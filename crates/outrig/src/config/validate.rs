@@ -5,7 +5,8 @@
 //! the *merged* config and checks that it hangs together. [`validate_as_repo`]
 //! runs on a single *unmerged* repo file and checks what that file was allowed
 //! to say -- a question the merged value cannot answer, since the merge has by
-//! then taken each global-only key from the global side.
+//! then taken each global-only key from the global side and replaced any
+//! global provider a repo entry shadowed, with no record of which file won.
 //!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
@@ -357,6 +358,17 @@ pub enum ConfigValidationError {
          global config"
     )]
     RepoNetworkPolicy { key: &'static str },
+
+    #[error(
+        "repo config may not declare [providers.{provider}]: a style={style} \
+         provider carries api-key ${{{var}}}, which belongs in global config"
+    )]
+    #[non_exhaustive]
+    RepoProviderApiKey {
+        provider: String,
+        style: &'static str,
+        var: String,
+    },
 
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
@@ -836,14 +848,32 @@ pub(super) fn validate_with_options(
 
 /// The rules that apply to a repo config file, checked on the unmerged value.
 ///
-/// Today there is one: `[network]`'s policy keys describe the machine's egress
-/// and belong to the operator, so a repo config may declare `mode` and nothing
-/// else. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
+/// Two today, drawing one line: what the operator's machine does stays with
+/// the operator. `[network]`'s policy keys describe the machine's egress, so a
+/// repo config may declare `mode` and nothing else. A provider's `api-key`
+/// names a host environment variable and its `base-url` says where the host
+/// process sends it, so a repo config may declare only providers that carry no
+/// key -- `style = "mistralrs"` today; a repo model may still name a global
+/// provider. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
-    match cfg.network.declared_policy_key() {
-        Some(key) => Err(ConfigValidationError::RepoNetworkPolicy { key }),
-        None => Ok(()),
+    if let Some(key) = cfg.network.declared_policy_key() {
+        return Err(ConfigValidationError::RepoNetworkPolicy { key });
     }
+    for (name, provider) in &cfg.providers {
+        // Deliberately without a `_` arm, as in `validate`: a new provider
+        // style has to say here whether a repo file may declare it.
+        match provider {
+            LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. } => {
+                return Err(ConfigValidationError::RepoProviderApiKey {
+                    provider: name.clone(),
+                    style: provider.style(),
+                    var: api_key.var_name().to_string(),
+                });
+            }
+            LlmProvider::Mistralrs { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {

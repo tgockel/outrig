@@ -58,9 +58,10 @@ async fn build_local_image(tag: &str, image_ctx: &std::path::Path) {
     );
 }
 
-const AGENT_CONFIG_TOML: &str = r#"
-default-agent = "smoke"
-
+/// The operator's half of the agent-bearing fixture: the keyed provider and
+/// the model it serves. A repo config may not declare a provider that carries
+/// an `api-key`, so this always goes to a `--global-config` file.
+const GLOBAL_CONFIG_TOML: &str = r#"
 [providers.openai]
 style = "openai"
 base-url = "http://127.0.0.1:1/v1"
@@ -69,6 +70,11 @@ api-key = "${OUTRIG_TEST_KEY}"
 [models.fast]
 provider = "openai"
 identifier = "gpt-4o-mini"
+"#;
+
+/// The repo's half: an agent over the global model.
+const AGENT_REPO_CONFIG_TOML: &str = r#"
+default-agent = "smoke"
 
 [agents.smoke]
 model = "fast"
@@ -90,10 +96,14 @@ provider = "openai"
 identifier = "gpt-4o-mini"
 "#;
 
-fn write_agent_only_config(repo: &std::path::Path) {
+/// Writes the agent-bearing fixture across its two files: the provider and
+/// model to `global`, which the caller passes as `--global-config`, and the
+/// agent that names the model to the repo's `.agents/outrig/config.toml`.
+fn write_agent_only_config(repo: &std::path::Path, global: &std::path::Path) {
+    std::fs::write(global, GLOBAL_CONFIG_TOML).expect("write global config");
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
-    std::fs::write(agents_dir.join("config.toml"), AGENT_CONFIG_TOML).expect("write config");
+    std::fs::write(agents_dir.join("config.toml"), AGENT_REPO_CONFIG_TOML).expect("write config");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,7 +253,9 @@ async fn run_accepts_raw_local_image_ref() {
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let image_ctx = tempfile::tempdir().expect("tempdir image context");
-    write_agent_only_config(repo_dir.path());
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+    let global_config = global_dir.path().join("config.toml");
+    write_agent_only_config(repo_dir.path(), &global_config);
 
     let image_ref = unique_image_tag("raw-run");
     std::fs::write(
@@ -258,6 +270,8 @@ async fn run_accepts_raw_local_image_ref() {
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "run",
@@ -295,7 +309,9 @@ async fn missing_raw_image_ref_is_local_only() {
     let _guard = E2E_LOCK.lock().await;
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
-    write_agent_only_config(repo_dir.path());
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+    let global_config = global_dir.path().join("config.toml");
+    write_agent_only_config(repo_dir.path(), &global_config);
 
     let image_ref = unique_image_tag("missing-raw");
     let bin = env!("CARGO_BIN_EXE_outrig");
@@ -303,6 +319,8 @@ async fn missing_raw_image_ref_is_local_only() {
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "run",
@@ -348,7 +366,11 @@ async fn run_without_repo_config_uses_global_config() {
     let extra_dir = tempfile::tempdir().expect("tempdir extra mount");
 
     let global_config = global_dir.path().join("config.toml");
-    std::fs::write(&global_config, AGENT_CONFIG_TOML).expect("write global config");
+    std::fs::write(
+        &global_config,
+        [AGENT_REPO_CONFIG_TOML, GLOBAL_CONFIG_TOML].concat(),
+    )
+    .expect("write global config");
 
     let image_ref = unique_image_tag("config-less-run");
     std::fs::write(
@@ -612,19 +634,13 @@ async fn run_mode_uses_embedded_image_entries() {
     );
     std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
 
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+    let global_config = global_dir.path().join("config.toml");
+    std::fs::write(&global_config, GLOBAL_CONFIG_TOML).expect("write global config");
     let config_toml = format!(
         r#"
 default-agent = "smoke"
 default-image = "smoke"
-
-[providers.openai]
-style = "openai"
-base-url = "http://127.0.0.1:1/v1"
-api-key = "${{OUTRIG_TEST_KEY}}"
-
-[models.fast]
-provider = "openai"
-identifier = "gpt-4o-mini"
 
 [agents.smoke]
 model = "fast"
@@ -644,6 +660,8 @@ context = "{context}"
         TEST_TIMEOUT,
         Command::new(bin)
             .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
                 "--session-root",
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "run",

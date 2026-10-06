@@ -235,12 +235,14 @@ async fn ask_repo_models(
     }
 
     if prompt.ask_bool(&CONFIGURE_REPO_MODELS_FIELD, true).await? {
-        let (models, new_providers) =
-            config_init::prompt_models_loop(prompt, &summary.providers, hf).await?;
+        // No new providers here: a provider carries an API key, and a repo
+        // config may not declare one (`Config::validate_as_repo`), so a name
+        // the global config lacks is re-asked rather than defined.
+        let (models, _no_new_providers) =
+            config_init::prompt_models_loop(prompt, &summary.providers, hf, false).await?;
         let default = config_init::prompt_default_model(prompt, &models).await?;
         return Ok(RepoModelChoices {
             models,
-            providers: new_providers,
             default_model: default,
         });
     }
@@ -252,7 +254,6 @@ async fn ask_repo_models(
     let default = ask_repo_default_model_from_global(prompt, summary).await?;
     Ok(RepoModelChoices {
         models: BTreeMap::new(),
-        providers: BTreeMap::new(),
         default_model: default,
     })
 }
@@ -342,11 +343,11 @@ async fn pick_global_model(
     }
 }
 
-/// Outcome of the model section: any new repo-local providers / models
-/// the user defined, plus the chosen repo `default-model` if any.
+/// Outcome of the model section: any new repo-local models the user
+/// defined, plus the chosen repo `default-model` if any. Never providers:
+/// those carry API keys and a repo config may not declare one.
 #[derive(Default)]
 struct RepoModelChoices {
-    providers: BTreeMap<String, LlmProvider>,
     models: BTreeMap<String, Model>,
     default_model: Option<String>,
 }
@@ -376,7 +377,6 @@ fn render(
     cfg.default_agent = Some(agent_name);
     cfg.default_model = model_choices.default_model;
     cfg.workspace = Workspace::new(host_path, container_path);
-    cfg.providers = model_choices.providers;
     cfg.models = model_choices.models;
     cfg.agents = agents;
     toml::to_string_pretty(&cfg)

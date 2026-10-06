@@ -253,6 +253,7 @@ A typical startup looks like:
 [outrig] building agent
 [outrig] agent ready (0ms)
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
+[outrig] base-url:          https://api.openai.com/v1
 [outrig] tool-call max:     50
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding

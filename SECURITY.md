@@ -45,6 +45,10 @@ Issues that bear on **host integrity** are in scope, for example:
 - A repo config's `[network]` block reaching the egress policy. A repo may choose
   `[network].mode`; `default`, `allow`, and `deny` belong to the operator's global config, and
   a repo value carrying them must not widen or replace what the global config set.
+- A repo config binding a host secret: a `[providers.<name>]` entry that carries an `api-key`
+  belongs to the operator's global config, and a repo config -- committed, or edited by the
+  agent through the read-write workspace -- that declares one must be refused rather than
+  handed the operator's key to send to a `base-url` of its choosing.
 - Capability handling that is more permissive than the selected capability profile
   (`default` / `no-net-raw` / `drop-all`).
 - A container launched more permissively than its `[images.<name>.security]` block asks for --

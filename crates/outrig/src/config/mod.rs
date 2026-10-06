@@ -506,14 +506,19 @@ impl Config {
     ///
     /// [`validate`](Self::validate) runs on the merged config, which by
     /// construction has already taken its `[network]` policy from the global
-    /// side and so cannot say which file declared what. These rules therefore
-    /// run per-file, before [`merge`](fn@merge). Today there is one: a repo
+    /// side and replaced any global provider a repo entry shadowed, and so
+    /// cannot say which file declared what. These rules therefore run
+    /// per-file, before [`merge`](fn@merge). Today there are two. A repo
     /// config may choose `[network].mode`, but `default`, `allow`, and `deny`
-    /// describe the machine's egress and stay with the operator.
+    /// describe the machine's egress and stay with the operator. And a repo
+    /// config may declare only providers that carry no `api-key`: a key names
+    /// a host environment variable, and a repo that could pair one with its
+    /// own `base-url` would decide where the operator's secret is sent.
     ///
     /// `Config::load` applies this to the repo file it reads. An embedder
     /// assembling a repo-side `Config` by hand should call it too -- `merge`
-    /// is infallible and simply drops a repo policy rather than reporting it.
+    /// is infallible: it drops a repo policy rather than reporting it, and it
+    /// takes a repo provider as written.
     pub fn validate_as_repo(&self) -> Result<()> {
         validate::validate_as_repo(self)?;
         Ok(())

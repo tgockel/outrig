@@ -273,11 +273,15 @@ fn build_load_still_validates_model_shape_and_alias_graph() {
         ),
     ] {
         let tmp = tempdir().unwrap();
+        // `CONCRETE` carries a keyed provider, which only the global file may
+        // declare; the rows under test stay in the repo file.
+        let global = tmp.path().join("global.toml");
+        fs::write(&global, CONCRETE).unwrap();
         let agents = tmp.path().join(".agents/outrig");
         fs::create_dir_all(&agents).unwrap();
-        fs::write(agents.join("config.toml"), format!("{CONCRETE}{models}")).unwrap();
+        fs::write(agents.join("config.toml"), models).unwrap();
 
-        let err = Config::load_for_build(tmp.path(), None)
+        let err = Config::load_for_build(tmp.path(), Some(&global))
             .expect_err(&format!("{case}: build load should reject it"));
         assert!(
             err.to_string().contains(needle),

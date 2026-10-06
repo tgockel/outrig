@@ -238,9 +238,10 @@ const MODEL_PROVIDER_FIELD: Field = Field {
     description: "An LLM provider is a backend that hosts the model -- e.g. \
                   OpenAI, OpenRouter, vLLM, or a local mistralrs runtime. \
                   Each carries its own connection details (URL, API key, \
-                  etc.). This can be the name of an existing \
-                  [providers.<name>] entry or you can give a new name to \
-                  create a new provider.",
+                  etc.). Name an existing [providers.<name>] entry. When \
+                  writing the global config, a new name offers to define \
+                  one; a repo config only references global providers, \
+                  since providers carry API keys.",
     options: &[],
     doc_link: "doc/concepts/llm-providers.md",
 };
@@ -382,20 +383,22 @@ async fn prompt_models(
     if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
         return Ok(BTreeMap::new());
     }
-    let (models, new_providers) = prompt_models_loop(prompt, providers, hf).await?;
+    let (models, new_providers) = prompt_models_loop(prompt, providers, hf, true).await?;
     providers.extend(new_providers);
     Ok(models)
 }
 
 /// The model-add loop without the outer `Define a model now?` gate.
-/// Returns `(models, new_providers)` -- providers added inline (when the
-/// user references one that doesn't exist yet) come back to the caller so
-/// init::repo can write them to the repo config without mutating the
-/// global providers it was passed.
+/// Returns `(models, new_providers)` -- providers added inline when the user
+/// names one that doesn't exist yet. Only the global flow passes
+/// `allow_new_providers`: a provider carries an API key, which a repo config
+/// may not declare (`Config::validate_as_repo`), so the repo flow re-asks
+/// until an existing name is given and its map comes back empty.
 pub(crate) async fn prompt_models_loop(
     prompt: &mut impl PromptSource,
     existing_providers: &BTreeMap<String, LlmProvider>,
     hf: &mut impl HfTreeFetcher,
+    allow_new_providers: bool,
 ) -> Result<(BTreeMap<String, Model>, BTreeMap<String, LlmProvider>)> {
     let mut out = BTreeMap::new();
     let mut new_providers: BTreeMap<String, LlmProvider> = BTreeMap::new();
@@ -425,6 +428,15 @@ pub(crate) async fn prompt_models_loop(
                 .await?;
             if existing_providers.contains_key(&answer) || new_providers.contains_key(&answer) {
                 break answer;
+            }
+            if !allow_new_providers {
+                eprintln!(
+                    "[outrig] no provider named `{answer}`. Providers carry API keys and \
+                     belong in your global config; add `{answer}` there first, or pick one \
+                     of: {}",
+                    provider_names.join(", ")
+                );
+                continue;
             }
             eprintln!("[outrig] no provider named `{answer}` yet.");
             if prompt.ask_bool(&ADD_NEW_PROVIDER_FIELD, true).await? {

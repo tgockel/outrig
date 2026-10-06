@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo config may not declare a provider that carries an `api-key`.** `[providers.<name>]`
+  rows of `style = "openai"` or `"anthropic"` in `.agents/outrig/config.toml`, or in a file named
+  by `--config`, are now a load error, reported by `Config::validate_as_repo` beside the
+  `[network]` policy rule as the new `ConfigValidationError::RepoProviderApiKey`, which names
+  the provider, its style, and the variable its key references. Before, a repo entry replaced
+  the global one of the same name wholesale, so a committed file -- or one the agent edited
+  through the read-write workspace for the next session -- could restate `[providers.anthropic]`
+  with its own `base-url` and `api-key = "${ANTHROPIC_API_KEY}"`, or add a provider under a new
+  name and reach it through `default-model`, an agent's `model`, or a redeclared
+  `[models.<name>]`, and the first turn posted the operator's key to the endpoint the repo chose.
+  A repo config may still declare keyless `style = "mistralrs"` providers and may name global
+  providers from `[models.<name>]`. `merge` is unchanged and takes a repo provider as written, so
+  an embedder assembling a repo-side `Config` by hand should call `validate_as_repo`, as the
+  network rule already asked. If a repo config of yours declares a remote provider, move the
+  entry to `~/.outrig/config.toml` or a file passed as `--global-config`; the models keep
+  referencing it by name.
 - **A terminal's Ctrl-C no longer reaches an `McpClient`'s transport.** The `podman exec -i` or
   `podman start --attach` client behind each `McpClient` was in the embedding process's group.
   The terminal sends `SIGINT` to that whole group, and the podman client exited on it, so a

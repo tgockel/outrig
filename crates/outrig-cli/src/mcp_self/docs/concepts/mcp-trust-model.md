@@ -36,6 +36,13 @@ audit or filter mode. Installing and removing that policy runs nothing from a co
 either: outrig rewrites and restores the container's `/etc/resolv.conf` itself, so a hostile
 image gets no foothold outside its own namespaces while policy is being put in place.
 
+Part of the config that shapes a session is inside the boundary. `.agents/outrig/config.toml`
+lives in the workspace, which is mounted read-write, so an agent can edit it in one session and
+have the next session load the result. That is why what reaches the host's secrets stays
+global-only: a provider carrying an `api-key` -- a reference to a variable in the operator's
+environment, paired with the `base-url` it is sent to -- is refused in a repo config, as the
+`[network]` policy keys are. A repo config may still name global providers from its models.
+
 [Subagents](subagents.md) do not bend this. An agent can launch one with `outrig__subagent`, but a
 subagent runs in the container that is already there, over the MCP connections that are already
 open. It starts no container, connects no server, and can call nothing the operator did not

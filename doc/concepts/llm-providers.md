@@ -57,9 +57,11 @@ endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at r
 never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
 
-You can declare as many providers as you want -- one per account, one per local Ollama install,
-one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`, `local-ollama`,
-`work-account`) become labels you reference from models.
+You can declare as many providers as you want in your global config -- one per account, one
+per local Ollama install, one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`,
+`local-ollama`, `work-account`) become labels you reference from models, in either file. A
+repo config may not declare a provider that carries an `api-key`; see
+[Where things live](#where-things-live-global-vs-repo) below.
 
 ## `[models.<name>]`
 
@@ -465,10 +467,16 @@ on stderr. No tool-call line means no tool calling.
 `api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses to load any
 other value -- a literal key, a missing `${...}` wrapper, anything. This guarantees:
 
-- Configs are safe to commit to source control.
+- No config file holds key material, so none of them can leak it.
 - Keys never end up in `outrig logs` output, in tracing diagnostics, or in session metadata on
   disk.
 - Rotating a key is a shell change, not a file edit.
+
+The reference is resolved on the machine running outrig, and the provider's `base-url` says
+where the result is sent. That pairing is the operator's to make, so a provider that carries an
+`api-key` may be declared only in the global config: a committed `.agents/outrig/config.toml`
+cannot name your key, and so cannot redirect it. (The repo file sits inside the read-write
+workspace, where the agent could edit it for the next session.)
 
 Different shells (different accounts, different rate limits) just point `api-key` at different
 env-var names:
@@ -489,7 +497,7 @@ api-key  = "${OPENAI_API_KEY}"
 
 | Layer                 | Global (`~/.outrig/config.toml`) | Repo (`.agents/outrig/config.toml`) |
 |-----------------------|----------------------------------|-------------------------------------|
-| `[providers.<name>]`  | typical home                     | allowed for repo-only providers     |
+| `[providers.<name>]`  | home for every keyed provider    | `style = "mistralrs"` only          |
 | `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
 | `[agents.<name>]`     | rare                             | typical home                        |
 | `[workspace]`         | rare (machine-wide paths)        | typical home                        |
@@ -498,7 +506,10 @@ api-key  = "${OPENAI_API_KEY}"
 | `default-agent`       | rare                             | optional                            |
 | `default-image`       | rare                             | required for `outrig run`           |
 
-If a name is defined in both, the repo wins -- override by redefining.
+If a name is defined in both, the repo wins -- override by redefining. Providers are the one
+map with a repo-side restriction: a repo config may declare only providers without an
+`api-key`, so a keyed provider is always the global file's, `base-url` included, and a repo
+`[models.<name>]` names it. A repo config that declares a keyed provider is rejected at load.
 
 `[workspace]` is the one block that does not merge by name. Its `host-path` and `container-path`
 merge per key, so a global `container-path` stays in effect until a repo declares its own, and

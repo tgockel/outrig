@@ -1,5 +1,7 @@
-# Mirror of doc/reference/config.md "Full examples", flattened into one file
-# so the schema fixture exercises every legal section in a single round-trip.
+# Mirror of doc/reference/config.md "Full examples" -- both files flattened
+# into one so the schema fixture exercises every legal section in a single
+# round-trip. Loads as a *global* config; as a repo config it is refused,
+# because only the operator's file may declare the keyed providers below.
 
 default-image      = "coding"
 default-agent      = "coding"

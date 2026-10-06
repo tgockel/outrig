@@ -53,7 +53,7 @@ provider   = "local"
 model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 
-# After:
+# After -- in your global config, since a provider with an api-key may not live in the repo file:
 [providers.local]
 style    = "openai"
 base-url = "http://127.0.0.1:11434/v1"   # Ollama's default; vLLM 8000, llama-server 8080

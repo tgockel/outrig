@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `outrig run` banner names the endpoint.** A `[outrig] base-url:` row follows the
+  `agent:`/`model:` line for an `openai` or `anthropic` provider, so where the session's key goes
+  is on screen before the first turn; the provider *style* on the line above reads the same for
+  any two endpoints speaking one wire format. Credentials embedded in the URL
+  (`https://user:secret@proxy.example`) print as `***@`. An in-process `mistralrs` model prints
+  no such row.
 - **The `outrig run` prompt is a line editor.** On an interactive terminal it has readline-style
   editing -- `Ctrl-A`/`Ctrl-E`, `Ctrl-W`, `Ctrl-K`, word motion -- and `Up`/`Down` recall of the
   prompts typed earlier in the session, with `Ctrl-R` to search them. Recall is in memory for the
@@ -33,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo config may not declare a provider that carries an `api-key`.** `outrig run`,
+  `outrig mcp`, and `outrig build` refuse a `.agents/outrig/config.toml`, or a `--config` file,
+  that declares an `openai` or `anthropic` provider, naming the provider and the variable. A repo
+  entry used to replace the global provider of the same name wholesale, so a cloned repo -- or
+  one whose config the agent edited during the previous session -- could send the operator's key
+  to a `base-url` of its choosing, and the banner showed nothing different. The repo phase of
+  `outrig init` and the `outrig image add` bootstrap no longer offer to define a provider: a
+  model there names one from the global config, and an unknown name is asked again. Move any
+  remote provider a repo config declares to `~/.outrig/config.toml` or a `--global-config` file;
+  the repo's models keep naming it. Fixed in `outrig`; see that crate's changelog.
 - **Ctrl-C during a turn no longer takes the session's tools with it.** The terminal sends
   `SIGINT` to its whole foreground process group, and every `podman exec` transport to an MCP
   server was in outrig's group. The podman client exited on it, so after `[outrig] interrupted`

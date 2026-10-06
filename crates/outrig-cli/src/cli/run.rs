@@ -982,9 +982,10 @@ fn print_banner(banner: StartupBanner<'_>) {
 }
 
 /// Split from `print_banner` so the lines it claims can be asserted on. Every
-/// conditional row here -- the agentless lead, the failover list, the device,
-/// the built-in-default marker -- is something `doc/` states, and a banner that
-/// only ever reaches stderr is a documented claim with nothing behind it.
+/// conditional row here -- the agentless lead, the failover list, the
+/// endpoint, the device, the built-in-default marker -- is something `doc/`
+/// states, and a banner that only ever reaches stderr is a documented claim
+/// with nothing behind it.
 fn render_banner(banner: StartupBanner<'_>) -> String {
     let StartupBanner {
         resolved,
@@ -1029,6 +1030,19 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     if !fallbacks.is_empty() {
         let _ = writeln!(buf, "[outrig] model failover:    {}", fallbacks.join(", "));
     }
+    // Where the key goes. The provider *style* above reads the same for any
+    // two endpoints speaking one wire format, so the endpoint itself is the
+    // row that tells them apart. A repo config cannot declare a keyed
+    // provider, so this is always a `base-url` the operator's own file set.
+    if let llm::ResolvedProvider::OpenAi { base_url, .. }
+    | llm::ResolvedProvider::Anthropic { base_url, .. } = resolved.provider()
+    {
+        let _ = writeln!(
+            buf,
+            "[outrig] base-url:          {}",
+            redact_url_userinfo(base_url)
+        );
+    }
     let _ = writeln!(
         buf,
         "[outrig] tool-call max:     {}",
@@ -1060,6 +1074,29 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
         "[outrig] session id: {session_id}   (Ctrl-D to exit, /help for slash commands)"
     );
     buf
+}
+
+/// `url` with any userinfo replaced by `***`: a gateway configured as
+/// `https://user:secret@proxy.example/v1` sends those credentials with every
+/// request, and the banner names its host and nothing else. Textual rather
+/// than a URL parse, so the operator's own spelling is what prints and a URL
+/// a parser would refuse is left alone.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+    match url[authority_start..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}***{}",
+            &url[..authority_start],
+            &url[authority_start + at..]
+        ),
+        None => url.to_string(),
+    }
 }
 
 fn build_tools_summary(tools: &[SessionTool]) -> String {
@@ -1281,6 +1318,84 @@ mod tests {
                 .contains("[outrig] model device:      cpu\n"),
             "an in-process model reports its device"
         );
+    }
+
+    /// The endpoint is the one fact the provider *style* does not carry, and
+    /// the one a key is posted to, so a remote provider names it up front. An
+    /// in-process model has no endpoint, and the resolved key itself is never
+    /// part of the banner.
+    #[test]
+    fn the_banner_names_the_base_url_only_for_a_remote_provider() {
+        let local = test_resolved_agent();
+        assert!(
+            !render_test_banner(&local, "rust-dev", false).contains("base-url:"),
+            "an in-process model has no endpoint to report"
+        );
+
+        let mut remote = test_resolved_agent();
+        remote.candidates[0].provider = llm::ResolvedProvider::OpenAi {
+            base_url: "http://127.0.0.1:18081/v1".to_string(),
+            api_key: "sk-PROBE-KEY-123".to_string(),
+            request_timeout_secs: None,
+            retry_budget_secs: None,
+        };
+        let banner = render_test_banner(&remote, "rust-dev", false);
+        assert!(
+            banner.contains("[outrig] base-url:          http://127.0.0.1:18081/v1\n"),
+            "a remote provider names its endpoint: {banner}"
+        );
+        assert!(
+            !banner.contains("sk-PROBE-KEY-123"),
+            "the resolved key never reaches the banner: {banner}"
+        );
+    }
+
+    /// A gateway may carry Basic-auth credentials in its URL, and the client
+    /// sends them with every request; the banner must not repeat them. The
+    /// host and path remain, with a marker where the credentials were.
+    #[test]
+    fn the_banner_masks_credentials_embedded_in_the_base_url() {
+        let mut remote = test_resolved_agent();
+        remote.candidates[0].provider = llm::ResolvedProvider::Anthropic {
+            base_url: "https://gateway-user:SECRET-PASS@proxy.corp.example/anthropic".to_string(),
+            api_key: "sk-PROBE-KEY-123".to_string(),
+            request_timeout_secs: None,
+            retry_budget_secs: None,
+        };
+        let banner = render_test_banner(&remote, "rust-dev", false);
+        assert!(
+            banner.contains(
+                "[outrig] base-url:          https://***@proxy.corp.example/anthropic\n"
+            ),
+            "the host and path remain: {banner}"
+        );
+        assert!(
+            !banner.contains("SECRET-PASS") && !banner.contains("gateway-user"),
+            "neither half of the credential reaches the banner: {banner}"
+        );
+    }
+
+    /// The redaction is textual and touches only the authority: an `@` in a
+    /// path or query is not a credential, a URL without userinfo prints as
+    /// written, and one without a scheme is left alone.
+    #[test]
+    fn url_userinfo_redaction_touches_only_the_authority() {
+        for (url, shown) in [
+            ("https://api.openai.com/v1", "https://api.openai.com/v1"),
+            ("https://token@host.example", "https://***@host.example"),
+            (
+                "https://u:p@host.example:8443/v1?x=a@b#f",
+                "https://***@host.example:8443/v1?x=a@b#f",
+            ),
+            (
+                "https://host.example/path@with@ats",
+                "https://host.example/path@with@ats",
+            ),
+            ("https://host.example/?q=user@x", "https://host.example/?q=user@x"),
+            ("localhost:11434/v1", "localhost:11434/v1"),
+        ] {
+            assert_eq!(redact_url_userinfo(url), shown, "{url}");
+        }
     }
 
     /// Locks `/help` to the exact text the REPL printed when it owned the

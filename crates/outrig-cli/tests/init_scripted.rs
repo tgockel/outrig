@@ -195,3 +195,58 @@ async fn skips_global_phase_when_global_exists() {
     // Touch path: the merged load works against the pre-seeded global.
     let _merged: Config = Config::load(&cwd, Some(&global)).expect("merged config must load");
 }
+
+/// #330: the repo phase may define models but never a provider -- a provider
+/// carries an API key, and a repo config may not declare one. A provider name
+/// the global config lacks is re-asked rather than created, so the file this
+/// phase writes is one its own next load accepts.
+#[tokio::test]
+async fn the_repo_phase_refuses_a_provider_the_global_config_lacks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+    std::fs::write(
+        &global,
+        "default-model = \"fast\"\n\
+         \n\
+         [providers.openai]\n\
+         style = \"openai\"\n\
+         base-url = \"https://api.openai.com/v1\"\n\
+         api-key = \"${OPENAI_API_KEY}\"\n\
+         \n\
+         [models.fast]\n\
+         provider = \"openai\"\n\
+         identifier = \"gpt-4o-mini\"\n",
+    )
+    .unwrap();
+
+    // Phase 1 is skipped. Phase 2: configure-repo-models (Y), model name
+    // (default), provider `nowhere` -- unknown, so the prompt comes straight
+    // back without offering to define it -- then `openai`, identifier
+    // (default), add-another (N), use-as-default (Y), agent x2, container
+    // name, workspace x2; phase 3 takes 4. One line more than the all-defaults
+    // walk, for the re-asked provider: 16.
+    let script = b"\n\nnowhere\nopenai\n\n\n\n\n\n\n\n\n\n\n\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    timeout(
+        TEST_TIMEOUT,
+        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("init must not hang")
+    .expect("init must succeed");
+
+    let repo_cfg = std::fs::read_to_string(cwd.join(".agents/outrig/config.toml")).unwrap();
+    assert!(
+        !repo_cfg.contains("[providers."),
+        "the repo phase must not write a provider:\n{repo_cfg}"
+    );
+    assert!(
+        repo_cfg.contains("provider = \"openai\""),
+        "the model names the global provider:\n{repo_cfg}"
+    );
+    let _merged: Config = Config::load(&cwd, Some(&global)).expect("merged config must load");
+}

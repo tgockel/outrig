@@ -9,7 +9,10 @@ use super::Config;
 /// - For each map (`providers`, `models`, `agents`, `images`, `sidecars`):
 ///   repo entries replace global entries with the same key. Entries unique to
 ///   either side are preserved as-is. A repo image-config can therefore name a
-///   sidecar the user declared globally.
+///   sidecar the user declared globally. Which providers a repo file may
+///   declare is not this function's question: [`Config::validate_as_repo`]
+///   refuses a repo provider that carries an `api-key` before the file gets
+///   here, and a repo value built by hand must be held to it the same way.
 /// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-max`, `tool-result-max`, `subagent-depth-max`,

@@ -8,7 +8,10 @@ outrig reads two TOML files:
   model identifiers that belong to the user, not to any one repo.
 - **Repo config** at `.agents/outrig/config.toml` -- repository-level, committed to source
   control. Holds `[workspace]`, `[images.<name>]`, `[agents.<name>]`, and any repo-specific
-  providers or models.
+  models, which may name the global providers. A repo config may not declare a provider that
+  carries an `api-key`: the file sits inside the read-write workspace, so an agent could edit
+  it for the next session, and a key names a secret in the operator's environment. Keyless
+  `style = "mistralrs"` providers are the exception.
 
 Both files use the same schema. Names declared in either are visible everywhere; if a name
 appears in both files, the **repo entry wins**. Outrig keys are **kebab-case**; only inner-map
@@ -251,9 +254,12 @@ interceptor.
 ## `[providers.<name>]`
 
 A provider tells outrig how to reach a model -- either a remote HTTPS endpoint that speaks
-a known wire format, or a local in-process backend. Multiple providers in either file. Repo
-entries with the same name override globals, replacing the whole entry rather than merging
-field by field. The accepted `style` values are `"openai"`, `"anthropic"`, and
+a known wire format, or a local in-process backend. The remote styles carry an `api-key`,
+which names a variable in the operator's environment, so they belong to the global config: a
+repo config that declares one is rejected at load, whatever name it uses. A repo config may
+declare keyless `style = "mistralrs"` providers, and its models may name any global provider.
+Where both files declare the same name, the repo entry replaces the whole global entry rather
+than merging field by field. The accepted `style` values are `"openai"`, `"anthropic"`, and
 `"mistralrs"`. Which other fields are valid depends on `style`.
 
 ### `style = "openai"`
@@ -386,9 +392,10 @@ build-time feature gates only the *use* of the provider: trying to resolve an ag
 points at a `mistralrs` provider on a non-feature build fails at run time, with a message
 that names the missing flag.
 
-The reason is portability -- a checked-in `.agents/outrig/config.toml` can declare both
-remote and in-process providers, and the same config works for teammates whether or not
-they built with the feature on.
+The reason is portability -- a checked-in `.agents/outrig/config.toml` can declare an
+in-process provider and the models over it, and the same config works for teammates whether
+or not they built with the feature on. (The remote providers beside it live in each
+teammate's global config; see [`api-key` syntax](#api-key-syntax).)
 
 ### `api-key` syntax
 
@@ -405,6 +412,13 @@ api-key = "OPENAI_API_KEY"      # ERROR -- ${...} required
 
 The variable name must match `^[A-Z_][A-Z0-9_]*$`. If the named environment variable is unset
 when outrig needs the key, outrig fails with a pointed error.
+
+A provider that carries an `api-key` is accepted only from the global config (or the file named
+by `--global-config`). The reference is resolved on the host, and the provider's `base-url`
+says where the host process sends the result; a repo config that could pair the two would
+decide where the operator's secret goes. `outrig run`, `outrig mcp`, and `outrig build` all
+refuse a repo config -- `.agents/outrig/config.toml` or a `--config` file -- that declares one,
+naming the provider and the variable.
 
 See [Concepts -> LLM Providers](https://tgockel.github.io/outrig/concepts/llm-providers.html).
 
@@ -1132,9 +1146,14 @@ used in full (no per-key merging).
 ```
 ~/.outrig/config.toml             .agents/outrig/config.toml         effective
 [providers.openai]                                                   global value
-[providers.local]                 [providers.local]                  repo overrides
-                                  [providers.staging]                repo only
+[models.fast]                     [models.fast]                      repo overrides
+                                  [models.review]                    repo only
 ```
+
+The one map with a repo-side restriction is `[providers.<name>]`: a repo config may declare
+only providers without an `api-key` (`style = "mistralrs"`), so every keyed provider in the
+effective config is one the global file declared, `base-url` included. A repo `[models.<name>]`
+names a global provider the way `fast` does above.
 
 `outrig run` walks the chain at startup: agent -> model (explicit or `default-model`) -> provider
 -> resolved api-key from env. Anything that fails to resolve is an error printed to stderr
@@ -1279,6 +1298,9 @@ default-agent = "coding"
 [network]
 mode = "audit"   # the only `[network]` key a repo config may set
 
+# No `[providers.<name>]` -- a provider with an `api-key` belongs in the global config; the
+# agents below name the global models.
+
 [workspace]
 host-path      = "."
 container-path = "/workspace"
@@ -1381,6 +1403,9 @@ image-config in the merged config but does not require agent/model/provider wiri
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
   `[network].deny` are rejected there.
+- A repo config may declare only providers without an `api-key` (`style = "mistralrs"`); an
+  `openai` or `anthropic` provider in `.agents/outrig/config.toml`, or in a `--config` file,
+  is rejected there, naming the provider and the variable its key references.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.

@@ -92,8 +92,10 @@ built from it, so a name typed here that can't be one is asked for again; see
 The model section reads your global `~/.outrig/config.toml` and lists the available models.
 Answering "yes" walks the same model-definition prompts as `outrig config init`, except the
 new `[models.<name>]` entries land in the repo config (referencing the global providers).
-You can then optionally pin one as the repo's `default-model`. "No" inherits everything
-from the global config.
+A provider name the global config lacks is asked again rather than defined: a provider
+carries an API key, and a repo config may not declare one. You can then optionally pin one
+of the new models as the repo's `default-model`. "No" inherits everything from the global
+config.
 
 If your global config has no providers, the section instead prints a hint to run
 `outrig config init` and skips the prompt -- the agent can't run without a provider.

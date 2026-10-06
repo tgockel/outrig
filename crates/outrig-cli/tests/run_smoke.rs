@@ -1,9 +1,10 @@
 //! End-to-end smoke for `outrig run`. Gated behind `--features e2e`.
 //!
-//! Sets up a fixture repo in a tempdir whose `.agents/outrig/config.toml`
-//! points its OpenAI base-url at a local hand-rolled mock server, then runs
-//! the `outrig` binary as a subprocess, pipes one prompt to stdin, and
-//! asserts on captured stdout/stderr.
+//! Sets up a fixture repo in a tempdir, plus a global config under a private
+//! `XDG_CONFIG_HOME` whose OpenAI provider points at a local hand-rolled mock
+//! server (a repo config may not declare a keyed provider), then runs the
+//! `outrig` binary as a subprocess, pipes one prompt to stdin, and asserts on
+//! captured stdout/stderr.
 //!
 //! Run with:
 //!
@@ -13,7 +14,7 @@
 
 #![cfg(feature = "e2e")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,9 +62,37 @@ default-model = "fast"
     );
 }
 
+/// Where the fixture's global config lives. `run_child` points
+/// `XDG_CONFIG_HOME` here, so the provider and its model are read from the
+/// operator's side of the merge -- a repo config may not declare a provider
+/// that carries an `api-key` -- and the developer's real global config is
+/// never read.
+fn xdg_config_home(repo: &Path) -> PathBuf {
+    repo.join("xdg")
+}
+
 /// `top` lands with the other scalar keys, above every table; `agents` lands
-/// at the bottom, after the provider/model registry.
+/// at the bottom, after the image-config. The provider and the model it serves
+/// go to the global config under [`xdg_config_home`].
 fn write_config(repo: &Path, mock_addr: &str, top: &str, agents: &str) {
+    let global_dir = xdg_config_home(repo).join("outrig");
+    std::fs::create_dir_all(&global_dir).expect("mkdir xdg/outrig");
+    let global_toml = format!(
+        r#"
+[providers.openai]
+style = "openai"
+base-url = "http://{addr}/v1"
+api-key = "${{OUTRIG_TEST_KEY}}"
+request-timeout-secs = 10
+
+[models.fast]
+provider = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        addr = mock_addr,
+    );
+    std::fs::write(global_dir.join("config.toml"), global_toml).expect("write global config");
+
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
@@ -74,16 +103,6 @@ fn write_config(repo: &Path, mock_addr: &str, top: &str, agents: &str) {
 default-image = "smoke"
 {top}
 
-[providers.openai]
-style = "openai"
-base-url = "http://{addr}/v1"
-api-key = "${{OUTRIG_TEST_KEY}}"
-request-timeout-secs = 10
-
-[models.fast]
-provider = "openai"
-identifier = "gpt-4o-mini"
-
 [images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
@@ -92,7 +111,6 @@ context = "{context}"
   fs = ["mcp-server-filesystem", "/workspace"]
 {agents}
 "#,
-        addr = mock_addr,
         dockerfile = dockerfile.display(),
         context = context.display(),
     );
@@ -168,6 +186,7 @@ async fn run_drives_one_tool_call_and_prints_reply() {
             "[outrig] building agent",
             "[outrig] agent ready",
             "[outrig] agent:",
+            "[outrig] base-url:          http://127.0.0.1:",
             "[outrig] entering REPL",
         ],
     );
@@ -712,6 +731,7 @@ async fn run_sigint_to_the_group_mid_turn_keeps_the_mcp_transports() {
         .current_dir(repo_dir.path())
         .env("OUTRIG_TEST_KEY", "test-key")
         .env("OUTRIG_LOG", "info")
+        .env("XDG_CONFIG_HOME", xdg_config_home(repo_dir.path()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -879,6 +899,7 @@ async fn run_child_with_input(args: &[&str], repo: &Path, input: &[u8]) -> Captu
         .current_dir(repo)
         .env("OUTRIG_TEST_KEY", "test-key")
         .env("OUTRIG_LOG", "info")
+        .env("XDG_CONFIG_HOME", xdg_config_home(repo))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

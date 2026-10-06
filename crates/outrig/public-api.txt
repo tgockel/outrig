@@ -159,6 +159,10 @@ pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: 
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RepoProviderApiKey
+pub outrig::config::ConfigValidationError::RepoProviderApiKey::provider: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoProviderApiKey::style: &'static str
+pub outrig::config::ConfigValidationError::RepoProviderApiKey::var: alloc::string::String
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::max: u64
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::path: alloc::string::String
