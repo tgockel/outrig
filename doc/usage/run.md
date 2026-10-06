@@ -219,7 +219,7 @@ tools) and `shell` is unavailable. Full details in
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
    system prompt at all.
-10. **Open the REPL.** Banner on stderr, `> ` prompt, ready for input.
+10. **Open the REPL.** Banner on stderr, `> ` prompt on the terminal, ready for input.
 
 If anything before step 10 fails, `outrig run` reports the error on stderr and exits non-zero
 without starting the REPL.
@@ -266,7 +266,10 @@ A typical startup looks like:
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
 the assistant's natural-language reply. For in-process `mistralrs` models, that reply is flushed
 as chunks while the model decodes; OpenAI-compatible providers print the reply when the turn
-finishes. The stream separation makes it easy to capture just the model output:
+finishes. On an interactive terminal the `> ` prompt and the echo of what you type go to the
+terminal itself rather than to either stream, so neither `outrig run > out.txt` nor
+`outrig run 2> err.txt` captures them, and the prompt stays visible in both. The stream separation
+makes it easy to capture just the model output:
 
 ```sh
 $ echo "summarise this repo" | outrig run > summary.txt
@@ -365,9 +368,31 @@ conversation keeps. The call is retried twice before outrig gives up:
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
-The REPL is line-buffered. Multi-line input is not supported in v0.
+## Line editing and history
 
-> **TODO: Incomplete** -- multi-line / paste-mode input is deferred.
+On an interactive terminal the `>` prompt is a full line editor. Arrow keys and the usual
+readline bindings move and edit within the line -- `Ctrl-A`/`Ctrl-E` for the ends, `Ctrl-W` and
+`Ctrl-K` to cut a word or the tail, `Alt-B`/`Alt-F` to move by word. `Up` and `Down` recall the
+prompts you typed earlier in this session, and `Ctrl-R` searches them.
+
+That history lives in memory for the length of the session. **outrig writes no history file**:
+nothing you type at the prompt is persisted anywhere, and a new `outrig run` starts with an empty
+recall list. `/reset` clears the *conversation* history the model sees; it does not touch the
+prompts the editor recalls.
+
+Pasting several lines at once sends them as a single prompt, with the line breaks intact, rather
+than as one turn per line. Typing multi-line input is still not supported -- `Enter` always ends
+the prompt.
+
+The editor needs a terminal it can drive. When stdin is a pipe or a file, or a terminal other
+than the one you are typing at (`outrig run < /dev/pts/7`), or `TERM` is `dumb`, `cons25`, or
+`emacs`, the prompt falls back to reading one line at a time with no editing and no recall, which
+is what keeps scripted use (`echo "..." | outrig run`) working unchanged.
+
+`RUST_LOG=debug` and `OUTRIG_LOG=debug` do not record what you type. The editor's own debug
+output names every keystroke, so it stays at `warn` unless the filter mentions `rustyline`.
+
+> **TODO: Incomplete** -- typed multi-line input is deferred.
 
 ## Slash commands
 
@@ -473,7 +498,8 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   Ctrl-D, is what stops those.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
-- A second Ctrl-C without an intervening prompt also exits.
+- **Ctrl-C** at the prompt discards whatever is typed on that line and draws a fresh `> `. A
+  second Ctrl-C, with nothing entered in between, exits.
 - **Ctrl-C before the first prompt** -- while the image builds, the container starts, or an MCP
   server initializes -- ends the session the way Ctrl-D does: whatever had started is stopped,
   and the session record is finalized. So does **SIGTERM** or **SIGHUP** at any point, prompt

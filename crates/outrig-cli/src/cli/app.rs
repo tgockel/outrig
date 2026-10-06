@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Directive;
 
 use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
@@ -320,9 +321,11 @@ fn dispatch(cli: &Cli) -> Result<i32> {
 fn init_tracing(verbose: u8) {
     let outrig_log = std::env::var("OUTRIG_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
-    let mut filter =
-        EnvFilter::try_new(log_filter_spec(outrig_log.as_deref(), rust_log.as_deref()))
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+    let spec = log_filter_spec(outrig_log.as_deref(), rust_log.as_deref());
+    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(directive) = quiet_rustyline(spec) {
+        filter = filter.add_directive(directive);
+    }
     if verbose >= 2 {
         filter = filter.add_directive(
             "outrig=trace"
@@ -341,6 +344,22 @@ fn init_tracing(verbose: u8) {
 
 fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -> &'a str {
     outrig_log.or(rust_log).unwrap_or("info")
+}
+
+/// Hold rustyline's own records at `warn` unless the filter names it.
+///
+/// rustyline logs every key it decodes and every buffer it reads at `debug`
+/// -- the text typed at the REPL prompt, including what a Ctrl-C discards --
+/// and the `log` bridge this subscriber installs would carry all of it to
+/// stderr under the documented `RUST_LOG=debug`, where a redirected
+/// diagnostic log is the last place a pasted key belongs. A spec that
+/// mentions `rustyline` is the opt-in and is left alone.
+fn quiet_rustyline(spec: &str) -> Option<Directive> {
+    (!spec.contains("rustyline")).then(|| {
+        "rustyline=warn"
+            .parse()
+            .expect("hard-coded rustyline directive must parse")
+    })
 }
 
 /// Shared preamble for `ls`/`logs`/`discard`: cwd, the resolved global
@@ -383,7 +402,7 @@ fn repo_cmd_ctx(
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Cmd, ImageCmd, log_filter_spec};
+    use super::{Cli, Cmd, EnvFilter, ImageCmd, log_filter_spec, quiet_rustyline};
 
     /// The `outrig ...` lines of the README's `## Commands` fence, with
     /// trailing comments dropped and an `a|b` alternation in the final word
@@ -450,6 +469,21 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
         assert_eq!(err.exit_code(), 2, "a usage failure is not a successful run");
         Cli::try_parse_from(["outrig", "design", "prompt"]).expect("`design prompt` parses");
+    }
+
+    /// `RUST_LOG=debug` is documented for podman transcripts; it must not also
+    /// print what the user types at the line editor.
+    #[test]
+    fn a_global_filter_holds_rustyline_at_warn() {
+        let directive = quiet_rustyline("debug").expect("a global spec gets the directive");
+        let filter = EnvFilter::new("debug").add_directive(directive);
+        assert!(filter.to_string().contains("rustyline=warn"), "{filter}");
+    }
+
+    #[test]
+    fn naming_rustyline_in_the_filter_is_the_opt_in() {
+        assert!(quiet_rustyline("rustyline=debug").is_none());
+        assert!(quiet_rustyline("outrig=trace,rustyline=trace").is_none());
     }
 
     #[test]
