@@ -149,17 +149,21 @@ pub(crate) async fn load(
 
     let started = Instant::now();
     let device = candle_device(model_name, device_spec)?;
-    let loader = GGUFLoaderBuilder::new(
-        None,
-        None,
-        quantized_model_id,
-        quantized_filenames,
-        GGUFSpecificConfig::default(),
-        false,
-        None,
-    )
-    .build();
-    let pipeline = loader
+    // The download and the load are synchronous and can take minutes. On the
+    // blocking pool they leave the runtime free to hear a signal: the session
+    // then ends around a load still running, and whatever it produces is
+    // dropped with the task that nothing is waiting on anymore.
+    let pipeline = tokio::task::spawn_blocking(move || {
+        GGUFLoaderBuilder::new(
+            None,
+            None,
+            quantized_model_id,
+            quantized_filenames,
+            GGUFSpecificConfig::default(),
+            false,
+            None,
+        )
+        .build()
         .load_model_from_hf(
             hf_revision,
             TokenSource::CacheToken,
@@ -170,7 +174,10 @@ pub(crate) async fn load(
             None,
             None,
         )
-        .map_err(load_err)?;
+    })
+    .await
+    .map_err(|e| load_err(anyhow::anyhow!("model load task failed: {e}")))?
+    .map_err(load_err)?;
 
     info!(
         model = model_name,

@@ -247,7 +247,9 @@ auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
-when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C.
+when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C. A Ctrl-C before
+the first prompt, or a SIGTERM or SIGHUP at any point, ends the session the same way -- its
+containers stopped, its record finalized -- and exits `130`, `143`, or `129`.
 
 With no repo config found and no `--config`, `run` and `mcp` use the current directory as the
 workspace root and take all config from the global file. `run` then needs exactly one thing
@@ -352,12 +354,13 @@ repo-local overrides, not for serving MCP JSON-RPC.
 container or require a repo config. Use it from an external MCP-capable AI tool when the built-in
 image templates do not fit.
 
-| Trigger or failure                               | Exit |
-|--------------------------------------------------|------|
-| Stdio client closes stdin after successful startup | `0` |
-| SIGINT or SIGTERM after successful startup       | `0`  |
-| Config, image, container, or MCP startup failure | `1`  |
-| Bad flags or missing required args               | `2`  |
+| Trigger or failure                                  | Exit                  |
+|-----------------------------------------------------|-----------------------|
+| Stdio client closes stdin after successful startup  | `0`                   |
+| SIGINT, SIGTERM, or SIGHUP after successful startup | `0`                   |
+| SIGINT, SIGTERM, or SIGHUP during startup           | `130`, `143`, `129`   |
+| Config, image, container, or MCP startup failure    | `1`                   |
+| Bad flags or missing required args                  | `2`                   |
 
 Environment variables used by `outrig mcp`:
 
@@ -498,7 +501,14 @@ only thing keeping it away from a build in flight.
 | `0`   | Success.                                                               |
 | `1`   | Generic failure (config, image build, LLM API error, etc.).            |
 | `2`   | Misuse (bad flags, missing required args). clap prints the usage line. |
-| `130` | Interrupted by SIGINT before subcommand-specific handling.             |
+| `129` | Ended by SIGHUP.                                                       |
+| `130` | Ended by SIGINT.                                                       |
+| `143` | Ended by SIGTERM.                                                      |
+
+Once `outrig run` or `outrig mcp` has written its session record, it catches all three signals:
+it stops the session's containers and finalizes the record, which keeps the same code, before it
+exits. `outrig mcp` exits `0` on a signal once its startup has finished; see
+[`outrig mcp`](#outrig-mcp).
 
 `outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
 there; the run is reported in full, and the container is named on stderr.

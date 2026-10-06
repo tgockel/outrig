@@ -5,7 +5,7 @@
 //! everything else (banner, tracing) goes to stderr.
 //!
 //! The exit triggers -- stdio stdin EOF (peer disconnect), SIGINT, SIGTERM,
-//! and attached-container stop -- all funnel through the same teardown order
+//! SIGHUP, and attached-container stop -- all funnel through the same teardown order
 //! as `outrig run`: cancel the rmcp service so its dispatcher quiesces ->
 //! `McpClient::shutdown` per backing server -> `Container::stop` ->
 //! `SessionStore::finalize`. Backing MCPs are `podman exec` processes whose
@@ -16,7 +16,6 @@
 
 use std::fmt::Write as _;
 use std::future::IntoFuture;
-use std::io::Write as _;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -29,13 +28,14 @@ use rmcp::transport::streamable_http_server::{
     SessionManager, StreamableHttpServerConfig, StreamableHttpService,
     session::local::LocalSessionManager,
 };
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
     self, SessionContainers, SessionRuntime, SessionSetup, SessionSetupArgs,
 };
+use crate::cli::signals::Signals;
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::cli::watcher;
 use crate::error::{OutrigError, Result};
@@ -176,6 +176,7 @@ async fn serve(
         mcp_plan,
         watcher,
         used_builtin_default,
+        mut signals,
         cfg: _,
         session: _,
         repo_root: _,
@@ -198,12 +199,11 @@ async fn serve(
         attached,
         primary_died,
         listen,
+        &mut signals,
     )
     .await;
 
-    let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(runtime, &store, &sid, final_exit).await;
-    watcher::exit_if_monitor_stopped(&outcome, final_exit);
+    session_setup::teardown(runtime, &store, &sid, &outcome).await;
     outcome
 }
 
@@ -223,15 +223,15 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         log_dir: _,
         repo_root: _,
         used_builtin_default: _,
+        mut signals,
     } = setup;
 
-    let outcome = write_merged_mcp(&mcp_plan).map(|()| 0);
-    let final_exit = outcome.as_ref().copied().unwrap_or(1);
+    let outcome = signals.race(write_merged_mcp(&mcp_plan)).await.map(|()| 0);
     session_setup::teardown(
         SessionRuntime::new(watcher, network, containers),
         &store,
         &sid,
-        final_exit,
+        &outcome,
     )
     .await;
     outcome
@@ -268,9 +268,13 @@ async fn serve_inner(
     attached: bool,
     primary_died: Option<CancellationToken>,
     listen: Option<&ListenAddr>,
+    signals: &mut Signals,
 ) -> Result<i32> {
-    let connected =
-        session_setup::connect_mcp_clients(containers, mcp_plan, log_dir, cli_env).await?;
+    let connected = signals
+        .race(session_setup::connect_mcp_clients(
+            containers, mcp_plan, log_dir, cli_env,
+        ))
+        .await?;
     if connected.is_empty() {
         return Err(OutrigError::Configuration(
             "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),
@@ -279,7 +283,7 @@ async fn serve_inner(
     }
     mcp_arcs.extend(connected);
 
-    let proxy = ProxyServer::build(mcp_arcs.clone()).await?;
+    let proxy = signals.race(ProxyServer::build(mcp_arcs.clone())).await?;
     let per_server_counts: Vec<(String, usize)> = proxy
         .per_server_counts()
         .into_iter()
@@ -316,8 +320,8 @@ async fn serve_inner(
     };
 
     match listen {
-        None => serve_stdio_transport(proxy, monitor).await,
-        Some(addr) => serve_http_transport(proxy, addr, monitor, mcp_arcs).await,
+        None => serve_stdio_transport(proxy, monitor, signals).await,
+        Some(addr) => serve_http_transport(proxy, addr, monitor, mcp_arcs, signals).await,
     }
 }
 
@@ -348,27 +352,32 @@ async fn monitor_session(monitor: SessionMonitor) -> Result<()> {
     }
 }
 
-async fn serve_stdio_transport(proxy: ProxyServer, monitor: SessionMonitor) -> Result<i32> {
+async fn serve_stdio_transport(
+    proxy: ProxyServer,
+    monitor: SessionMonitor,
+    signals: &mut Signals,
+) -> Result<i32> {
     // `serve_server_with_ct` lets us hold the cancellation token outside the
     // service, which is otherwise consumed by `waiting()`. Cancel-on-signal
     // -> dispatcher quiesces -> `waiting()` returns -> teardown runs.
     let ct = CancellationToken::new();
-    let service =
-        rmcp::service::serve_server_with_ct(proxy, rmcp::transport::stdio(), ct.clone()).await?;
+    // The handshake waits on the client, which may never send `initialize`.
+    let service = signals
+        .race(rmcp::service::serve_server_with_ct(
+            proxy,
+            rmcp::transport::stdio(),
+            ct.clone(),
+        ))
+        .await?;
     eprintln!("[outrig] mcp server ready");
 
     let mut waiter = tokio::spawn(service.waiting());
-    let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
     let mut monitor = Box::pin(monitor_session(monitor));
 
     tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!(target: "outrig::cli::mcp", "received SIGINT; shutting down");
-            ct.cancel();
-        }
-        _ = sigterm.recv() => {
-            tracing::info!(target: "outrig::cli::mcp", "received SIGTERM; shutting down");
+        sig = signals.any() => {
+            tracing::info!(target: "outrig::cli::mcp", "received {sig}; shutting down");
             ct.cancel();
         }
         result = &mut waiter => {
@@ -407,6 +416,7 @@ async fn serve_http_transport(
     listen: &ListenAddr,
     monitor: SessionMonitor,
     backing_clients: &[Arc<McpClient>],
+    signals: &mut Signals,
 ) -> Result<i32> {
     let ct = CancellationToken::new();
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -425,9 +435,11 @@ async fn serve_http_transport(
             );
             let shutdown = http_shutdown(ct.clone());
             let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
-            wait_for_http_shutdown(server, ct, monitor).await
+            wait_for_http_shutdown(server, ct, monitor, signals).await
         }
-        ListenAddr::Unix(path) => serve_unix_http_transport(router, path, ct, monitor).await,
+        ListenAddr::Unix(path) => {
+            serve_unix_http_transport(router, path, ct, monitor, signals).await
+        }
     };
     close_http_sessions(&session_manager).await;
     wait_for_http_session_refs(backing_clients).await;
@@ -440,6 +452,7 @@ async fn serve_unix_http_transport(
     path: &Path,
     ct: CancellationToken,
     monitor: SessionMonitor,
+    signals: &mut Signals,
 ) -> Result<i32> {
     prepare_unix_socket(path)?;
     let listener = tokio::net::UnixListener::bind(path)?;
@@ -449,7 +462,7 @@ async fn serve_unix_http_transport(
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
-    wait_for_http_shutdown(server, ct, monitor).await
+    wait_for_http_shutdown(server, ct, monitor, signals).await
 }
 
 #[cfg(not(unix))]
@@ -458,6 +471,7 @@ async fn serve_unix_http_transport(
     _path: &Path,
     _ct: CancellationToken,
     _monitor: SessionMonitor,
+    _signals: &mut Signals,
 ) -> Result<i32> {
     Err(
         OutrigError::Configuration("unix listen addresses require a Unix platform".to_string())
@@ -498,23 +512,19 @@ async fn wait_for_http_shutdown<F>(
     server: F,
     ct: CancellationToken,
     monitor: SessionMonitor,
+    signals: &mut Signals,
 ) -> Result<i32>
 where
     F: IntoFuture<Output = std::io::Result<()>>,
 {
     eprintln!("[outrig] mcp server ready");
     let mut server = Box::pin(server.into_future());
-    let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
     let mut monitor = Box::pin(monitor_session(monitor));
 
     tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!(target: "outrig::cli::mcp", "received SIGINT; shutting down");
-            ct.cancel();
-        }
-        _ = sigterm.recv() => {
-            tracing::info!(target: "outrig::cli::mcp", "received SIGTERM; shutting down");
+        sig = signals.any() => {
+            tracing::info!(target: "outrig::cli::mcp", "received {sig}; shutting down");
             ct.cancel();
         }
         result = &mut server => {
@@ -651,11 +661,13 @@ async fn wait_for_attached_container_stop(container_name: String) -> Result<()> 
     )))
 }
 
-fn write_merged_mcp(plan: &SessionMcpPlan) -> Result<()> {
-    let rendered = render_merged_mcp(plan);
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(rendered.as_bytes())?;
-    stdout.flush()?;
+/// Written through tokio's stdout, which writes from its blocking pool: a
+/// reader that stops draining the pipe then holds that thread rather than the
+/// runtime, and a signal can still end the session around it.
+async fn write_merged_mcp(plan: &SessionMcpPlan) -> Result<()> {
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(render_merged_mcp(plan).as_bytes()).await?;
+    stdout.flush().await?;
     Ok(())
 }
 

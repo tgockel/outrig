@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::engine;
-use crate::error::{CliError, Result};
+use crate::error::CliError;
 use outrig::container::LABEL_SESSION;
 
 /// Podman container label identifying one sidecar container of one session.
@@ -347,17 +347,6 @@ pub fn primary_death_error(primary: &str) -> CliError {
     CliError::SessionMonitorStopped(format!(
         "primary container {primary} exited unexpectedly; session ended"
     ))
-}
-
-/// After teardown: when the session ended because a monitored container went
-/// away, print the error and exit instead of returning. Tokio's blocking
-/// stdin read (MCP stdio transport, REPL) never returns while the peer holds
-/// the pipe open, so a graceful runtime shutdown would hang.
-pub fn exit_if_monitor_stopped(outcome: &Result<i32>, final_exit: i32) {
-    if let Err(e @ CliError::SessionMonitorStopped(_)) = outcome {
-        eprintln!("error: {e}");
-        std::process::exit(final_exit.clamp(0, 255));
-    }
 }
 
 /// Block until the named container exits. `podman wait` returning an error

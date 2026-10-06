@@ -474,6 +474,16 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
 - A second Ctrl-C without an intervening prompt also exits.
+- **Ctrl-C before the first prompt** -- while the image builds, the container starts, or an MCP
+  server initializes -- ends the session the way Ctrl-D does: whatever had started is stopped,
+  and the session record is finalized. So does **SIGTERM** or **SIGHUP** at any point, prompt
+  and turn included: `kill <pid>`, a closed terminal, a service manager stopping the process, a
+  CI job timing out. outrig prints `[outrig] SIGTERM received; ending the session` (or the
+  signal's own name) and exits with 128 plus the signal number -- `130` for SIGINT, `143` for
+  SIGTERM, `129` for SIGHUP -- which is also the exit code the session record keeps.
+- A SIGINT or SIGTERM while that shutdown is still stopping containers stops the waiting:
+  outrig finalizes the record and exits, and the remaining containers are force-removed in the
+  background. A SIGHUP does not hurry it, since a closed terminal can deliver one twice.
 
 ```
 > please refactor everything   ^C

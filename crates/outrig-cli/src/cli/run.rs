@@ -26,6 +26,7 @@ use crate::cli::session_setup::{
     self, ProgressSpan, STOP_GRACE, SessionRuntime, SessionSetup, SessionSetupArgs,
     SidecarStartCtx, plural,
 };
+use crate::cli::signals::{self, Signals};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
@@ -145,6 +146,7 @@ pub async fn execute(
         mcp_plan,
         watcher,
         used_builtin_default,
+        mut signals,
         attached: _,
         session: _,
     } = setup;
@@ -175,12 +177,11 @@ pub async fn execute(
         cli_env: &cli_env,
         runtime: &mut runtime,
         store: &store,
+        signals: &mut signals,
     })
     .await;
 
-    let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(runtime, &store, &sid, final_exit).await;
-    crate::cli::watcher::exit_if_monitor_stopped(&outcome, final_exit);
+    session_setup::teardown(runtime, &store, &sid, &outcome).await;
     outcome
 }
 
@@ -218,6 +219,9 @@ struct RunInnerArgs<'a> {
     cli_env: &'a CliEnvEntries,
     runtime: &'a mut SessionRuntime,
     store: &'a SessionStore,
+    /// Raced against each slow startup step, then against the REPL for
+    /// SIGTERM and SIGHUP.
+    signals: &'a mut Signals,
 }
 
 async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
@@ -239,6 +243,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cli_env,
         runtime,
         store,
+        signals,
     } = args;
 
     // Grab the death token before the watcher disappears into the REPL's
@@ -263,17 +268,26 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
-    let connected =
-        session_setup::connect_mcp_clients(&mut runtime.containers, mcp_plan, log_dir, cli_env)
-            .await?;
+    let connected = signals
+        .race(session_setup::connect_mcp_clients(
+            &mut runtime.containers,
+            mcp_plan,
+            log_dir,
+            cli_env,
+        ))
+        .await?;
     runtime.mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<SessionTool> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
     for arc in runtime.mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
-        let adapters =
-            McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_max_bytes).await?;
+        let adapters = signals
+            .race(McpToolAdapter::from_client_tools(
+                arc.clone(),
+                resolved.tool_result_max_bytes,
+            ))
+            .await?;
         let tool_count = adapters.len();
         let tool_word = plural(tool_count, "tool", "tools");
         span.done(format!(
@@ -325,14 +339,15 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     }
 
     let span = ProgressSpan::start("building agent");
-    let agent = llm::build_agent(
-        &resolved,
-        agent_tools.clone(),
-        cache_root,
-        #[cfg(feature = "local-llm")]
-        &registry,
-    )
-    .await?;
+    let agent = signals
+        .race(llm::build_agent(
+            &resolved,
+            agent_tools.clone(),
+            cache_root,
+            #[cfg(feature = "local-llm")]
+            &registry,
+        ))
+        .await?;
     span.done("agent ready");
 
     print_banner(StartupBanner {
@@ -371,16 +386,21 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     eprintln!("[outrig] entering REPL");
     // When a watcher is armed, external death of the primary ends the REPL
     // with an error instead of leaving the agent talking to dead tools.
-    let result = match primary_died {
-        Some(died) => {
-            tokio::select! {
-                result = run_repl(session) => result,
-                _ = died.cancelled() => {
-                    Err(crate::cli::watcher::primary_death_error(&primary_name))
-                }
-            }
+    let primary_died = async {
+        match primary_died {
+            Some(died) => died.cancelled().await,
+            None => std::future::pending().await,
         }
-        None => run_repl(session).await,
+    };
+    // SIGINT is the REPL's own: it cancels a turn, and only a second one ends
+    // the session. SIGTERM and SIGHUP end it from anywhere, mid-turn included.
+    // The signal wins a tie: a closed terminal delivers SIGHUP and ends stdin
+    // at once, and the record should say which of the two ended the session.
+    let result = tokio::select! {
+        biased;
+        sig = signals.termination() => Err(signals::interrupted_mid_line(sig)),
+        () = primary_died => Err(crate::cli::watcher::primary_death_error(&primary_name)),
+        result = run_repl(session) => result,
     };
 
     // Stop every subagent *and wait for the tasks to end* before teardown.

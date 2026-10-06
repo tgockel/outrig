@@ -13,7 +13,7 @@
 
 #![cfg(feature = "e2e")]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -24,14 +24,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-fn fixture_mcp_fs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("outrig-cli is under crates/")
-        .join("outrig/tests/fixtures/mcp-fs")
-}
+mod common;
+use common::{E2E_TIMEOUT, fixture_mcp_fs_dir};
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
     write_config(
@@ -748,9 +742,9 @@ async fn run_child_with_input(args: &[&str], repo: &Path, input: &[u8]) -> Captu
     stdin.flush().await.expect("flush stdin");
     drop(stdin);
 
-    let output = timeout(TEST_TIMEOUT, child.wait_with_output())
+    let output = timeout(E2E_TIMEOUT, child.wait_with_output())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("wait_with_output");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

@@ -451,16 +451,23 @@ rendering, because that is the shape its tool channel has.
 
 ## Lifecycle
 
-`outrig mcp` has three graceful shutdown triggers:
+`outrig mcp` has four graceful shutdown triggers:
 
 - stdio stdin EOF, which usually means the external MCP client disconnected
 - SIGINT, such as Ctrl-C in the terminal that launched the process
 - SIGTERM, such as a supervisor asking the process to stop
+- SIGHUP, such as the terminal that launched the process closing
 
 All paths cancel the rmcp service, wait for the dispatcher to settle, shut down each
 backing MCP server, and finalize the session record. Fresh-container mode then stops the
 containers -- sidecars first, primary last. Attach mode leaves the borrowed container
-running.
+running. A signal is how a server is stopped, so once startup has finished it exits `0`.
+
+A signal during startup -- while the image builds, the container starts, a backing server
+initializes, or a stdio client has yet to send `initialize` -- stops whatever had started and
+finalizes the record too, and exits with 128 plus the signal number: `130`, `143`, `129`. A
+SIGINT or SIGTERM while the containers are being stopped stops the waiting: outrig finalizes
+the record, exits, and leaves the remaining containers to a forced removal in the background.
 
 Sessions with sidecars also watch the primary container: if it dies out from under outrig
 (a manual `podman kill`, the OOM killer), the sidecars are reaped and the process exits
@@ -468,8 +475,8 @@ non-zero. A sidecar dying mid-session only degrades the tool set -- its tools re
 errors and the session continues.
 
 HTTP/SSE mode is daemon-shaped: client disconnects close only that MCP session. The
-`outrig mcp --listen` process stays alive until SIGINT, SIGTERM, or attached-container
-shutdown.
+`outrig mcp --listen` process stays alive until SIGINT, SIGTERM, SIGHUP, or
+attached-container shutdown.
 
 If an attached host session stops the container while `outrig mcp --attach` is live, the
 attacher cancels its proxy, shuts down its MCP children, finalizes its session with a

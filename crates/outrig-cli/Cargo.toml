@@ -81,6 +81,9 @@ walkdir            = { workspace = true, default-features = true }
 # module tree `internal-test-api` exposes, without a plain build enabling it.
 outrig-cli = { path = ".", features = ["internal-test-api"] }
 
+# `raise`, for `tests/signals.rs`, which signals its own process.
+nix = { workspace = true, features = ["signal"] }
+
 # `test-util` gives tests `start_paused`, so the subagent registry tests can
 # drive a round whose retry backoff would otherwise take seconds of real time.
 tokio = { workspace = true, default-features = true, features = ["test-util"] }

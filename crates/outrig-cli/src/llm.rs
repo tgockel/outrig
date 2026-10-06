@@ -1712,24 +1712,27 @@ async fn mistralrs_model(
                 model: candidate.model_name.clone(),
                 source: anyhow::anyhow!("internal: resolved mistralrs agent has no model_weights"),
             })?;
-    let model_name = candidate.model_name.as_str();
-    let model_id = weights.model_id.as_deref();
-    let model_path = weights.model_path.as_deref();
-    let model_file = weights.model_file.as_deref();
-    let revision = weights.revision.as_deref();
+    // Owned, because the load outlives this call: the registry runs it to the
+    // end even if the turn waiting on it is cut short.
+    let model_name = candidate.model_name.clone();
+    let model_id = weights.model_id.clone();
+    let model_path = weights.model_path.clone();
+    let model_file = weights.model_file.clone();
+    let revision = weights.revision.clone();
     let context_length = weights.context_length;
     let device = weights.device;
+    let cache_root = cache_root.to_path_buf();
     registry
-        .get_or_init(model_name, || async move {
+        .get_or_init(&candidate.model_name, || async move {
             crate::llm::mistralrs::load(
-                model_name,
-                model_id,
-                model_path,
-                model_file,
-                revision,
+                &model_name,
+                model_id.as_deref(),
+                model_path.as_deref(),
+                model_file.as_deref(),
+                revision.as_deref(),
                 context_length,
                 device,
-                cache_root,
+                &cache_root,
             )
             .await
         })

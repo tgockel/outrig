@@ -35,19 +35,10 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use serde_json::Value;
 use tokio::process::Command;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 mod common;
-use common::stream_lines;
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-fn fixture_mcp_fs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("outrig-cli is under crates/")
-        .join("outrig/tests/fixtures/mcp-fs")
-}
+use common::{E2E_TIMEOUT, fixture_mcp_fs_dir, stream_lines, wait_for_stderr_value};
 
 fn fs_spec() -> McpServerSpec {
     McpServerSpec::Short(vec![
@@ -184,9 +175,9 @@ async fn run_mcp_client(args: &[String], repo: &Path) -> McpRun {
 
     let _ = service.cancel().await;
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = stderr_task.await;
     let stderr = stderr_buf.lock().unwrap().clone();
@@ -199,25 +190,6 @@ fn stderr_value<'a>(stderr: &'a str, prefix: &str) -> &'a str {
         .lines()
         .find_map(|line| line.strip_prefix(prefix).map(str::trim))
         .unwrap_or_else(|| panic!("stderr lacked {prefix:?}: {stderr}"))
-}
-
-async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
-    timeout(TEST_TIMEOUT, async {
-        loop {
-            {
-                let snapshot = stderr.lock().unwrap().clone();
-                if let Some(value) = snapshot
-                    .lines()
-                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
-                {
-                    return value.to_string();
-                }
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
 }
 
 /// An MCP session opened over `--listen`: the id the server issued, and the
@@ -462,11 +434,11 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
     };
 
     // 4. Wait for everything with a wall-clock bound.
-    timeout(TEST_TIMEOUT, work)
+    timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let wait_result = timeout(TEST_TIMEOUT, child.wait()).await;
+    let wait_result = timeout(E2E_TIMEOUT, child.wait()).await;
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => panic!("child.wait() failed: {e}"),
@@ -476,7 +448,7 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
                 stderr_buf.lock().unwrap()
             );
             let _ = child.kill().await;
-            panic!("subprocess did not exit within {TEST_TIMEOUT:?}");
+            panic!("subprocess did not exit within {E2E_TIMEOUT:?}");
         }
     };
     let _ = stderr_task.await;
@@ -628,9 +600,9 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
         .expect("send SIGTERM");
     assert!(term.success(), "kill -TERM failed with {term}");
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = stderr_task.await;
     let stderr_str = stderr_buf.lock().unwrap().clone();
@@ -870,9 +842,9 @@ async fn mcp_attach_exits_when_host_stops_container() {
         .await
         .expect("host stop");
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     drop(service);
     let _ = stderr_task.await;
@@ -898,7 +870,7 @@ async fn run_mcp_with_undeclared_env_server(
     args: &[&str],
 ) -> Vec<Session> {
     let output = timeout(
-        TEST_TIMEOUT,
+        E2E_TIMEOUT,
         Command::new(env!("CARGO_BIN_EXE_outrig"))
             .arg("--session-root")
             .arg(session_root)
@@ -911,7 +883,7 @@ async fn run_mcp_with_undeclared_env_server(
             .output(),
     )
     .await
-    .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+    .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
     .expect("run outrig mcp");
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("--- subprocess stderr ---\n{stderr}");

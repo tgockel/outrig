@@ -3713,19 +3713,20 @@ mod tests {
         );
 
         let engines: crate::llm::LlmRegistry<Stub> = crate::llm::LlmRegistry::new();
-        let loads = AtomicUsize::new(0);
-        let one = engines
-            .get_or_init(first.model_name(), || async {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let loader = || {
+            let loads = loads.clone();
+            async move {
                 loads.fetch_add(1, Ordering::SeqCst);
                 Ok(Stub)
-            })
+            }
+        };
+        let one = engines
+            .get_or_init(first.model_name(), loader)
             .await
             .expect("first load");
         let two = engines
-            .get_or_init(second.model_name(), || async {
-                loads.fetch_add(1, Ordering::SeqCst);
-                Ok(Stub)
-            })
+            .get_or_init(second.model_name(), loader)
             .await
             .expect("the second launch finds the slot");
 

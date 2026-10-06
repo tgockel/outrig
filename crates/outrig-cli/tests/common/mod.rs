@@ -185,6 +185,77 @@ pub fn assert_only_user_files_left(dir: &Path) {
     }
 }
 
+/// The mcp-fs fixture: a `Dockerfile` whose image carries
+/// `mcp-server-filesystem`, the server the e2e tests drive.
+#[allow(dead_code)]
+pub fn fixture_mcp_fs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("outrig-cli is under crates/")
+        .join("outrig/tests/fixtures/mcp-fs")
+}
+
+/// Ceiling for an e2e wait on a live `outrig` process or on podman.
+#[allow(dead_code)]
+pub const E2E_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wait for a stderr line starting with `prefix`, and return the rest of it,
+/// trimmed.
+#[allow(dead_code)]
+pub async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            {
+                let snapshot = stderr.lock().unwrap().clone();
+                if let Some(value) = snapshot
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+                {
+                    return value.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
+}
+
+/// The names of every container, running or not, that `filter` selects.
+#[allow(dead_code)]
+pub async fn podman_names(filter: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("podman")
+        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Wait until no container by any of `names` exists.
+#[allow(dead_code)]
+pub async fn wait_until_gone(names: &[String]) {
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            let mut alive = Vec::new();
+            for name in names {
+                let found = podman_names(&format!("name={name}")).await;
+                alive.extend(found);
+            }
+            if alive.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("containers {names:?} were not reaped within {E2E_TIMEOUT:?}"));
+}
+
 /// Drain `reader` line-by-line, mirroring each line to the test runner's
 /// stderr (so a hang dumps everything-so-far) and into the shared `sink`
 /// buffer for later assertions. `label` distinguishes which stream a line

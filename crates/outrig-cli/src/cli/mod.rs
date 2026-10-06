@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod mcp_self;
 pub mod run;
 pub mod session_setup;
+pub mod signals;
 pub mod volume_arg;
 pub mod watcher;
 

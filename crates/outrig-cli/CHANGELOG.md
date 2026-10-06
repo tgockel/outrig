@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A signal ends `outrig run` and `outrig mcp` through teardown.** A Ctrl-C before the REPL's
+  first prompt, or a SIGTERM or SIGHUP at any time -- `kill <pid>`, a closed terminal, a service
+  manager or CI timeout -- killed outrig outright. The containers ran on, and the record never
+  ended, so `outrig discard` refused it as still running and `outrig clean` skipped it, leaving
+  `podman rm -f` as the only way out. `outrig mcp` did the same during startup, and while serving
+  it ignored SIGHUP. Both now stop what the session started, finalize its record, and exit with
+  128 plus the signal number: `130`, `143`, or `129`, which the record keeps too. `outrig mcp`
+  still exits `0` on a signal once it is serving. A SIGINT or SIGTERM while containers are being
+  stopped ends the wait, and the rest are force-removed in the background.
+- **A session that ends with stdin still open exits once it is torn down.** `outrig mcp` over
+  stdio, stopped by a signal while its client held the pipe open, and `outrig run` left by a
+  second Ctrl-C at the prompt both finished teardown and then waited -- for the client to close
+  the pipe, or for someone to press Enter. The read in flight on stdin no longer holds the exit.
 - **`outrig discard` and `outrig clean` remove only what outrig wrote.** `--session-dir` took any
   existing directory, and discard and clean later removed it recursively with the session, so
   `--session-dir .` in a checkout, or a directory of notes, went with it. `--session-dir` now has

@@ -1,4 +1,5 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -12,7 +13,7 @@ use crate::cli::ls::{self, LsArgs};
 use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::paths::{
     RepoConfig, global_config_path, resolve_repo_config, resolve_repo_config_optional,
 };
@@ -156,23 +157,46 @@ pub fn run() -> ExitCode {
         Ok(0) => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(1)
+            // A signal announced itself as it landed, and the terminal it
+            // would be reported to may be gone.
+            if !matches!(e, CliError::Interrupted(_)) {
+                eprintln!("error: {e}");
+            }
+            ExitCode::from(e.exit_code().clamp(0, 255) as u8)
         }
     }
+}
+
+/// Drive a session command, then shut its runtime down without waiting on
+/// blocking work. A REPL or a stdio MCP transport can leave a blocking stdin
+/// read in flight that returns only when the other end writes or closes the
+/// pipe, and dropping the runtime normally waits for it -- after a signal, a
+/// stopped container, or a second Ctrl-C, the session was torn down and the
+/// process sat there until someone pressed Enter. Every session has finished
+/// its own teardown by the time `fut` resolves.
+fn block_on_session(
+    runtime: tokio::runtime::Runtime,
+    fut: impl Future<Output = Result<i32>>,
+) -> Result<i32> {
+    let result = runtime.block_on(fut);
+    runtime.shutdown_background();
+    result
 }
 
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.cmd {
         Cmd::Run(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(run::execute(
-                &repo_config,
-                &global_config,
-                cli.session_root.as_deref(),
-                args,
-                cli.verbose,
-            ))
+            block_on_session(
+                runtime,
+                run::execute(
+                    &repo_config,
+                    &global_config,
+                    cli.session_root.as_deref(),
+                    args,
+                    cli.verbose,
+                ),
+            )
         }
         Cmd::Mcp(args) => {
             if args.is_self_description() {
@@ -182,13 +206,16 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 return runtime.block_on(mcp_self_cli::execute(args));
             }
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(mcp::execute(
-                &repo_config,
-                &global_config,
-                cli.session_root.as_deref(),
-                args,
-                cli.verbose,
-            ))
+            block_on_session(
+                runtime,
+                mcp::execute(
+                    &repo_config,
+                    &global_config,
+                    cli.session_root.as_deref(),
+                    args,
+                    cli.verbose,
+                ),
+            )
         }
         Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {

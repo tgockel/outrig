@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
+use crate::cli::signals::{self, Signals};
 use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
@@ -275,6 +276,10 @@ pub struct SessionSetup {
     /// Present only when sidecars started; orderly teardown disarms it
     /// before stopping containers.
     pub watcher: Option<SessionWatcher>,
+    /// Installed before the record was written, so no signal since has been
+    /// at its default disposition. The command races its own slow steps
+    /// against these, as setup did.
+    pub signals: Signals,
 }
 
 #[derive(Debug)]
@@ -526,30 +531,38 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         exit_code: None,
         link_target: None,
     };
+    // The record is the first thing a signal could orphan. From here on, none
+    // ends the process without the session torn down: each slow step below
+    // is raced against these, and a signal takes that step's bail-out.
+    let mut signals = Signals::install()?;
     let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
+    // Every bail-out before there are containers to stop: end the record with
+    // the exit code `e` carries, and pass `e` on.
+    let fail = |e: CliError| {
+        let _ = store.finalize(&sid, SystemTime::now(), e.exit_code());
+        e
+    };
     let log_dir = session_dir.join(session::LOGS_DIR);
-    if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
-        let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e)
-            .path_ctx("create directory", &log_dir)
-            .map_err(Into::into);
-    }
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .path_ctx("create directory", &log_dir)
+        .map_err(|e| fail(e.into()))?;
 
     let transcript = if args.verbose > 0 {
-        match Transcript::create(&log_dir.join("container.log"), true).await {
-            Ok(t) => Some(t),
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
-        }
+        let transcript = Transcript::create(&log_dir.join("container.log"), true).await;
+        Some(transcript.map_err(|e| fail(e.into()))?)
     } else {
         None
     };
 
-    let mut container = if let Some(attach) = &attach {
+    let container = if let Some(attach) = &attach {
         let span = ProgressSpan::start(format!("attaching to container {}", attach.container_name));
-        match Container::is_running(&attach.container_name).await {
+        // Raced like every step after the record: a stalled podman must not
+        // leave a signal with nothing to answer it.
+        match signals
+            .race(Container::is_running(&attach.container_name))
+            .await
+        {
             Ok(true) => {
                 span.done(format!("attached to container: {}", attach.container_name));
                 Container::attach(
@@ -560,40 +573,34 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                 )
             }
             Ok(false) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(OutrigError::Configuration(format!(
-                    "attached container {:?} is not running",
-                    attach.container_name
-                ))
-                .into());
+                return Err(fail(
+                    OutrigError::Configuration(format!(
+                        "attached container {:?} is not running",
+                        attach.container_name
+                    ))
+                    .into(),
+                ));
             }
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
+            Err(e) => return Err(fail(e)),
         }
     } else {
         let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
-        let ensure = if raw_local_image {
-            image::ensure_local_image(&image_tag, transcript.as_ref()).await
-        } else {
-            image::ensure_tagged_image_for(
-                &image_cfg_name,
-                &image_cfg,
-                &repo_root,
-                &image_tag,
-                false,
-                transcript.as_ref(),
-            )
-            .await
-        };
-        let image_outcome = match ensure {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
+        let ensure = async {
+            if raw_local_image {
+                image::ensure_local_image(&image_tag, transcript.as_ref()).await
+            } else {
+                image::ensure_tagged_image_for(
+                    &image_cfg_name,
+                    &image_cfg,
+                    &repo_root,
+                    &image_tag,
+                    false,
+                    transcript.as_ref(),
+                )
+                .await
             }
         };
+        let image_outcome = signals.race(ensure).await.map_err(fail)?;
         let cache_status = if raw_local_image {
             "local image"
         } else if image_outcome.cache_hit {
@@ -607,25 +614,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         ));
 
         let span = ProgressSpan::start(format!("starting container {container_name}"));
-        match Container::start_named(&image_tag, launch, container_name, transcript.clone()).await {
-            Ok(container) => {
-                span.done(format!("container ready: {}", container.name()));
-                container
-            }
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
-        }
+        let start = Container::start_named(&image_tag, launch, container_name, transcript.clone());
+        let container = signals.race(start).await.map_err(fail)?;
+        span.done(format!("container ready: {}", container.name()));
+        container
     };
-
-    let span = ProgressSpan::start("bootstrapping container user");
-    if let Err(e) = container.bootstrap_user().await {
-        let _ = container.stop(STOP_GRACE).await;
-        let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e.into());
-    }
-    span.done("container user ready");
 
     // In a local as well as in `containers`, because the sidecar phase takes
     // the container set by `&mut` and cannot also hold a borrow into it.
@@ -636,6 +629,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         instance_salt: instance_salt.clone(),
         primary: container,
     };
+
+    let span = ProgressSpan::start("bootstrapping container user");
+    if let Err(e) = signals.race(containers.primary.bootstrap_user()).await {
+        return Err(abort_containers(containers, &store, &sid, e).await);
+    }
+    span.done("container user ready");
 
     // Placement plan, sidecar starts, and network interception. Any error
     // propagated out of the phase aborts the whole container set.
@@ -656,19 +655,16 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         cli_env: args.cli_env,
         transcript: transcript.as_ref(),
     };
-    let (mcp_plan, network) = match setup_sidecars_and_network(phase, &mut containers).await {
+    let sidecars_and_network = setup_sidecars_and_network(phase, &mut containers);
+    let (mcp_plan, network) = match signals.race(sidecars_and_network).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            abort_containers(containers, &store, &sid).await;
-            return Err(e);
-        }
+        Err(e) => return Err(abort_containers(containers, &store, &sid, e).await),
     };
 
     if !containers.sidecars.is_empty() {
         let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
-            abort_containers(containers, &store, &sid).await;
-            return Err(e.into());
+            return Err(abort_containers(containers, &store, &sid, e.into()).await);
         }
         session.sidecar_container_names = names;
     }
@@ -704,6 +700,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         network,
         mcp_plan,
         watcher,
+        signals,
     })
 }
 
@@ -1355,23 +1352,36 @@ async fn create_one_entrypoint_sidecar(
     Ok(container)
 }
 
-/// Stop every session container (sidecars before the primary) and finalize
-/// the session row with a failure exit. Setup's bail-out path.
-async fn abort_containers(containers: SessionContainers, store: &SessionStore, sid: &SessionId) {
-    let SessionContainers {
-        abandoned,
-        sidecars,
-        instance_salt: _,
-        primary,
-    } = containers;
-    for container in abandoned {
-        let _ = container.stop(STOP_GRACE).await;
-    }
-    for (_, container) in sidecars {
-        let _ = container.stop(STOP_GRACE).await;
-    }
-    let _ = primary.stop(STOP_GRACE).await;
-    let _ = store.finalize(sid, SystemTime::now(), 1);
+/// Stop every session container (sidecars before the primary), finalize the
+/// session row with the exit code `cause` carries, and hand `cause` back.
+/// Setup's bail-out once there are containers.
+///
+/// A signal during the stops ends the wait, not the cleanup -- see
+/// [`signals::unless_signaled`] -- and the record is finalized either way.
+async fn abort_containers(
+    containers: SessionContainers,
+    store: &SessionStore,
+    sid: &SessionId,
+    cause: CliError,
+) -> CliError {
+    signals::unless_signaled(async move {
+        let SessionContainers {
+            abandoned,
+            sidecars,
+            instance_salt: _,
+            primary,
+        } = containers;
+        for container in abandoned {
+            let _ = container.stop(STOP_GRACE).await;
+        }
+        for (_, container) in sidecars {
+            let _ = container.stop(STOP_GRACE).await;
+        }
+        let _ = primary.stop(STOP_GRACE).await;
+    })
+    .await;
+    let _ = store.finalize(sid, SystemTime::now(), cause.exit_code());
+    cause
 }
 
 /// Resolve an image-config name to its [`ImageConfig`] and whether it is a
@@ -1545,8 +1555,13 @@ pub async fn connect_mcp_clients(
 /// mistaken for external death) -> MCP shutdowns (so their `podman exec`
 /// pipes drain before the containers go away) -> network interceptor
 /// shutdown (detaches every container) -> sidecar stops -> primary stop ->
-/// session finalize. Each step's failure is logged but never propagated;
-/// the caller's outcome owns the process exit code.
+/// session finalize, with the exit code `outcome` carries. Each step's
+/// failure is logged but never propagated; the caller's outcome owns the
+/// process exit code.
+///
+/// A SIGINT or SIGTERM during the stops ends the wait, not the cleanup --
+/// see [`signals::unless_signaled`]. The record is finalized either way,
+/// which is why it is not part of the sequence that signal can cut short.
 ///
 /// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
@@ -1555,8 +1570,22 @@ pub async fn teardown(
     runtime: SessionRuntime,
     store: &SessionStore,
     sid: &SessionId,
-    final_exit: i32,
+    outcome: &Result<i32>,
 ) {
+    signals::unless_signaled(stop_session(runtime)).await;
+    let exit_code = outcome
+        .as_ref()
+        .map_or_else(CliError::exit_code, |code| *code);
+    if let Err(e) = store.finalize(sid, SystemTime::now(), exit_code) {
+        tracing::warn!(
+            target: "outrig::cli::session_setup",
+            "session finalize failed: {e}"
+        );
+    }
+}
+
+/// Everything [`teardown`] does before it finalizes the record.
+async fn stop_session(runtime: SessionRuntime) {
     let SessionRuntime {
         watcher,
         mcp_arcs,
@@ -1619,12 +1648,6 @@ pub async fn teardown(
         tracing::warn!(
             target: "outrig::cli::session_setup",
             "container stop failed: {e}"
-        );
-    }
-    if let Err(e) = store.finalize(sid, SystemTime::now(), final_exit) {
-        tracing::warn!(
-            target: "outrig::cli::session_setup",
-            "session finalize failed: {e}"
         );
     }
 }

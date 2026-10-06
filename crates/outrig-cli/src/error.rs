@@ -5,6 +5,7 @@ use thiserror::Error;
 
 pub use outrig::error::OutrigError;
 
+use crate::cli::signals::EndSignal;
 use crate::llm::LlmResolveError;
 
 #[derive(Debug, Error)]
@@ -14,12 +15,15 @@ pub enum CliError {
 
     /// A monitored session container went away: the borrowed container in
     /// attach mode stopped, or the watcher saw the primary die externally.
-    /// The type doubles as a control signal -- after teardown the process
-    /// must `std::process::exit` instead of returning, because the blocking
-    /// stdin read (MCP stdio transport, REPL) never completes while the peer
-    /// holds the pipe open. See `cli::watcher::exit_if_monitor_stopped`.
     #[error("{0}")]
     SessionMonitorStopped(String),
+
+    /// A signal ended the session before it finished on its own. Not a
+    /// failure to report: the signal was announced as it landed, and the
+    /// session is torn down with its record keeping [`EndSignal::exit_code`],
+    /// which is also what the process exits with.
+    #[error("interrupted by {0}")]
+    Interrupted(EndSignal),
 
     #[error("{0}")]
     LlmResolve(#[from] LlmResolveError),
@@ -87,6 +91,17 @@ impl From<std::io::Error> for CliError {
 impl From<rmcp::service::ServerInitializeError> for CliError {
     fn from(e: rmcp::service::ServerInitializeError) -> Self {
         CliError::McpServerInitialize(Box::new(e))
+    }
+}
+
+impl CliError {
+    /// The exit code a session that ended on this error records: the signal's
+    /// for [`CliError::Interrupted`], `1` for everything else.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            CliError::Interrupted(sig) => sig.exit_code(),
+            _ => 1,
+        }
     }
 }
 

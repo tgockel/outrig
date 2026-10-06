@@ -94,8 +94,10 @@ ID                     STARTED              DURATION  IMAGE      EXIT
 
 `EXIT` is the outrig process exit code, not the agent's "did it succeed" signal -- there's no
 formal way for the agent to declare success or failure. A non-zero exit usually means an LLM API
-error, a container failure, or a SIGINT after the user gave up. The `-> /path` suffix marks
-sessions whose root entry is a symlink (created via `outrig run --session-dir`).
+error or a container failure. `130`, `143`, and `129` mean a SIGINT, SIGTERM, or SIGHUP ended the
+session -- Ctrl-C during startup, a `kill`, a closed terminal -- and it was torn down like any
+other. The `-> /path` suffix marks sessions whose root entry is a symlink (created via
+`outrig run --session-dir`).
 
 `outrig mcp` sessions have no agent. Their in-memory session row has `agent_name = None`; new
 on-disk `session.json` files omit `agent_name`, and older records with `"agent_name": null`

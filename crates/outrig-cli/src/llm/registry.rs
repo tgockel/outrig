@@ -7,12 +7,18 @@
 //! get the cached `Arc` without further work.
 //!
 //! Failure semantics: if the loader returns `Err`, the slot stays empty so
-//! the next caller retries (good for transient HF-download failures). If the
-//! awaiting future is dropped mid-init, the slot also stays empty -- losing
-//! racers wait on a `Notify`, not on the original future, so dropping one
-//! does not strand the others.
+//! the next caller retries (good for transient HF-download failures).
+//!
+//! A load belongs to its slot, not to whoever is waiting on it: it runs in a
+//! task of its own, so a waiter that is dropped -- a turn a Ctrl-C cut short
+//! -- stops waiting without stopping the load or losing what it produces, and
+//! the next caller waits on that same load rather than starting a second one
+//! beside it. A load runs for minutes and holds gigabytes, and its heavy part
+//! keeps going on the blocking pool whatever its waiters do, so a second one
+//! would double both.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::OnceCell;
@@ -40,10 +46,14 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
         Self::default()
     }
 
+    /// The loaded model for `model_name`, loading it through `init` if no
+    /// load has succeeded yet. `init` is called only on a miss; its future is
+    /// run only if no load is already under way, and runs to the end even if
+    /// this call is dropped first.
     pub async fn get_or_init<F, Fut>(&self, model_name: &str, init: F) -> Result<Arc<T>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>> + Send + 'static,
     {
         let cell = {
             let mut map = self.models.lock().expect("registry mutex poisoned");
@@ -58,22 +68,34 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
             }
         };
 
-        let arc = cell
-            .get_or_try_init(|| async { init().await.map(Arc::new) })
-            .await?;
-        Ok(arc.clone())
+        if let Some(loaded) = cell.get() {
+            return Ok(loaded.clone());
+        }
+        let load = init();
+        let task = tokio::spawn(async move {
+            cell.get_or_try_init(|| async move { load.await.map(Arc::new) })
+                .await
+                .cloned()
+        });
+        match task.await {
+            Ok(loaded) => loaded,
+            // A loader that panicked panics here, in its caller, as it did when
+            // the caller ran it. Cancellation means the runtime is shutting
+            // down, which drops this call before it could see the error.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
     /// Whether this model is actually *loaded* -- the slot exists and its cell
     /// holds a model. Takes the same lock [`Self::get_or_init`] does and
     /// constructs nothing, so it is safe to ask on a path that must not load.
     ///
-    /// Slot existence is deliberately not the test. A load that failed or was
-    /// cancelled leaves its `OnceCell` behind, empty, and `get_or_try_init`
-    /// will re-run the initializer on the next attempt -- so a retry after a
-    /// failed load is every bit as cold as the first try. Answering on
-    /// membership alone reported it as warm and swallowed the advisory line
-    /// before exactly the wait it exists to explain.
+    /// Slot existence is deliberately not the test. A load that failed leaves
+    /// its `OnceCell` behind, empty, and `get_or_try_init` will re-run the
+    /// initializer on the next attempt -- so a retry after a failed load is
+    /// every bit as cold as the first try. Answering on membership alone
+    /// reported it as warm and swallowed the advisory line before exactly the
+    /// wait it exists to explain.
     ///
     /// Racing a concurrent load is still acceptable: the caller uses this to
     /// decide whether to *announce* a cold load, and the worst case there is a
@@ -89,6 +111,11 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
     use super::*;
 
     struct Stub;
@@ -121,5 +148,45 @@ mod tests {
             .await
             .expect("the retry loads");
         assert!(registry.is_loaded("qwen"), "now it is genuinely warm");
+    }
+
+    /// A waiter dropped mid-load -- the turn a Ctrl-C cut short -- does not
+    /// take the load with it. The next caller waits on that same load and gets
+    /// what it produced, and the loader runs once: a second load beside the
+    /// first would hold the weights twice.
+    #[tokio::test]
+    async fn a_dropped_waiter_leaves_its_load_for_the_next_caller() {
+        let registry: LlmRegistry<Stub> = LlmRegistry::new();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let loader = || {
+            let loads = loads.clone();
+            let release = release.clone();
+            async move {
+                loads.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(Stub)
+            }
+        };
+
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            registry.get_or_init("qwen", loader),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the first waiter is dropped mid-load");
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "its load is under way");
+
+        let releaser = release.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            releaser.notify_one();
+        });
+        registry
+            .get_or_init("qwen", loader)
+            .await
+            .expect("the next caller gets the load already under way");
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the loader ran once");
+        assert!(registry.is_loaded("qwen"));
     }
 }
