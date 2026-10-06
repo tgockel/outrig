@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`load_project` takes only a config this process's user owns.** Its walk up from `dir` took
+  the first `.agents/outrig/config.toml` it found, so a config another user planted in a shared
+  ancestor such as `/tmp` was loaded as the project's. It now returns
+  `OutrigError::Configuration` naming the file unless the effective user owns it, the
+  `.agents/` and `outrig/` directories above it, and the directory they sit in. `Config::load`,
+  given a root outright, is unchanged.
 - **Network attach and detach run nothing from the container's image.** Under audit and filter,
   `NetworkInterceptor::attach` pointed a container's `/etc/resolv.conf` at its DNS listener, and
   `detach` put it back, by running a shell through `nsenter` in the container's mount namespace

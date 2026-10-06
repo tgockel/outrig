@@ -79,7 +79,14 @@ pub const PUBLIC_DOC_BASE_URL: &str = "https://tgockel.github.io/outrig/";
 /// config (repo precedence) and validates the result. Returns the merged
 /// [`Config`] plus the resolved repo root.
 ///
+/// The config found is refused with [`OutrigError::Configuration`] unless this
+/// process's effective user owns it, its `.agents/outrig/` directories, and
+/// the directory they sit in: anyone who owns one of those could have written
+/// it. To read a config on purpose, pass its root to [`Config::load`].
+///
 /// [`Config`]: crate::config::Config
+/// [`Config::load`]: crate::config::Config::load
+/// [`OutrigError::Configuration`]: crate::error::OutrigError::Configuration
 pub fn load_project(dir: &Path, global: Option<&Path>) -> error::Result<(config::Config, PathBuf)> {
     let repo_root = repo::find_repo_root_from(dir)?;
     let cfg = config::Config::load(&repo_root, global)?;

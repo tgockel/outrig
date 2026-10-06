@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The walk up from the current directory takes only a config you own.** It took the first
+  `.agents/outrig/config.toml` above the working directory, whoever had written it. So on a
+  shared host, a config another user planted in `/tmp` or a group-writable directory became the
+  config of every `run`, `mcp`, `build`, `image add`, `ls`, `logs`, `discard`, and `clean` below
+  it that had none of its own. It could mount your home read-write, run MCP commands as you,
+  resolve build-args from your environment, and send your API key to a host of its choosing. A
+  config found by the walk is now refused, with an error naming it, unless you own it, the
+  `.agents/` and `outrig/` directories above it, and the directory they sit in; symlinks are
+  judged as themselves. As with git's refusal of another user's repository, this is an error
+  rather than a fall back to a config-less run. `--config` names a file on purpose and is not
+  refused. `run` and `mcp` now name the config file they read, and the workspace they mount,
+  before anything is built or started.
 - **A signal ends `outrig run` and `outrig mcp` through teardown.** A Ctrl-C before the REPL's
   first prompt, or a SIGTERM or SIGHUP at any time -- `kill <pid>`, a closed terminal, a service
   manager or CI timeout -- killed outrig outright. The containers ran on, and the record never

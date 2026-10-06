@@ -177,7 +177,9 @@ tools) and `shell` is unavailable. Full details in
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
    found. If none is found and no `--config` is given, run config-less: the current directory
    becomes the workspace root and config comes from the global file only (see
-   [Config-less runs](#config-less-runs)).
+   [Config-less runs](#config-less-runs)). A config found that another user owns is refused, not
+   read (see [Reference -> CLI](../reference/cli.md#global-flags)). Startup names the config
+   file it read and the workspace it will mount before anything is built or started.
 2. **Resolve image.** Uses explicit `--image` first. If that value matches
    `[images.<name>]`, OutRig uses the config block; otherwise it must already
    exist in local Podman images. Without explicit `--image`, agent `image` and
@@ -230,7 +232,8 @@ A typical startup looks like:
 
 ```
 [outrig] loading config
-[outrig] config loaded (1ms)
+[outrig] config loaded: /home/you/coding/.agents/outrig/config.toml (1ms)
+[outrig] workspace: /home/you/coding
 [outrig] resolving agent and image-config
 [outrig] agent/image-config resolved: agent coding, image-config coding (0ms)
 [outrig] computing image tag
@@ -529,6 +532,19 @@ help: run `outrig init` to initialize
 ```
 
 You're not inside an outrig-configured repo. Either `cd` into one or pass `--config <path>`.
+
+```
+$ outrig run
+error: configuration: refusing /tmp/.agents/outrig/config.toml: it is owned by uid 1001,
+       not by you (uid 1000), so another user could have written it
+help: run `outrig init` where you are to start a config of your own; outrig reads a
+      config you do not own only when --config names it
+```
+
+The nearest config above the current directory belongs to someone else, so outrig will not run
+on it. If it should not be there, `outrig init` gives the current directory a config of its
+own, which the walk finds first. If you trust it -- a checkout shared with your team -- pass it
+with `--config`.
 
 ```
 $ outrig run

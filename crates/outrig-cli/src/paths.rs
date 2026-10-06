@@ -1,6 +1,7 @@
 //! CLI-owned repo, config, and cache path policy.
 
 use std::io::Write as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
@@ -28,10 +29,19 @@ pub(crate) fn current_dir() -> Result<PathBuf> {
     })
 }
 
+/// The nearest directory at or above `cwd` holding `.agents/outrig/config.toml`,
+/// refused when that config is not the invoking user's own (see
+/// [`refuse_foreign_repo_config`]).
 pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
+    find_repo_root_with(cwd, nix::unistd::geteuid().as_raw())
+}
+
+/// [`find_repo_root_from`] for the user `uid`.
+fn find_repo_root_with(cwd: &Path, uid: u32) -> Result<PathBuf> {
     let mut cur = cwd;
     loop {
         if cur.join(REPO_CONFIG_REL).is_file() {
+            refuse_foreign_repo_config(cur, uid)?;
             return Ok(cur.to_path_buf());
         }
         match cur.parent() {
@@ -39,6 +49,50 @@ pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
             None => return Err(OutrigError::NoRepoConfig),
         }
     }
+}
+
+/// Refuse the repo config under `root` unless `uid` owns it, the
+/// `.agents/outrig/` directories it sits in, and `root` itself. Whoever owns
+/// any of those could have put the file there, and the config decides what is
+/// mounted, which commands run, and where API keys are sent, all as the user
+/// running outrig -- so a directory others can write, such as `/tmp`, must not
+/// hand its config to everything below it. git refuses another user's
+/// repository for the same reason. Each entry is judged as itself rather than
+/// through a symlink, so a link someone else planted is refused even when it
+/// points at a config of your own. `--config` names a file outright and is not
+/// asked.
+fn refuse_foreign_repo_config(root: &Path, uid: u32) -> Result<()> {
+    // A walk from a relative `cwd` can end at the empty path, which is the
+    // current directory to `join` but nothing at all to `stat`.
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let config = repo_config_path(root);
+    // `config.toml`, `outrig/`, `.agents/`, and then `root`.
+    for path in config.ancestors().take(4) {
+        let owner = std::fs::symlink_metadata(path)
+            .path_ctx("stat", path)?
+            .uid();
+        if owner != uid {
+            let entry = if path == config {
+                "it".to_string()
+            } else {
+                path.display().to_string()
+            };
+            // Not "pass --config": with a `--config` of their own, the walk
+            // only picks the root, and `image add` does not read the flag.
+            return Err(OutrigError::Configuration(format!(
+                "refusing {config}: {entry} is owned by uid {owner}, not by you (uid {uid}), \
+                 so another user could have written it\n\
+                 help: run `outrig init` where you are to start a config of your own; \
+                 outrig reads a config you do not own only when --config names it",
+                config = config.display(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn repo_config_path(root: &Path) -> PathBuf {
@@ -164,7 +218,7 @@ pub(crate) fn resolve_repo_config_optional(
 ) -> Result<RepoConfig> {
     match override_path {
         Some(p) => explicit_repo_config(p, cwd),
-        None => Ok(RepoConfig::at_root(repo_root_or_cwd(cwd))),
+        None => Ok(RepoConfig::at_root(repo_root_or_cwd(cwd)?)),
     }
 }
 
@@ -194,13 +248,18 @@ fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
         return Ok(RepoConfig::at_root(root.to_path_buf()));
     }
     Ok(RepoConfig {
-        root: repo_root_or_cwd(cwd),
+        root: repo_root_or_cwd(cwd)?,
         file: Some(file),
     })
 }
 
-fn repo_root_or_cwd(cwd: &Path) -> PathBuf {
-    find_repo_root_from(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+/// The repo found from `cwd`, else `cwd` when there is none. A config the walk
+/// refused is an error, not a config-less run.
+fn repo_root_or_cwd(cwd: &Path) -> Result<PathBuf> {
+    match find_repo_root_from(cwd) {
+        Err(OutrigError::NoRepoConfig) => Ok(cwd.to_path_buf()),
+        found => found,
+    }
 }
 
 /// Refuse a workspace no config declared when it is the invoking user's home
@@ -381,6 +440,38 @@ mod tests {
 
         let root = find_repo_root_from(&nested).unwrap();
         assert_eq!(root, tmp.path());
+    }
+
+    /// #329: a config the walk finds is taken only from its owner. To anyone
+    /// else -- the victim below a config planted in `/tmp` -- it is an error
+    /// naming the file, not a config to run on and not a missing one to run
+    /// config-less past.
+    #[test]
+    fn find_repo_root_refuses_a_config_another_user_owns() {
+        let tmp = tempdir().unwrap();
+        let config = write_repo_config(tmp.path());
+        let nested = tmp.path().join("victim/scratch");
+        fs::create_dir_all(&nested).unwrap();
+        let owner = fs::metadata(&config).unwrap().uid();
+
+        assert_eq!(find_repo_root_with(&nested, owner).unwrap(), tmp.path());
+
+        let other = owner + 1;
+        let err = find_repo_root_with(&nested, other).unwrap_err();
+        assert!(
+            matches!(err, OutrigError::Configuration(_)),
+            "a refusal, not a missing config: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "configuration: refusing {config}: it is owned by uid {owner}, not by you \
+                 (uid {other}), so another user could have written it\n\
+                 help: run `outrig init` where you are to start a config of your own; \
+                 outrig reads a config you do not own only when --config names it",
+                config = config.display(),
+            ),
+        );
     }
 
     /// `--config <repo>/.agents/outrig/config.toml` is that repo, wherever the

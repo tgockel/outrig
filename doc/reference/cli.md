@@ -25,6 +25,17 @@ These are accepted by every subcommand.
 without an `outrig/config.toml` inside does not terminate the walk -- outrig keeps looking in
 parents.
 
+The walk takes only a config of your own. The file, the `.agents/` and `outrig/` directories
+above it, and the directory they sit in must all belong to the user running outrig; a symlink
+counts as itself, not as what it points to. Anyone who owns one of them could have written the
+config, and the config decides what is mounted, which commands run, and where API keys go. So a
+config found anywhere else -- `/tmp/.agents/outrig/config.toml`, say, planted by another user of
+a shared host -- stops the command with an error naming it, as git does for a repository another
+user owns. It is not read, and not skipped in favor of a config-less run. The walk finds the
+nearest config first, so `outrig init` in your own directory puts one between you and it. To
+read a config you do not own on purpose, such as a checkout shared with your team, name it with
+`--config`, which is never refused for its owner.
+
 The flag names a file, and that file has to exist: a path that is not one is an error, not a
 config-less run. Which repo the command then runs against depends on where the file is:
 

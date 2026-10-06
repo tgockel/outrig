@@ -299,14 +299,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else {
         args.repo.load(args.global_cfg_path)?
     };
-    span.done("config loaded");
-    // No config of its own at the root means the root is the working
-    // directory by default, whether or not `--config` supplied the settings.
-    if !repo_config_path(&repo_root).exists() {
-        eprintln!(
-            "[outrig] no repo config found; using current directory as workspace ({})",
-            repo_root.display()
-        );
+    // Named before anything runs, so a config picked up from somewhere
+    // unexpected is on screen before it mounts or starts anything. A
+    // `--config` file was checked to exist when it was resolved.
+    let own_config = repo_config_path(&repo_root).is_file();
+    if own_config || args.repo.file.is_some() {
+        span.done(format!("config loaded: {}", args.repo.config_path().display()));
+    } else {
+        span.done("config loaded");
     }
 
     let session_root =
@@ -324,8 +324,28 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
     // A workspace no config declared is outrig's pick, and outrig never picks
     // the home directory or one above it. An attached session mounts nothing.
-    if attach.is_none() && cfg.workspace.declared_host_path().is_none() {
-        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
+    if attach.is_none() {
+        // Spelled without the default `.` it joins to the root.
+        let workspace: PathBuf = cfg
+            .workspace
+            .resolved_host_path(&repo_root)
+            .components()
+            .collect();
+        let declared = cfg.workspace.declared_host_path().is_some();
+        if !declared {
+            refuse_home_workspace(&workspace, &repo_root)?;
+        }
+        // No config of its own at the root, and no declared host path, means
+        // the working directory by default, whether or not `--config`
+        // supplied the settings.
+        if declared || own_config {
+            eprintln!("[outrig] workspace: {}", workspace.display());
+        } else {
+            eprintln!(
+                "[outrig] no repo config found; using current directory as workspace ({})",
+                workspace.display()
+            );
+        }
     }
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
     if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {

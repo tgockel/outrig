@@ -289,7 +289,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 1. **Locate config.** Walks up from the current directory until
    `.agents/outrig/config.toml` is found, else runs config-less there. The MCP host's
    `cwd` therefore needs to be the repo, or pass `--config <repo>/.agents/outrig/config.toml`
-   explicitly.
+   explicitly. A config found that another user owns is refused, not read (see
+   [Reference -> CLI](../reference/cli.md#global-flags)). Startup names the config file it read
+   and the workspace it will mount on stderr before anything is built or started.
 2. **Resolve image.** Uses explicit `--image` first. Config entries win; an
    unknown explicit value is treated as a local Podman image ref. Without
    explicit `--image`, top-level `default-image` still names a config block.
