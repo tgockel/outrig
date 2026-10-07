@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every `5xx` from an LLM endpoint is retried, as documented.** Only `500`, `502`, `503`, and
+  `504` were. Any other `5xx` -- Anthropic's `529` "overloaded", Cloudflare's `520`-`527` in
+  front of a proxied endpoint -- ended `outrig run` on its first occurrence and tore the session
+  down. These are now retried within `retry-budget-secs` like the rest. If the endpoint never
+  recovers, the turn ends with the usual notice and the conversation is kept. A failover chain
+  also counts these failures as recoverable now.
 - **`outrig__wait_results` no longer waits on a subagent you already collected that is idle.**
   Its description told the model that a collected name came back again immediately. In fact a
   collected name counted only once the subagent reported again, and an idle subagent reports again

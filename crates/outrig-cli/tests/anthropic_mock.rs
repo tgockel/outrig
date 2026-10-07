@@ -515,9 +515,23 @@ async fn tool_call_cap_applies_to_the_anthropic_path() {
 /// lands. The real wait here is one jittered base delay, at most a second.
 #[tokio::test]
 async fn transient_status_is_retried_at_the_http_layer() {
+    assert_retried_at_the_http_layer("OUTRIG_TEST_ANTHROPIC_RETRY", 503).await;
+}
+
+/// `529` is Anthropic's documented "overloaded" status and sits outside the
+/// standard `5xx` codes, so an explicit list of those once let it end the
+/// session on the first occurrence (#332). Not `start_paused`, as above.
+#[tokio::test]
+async fn overloaded_529_is_retried_at_the_http_layer() {
+    assert_retried_at_the_http_layer("OUTRIG_TEST_ANTHROPIC_RETRY_529", 529).await;
+}
+
+/// One model call answered `status` and then a reply: the turn completes, and
+/// the retry sent the same request again rather than rebuilding the turn.
+async fn assert_retried_at_the_http_layer(var: &str, status: u16) {
     let (addr, mut requests) = start_mock_http(vec![
         CannedResponse::status(
-            503,
+            status,
             json!({
                 "type": "error",
                 "error": { "type": "overloaded_error", "message": "overloaded" },
@@ -527,15 +541,9 @@ async fn transient_status_is_retried_at_the_http_layer() {
     ])
     .await;
 
-    let reply = run_one_turn(
-        addr,
-        "OUTRIG_TEST_ANTHROPIC_RETRY",
-        MODEL,
-        Some(1024),
-        vec![],
-    )
-    .await
-    .expect("the retry should carry the turn through the 503");
+    let reply = run_one_turn(addr, var, MODEL, Some(1024), vec![])
+        .await
+        .expect("the retry should carry the turn through the failed call");
 
     assert_eq!(reply, "Recovered.");
 

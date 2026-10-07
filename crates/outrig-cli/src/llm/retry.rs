@@ -684,8 +684,12 @@ where
 /// The retry-worthy statuses: request timeouts, "too early", rate limits, and
 /// the server-side 5xx family. Everything else -- other 4xx especially -- is
 /// terminal, because replaying it would fail the same way.
+///
+/// The 5xx family is taken whole because providers put nonstandard codes in
+/// it -- Anthropic's `529` overloaded, Cloudflare's `520`-`527` -- that an
+/// explicit list of the standard ones misses.
 fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
 }
 
 /// Pre-jitter backoff in seconds: `base_delay * 2^attempt`, capped at
@@ -754,10 +758,17 @@ fn next_delay(
 /// A short label for a failure: the status line, or the transport error. Never
 /// the provider's error body -- a rate-limited gateway's body runs to kilobytes
 /// of nested JSON.
+///
+/// A code with no standard reason phrase is shown bare: `StatusCode`'s own
+/// `Display` would print `529 <unknown status code>`, which says nothing more
+/// and pushes the retry line past a terminal's width.
 fn failure_label(err: &HttpError) -> String {
     match err {
         HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
-            format!("HTTP {code}")
+            match code.canonical_reason() {
+                Some(_) => format!("HTTP {code}"),
+                None => format!("HTTP {}", code.as_u16()),
+            }
         }
         HttpError::Instance(inner) => format!("connection error: {inner}"),
         other => other.to_string(),
@@ -885,9 +896,12 @@ mod tests {
         exhausted_transient_label(&PromptError::CompletionError(err))
     }
 
+    /// The only 4xx statuses that retry; the tables below split 4xx on it.
+    const RETRYABLE_4XX: [u16; 3] = [408, 425, 429];
+
     #[test]
     fn retryable_status_codes_are_transient() {
-        for code in [408, 425, 429, 500, 502, 503, 504] {
+        for code in RETRYABLE_4XX.into_iter().chain(500..=599) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(is_retryable_status(status), "{code} should retry");
             assert!(
@@ -899,7 +913,7 @@ mod tests {
 
     #[test]
     fn client_errors_are_terminal() {
-        for code in [400, 401, 403, 404, 422] {
+        for code in (400..=499).filter(|code| !RETRYABLE_4XX.contains(code)) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(!is_retryable_status(status), "{code} should not retry");
             assert!(
@@ -907,6 +921,15 @@ mod tests {
                 "{code} should stay fatal at the REPL",
             );
         }
+    }
+
+    #[test]
+    fn a_nonstandard_status_is_labeled_by_its_code() {
+        assert_eq!(label_of(http_status(529)).as_deref(), Some("HTTP 529"));
+        assert_eq!(
+            label_of(http_status(503)).as_deref(),
+            Some("HTTP 503 Service Unavailable"),
+        );
     }
 
     #[test]
