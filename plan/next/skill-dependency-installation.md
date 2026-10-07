@@ -19,11 +19,11 @@ cannot make by itself.
   `0003-20` approves a repo-declared binding: asked once, remembered by the skill's digest, asked
   again when the skill changes.
 - **Where it installs.** In the container with the payload's pip, which keeps `[network]` in
-  force and shares the user site (`plan/next/the-payloads-pip-shares-the-user-site.md`); or on
+  force and shares the user site (#466); or on
   the host into the package cache `0003-18` builds for bindings, keyed by requirement set and
   mounted read-only, where the container's network policy does not apply.
 - **What it installs.** Pure-Python wheels only, through the same check `0003-18` applies to
-  binding installs and `plan/next/pip-builds-what-it-cannot-load.md` wants for the agent's pip.
+  binding installs and #465 wants for the agent's pip.
 - **When.** At invocation, never at discovery. A failed install fails the invocation with the
   reason.
 

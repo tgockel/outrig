@@ -1,7 +1,7 @@
 # A startup failure hands back a string where a session failure hands back a kind
 
 > **Cheaper before 0.2.0 than after**, like
-> `plan/next/mcp-service-error-does-not-name-its-server.md`: it retypes a public field, so it
+> #460: it retypes a public field, so it
 > is free while the freeze window is open and a major version once `0002-54` ships.
 
 ## Context

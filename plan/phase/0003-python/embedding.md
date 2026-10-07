@@ -302,8 +302,8 @@ thread that reads the environment, and every process started meanwhile inherits 
 - The module's public name and its type names -- `0003-19`'s design fork.
 - Whether starting a session ensures its image. `run-new` does that itself today, before
   `Outrig::launch`, because `launch` neither pulls nor builds under the image-config's name
-  (`plan/next/launch-image-handling-differs-from-the-cli.md`). If this API is all `run-new` uses,
-  either the session takes that step or the API offers it.
+  (#456). If this API is all `run-new` uses, either the session takes that step or the API
+  offers it.
 - Which of `run`'s flags `run-new` gains (`plan/next/run-new-flag-parity.md`) becomes a question
   about the builder: a flag with no builder input has no way in.
 - Whether a subscriber can join a session that has already started, and what it is told about the

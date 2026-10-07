@@ -30,7 +30,7 @@ A process group of its own also keeps a terminal's Ctrl-C from reaching the bind
 The task's second subject is packages. A binding's `requires` (`0003-20`) is installed with the
 payload's own pip into a directory the binding imports from, and which the container later mounts
 read-only. Only pure Python can load on either side: the payload is a static build with no way to
-load an extension module. `plan/next/pip-builds-what-it-cannot-load.md` records that this pip
+load an extension module. #465 records that this pip
 offers only the bare `linux_<arch>` platform tag, so a package whose PyPI wheels are all compiled
 falls back to its source distribution. `--only-binary=:all:` refuses that, and with it any build
 code running on the host. It does not refuse a compiled wheel that pip finds compatible, such as a
@@ -144,7 +144,7 @@ maintainer rather than changing the host process model on its own.
   `Cmd::in_own_process_group`.
 - `crates/outrig/src/python/payload.rs` -- `unpack_once` and `cache_root`, whose lock, rename and
   cache rule the install repeats.
-- `plan/next/pip-builds-what-it-cannot-load.md` -- the agent's own pip, which should share the tag
+- #465 -- the agent's own pip, which should share the tag
   check.
 - #295 and `plan/next/hosted-effect-confinement.md` -- why binding hosts are Linux-only, and
   confining what a binding's programs do, deferred.

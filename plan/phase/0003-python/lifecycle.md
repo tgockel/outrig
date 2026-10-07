@@ -365,7 +365,7 @@ What this does not cover, stated rather than implied:
   the container is podman's rather than a child of the owner, so it keeps running -- with the
   workspace mounted and whatever the agent started in it -- until someone removes it.
   `outrig clean` reports a running stray rather than removing it, and cannot see `run-new`'s at
-  all, which carries no session label yet (`plan/next/run-new-container-has-no-session-label.md`).
+  all, which carries no session label yet (#469).
 
 ## The interpreter's death ends the session
 
@@ -509,8 +509,8 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
   would stop agent code running in a session that is ending, at the cost of failing a call that
   could have returned. `0003-21`'s callback tests are where a reason either way would show.
 - Whether the session labels its container, so that `outrig clean` can find it after an abrupt
-  death. `plan/next/run-new-container-has-no-session-label.md` waits for the library to have a
-  session identity, and the session API is the obvious place for one.
+  death. #469 waits for the library to have a session identity, and the session API is the
+  obvious place for one.
 
 ## Unverified
 

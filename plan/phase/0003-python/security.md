@@ -28,7 +28,7 @@ reach it. That is also why `run-new` starts no MCP server: one placed in the pri
 resolved secrets beside the interpreter, as the same user, and MCP servers presented as Python
 objects are not in this phase (`mcp-wrappers.md`). What the container runtime passes in on its own
 is not covered: podman forwards the host's proxy variables by default, and a proxy URL can carry a
-password (`plan/next/proxy-credentials-reach-the-primary.md`).
+password (#455).
 
 ## OutRig's existing property, unchanged
 

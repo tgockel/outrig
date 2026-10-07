@@ -262,5 +262,4 @@ public module, and `run-new` uses that module and nothing else of the loop.
 - `crates/outrig-cli/src/cli/run_new.rs` and `crates/outrig-cli/src/cli/run_new/converse.rs` --
   the terminal rebuilt on the new module.
 - `crates/outrig/tests/public_api_boundary.rs` -- the snapshot rules the new test joins.
-- `plan/next/run-new-round-moves-at-the-terminals-pace.md` -- the terminal setting a round's pace,
-  which fork 5 bears on.
+- #471 -- the terminal setting a round's pace, which fork 5 bears on.
