@@ -9,9 +9,11 @@ gets there, and the runtime it reaches has to be the calling execution's. `sys.m
 interpreter-wide, so one module object serves every co-hosted kernel.
 
 `interpreter.py` already tracks which execution is running: `_CURRENT` is a context variable set
-at the top of each execution's task. `asyncio.to_thread` copies the context and a raw
-`threading.Thread` does not, so a `to_thread` worker can resolve the caller's runtime and a raw
-thread has nothing to resolve -- which its error has to say.
+at the top of each execution's task. A task, a `threading.Thread`, and an item given to a thread
+pool -- `asyncio.to_thread`'s included -- carry the context they were started or submitted from
+(#474), so each can resolve its execution's runtime. A thread started with
+`_thread.start_new_thread`, or a pool's `initializer`, runs outside every execution's context and
+has nothing to resolve -- which its error has to say.
 
 The second half is the decoder typed results need (`typed-agents.md`). A child's completion is JSON
 that must become the declared dataclass strictly: an unknown key is an error rather than dropped, a
@@ -36,9 +38,10 @@ becomes a declared dataclass only when it has exactly the declared shape.
   lives per fork 1. It holds OutRig's own code and nothing vendored: RPyC is vendored by
   `build.rs` into a directory of its own, mounted read-only beside the payload (`0003-16`).
 - **`outrig.runtime`**, the current execution's runtime, resolved from `_CURRENT` per fork 2. The
-  kernel's `runtime` global stays. Outside any execution's context -- a raw thread -- it raises an
-  error saying why and naming `asyncio.to_thread` and `contextvars.copy_context().run` as the ways
-  to carry the context.
+  kernel's `runtime` global stays. Outside every execution's context -- a thread started with
+  `_thread.start_new_thread`, a pool's `initializer` -- it raises an error saying why and naming
+  `threading.Thread`, `asyncio.to_thread` and `contextvars.copy_context().run` as the ways to
+  carry the context.
 - **`outrig.schema`**, with `doc(text)` and `alias(name)` markers for `typing.Annotated`. A `doc`
   text is the field's description, and an `alias` is the field's JSON key. Nothing else renames a
   field: there is no hyphen-to-underscore conversion in either direction.
@@ -69,8 +72,9 @@ becomes a declared dataclass only when it has exactly the declared shape.
   kernel's runtime in each.
 - A function in a module imported once, called from two kernels, reaches each caller's runtime
   through `outrig.runtime`.
-- **In a `to_thread` worker, `outrig.runtime` is the calling execution's runtime**; in a raw
-  `threading.Thread` it raises the documented error, not an `AttributeError` and not `None`.
+- **In a `to_thread` worker and a `threading.Thread`, `outrig.runtime` is the calling execution's
+  runtime**; in `contextvars.Context().run(...)`, outside every execution's context, it raises the
+  documented error, not an `AttributeError` and not `None`.
 - **The maintainer's `ReviewResult`, copied from `typed-agents.md` unchanged, declares without
   error**, and its example JSON decodes to the instance the example describes. Its schema text
   carries every `doc()` text verbatim.

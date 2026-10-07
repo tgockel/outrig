@@ -650,23 +650,28 @@ fn generated_code_cannot_forge_a_protocol_message() {
 #[test]
 fn what_no_execution_wrote_goes_to_stderr_and_no_result() {
     // A raw descriptor write names no writer, and a thread started with
-    // `threading` begins with no execution in its context. Both land on the
-    // stream the host records as diagnostics, never in some result.
+    // `_thread`, beneath `threading`, begins with no execution in its context.
+    // Both land on the stream the host records as diagnostics, never in some
+    // result.
     let mut k = Interpreter::start();
     let out = k.output(
         1,
         &py(r#"
-            import os, threading
+            import _thread, os
             os.write(1, b'RAW-ONE\n')
             os.write(2, b'RAW-TWO\n')
-            t = threading.Thread(target=print, args=('FROM-A-THREAD',))
-            t.start()
-            t.join()
+            done = _thread.allocate_lock()
+            done.acquire()
+            def bare():
+                print('FROM-A-BARE-THREAD')
+                done.release()
+            _thread.start_new_thread(bare, ())
+            done.acquire()
             'done'
             "#),
     );
     assert_eq!(out, "'done'\n");
-    for needle in ["RAW-ONE", "RAW-TWO", "FROM-A-THREAD"] {
+    for needle in ["RAW-ONE", "RAW-TWO", "FROM-A-BARE-THREAD"] {
         k.await_stderr(needle);
     }
 }
@@ -937,6 +942,145 @@ fn an_exit_raised_in_a_background_task_ends_only_that_task() {
         k.output(2, "type(leaving.exception()).__name__"),
         "'SystemExit'\n"
     );
+}
+
+#[test]
+fn a_thread_is_billed_to_the_execution_that_started_it() {
+    // Everything the thread causes is the execution's: its prints, a child it
+    // runs, and the report of an exception it did not catch. What it writes
+    // once the execution has reported is that execution's background.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import subprocess, sys, threading
+            def work():
+                print('FROM-A-THREAD')
+                subprocess.run([sys.executable, '-c', 'print("FROM-ITS-CHILD")'])
+                raise ValueError('the thread failed')
+            t = threading.Thread(target=work)
+            t.start()
+            t.join()
+            go = threading.Event()
+            def later():
+                go.wait()
+                print('LATE-THREAD')
+            late = threading.Thread(target=later)
+            late.start()
+            "#),
+    );
+    assert!(out.starts_with("FROM-A-THREAD\nFROM-ITS-CHILD\n"), "{out}");
+    assert!(out.contains("ValueError: the thread failed"), "{out}");
+
+    let result = k.exec(2, "go.set()\nlate.join()\nprint('MINE')");
+    assert_eq!(result["output"], "MINE\n", "{result}");
+    assert_eq!(
+        result["background"],
+        json!([{"id": 1, "output": "LATE-THREAD\n", "dropped": 0}])
+    );
+}
+
+#[test]
+fn pool_items_are_billed_to_the_execution_that_submitted_them() {
+    // Each pool's worker is started for 1 and serves 2 as well. An item, or a
+    // callback, is billed to the execution that submitted it, whichever
+    // worker runs it and however late.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import concurrent.futures, multiprocessing.pool, threading
+            loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(1)
+            pool = multiprocessing.pool.ThreadPool(1)
+            executor.submit(print, 'EXECUTOR-1').result()
+            await loop.run_in_executor(None, print, 'DEFAULT-1')
+            pool.apply(print, ('POOL-1',))
+            go = threading.Event()
+            def later():
+                go.wait()
+                print('EXECUTOR-LATE-1')
+            executor.submit(later)
+            None
+            "#),
+    );
+    assert_eq!(out, "EXECUTOR-1\nDEFAULT-1\nPOOL-1\n");
+
+    // The late item holds the executor's one worker until 2 releases it, so it
+    // writes while 2 runs, before 2's own item.
+    let result = k.exec(
+        2,
+        &py(r#"
+            go.set()
+            executor.submit(print, 'EXECUTOR-2').result()
+            await loop.run_in_executor(None, print, 'DEFAULT-2')
+            await asyncio.to_thread(print, 'TO-THREAD-2')
+            pool.map(print, ['MAP-2'])
+            pool.apply_async(int, callback=lambda _: print('CALLBACK-2')).wait()
+            list(pool.imap(print, ['IMAP-2']))
+            None
+            "#),
+    );
+    assert_eq!(
+        text(&result["output"]),
+        "EXECUTOR-2\nDEFAULT-2\nTO-THREAD-2\nMAP-2\nCALLBACK-2\nIMAP-2\n",
+        "{result}"
+    );
+    assert_eq!(result["dropped"], 0);
+    assert_eq!(
+        result["background"],
+        json!([{"id": 1, "output": "EXECUTOR-LATE-1\n", "dropped": 0}])
+    );
+}
+
+#[test]
+fn a_callback_is_billed_to_the_execution_that_added_it() {
+    // A callback runs on whichever thread finishes the work: a detached
+    // worker, or a process pool's own thread, which 1 started. Each of these
+    // is 2's.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import concurrent.futures, multiprocessing, threading
+            fork = multiprocessing.get_context('fork')
+            executor = concurrent.futures.ThreadPoolExecutor(1)
+            processes = concurrent.futures.ProcessPoolExecutor(1, mp_context=fork)
+            pool = fork.Pool(1)
+            executor.submit(abs, -1).result()
+            processes.submit(abs, -1).result()
+            pool.apply(abs, (-1,))
+            said = threading.Event()
+            def say(text):
+                def callback(_):
+                    print(text)
+                    said.set()
+                return callback
+            None
+            "#),
+    );
+    assert_eq!(out, "");
+
+    let result = k.exec(
+        2,
+        &py(r#"
+            go = threading.Event()
+            executor.submit(go.wait).add_done_callback(say('EXECUTOR-DONE-2'))
+            go.set()
+            said.wait()
+            said.clear()
+            processes.submit(abs, -1).add_done_callback(say('PROCESSES-DONE-2'))
+            said.wait()
+            pool.apply_async(abs, (-1,), callback=say('POOL-CALLBACK-2')).wait()
+            None
+            "#),
+    );
+    assert_eq!(
+        text(&result["output"]),
+        "EXECUTOR-DONE-2\nPROCESSES-DONE-2\nPOOL-CALLBACK-2\n",
+        "{result}"
+    );
+    assert_eq!(result["background"], json!([]));
 }
 
 #[test]

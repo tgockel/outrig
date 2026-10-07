@@ -171,8 +171,8 @@ host call:
 
 - At class creation: every rule of "The declaration" and "Message and reply types".
 - In the constructor, synchronously: an input outside the subset, and a constructor called outside
-  any execution's context -- on a raw thread -- which raises as `outrig.runtime` does there
-  (`0003-24`).
+  every execution's context -- on a thread started with `_thread.start_new_thread`, or in a pool's
+  `initializer` -- which raises as `outrig.runtime` does there (`0003-24`).
 - At `ready()` and at the first handle, because they are the host's answers and the host is asked
   in the background: an unknown `model=`, with the configured names listed; a parent already at
   `subagent-depth-max`; the session at `children-max`, which is `AgentLimitReached` ("Limits and

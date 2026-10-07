@@ -22,9 +22,10 @@ Five things here are load-bearing rather than incidental:
 - **Output is attributed to the execution that caused it**, not merely to its agent. A context
   variable names the execution, and asyncio copies it into every task the execution starts, so
   a task an earlier execution left running is billed to that execution rather than to whichever
-  holds the slot. Each execution has a pipe of its own for the same reason: a child process's
-  bytes carry no writer identity, so the descriptor it inherited is the only attribution there
-  is.
+  holds the slot. A thread carries the context it was started in, and an item a thread pool runs
+  the one it was submitted from. Each execution has a pipe of its own for the same reason: a
+  child process's bytes carry no writer identity, so the descriptor it inherited is the only
+  attribution there is.
 - **Output is bounded at the descriptor, not at `print`.** Each execution's pipe is drained on
   its own thread against `OUTPUT_MAX`, and a result never waits for a descendant that still
   holds the pipe open.
@@ -44,6 +45,7 @@ import asyncio
 import base64
 import builtins
 import collections
+import concurrent.futures
 import contextlib
 import contextvars
 import dataclasses
@@ -56,6 +58,7 @@ import itertools
 import json
 import math
 import mmap
+import multiprocessing.pool
 import os
 import resource
 import select
@@ -173,8 +176,8 @@ def _send(message):
 # ---------------------------------------------------------------------------- output
 
 # The execution a write belongs to. Set at the top of an execution's task, so every task that
-# execution creates carries it, and so does `asyncio.to_thread`, which copies the context. A
-# thread started any other way starts with none.
+# execution creates carries it, and so does `asyncio.to_thread`, which copies the context. So do
+# a thread it starts and an item it gives a thread pool, through the patches after the fork hooks.
 _CURRENT = contextvars.ContextVar("outrig_execution", default=None)
 
 
@@ -587,6 +590,134 @@ os.register_at_fork(
     after_in_parent=_after_fork_in_parent,
     after_in_child=_after_fork_in_child,
 )
+
+# A thread runs in a copy of the context it was started in, and so is billed to the execution
+# that started it. This is Python 3.14's `thread_inherit_context`, except that the report of an
+# exception the thread did not catch is made in that context too, rather than lost to stderr. A
+# thread started with `_thread.start_new_thread`, which bypasses `Thread.start`, carries none.
+_thread_start = threading.Thread.start
+_thread_bootstrap_inner = threading.Thread._bootstrap_inner
+
+
+@functools.wraps(_thread_start)
+def _attributed_thread_start(self):
+    # Kept for the thread's life, as 3.14 keeps its own.
+    self._outrig_context = contextvars.copy_context()
+    _thread_start(self)
+
+
+@functools.wraps(_thread_bootstrap_inner)
+def _attributed_bootstrap_inner(self):
+    context = getattr(self, "_outrig_context", None)
+    if context is None:
+        _thread_bootstrap_inner(self)
+    else:
+        context.run(_thread_bootstrap_inner, self)
+
+
+threading.Thread.start = _attributed_thread_start
+threading.Thread._bootstrap_inner = _attributed_bootstrap_inner
+
+# A pool's worker is not the work it runs. Started for the first submission that needed it, it
+# serves every later one, and the context it was started in would bill all of their work to the
+# first. So a thread pool's workers start in an empty context, and each item runs in a copy of the
+# context it was submitted from -- which 3.14's flag, copying per thread, does not do either. A
+# callback runs on whichever thread finishes the work, and is billed the same way, to the context
+# it was added in.
+
+
+def _submitted(fn):
+    """`fn`, run in a copy of the context it was handed over in. `None` stays `None`.
+
+    A new copy for each call, because `map` runs one function on several workers at once, and a
+    context can be entered by only one thread at a time.
+    """
+    if fn is None:
+        return None
+    context = contextvars.copy_context()
+
+    def submitted(*args, **kwargs):
+        return context.copy().run(fn, *args, **kwargs)
+
+    return submitted
+
+
+def _detached(fn):
+    """`fn`, run in an empty context, so that a thread it starts carries no execution."""
+
+    @functools.wraps(fn)
+    def detached(*args, **kwargs):
+        return contextvars.Context().run(fn, *args, **kwargs)
+
+    return detached
+
+
+# `ThreadPoolExecutor` starts a worker inside `submit`, when no idle one is left. It is what
+# `loop.run_in_executor` submits to by default, and `asyncio.to_thread` through that.
+_executor_submit = _detached(concurrent.futures.ThreadPoolExecutor.submit)
+
+
+@functools.wraps(_executor_submit)
+def _attributed_submit(self, fn, /, *args, **kwargs):
+    return _executor_submit(self, _submitted(fn), *args, **kwargs)
+
+
+concurrent.futures.ThreadPoolExecutor.submit = _attributed_submit
+
+# A `concurrent.futures` future's callbacks, a process pool's included, run in the context they
+# were added in, as an asyncio future's do.
+_add_done_callback = concurrent.futures.Future.add_done_callback
+
+
+@functools.wraps(_add_done_callback)
+def _attributed_add_done_callback(self, fn):
+    _add_done_callback(self, _submitted(fn))
+
+
+concurrent.futures.Future.add_done_callback = _attributed_add_done_callback
+
+
+def _attributing(method):
+    """`method`, with the function it is given run as `_submitted` runs it."""
+
+    @functools.wraps(method)
+    def attributing(self, func, *args, **kwargs):
+        return method(self, _submitted(func), *args, **kwargs)
+
+    return attributing
+
+
+# `multiprocessing.pool.ThreadPool` starts its workers, and the threads that run callbacks, when it
+# is made. What it is given reaches a worker through the four methods below, which `apply`, `map`,
+# and the rest call. `ThreadPool` alone: a process `Pool` pickles what it is given, and a context
+# cannot be. `_map_async` runs a chunk at a time through its `mapper`, so the mapper is what runs
+# in the submitter's context: a copy per chunk rather than per item.
+_ThreadPool = multiprocessing.pool.ThreadPool
+_ThreadPool.__init__ = _detached(_ThreadPool.__init__)
+_ThreadPool.apply_async = _attributing(_ThreadPool.apply_async)
+_ThreadPool.imap = _attributing(_ThreadPool.imap)
+_ThreadPool.imap_unordered = _attributing(_ThreadPool.imap_unordered)
+_pool_map_async = _ThreadPool._map_async
+
+
+@functools.wraps(_pool_map_async)
+def _attributed_map_async(self, func, iterable, mapper, *args, **kwargs):
+    return _pool_map_async(self, func, iterable, _submitted(mapper), *args, **kwargs)
+
+
+_ThreadPool._map_async = _attributed_map_async
+
+# Callbacks stay in this process whichever pool runs the work, so every pool's, a process pool's
+# included, are wrapped where its results are made.
+_apply_result_init = multiprocessing.pool.ApplyResult.__init__
+
+
+@functools.wraps(_apply_result_init)
+def _attributed_apply_result_init(self, pool, callback, error_callback):
+    _apply_result_init(self, pool, _submitted(callback), _submitted(error_callback))
+
+
+multiprocessing.pool.ApplyResult.__init__ = _attributed_apply_result_init
 
 
 def _attributed_exception(loop, context):
