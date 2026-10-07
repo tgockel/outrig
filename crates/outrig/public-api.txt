@@ -957,6 +957,9 @@ pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static s
 pub fn outrig::error::superseded_by_a_confirmed_stop(outrig::error::OutrigError, &str) -> outrig::error::OutrigError
 pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
 pub mod outrig::image
+#[non_exhaustive] pub enum outrig::image::BuildOutput
+pub outrig::image::BuildOutput::Captured
+pub outrig::image::BuildOutput::Stderr
 #[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
 pub outrig::image::ImageBuildOutcome::cache_hit: bool
 pub outrig::image::ImageBuildOutcome::tag: outrig::image::ImageTag
@@ -976,6 +979,7 @@ pub async fn outrig::image::compute_tag_for(&str, &outrig::config::ImageConfig, 
 pub async fn outrig::image::ensure_image(&outrig::config::ImageConfig, &std::path::Path, bool) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::ensure_local_image(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::ensure_tagged_image_for(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
+pub async fn outrig::image::ensure_tagged_image_for_with_output(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool, core::option::Option<&outrig::Transcript>, outrig::image::BuildOutput) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::probe_cached(&outrig::image::ImageTag) -> outrig::error::Result<bool>
 pub async fn outrig::image::probe_pulled(&outrig::image::ImageTag) -> outrig::error::Result<bool>
 pub async fn outrig::image::pull_image(&outrig::image::ImageTag) -> outrig::error::Result<()>

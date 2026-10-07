@@ -367,6 +367,7 @@ By default, `outrig mcp` serves MCP over stdio. Its stdout is reserved for JSON-
 messages to the client; all other process output goes somewhere else:
 
 - startup banner: stderr
+- a cache-miss image build or pull, as `[buildah]` / `[podman]` lines: stderr
 - outrig tracing controlled by `OUTRIG_LOG`, or `RUST_LOG` when unset: stderr
 - top-level startup errors: stderr
 - backing server stderr: `<session_dir>/logs/<server>.stderr`

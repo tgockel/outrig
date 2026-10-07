@@ -60,7 +60,9 @@ directory.
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
 enable trace-level logs from outrig's own modules for that invocation. It does not change
 container, MCP, or agent behavior. Normal startup progress is printed to stderr without
-`--verbose`.
+`--verbose`, and so is a cache-miss `buildah build` or `podman pull` during startup, as
+`[buildah]` / `[podman]` lines while it runs; `--verbose` adds the command lines and the output
+of every other command, and writes it all to `container.log`.
 
 `--verbose` controls command *output*; the tracing filter controls command *lines*. At
 `debug`, every buildah/podman invocation is logged before it is spawned and again on exit with

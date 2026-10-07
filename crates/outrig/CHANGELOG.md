@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
+  It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
+  (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
+  `buildah build` or `podman pull` to the process's stderr as `[buildah]` / `[podman]` lines
+  while it runs -- once, since a `Transcript` that already mirrors to stderr is left to do it --
+  and a failure then carries no tail, because the lines are already above it. The cache probe,
+  the label commit, and the `$ <cmd>` echo are unaffected. (#478)
+
 - **`Config::load_global` reads a global config on its own.** It parses the file, resolves
   `session-root` and `model-cache-root` beside it, and stamps every path entry with its origin, but
   neither merges nor validates: a global file's `default-model` may name a model only a repo

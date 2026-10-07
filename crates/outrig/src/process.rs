@@ -744,19 +744,76 @@ impl Transcript {
     /// Record one already-rendered logical line with the conventional
     /// `[prefix]` marker.
     pub async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
-        let rendered = format!("[{prefix}] {line}\n");
-        self.write_all(rendered.as_bytes()).await
+        self.write_all(render_line(prefix, line).as_bytes()).await
     }
 
     async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         if self.stderr {
-            let mut stderr = tokio::io::stderr();
-            stderr.write_all(bytes).await?;
-            stderr.flush().await?;
+            write_to_stderr(bytes).await?;
         }
         let mut file = self.file.lock().await;
         file.write_all(bytes).await?;
         file.flush().await
+    }
+}
+
+/// The one rendering of a command's line, so a line shown as it arrives and
+/// the same line recorded under `-v` read alike.
+fn render_line(prefix: &str, line: &str) -> String {
+    format!("[{prefix}] {line}\n")
+}
+
+/// Write to this process's stderr and wait for the bytes to land. tokio's
+/// stderr hands each write to a blocking thread and only `flush` waits for
+/// it, so a caller that orders a later `eprintln!` after this needs both.
+async fn write_to_stderr(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stderr = tokio::io::stderr();
+    stderr.write_all(bytes).await?;
+    stderr.flush().await
+}
+
+/// Where a captured command's lines go besides the caller's buffer.
+///
+/// A transcript records every line it is given and, under `-v`, mirrors it
+/// to stderr; the live sink writes to stderr and nowhere else. The two meet
+/// in one rule, applied at construction: a line reaches stderr once, however
+/// many sinks are on.
+#[derive(Clone, Debug)]
+pub(crate) struct Tee {
+    /// Also the only sink for what is recorded but never shown as it
+    /// happens: the `$ <cmd>` echo.
+    transcript: Option<Transcript>,
+    /// Write each line to this process's stderr as it arrives. Cleared when
+    /// `transcript` already mirrors there.
+    live_stderr: bool,
+}
+
+impl Tee {
+    pub(crate) fn new(transcript: Option<Transcript>, live_stderr: bool) -> Self {
+        let mirrored = transcript.as_ref().is_some_and(|t| t.stderr);
+        Self {
+            transcript,
+            live_stderr: live_stderr && !mirrored,
+        }
+    }
+
+    /// `[prefix] line` to every sink that is on.
+    ///
+    /// A transcript failure is returned: the caller asked for a record and
+    /// did not get one. A live failure is dropped: the view is best-effort,
+    /// and neither the drain nor the command stops over it.
+    async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
+        if self.transcript.is_none() && !self.live_stderr {
+            return Ok(());
+        }
+        let rendered = render_line(prefix, line);
+        if self.live_stderr {
+            let _ = write_to_stderr(rendered.as_bytes()).await;
+        }
+        match &self.transcript {
+            Some(t) => t.write_all(rendered.as_bytes()).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -831,8 +888,21 @@ pub(crate) async fn try_capture_logged_until(
     termination: Termination,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
-    let transcript = transcript.cloned();
-    if let Some(t) = &transcript {
+    let tee = Tee::new(transcript.cloned(), false);
+    try_capture_tee_until(cmd, prefix, tee, termination, stop).await
+}
+
+/// [`try_capture_logged_until`] over any [`Tee`]: the body every logged
+/// capture shares, so the recorded and the shown variants differ only in
+/// where their lines go.
+async fn try_capture_tee_until(
+    cmd: Cmd,
+    prefix: &'static str,
+    tee: Tee,
+    termination: Termination,
+    stop: impl Future<Output = ()>,
+) -> Result<Output> {
+    if let Some(t) = &tee.transcript {
         t.line(prefix, &format!("$ {}", cmd.render())).await?;
     }
 
@@ -842,12 +912,8 @@ pub(crate) async fn try_capture_logged_until(
     let started = Instant::now();
 
     let mut child = cmd.spawn_owned(StdioSpec::captured(), termination)?;
-    let stdout_task = Drain::spawn(capture_stream(
-        child.take_stdout(),
-        prefix,
-        transcript.clone(),
-    ));
-    let stderr_task = Drain::spawn(capture_stream(child.take_stderr(), prefix, transcript));
+    let stdout_task = Drain::spawn(capture_stream(child.take_stdout(), prefix, tee.clone()));
+    let stderr_task = Drain::spawn(capture_stream(child.take_stderr(), prefix, tee));
 
     // Pinned so the same signal can be awaited twice: once against the child,
     // and again against the drain that outlives it.
@@ -935,7 +1001,8 @@ pub(crate) async fn run_capture_logged(
 /// Separate rather than a fourth parameter on the common helper: `Kill` is
 /// right for every one of its callers but the build, and a parameter on all
 /// of them would bury the single exception in a column of identical
-/// arguments instead of naming it.
+/// arguments instead of naming it. [`run_capture_shown`] is the same shape
+/// for the other exception a session's build makes.
 pub(crate) async fn run_capture_logged_terminating(
     cmd: Cmd,
     prefix: &'static str,
@@ -957,6 +1024,42 @@ pub(crate) async fn run_capture_logged_terminating(
             output.status.code(),
             tail_string(&output.stderr, STDERR_TAIL_LIMIT),
         ))
+    }
+}
+
+/// [`run_capture_logged_terminating`] for the one command whose output is
+/// the point: a cache-miss `buildah build` or `podman pull` during session
+/// startup. Each line goes to this process's stderr as it arrives -- once,
+/// since a transcript that already mirrors there is left to do it -- so a
+/// build that takes minutes is seen to be running rather than hung.
+///
+/// No stderr tail on failure. The lines are already above the error, and
+/// repeating up to a mebibyte of them would bury it: the same reasoning as
+/// [`run_streamed_checked`].
+///
+/// Every line is on stderr before this returns. [`write_to_stderr`] waits for
+/// each write to land, and the drains are joined before the `Output` exists,
+/// so a caller's own `eprintln!` after the await lands after the last shown
+/// line.
+pub(crate) async fn run_capture_shown(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    termination: Termination,
+) -> Result<Output> {
+    let tee = Tee::new(transcript.cloned(), true);
+    let output = try_capture_tee_until(
+        cmd.clone(),
+        prefix,
+        tee,
+        termination,
+        std::future::pending(),
+    )
+    .await?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(cmd.process_error(output.status.code(), String::new()))
     }
 }
 
@@ -1129,11 +1232,7 @@ impl BoundedStderrTail {
     }
 }
 
-async fn capture_stream<R>(
-    stream: R,
-    prefix: &'static str,
-    transcript: Option<Transcript>,
-) -> std::io::Result<Vec<u8>>
+async fn capture_stream<R>(stream: R, prefix: &'static str, tee: Tee) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
@@ -1144,7 +1243,7 @@ where
     // transcript on a full disk used to end this loop with the child still
     // writing, which for a child whose read end this module holds open is a
     // stall rather than an error -- see the drain in [`run_streamed`].
-    let mut transcript_failed = None;
+    let mut tee_failed = None;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
@@ -1152,17 +1251,15 @@ where
             break;
         }
         captured.extend_from_slice(&line);
-        if let Some(t) = &transcript
-            && transcript_failed.is_none()
-        {
+        if tee_failed.is_none() {
             let rendered = String::from_utf8_lossy(&line);
             let rendered = rendered.trim_end_matches(['\r', '\n']);
-            if let Err(e) = t.line(prefix, rendered).await {
-                transcript_failed = Some(e);
+            if let Err(e) = tee.line(prefix, rendered).await {
+                tee_failed = Some(e);
             }
         }
     }
-    match transcript_failed {
+    match tee_failed {
         Some(e) => Err(e),
         None => Ok(captured),
     }

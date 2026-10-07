@@ -165,6 +165,21 @@ pub struct ImageBuildOutcome {
     pub cache_hit: bool,
 }
 
+/// Where a cache-miss `buildah build` or `podman pull` writes its output
+/// while it runs. See [`ensure_tagged_image_for_with_output`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildOutput {
+    /// Held in memory. A failure carries the last 1 MiB of stderr.
+    Captured,
+    /// Each line to this process's stderr as `[buildah] <line>` (or
+    /// `[podman] <line>` for a pull) as it arrives, so a build that takes
+    /// minutes is seen to be running. Once: a [`Transcript`] that already
+    /// mirrors to stderr suppresses the live copy. A failure carries no
+    /// stderr tail, because the lines are already above it.
+    Stderr,
+}
+
 pub(crate) struct CacheKey;
 
 impl CacheKey {
@@ -396,13 +411,38 @@ pub async fn pull_image(tag: &ImageTag) -> Result<()> {
 }
 
 /// Logged sibling of [`pull_image`] for session startup.
-async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
-    process::run_capture_logged(
+async fn pull_image_logged(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+    output: BuildOutput,
+) -> Result<()> {
+    run_shown_or_captured(
         Cmd::new("podman").arg("pull").arg(tag.as_str()),
         "podman",
         transcript,
+        process::Termination::Kill,
+        output,
     )
-    .await?;
+    .await
+}
+
+/// The one dispatch on [`BuildOutput`], so the two commands it governs
+/// cannot disagree about what each variant means.
+async fn run_shown_or_captured(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    termination: process::Termination,
+    output: BuildOutput,
+) -> Result<()> {
+    match output {
+        BuildOutput::Captured => {
+            process::run_capture_logged_terminating(cmd, prefix, transcript, termination).await?;
+        }
+        BuildOutput::Stderr => {
+            process::run_capture_shown(cmd, prefix, transcript, termination).await?;
+        }
+    }
     Ok(())
 }
 
@@ -466,13 +506,15 @@ async fn build_image_logged_with_build_args(
     no_cache: bool,
     transcript: Option<&Transcript>,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
+    output: BuildOutput,
 ) -> Result<()> {
     into_temp_tag(tag, transcript, async |temp_tag| {
-        process::run_capture_logged_terminating(
+        run_shown_or_captured(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
             transcript,
             build_termination(),
+            output,
         )
         .await?;
         stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, transcript).await
@@ -541,6 +583,9 @@ async fn ensure_image_for(
 /// framed against the selected image-config. This lets session startup
 /// write a complete `session.json` and open `logs/container.log` before the
 /// buildah probe/build begins, without hashing the Dockerfile/context twice.
+///
+/// A cache miss's build or pull is captured; see
+/// [`ensure_tagged_image_for_with_output`] to show it as it runs.
 pub async fn ensure_tagged_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -548,6 +593,35 @@ pub async fn ensure_tagged_image_for(
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_tagged_image_for_with_output(
+        image,
+        cfg,
+        repo_root,
+        tag,
+        no_cache,
+        transcript,
+        BuildOutput::Captured,
+    )
+    .await
+}
+
+/// [`ensure_tagged_image_for`] with a say in where a cache miss's `buildah
+/// build` or `podman pull` writes its output while it runs.
+///
+/// Only that one command honors `output`. The cache probe, the label commit
+/// that follows a build, and the `$ <cmd>` echo of each command are recorded
+/// by `transcript` alone, so what [`BuildOutput::Stderr`] adds to a plain
+/// session is the build itself and nothing a `--verbose` transcript would
+/// not also carry.
+pub async fn ensure_tagged_image_for_with_output(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+    transcript: Option<&Transcript>,
+    output: BuildOutput,
 ) -> Result<ImageBuildOutcome> {
     match cfg.source() {
         ImageSourceRef::Image { .. } => {
@@ -558,7 +632,7 @@ pub async fn ensure_tagged_image_for(
                     cache_hit: true,
                 });
             }
-            pull_image_logged(tag, transcript).await?;
+            pull_image_logged(tag, transcript, output).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag: tag.clone(),
@@ -581,6 +655,7 @@ pub async fn ensure_tagged_image_for(
                 no_cache,
                 transcript,
                 &build_args,
+                output,
             )
             .await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");

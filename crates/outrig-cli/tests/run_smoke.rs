@@ -75,23 +75,7 @@ fn xdg_config_home(repo: &Path) -> PathBuf {
 /// at the bottom, after the image-config. The provider and the model it serves
 /// go to the global config under [`xdg_config_home`].
 fn write_config(repo: &Path, mock_addr: &str, top: &str, agents: &str) {
-    let global_dir = xdg_config_home(repo).join("outrig");
-    std::fs::create_dir_all(&global_dir).expect("mkdir xdg/outrig");
-    let global_toml = format!(
-        r#"
-[providers.openai]
-style = "openai"
-base-url = "http://{addr}/v1"
-api-key = "${{OUTRIG_TEST_KEY}}"
-request-timeout-secs = 10
-
-[models.fast]
-provider = "openai"
-identifier = "gpt-4o-mini"
-"#,
-        addr = mock_addr,
-    );
-    std::fs::write(global_dir.join("config.toml"), global_toml).expect("write global config");
+    write_global_config(repo, mock_addr);
 
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
@@ -115,6 +99,112 @@ context = "{context}"
         context = context.display(),
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
+}
+
+/// The provider and the model every fixture resolves against, served by the
+/// mock at `mock_addr`, in the global config under [`xdg_config_home`].
+fn write_global_config(repo: &Path, mock_addr: &str) {
+    let global_dir = xdg_config_home(repo).join("outrig");
+    std::fs::create_dir_all(&global_dir).expect("mkdir xdg/outrig");
+    let global_toml = format!(
+        r#"
+[providers.openai]
+style = "openai"
+base-url = "http://{addr}/v1"
+api-key = "${{OUTRIG_TEST_KEY}}"
+request-timeout-secs = 10
+
+[models.fast]
+provider = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        addr = mock_addr,
+    );
+    std::fs::write(global_dir.join("config.toml"), global_toml).expect("write global config");
+}
+
+/// A repo whose image the content-hash cache has never seen, so the session
+/// has to build it: `dockerfile` is written under the repo and should carry
+/// [`miss_nonce`]. No MCP table, so the REPL opens with nothing to connect,
+/// and no agent, as [`write_agentless_config`] has none.
+fn write_miss_config(repo: &Path, mock_addr: &str, dockerfile: &str) {
+    write_global_config(repo, mock_addr);
+
+    let image_dir = repo.join("image");
+    std::fs::create_dir_all(&image_dir).expect("mkdir image");
+    std::fs::write(image_dir.join("Dockerfile"), dockerfile).expect("write Dockerfile");
+
+    let agents_dir = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+    let config_toml = format!(
+        r#"
+default-image = "smoke-miss"
+default-model = "fast"
+
+[images.smoke-miss]
+dockerfile = "{dockerfile}"
+context = "{context}"
+"#,
+        dockerfile = image_dir.join("Dockerfile").display(),
+        context = image_dir.display(),
+    );
+    std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
+}
+
+/// What makes a miss fixture a miss: the repo tempdir's name, which no earlier
+/// run of this binary can have used, reduced to what a shell word is happy
+/// with.
+fn miss_nonce(repo: &Path) -> String {
+    repo.file_name()
+        .and_then(|name| name.to_str())
+        .expect("tempdir name is UTF-8")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+/// A final chat-completions reply saying `content`, for a session with no
+/// tools to call.
+fn plain_reply(content: &str) -> Value {
+    json!({
+        "id": "chatcmpl-plain",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+}
+
+/// The image a cache-miss run built, removed on drop so a failed assertion
+/// cannot leave it behind. Best-effort, and blocking because `Drop` is.
+struct BuiltImage(Option<String>);
+
+impl BuiltImage {
+    /// The tag off the `[outrig] image ready: <tag> (built) (..)` line, if the
+    /// run got that far.
+    fn from_stderr(stderr: &str) -> Self {
+        let tag = stderr
+            .lines()
+            .find_map(|line| line.split("[outrig] image ready: ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .map(str::to_string);
+        Self(tag)
+    }
+}
+
+impl Drop for BuiltImage {
+    fn drop(&mut self) {
+        if let Some(tag) = &self.0 {
+            let _ = std::process::Command::new("buildah")
+                .args(["rmi", tag])
+                .output();
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -314,6 +404,275 @@ async fn run_without_an_agent_sends_no_preamble() {
             .any(|m| m.get("role").and_then(Value::as_str) == Some("system")),
         "an agentless session must send no system message; got: {}",
         serde_json::to_string(messages).expect("messages serialize"),
+    );
+}
+
+/// A cache miss shows its build as it runs. Both of buildah's streams reach
+/// stderr -- a `RUN`'s stdout and its stderr alike -- as `[buildah]` lines
+/// between `ensuring image` and `image ready`, each once, with no command
+/// echo and no `container.log`, which stay behind `--verbose`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_miss_shows_the_build_on_a_plain_run() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let (mock_addr, _requests) =
+        start_mock_http(vec![CannedResponse::ok(plain_reply("built fine"))]).await;
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let nonce = miss_nonce(repo_dir.path());
+    write_miss_config(
+        repo_dir.path(),
+        &mock_addr.to_string(),
+        &format!(
+            "FROM docker.io/library/alpine:latest\n\
+             # cache-bust: {nonce}\n\
+             RUN echo outrig-e2e-miss-{nonce}\n\
+             RUN echo outrig-e2e-miss-err-{nonce} 1>&2\n"
+        ),
+    );
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+        ],
+        repo_dir.path(),
+    )
+    .await;
+    let _built = BuiltImage::from_stderr(&captured.stderr);
+
+    assert!(
+        captured.status.success(),
+        "outrig run exited with {:?}; stderr was: {}",
+        captured.status,
+        captured.stderr
+    );
+    assert_stderr_lines_in_order(
+        &captured.stderr,
+        &[
+            "[outrig] ensuring image smoke-miss:",
+            "[buildah] STEP 1/",
+            &format!("[buildah] outrig-e2e-miss-{nonce}"),
+            &format!("[buildah] outrig-e2e-miss-err-{nonce}"),
+            "[outrig] image ready: smoke-miss:",
+            "[outrig] starting container",
+        ],
+    );
+    let ready = captured
+        .stderr
+        .lines()
+        .find(|line| line.contains("[outrig] image ready:"))
+        .expect("image ready line");
+    assert!(
+        ready.contains("(built)"),
+        "a miss is reported as built: {ready}"
+    );
+    assert_eq!(
+        captured.stderr.matches("[buildah] STEP 1/").count(),
+        1,
+        "each build line is shown once: {}",
+        captured.stderr
+    );
+    assert!(
+        !captured.stderr.contains("[buildah] $"),
+        "the command echo stays behind --verbose: {}",
+        captured.stderr
+    );
+    assert!(
+        !captured.stderr.contains("[podman] $"),
+        "the command echo stays behind --verbose: {}",
+        captured.stderr
+    );
+    assert!(
+        !session_dir.path().join("logs/container.log").exists(),
+        "a plain run writes no container.log"
+    );
+    assert!(
+        captured.stdout.contains("built fine"),
+        "stdout lacked canned reply: {}",
+        captured.stdout
+    );
+}
+
+/// Under `--verbose` the transcript already mirrors every line to stderr, so
+/// the shown build adds nothing: each line once, plus the command echo, and
+/// all of it in `container.log`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_miss_under_verbose_prints_each_build_line_once() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let (mock_addr, _requests) =
+        start_mock_http(vec![CannedResponse::ok(plain_reply("built fine"))]).await;
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let nonce = miss_nonce(repo_dir.path());
+    write_miss_config(
+        repo_dir.path(),
+        &mock_addr.to_string(),
+        &format!(
+            "FROM docker.io/library/alpine:latest\n\
+             # cache-bust: {nonce}\n\
+             RUN echo outrig-e2e-miss-{nonce}\n"
+        ),
+    );
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+            "-v",
+        ],
+        repo_dir.path(),
+    )
+    .await;
+    let _built = BuiltImage::from_stderr(&captured.stderr);
+
+    assert!(
+        captured.status.success(),
+        "outrig run -v exited with {:?}; stderr was: {}",
+        captured.status,
+        captured.stderr
+    );
+    assert_eq!(
+        captured.stderr.matches("[buildah] STEP 1/").count(),
+        1,
+        "a mirrored transcript is not doubled by the shown build: {}",
+        captured.stderr
+    );
+    assert_eq!(
+        captured
+            .stderr
+            .matches(&format!("[buildah] outrig-e2e-miss-{nonce}"))
+            .count(),
+        1,
+        "a mirrored transcript is not doubled by the shown build: {}",
+        captured.stderr
+    );
+    assert!(
+        captured.stderr.contains("[buildah] $ buildah build"),
+        "--verbose adds the command echo: {}",
+        captured.stderr
+    );
+
+    let log_path = session_dir.path().join("logs/container.log");
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", log_path.display()));
+    assert!(
+        log.contains("[buildah] $ buildah build"),
+        "container.log lacked the build command: {log}"
+    );
+    assert!(
+        log.contains("[buildah] STEP 1/"),
+        "container.log lacked the build output: {log}"
+    );
+}
+
+/// A failing build's lines were on stderr as they arrived, so the error that
+/// ends the session carries no tail to repeat them with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_build_on_a_plain_run_does_not_repeat_its_output() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let nonce = miss_nonce(repo_dir.path());
+    // The model is never reached; any closed port will do.
+    write_miss_config(
+        repo_dir.path(),
+        "127.0.0.1:1",
+        &format!(
+            "FROM docker.io/library/alpine:latest\n\
+             # cache-bust: {nonce}\n\
+             RUN false\n"
+        ),
+    );
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+        ],
+        repo_dir.path(),
+    )
+    .await;
+
+    assert!(
+        !captured.status.success(),
+        "a failed build must fail the run; stderr was: {}",
+        captured.stderr
+    );
+    assert_eq!(
+        captured
+            .stderr
+            .matches("[buildah] STEP 2/2: RUN false")
+            .count(),
+        1,
+        "the failing step is shown once: {}",
+        captured.stderr
+    );
+    assert!(
+        captured
+            .stderr
+            .contains("error: process `buildah` exited with code 1"),
+        "the error names the exit: {}",
+        captured.stderr
+    );
+    assert_eq!(
+        captured
+            .stderr
+            .matches("building at STEP \"RUN false\"")
+            .count(),
+        1,
+        "buildah's own error line is shown once and not repeated in the error's tail: {}",
+        captured.stderr
+    );
+    for absent in [
+        "[outrig] image ready:",
+        "[outrig] starting container",
+        "[buildah] $",
+    ] {
+        assert!(
+            !captured.stderr.contains(absent),
+            "{absent:?} must not appear: {}",
+            captured.stderr
+        );
+    }
+    assert!(
+        !session_dir.path().join("logs/container.log").exists(),
+        "a plain run writes no container.log"
     );
 }
 

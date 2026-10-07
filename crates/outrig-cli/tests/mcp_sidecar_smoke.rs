@@ -302,6 +302,11 @@ async fn sidecar_hosts_servers_with_labels_record_and_clean_reap() {
     eprintln!("--- subprocess stderr ---\n{stderr}");
 
     assert!(status.success(), "clean EOF exit expected: {stderr}");
+    assert!(
+        stderr.contains("[outrig] ensuring sidecar image ")
+            && stderr.contains("[outrig] sidecar image ready: "),
+        "a sidecar image reports its progress pair: {stderr}"
+    );
     let leftovers = podman_names(&format!("label=org.outrig.session={sid}")).await;
     assert!(
         leftovers.is_empty(),

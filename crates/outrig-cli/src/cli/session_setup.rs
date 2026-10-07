@@ -51,7 +51,7 @@ use outrig::container::{
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
 use outrig::error::IoPathExt;
-use outrig::image::{self, ImageTag};
+use outrig::image::{self, BuildOutput, ImageBuildOutcome, ImageTag};
 use outrig::network::NetworkInterceptor;
 use outrig::{McpClient, Transcript};
 
@@ -93,6 +93,18 @@ fn format_elapsed(duration: Duration) -> String {
         return format!("{:.1}s", duration.as_secs_f64());
     }
     format!("{}m{:02}s", secs / 60, secs % 60)
+}
+
+/// The parenthetical an `image ready` line carries: how the image came to
+/// exist. One function so the primary's and a sidecar's lines cannot drift.
+fn cache_status(raw_local_image: bool, outcome: &ImageBuildOutcome) -> &'static str {
+    if raw_local_image {
+        "local image"
+    } else if outcome.cache_hit {
+        "cache hit"
+    } else {
+        "built"
+    }
 }
 
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
@@ -605,32 +617,31 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         }
     } else {
         let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
+        // A cache miss shows its build as it runs: `ensuring image` followed by
+        // minutes of nothing reads as a hang, and the Ctrl-C that answers one
+        // throws the partial build away. The `-v` transcript, when there is
+        // one, already mirrors to stderr and is left to do it.
         let ensure = async {
             if raw_local_image {
                 image::ensure_local_image(&image_tag, transcript.as_ref()).await
             } else {
-                image::ensure_tagged_image_for(
+                image::ensure_tagged_image_for_with_output(
                     &image_cfg_name,
                     &image_cfg,
                     &repo_root,
                     &image_tag,
                     false,
                     transcript.as_ref(),
+                    BuildOutput::Stderr,
                 )
                 .await
             }
         };
         let image_outcome = signals.race(ensure).await.map_err(fail)?;
-        let cache_status = if raw_local_image {
-            "local image"
-        } else if image_outcome.cache_hit {
-            "cache hit"
-        } else {
-            "built"
-        };
         span.done(format!(
-            "image ready: {} ({cache_status})",
-            image_outcome.tag
+            "image ready: {} ({})",
+            image_outcome.tag,
+            cache_status(raw_local_image, &image_outcome)
         ));
 
         let span = ProgressSpan::start(format!("starting container {container_name}"));
@@ -824,9 +835,10 @@ async fn setup_sidecars_and_network(
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
     // Phase A -- ensure each distinct sidecar image (and read its labels when a
-    // label-honoring sidecar needs them) concurrently. Sidecars are independent,
-    // so their podman-heavy ensure/inspect work overlaps; the results are
-    // consumed below in deterministic name order.
+    // label-honoring sidecar needs them). Sidecars are independent, so their
+    // podman-heavy label inspects overlap; the ensures run one at a time so a
+    // cache miss's shown build is not interleaved with another's. The results
+    // are consumed below in deterministic name order.
     let resolutions =
         resolve_sidecar_images(&plan, args.cfg, args.repo_root, args.transcript).await;
 
@@ -911,11 +923,18 @@ struct ImageResolution {
     labels: Option<std::result::Result<BTreeMap<String, McpServerSpec>, String>>,
 }
 
-/// Ensure every distinct sidecar image (and read its labels when needed)
-/// concurrently, deduped by image ref so two sidecars sharing an image run the
-/// tag-compute + ensure + label-inspect once. `join_all` runs the futures on
-/// the current task, so the borrowed inputs need no `'static` and nothing is
+/// Ensure every distinct sidecar image (and read its labels when needed),
+/// deduped by image ref so two sidecars sharing an image run the tag compute,
+/// the ensure, and the label inspect once. `join_all` runs the futures on the
+/// current task, so the borrowed inputs need no `'static` and nothing is
 /// cloned beyond the image key.
+///
+/// The ensures take turns; the label reads overlap. An ensure that misses the
+/// cache shows its `buildah build` as it runs, and two of those at once would
+/// interleave their `[buildah]` lines and split each one's progress pair --
+/// the reason `outrig build --all` builds serially too. The turn also covers
+/// the tag hash and the cache probe, which is what a warm start pays for it:
+/// one probe after another instead of all at once, tens of milliseconds each.
 async fn resolve_sidecar_images(
     plan: &SessionMcpPlan,
     cfg: &Config,
@@ -930,8 +949,14 @@ async fn resolve_sidecar_images(
         *images.entry(sc.image.as_str()).or_default() |= plan.sidecar_honors_labels(sc);
     }
 
+    let one_ensure_at_a_time = tokio::sync::Mutex::new(());
+    let one_ensure_at_a_time = &one_ensure_at_a_time;
     futures_util::future::join_all(images.into_iter().map(|(image, read_labels)| async move {
-        let resolution = match ensure_sidecar_image(cfg, repo_root, image, transcript).await {
+        let ensured = {
+            let _turn = one_ensure_at_a_time.lock().await;
+            ensure_sidecar_image(cfg, repo_root, image, transcript).await
+        };
+        let resolution = match ensured {
             Ok(tag) => {
                 let labels = if read_labels {
                     Some(
@@ -1160,23 +1185,39 @@ fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliErr
 /// Resolve and ensure a sidecar's image with `--image`-identical semantics:
 /// an `[images.<name>]` config name builds through the content-hash cache; an
 /// unmatched name is a raw podman ref that must be present locally.
+///
+/// Reports a progress pair like the primary's, and shows a cache miss's build
+/// as it runs for the same reason: without them a sidecar that needs building
+/// is a silent pause between `container user ready` and whatever comes next.
 async fn ensure_sidecar_image(
     cfg: &Config,
     repo_root: &Path,
     image_name: &str,
     transcript: Option<&Transcript>,
 ) -> Result<ImageTag> {
+    let span = ProgressSpan::start(format!("ensuring sidecar image {image_name}"));
     let (image_cfg, raw_local) = resolve_image_config(cfg, image_name, true)?;
-    if raw_local {
-        let tag = ImageTag::new(image_name);
-        image::ensure_local_image(&tag, transcript).await?;
-        Ok(tag)
+    let outcome = if raw_local {
+        image::ensure_local_image(&ImageTag::new(image_name), transcript).await?
     } else {
         let tag = image::compute_tag_for(image_name, &image_cfg, repo_root).await?;
-        image::ensure_tagged_image_for(image_name, &image_cfg, repo_root, &tag, false, transcript)
-            .await?;
-        Ok(tag)
-    }
+        image::ensure_tagged_image_for_with_output(
+            image_name,
+            &image_cfg,
+            repo_root,
+            &tag,
+            false,
+            transcript,
+            BuildOutput::Stderr,
+        )
+        .await?
+    };
+    span.done(format!(
+        "sidecar image ready: {} ({})",
+        outcome.tag,
+        cache_status(raw_local, &outcome)
+    ));
+    Ok(outcome.tag)
 }
 
 /// The launch inputs every sidecar container shares, whichever path starts

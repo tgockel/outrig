@@ -382,10 +382,12 @@ alphanumeric separated by `.`, `_`, or `-` -- and `outrig` rejects invalid names
 
 A change to the `Dockerfile`, any file in the context, build args, or `[images.<name>.mcp]`
 causes a rebuild on the next `outrig run` or `outrig build`. Otherwise the cache hit is
-immediate. To force a rebuild without changing files, run `outrig build --no-cache`. In a git
-repo, unless `.gitignore` excludes the context whole, a file it excludes does not count when the
-`Dockerfile` copies it by its own path, so run `outrig build --no-cache` after changing one. A
-symlink counts by what it points at, ignored or not, since copying the link copies that.
+immediate. Either command shows the build as it runs, as `[buildah]` lines on stderr (`[podman]`
+lines for a pull), so a rebuild is visible rather than a pause before `image ready`. To force a
+rebuild without changing files, run `outrig build --no-cache`. In a git repo, unless
+`.gitignore` excludes the context whole, a file it excludes does not count when the `Dockerfile`
+copies it by its own path, so run `outrig build --no-cache` after changing one. A symlink counts
+by what it points at, ignored or not, since copying the link copies that.
 
 Image-name configs use podman's local image store directly; there is no `<name>:<hash>`
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the

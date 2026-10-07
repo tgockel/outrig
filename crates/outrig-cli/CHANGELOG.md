@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output stays at `warn` unless the filter names `rustyline`. See
   [Line editing and history](../../doc/usage/run.md#line-editing-and-history).
 
+### Changed
+
+- **A cache miss during `outrig run` and `outrig mcp` startup shows the build as it happens.**
+  `[outrig] ensuring image <tag>` used to be followed by silence for as long as `buildah build`
+  took, which on a first run looked like a hang. The build's output (or the `podman pull` for an
+  `image-name` config) now streams to stderr as `[buildah]` / `[podman]` lines between
+  `ensuring image` and `image ready`, without `--verbose`; `-v` still adds the command lines and
+  `container.log`, and each line appears once. Sidecar images report `ensuring sidecar image
+  <name>` / `sidecar image ready: <tag> (..)` and are ensured one at a time so two builds never
+  interleave, while their label reads stay concurrent. stdout is untouched, so `outrig mcp`'s
+  JSON-RPC channel is unaffected, and a failed build no longer repeats its output inside the
+  error. (#478)
+
 ### Fixed
 
 - **The session root is the global config's, from every directory.** `outrig ls`, `logs`, `discard`,

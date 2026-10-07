@@ -1,9 +1,10 @@
 //! Unit tests for `process`: covers all four call patterns (`run_capture`,
 //! `try_capture_logged`, `run_streamed`, `spawn_stdio`), the structured
 //! `Process` error variant, the spawn/exit tracing every podman invocation
-//! relies on, the honest stderr-tail truncation behavior, and both halves of
-//! the ownership guarantee -- the bound a dropped future gets and the
-//! confirmed reap a stop signal gets.
+//! relies on, the honest stderr-tail truncation behavior, the once-only rule
+//! of the `Tee` behind `run_capture_shown`, and both halves of the ownership
+//! guarantee -- the bound a dropped future gets and the confirmed reap a stop
+//! signal gets.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -18,7 +19,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::error::OutrigError;
 
-use super::{Cmd, Termination, Transcript};
+use super::{Cmd, Tee, Termination, Transcript};
 
 /// Ceiling for the drop path. Termination is synchronous and the reap is one
 /// task hop, so the real figure is microseconds; this is margin for a loaded
@@ -1183,7 +1184,7 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
 
     let drained = tokio::time::timeout(
         Duration::from_secs(20),
-        super::capture_stream(reader, "test", Some(transcript)),
+        super::capture_stream(reader, "test", Tee::new(Some(transcript), false)),
     )
     .await
     .expect("the drain stopped reading and never returned");
@@ -1197,6 +1198,78 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         .expect("the writer was left blocked on a stream nobody was draining")
         .expect("the pump task panicked")
         .expect("the writer must have been able to finish");
+}
+
+// ---------------------------------------------------------------------------
+// The shown capture: a line reaches stderr once, and a failure has no tail
+// ---------------------------------------------------------------------------
+
+/// The rule lives in the constructor, so it is the constructor under test:
+/// the live sink is on only when nothing else already writes to stderr.
+///
+/// Constructing a mirroring transcript writes nothing until a line is given,
+/// so the test binary's own fd 2 is never touched. The write itself cannot be
+/// observed in-process -- tokio's stderr bypasses libtest's capture -- and is
+/// pinned end to end by `run_smoke`'s cache-miss cases instead.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tee_writes_live_only_when_the_transcript_does_not_already() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mirroring = Transcript::create(&dir.path().join("mirroring.log"), true)
+        .await
+        .expect("create transcript");
+    let recording = Transcript::create(&dir.path().join("recording.log"), false)
+        .await
+        .expect("create transcript");
+
+    assert!(Tee::new(None, true).live_stderr);
+    assert!(Tee::new(Some(recording), true).live_stderr);
+    assert!(
+        !Tee::new(Some(mirroring.clone()), true).live_stderr,
+        "a transcript already mirroring to stderr leaves the line to it"
+    );
+    assert!(!Tee::new(None, false).live_stderr);
+    assert!(!Tee::new(Some(mirroring), false).live_stderr);
+}
+
+/// A shown command's lines were on stderr as they arrived, so its failure
+/// carries nothing to repeat them with -- the `Process` error has the exit
+/// code and an empty tail, as a streamed failure does.
+///
+/// The child writes a line to stderr before it fails, so a tail that kept
+/// the child's stderr would carry that line and fail the assertion. Being
+/// shown, the line also reaches this test binary's own fd 2: one `[test]`
+/// line in the test output is this test working.
+#[tokio::test(flavor = "current_thread")]
+async fn a_shown_failure_carries_no_tail() {
+    // Reaches the spawn/exit callsites with no subscriber installed. See
+    // `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
+    // The shell assembles the marker, so it is in the child's stderr but not
+    // in the argv the error prints.
+    let marker = "a shown line the error must not repeat";
+    let script = "m=repeat; echo \"a shown line the error must not $m\" >&2; exit 3";
+    let err = super::run_capture_shown(
+        Cmd::new("/bin/sh").args(["-c", script]),
+        "test",
+        None,
+        Termination::Kill,
+    )
+    .await
+    .expect_err("exit 3 must fail");
+    let OutrigError::Process {
+        exit_code,
+        stderr_tail,
+        ..
+    } = &err
+    else {
+        panic!("expected a Process error, got {err:?}");
+    };
+    assert_eq!(*exit_code, Some(3));
+    assert_eq!(stderr_tail, "", "a shown failure repeats nothing");
+    assert!(
+        !err.to_string().contains(marker),
+        "the rendered error must not repeat a shown line: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

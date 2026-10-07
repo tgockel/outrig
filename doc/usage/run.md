@@ -74,14 +74,20 @@ Normal startup progress is always printed to stderr so slow container or MCP sta
 progress lines. Tracing filters come from `OUTRIG_LOG` first, then `RUST_LOG` if `OUTRIG_LOG`
 is unset -- a set `OUTRIG_LOG` shadows `RUST_LOG` entirely.
 
+When the image is not cached, the `buildah build` (or the `podman pull` for an `image-name`
+config) that produces it is shown as it runs, as `[buildah]` / `[podman]` lines between
+`ensuring image` and `image ready`, so a first run does not look hung. `--verbose` is not
+required for that either; it adds the command line itself and writes everything to
+`container.log`. Sidecar images report the same way, one at a time.
+
 Three levels of detail, in increasing order:
 
-| Setting               | What it adds                                                     |
-|-----------------------|------------------------------------------------------------------|
-| (none)                | Progress lines only: one per startup phase, with elapsed time.   |
-| `RUST_LOG=debug`      | Every buildah/podman command line, plus its exit code and timing. |
+| Setting               | What it adds                                                           |
+|-----------------------|------------------------------------------------------------------------|
+| (none)                | Progress lines, plus the output of a build or pull on a cache miss.    |
+| `RUST_LOG=debug`      | Every buildah/podman command line, plus its exit code and timing.      |
 | `--verbose` (`-v`)    | The full command *output* transcript, also written to `container.log`. |
-| `-vv`                 | Trace-level logs from outrig's own modules.                      |
+| `-vv`                 | Trace-level logs from outrig's own modules.                            |
 
 A phase that stalls between progress lines is a stalled child process. `RUST_LOG=debug` names
 the exact command it is waiting on, which is the fastest way to reproduce the stall by hand:
@@ -188,7 +194,8 @@ tools) and `shell` is unavailable. Full details in
    [the built-in default](#the-built-in-default-image).
 3. **Build/cache/probe the image.** Config build images run `buildah build` or
    cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
-   local-only and are checked with `podman image exists`.
+   local-only and are checked with `podman image exists`. A build or pull streams
+   its output to stderr while it runs.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
    become additional `-v` binds. The trailing `sleep infinity` is the container's command and
@@ -266,6 +273,22 @@ A typical startup looks like:
 [outrig] entering REPL
 >
 ```
+
+When the image is not cached, the build runs between `ensuring image` and `image ready`, and its
+output is shown as it happens:
+
+```
+[outrig] ensuring image coding:8c2a4f7e91d6b5a3
+[buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
+[buildah] STEP 2/6: RUN apt-get update && apt-get install -y git
+...
+[outrig] image ready: coding:8c2a4f7e91d6b5a3 (built) (4m12s)
+```
+
+The lines are buildah's own (`podman pull`'s, as `[podman]`, for an `image-name` config). Without
+`--verbose` the command line itself is not shown and nothing is written to `container.log`; with
+it, each line still appears once. A sidecar image that needs building shows the same, under its
+own `ensuring sidecar image <name>` / `sidecar image ready` pair.
 
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
 the assistant's natural-language reply. For in-process `mistralrs` models, that reply is flushed
