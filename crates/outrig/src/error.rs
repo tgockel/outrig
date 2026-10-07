@@ -259,6 +259,22 @@ pub enum OutrigError {
         #[source]
         source: tokio::task::JoinError,
     },
+
+    /// One of an attachment's listeners stopped taking the container's
+    /// traffic before teardown asked it to: its socket failed in a way it
+    /// cannot recover from, or it was still failing when it was stopped.
+    ///
+    /// The redirect stays installed until detach, so from then on that traffic
+    /// was refused rather than let through -- the container lost it, and this
+    /// is what says so.
+    #[error("the interceptor's {listener} listener stopped taking traffic: {source}")]
+    #[non_exhaustive]
+    NetworkListenerFailed {
+        /// `"tcp"` or `"dns"`.
+        listener: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl From<tempfile::PersistError> for OutrigError {

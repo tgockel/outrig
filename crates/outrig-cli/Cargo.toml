@@ -60,7 +60,7 @@ hf-hub             = { workspace = true, optional = true, features = ["tokio"] }
 indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
 mistralrs-core     = { workspace = true, optional = true }
-nix                = { workspace = true, features = ["term", "user"] }
+nix                = { workspace = true, features = ["resource", "term", "user"] }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }

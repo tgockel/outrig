@@ -128,8 +128,8 @@ Accepted modes:
 
 - `default`: use Podman's configured default networking, do not install the interceptor, and do
   not write `logs/network.jsonl`.
-- `audit`: allow all outbound session-container traffic, but write Zeek `conn.log`-style
-  records to `<session_dir>/logs/network.jsonl`.
+- `audit`: allow all outbound session-container traffic, short of the per-container connection
+  limit below, but write Zeek `conn.log`-style records to `<session_dir>/logs/network.jsonl`.
 - `filter`: install the same interceptor as audit mode, write the same audit log, and enforce
   global allow/deny policy before opening upstream TCP connections. Traffic the interceptor
   cannot carry -- UDP to any port but 53, ICMP, anything else -- follows `default` directly.
@@ -141,8 +141,12 @@ outbound TCP and UDP/53 over both IPv4 and IPv6, and removes the nftables table 
 A lookup a tool sends to some other resolver address, such as `dig @8.8.8.8`, is redirected to
 the same listener and answered from the address it was sent to. The listener forwards each
 lookup on its own, up to 64 at once per container, so one name a host resolver is slow to answer
-does not hold up the container's other lookups. If either mode is requested and setup fails, the
-session fails before MCP servers launch.
+does not hold up the container's other lookups. TCP connections are carried up to 256 at once per
+container, in either mode: each holds two of outrig's open files, and the limit keeps one container
+from taking all of them. A connection past it is closed as soon as it is accepted and recorded with
+`outrig.action = "deny"` and `outrig.rule = "connection-limit"`. For the same reason `outrig`
+raises its own soft open-file limit to the hard limit when it starts. If either mode is requested
+and setup fails, the session fails before MCP servers launch.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback

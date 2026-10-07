@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig` raises its soft open-file limit to the hard limit when it starts.** The soft limit is
+  commonly 1024. Under `--network audit` or `filter` each connection a container makes holds two
+  of outrig's descriptors, so a few busy containers could exhaust the limit together. LLM calls
+  and `podman exec` pipes then failed with the container's connections. The library's
+  per-container cap of 256 connections keeps one container from doing this alone; the higher
+  limit covers several. A limit that cannot be raised is left as it was.
 - **Every `5xx` from an LLM endpoint is retried, as documented.** Only `500`, `502`, `503`, and
   `504` were. Any other `5xx` -- Anthropic's `529` "overloaded", Cloudflare's `520`-`527` in
   front of a proxied endpoint -- ended `outrig run` on its first occurrence and tore the session

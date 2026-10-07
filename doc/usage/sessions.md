@@ -188,7 +188,9 @@ the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, a
 metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`,
 `outrig.host`, and `outrig.host_source`. The last of those is `resolved` when the name in
 `outrig.host` is one the interceptor validated for that address and `asserted` when the
-container merely claimed it -- only a resolved name can have granted a hostname allow rule.
+container merely claimed it -- only a resolved name can have granted a hostname allow rule. A
+connection refused because its container already had 256 open through the interceptor is recorded
+with `outrig.action` `deny` and `outrig.rule` `connection-limit`.
 
 Interception ends with the session, and ending it is the exact inverse of starting it. Every
 connection still open through the interceptor is cut, and each one is recorded before teardown
@@ -209,11 +211,12 @@ table something replaced under that name is left alone and so is a namespace thi
 reaches by a pid that has since been reused.
 
 If any part of that fails -- the resolver cannot be written back, the rules cannot be removed,
-a task does not end -- the remaining parts still run, and the failure is *returned* rather than
-logged and swallowed. Returned to the caller of the interceptor, that is: a library embedding
-outrig gets it and decides. `outrig` the command is one such caller, and what it decides is to
-log it and carry on stopping containers, because stopping them is the more urgent half, so from
-the command line these failures appear in `container.log` rather than in the exit status.
+a task does not end, a listener had stopped taking the container's traffic before teardown began
+-- the remaining parts still run, and the failure is *returned* rather than logged and swallowed.
+Returned to the caller of the interceptor, that is: a library embedding outrig gets it and
+decides. `outrig` the command is one such caller, and what it decides is to log it and carry on
+stopping containers, because stopping them is the more urgent half, so from the command line these
+failures appear in `container.log` rather than in the exit status.
 
 Attaching has the same property from the other side: a failed or interrupted attach leaves the
 container exactly as it found it, so a container never ends up resolving to a listener that is

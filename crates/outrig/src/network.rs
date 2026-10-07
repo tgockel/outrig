@@ -24,6 +24,7 @@ use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Write as _};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -83,6 +84,21 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// the attachment's bound on those. Past it the listener stops reading and
 /// the backlog waits in its receive buffer.
 const DNS_IN_FLIGHT: usize = 64;
+/// How many connections one attachment carries at once. Each holds two of the
+/// process's descriptors -- the container's end and the upstream one -- and
+/// the usual soft limit on those is 1024, so this keeps one container from
+/// taking every descriptor outrig has. Past it a connection is closed as soon
+/// as it is accepted and recorded as denied by [`CONNECTION_LIMIT_RULE`].
+const TCP_CONNECTIONS: usize = 256;
+/// The `outrig.rule` a connection refused for [`TCP_CONNECTIONS`] is recorded
+/// under. Policy rules are labelled `default`, `allow[N]` and `deny[N]`, so it
+/// cannot be read as one of them.
+const CONNECTION_LIMIT_RULE: &str = "connection-limit";
+/// How long a listener waits before trying again after a failure that is not
+/// about one connection -- out of descriptors, buffers, memory. Connections
+/// finishing is what frees those, which takes time, and trying again at once
+/// would only spin. A second is what hyper and axum wait.
+const LISTENER_BACKOFF: Duration = Duration::from_secs(1);
 /// How much of a client's opening bytes is examined for an asserted name. A
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
@@ -448,8 +464,9 @@ struct Attachment {
     cancel: CancellationToken,
     /// The accept and DNS loops. A `JoinSet` rather than handles because
     /// dropping one aborts what it holds: an interceptor that is dropped
-    /// rather than shut down leaves nothing behind still moving bytes.
-    tasks: JoinSet<()>,
+    /// rather than shut down leaves nothing behind still moving bytes. Each
+    /// ends in an error if its listener stopped taking traffic first.
+    tasks: JoinSet<Result<()>>,
     rollback: Rollback,
     transcript: Option<Transcript>,
     /// This container's handle on the session's audit sink, kept so teardown
@@ -774,14 +791,19 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
 /// need no such wait: it aborts them itself on the way out, and they owe
 /// nothing that would be lost if it were aborted first.
-async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
+///
+/// A task that returned an error is reported with it: that is a listener
+/// that had stopped taking traffic before it was asked to.
+async fn stop_tasks(tasks: &mut JoinSet<Result<()>>) -> Vec<OutrigError> {
     let mut failures = Vec::new();
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while let Some(joined) = tasks.join_next().await {
             // Nothing has been aborted yet, so the only way a join fails
             // inside the grace is a task that panicked.
-            if let Err(source) = joined {
-                failures.push(OutrigError::NetworkTaskPanicked { source });
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failures.push(e),
+                Err(source) => failures.push(OutrigError::NetworkTaskPanicked { source }),
             }
         }
     })
@@ -790,7 +812,15 @@ async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
         failures.push(OutrigError::NetworkTasksAborted {
             grace: SHUTDOWN_GRACE,
         });
-        tasks.shutdown().await;
+        // Joined one by one rather than through `shutdown`, which discards
+        // what each returned: a loop that ended on a failure just as the grace
+        // ran out still owes the report.
+        tasks.abort_all();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(Err(e)) = joined {
+                failures.push(e);
+            }
+        }
     }
     failures
 }
@@ -1517,6 +1547,11 @@ impl AuditSink {
         }
     }
 
+    /// Whose records this handle writes, as losses are filed.
+    fn owner(&self) -> AuditOwner {
+        (self.generation, self.container.clone())
+    }
+
     #[cfg(test)]
     fn for_container(&self, container: &str) -> Self {
         self.for_attachment(container, 0)
@@ -1619,7 +1654,7 @@ impl AuditSink {
             return Vec::new();
         };
         unwritten
-            .remove(&(self.generation, self.container.clone()))
+            .remove(&self.owner())
             .map(|loss| OutrigError::NetworkAuditUnwritten {
                 container: self.container.clone(),
                 integrity: loss.integrity.map(Box::new),
@@ -1630,7 +1665,7 @@ impl AuditSink {
             .collect()
     }
 
-    /// Queues one record for the writer.
+    /// Queues one record for the writer and waits until it is in the file.
     ///
     /// The bytes never leave this task, so nothing a caller does can cut a
     /// record in half: what gets cancelled here is the *queueing*, which
@@ -1638,6 +1673,40 @@ impl AuditSink {
     /// reported -- a connection cancelled that late is one teardown aborted,
     /// and says so.
     async fn write(&self, record: &AuditRecord) -> Result<()> {
+        let written = self.queue(record).await?;
+        // Deliberately *not* released on this error: the writer took the
+        // record and then died holding it, so it is one of the records
+        // `close` reports, under the owner that is still counted here.
+        written.await.map_err(|_| {
+            OutrigError::Configuration("the network audit writer has stopped".to_string())
+        })
+    }
+
+    /// Queues one record without waiting for it to be written, unless
+    /// `cancel` comes first while the queue is full. Then the record is counted
+    /// as lost rather than waited for, so the teardown that cancelled it finds
+    /// it in this attachment's losses instead of finding it missing unsaid.
+    async fn queue_unless(&self, record: &AuditRecord, cancel: &CancellationToken) -> Result<()> {
+        tokio::select! {
+            // Queueing first: a record the writer can take now is one that
+            // does not have to be reported lost.
+            biased;
+            queued = self.queue(record) => queued.map(drop),
+            _ = cancel.cancelled() => {
+                Self::remember_unwritten(
+                    &self.unwritten,
+                    &self.owner(),
+                    io::Error::other("teardown began before the record could be queued"),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The queueing half of [`write`](Self::write): hands the record to the
+    /// writer and returns what the writer answers on once it is in the file.
+    /// Cancellation-safe -- dropped before it returns, it queued nothing.
+    async fn queue(&self, record: &AuditRecord) -> Result<tokio::sync::oneshot::Receiver<()>> {
         let mut line = serde_json::to_vec(record)
             .map_err(|e| OutrigError::Configuration(format!("encoding network audit: {e}")))?;
         line.push(b'\n');
@@ -1645,7 +1714,7 @@ impl AuditSink {
         let records = self.records.as_ref().ok_or_else(|| {
             OutrigError::Configuration("the network audit writer has stopped".to_string())
         })?;
-        let who = (self.generation, self.container.clone());
+        let who = self.owner();
         // Capacity first, then the count, then the send -- and no await
         // between the last two, which is what makes the count mean something.
         //
@@ -1669,12 +1738,7 @@ impl AuditSink {
             line,
             done,
         });
-        // Deliberately *not* released on this error: the writer took the
-        // record and then died holding it, so it is one of the records
-        // `close` reports, under the owner that is still counted here.
-        written.await.map_err(|_| {
-            OutrigError::Configuration("the network audit writer has stopped".to_string())
-        })
+        Ok(written)
     }
 
     fn enter_pending(pending: &Mutex<BTreeMap<AuditOwner, u64>>, who: &AuditOwner) {
@@ -2015,6 +2079,9 @@ fn zeek_uid() -> String {
 /// in a `JoinSet` rather than detaching them is what lets a detach end them:
 /// this task is joined, and it does not return until every connection it
 /// started has.
+///
+/// Returns an error when the listener stopped taking connections before it
+/// was asked to; see [`after_listener_failure`].
 async fn tcp_accept_loop(
     listener: TcpListener,
     audit: AuditSink,
@@ -2023,14 +2090,14 @@ async fn tcp_accept_loop(
     host_alias: Option<HostAlias>,
     cancel: CancellationToken,
     live: mpsc::Sender<()>,
-) {
+) -> Result<()> {
     // A child of the attachment's token. Connections are still cancelled when
-    // the attachment is, but the accept-failure path below can end them
+    // the attachment is, but the listener-failure path below can end them
     // without reaching the DNS listener, which is a separate socket in a
     // separate task and is still working.
     let conn_cancel = cancel.child_token();
     let mut conns = JoinSet::new();
-    accept_into(
+    let accepted = accept_into(
         &listener,
         &audit,
         &bindings,
@@ -2042,24 +2109,49 @@ async fn tcp_accept_loop(
         &live,
     )
     .await;
-    // Every connection watches `conn_cancel`, which by here has been cancelled
-    // either way -- directly on the accept-failure path, and through its
-    // parent on the detach path -- so their records are all written before
+    // Every connection watches `conn_cancel`. On the detach path its parent
+    // has already cancelled it; on the listener-failure path this does, ending
+    // them the same cooperative way -- each still writes its audit record --
+    // rather than leaving this task parked on them until the detach that
+    // reports the failure. Either way their records are all written before
     // this task, and therefore the detach joining it, returns.
     conn_cancel.cancel();
     while conns.join_next().await.is_some() {}
+    accepted.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "tcp",
+        source,
+    })
 }
 
-/// The accepting half, with its carrier passed in.
+/// Where the accept loop takes its connections from.
+///
+/// A seam for one reason: the failures the loop has to survive -- out of
+/// descriptors, out of memory -- cannot be had from a real listener without
+/// starving every other test in the process of the same thing.
+trait Accept: Send + Sync {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+impl Accept for TcpListener {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+        TcpListener::accept(self)
+    }
+}
+
+/// The accepting half, with its carrier passed in. Carries at most
+/// [`TCP_CONNECTIONS`] at once, refusing the rest.
 ///
 /// Split out for one reason: the claim that finished connections are taken
 /// back out of the set as they complete is only observable in the set itself,
 /// and a test cannot see one the loop owns privately. Removing the
 /// `reap_finished` call below otherwise fails nothing -- a finished task is
 /// not an alive task, so no task count notices the handles piling up.
+///
+/// `Ok` once `cancel` ends it; an error when the listener stopped taking
+/// connections first.
 #[allow(clippy::too_many_arguments)]
-async fn accept_into(
-    listener: &TcpListener,
+async fn accept_into<L: Accept>(
+    listener: &L,
     audit: &AuditSink,
     bindings: &Bindings,
     policy: &Arc<CompiledNetworkPolicy>,
@@ -2068,65 +2160,162 @@ async fn accept_into(
     conn_cancel: &CancellationToken,
     conns: &mut JoinSet<()>,
     live: &mpsc::Sender<()>,
-) {
+) -> io::Result<()> {
     loop {
+        let (stream, peer) = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => match after_listener_failure("tcp", e, cancel).await {
+                    ControlFlow::Continue(()) => continue,
+                    ControlFlow::Break(e) => return Err(e),
+                },
+            },
+        };
+        // The listener takes both families, so an IPv4 client arrives
+        // v4-mapped. It is looked up and recorded as the IPv4 connection it is.
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        let dst = match original_dst(&stream, peer) {
+            Ok(dst) => dst,
+            Err(e) => {
+                tracing::warn!(target: "outrig::network", "SO_ORIGINAL_DST failed: {e}");
+                continue;
+            }
+        };
+        // Reaped here, as each connection arrives, rather than before the
+        // accept: it can have waited a long time, and a connection that
+        // finished meanwhile is not one this is still carrying.
         reap_finished(conns);
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, peer)) => {
-                        // The listener takes both families, so an IPv4
-                        // client arrives v4-mapped. It is looked up and
-                        // recorded as the IPv4 connection it is.
-                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-                        let dst = match original_dst(&stream, peer) {
-                            Ok(dst) => dst,
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "outrig::network",
-                                    "SO_ORIGINAL_DST failed: {e}"
-                                );
-                                continue;
-                            }
-                        };
-                        // The connection carries a clone of `live` for as
-                        // long as it runs, so teardown can wait every one of
-                        // them out even on the path where this loop is
-                        // aborted and its carrier dropped.
-                        let held = live.clone();
-                        let (audit, bindings) = (audit.clone(), bindings.clone());
-                        let (policy, cancel) = (policy.clone(), conn_cancel.clone());
-                        conns.spawn(async move {
-                            handle_tcp(
-                                stream,
-                                peer,
-                                dst,
-                                host_alias,
-                                audit,
-                                bindings,
-                                policy,
-                                cancel,
-                            )
-                            .await;
-                            drop(held);
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
-                        // The listener is gone, so this attachment is over.
-                        // Cancelling ends the connections it already has the
-                        // same cooperative way a detach would -- each still
-                        // writes its audit record -- rather than parking this
-                        // task on connections nothing is coming to end. The
-                        // child token, so a TCP listener failing does not take
-                        // this attachment's DNS interception down with it.
-                        conn_cancel.cancel();
-                        break;
-                    }
-                }
+        if conns.len() >= TCP_CONNECTIONS {
+            drop(stream);
+            record_refused(audit, bindings, peer, dst, cancel).await;
+            continue;
+        }
+        // The connection carries a clone of `live` for as long as it runs, so
+        // teardown can wait every one of them out even on the path where this
+        // loop is aborted and its carrier dropped.
+        let held = live.clone();
+        let (audit, bindings) = (audit.clone(), bindings.clone());
+        let (policy, cancel) = (policy.clone(), conn_cancel.clone());
+        conns.spawn(async move {
+            handle_tcp(
+                stream, peer, dst, host_alias, audit, bindings, policy, cancel,
+            )
+            .await;
+            drop(held);
+        });
+    }
+}
+
+/// What one failed `accept` or receive says about the socket that returned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerFailure {
+    /// About one connection or one call, and already over: try again at once.
+    Passing,
+    /// About the socket itself, which cannot be used again.
+    Broken,
+    /// Anything else -- out of descriptors, buffers, memory, or an error this
+    /// does not recognize: try again after [`LISTENER_BACKOFF`].
+    Retry,
+}
+
+/// Classifies a listener's failure by its errno.
+///
+/// Only an errno that positively says the socket is unusable ends a listener.
+/// Linux `accept` also hands back network errors belonging to the connection
+/// it was about to return, so one this does not recognize is far likelier to
+/// be about a connection than about the listener, and treating it as the end
+/// is the mistake that cost a container its egress for a whole session.
+fn listener_failure(e: &io::Error) -> ListenerFailure {
+    match e.raw_os_error() {
+        Some(libc::ECONNABORTED | libc::EINTR) => ListenerFailure::Passing,
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EFAULT) => ListenerFailure::Broken,
+        _ => ListenerFailure::Retry,
+    }
+}
+
+/// Deals with one failed accept or receive on behalf of the loop around
+/// `listener`: `Continue` once it is worth trying again, `Break` with the
+/// error the loop has to end on.
+///
+/// A loop cancelled while it waits out the back-off ends on that failure too.
+/// It was still failing when it was stopped, so it had stopped taking the
+/// container's traffic, which is what a broken socket says as well -- and the
+/// redirect pointing at it outlives both, so either way the container's
+/// traffic was refused and the detach owes it a report.
+async fn after_listener_failure(
+    listener: &str,
+    e: io::Error,
+    cancel: &CancellationToken,
+) -> ControlFlow<io::Error> {
+    match listener_failure(&e) {
+        ListenerFailure::Passing => {
+            tracing::debug!(target: "outrig::network", "{listener} listener: {e}");
+            ControlFlow::Continue(())
+        }
+        ListenerFailure::Broken => {
+            tracing::error!(
+                target: "outrig::network",
+                "{listener} listener failed, and takes no more traffic until detach: {e}"
+            );
+            ControlFlow::Break(e)
+        }
+        ListenerFailure::Retry => {
+            tracing::warn!(
+                target: "outrig::network",
+                "{listener} listener failed, retrying in {LISTENER_BACKOFF:?}: {e}"
+            );
+            tokio::select! {
+                // Cancellation first. A back-off that has also run out by the
+                // time this is polled again has shown nothing about the
+                // listener; trying again is all it was for, so a loop that was
+                // stopped meanwhile still ends on the failure, and the caller,
+                // finding itself cancelled, would otherwise end it clean.
+                biased;
+                _ = cancel.cancelled() => ControlFlow::Break(e),
+                _ = tokio::time::sleep(LISTENER_BACKOFF) => ControlFlow::Continue(()),
             }
         }
+    }
+}
+
+/// Records a connection refused because its attachment already carries
+/// [`TCP_CONNECTIONS`]: denied by [`CONNECTION_LIMIT_RULE`], nothing read,
+/// nothing moved.
+///
+/// Queued rather than waited out. The accept loop is the one doing this, and
+/// waiting for the write would hold it out of `accept` -- and deaf to its
+/// cancellation -- for as long as the writer is behind on the whole session's
+/// records. The drain teardown runs is queued behind it, so it is still in the
+/// file before a detach says it is.
+async fn record_refused(
+    audit: &AuditSink,
+    bindings: &Bindings,
+    orig: SocketAddr,
+    dst: SocketAddr,
+    cancel: &CancellationToken,
+) {
+    let record = AuditRecord::new(
+        &audit.session_id,
+        &audit.container,
+        AuditEvent {
+            opened: SystemTime::now(),
+            duration: Duration::ZERO,
+            orig,
+            dst,
+            resolved: resolved_names(bindings, dst.ip()),
+            assertion: ClientAssertion::default(),
+            service: "-",
+            bytes_tx: 0,
+            bytes_rx: 0,
+            decision: PolicyDecision {
+                action: NetworkAction::Deny,
+                rule: CONNECTION_LIMIT_RULE.to_string(),
+            },
+        },
+    );
+    if let Err(e) = audit.queue_unless(&record, cancel).await {
+        tracing::warn!(target: "outrig::network", "network audit record not queued: {e}");
     }
 }
 
@@ -2549,27 +2738,36 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
 /// container shares this listener, and a forward can wait out `DNS_TIMEOUT`
 /// per resolver, so one name a resolver is slow to answer must hold up only
 /// the client that asked for it. At most [`DNS_IN_FLIGHT`] run at once.
+///
+/// Returns an error when the listener stopped taking queries before it was
+/// asked to; see [`after_listener_failure`].
 async fn dns_loop(
     socket: UdpSocket,
     resolvers: Vec<SocketAddr>,
     bindings: Bindings,
     cancel: CancellationToken,
-) {
+) -> Result<()> {
     let socket = Arc::new(socket);
     let resolvers: Arc<[SocketAddr]> = resolvers.into();
     let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
-    loop {
+    let ended = loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => break Ok(()),
             // Takes each finished lookup back out of the set, which is what
             // frees its slot.
             Some(_) = lookups.join_next() => {}
             // With the set full, the next query stays in the socket until a
             // lookup finishes rather than being read with nowhere to go.
             received = recv_query(&socket, &mut buf), if lookups.len() < DNS_IN_FLIGHT => {
-                let Ok((n, peer, asked)) = received else {
-                    break;
+                let (n, peer, asked) = match received {
+                    Ok(Some(query)) => query,
+                    // Already read, and nothing in it can be answered.
+                    Ok(None) => continue,
+                    Err(e) => match after_listener_failure("dns", e, &cancel).await {
+                        ControlFlow::Continue(()) => continue,
+                        ControlFlow::Break(e) => break Err(e),
+                    },
                 };
                 let raw = buf[..n].to_vec();
                 let (socket, resolvers, bindings) =
@@ -2579,11 +2777,15 @@ async fn dns_loop(
                 });
             }
         }
-    }
+    };
     // Aborted rather than waited out: a forward outlasts the grace a detach
     // gives this task, and a lookup owes no record, so abandoning one loses
     // nothing a detach has to account for.
     lookups.shutdown().await;
+    ended.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "dns",
+        source,
+    })
 }
 
 /// Forwards one query and sends `peer` whatever validly answers it, from
@@ -2653,6 +2855,10 @@ fn dns_listener(fd: OwnedFd) -> io::Result<UdpSocket> {
 /// Reads one query from a [`dns_listener`]: its length, who sent it, and the
 /// address it was sent to.
 ///
+/// `None` for a datagram that came without either of the last two, which
+/// cannot be answered. It has been read all the same, so skipping it is all
+/// there is to do; an error is about the socket, not about one datagram.
+///
 /// The last is where the answer has to come from. A query to any resolver
 /// but the container's loopback one arrives by way of the redirect, which
 /// rewrote it to loopback, and conntrack undoes that rewrite only on an
@@ -2660,7 +2866,10 @@ fn dns_listener(fd: OwnedFd) -> io::Result<UdpSocket> {
 /// the unspecified address, so an answer left to routing goes out from the
 /// container's own address instead. Nothing undoes it, and the client drops
 /// it as coming from a server it never asked.
-async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Asked)> {
+async fn recv_query(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr, Asked)>> {
     socket
         .async_io(Interest::READABLE, || {
             let mut iov = [IoSliceMut::new(buf)];
@@ -2671,20 +2880,21 @@ async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
                 Some(&mut control),
                 MsgFlags::empty(),
             )?;
-            let peer = msg
-                .address
-                .as_ref()
-                .and_then(|addr| {
-                    addr.as_sockaddr_in6()
-                        .map(|v6| SocketAddr::V6((*v6).into()))
-                        .or_else(|| addr.as_sockaddr_in().map(|v4| SocketAddr::V4((*v4).into())))
-                })
-                .ok_or_else(|| io::Error::other("a query arrived with no sender address"))?;
+            let peer = msg.address.as_ref().and_then(|addr| {
+                addr.as_sockaddr_in6()
+                    .map(|v6| SocketAddr::V6((*v6).into()))
+                    .or_else(|| addr.as_sockaddr_in().map(|v4| SocketAddr::V4((*v4).into())))
+            });
+            let Some(peer) = peer else {
+                tracing::debug!(target: "outrig::network", "dns query with no sender address");
+                return Ok(None);
+            };
             // The address alone: the interface the query came in on is not
-            // one its answer has to leave by.
-            let asked = msg
-                .cmsgs()?
-                .find_map(|cmsg| match cmsg {
+            // one its answer has to leave by. Control data the kernel had to
+            // truncate is this datagram's problem, so it is a query without
+            // the address rather than a failed socket.
+            let asked = msg.cmsgs().ok().and_then(|mut cmsgs| {
+                cmsgs.find_map(|cmsg| match cmsg {
                     ControlMessageOwned::Ipv6PacketInfo(info) => {
                         Some(Asked::V6(libc::in6_pktinfo {
                             ipi6_ifindex: 0,
@@ -2699,10 +2909,15 @@ async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
                     }
                     _ => None,
                 })
-                .ok_or_else(|| {
-                    io::Error::other("a query arrived without the address it was sent to")
-                })?;
-            Ok((msg.bytes, peer, asked))
+            });
+            let Some(asked) = asked else {
+                tracing::debug!(
+                    target: "outrig::network",
+                    "dns query from {peer} without the address it was sent to"
+                );
+                return Ok(None);
+            };
+            Ok(Some((msg.bytes, peer, asked)))
         })
         .await
 }
@@ -5538,6 +5753,13 @@ mod tests {
         ))
     }
 
+    /// `task` as one a [`stop_tasks`] set holds: a task with nothing to
+    /// report but that it ended.
+    async fn returning_ok(task: impl Future<Output = ()>) -> Result<()> {
+        task.await;
+        Ok(())
+    }
+
     fn empty_bindings() -> Bindings {
         Arc::new(Mutex::new(NameBindings::default()))
     }
@@ -5571,13 +5793,18 @@ mod tests {
     /// asked for -- no polling, no retry, so a record written late is a
     /// failure rather than a slow pass.
     fn only_audit_record(dir: &Path) -> serde_json::Value {
-        let text = std::fs::read_to_string(dir.join(NETWORK_LOG)).expect("read audit log");
-        let mut lines = text.lines();
-        let record = lines
-            .next()
-            .expect("an audit record for the cut connection");
-        assert_eq!(lines.next(), None, "exactly one connection was made");
-        serde_json::from_str(record).expect("audit record json")
+        let mut records = audit_records(dir);
+        assert_eq!(records.len(), 1, "exactly one connection was made");
+        records.remove(0)
+    }
+
+    /// Every record in `dir`'s audit log, in order, read the same way.
+    fn audit_records(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join(NETWORK_LOG))
+            .expect("read audit log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit record json"))
+            .collect()
     }
 
     /// One accepted connection, wired the way the accept loop wires one: the
@@ -5609,7 +5836,7 @@ mod tests {
     struct LiveConnection {
         client: TcpStream,
         upstream: TcpStream,
-        tasks: JoinSet<()>,
+        tasks: JoinSet<Result<()>>,
         cancel: CancellationToken,
     }
 
@@ -5626,7 +5853,7 @@ mod tests {
         });
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(handle_tcp(
+        tasks.spawn(returning_ok(handle_tcp(
             intercepted,
             orig,
             dst,
@@ -5635,7 +5862,7 @@ mod tests {
             empty_bindings(),
             allow_all_policy(),
             cancel.clone(),
-        ));
+        )));
 
         // Written before the upstream is accepted: this is the client's
         // opening burst, which the sniff reads and the bridge forwards.
@@ -5730,7 +5957,7 @@ mod tests {
         let (dst, _upstream) = upstream_once().await;
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(handle_tcp(
+        tasks.spawn(returning_ok(handle_tcp(
             intercepted,
             orig,
             dst,
@@ -5739,7 +5966,7 @@ mod tests {
             empty_bindings(),
             allow_all_policy(),
             cancel.clone(),
-        ));
+        )));
         // The client says nothing, so the connection is parked in the sniff
         // read with no evidence yet gathered.
         tokio::task::yield_now().await;
@@ -5867,7 +6094,7 @@ mod tests {
         tasks.spawn(async move {
             // Only dropped when this task's frame is destroyed.
             let _held = held;
-            std::future::pending::<()>().await;
+            std::future::pending::<Result<()>>().await
         });
         tokio::task::yield_now().await;
 
@@ -5899,7 +6126,7 @@ mod tests {
     async fn spawned_dns_loop(
         resolvers: Vec<SocketAddr>,
         bindings: Bindings,
-    ) -> (SocketAddr, CancellationToken, JoinSet<()>) {
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
         let socket = dns_listener(bind_any(SockType::Datagram, 0).expect("bind dns listener"))
             .expect("dns listener");
         let port = socket.local_addr().expect("dns addr").port();
@@ -6140,22 +6367,12 @@ mod tests {
             }
         });
 
-        let (live, _idle) = mpsc::channel(1);
-        accept_into(
-            &listener,
-            &audit,
-            &empty_bindings(),
-            &deny_all_policy(),
-            None,
-            &cancel,
-            &conn_cancel,
-            &mut conns,
-            &live,
-        )
-        .await;
+        run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns)
+            .await
+            .expect("only the cancel ends the loop");
         clients.await.expect("clients");
 
-        // Not zero: the loop reaps on its way in to an accept, so the
+        // Not zero: the loop reaps as each connection arrives, so the
         // connection it served last is still held either way, and the drain
         // that follows `accept_into` in production is what collects it. What
         // the gate above buys is that only the last one or two can be --
@@ -6253,6 +6470,391 @@ mod tests {
             records, HELD,
             "every connection the loop started owes a record before it returns"
         );
+    }
+
+    /// Only an errno that says the socket itself is unusable ends a listener.
+    /// Everything else -- including errors this does not recognize, and the
+    /// ones Linux `accept` passes through from the connection it was about to
+    /// return -- is tried again.
+    #[test]
+    fn only_an_unusable_socket_ends_a_listener() {
+        use ListenerFailure::{Broken, Passing, Retry};
+        for (errno, want) in [
+            (libc::ECONNABORTED, Passing),
+            (libc::EINTR, Passing),
+            (libc::EBADF, Broken),
+            (libc::EINVAL, Broken),
+            (libc::ENOTSOCK, Broken),
+            (libc::EFAULT, Broken),
+            (libc::EMFILE, Retry),
+            (libc::ENFILE, Retry),
+            (libc::ENOBUFS, Retry),
+            (libc::ENOMEM, Retry),
+            (libc::ENOSPC, Retry),
+            (libc::EPERM, Retry),
+            (libc::EPROTO, Retry),
+            (libc::EOPNOTSUPP, Retry),
+            (libc::ENETUNREACH, Retry),
+        ] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert_eq!(listener_failure(&e), want, "{e}");
+        }
+        assert_eq!(listener_failure(&io::Error::other("no errno")), Retry);
+    }
+
+    /// A listener that fails as scripted, one errno per call, and then waits
+    /// forever for a connection that never comes: the failures a real one
+    /// only produces when the whole process is out of something.
+    struct ScriptedListener {
+        script: Mutex<std::collections::VecDeque<i32>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedListener {
+        fn new(errnos: &[i32]) -> Self {
+            Self {
+                script: Mutex::new(errnos.iter().copied().collect()),
+                calls: Default::default(),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Accept for ScriptedListener {
+        fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.script.lock().expect("script").pop_front();
+            async move {
+                match next {
+                    Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    /// The accept loop over `listener`, carrying `conns`, until `cancel` or
+    /// the listener ends it. Under [`deny_all_policy`], so a connection it
+    /// accepts is never bridged back into the listener it came from.
+    async fn run_accept_loop(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+    ) -> io::Result<()> {
+        let (live, _idle) = mpsc::channel(1);
+        accept_into(
+            listener,
+            audit,
+            &empty_bindings(),
+            &deny_all_policy(),
+            None,
+            cancel,
+            conn_cancel,
+            conns,
+            &live,
+        )
+        .await
+    }
+
+    /// Running out of descriptors, buffers or memory does not end the loop,
+    /// and neither does a connection that was gone before it was accepted:
+    /// each is tried again, and the connections the loop already carries are
+    /// left alone. One `EMFILE` used to end interception for the session.
+    #[tokio::test(start_paused = true)]
+    async fn transient_accept_failures_do_not_end_the_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+        ]);
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let mut conns = JoinSet::new();
+        conns.spawn(std::future::pending::<()>());
+
+        let ran = tokio::time::timeout(
+            10 * LISTENER_BACKOFF,
+            run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns),
+        )
+        .await;
+
+        assert!(
+            ran.is_err(),
+            "the loop ended on a failure it retries: {ran:?}"
+        );
+        assert_eq!(
+            listener.calls(),
+            6,
+            "every failure tried again, then waiting on the next connection"
+        );
+        assert!(
+            !conn_cancel.is_cancelled(),
+            "the connections it carries were cut"
+        );
+        assert_eq!(conns.len(), 1);
+    }
+
+    /// A listener that cannot accept again ends the loop with the error that
+    /// says so, after whatever it retried on the way there.
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_listener_ends_the_loop_with_its_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[libc::EMFILE, libc::EBADF]);
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let ended = run_accept_loop(
+            &listener,
+            &audit,
+            &cancel,
+            &cancel.child_token(),
+            &mut JoinSet::new(),
+        )
+        .await;
+
+        let e = ended.expect_err("a broken listener ends the loop");
+        assert_eq!(e.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(listener.calls(), 2);
+        assert!(
+            started.elapsed() >= LISTENER_BACKOFF,
+            "the EMFILE was not waited out"
+        );
+    }
+
+    /// A loop stopped while it waits out a failure stops at once, and reports
+    /// the failure: it had stopped taking connections, and the redirect sent
+    /// the container's to it all the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_stopped_while_failing_reports_the_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[libc::EMFILE]);
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LISTENER_BACKOFF / 10).await;
+            stopping.cancel();
+        });
+        let started = tokio::time::Instant::now();
+
+        let ended = run_accept_loop(
+            &listener,
+            &audit,
+            &cancel,
+            &cancel.child_token(),
+            &mut JoinSet::new(),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < LISTENER_BACKOFF,
+            "the back-off outlived the cancel"
+        );
+        let e = ended.expect_err("a listener still failing when stopped is reported");
+        assert_eq!(e.raw_os_error(), Some(libc::EMFILE));
+    }
+
+    /// A cancel and a back-off that have both landed by the time the wait is
+    /// polled again end it on the failure, as a cancel alone does. Repeated,
+    /// because without the bias `select!` picks between ready branches at
+    /// random, and the clock it would pick is the one that reports nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_that_lands_with_the_back_off_still_reports_the_failure() {
+        for _ in 0..64 {
+            let cancel = CancellationToken::new();
+            let mut waiting = std::pin::pin!(after_listener_failure(
+                "tcp",
+                io::Error::from_raw_os_error(libc::EMFILE),
+                &cancel,
+            ));
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
+            assert!(first.is_pending(), "the back-off has to be waiting");
+
+            cancel.cancel();
+            tokio::time::advance(LISTENER_BACKOFF).await;
+
+            match waiting.await {
+                ControlFlow::Break(e) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE)),
+                ControlFlow::Continue(()) => panic!("a stopped loop was sent to try again"),
+            }
+        }
+    }
+
+    /// The whole path against a real socket: a listener the kernel takes out of
+    /// `LISTEN` ends its loop on its own, and stopping the attachment's tasks
+    /// reports it instead of returning clean.
+    #[tokio::test]
+    async fn a_listener_that_breaks_is_reported_when_its_tasks_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let fd = listener.as_raw_fd();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            deny_all_policy(),
+            None,
+            CancellationToken::new(),
+            mpsc::channel(1).0,
+        ));
+        tokio::task::yield_now().await;
+
+        // Every accept on it fails with `EINVAL` from here on.
+        nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Both).expect("shutdown");
+        // Never cancelled: a loop still running when the grace runs out is
+        // aborted and reported as that instead, so this is the loop's own end.
+        let failures = stop_tasks(&mut tasks).await;
+
+        match failures.as_slice() {
+            [OutrigError::NetworkListenerFailed { listener, source }] => {
+                assert_eq!(*listener, "tcp");
+                assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
+            }
+            _ => panic!("a broken listener has to be reported: {failures:#?}"),
+        }
+    }
+
+    /// Panics, saying why, when `SO_ORIGINAL_DST` cannot be read on loopback.
+    /// Without conntrack, as inside some sandboxes, the accept loop drops
+    /// every connection it is handed, and a test waiting on its records would
+    /// only time out.
+    async fn require_original_dst() {
+        let (_client, intercepted, orig) = accepted_connection().await;
+        if let Err(e) = original_dst(&intercepted, orig) {
+            panic!("SO_ORIGINAL_DST is unavailable here ({e}); this test needs conntrack");
+        }
+    }
+
+    /// An attachment carrying as many connections as it may refuses the next
+    /// one at once and records it as refused; once those finish, it carries
+    /// connections again.
+    #[tokio::test]
+    async fn a_connection_past_the_limit_is_refused_and_recorded() {
+        require_original_dst().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+
+        // Stand-ins for the connections it carries, held until `release`: no
+        // sockets, so a full complement costs the test no descriptors. Each
+        // holds a sender, so the receiver says when all of them are gone.
+        let release = CancellationToken::new();
+        let (held, mut gone) = mpsc::channel::<()>(1);
+        let mut conns = JoinSet::new();
+        for _ in 0..TCP_CONNECTIONS {
+            let (release, held) = (release.clone(), held.clone());
+            conns.spawn(async move {
+                release.cancelled().await;
+                drop(held);
+            });
+        }
+        drop(held);
+
+        let token = cancel.clone();
+        let log = dir.path().to_path_buf();
+        let clients = tokio::spawn(async move {
+            // However this ends, the loop ends with it; see
+            // `the_accept_loop_keeps_taking_finished_connections_back`.
+            let _ends_the_loop = token.drop_guard();
+
+            let mut refused = TcpStream::connect(addr).await.expect("connect");
+            let port = refused.local_addr().expect("client addr").port();
+            await_audit_records(&log, 1).await;
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(SNIFF_TIMEOUT, refused.read(&mut buf))
+                .await
+                .expect("a refused connection is closed at once, not left open");
+            assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+            let record = only_audit_record(&log);
+            assert_eq!(record["outrig.rule"], CONNECTION_LIMIT_RULE);
+            assert_eq!(record["outrig.action"], "deny");
+            assert_eq!(record["id.orig_p"], port);
+            assert_eq!(record["orig_bytes"], 0);
+            assert_eq!(record["resp_bytes"], 0);
+
+            release.cancel();
+            assert!(gone.recv().await.is_none());
+            // Spoken to, so the sniff decides it at once rather than after
+            // its window.
+            let mut carried = TcpStream::connect(addr).await.expect("connect");
+            carried.write_all(b"x").await.expect("write");
+            await_audit_records(&log, 2).await;
+            let record = &audit_records(&log)[1];
+            assert_ne!(
+                record["outrig.rule"], CONNECTION_LIMIT_RULE,
+                "the connections it was carrying are gone, so this one is decided by policy"
+            );
+        });
+
+        run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns)
+            .await
+            .expect("only the cancel ends the loop");
+        clients.await.expect("clients");
+    }
+
+    /// How many bytes the next datagram queued on `fd` holds; zero once there
+    /// is none.
+    fn queued_datagram(fd: RawFd) -> libc::c_int {
+        let mut n: libc::c_int = 0;
+        // `FIONREAD` writes one `int` through the pointer it is handed.
+        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+        assert_ne!(rc, -1, "FIONREAD: {}", io::Error::last_os_error());
+        n
+    }
+
+    /// A datagram the DNS listener cannot answer is skipped, not taken as the
+    /// end of the listener: it has been read already, and the next query is
+    /// still owed an answer.
+    #[tokio::test]
+    async fn an_unanswerable_datagram_does_not_end_the_dns_loop() {
+        // Bound without asking the kernel where each query was sent, so every
+        // datagram it reads is one the loop cannot answer.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind dns");
+        let listener = socket.local_addr().expect("dns addr");
+        let fd = socket.as_raw_fd();
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(
+            socket,
+            Vec::new(),
+            empty_bindings(),
+            cancel.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x4444, "example.test").await;
+        // Read once nothing is queued on the socket. The test runtime has one
+        // thread, so the loop has finished with the datagram by then too.
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            while queued_datagram(fd) > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(read.is_ok(), "the loop never read the datagram");
+
+        assert!(
+            tasks.try_join_next().is_none(),
+            "the loop ended on a datagram it could not answer"
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Repeated attach/detach cycles leave nothing behind: what a detach ends,

@@ -892,6 +892,9 @@ pub outrig::error::OutrigError::NetworkAuditUnwritten::records: u64
 pub outrig::error::OutrigError::NetworkAuditUnwritten::source: alloc::boxed::Box<outrig::error::OutrigError>
 #[non_exhaustive] pub outrig::error::OutrigError::NetworkConnectionsUnfinished
 pub outrig::error::OutrigError::NetworkConnectionsUnfinished::grace: core::time::Duration
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkListenerFailed
+pub outrig::error::OutrigError::NetworkListenerFailed::listener: &'static str
+pub outrig::error::OutrigError::NetworkListenerFailed::source: std::io::error::Error
 #[non_exhaustive] pub outrig::error::OutrigError::NetworkTaskPanicked
 pub outrig::error::OutrigError::NetworkTaskPanicked::source: tokio::runtime::task::error::JoinError
 #[non_exhaustive] pub outrig::error::OutrigError::NetworkTasksAborted

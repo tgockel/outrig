@@ -150,6 +150,7 @@ enum ImageCmd {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    raise_descriptor_limit();
 
     outrig::container::install_panic_hook();
 
@@ -315,6 +316,31 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             let repo_cfg = cli.config.as_deref();
             runtime.block_on(clean::execute(args, session_root, repo_cfg, &global, &cwd))
         }
+    }
+}
+
+/// Raises this process's soft limit on open descriptors to its hard limit.
+///
+/// The soft limit is commonly 1024, kept low for programs that still use
+/// `select`, which outrig does not. Under network audit or filter each
+/// connection a container makes holds two of outrig's descriptors, on top of
+/// the MCP pipes, logs and LLM sockets it already has, so a few busy
+/// containers could take all 1024 between them -- after which an LLM call
+/// fails as surely as the container's next connection. The hard limit is the
+/// ceiling the host set, so going up to it asks for nothing more. Processes
+/// outrig starts inherit it; podman, the main one, raises its own to the same
+/// ceiling regardless.
+fn raise_descriptor_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let raised = getrlimit(Resource::RLIMIT_NOFILE).and_then(|(soft, hard)| {
+        if soft < hard {
+            setrlimit(Resource::RLIMIT_NOFILE, hard, hard)?;
+            tracing::debug!("raised the open-file limit from {soft} to {hard}");
+        }
+        Ok(())
+    });
+    if let Err(e) = raised {
+        tracing::debug!("left the open-file limit as it was: {e}");
     }
 }
 

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A listener failure no longer ends interception for the session unreported.** The TCP
+  accept loop took every `accept` error to mean its listener was gone. Running out of
+  descriptors ended TCP interception for the rest of the session, with the redirect still sending
+  the container's connections to the closed port, and `detach` and `shutdown` then returned `Ok`.
+  A container could cause that by holding a few hundred connections open, at two of outrig's
+  descriptors each. Failures that are not about the socket itself -- `EMFILE`, `ENFILE`,
+  `ENOBUFS`, `ENOMEM`, and errors outrig does not recognize -- are now retried after a second, and
+  a connection gone before it was accepted is passed over at once. An attachment carries at most
+  256 connections at once, in audit mode as in filter: past that, a connection is closed as soon
+  as it is accepted and recorded with `outrig.action = "deny"` and
+  `outrig.rule = "connection-limit"`. A listener whose socket can no longer be used, or that was
+  still failing when it was stopped, makes teardown return the new
+  `OutrigError::NetworkListenerFailed` naming the container. The DNS listener had the same flaw:
+  any receive error ended it. It now skips a datagram it cannot answer, retries the same failures,
+  and is reported the same way.
 - **A `deny` glob covers every name under its zone.** A filter-mode host glob looked for the
   literal after its last `*` at that literal's first occurrence in the name, then required the
   name to end there, so `deny = ["*.evil.example"]` missed `x.evil.example.evil.example`. Whoever
