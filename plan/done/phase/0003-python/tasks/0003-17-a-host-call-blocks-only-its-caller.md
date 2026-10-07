@@ -318,3 +318,256 @@ notes when it starts and ends on the host and sleeps for a given time.
   `_on_sigint`.
 - `plan/next/awaitable-hosted-calls.md` and `plan/next/cancel-a-running-hosted-call.md` -- an
   awaitable call without a worker thread, and stopping a call on the host, both deferred.
+
+## Decisions
+
+Every acceptance item of the first half was met, so the spike did not stop, and fork 4's
+alternative was not measured. The forks were taken as recommended, with fork 3 as the maintainer
+settled it: a woken call raises `KeyboardInterrupt` for an interrupt and `asyncio.CancelledError`
+for a cancel, each naming the binding and saying the call's outcome on the host is unknown, or
+that the call was never sent (fork 1); the primary's hosted wait is woken as a child's is, and
+SIGINT is sent only when the primary's thread is not waiting (fork 2); one request per connection,
+each on its own thread, and one at a time only under `--serialize` (fork 3); a pool of up to four
+connections per kernel and binding, with one object table per kernel in the binding (fork 4).
+The maintainer chose, when asked: both halves in this task; the minutes-long measurements as
+`#[ignore]`d tests run by hand for this record; and the 60-second item run at 60 seconds under
+`cargo test`.
+
+- **The pool, as built.** `_Pool` in `interpreter.py`, one per kernel and binding, holds the
+  connections and one condition variable, which every channel of the pool waits on and notifies:
+  a frame, a freed connection and an interrupt all wake the same wait, which is what lets a
+  thread waiting for a free connection learn that an abandoned connection's late reply has
+  arrived. A connection has an owner (the thread whose call is in flight), a depth (the nested
+  calls a callback served on it makes) and `pending`, the requests sent on it whose reply has not
+  been read. Free is no owner and nothing pending; abandoned is no owner and a reply to come.
+  `take` gives a thread its own connection when it already holds one (a nested call goes on the
+  callback's connection, where the host's thread is waiting), else tidies an abandoned
+  connection whose frames have arrived, else a free one, else opens one under four, else waits.
+  Nothing dispatches, boxes or writes a frame under the condition variable: a tidy is claimed
+  under it and run outside it. A request is pending from before its first byte goes out until
+  its reply frame is *read*, before unboxing -- unboxing can wait for a nested `inspect` and be
+  woken there, which would otherwise leave the outer reply pending for ever -- and a `del` is
+  never pending, since nothing waits for its reply.
+- **A proxy stays bound to the connection that produced it and routes through the pool.**
+  `Hosted.sync_request`, which `netref.syncreq` calls on the proxy's own connection, is the one
+  entry point; it refuses a closed connection's proxy with the close reason and otherwise asks
+  the pool for a connection. Releases keep travelling on the producing connection, because the
+  binding counts references per connection; the proxy cache stays per connection, so the same
+  object on two connections is two proxies, as `hosted-objects.md` says; and the proxy a reply
+  creates is bound to the connection the call took. `_box` accepts a proxy of any connection in
+  the same pool as `LABEL_LOCAL_REF`, and refuses another binding's or another kernel's as
+  before.
+- **RPyC's `serve` is replaced.** Its receive lock and event exist so that several threads can
+  read one connection; the pool gives a connection to one thread at a time, and a callback's
+  nested `serve` runs on that same thread, so the replacement waits on the pool's condition
+  variable for a frame, a close, or the exception the reader thread left, and raises that
+  exception there, between frames, and nowhere else. `AsyncResult.wait` re-checks its own
+  predicate after every `serve`, so the `waiting` argument is accepted and ignored.
+- **A tidy drops a late reply unread**, queuing a release for every reference the reply holds so
+  the binding's count stays right, and answers a request found there -- a callback the library
+  made after its caller was interrupted -- with a `RuntimeError` saying the callback did not
+  run, so the library's call of it raises. The limit this leaves: a library that calls back after
+  its caller was interrupted waits until the kernel next calls into that pool, because only a
+  kernel-side thread may dispatch, never the reader thread. Recorded in `hosted-objects.md`.
+- **The wake applies `_on_sigint`'s rule.** Whether an interrupt may end a hosted call is decided
+  when the call starts, from the calling thread's own frames, by the walk `_on_sigint` makes from
+  a signal's landing frame (`_agent_code_outward`, which both now use): a hosted call the
+  interpreter makes for itself -- formatting a traceback whose exception holds a proxy -- is not
+  woken. The reader thread re-checks the thread's record under the pool's condition variable
+  before setting the exception, so a wake cannot land on a record the thread has just dropped.
+  A thread inside a hosted call but not waiting -- running a callback's code, boxing, sending --
+  is `busy`: the exception is left for its next wait, and on the primary SIGINT is sent too, for
+  a runaway inside a callback. The wake path sets `_landed`, so an interrupt that ends a
+  background task's call is reported to that task's owner, and never `_interrupting`, which
+  would arm the handler for a signal nobody sends. `Kernel.cancel` wakes the same way and then
+  still cancels through the loop, for code that catches the error and carries on.
+- **`Hosted._send` joined `_MACHINERY`; `_dispatch` did not.** A signal landing while a request is
+  encoded or written is declined, as one landing in `_write_line` is. `_dispatch` stays
+  interruptible so that a callback defined in an imported module -- no `<execution>` frame of its
+  own -- can still be interrupted by the handler's walk, which then finds the outer call's frame.
+- **`Kernel.close_hosted(binding=None, reason=...)`** is the hook `0003-21`'s close and
+  `0003-25`'s release call. Under the pool's condition variable it marks the pool closed, closes
+  every channel (which wakes every reply wait with `EOFError` saying the outcome is unknown),
+  closes idle connections itself and leaves owned ones to their owners -- the `0003-16` rule that
+  `_cleanup` runs on the serving thread, since it releases locks only the holder may release --
+  and gives every thread waiting for a connection an `EOFError` saying the call was never sent;
+  the close notices go out after the lock is released.
+- **One table per kernel in the binding, counted per connection.** `Objects`, one per agent,
+  holds `{id_pack: [object, total]}` and, per connection, the references that connection handed
+  out; `_box`, `_lookup`, `_release` and the `del` handler use it, and RPyC's own per-connection
+  table stays empty. A release is checked against the arriving connection's own count under the
+  one lock. An object's last reference dies after the lock is released, since destructors are
+  library code (GitPython's `Repo.__del__` runs `git`): what a method takes out of the table it
+  leaves in a local and deletes after the `with`. A connection's cleanup gives back its own
+  references. The table is dropped when the agent's last serving thread has ended -- after its
+  cleanup, not when the close notice arrives -- with a diagnostic line on stderr that names the
+  agent and how many objects were left, which the release test reads. The `del` handler's target
+  is never unboxed: a reference to the object in the handler's frame outlived the release, so
+  the object died after the reply rather than before it, and a test that asked another
+  connection whether it was alive raced that frame.
+- **The serialize lock is a turn, `Turn`**: taken with `with`, granted in arrival order, which
+  `threading.RLock` does not promise, and re-entrant for the holding thread, so a callback's
+  nested request -- served on the thread holding it -- runs at once. It is entered after
+  `_target` and `_unbox`, through an `ExitStack` so that one `try` covers the handler's
+  invocation, the boxing of its result and the rendering of what it raised, all library code;
+  `ping` and `close` skip it, and `_cleanup` takes it itself, since taking back a connection's
+  references runs destructors. `del` takes it for the same reason. A waiter is a record with a
+  `dropped` reason for `0003-21` to set when a cancel names a waiting request or the session
+  closes; until then a waiter whose connection closed runs its call when its turn comes and ends
+  when its reply cannot be sent.
+- **`--serialize`** is the binding program's optional fourth argument, which `0003-20` passes from
+  the declaration; `main` replaces the module's `_turn`, a `nullcontext` by default, with a
+  `Turn`.
+- **A live callback read back through another connection is refused.** Found in review: it would
+  have crossed as a proxy of the `Callback` object itself, callable from a connection the
+  container never passed it to.
+- **A method call is two requests, not one.** `root.ask("...")` costs a `getattr`, which brings
+  the bound method back as a proxy, a `call` on that proxy, and a `del` of it afterwards.
+  RPyC's `BaseNetref.__getattribute__` sends `getattr` for every name outside its local set and
+  never consults the methods `class_factory` generated on the proxy's class; those -- the
+  one-request `callattr` -- are reached only through Python's special-method lookup on the type,
+  so iterating a proxied list is a `callattr` per item and per field read. The acceptance's "one
+  request each" was the hypothesis; the test asserts the shape observed, and
+  `plan/next/one-request-per-hosted-method-call.md` holds the stub that would make it one.
+- **What stood in for the outcome event.** No hosted-call event exists before `0003-18` and
+  `0003-21`. The release test reads, instead, the fixture's record that both worker calls ran to
+  their end on the host, the relay's count showing that no reply line crossed to the interpreter
+  for the closed connections, and the binding's table-dropped line.
+- **`answer()` cannot be called inside a serialized session**: the thread waiting in
+  `wait_for_answer` holds the binding's lock, so the call that would answer it waits behind it.
+  The fixture is released by a file instead, and the two-session measurement answers through the
+  service process. This is the ticket pattern's argument in one sentence
+  (`potential/ticket-based-service-waits.md`).
+- **The test relay** gained per-agent-and-binding traffic counts and the set of connection ids
+  seen, which is how a test proves a kernel never held a fifth connection; out-of-order matching
+  with messages held back for later reads, since two kernels answer in whichever order they
+  finish; `interrupt`, `cancel`, `inv`, `cpu` and `msg` for any kernel; `--serialize`; the
+  binding's resident size from `/proc`; and the service process. `Flag` and `eventually` moved
+  to `testing.rs`. Where a test's kernel thread blocks right after starting a worker, the worker
+  is `loop.run_in_executor`, which is `asyncio.to_thread`'s own mechanism: `to_thread` is a
+  coroutine that submits nothing until it is awaited, which a blocked loop never does.
+- **Simplified after review.** `/simplify` generated independent versions of the binding's half
+  and the interpreter's half and compared each with the original. The binding's half took the
+  alternative's shape: one `Objects` class per agent, keyed by connection, in place of a table
+  and a per-connection view with RPyC's collection interface; a `Turn` taken with `with` in
+  place of a lock with `acquire` and `release`; the module's `_turn`, switched by `main`, in
+  place of a lock passed through constructors; and one `try` around an `ExitStack` in place of
+  two. Kept from the original: the `try`/`finally` that dequeues a waiter however its wait ends,
+  the explicit `del` that makes an object's last reference die outside the lock, and the object
+  count in the table-drop line. The interpreter's half kept the original -- it releases the
+  references in a dropped late reply, installs the wait record under the condition variable so a
+  racing interrupt is not lost, and lets a child inside a callback raise at its next wait, none
+  of which the alternative did -- and borrowed three constructs from it: a `ready` property on
+  the frame channel in place of a zero-timeout poll under the lock, one `block` method for both
+  waits, and RPyC's own callback map as the mark of an outstanding request in place of a set
+  kept by `_send`. The reviewer of the interpreter's half ended on a spend limit before its
+  verdict, so that comparison was made by hand from both texts.
+- **Three defects found by an external review of the landed commit, each fixed with a test:**
+  - A dropped late reply left the callables its request had handed out in the connection's
+    table: the callback this side registered for a request was also what released them, and a
+    tidy popped it unrun. The callables of each request are now kept by sequence number and
+    released once the reply has been delivered -- not before it is unboxed, since a method that
+    returns the callable it was given sends it back as a reference into that table, and the
+    review's second pass caught the first fix breaking that -- or at once when the reply is
+    dropped, the host having revoked them before replying. An interrupted call that carried a
+    callable no longer holds it until the connection closes.
+  - A proxy produced on a connection the kernel's calls stopped taking kept its host object
+    alive: its release was queued on that connection, and the pool always took the first free
+    one. Among free connections with releases queued, the one taken least recently now goes
+    first, so the next calls send them before their own requests, as the single connection did;
+    the review's second pass showed that taking the first of them was not enough, since a
+    factory's result discarded on every call requeues a release on the connection just taken
+    and would have kept the other waiting for ever.
+  - On the host, a library whose callback's connection closed under it, and which swallowed the
+    error and still returned an object, re-added that object to the kernel's table after the
+    connection's cleanup had run; the reply then failed to send with nothing taken back, and
+    the closed connection stayed a key of the table with the object under it. A reply that
+    cannot be sent now gives back what it would have referenced, and a connection holding
+    nothing is no longer a key.
+- **The spike's record.**
+  - Versions: RPyC 6.0.2 from the pinned wheel; the payload's CPython 3.13.15
+    (`python-build-standalone` 20260901, x86_64, `+static`); the fixture library of this task's
+    tests and no real library -- no GitPython, no git; no podman, no container; Linux
+    7.0.0-38-generic on the development machine, an AMD Ryzen Threadripper PRO 5965WX with 48
+    threads and 125 GiB; Rust 1.99.0.
+  - Where things sit: every process on the host, started by the test binary in process groups of
+    their own -- the interpreter with `-I -c` and the RPyC directory, each binding with `-I -c`,
+    the RPyC directory, the fixture's install directory and `--serialize` where a test asks, the
+    service process with `-I -c` and a Unix socket under the system's temporary directory --
+    with `HOME` under that directory. No mount, no credential.
+  - Real: both programs as a session will run them, the pool and the wakes, the shared table and
+    the serialize lock, every frame crossing both channels, the interrupts and cancels through
+    the protocol, and the service process behind its socket. Stood in for: the Rust relay in
+    `host.rs`, by the test relay; the owner's supervision of binding processes; the hosted-call
+    events of `0003-21`, as above; and a service written in Rust, by a pure-Python one.
+  - Untested: a binding process dying mid-call; aarch64; the container mount; a cancel named at
+    a waiting ticket of the serialize lock, which `0003-21` builds; a request held waiting for
+    the lock when its channel closes, which runs its call before it ends; a `to_thread` worker's
+    call cancelled, which the design says cancels the wait alone -- the worker's own call is not
+    woken, which the tests show, but nothing cancels a coroutine awaiting one.
+  - Limits reached: four connections per kernel and binding, with a fifth call waiting and the
+    relay seeing no fifth id; a late reply after an interrupt, dropped unread; a kernel's pool
+    closed under two live calls, both finished by the binding to nobody; a callback made after
+    its caller was interrupted, answered only at the kernel's next call into the pool; a call
+    blocked 60 s on its kernel's thread while another kernel's call and its own worker's
+    returned in milliseconds; and the minutes-long waits below.
+- **The measurements**, on the machine above, with the measurement tests run by hand
+  (`cargo test -p outrig --lib python::binding_tests::measurements -- --ignored --nocapture
+  --test-threads=1`); the numbers are the deliverable, and no threshold is set on them.
+  - **Requests per operation**, counted on the container side by handler. `ask`, `poll`,
+    `records_by_value(300)` and `update_records(300)`: 2 requests each (`getattr`, `call`) and
+    1 release after. Iterating `list_records(300)` and reading two fields of each record: 2
+    requests for the call, 903 `callattr` requests (`__iter__`, 301 `__next__`, 600
+    `__getitem__`) and 301 releases flushed as it went, 2 after. The whole run of six operations
+    was 1237 `rpc` lines toward the binding.
+  - **One session, two kernels, kernel A blocked 180 s in `wait_for_answer` through a worker,
+    answering `inv` every 30 s meanwhile; kernel B's calls, with a 10 ms pause per round, in
+    milliseconds (median / 99th percentile / maximum):**
+
+    | Operation, binding not serialized      | n     | median  | p99     | max     |
+    | -------------------------------------- | ----- | ------- | ------- | ------- |
+    | `ask`                                  | 4541  | 0.947   | 1.351   | 6.406   |
+    | `poll` (no answer yet)                 | 4541  | 0.666   | 0.965   | 5.114   |
+    | `poll` (the answer)                    | 4541  | 0.623   | 0.955   | 6.090   |
+    | `records_by_value(300)`                | 4541  | 3.025   | 4.004   | 6.001   |
+    | `update_records(300)`                  | 4541  | 6.686   | 8.867   | 14.352  |
+    | `list_records(300)`, iterated, 1 field | 455   | 176.325 | 235.821 | 396.222 |
+
+    B's first call returned in 1.3 ms. The binding's resident size was 17,444 KiB before, rose
+    through 18,416 to 19,184 KiB during, and stayed at 19,184 KiB after a collection in both
+    kernels. Under `--serialize`, B's first call -- an `ask` that reached the lock before A's
+    call did -- returned in 1.5 ms, and its next waited 180,038 ms, behind A's call, until the
+    file released A; the one round that followed had `ask` 1.5, `poll` 1.1, `records_by_value`
+    4.1, `update_records` 7.7 and the iterated list 201.6 ms, and the binding's resident size
+    went from 17,448 KiB to 17,760 KiB. The measuring window counts from the first call's
+    return, so the serialized run's post-release numbers are one round; the wait is the number
+    that run exists for.
+  - **Two sessions as two clients of one service process, session 1 blocked 180 s in
+    `wait_for_answer` against the service, session 2's calls through its own binding to the same
+    service, each a round trip over the service's Unix socket beyond the RPyC request, in
+    milliseconds (median / 99th percentile / maximum):**
+
+    | Operation                              | both plain, n=4103      | both serialized, n=3990 |
+    | -------------------------------------- | ----------------------- | ----------------------- |
+    | `ask`                                  | 1.209 / 2.808 / 8.612   | 1.238 / 3.123 / 8.560   |
+    | `poll` (no answer yet)                 | 0.836 / 1.750 / 7.088   | 0.850 / 1.970 / 14.352  |
+    | `poll` (the answer)                    | 0.799 / 1.602 / 7.923   | 0.815 / 1.965 / 8.722   |
+    | `records_by_value(300)`                | 3.482 / 5.242 / 10.110  | 3.498 / 5.582 / 11.469  |
+    | `update_records(300)`                  | 7.345 / 11.889 / 21.833 | 7.330 / 12.312 / 15.359 |
+    | `list_records(300)`, iterated, 1 field | 192.0 / 430.8 / 515.1   | 195.6 / 463.0 / 488.3   |
+
+    Session 2's first call returned in 1.3 ms in both runs: the sessions have separate binding
+    processes and separate locks, so session 1's lock -- held for the whole wait under
+    `--serialize` -- held none of session 2's calls, and the service answered session 1's wait
+    when session 2 called `answer` at the end. Resident sizes, in KiB, (session 1, session 2):
+    plain 20,508 and 20,512 before, 20,508 and 21,340 to 21,368 during, 20,508 and 21,352 after;
+    serialized 20,512 and 20,508 before, 20,512 and 21,324 to 21,352 during, 20,512 and 21,340
+    after. The service round trip costs about 0.3 ms per call over the in-process fixture.
+  - **What the numbers say about `plan/next/rust-object-as-python-object.md`**, for the
+    maintainer to decide: a hosted Python client costs a service about a millisecond per call
+    and 3 to 7 ms per 300 records by value, grows its process by about 2 MiB under three
+    minutes of continuous calls, and lets a wait of minutes hold one connection and one thread
+    and nothing else. What costs are a proxied collection -- about 0.6 ms per item per field --
+    and `--serialize`, under which a wait of minutes holds every call of that binding from every
+    kernel of its session, which is the ticket pattern's argument
+    (`potential/ticket-based-service-waits.md`).

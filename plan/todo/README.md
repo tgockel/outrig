@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-17` | A host call blocks only its caller                                 |
 | `0003-18` | A binding's process dies with its owner                            |
 
 **The owner's API**
@@ -165,9 +164,6 @@ Cross-cutting notes the individual tasks carry rather than this file:
   list, not forgotten.
 - `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
   box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
-  The same pass may defer `0003-17`'s service-shaped measurements -- RPC count, process memory and
-  tail latency against a service that blocks for minutes -- to a task of their own, when the spike
-  is better kept to its own question.
 
 ## Not queued, deliberately
 

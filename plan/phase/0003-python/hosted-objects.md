@@ -227,7 +227,8 @@ between kernels (`agent-placement.md`), one call is in flight on a connection at
 kernel opens more than one so that a blocked call blocks no other ("Calls are synchronous"). On
 the host, the binding process serves each connection on a thread of its own, which is RPyC's
 ordinary server model, so requests from different connections run in the library at the same time
-unless the binding is declared `serialize = true`. `0003-17` proves the arrangement holds.
+unless the binding is declared `serialize = true`. `0003-17` proved the arrangement holds, with
+both programs started on the host by its tests; its `## Decisions` record what held.
 
 ## Interception
 
@@ -323,6 +324,12 @@ Results, from the host:
   host either way. A library that builds a new object on every access yields a new proxy on every
   access: GitPython builds a new `HEAD` each time `repo.head` is read, so `repo.head is repo.head`
   is false. That is the library's behavior, not the transport's.
+- A method call is two requests, not one. RPyC's proxy fetches the bound method as a proxy of
+  its own, calls that, and releases it afterwards; its one-request `callattr` is sent only for
+  the special methods Python looks up on the type -- `__iter__`, `__next__`, `__getitem__` -- so
+  iterating a returned list costs one request per item and per field read, and a release per
+  proxy. `0003-17` measured both; making an ordinary call one request is
+  `plan/next/one-request-per-hosted-method-call.md`.
 
 ## Exceptions
 
@@ -415,7 +422,7 @@ of them, and the container side sends a proxy's request on whichever connection 
 its root resolved then, on the kernel's own thread ("Presentation"); a later one is opened by the
 thread whose call needs it, which is never the reader thread. A thread waiting for a free
 connection waits where the reader thread can wake it, as a caller waiting for its reply does, and
-a call woken there was never sent. `0003-17` proves the arrangement.
+a call woken there was never sent. `0003-17` proved the arrangement.
 
 **The binding process serves each connection on a thread of its own.** That is RPyC's ordinary
 server model -- its `ThreadedServer` starts a thread per connection -- so calls from different
@@ -438,7 +445,10 @@ an approval holds it for nobody, and the binding serves other calls while the ap
 (`boundary-policy.md`).
 The cost is the one the default avoids: under `serialize = true`, a call that blocks for an hour
 holds every other call to that binding for an hour, from every kernel. `0003-20` delivers the
-setting and `0003-17` proves both modes.
+setting; `0003-17` proved both modes, starting the binding program with `--serialize`, which is
+how the setting reaches it. The lock is granted in arrival order and is re-entrant for the thread
+holding it; a waiter holds a ticket, which `0003-21` drops when a cancel names its request or
+when the session closes.
 
 **Why every binding is not serialized.** Until the review of 2026-10-02 this page said the
 opposite: one request at a time per binding process, so that no hosted library had to be
@@ -458,7 +468,11 @@ included, rather than by the primary's SIGINT path, which could raise between a 
 its body (`0003-17`). A call whose target had been invoked keeps running on the host, because RPyC
 has no request that cancels one. Its reply, when it comes, is not handed to anyone, but it is
 recorded: the call's outcome is `returned` or `raised`, with the note that the caller had been
-interrupted, and the connection stays usable. Only a call whose binding is killed or dies before
+interrupted, and the connection stays usable -- though not before that reply has arrived: the
+next call into the pool reads it and drops it, and the connection is free again. A callback the
+library makes after its caller was interrupted is refused the same way, when that next call
+reads it, so a library that calls back then waits for the kernel's next call into the pool
+(`0003-17`). Only a call whose binding is killed or dies before
 replying is `unknown`, in the sense `execution-and-rounds.md` gives it: the host cannot say whether
 it took effect, and nothing retries it. A call not yet invoked -- held for a decision, waiting for
 a free connection, or waiting for the serialize lock -- is `cancelled`, with the
@@ -487,7 +501,8 @@ session then closes and reports as at shutdown
 (`plan/next/interpreter-restart-with-a-reset-notice.md`).
 
 **A call that outlives its caller runs to completion.** A call still running in its binding when
-its kernel is released (`0003-25`), or when the connection that carried it closes for another
+its kernel is released (`0003-25`, through `Kernel.close_hosted`, which closes the kernel's pool
+and wakes every call waiting on it), or when the connection that carried it closes for another
 reason -- the relay closing it after a frame that did not fit (`0003-21`), the interpreter's
 death -- cannot be stopped: RPyC has no cancel, so the binding runs it on its thread until it
 returns, and the reply reaches nobody. Its caller is told `unknown`, since its wait ended with no
@@ -588,22 +603,24 @@ pure-Python client that is hosted like any library. The trait idea is
   on the connection that produced it (`netref.syncreq`), the object table per connection
   (`_local_objects`) and its reference counts, the by-value types in `brine`, class resolution
   through `sys.modules`, how `vinegar` dumps and rebuilds exceptions, a safe list without
-  `__call__`, and the nested `inspect` a proxy's class is built from. Still read rather than
-  exercised: the 30-second default and `bind_threads` (both turned off in config), a request
-  served on whichever thread reads it, the per-thread connection advice in `serve_threaded`'s
-  docstring, `ThreadedServer` starting a thread per connection, and the `_rpyc_getattr` hooks
-  consulted where `_check_attr` is, which the interception never calls.
-- That a kernel's connections can share one object table without breaking RPyC's reference
-  counting, and that the container side can send a proxy's request on a connection other than
-  its own, is reasoned from `_box`, `_unbox` and the `del` handler, not tested. The spike's
-  questions about the shared table are these: whether nested callbacks complete when every
-  pooled connection is occupied; whether closing one connection drops only its entries while a
-  proxy on another connection of the same kernel keeps working; whether a kernel's pool closed
-  under live worker calls tells their callers `unknown`, records each call's outcome when its
-  reply comes, and leaves its table gone; and whether a proxy released on one connection frees
-  its object only when no connection holds it. `0003-17` tests each; if the table or the routing
-  fails it also measures the alternative its fork 4 names --
-  one connection per kernel and binding, with replies out of order -- and then stops and reports.
+  `__call__`, and the nested `inspect` a proxy's class is built from. `0003-17` exercised a
+  request served on whichever thread reads the connection -- a callback runs on the thread whose
+  call it belongs to -- and the binding's thread per connection, which the binding program
+  starts itself rather than through `ThreadedServer`. Still read rather than exercised: the
+  30-second default and `bind_threads` (both turned off in config), the per-thread connection
+  advice in `serve_threaded`'s docstring, and the `_rpyc_getattr` hooks consulted where
+  `_check_attr` is, which the interception never calls.
+- That a kernel's connections share one object table without breaking RPyC's reference
+  counting, and that the container side sends a proxy's request on a connection other than its
+  own, was reasoned from `_box`, `_unbox` and the `del` handler, and `0003-17` tested each of
+  the spike's questions about it: nested callbacks complete with every pooled connection
+  occupied; closing one connection drops only its entries while a proxy on another connection
+  of the same kernel keeps working; a kernel's pool closed under live worker calls tells their
+  callers `unknown`, leaves the binding to finish the calls, and leaves its table gone; and a
+  proxy released on one connection frees its object only when no connection holds it. All four
+  held, so fork 4's alternative -- one connection per kernel and binding, with replies out of
+  order -- was not measured. What stood in for the outcome event, which `0003-21` builds, was
+  the binding's record of the finished call and the reply crossing to a closed connection.
 - The two CVEs are described from their published advisories. `0003-16` sent each one's request
   by hand -- a comparison naming `__getattribute__`, and a host method copying and pickling a
   callback it was given -- and both are refused; neither was reproduced against stock RPyC.
@@ -622,15 +639,18 @@ pure-Python client that is hosted like any library. The trait idea is
     reference count), copied containers arrive as builtins, and a large result is bounded. Its
     `## Decisions` record what else the spike found: a by-value target reaching attributes
     through `str.format`, and a generator's frame reaching the host's globals, both now denied.
-  - `0003-17`: another kernel progresses while one blocks for ten seconds, two kernels' calls to
+  - `0003-17` -- confirmed: another kernel progresses while one blocks, two kernels' calls to
     one binding overlap on the host and never overlap under `serialize = true`, two `to_thread`
-    workers' calls from one kernel overlap and never receive each other's replies, a proxy's
-    request travels on any free connection of its kernel's pool, a callback runs on the calling
-    thread and cannot be invoked after its call, an interrupted call leaves the connection
-    usable, nested callbacks complete with every connection occupied, a closed connection takes
-    only its own entries from the kernel's table, a pool closed under live worker calls leaves
-    them `unknown` and its table gone, and a proxy released on one connection frees its object
-    only when no connection holds it.
+    workers' calls from one kernel overlap and each receives its own reply, a proxy's request
+    travels on any free connection of its kernel's pool, a callback runs on the calling thread
+    and cannot be invoked after its call, an interrupt or a cancel wakes a call on a child's
+    kernel and on the primary and leaves the connection usable, a call woken while waiting for
+    a connection was never sent, nested callbacks complete with every connection occupied, a
+    closed connection takes only its own entries from the kernel's table, a pool closed under
+    live worker calls leaves them `unknown` and its table gone, and a proxy released on one
+    connection frees its object only when no connection holds it. Its `## Decisions` record
+    the measurements of the binding as a service client, and that a method call is two
+    requests.
   - `0003-18`: `kill -9` of the owner leaves nothing in the binding's process group, a requirement
     set is installed once, a compiled wheel is refused with the reason, and the cache imports
     inside a container.

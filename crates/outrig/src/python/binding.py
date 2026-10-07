@@ -3,17 +3,26 @@
 Started on the host by the Rust owner with the payload's `python3 -I -c <this program>` and three
 arguments -- the vendored RPyC's directory, the binding's package directory, and the factory as
 `module:callable` -- it imports the factory, calls it once, and serves the object it returned as the
-root of every connection. Its stdin and stdout carry NDJSON: RPyC frames tagged by agent and
-connection, split into bounded parts (`rpc` lines), and a `ready` line once the factory has
-returned. Everything else it writes goes to stderr, where the owner logs it.
+root of every connection. A fourth argument, `--serialize`, is for a library that is not
+thread-safe: the binding then runs one request at a time across all its connections, in the order
+they arrived, except that a callback's nested request runs at once on the thread whose turn it is,
+and that `ping` and `close` never wait. Its stdin and stdout carry NDJSON: RPyC frames tagged by
+agent and connection, split into bounded parts (`rpc` lines), and a `ready` line once the factory
+has returned. Everything else it writes goes to stderr, where the owner logs it.
+
+Each connection is served on a thread of its own. The objects handed out to one agent live in one
+table its connections share, so a proxy resolves on whichever of them it arrives on and on no other
+agent's; each connection counts the references it handed out itself, gives back only those when it
+closes, and the table goes once the agent's last connection has ended.
 
 Enforcement lives here, on the host, because the container side cannot be trusted: agent code runs
 in the same process as the other end of this transport and can write frames of its own. So every
 one of RPyC's 20 request handlers is replaced, and each request is checked before anything acts on
 it:
 
-- A request's target must be an object this connection handed out. A by-value target would let
-  `str.format` read attributes through its format string, past the attribute rule.
+- A request's target must be an object handed out to this agent, on this connection or another of
+  its. A by-value target would let `str.format` read attributes through its format string, past
+  the attribute rule.
 - A member name must be public -- no leading underscore -- or on RPyC's `safe_attrs` list, for
   every handler that names one, `cmp`'s operator included; `cmp` takes comparison operators only.
 - Nothing arrives by reference from the container except a callable, which becomes a proxy that can
@@ -21,7 +30,7 @@ it:
 - Frames and tracebacks never leave: a generator's frame reaches this process's globals through
   public names alone.
 - No pickle, no import of anything the container names, no traceback text in an exception, and a
-  release of more references than were handed out is refused.
+  release of more references than this connection handed out is refused.
 
 The frame channel below is a copy of the interpreter's, since the two programs share no module.
 Keep them the same.
@@ -110,10 +119,11 @@ class FrameChannel:
     why. A frame is never half-delivered: `recv` returns whole frames or raises.
     """
 
-    def __init__(self, write):
-        # `write(part, more)` writes one part as one protocol line.
+    def __init__(self, write, cond=None):
+        # `write(part, more)` writes one part as one protocol line. `cond` is the condition
+        # variable to wait on, when the caller shares one between channels.
         self._write = write
-        self._cond = threading.Condition()
+        self._cond = threading.Condition() if cond is None else cond
         self._reason = None  # why the channel closed; `None` while it is open
         self._frames = collections.deque()  # whole frames, data only
         self._held = 0  # bytes in `_frames`
@@ -128,6 +138,11 @@ class FrameChannel:
     @property
     def reason(self):
         return self._reason
+
+    @property
+    def ready(self):
+        """Whether `recv` would return at once: a frame is held, or the channel has closed."""
+        return bool(self._frames) or self._reason is not None
 
     def fileno(self):
         raise OSError("a frame channel has no descriptor")
@@ -202,7 +217,7 @@ class FrameChannel:
         `None` -- for one. True once the channel has closed, so the reader learns why."""
         left = timeout.timeleft() if hasattr(timeout, "timeleft") else timeout
         with self._cond:
-            return self._cond.wait_for(lambda: bool(self._frames) or self._reason is not None, left)
+            return self._cond.wait_for(lambda: self.ready, left)
 
     def recv(self):
         """The next whole frame's data, or `EOFError` with the reason the channel closed."""
@@ -298,6 +313,131 @@ class _Context(threading.local):
     boxed = None
 
 
+# ---------------------------------------------------------------------------- the agent's objects
+
+
+class Objects:
+    """The objects handed out to one agent, by id_pack, shared by the agent's connections: a proxy
+    resolves on whichever of them it arrives on. Each connection's references are counted apart,
+    so a release is checked against what that connection handed out, and the object stays until no
+    connection holds it.
+
+    An object's last reference may run library code as it dies -- a destructor -- so nothing dies
+    under the lock: what a method takes out of the table, it leaves in a local that dies with its
+    frame, after the lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._slots = {}  # id_pack -> [obj, references held across the agent's connections]
+        self._held = {}  # connection -> {id_pack -> references it handed out}
+
+    def __len__(self):
+        with self._lock:
+            return len(self._slots)
+
+    def __getitem__(self, id_pack):
+        with self._lock:
+            return self._slots[id_pack][0]
+
+    def add(self, conn, id_pack, obj):
+        """One more reference to `obj`, handed out by `conn`."""
+        with self._lock:
+            slot = self._slots.setdefault(id_pack, [obj, 0])
+            slot[1] += 1
+            held = self._held.setdefault(conn, {})
+            held[id_pack] = held.get(id_pack, 0) + 1
+
+    def release(self, conn, id_pack, count):
+        """`count` fewer references from `conn` to the object `id_pack` names, unless that is more
+        than `conn` handed out."""
+        with self._lock:
+            held = self._held.get(conn, {})
+            handed = held.get(id_pack, 0)
+            if not handed:
+                raise Refused("a release of an object this connection never handed out")
+            if count > handed:
+                raise Refused(
+                    f"a release of {count} references to an object this connection handed out "
+                    f"{handed} times"
+                )
+            if count == handed:
+                del held[id_pack]
+                if not held:
+                    del self._held[conn]  # so a closed connection is not kept as a key
+            else:
+                held[id_pack] = handed - count
+            slot = self._take(id_pack, count)
+        del slot  # outside the lock: this may have been the object's last reference
+
+    def forget(self, conn):
+        """Every reference `conn` handed out, taken back: it has closed."""
+        with self._lock:
+            slots = [
+                self._take(id_pack, count) for id_pack, count in self._held.pop(conn, {}).items()
+            ]
+        del slots  # outside the lock, as above
+
+    def _take(self, id_pack, count):
+        """Under the lock: `count` fewer references to the object `id_pack` names. Its slot leaves
+        the table once none are left, and is returned so that it outlives the lock."""
+        slot = self._slots[id_pack]
+        slot[1] -= count
+        if not slot[1]:
+            del self._slots[id_pack]
+        return slot
+
+
+class Turn:
+    """One request at a time across every connection of this binding, under `--serialize`: taken
+    with `with`, granted to waiters in the order they arrived -- which `threading.RLock` does not
+    promise -- and re-entrant for the thread whose turn it is, so a callback's nested request,
+    served on that thread, runs at once.
+
+    Each waiter is a record a later task can mark `dropped` with a reason; it then stops waiting
+    and raises `EOFError(reason)` instead of taking its turn.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._owner = None  # the ident of the thread whose turn it is
+        self._depth = 0  # how many times that thread has taken it
+        self._waiters = collections.deque()  # in arrival order
+
+    def __enter__(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner == me:
+                self._depth += 1
+                return
+            waiter = types.SimpleNamespace(dropped=None)
+            self._waiters.append(waiter)
+            try:
+                self._cond.wait_for(
+                    lambda: waiter.dropped is not None
+                    or (self._owner is None and self._waiters[0] is waiter)
+                )
+            finally:
+                # However the wait ends, nobody waits behind a waiter that is gone.
+                self._waiters.remove(waiter)
+            if waiter.dropped is not None:
+                self._cond.notify_all()  # the next in line may be first now
+                raise EOFError(waiter.dropped)
+            self._owner, self._depth = me, 1
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._depth -= 1
+            if not self._depth:
+                self._owner = None
+                self._cond.notify_all()
+
+
+# The turn every request takes once it is checked: a `Turn` under `--serialize`, set by `main`;
+# otherwise nothing, and requests on different connections run at the same time.
+_turn = contextlib.nullcontext()
+
+
 def connection_class(rpyc):
     """The connection class that intercepts every request, built over the imported `rpyc`.
 
@@ -332,6 +472,8 @@ def connection_class(rpyc):
     targetless = frozenset(
         [consts.HANDLE_PING, consts.HANDLE_CLOSE, consts.HANDLE_GETROOT, consts.HANDLE_INSPECT]
     )
+    # Requests that run no library code, so they wait for no turn under `--serialize`.
+    unserialized = frozenset([consts.HANDLE_PING, consts.HANDLE_CLOSE])
 
     def allowed(name):
         """The attribute rule: a public name, or one on RPyC's safe list."""
@@ -397,13 +539,16 @@ def connection_class(rpyc):
             return self.__reduce__()
 
     class Binding(Connection):
-        """One connection to one kernel, every request checked."""
+        """One connection to one kernel, every request checked; what it hands out goes in the
+        agent's table."""
 
-        def __init__(self, channel, *, root_object, on_close):
+        def __init__(self, channel, *, root_object, objects, on_close):
             # The connection's RPyC root is a service of nothing, whose `on_disconnect` RPyC
             # calls at cleanup; `getroot` answers with the object the factory returned.
             super().__init__(rpyc.core.service.VoidService(), channel, config)
             self._root_object = root_object
+            # The agent's `Objects`; RPyC's own per-connection `_local_objects` stays empty.
+            self._objects = objects
             self._on_close = on_close
             self._context = _Context()
             # The last exception's whole traceback text, for the event `0003-21` records. The
@@ -480,24 +625,33 @@ def connection_class(rpyc):
             self._context.marks = marks = []
             handed = []
             try:
-                try:
-                    handler, boxed = raw_args
-                    method = self._HANDLERS.get(handler) if type(handler) is int else None
-                    if method is None:
-                        raise Refused(f"request type {handler!r} is not one this binding answers")
-                    target = self._target(handler, boxed)
-                    args = self._unbox(boxed)
-                    if handler == consts.HANDLE_DEL:
-                        res = self._handle_del(target, *args[1:])
-                    else:
+                with contextlib.ExitStack() as turn:
+                    try:
+                        handler, boxed = raw_args
+                        method = self._HANDLERS.get(handler) if type(handler) is int else None
+                        if method is None:
+                            raise Refused(
+                                f"request type {handler!r} is not one this binding answers"
+                            )
+                        target = self._target(handler, boxed)
+                        if handler == consts.HANDLE_DEL:
+                            # The target stays an id_pack: unboxed, this frame would hold the
+                            # object past its release.
+                            args = (target, *map(self._unbox, boxed[1][1:]))
+                        else:
+                            args = self._unbox(boxed)
+                        if handler not in unserialized:
+                            # Once the request is checked, so a refused one waits for nobody; held
+                            # until its exception, if any, is rendered below.
+                            turn.enter_context(_turn)
                         res = method(self, *args)
-                    reply = (consts.MSG_REPLY, self._box_tracked(res, handed))
-                except BaseException:
-                    # The reply never goes out, so nothing it would have referenced is held.
-                    self._release(handed)
-                    t, v, tb = sys.exc_info()
-                    self._last_traceback = tb
-                    reply = (consts.MSG_EXCEPTION, self._box_exc(t, v, tb))
+                        reply = (consts.MSG_REPLY, self._box_tracked(res, handed))
+                    except BaseException:
+                        # The reply never goes out, so nothing it would have referenced is held.
+                        self._release(handed)
+                        t, v, tb = sys.exc_info()
+                        self._last_traceback = tb
+                        reply = (consts.MSG_EXCEPTION, self._box_exc(t, v, tb))
             finally:
                 # Before the reply goes out, so no call can be queued after it.
                 for mark in marks:
@@ -510,6 +664,12 @@ def connection_class(rpyc):
                 self._release(handed)
                 refused = Refused(str(e))
                 self._send(consts.MSG_EXCEPTION, seq, self._box_exc(Refused, refused, None))
+            except BaseException:
+                # The reply could not be written: the channel closed under the request -- under
+                # a callback, say -- and this connection's cleanup has already run, so what the
+                # reply would have referenced goes back now or never.
+                self._release(handed)
+                raise
 
         def _send(self, msg, seq, args):
             """RPyC's, without its shared send queue: a frame past the bound raises in the thread
@@ -542,9 +702,11 @@ def connection_class(rpyc):
                 self._context.boxed = saved
 
         def _release(self, boxed):
+            """Take back one reference to each object in `boxed`, handed out for a message that
+            was never sent."""
             for id_pack in boxed:
-                with contextlib.suppress(KeyError):
-                    self._local_objects.decref(id_pack)
+                with contextlib.suppress(Refused):
+                    self._objects.release(self, id_pack, 1)
 
         def _target(self, handler, boxed):
             """The id_pack of the request's target, which must be an object this connection handed
@@ -619,11 +781,11 @@ def connection_class(rpyc):
 
         def _lookup(self, id_pack, required=True):
             try:
-                return self._local_objects[id_pack]
+                return self._objects[id_pack]
             except (KeyError, TypeError):
                 if required:
                     raise Refused(
-                        "the request names an object this connection never handed out"
+                        "the request names an object this binding never handed out to this agent"
                     ) from None
                 return None
 
@@ -638,13 +800,19 @@ def connection_class(rpyc):
                 return consts.LABEL_VALUE, obj
             if type(obj) is tuple:
                 return consts.LABEL_TUPLE, tuple(self._box(item) for item in obj)
-            if type(obj) is Callback and obj._conn is self:
+            if type(obj) is Callback:
                 if not obj._live:
                     # The container released it when the call it was passed to returned, so a
                     # reference would name nothing there.
                     raise Refused(
                         "a callback cannot be read back once the call it was passed to has "
                         "returned"
+                    )
+                if obj._conn is not self:
+                    # Its id_pack names a callable on the connection it came in on, not here.
+                    raise Refused(
+                        "a callback cannot be read back on a connection other than the one it "
+                        "came in on"
                     )
                 return consts.LABEL_LOCAL_REF, obj._id_pack
             if isinstance(obj, (types.FrameType, types.TracebackType)):
@@ -653,7 +821,7 @@ def connection_class(rpyc):
                     f"globals"
                 )
             id_pack = get_id_pack(obj)
-            self._local_objects.add(id_pack, obj)
+            self._objects.add(self, id_pack, obj)
             if self._context.boxed is not None:
                 self._context.boxed.append(id_pack)
             return consts.LABEL_REMOTE_REF, id_pack
@@ -749,6 +917,13 @@ def connection_class(rpyc):
             self._channel.close(reason)
             self.close()
 
+        def _cleanup(self, _anyway=True):
+            """RPyC's, and then this connection's references go back to the agent's table -- under
+            the turn when the binding serializes, since the last of them may run a destructor."""
+            with _turn:
+                super()._cleanup(_anyway)
+                self._objects.forget(self)
+
         # ------------------------------------------------------------------ handlers
 
         def _handle_ping(self, data):
@@ -812,24 +987,11 @@ def connection_class(rpyc):
         def _handle_del(self, id_pack, count=1):
             """Release `count` references to the object `id_pack` names -- taken from the request
             rather than from the object, whose attributes would run library code -- unless that is
-            more than this connection handed out."""
+            more than this connection handed out. The object was not unboxed for this request, so
+            once no connection holds it, it dies here, before the reply."""
             if type(count) is not int or count < 1:
                 raise Refused(f"a release of {count!r} references")
-            table = self._local_objects
-            with table._lock:
-                slot = table._dict.get(id_pack)
-                if slot is None:
-                    raise Refused("a release of an object this connection never handed out")
-                handed = slot[1] + 1
-                if count > handed:
-                    raise Refused(
-                        f"a release of {count} references to an object this connection handed out "
-                        f"{handed} times"
-                    )
-                if count == handed:
-                    del table._dict[id_pack]
-                else:
-                    slot[1] -= count
+            self._objects.release(self, id_pack, count)
 
         def _handle_buffiter(self, obj, count):
             if type(count) is not int or count < 0:
@@ -864,7 +1026,8 @@ def connection_class(rpyc):
 
 class Connections:
     """The connections of this binding, by agent and connection id, shared by the reading thread
-    and the serving threads."""
+    and the serving threads; and each agent's object table, which its connections share for as
+    long as one of them is serving."""
 
     def __init__(self, Binding, root_object):
         self._Binding = Binding
@@ -872,6 +1035,8 @@ class Connections:
         self._lock = threading.Lock()
         self._open = {}  # (agent, id) -> channel
         self._closed = set()  # (agent, id) of connections that have closed
+        self._objects = {}  # agent -> its Objects
+        self._serving = collections.Counter()  # agent -> its connections still serving
 
     def channel(self, agent, cid):
         """The channel for `(agent, cid)`, started if new; `None` once it has closed."""
@@ -893,9 +1058,13 @@ class Connections:
                     }
                 )
             )
+            self._serving[agent] += 1
+            if self._serving[agent] == 1:
+                self._objects[agent] = Objects()
             conn = self._Binding(
                 channel,
                 root_object=self._root_object,
+                objects=self._objects[agent],
                 on_close=lambda reason: self.notice(agent, cid, reason),
             )
             self._open[key] = channel
@@ -911,6 +1080,21 @@ class Connections:
             _diag(f"connection {key[0]}#{key[1]}: serving it failed: {e!r}")
         finally:
             self.forget(*key)
+            self._ended(key[0])
+
+    def _ended(self, agent):
+        """One of `agent`'s connections has finished serving, its cleanup run; after the last of
+        them, the agent's table goes."""
+        with self._lock:
+            self._serving[agent] -= 1
+            if self._serving[agent]:
+                return
+            del self._serving[agent]
+            objects = self._objects.pop(agent)
+        _diag(
+            f"agent {agent!r}: its last connection has ended, and its object table is dropped "
+            f"with {len(objects)} objects"
+        )
 
     def forget(self, agent, cid):
         with self._lock:
@@ -971,11 +1155,17 @@ def _read(connections):
 
 
 def main():
-    if len(sys.argv) != 4:
-        _diag(f"usage: python3 -I -c <program> <rpyc-dir> <package-dir> <module:callable>; got {sys.argv[1:]!r}")
+    serialize = sys.argv[4:] == ["--serialize"]
+    if len(sys.argv) != 4 and not serialize:
+        _diag(
+            "usage: python3 -I -c <program> <rpyc-dir> <package-dir> <module:callable> "
+            f"[--serialize]; got {sys.argv[1:]!r}"
+        )
         os._exit(2)
-    rpyc_dir, packages, factory = sys.argv[1:]
-    global _PROTO_IN, _PROTO_OUT
+    rpyc_dir, packages, factory = sys.argv[1:4]
+    global _PROTO_IN, _PROTO_OUT, _turn
+    if serialize:
+        _turn = Turn()
     # The protocol never shares a descriptor with the library: fd 0 reads nothing, and what the
     # library prints goes to stderr with the diagnostics.
     _PROTO_IN = os.dup(0)

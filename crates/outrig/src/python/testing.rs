@@ -11,7 +11,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
@@ -44,6 +44,90 @@ pub(crate) async fn slot_freed(interpreter: &Interpreter) {
         }
     })
     .await;
+}
+
+/// Polls `check` until it answers, failing after [`TIMEOUT`] with what it was waiting for.
+pub(crate) fn eventually<T>(
+    mut check: impl FnMut() -> Option<T>,
+    waited_for: impl FnOnce() -> String,
+) -> T {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(answer) = check() {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {} within {TIMEOUT:?}",
+            waited_for()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A path nothing exists at until someone says so: the test, or a program under test that
+/// creates it to report where it has got to.
+pub(crate) struct Flag {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl Flag {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("flag");
+        Self { _dir: dir, path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The path as a Python string literal.
+    pub(crate) fn py(&self) -> String {
+        format!("{:?}", self.path.to_str().expect("a UTF-8 temp path"))
+    }
+
+    pub(crate) fn raise(&self) {
+        std::fs::write(&self.path, b"").expect("raise the flag");
+    }
+
+    pub(crate) fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Block until the flag exists, failing after [`TIMEOUT`].
+    pub(crate) fn wait(&self) {
+        eventually(
+            || self.exists().then_some(()),
+            || format!("flag {}", self.path.display()),
+        );
+    }
+
+    /// Python that awaits the flag, failing rather than hanging if it never appears.
+    pub(crate) fn awaited(&self) -> String {
+        self.waited_with("await asyncio.sleep(0.01)")
+    }
+
+    /// The same wait, holding the kernel's loop the whole time.
+    pub(crate) fn blocked(&self) -> String {
+        self.waited_with("time.sleep(0.01)")
+    }
+
+    fn waited_with(&self, pause: &str) -> String {
+        py(&format!(
+            r#"
+            import os, time
+            deadline = time.monotonic() + {timeout}
+            while not os.path.exists({path}):
+                if time.monotonic() > deadline:
+                    raise TimeoutError('the flag never appeared')
+                {pause}
+            "#,
+            path = self.py(),
+            timeout = TIMEOUT.as_secs(),
+        ))
+    }
 }
 
 /// A clean run that printed `output` and nothing else.

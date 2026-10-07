@@ -8,14 +8,14 @@
 //! interpreter says is handed to the test. The relay counts the lines each way and remembers the
 //! longest, which is how a test checks the frame bound held in transit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -51,13 +51,149 @@ pub(crate) fn rpyc_dir() -> &'static Path {
 
 /// The fixture library as a module: an object with public and private members, a nested object,
 /// a sequence, a context manager, methods that call back, report types, and return a large
-/// result, two exception classes, and a counter around `pickle.loads`.
+/// result, two exception classes, a counter around `pickle.loads`, a recording method that notes
+/// when it ran on the host and sleeps or waits for a file, and objects made on request with a
+/// weak reference kept, so a test can watch the binding's table drop them.
 pub(crate) const FIXTURE_SOURCE: &str = r#"
 """The fixture library a binding process hosts in tests."""
 
+import itertools
 import os
 import pickle
 import sys
+import threading
+import time
+import weakref
+
+
+class Records:
+    """The service shape: a wait that blocks until someone answers, a question asked for a ticket
+    and polled for, and records in bulk. One implementation of the state, used in the binding's
+    process by `Root` and in the service process the two-session measurement starts."""
+
+    def __init__(self):
+        self._answer = threading.Event()
+        self._answer_value = None
+        self._tickets = {}  # ticket -> [question, polls so far]
+        self._next_ticket = itertools.count(1)
+        self._records_lock = threading.Lock()
+        self._records = [
+            {"id": i, "name": f"record {i}", "score": i * 1.5, "flag": bool(i % 2)}
+            for i in range(1000)
+        ]
+
+    def wait_for_answer(self, until=None, timeout=600):
+        """Block until `answer` is called -- or, given `until`, until that file exists: the one
+        release that works inside a binding started with `--serialize`, where `answer` would
+        wait for the lock this call holds."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._answer.wait(0.05):
+                return self._answer_value
+            if until is not None and os.path.exists(until):
+                return "released by file"
+            if time.monotonic() > deadline:
+                raise TimeoutError("nobody answered")
+
+    def answer(self, value):
+        self._answer_value = value
+        self._answer.set()
+
+    def ask(self, question):
+        """A ticket for `question`, answered on the second poll."""
+        ticket = next(self._next_ticket)
+        self._tickets[ticket] = [question, 0]
+        return ticket
+
+    def poll(self, ticket):
+        entry = self._tickets[ticket]
+        entry[1] += 1
+        return f"answer to {entry[0]}" if entry[1] >= 2 else None
+
+    def list_records(self, n):
+        """The first `n` records as a list of dicts, which the agent receives proxied."""
+        with self._records_lock:
+            return [dict(record) for record in self._records[:n]]
+
+    def records_by_value(self, n):
+        """The first `n` records as field names and a tuple of tuples, which cross by value."""
+        with self._records_lock:
+            rows = tuple(
+                (record["id"], record["name"], record["score"], record["flag"])
+                for record in self._records[:n]
+            )
+        return ("id", "name", "score", "flag"), rows
+
+    def update_records(self, changes):
+        """Apply `changes`, dicts with an `id`, and return how many."""
+        with self._records_lock:
+            by_id = {record["id"]: record for record in self._records}
+            for change in changes:
+                by_id[change["id"]].update(change)
+        return len(changes)
+
+
+class ServiceClient:
+    """A client of the service process, as a Rust service would ship one: each method is one
+    round trip over a Unix socket. One connection per calling thread, since the binding serves
+    its connections on several threads and one socket cannot carry two exchanges at once."""
+
+    def __init__(self, address):
+        self._address = address
+        self._local = threading.local()
+
+    def _connection(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            from multiprocessing.connection import Client
+
+            conn = self._local.conn = Client(self._address, family="AF_UNIX", authkey=b"fixture")
+        return conn
+
+    def _call(self, method, *args, **kwargs):
+        conn = self._connection()
+        conn.send((method, args, kwargs))
+        status, value = conn.recv()
+        if status == "error":
+            raise RuntimeError(value)
+        return value
+
+    def wait_for_answer(self, until=None, timeout=600):
+        return self._call("wait_for_answer", until=until, timeout=timeout)
+
+    def answer(self, value):
+        return self._call("answer", value)
+
+    def ask(self, question):
+        return self._call("ask", question)
+
+    def poll(self, ticket):
+        return self._call("poll", ticket)
+
+    def list_records(self, n):
+        return self._call("list_records", n)
+
+    def records_by_value(self, n):
+        return self._call("records_by_value", n)
+
+    def update_records(self, changes):
+        return self._call("update_records", changes)
+
+
+def service_client():
+    """The factory of a binding that is a client of the service process."""
+    return ServiceClient(os.environ["OUTRIG_FIXTURE_SERVICE"])
+
+
+class Fresh:
+    """An object made on request, so a test can watch the binding's table drop it."""
+
+    def __init__(self, root, name):
+        self._root = root
+        self.name = name
+
+    def record(self, **kwargs):
+        return self._root.record(**kwargs)
 
 
 class FixtureError(Exception):
@@ -127,8 +263,9 @@ def _counting_loads(data, *args, **kwargs):
 pickle.loads = _counting_loads
 
 
-class Root:
+class Root(Records):
     def __init__(self):
+        Records.__init__(self)
         self.public = "public value"
         self._private = "private value"
         self.writable = "before"
@@ -141,15 +278,99 @@ class Root:
         self.str_type = str
         self.calls = 0
         self.last_raised = None
+        self._lock = threading.Lock()
+        self._intervals = []
+        self._kept = {}  # name -> (weak reference, strong reference or None)
 
     def _private_method(self):
         return "private"
+
+    def record(self, seconds=0, label="", started=None, until=None):
+        """The recording method: notes when it starts and ends here, on the host, and the thread
+        that served it. It sleeps `seconds`, or, given `until`, waits for that file to exist with
+        `seconds or 60` as the ceiling; `started` is a file it creates on starting, so a test
+        knows the call is in flight."""
+        start = time.monotonic()
+        if started:
+            open(started, "w").close()
+        if until is None:
+            time.sleep(seconds)
+        else:
+            deadline = start + (seconds or 60)
+            while not os.path.exists(until):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{until} never appeared")
+                time.sleep(0.01)
+        self._note(label, start)
+        return label
+
+    def hold_callable(self, fn, started=None, until=None):
+        """Wait as `record` does, holding `fn` without calling it: a call that carries a callable
+        and blocks."""
+        self.record(0, "hold", started=started, until=until)
+
+    def call_then_fresh(self, fn, name):
+        """Call `fn`, swallow what it raises -- a connection that closed under it -- and return a
+        fresh object under `name`, as a library that survives a failed callback and still
+        answers would."""
+        try:
+            fn()
+        except Exception:
+            pass
+        return self.fresh(name)
+
+    def call_recorded(self, fn, label):
+        """`fn()`, with its interval recorded as `record` records one."""
+        start = time.monotonic()
+        try:
+            return fn()
+        finally:
+            self._note(label, start)
+
+    def _note(self, label, start):
+        with self._lock:
+            self._intervals.append((label, start, time.monotonic(), threading.current_thread().name))
+
+    def intervals(self):
+        """Every recorded interval as `(label, start, end, thread name)`, by value."""
+        with self._lock:
+            return tuple(self._intervals)
+
+    def thread_name(self):
+        return threading.current_thread().name
+
+    def fresh(self, name):
+        """A new object, kept here under `name` with a weak reference beside it."""
+        obj = Fresh(self, name)
+        self._kept[name] = (weakref.ref(obj), obj)
+        return obj
+
+    def again(self, name):
+        """The object `fresh` made under `name`, once more."""
+        return self._kept[name][1]
+
+    def let_go(self, name):
+        """Drop this module's own reference to `name`'s object, so the binding's table alone
+        holds it."""
+        ref, _ = self._kept[name]
+        self._kept[name] = (ref, None)
+
+    def alive(self, name):
+        """Whether `name`'s object still exists, after a collection."""
+        import gc
+
+        gc.collect()
+        return self._kept[name][0]() is not None
 
     def method(self, x, y=1):
         return x + y
 
     def takes(self, obj):
         return obj is self.nested
+
+    def echo(self, x):
+        """`x` itself, so a callable passed in comes back as a reference to it."""
+        return x
 
     def types(self, *args):
         return tuple(type(a).__name__ for a in args)
@@ -252,6 +473,97 @@ class Root:
 def make():
     return Root()
 "#;
+
+/// The service process of the two-session measurement: the fixture's `Records` behind a Unix
+/// socket, a thread per connection, each exchange a `(method, args, kwargs)` tuple answered with
+/// `("ok", result)` or `("error", text)`. Started as `python3 -I -c <this> <socket> <fixture-dir>`,
+/// and says `ready` on stdout once it listens.
+pub(crate) const SERVICE_SOURCE: &str = r#"
+import sys, threading
+from multiprocessing.connection import Listener
+
+address, fixture_dir = sys.argv[1], sys.argv[2]
+sys.path.append(fixture_dir)
+from outrig_fixture import Records
+
+state = Records()
+listener = Listener(address, family="AF_UNIX", authkey=b"fixture")
+print("ready", flush=True)
+
+
+def serve(conn):
+    with conn:
+        while True:
+            try:
+                method, args, kwargs = conn.recv()
+            except EOFError:
+                return
+            try:
+                result = ("ok", getattr(state, method)(*args, **kwargs))
+            except Exception as e:
+                result = ("error", f"{type(e).__name__}: {e}")
+            conn.send(result)
+
+
+while True:
+    threading.Thread(target=serve, args=(listener.accept(),), daemon=True).start()
+"#;
+
+/// The service process, started on the host and killed with the test.
+pub(crate) struct Service {
+    child: Child,
+    _dir: tempfile::TempDir,
+    /// The Unix socket it listens on, for `OUTRIG_FIXTURE_SERVICE`.
+    pub(crate) socket: PathBuf,
+}
+
+impl Service {
+    pub(crate) fn start() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("outrig-svc-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("a directory for the socket");
+        let socket = dir.path().join("s");
+        let mut child = python_command(None)
+            .args(["-I", "-c", SERVICE_SOURCE])
+            .arg(&socket)
+            .arg(fixture_dir())
+            .spawn()
+            .expect("the service starts");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = capture(child.stderr.take().expect("stderr is piped"));
+        let (ready_tx, ready_rx) = channel();
+        std::thread::spawn(move || {
+            let first = BufReader::new(stdout).lines().next();
+            let _ = ready_tx.send(first.map(|line| line.unwrap_or_default()));
+        });
+        match ready_rx.recv_timeout(TIMEOUT) {
+            Ok(Some(line)) if line == "ready" => {}
+            other => panic!(
+                "the service did not greet: {other:?}; its stderr: {}",
+                stderr.lock().expect("stderr lock")
+            ),
+        }
+        Self {
+            child,
+            _dir: dir,
+            socket,
+        }
+    }
+
+    pub(crate) fn socket(&self) -> &str {
+        self.socket.to_str().expect("a UTF-8 socket path")
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        let _ = self.child.wait();
+    }
+}
 
 /// A module the binding process could import, which writes a file when it is: the host must
 /// never import a module the container names.
@@ -360,18 +672,73 @@ impl Counter {
 }
 
 /// What crossed the relay: `rpc` lines toward the bindings and toward the interpreter, and how
-/// many of those toward a binding were close notices.
+/// many of those toward a binding were close notices -- overall, and per agent and binding.
 #[derive(Default)]
 pub(crate) struct Stats {
     pub(crate) to_binding: Counter,
     pub(crate) to_interpreter: Counter,
     closed_to_binding: AtomicUsize,
+    per: Mutex<HashMap<(String, String), Arc<Traffic>>>,
 }
 
 impl Stats {
     pub(crate) fn closed_to_binding(&self) -> usize {
         self.closed_to_binding.load(Ordering::SeqCst)
     }
+
+    /// The traffic between `agent` and `binding`, empty while none has crossed.
+    pub(crate) fn between(&self, agent: &str, binding: &str) -> Arc<Traffic> {
+        let mut per = self.per.lock().expect("stats lock");
+        Arc::clone(
+            per.entry((agent.to_string(), binding.to_string()))
+                .or_default(),
+        )
+    }
+}
+
+/// One agent's `rpc` traffic with one binding, and the connection ids it has used.
+#[derive(Default)]
+pub(crate) struct Traffic {
+    pub(crate) to_binding: Counter,
+    pub(crate) to_interpreter: Counter,
+    closed_to_binding: AtomicUsize,
+    ids: Mutex<BTreeSet<u64>>,
+}
+
+impl Traffic {
+    pub(crate) fn closed_to_binding(&self) -> usize {
+        self.closed_to_binding.load(Ordering::SeqCst)
+    }
+
+    /// Every connection id a line has named, either way.
+    pub(crate) fn connection_ids(&self) -> BTreeSet<u64> {
+        self.ids.lock().expect("ids lock").clone()
+    }
+
+    fn record(&self, len: usize, id: Option<u64>, to_binding: bool, closed: bool) {
+        if to_binding {
+            self.to_binding.record(len);
+            if closed {
+                self.closed_to_binding.fetch_add(1, Ordering::SeqCst);
+            }
+        } else {
+            self.to_interpreter.record(len);
+        }
+        if let Some(id) = id {
+            self.ids.lock().expect("ids lock").insert(id);
+        }
+    }
+}
+
+/// How [`Relay::bind_opts`] starts a binding process.
+#[derive(Default)]
+pub(crate) struct Bind<'a> {
+    /// The factory, as `module:callable`, in the fixture package.
+    pub(crate) factory: &'a str,
+    /// Extra environment variables for the process.
+    pub(crate) env: &'a [(&'a str, &'a str)],
+    /// `--serialize`: one call at a time across the binding's connections.
+    pub(crate) serialize: bool,
 }
 
 struct BindingProcess {
@@ -384,6 +751,8 @@ pub(crate) struct Relay {
     interpreter: Child,
     stdin: Arc<Mutex<ChildStdin>>,
     other: Receiver<Result<Value, String>>,
+    /// Messages read while looking for another, kept in order for the next `recv`.
+    pending: VecDeque<Value>,
     stderr: Arc<Mutex<String>>,
     bindings: Arc<Mutex<HashMap<String, BindingProcess>>>,
     pub(crate) stats: Arc<Stats>,
@@ -428,6 +797,7 @@ impl Relay {
             interpreter: child,
             stdin,
             other,
+            pending: VecDeque::new(),
             stderr,
             bindings,
             stats,
@@ -446,12 +816,41 @@ impl Relay {
 
     /// [`Relay::bind`] with extra environment variables for the binding's process.
     pub(crate) fn bind_with(&mut self, name: &str, factory: &str, env: &[(&str, &str)]) {
-        let mut child = python_command(None)
+        self.bind_opts(
+            name,
+            &Bind {
+                factory,
+                env,
+                serialize: false,
+            },
+        );
+    }
+
+    /// [`Relay::bind`] with `--serialize`: the binding runs one call at a time.
+    pub(crate) fn bind_serialized(&mut self, name: &str, factory: &str) {
+        self.bind_opts(
+            name,
+            &Bind {
+                factory,
+                env: &[],
+                serialize: true,
+            },
+        );
+    }
+
+    /// Start binding `name`'s process as `bind` says, and wait for it to be ready.
+    pub(crate) fn bind_opts(&mut self, name: &str, bind: &Bind) {
+        let mut command = python_command(None);
+        command
             .args(["-I", "-c", BINDING])
             .arg(rpyc_dir())
             .arg(fixture_dir())
-            .arg(factory)
-            .envs(env.iter().copied())
+            .arg(bind.factory);
+        if bind.serialize {
+            command.arg("--serialize");
+        }
+        let mut child = command
+            .envs(bind.env.iter().copied())
             .spawn()
             .expect("the binding starts");
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin is piped")));
@@ -495,13 +894,26 @@ impl Relay {
         write_line(&binding.stdin, &message);
     }
 
-    /// The next message from the interpreter that is not an `rpc` line.
+    /// The next message from the interpreter that is not an `rpc` line: one held back by
+    /// [`Relay::recv_where`] first, else the next to arrive within [`TIMEOUT`].
     pub(crate) fn recv(&mut self) -> Value {
-        let message = match self.other.recv_timeout(TIMEOUT) {
+        self.recv_within(TIMEOUT)
+    }
+
+    /// [`Relay::recv`], waiting up to `within` for a fresh message.
+    pub(crate) fn recv_within(&mut self, within: Duration) -> Value {
+        match self.pending.pop_front() {
+            Some(message) => message,
+            None => self.recv_fresh(within),
+        }
+    }
+
+    fn recv_fresh(&mut self, within: Duration) -> Value {
+        let message = match self.other.recv_timeout(within) {
             Ok(Ok(message)) => message,
             Ok(Err(bad)) => panic!("{bad}"),
             Err(RecvTimeoutError::Timeout) => {
-                panic!("quiet for {TIMEOUT:?}; stderr: {}", self.stderr())
+                panic!("quiet for {within:?}; stderr: {}", self.stderr())
             }
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("the interpreter exited; stderr: {}", self.stderr())
@@ -514,15 +926,92 @@ impl Relay {
         message
     }
 
-    /// Submit `source` to `agent` and return its result, which must be the very next message.
-    pub(crate) fn exec_in(&mut self, agent: &str, id: u64, source: &str) -> Value {
+    /// The next message `matches`, within `within`; the messages read meanwhile that do not are
+    /// held back, in order, for later `recv`s. How a test reads answers from several kernels
+    /// that arrive in whatever order they finish.
+    pub(crate) fn recv_where(
+        &mut self,
+        within: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        self.try_recv_where(within, matches).unwrap_or_else(|| {
+            panic!(
+                "no matching message within {within:?}; held back: {:?}; stderr: {}",
+                self.pending,
+                self.stderr()
+            )
+        })
+    }
+
+    /// [`Relay::recv_where`], answering `None` rather than failing when `within` passes.
+    pub(crate) fn try_recv_where(
+        &mut self,
+        within: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        if let Some(index) = self.pending.iter().position(&matches) {
+            return Some(self.pending.remove(index).expect("an index in range"));
+        }
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let message = match self.other.recv_timeout(left) {
+                Ok(Ok(message)) => message,
+                Ok(Err(bad)) => panic!("{bad}"),
+                Err(RecvTimeoutError::Timeout) => return None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the interpreter exited; stderr: {}", self.stderr())
+                }
+            };
+            if matches(&message) {
+                return Some(message);
+            }
+            self.pending.push_back(message);
+        }
+    }
+
+    /// Submit `source` to `agent` without waiting for its result.
+    pub(crate) fn submit_in(&mut self, agent: &str, id: u64, source: &str) {
         self.send(json!({"t": "exec", "agent": agent, "id": id, "src": source}));
-        let result = self.recv();
-        assert!(
-            result["t"] == "result" && result["agent"] == agent && result["id"] == id,
-            "expected the result of {agent}/{id}, got: {result}"
-        );
-        result
+    }
+
+    /// The result of `agent`'s execution `id`, within `within`, whatever else arrives first.
+    pub(crate) fn result_from(&mut self, agent: &str, id: u64, within: Duration) -> Value {
+        self.recv_where(within, |m| {
+            m["t"] == "result" && m["agent"] == agent && m["id"] == id
+        })
+    }
+
+    /// [`Relay::result_from`], answering `None` rather than failing when `within` passes.
+    pub(crate) fn try_result_from(
+        &mut self,
+        agent: &str,
+        id: u64,
+        within: Duration,
+    ) -> Option<Value> {
+        self.try_recv_where(within, |m| {
+            m["t"] == "result" && m["agent"] == agent && m["id"] == id
+        })
+    }
+
+    /// Submit `source` to `agent` and return its result.
+    pub(crate) fn exec_in(&mut self, agent: &str, id: u64, source: &str) -> Value {
+        self.exec_in_within(agent, id, source, TIMEOUT)
+    }
+
+    /// [`Relay::exec_in`], waiting up to `within` for the result.
+    pub(crate) fn exec_in_within(
+        &mut self,
+        agent: &str,
+        id: u64,
+        source: &str,
+        within: Duration,
+    ) -> Value {
+        self.submit_in(agent, id, source);
+        self.result_from(agent, id, within)
     }
 
     pub(crate) fn exec(&mut self, id: u64, source: &str) -> Value {
@@ -531,7 +1020,18 @@ impl Relay {
 
     /// Run `source` in `agent`, asserting it did not raise, and return what it printed.
     pub(crate) fn output_in(&mut self, agent: &str, id: u64, source: &str) -> String {
-        let result = self.exec_in(agent, id, source);
+        self.output_in_within(agent, id, source, TIMEOUT)
+    }
+
+    /// [`Relay::output_in`], waiting up to `within` for the result.
+    pub(crate) fn output_in_within(
+        &mut self,
+        agent: &str,
+        id: u64,
+        source: &str,
+        within: Duration,
+    ) -> String {
+        let result = self.exec_in_within(agent, id, source, within);
         assert_eq!(
             result["status"],
             "ok",
@@ -547,6 +1047,66 @@ impl Relay {
 
     pub(crate) fn output(&mut self, id: u64, source: &str) -> String {
         self.output_in(PRIMARY, id, source)
+    }
+
+    pub(crate) fn interrupt(&mut self, agent: &str, id: u64, runaway: bool) {
+        self.send(json!({"t": "interrupt", "agent": agent, "id": id, "runaway": runaway}));
+    }
+
+    pub(crate) fn cancel(&mut self, agent: &str, id: u64) {
+        self.send(json!({"t": "cancel", "agent": agent, "id": id}));
+    }
+
+    /// Ask `agent` for its inventory without waiting; the answer comes from its loop.
+    pub(crate) fn ask_inv(&mut self, agent: &str, id: u64) {
+        self.send(json!({"t": "inv", "agent": agent, "id": id}));
+    }
+
+    /// The answer to [`Relay::ask_inv`], whatever else arrives first.
+    pub(crate) fn inv_answer(&mut self, agent: &str, id: u64, within: Duration) -> Value {
+        self.recv_where(within, |m| {
+            m["t"] == "inv" && m["agent"] == agent && m["id"] == id
+        })
+    }
+
+    /// An inventory round trip, which proves `agent`'s loop turns.
+    pub(crate) fn inv(&mut self, agent: &str, id: u64) -> Value {
+        self.ask_inv(agent, id);
+        self.inv_answer(agent, id, TIMEOUT)
+    }
+
+    /// The CPU time `agent`'s thread has used, answered on the reader thread.
+    pub(crate) fn cpu(&mut self, agent: &str, id: u64) -> Value {
+        self.send(json!({"t": "cpu", "agent": agent, "id": id}));
+        self.recv_where(TIMEOUT, |m| {
+            m["t"] == "cpu" && m["agent"] == agent && m["id"] == id
+        })
+    }
+
+    /// Post `body` on `agent`'s channel `channel`, answered on the reader thread with how many
+    /// messages then wait there.
+    pub(crate) fn msg(&mut self, agent: &str, id: u64, channel: &str, body: &str) -> Value {
+        self.send(json!({"t": "msg", "agent": agent, "id": id, "channel": channel, "body": body}));
+        self.recv_where(TIMEOUT, |m| {
+            m["t"] == "msg" && m["agent"] == agent && m["id"] == id
+        })
+    }
+
+    pub(crate) fn binding_pid(&self, name: &str) -> u32 {
+        let bindings = self.bindings.lock().expect("bindings lock");
+        bindings.get(name).expect("a started binding").child.id()
+    }
+
+    /// The binding process's resident set, in KiB, as `/proc` reports it.
+    pub(crate) fn binding_rss_kib(&self, name: &str) -> usize {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.binding_pid(name)))
+            .expect("the binding's /proc status");
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|kib| kib.parse().ok())
+            .expect("a VmRSS line")
     }
 
     /// Open a kernel for `agent` and wait for its greeting.
@@ -623,7 +1183,8 @@ fn pump_interpreter(
             continue;
         }
         stats.to_binding.record(line.len());
-        if message.get("closed").is_some() {
+        let closed = message.get("closed").is_some();
+        if closed {
             stats.closed_to_binding.fetch_add(1, Ordering::SeqCst);
         }
         let binding = message
@@ -631,6 +1192,11 @@ fn pump_interpreter(
             .expect("an object")
             .remove("binding")
             .unwrap_or(Value::Null);
+        if let (Some(agent), Some(name)) = (message["agent"].as_str(), binding.as_str()) {
+            stats
+                .between(agent, name)
+                .record(line.len(), message["id"].as_u64(), true, closed);
+        }
         let target = binding.as_str().and_then(|name| {
             bindings
                 .lock()
@@ -674,6 +1240,11 @@ fn pump_binding(
             message["binding"] = json!(name);
             let len = write_line(&interpreter, &message);
             stats.to_interpreter.record(len);
+            if let Some(agent) = message["agent"].as_str() {
+                stats
+                    .between(agent, &name)
+                    .record(len, message["id"].as_u64(), false, false);
+            }
         } else if message["t"] == "ready" {
             let _ = ready.send(());
         } else {

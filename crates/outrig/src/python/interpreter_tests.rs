@@ -12,7 +12,7 @@
 //! things to overlap, a flag file or an `asyncio.Event` gates one on the other.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ExitStatus};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 
 use super::host::PRIMARY;
 use super::payload;
-use super::testing::{PIP_PROBE, Start, capture, interpreter_command, py};
+use super::testing::{Flag, PIP_PROBE, Start, capture, eventually, interpreter_command, py};
 
 /// How long any one reply may take. Generous for a loaded CI runner; nothing
 /// here comes close.
@@ -41,72 +41,6 @@ const HELP_MAX: usize = 8 * 1024;
 const QUEUE_MAX: usize = 256;
 const MESSAGE_MAX: usize = 1 << 20;
 const SEND_WINDOW: usize = 16;
-
-/// Polls `check` until it answers, failing after [`TIMEOUT`] with what it
-/// was waiting for.
-fn eventually<T>(mut check: impl FnMut() -> Option<T>, waited_for: impl FnOnce() -> String) -> T {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(answer) = check() {
-            return answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no {} within {TIMEOUT:?}",
-            waited_for()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// A path nothing exists at until the test says so.
-struct Flag {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-}
-
-impl Flag {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("flag");
-        Self { _dir: dir, path }
-    }
-
-    /// The path as a Python string literal.
-    fn py(&self) -> String {
-        format!("{:?}", self.path.to_str().expect("a UTF-8 temp path"))
-    }
-
-    fn raise(&self) {
-        std::fs::write(&self.path, b"").expect("raise the flag");
-    }
-
-    /// Python that awaits the flag, failing rather than hanging if it never
-    /// appears.
-    fn awaited(&self) -> String {
-        self.waited_with("await asyncio.sleep(0.01)")
-    }
-
-    /// The same wait, holding the kernel's loop the whole time.
-    fn blocked(&self) -> String {
-        self.waited_with("time.sleep(0.01)")
-    }
-
-    fn waited_with(&self, pause: &str) -> String {
-        py(&format!(
-            r#"
-            import os, time
-            deadline = time.monotonic() + {timeout}
-            while not os.path.exists({path}):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('the flag never appeared')
-                {pause}
-            "#,
-            path = self.py(),
-            timeout = TIMEOUT.as_secs(),
-        ))
-    }
-}
 
 pub(super) struct Interpreter {
     child: Child,
@@ -1498,7 +1432,7 @@ fn the_cpu_clock_tells_a_spinning_loop_from_a_blocked_one() {
     let blocked = format!(
         "import os, subprocess\nos.write(2, b'WAITING\\n')\n\
          subprocess.run(['sh', '-c', 'while [ ! -e {path} ]; do sleep 0.01; done'])\n'done'",
-        path = flag.path.display()
+        path = flag.path().display()
     );
     k.submit(1, &blocked);
     k.await_stderr("WAITING");
