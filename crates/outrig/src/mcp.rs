@@ -40,6 +40,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// keep running. Stopping the container is what ends it, and session teardown
 /// is what does that -- so a caller that drops an `McpClient` without also
 /// stopping the container has closed a pipe, not shut down a server.
+///
+/// The transport leads a process group of its own, so a terminal's Ctrl-C
+/// reaches the process holding this client and not the transport. It belongs
+/// to the session rather than to whatever request a Ctrl-C abandons, and
+/// [`McpClient::shutdown`] or a drop is what ends it.
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
@@ -186,8 +191,9 @@ impl McpClient {
         // Through the shared spawn chokepoint rather than a hand-rolled
         // `Command`, so this child gets the same ownership guarantee as every
         // other: see `crate::process`. The stderr override is the only reason
-        // this site needs a spec of its own.
-        let mut child = cmd.spawn_owned(
+        // this site needs a spec of its own. Out of the terminal's group, so
+        // the transport outlives a turn a Ctrl-C abandons (#335).
+        let mut child = cmd.in_own_process_group().spawn_owned(
             StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_std)),
             crate::process::Termination::Kill,
         )?;

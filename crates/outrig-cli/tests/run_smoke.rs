@@ -15,8 +15,11 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -25,7 +28,10 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 mod common;
-use common::{E2E_TIMEOUT, fixture_mcp_fs_dir};
+use common::{
+    CannedResponse, E2E_TIMEOUT, fixture_mcp_fs_dir, next_recorded, podman_names, start_mock_http,
+    stream_lines, wait_for_stderr_value,
+};
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
     write_config(
@@ -672,6 +678,149 @@ preamble = "test"
         continue_index > tool_call_index + 1,
         "follow-up prompt did not come after the kept tool result: {third_messages_json}",
     );
+}
+
+/// A Ctrl-C mid-turn abandons the turn and nothing else: the next prompt's
+/// tool call still reaches the MCP server (#335). The `SIGINT` goes to the
+/// whole process group, as a terminal sends it. That used to reach every
+/// `podman exec` transport too, and each tool call after it failed with
+/// `Transport closed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sigint_to_the_group_mid_turn_keeps_the_mcp_transports() {
+    common::init_tracing();
+
+    let (mock_addr, mut requests) = start_mock_http(vec![
+        CannedResponse::held(),
+        list_workspace_call(),
+        text_reply("I listed the workspace."),
+    ])
+    .await;
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_smoke_config(repo_dir.path(), &mock_addr.to_string());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+
+    // A group of its own, as a shell gives a foreground job, so the signal
+    // below reaches outrig and what shares its group, and not this test.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--session-root")
+        .arg(sessions.path())
+        .arg("run")
+        .arg("--session-dir")
+        .arg(session_dir.path())
+        .current_dir(repo_dir.path())
+        .env("OUTRIG_TEST_KEY", "test-key")
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig");
+    let group = Pid::from_raw(child.id().expect("outrig is running") as i32);
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let stdout = Arc::new(Mutex::new(String::new()));
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stdout_task = tokio::spawn(stream_lines(
+        child.stdout.take().expect("stdout piped"),
+        stdout.clone(),
+        "stdout",
+    ));
+    let stderr_task = tokio::spawn(stream_lines(
+        child.stderr.take().expect("stderr piped"),
+        stderr.clone(),
+        "stderr",
+    ));
+
+    let container = wait_for_stderr_value(stderr.clone(), "[outrig] container started:").await;
+    wait_for_stderr_value(stderr.clone(), "[outrig] entering REPL").await;
+    stdin
+        .write_all(b"take your time\n")
+        .await
+        .expect("write prompt");
+    // The model call is in flight, and the mock never answers it.
+    next_recorded(&mut requests).await;
+
+    killpg(group, Signal::SIGINT).expect("signal outrig's group");
+    wait_for_stderr_value(stderr.clone(), "[outrig] interrupted").await;
+
+    stdin
+        .write_all(b"list the workspace\n")
+        .await
+        .expect("write prompt");
+    next_recorded(&mut requests).await;
+    let with_result = next_recorded(&mut requests).await;
+    let messages = with_result.messages();
+    let messages_json = serde_json::to_string(messages).expect("messages serialize");
+    let result = messages
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("call_1")
+        })
+        .unwrap_or_else(|| panic!("no result for call_1: {messages_json}"));
+    assert!(
+        !json_contains_str(result, "Transport closed"),
+        "the transport did not survive the Ctrl-C: {messages_json}"
+    );
+    assert!(
+        json_contains_str(result, ".agents"),
+        "the result is not the workspace listing: {messages_json}"
+    );
+    wait_for_stderr_value(stdout.clone(), "I listed the workspace.").await;
+
+    // EOF ends the session the way Ctrl-D does.
+    drop(stdin);
+    let status = timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("outrig exited in time")
+        .expect("wait for outrig");
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    assert!(
+        status.success(),
+        "outrig run exited with {status:?}; stderr: {}",
+        stderr.lock().unwrap()
+    );
+    let left = podman_names(&format!("name={container}")).await;
+    assert!(left.is_empty(), "container still exists: {left:?}");
+}
+
+/// A completion asking for `fs__list_directory` on `/workspace`, as `call_1`.
+fn list_workspace_call() -> CannedResponse {
+    completion(
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "fs__list_directory",
+                    "arguments": "{\"path\":\"/workspace\"}"
+                }
+            }]
+        }),
+        "tool_calls",
+    )
+}
+
+/// A completion that ends the turn with `text`.
+fn text_reply(text: &str) -> CannedResponse {
+    completion(json!({ "role": "assistant", "content": text }), "stop")
+}
+
+fn completion(message: Value, finish_reason: &str) -> CannedResponse {
+    CannedResponse::ok(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-4o-mini",
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+    }))
 }
 
 fn assistant_tool_call_index(messages: &[Value], call_id: &str, tool_name: &str) -> Option<usize> {

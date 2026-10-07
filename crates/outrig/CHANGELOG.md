@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A terminal's Ctrl-C no longer reaches an `McpClient`'s transport.** The `podman exec -i` or
+  `podman start --attach` client behind each `McpClient` was in the embedding process's group.
+  The terminal sends `SIGINT` to that whole group, and the podman client exited on it, so a
+  process that handled Ctrl-C and carried on was left with clients whose every call failed with
+  `Transport closed`. The transport now leads a process group of its own. An embedder that
+  relied on Ctrl-C to end its transports now has to call `McpClient::shutdown` or drop the
+  client. Other commands the library runs, such as image builds, stay in the caller's group and
+  still get the terminal's Ctrl-C.
 - **A listener failure no longer ends interception for the session unreported.** The TCP
   accept loop took every `accept` error to mean its listener was gone. Running out of
   descriptors ended TCP interception for the rest of the session, with the redirect still sending

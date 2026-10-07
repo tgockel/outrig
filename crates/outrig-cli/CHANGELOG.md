@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ctrl-C during a turn no longer takes the session's tools with it.** The terminal sends
+  `SIGINT` to its whole foreground process group, and every `podman exec` transport to an MCP
+  server was in outrig's group. The podman client exited on it, so after `[outrig] interrupted`
+  every tool call failed with `Transport closed` until the session ended. These transports now
+  run in a process group of their own, so the next prompt can call tools again, as
+  [Interrupting and exiting](../../doc/usage/run.md#interrupting-and-exiting) describes. The same
+  applies to the `podman start --attach` clients of entrypoint-stdio sidecars and to the
+  `podman events` watcher. A Ctrl-C used to end that watcher, which silently stopped sidecars
+  being reaped when the primary died. Ctrl-C still reaches one-shot commands such as a
+  `buildah build`.
 - **Ctrl-C during `outrig image build`'s validation removes the validation container.** The
   command left SIGINT at its default, so a Ctrl-C killed outrig before anything could clean up.
   The container it had started to test the image kept running `sleep infinity` until it was

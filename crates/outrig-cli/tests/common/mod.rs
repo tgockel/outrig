@@ -529,6 +529,19 @@ pub fn drain_recorded(
     out
 }
 
+/// The next request the mock records, waited for: [`drain_recorded`] for a
+/// test that has to know a request arrived before it acts -- a held model
+/// call it is about to interrupt, most usefully.
+#[allow(dead_code)]
+pub async fn next_recorded(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) -> RecordedRequest {
+    tokio::time::timeout(E2E_TIMEOUT, rx.recv())
+        .await
+        .expect("the mock received a request in time")
+        .expect("the mock is serving")
+}
+
 /// Set an environment variable for a test.
 ///
 /// SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread

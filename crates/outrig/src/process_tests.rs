@@ -1199,6 +1199,50 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         .expect("the writer must have been able to finish");
 }
 
+// ---------------------------------------------------------------------------
+// Process groups: who the terminal's Ctrl-C reaches
+// ---------------------------------------------------------------------------
+
+/// A plain child joins outrig's process group, so the terminal's `SIGINT`
+/// reaches it; one spawned `in_own_process_group` leads a group of its own,
+/// so it does not. Either way the drop still ends it: `Owned` signals the
+/// pid, never a group.
+///
+/// The membership is the whole of what this can pin without a terminal. A
+/// `SIGINT` to the test binary's own group would land on the test runner;
+/// `run_smoke`'s e2e case sends the real one to an `outrig run` (#335).
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_child_in_its_own_group_is_out_of_the_terminals_reach() {
+    use nix::unistd::{Pid, getpgid, getpgrp};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let joined_path = dir.path().join("joined.pid");
+    let own_path = dir.path().join("own.pid");
+
+    let joined = pid_publishing_sleeper(&joined_path)
+        .spawn_owned(super::StdioSpec::captured(), Termination::Kill)
+        .expect("spawn must succeed");
+    let own = pid_publishing_sleeper(&own_path)
+        .in_own_process_group()
+        .spawn_owned(super::StdioSpec::captured(), Termination::Kill)
+        .expect("spawn must succeed");
+    let joined_pid = published_pid(&joined_path).await;
+    let own_pid = published_pid(&own_path).await;
+
+    let group_of = |pid: u32| getpgid(Some(Pid::from_raw(pid as i32))).expect("getpgid");
+    assert_eq!(group_of(joined_pid), getpgrp(), "a plain child joins ours");
+    assert_eq!(
+        group_of(own_pid),
+        Pid::from_raw(own_pid as i32),
+        "the child leads its own group"
+    );
+
+    drop(joined);
+    drop(own);
+    elapsed_until_gone(joined_pid).await;
+    elapsed_until_gone(own_pid).await;
+}
+
 /// The value every test below hides, and what each shows in its place.
 const HIDDEN: &str = "s3cret-324";
 const STAND_IN: &str = "KEY=${VAR}";

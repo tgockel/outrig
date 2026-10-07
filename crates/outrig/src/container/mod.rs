@@ -1156,6 +1156,10 @@ impl Container {
     /// process it started: that runs in the container under conmon and
     /// survives its client. Stopping the workload means stopping the
     /// container.
+    ///
+    /// The client joins the caller's process group, so a terminal's Ctrl-C
+    /// reaches it as well as the caller, and podman's client exits on it.
+    /// Only [`crate::McpClient`]'s transports are spawned out of it.
     pub async fn exec_stdio(&self, cmd: &[String], options: &ExecOptions) -> Result<Child> {
         process::spawn_stdio(self.build_exec_argv(cmd, options)).await
     }

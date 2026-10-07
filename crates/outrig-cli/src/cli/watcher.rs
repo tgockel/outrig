@@ -260,6 +260,9 @@ async fn watch_events(
         .unwrap_or(0)
         .to_string();
     let label_filter = format!("label={LABEL_SESSION}={sid}");
+    // In a group of its own, like the session's MCP transports: it runs for
+    // the session, and the terminal's SIGINT for a Ctrl-C mid-turn would end
+    // it and leave auto-reap off for the rest of the session (#335).
     let mut child = match tokio::process::Command::new("podman")
         .args(["events", "--since", &since_secs])
         .args(["--filter", "event=died", "--filter", &label_filter])
@@ -267,6 +270,7 @@ async fn watch_events(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
     {
@@ -353,11 +357,14 @@ pub fn primary_death_error(primary: &str) -> CliError {
 /// (e.g. no such container) is treated as "already gone". Used by attach-mode
 /// `outrig mcp`, whose single borrowed container needs no events stream.
 pub(crate) async fn wait_for_container_exit(name: &str) {
+    // Out of the terminal's reach for the same reason as `podman events`: a
+    // `podman wait` that a Ctrl-C ended would read as the container stopping.
     let child = tokio::process::Command::new("podman")
         .args(["wait", name])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn();
     match child {

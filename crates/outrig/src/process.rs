@@ -32,7 +32,8 @@
 //! immediately, and the child is back to being killed outright. Ctrl-C is not
 //! covered by this mechanism at all and does not need to be: the terminal
 //! delivers `SIGINT` to the whole foreground process group, so the child has
-//! a catchable signal from the kernel before outrig does anything.
+//! a catchable signal from the kernel before outrig does anything -- unless
+//! it was spawned out of that group; see [Process groups](#process-groups).
 //!
 //! So the bound a caller who never passes a stop signal gets is **terminated
 //! synchronously, reaped as soon as the runtime is next driven** -- measured
@@ -60,6 +61,15 @@
 //! the reap becomes the holder's -- this module does not supervise a child it
 //! has given away. That is deliberate: `podman exec -i` callers want full
 //! bidirectional control of the handle.
+//!
+//! # Process groups
+//!
+//! A child joins outrig's process group, and that is load-bearing. `outrig
+//! build`, and the steps of a session before it listens for signals, leave
+//! `SIGINT` at its default: outrig dies where it stands, no `Drop` runs, and
+//! the only signal a running `buildah` gets is the terminal's copy. The
+//! exception is a child the session owns rather than the call that started
+//! it; see [`Cmd::in_own_process_group`].
 //!
 //! # What this module does not cover
 //!
@@ -134,6 +144,9 @@ pub(crate) struct Cmd {
     shown: Vec<(usize, OsString)>,
     /// Added to the environment the child inherits.
     env: Vec<(OsString, OsString)>,
+    /// Whether the child leads a process group of its own rather than
+    /// joining outrig's. See [`Cmd::in_own_process_group`].
+    own_process_group: bool,
 }
 
 impl Cmd {
@@ -143,6 +156,7 @@ impl Cmd {
             args: Vec::new(),
             shown: Vec::new(),
             env: Vec::new(),
+            own_process_group: false,
         }
     }
 
@@ -176,6 +190,26 @@ impl Cmd {
         self
     }
 
+    /// Spawn the child as the leader of a new process group, out of reach of
+    /// the terminal's Ctrl-C.
+    ///
+    /// For a child that belongs to the session rather than to the call that
+    /// started it -- an MCP transport, which has to outlive the turn a Ctrl-C
+    /// abandons. The terminal sends `SIGINT` to its foreground group, and
+    /// podman's client exits on it. A child in a group of its own hears only
+    /// what outrig sends it, so what ends it is the session's teardown:
+    /// [`crate::McpClient::shutdown`], or the drop of the [`Owned`] holding
+    /// it.
+    ///
+    /// Not for a child that inherits the terminal: a background group that
+    /// reads it is stopped with `SIGTTIN`, and one that writes to it can be
+    /// stopped with `SIGTTOU`. See [Process groups](self#process-groups) for
+    /// why this is not the default.
+    pub(crate) fn in_own_process_group(mut self) -> Self {
+        self.own_process_group = true;
+        self
+    }
+
     /// The argv as executed. For deciding what runs, never for display.
     pub(crate) fn exec_args(&self) -> &[OsString] {
         &self.args
@@ -197,12 +231,17 @@ impl Cmd {
         !self.shown.is_empty() || !self.env.is_empty()
     }
 
-    /// Build a fresh `std::process::Command` from this argv and environment.
-    /// No stdio configuration is applied.
+    /// Build a fresh `std::process::Command` from this argv, environment, and
+    /// process group. No stdio configuration is applied.
     pub(crate) fn std_command(&self) -> std::process::Command {
+        use std::os::unix::process::CommandExt as _;
+
         let mut c = std::process::Command::new(self.program);
         c.args(&self.args);
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        if self.own_process_group {
+            c.process_group(0);
+        }
         c
     }
 
@@ -322,6 +361,7 @@ impl fmt::Debug for Cmd {
             .field("program", &self.program)
             .field("argv", &self.shown_args())
             .field("env", &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .field("own_process_group", &self.own_process_group)
             .finish()
     }
 }
@@ -452,8 +492,8 @@ fn keep_pipes_open(child: &mut Child) -> Vec<std::os::fd::OwnedFd> {
 /// has already exited, whose zombie absorbs the signal harmlessly.
 ///
 /// The signal goes to the pid and never to a process group. outrig shares its
-/// group with everything it spawns, so `kill(-pgid, ..)` would be outrig
-/// signalling itself and every sibling command in flight.
+/// group with nearly everything it spawns, so `kill(-pgid, ..)` would be
+/// outrig signalling itself and every sibling command in flight.
 fn request_stop(child: &Child) -> bool {
     let Some(pid) = child.id() else {
         return false;
