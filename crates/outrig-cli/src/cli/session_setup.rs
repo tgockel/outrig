@@ -1322,7 +1322,7 @@ async fn create_one_entrypoint_sidecar(
     let ctx = args.start_ctx();
     let mut launch = sidecar_launch_base(&ctx, sc);
     let (_, env_spec) = spec.normalize();
-    let env = outrig::resolve_mcp_env_values(
+    let env = outrig::resolve_mcp_env(
         server_name,
         env_spec,
         &args.cli_env.for_server(server_name),

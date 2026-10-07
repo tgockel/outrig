@@ -262,8 +262,6 @@ pub outrig::config::EnvValue::EnvRef(alloc::string::String)
 pub outrig::config::EnvValue::Literal(alloc::string::String)
 impl outrig::config::EnvValue
 pub fn outrig::config::EnvValue::from_raw(alloc::string::String) -> Self
-pub fn outrig::config::EnvValue::resolve(&self) -> core::result::Result<alloc::string::String, outrig::config::EnvValueError>
-impl outrig::config::EnvValue
 pub fn outrig::config::EnvValue::to_raw(&self) -> alloc::string::String
 impl schemars::JsonSchema for outrig::config::EnvValue
 pub fn outrig::config::EnvValue::inline_schema() -> bool
@@ -1293,6 +1291,5 @@ pub fn outrig::WorkspaceSpec::new(impl core::convert::Into<std::path::PathBuf>, 
 pub const outrig::PUBLIC_DOC_BASE_URL: &str
 pub const outrig::RESERVED_SERVER: &str
 pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
-pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
-pub fn outrig::resolve_mcp_env_values(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>
+pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>
 pub fn outrig::sanitize_tool_name(&str, &str) -> alloc::string::String

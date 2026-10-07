@@ -50,10 +50,10 @@ CocoClaw and any other embedder start a system the same way.
   operator's layer.
 - **A secret resolver.** A hook the session calls to resolve each `${VAR}` its configuration
   names, for every model the session calls: the agent's, a child's, and the evaluator's. Today
-  `ApiKeyRef::resolve` and `EnvValue::resolve` read `std::env::var` directly. The CLI passes a
-  resolver that reads the process environment, which keeps today's behavior. An embedder running
-  many sessions in one process, each with its own key, passes a resolver per session and changes
-  no environment at all.
+  `ApiKeyRef::resolve` and `ResolvedEnvValue::resolve` read `std::env::var` directly. The CLI
+  passes a resolver that reads the process environment, which keeps today's behavior. An
+  embedder running many sessions in one process, each with its own key, passes a resolver per
+  session and changes no environment at all.
 - **Bindings** (`hosted-objects.md`), each with its name, description, factory and arguments, and
   optionally the environment and credentials its host process runs with. The CLI supplies none, so
   a binding inherits the user's environment: their ssh-agent, credential helpers and config. A

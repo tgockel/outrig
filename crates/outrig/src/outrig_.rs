@@ -1151,7 +1151,7 @@ impl Outrig {
         };
 
         let options = ContainerCreateOptions::new(image, launch, container_name)
-            .with_resolved_env(crate::mcp::resolve_mcp_env_values(
+            .with_resolved_env(crate::mcp::resolve_mcp_env(
                 server_name,
                 server.env().clone(),
                 &BTreeMap::new(),

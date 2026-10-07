@@ -1332,7 +1332,7 @@ async fn standalone_build(token: &str) -> Result<(), OutrigError> {
     .await
 }
 
-/// Whether `err` is buildah failing at `verb`, rather than at anything after.
+/// Whether `err` is podman or buildah failing at `verb`, not at anything after.
 fn failed_at(err: &OutrigError, verb: &str) -> bool {
     matches!(err, OutrigError::Process { argv, .. } if argv.first().is_some_and(|a| a == verb))
 }
@@ -1476,5 +1476,52 @@ async fn a_failed_build_reports_a_referenced_build_arg_by_name() {
 
     let (_, argv) = invocation(journal, "build", &[token.as_str()]).await;
     assert!(argv.contains(" --build-arg GH_TOKEN "), "{argv}");
+    assert!(!argv.contains(secret), "{argv}");
+}
+
+/// Issue #417: an MCP `env` value that `resolve_mcp_env` resolved from a
+/// `${VAR}` reference reaches podman by name, and a failed create reports it
+/// as the reference.
+///
+/// This is the composition a library caller writes. Before 0.3 the resolver
+/// returned plain strings, which only fit `with_env`, and that passes and
+/// shows each value as written. The journal holds the argv the fake was given,
+/// which is what `/proc/<pid>/cmdline` shows every local user while a real
+/// create runs.
+#[tokio::test]
+async fn a_failed_create_reports_a_referenced_mcp_env_by_name() {
+    let journal = fake_runtime();
+
+    let var = "OUTRIG_TEST_CANCELLATION_MCP_ENV_REF";
+    let secret = "s3cret-probe-value-417";
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(var, secret) };
+
+    let name = unique_name("referenced-env");
+    refuse_for(journal, "create", &name, 1);
+
+    let env = outrig::resolve_mcp_env(
+        "fetch",
+        std::collections::BTreeMap::from([(
+            "TOKEN".to_string(),
+            outrig::config::EnvValue::EnvRef(var.to_string()),
+        )]),
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("the variable is set");
+    let options = ContainerCreateOptions::new(image(), ContainerLaunchSpec::default(), &name)
+        .with_resolved_env(env);
+    let err = Container::create_initialized(options)
+        .await
+        .expect_err("the fake refuses the create");
+
+    assert!(failed_at(&err, "create"), "got {err}");
+    let shown = err.to_string();
+    assert!(shown.contains(&format!("TOKEN=${{{var}}}")), "{shown}");
+    assert!(!shown.contains(secret), "{shown}");
+
+    let (_, argv) = invocation(journal, "create", &[name.as_str()]).await;
+    assert!(argv.contains(" --env TOKEN "), "{argv}");
     assert!(!argv.contains(secret), "{argv}");
 }

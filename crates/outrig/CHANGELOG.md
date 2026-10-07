@@ -171,6 +171,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/outrig` is reserved inside the container.** `Outrig::launch` refuses a workspace or mount
   whose container path is `/outrig` or under it, with `OutrigError::Configuration`.
 
+- **`resolve_mcp_env` returns `ResolvedEnvValue`s, and `resolve_mcp_env_values` and
+  `EnvValue::resolve` are gone.** The old `resolve_mcp_env` and `EnvValue::resolve` each handed
+  back a value resolved from a `${VAR}` reference as a plain string, which `with_env` passes on
+  podman's command line -- readable by every local user through `/proc/<pid>/cmdline` while
+  podman runs -- and shows as written in the `Process`, `Canceled`, and `Spawn` errors, the `-v`
+  transcript, and the `outrig::process` debug trace. `resolve_mcp_env` now returns what
+  `resolve_mcp_env_values` did, so a call to the latter only needs renaming. Hand the result to
+  `ContainerCreateOptions::with_resolved_env` or `ExecOptions::with_resolved_env`, which pass
+  such a value by name and show it as `KEY=${VAR}`. `ResolvedEnvValue::resolve` replaces
+  `EnvValue::resolve`: it takes the `EnvValue` by value, and `value()` reads the result.
+  `with_env` still takes plain strings, passed and shown as written, for values the caller
+  chose. Nothing outrig runs itself changes: its own paths have kept each reference since 0.2.1.
+
 ### Removed
 
 - **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:

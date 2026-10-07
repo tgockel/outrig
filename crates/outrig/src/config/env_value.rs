@@ -50,20 +50,6 @@ impl EnvValue {
         }
     }
 
-    /// For `Literal`, returns the value. For `EnvRef`, reads `std::env::var`
-    /// and maps `VarError` into a typed error naming the missing variable.
-    pub fn resolve(&self) -> Result<String, EnvValueError> {
-        match self {
-            Self::Literal(s) => Ok(s.clone()),
-            Self::EnvRef(var) => std::env::var(var).map_err(|err| match err {
-                VarError::NotPresent => EnvValueError::NotPresent { var: var.clone() },
-                VarError::NotUnicode(_) => EnvValueError::NotUnicode { var: var.clone() },
-            }),
-        }
-    }
-}
-
-impl EnvValue {
     /// The config-file spelling this value round-trips through: the literal
     /// text, or `${VAR}` for a reference. Inverse of [`EnvValue::from_raw`].
     pub fn to_raw(&self) -> String {
@@ -92,9 +78,17 @@ pub struct ResolvedEnvValue {
 }
 
 impl ResolvedEnvValue {
-    /// Resolve `source` as [`EnvValue::resolve`] does, keeping it.
+    /// Resolve `source`, keeping it. A `Literal` is its own value; an `EnvRef`
+    /// reads `std::env::var` and maps `VarError` into a typed error naming the
+    /// missing variable.
     pub fn resolve(source: EnvValue) -> Result<Self, EnvValueError> {
-        let value = source.resolve()?;
+        let value = match &source {
+            EnvValue::Literal(s) => s.clone(),
+            EnvValue::EnvRef(var) => std::env::var(var).map_err(|err| match err {
+                VarError::NotPresent => EnvValueError::NotPresent { var: var.clone() },
+                VarError::NotUnicode(_) => EnvValueError::NotUnicode { var: var.clone() },
+            })?,
+        };
         Ok(Self { value, source })
     }
 
@@ -106,10 +100,6 @@ impl ResolvedEnvValue {
     /// The config value this was resolved from.
     pub fn source(&self) -> &EnvValue {
         &self.source
-    }
-
-    pub(crate) fn into_value(self) -> String {
-        self.value
     }
 
     /// A pair as if `source` had resolved to `value`, without reading the

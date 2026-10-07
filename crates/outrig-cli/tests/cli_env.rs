@@ -164,32 +164,6 @@ fn per_server_names_collects_all_named_servers() {
     assert_eq!(names, vec!["build", "fs", "shell"]);
 }
 
-// --- EnvValue resolution integration ---
-
-#[test]
-fn env_ref_resolves_from_host_env() {
-    let var = "OUTRIG_TEST_CLI_ENV_RESOLVE";
-    // SAFETY: unique var name, single-threaded test.
-    unsafe {
-        std::env::set_var(var, "hello");
-    }
-    let entries = CliEnvEntries::parse(&[format!("TOKEN=${{{var}}}")]).unwrap();
-    let merged = entries.for_server("any");
-    let resolved = merged["TOKEN"].resolve().expect("should resolve");
-    unsafe {
-        std::env::remove_var(var);
-    }
-    assert_eq!(resolved, "hello");
-}
-
-#[test]
-fn literal_value_unaffected_by_env() {
-    let entries = CliEnvEntries::parse(&["PATH=/usr/bin".to_string()]).unwrap();
-    let merged = entries.for_server("any");
-    let resolved = merged["PATH"].resolve().expect("should resolve");
-    assert_eq!(resolved, "/usr/bin");
-}
-
 // --- Merge overlay on BTreeMap (simulates config-file + CLI) ---
 
 #[test]

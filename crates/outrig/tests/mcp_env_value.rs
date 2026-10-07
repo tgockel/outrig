@@ -1,7 +1,7 @@
 //! Integration tests for `EnvValue`: parse classification, mixed-table
 //! deserialize, Serde round-trip, and resolve set/unset.
 
-use outrig::config::{Config, EnvValue, McpServerSpec};
+use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
 
 mod env_value {
     use super::*;
@@ -116,7 +116,7 @@ mod resolve {
     #[test]
     fn literal_resolves_to_itself() {
         let v = EnvValue::Literal("hello".to_string());
-        assert_eq!(v.resolve().unwrap(), "hello");
+        assert_eq!(ResolvedEnvValue::resolve(v).unwrap().value(), "hello");
     }
 
     #[test]
@@ -128,11 +128,11 @@ mod resolve {
             std::env::set_var(var, "hello-from-env");
         }
         let v = EnvValue::EnvRef(var.to_string());
-        let resolved = v.resolve().expect("resolves");
+        let resolved = ResolvedEnvValue::resolve(v).expect("resolves");
         unsafe {
             std::env::remove_var(var);
         }
-        assert_eq!(resolved, "hello-from-env");
+        assert_eq!(resolved.value(), "hello-from-env");
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod resolve {
             std::env::remove_var(var);
         }
         let v = EnvValue::EnvRef(var.to_string());
-        let err = v.resolve().expect_err("must error on unset var");
+        let err = ResolvedEnvValue::resolve(v).expect_err("must error on unset var");
         let msg = err.to_string();
         assert!(
             msg.contains(var),

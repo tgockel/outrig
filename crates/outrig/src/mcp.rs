@@ -99,7 +99,7 @@ impl McpClient {
         extra_env: &BTreeMap<String, EnvValue>,
     ) -> Result<Self> {
         let (command, env_spec) = server_cfg.normalize();
-        let env = resolve_mcp_env_values(name, env_spec, extra_env)?;
+        let env = resolve_mcp_env(name, env_spec, extra_env)?;
         // Sidecar servers run wherever their image puts them; no exec-side
         // working directory has come up for one yet.
         let exec_cmd =
@@ -314,29 +314,14 @@ impl McpClient {
 
 /// Layer the CLI `--env` overlay onto the config-file env (overlay wins on
 /// key conflict) and resolve each value -- literals verbatim, `${VAR}` refs
-/// from the host environment. `name` labels resolution failures with the
-/// owning server.
+/// from the host environment -- keeping what each was resolved from. `name`
+/// labels resolution failures with the owning server.
 ///
-/// The values come back as plain strings, which podman is handed and every
-/// diagnostic shows as written. For an environment headed to podman, use
-/// [`resolve_mcp_env_values`], which keeps each reference out of both.
+/// Shared by both stdio transports: exec-stdio resolves at connect time
+/// (`podman exec --env`), entrypoint-stdio at container-create time (`podman
+/// create --env`), and each hands the result to `with_resolved_env`, so a
+/// `${VAR}` value reaches podman by name and is shown as the reference.
 pub fn resolve_mcp_env(
-    name: &str,
-    config_env: BTreeMap<String, EnvValue>,
-    extra_env: &BTreeMap<String, EnvValue>,
-) -> Result<BTreeMap<String, String>> {
-    Ok(resolve_mcp_env_values(name, config_env, extra_env)?
-        .into_iter()
-        .map(|(key, value)| (key, value.into_value()))
-        .collect())
-}
-
-/// [`resolve_mcp_env`], keeping what each value was resolved from. Shared by
-/// both stdio transports: exec-stdio resolves at connect time (`podman exec
-/// --env`), entrypoint-stdio at container-create time (`podman create
-/// --env`), and each hands the result to `with_resolved_env`, so a `${VAR}`
-/// value reaches podman by name and is shown as the reference.
-pub fn resolve_mcp_env_values(
     name: &str,
     config_env: BTreeMap<String, EnvValue>,
     extra_env: &BTreeMap<String, EnvValue>,
@@ -615,21 +600,19 @@ mod tests {
             ),
         ]);
 
-        let env = resolve_mcp_env("svc", config_env.clone(), &extra_env).expect("resolves");
-        assert_eq!(env["KEEP"], "literal");
-        assert_eq!(env["BOTH"], "overlay");
-        assert_eq!(env["REF"], "from-host");
-
-        let values = resolve_mcp_env_values("svc", config_env, &extra_env).expect("resolves");
+        let env = resolve_mcp_env("svc", config_env, &extra_env).expect("resolves");
+        assert_eq!(env["KEEP"].value(), "literal");
+        assert_eq!(env["BOTH"].value(), "overlay");
+        assert_eq!(env["REF"].value(), "from-host");
         assert_eq!(
-            values["REF"].source(),
+            env["REF"].source(),
             &EnvValue::EnvRef("OUTRIG_TEST_MCP_ENV".to_string())
         );
         assert_eq!(
-            values["BOTH"].source(),
+            env["BOTH"].source(),
             &EnvValue::Literal("overlay".to_string())
         );
-        let debug = format!("{values:?}");
+        let debug = format!("{env:?}");
         assert!(!debug.contains("from-host"), "{debug}");
     }
 
