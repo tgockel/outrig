@@ -17,13 +17,19 @@
 
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use outrig_cli::image_setup::init;
+
+mod common;
+use common::{podman_names, stream_lines, wait_until_gone};
 
 // Serialize the cases: they share the host podman/buildah image store, and a
 // single heavyweight build at a time keeps resource use predictable.
@@ -279,4 +285,95 @@ async fn build_fails_when_mcp_server_cannot_start() {
         stderr.contains("broken"),
         "the error should name the failing server:\n{stderr}"
     );
+}
+
+/// A Ctrl-C while the live probe waits on a server stops and removes the
+/// validation container (#475). It used to kill outrig at SIGINT's default
+/// disposition, before any `Drop` ran, and the container went on running
+/// `sleep infinity` until someone removed it by hand. The signal goes to the
+/// whole process group, as a terminal sends it.
+#[tokio::test]
+async fn sigint_during_the_probe_removes_the_validation_container() {
+    let _guard = E2E_LOCK.lock().await;
+    let tag = "outrig-e2e-stuck-mcp";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("stuck-mcp");
+    write_project(
+        &proj,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache shadow\n\
+         CMD [\"sleep\", \"infinity\"]\n",
+        // Never answers `initialize`, and ignores EOF on its stdin.
+        &format!("[image]\nref = \"{tag}\"\n[mcp]\nstuck = [\"sleep\", \"infinity\"]\n"),
+    );
+
+    // A group of its own, as a shell gives a foreground job, so the signal
+    // reaches outrig and its children and not this test.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .args(["image", "build"])
+        .arg(&proj)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig image build");
+    let group = Pid::from_raw(child.id().expect("outrig is running") as i32);
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_task = tokio::spawn(stream_lines(
+        child.stderr.take().expect("stderr piped"),
+        stderr.clone(),
+        "stderr",
+    ));
+
+    // The probe is waiting on the handshake once its client exists.
+    let container = timeout(LIGHT_TIMEOUT, async {
+        loop {
+            let names = podman_names(&format!("ancestor={tag}")).await;
+            if let [name] = names.as_slice()
+                && probe_client_running(name).await
+            {
+                return name.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the probe never started; stderr:\n{}",
+            stderr.lock().unwrap()
+        )
+    });
+
+    killpg(group, Signal::SIGINT).expect("signal outrig's group");
+    let status = timeout(LIGHT_TIMEOUT, child.wait())
+        .await
+        .expect("outrig exited in time")
+        .expect("wait for outrig");
+    let _ = stderr_task.await;
+    let stderr = stderr.lock().unwrap().clone();
+
+    assert_eq!(status.code(), Some(130), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("[outrig] SIGINT received; ending the validation"),
+        "stderr:\n{stderr}"
+    );
+    wait_until_gone(std::slice::from_ref(&container)).await;
+    assert!(
+        !probe_client_running(&container).await,
+        "the probe's podman exec client outlived outrig"
+    );
+}
+
+/// Whether a `podman exec` client into `container` is running on this host.
+async fn probe_client_running(container: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", &format!("podman exec .*{container} ")])
+        .stdout(Stdio::null())
+        .status()
+        .await
+        .expect("spawn pgrep")
+        .success()
 }

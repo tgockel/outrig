@@ -520,7 +520,8 @@ only thing keeping it away from a build in flight.
 Once `outrig run` or `outrig mcp` has written its session record, it catches all three signals:
 it stops the session's containers and finalizes the record, which keeps the same code, before it
 exits. `outrig mcp` exits `0` on a signal once its startup has finished; see
-[`outrig mcp`](#outrig-mcp).
+[`outrig mcp`](#outrig-mcp). `outrig image build` catches them once it starts its validation
+container, and stops that container before it exits.
 
 `outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
 there; the run is reported in full, and the container is named on stderr.

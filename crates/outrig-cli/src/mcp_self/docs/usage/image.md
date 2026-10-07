@@ -350,6 +350,12 @@ validates it (every server name well-formed, every command non-empty). By defaul
 the image, and for each declared MCP server initializes it and calls `tools/list`, reporting the
 tool count per server. The image is built locally; nothing is pushed.
 
+Ctrl-C (or SIGTERM, or SIGHUP) once the image is built stops and removes that validation
+container before outrig exits, with `130`, `143`, or `129`. A server that never answers its
+`initialize` is the usual reason to press it. During the build itself, Ctrl-C reaches buildah
+directly, which removes the working containers it created; see
+[Cancelling a build](https://tgockel.github.io/outrig/usage/build.html#cancelling-a-build).
+
 ### Failure modes
 
 The command exits nonzero -- printing `error: ...` -- in these cases:

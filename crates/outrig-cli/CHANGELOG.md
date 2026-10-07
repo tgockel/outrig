@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ctrl-C during `outrig image build`'s validation removes the validation container.** The
+  command left SIGINT at its default, so a Ctrl-C killed outrig before anything could clean up.
+  The container it had started to test the image kept running `sleep infinity` until it was
+  removed by hand, and `outrig clean` skips a running container. A server that never answers
+  `initialize` is the usual reason to press Ctrl-C there. SIGINT, SIGTERM, and SIGHUP now stop the
+  probe and remove the container before outrig exits with `130`, `143`, or `129`. The build step
+  is unchanged: there buildah gets the Ctrl-C itself and removes its own working containers.
 - **`outrig` raises its soft open-file limit to the hard limit when it starts.** The soft limit is
   commonly 1024. Under `--network audit` or `filter` each connection a container makes holds two
   of outrig's descriptors, so a few busy containers could exhaust the limit together. LLM calls

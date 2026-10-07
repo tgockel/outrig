@@ -7,7 +7,8 @@
 //! refuses it as still running and `outrig clean` skips it. Session setup
 //! installs [`Signals`] just before it writes the record -- the first thing a
 //! signal could orphan -- and every phase from there that waits on something
-//! slow is raced against it.
+//! slow is raced against it. `outrig image build` does the same from the
+//! moment it starts its validation container.
 //!
 //! Two properties of tokio's listeners carry the design:
 //!
@@ -126,19 +127,32 @@ impl Signals {
     where
         CliError: From<E>,
     {
+        self.race_ending("the session", fut).await
+    }
+
+    /// [`Self::race`] for a command that is not a session, whose notice names
+    /// `ending` -- what the signal cuts short -- in place of the session.
+    pub async fn race_ending<T, E>(
+        &mut self,
+        ending: &str,
+        fut: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T>
+    where
+        CliError: From<E>,
+    {
         tokio::select! {
             biased;
-            sig = self.any() => Err(interrupted(sig)),
+            sig = self.any() => Err(interrupted(sig, ending)),
             result = fut => result.map_err(CliError::from),
         }
     }
 }
 
-/// The error a signal ends a session's wait with, announced as it happens: the
-/// teardown that follows can take seconds, and the user should not have to
-/// wonder what it is for.
-fn interrupted(sig: EndSignal) -> CliError {
-    notice(&format!("[outrig] {sig} received; ending the session"));
+/// The error a signal ends a wait with, announced as it happens: the teardown
+/// that follows can take seconds, and the user should not have to wonder what
+/// it is for.
+fn interrupted(sig: EndSignal, ending: &str) -> CliError {
+    notice(&format!("[outrig] {sig} received; ending {ending}"));
     CliError::Interrupted(sig)
 }
 
@@ -147,7 +161,7 @@ fn interrupted(sig: EndSignal) -> CliError {
 /// on a line of its own, as the REPL's `[outrig] interrupted` does.
 pub fn interrupted_mid_line(sig: EndSignal) -> CliError {
     notice("");
-    interrupted(sig)
+    interrupted(sig, "the session")
 }
 
 /// Run a session's container cleanup to completion, unless SIGINT or SIGTERM
