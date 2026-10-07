@@ -81,12 +81,6 @@ INVENTORY_MAX = 200  # global names listed in one inventory
 HELP_MAX = 8 * 1024  # characters of one `help()` answer
 DRAIN_TIMEOUT = 5.0  # seconds a result waits for its pipe to reach the end of the body's output
 
-# musl gives a thread 128 KiB of stack, far short of what CPython's recursion limits assume: deep
-# but legal recursion -- `json.loads` of a nested document, `repr` of a nested list -- overflows
-# it and kills the process, every agent with it, rather than raising `RecursionError`. Every
-# thread from here on, a sub-agent's or one the agent starts, gets the main thread's 8 MiB.
-threading.stack_size(8 << 20)
-
 # ---------------------------------------------------------------------------- descriptors
 
 # The exec's real stdin and stdout, moved aside before anything can touch them. Every protocol

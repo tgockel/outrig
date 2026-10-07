@@ -268,6 +268,9 @@ home directory. The rest are fixes, each described below.
 
 ### Fixed
 
+- The embedded Python now gives threads an 8 MiB default stack, including in child interpreters.
+  Deep recursion on a thread raises `RecursionError` instead of crashing with `SIGSEGV` (#464).
+
 - **`filter` mode with `default = "deny"` now stops what the interceptor cannot carry.** The
   nftables table interception installs held one nat chain, which can only rewrite: TCP was
   redirected to the proxy and UDP/53 to the DNS listener, and every other datagram the container

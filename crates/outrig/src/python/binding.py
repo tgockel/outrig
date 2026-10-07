@@ -985,8 +985,6 @@ def main():
     os.close(devnull)
     os.dup2(2, 1)
     sys.__stdout__.reconfigure(line_buffering=True)
-    # musl's 128 KiB thread stacks overflow under ordinary recursion; see the interpreter.
-    threading.stack_size(8 << 20)
     # After the standard library, so neither directory can replace a module this program imports.
     sys.path.append(rpyc_dir)
     sys.path.append(packages)

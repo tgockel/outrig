@@ -16,6 +16,11 @@ pub(crate) mod host;
 pub(crate) mod payload;
 pub(crate) mod recovery;
 
+mod stack {
+    use crate::container::enter::elf::{ElfKind, elf_interp};
+    include!("stack.rs");
+}
+
 #[cfg(test)]
 pub(crate) mod relay;
 #[cfg(test)]
@@ -26,6 +31,7 @@ pub(crate) mod testing;
 // it builds; compiled here only for its tests.
 #[cfg(test)]
 mod archive {
+    use super::stack::{THREAD_STACK, stack_field};
     use crate::container::enter::elf::{ElfKind, elf_interp};
     include!("archive.rs");
 }

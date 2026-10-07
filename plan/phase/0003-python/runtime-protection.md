@@ -107,10 +107,11 @@ The agent with a person in front of it keeps the interrupt path as the prototype
 recursion off the main thread -- `json.loads` of a nested document, `repr` of a nested list --
 overflowed it and killed the interpreter with `SIGSEGV`, every agent with it, before CPython's
 recursion limit could raise `RecursionError`. Measured on the payload: 1 MiB still crashed, 2 MiB
-did not. The interpreter sets 8 MiB, the main thread's, for every thread started after it boots --
-a subagent's, its reader, and any the agent starts -- so a subagent is no easier to crash than the
-primary. The cost is address space rather than resident memory, though the memory ceiling
-counts all of it.
+did not. Unpacking the verified payload sets `PT_GNU_STACK.p_memsz` to 8 MiB in the binary.
+musl uses that default for every thread, including threads in `sys.executable` child processes
+and threads started by C code. The build checks the header whenever the pin changes; the patched
+tree has a separate cache name. A subagent is no easier to crash than the primary. The cost is
+address space rather than resident memory, though the memory ceiling counts all of it.
 
 ## Two failures, two remedies
 

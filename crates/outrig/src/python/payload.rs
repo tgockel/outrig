@@ -2,11 +2,12 @@
 //! beside it, and where they live on the host.
 //!
 //! `build.rs` fetches the pinned `python-build-standalone` release, verifies
-//! it, and embeds it. A session's first start unpacks it under the user's cache
-//! directory, and every session binds that tree read-only at
-//! [`PAYLOAD_MOUNT`]. Nothing falls back to whatever `python3` the image
-//! happens to carry, which would be a different interpreter with a different
-//! library, or none at all.
+//! it, and embeds it. Unpacking sets the interpreter's GNU_STACK memory size
+//! to 8 MiB, the default musl gives every thread in every child process. A
+//! session's first start unpacks it under the user's cache directory, and every
+//! session binds that tree read-only at [`PAYLOAD_MOUNT`]. Nothing falls back
+//! to whatever `python3` the image happens to carry, which would be a different
+//! interpreter with a different library, or none at all.
 //!
 //! RPyC, which carries hosted-object requests between the interpreter and each
 //! binding process, arrives the same way: `build.rs` fetches the pinned wheel,
@@ -16,11 +17,13 @@
 //! beside the payload.
 
 use std::ffi::OsString;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::statvfs::{FsFlags, statvfs};
 
+use super::stack::{THREAD_STACK, stack_field};
 use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError, Result};
 
@@ -36,7 +39,8 @@ pub(crate) const PAYLOAD_MOUNT: &str = "/outrig/python";
 static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/python.tar.zst"));
 
 /// The archive's name less `.tar.zst`, which is also the directory it unpacks
-/// to -- so a new pin unpacks beside an old one rather than over it.
+/// to with a `-stack8m` suffix for the unpack-time patch -- so a new pin or
+/// patch unpacks beside an old tree rather than over it.
 pub(super) const PAYLOAD: &str = env!("OUTRIG_PYTHON_PAYLOAD");
 
 /// The part of the payload archive that is the interpreter: `python/build`
@@ -69,7 +73,7 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
     }
     let dir = cache_dir("python payload")?
         .join("outrig/python")
-        .join(PAYLOAD);
+        .join(format!("{PAYLOAD}-stack8m"));
     if dir.is_dir() {
         runnable_from(&dir)?;
         return Ok(dir);
@@ -271,11 +275,43 @@ fn unpack(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
         }
     }
 
+    if subtree == PAYLOAD_SUBTREE {
+        patch_thread_stack(&at.join(subtree).join("bin/python3"))?;
+    }
+
     match std::fs::rename(stage.path().join(subtree), dir) {
         Ok(()) => Ok(()),
         Err(_) if dir.is_dir() => Ok(()),
         Err(e) => Err(e).path_ctx("move the unpacked tree to", dir),
     }
+}
+
+/// Patch the staged interpreter before its directory becomes visible. The
+/// build checked this same field after verifying the archive's pinned digest.
+fn patch_thread_stack(path: &Path) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .path_ctx("open for the thread-stack patch", path)?;
+    let mut head = Vec::new();
+    (&mut file)
+        .take(64 * 1024)
+        .read_to_end(&mut head)
+        .path_ctx("read the ELF headers from", path)?;
+    let field = stack_field(&head).map_err(|why| {
+        OutrigError::Configuration(format!(
+            "cannot set the thread stack in {}: {why}",
+            path.display()
+        ))
+    })?;
+    if head[field..field + 8] != THREAD_STACK.to_le_bytes() {
+        file.seek(SeekFrom::Start(field as u64))
+            .path_ctx("seek in", path)?;
+        file.write_all(&THREAD_STACK.to_le_bytes())
+            .path_ctx("patch the thread stack in", path)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -290,10 +326,11 @@ mod tests {
     /// `python/build`, no directory entries, and `bin/python3` a symlink.
     fn archive() -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
+        let elf = super::super::stack::stack_tests::elf();
         for (path, bytes) in [
             ("python/PYTHON.json", &b"{}"[..]),
             ("python/build/Modules/Setup", b"build only"),
-            ("python/install/bin/python3.13", b"interpreter"),
+            ("python/install/bin/python3.13", &elf[..]),
             ("python/install/lib/python3.13/os.py", b"library"),
         ] {
             let mut header = tar::Header::new_gnu();
@@ -308,6 +345,34 @@ mod tests {
             .unwrap();
         let tar = tar.into_inner().unwrap();
         ruzstd::encoding::compress_to_vec(&tar[..], ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[tokio::test]
+    async fn the_real_payload_has_an_eight_mib_gnu_stack() {
+        let dir = host_dir().await.unwrap();
+        assert!(
+            dir.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-stack8m")
+        );
+        let head = std::fs::read(dir.join("bin/python3.13")).unwrap();
+        let field = stack_field(&head).unwrap();
+        assert_eq!(&head[field..field + 8], &THREAD_STACK.to_le_bytes());
+    }
+
+    #[test]
+    fn patching_changes_only_the_stack_field_and_is_idempotent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let original = super::super::stack::stack_tests::elf();
+        std::fs::write(file.path(), &original).unwrap();
+        patch_thread_stack(file.path()).unwrap();
+        let patched = std::fs::read(file.path()).unwrap();
+        assert_eq!(&patched[..104], &original[..104]);
+        assert_eq!(&patched[104..112], &THREAD_STACK.to_le_bytes());
+        assert_eq!(&patched[112..], &original[112..]);
+        patch_thread_stack(file.path()).unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap(), patched);
     }
 
     #[test]
@@ -402,10 +467,9 @@ mod tests {
         let dir = cache.path().join("python").join(PAYLOAD);
         unpack(&archive(), &dir, PAYLOAD_SUBTREE).unwrap();
 
-        assert_eq!(
-            std::fs::read(dir.join("bin/python3")).unwrap(),
-            b"interpreter"
-        );
+        let mut expected = super::super::stack::stack_tests::elf();
+        expected[104..112].copy_from_slice(&THREAD_STACK.to_le_bytes());
+        assert_eq!(std::fs::read(dir.join("bin/python3")).unwrap(), expected);
         assert_eq!(
             std::fs::read(dir.join("lib/python3.13/os.py")).unwrap(),
             b"library"

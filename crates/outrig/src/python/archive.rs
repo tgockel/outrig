@@ -40,8 +40,15 @@ fn verify_archive(
     e_machine: u16,
 ) -> Result<(), String> {
     verify_digest(archive, sha256)?;
-    static_elf64(&member_head(archive, interpreter)?, e_machine)
-        .map_err(|why| format!("{interpreter} is not usable: {why}"))
+    let head = member_head(archive, interpreter)?;
+    static_elf64(&head, e_machine)
+        .map_err(|why| format!("{interpreter} is not usable: {why}"))?;
+    stack_field(&head).map(|_| ()).map_err(|why| {
+        format!(
+            "{interpreter} cannot receive the {} MiB thread-stack patch: {why}",
+            THREAD_STACK >> 20
+        )
+    })
 }
 
 /// The first 64 KiB of `path` inside the tar.zst `archive` -- enough for the
@@ -204,6 +211,7 @@ mod tests {
         b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
         b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
         b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        b[64..68].copy_from_slice(&0x6474e551u32.to_le_bytes()); // PT_GNU_STACK
         if let Some(interp) = interp {
             let off = b.len() as u64;
             b[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP

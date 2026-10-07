@@ -830,6 +830,48 @@ fn deep_recursion_off_the_main_thread_raises_rather_than_crashing() {
 }
 
 #[test]
+fn a_child_interpreter_inherits_safe_thread_stacks() {
+    let mut k = Interpreter::start();
+    let script = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        script.path(),
+        r#"
+import json
+import threading
+
+def recurse():
+    for operation in (lambda: json.loads('[' * 100000), nested_repr):
+        try:
+            operation()
+        except RecursionError:
+            print('RecursionError')
+        else:
+            raise AssertionError('recursion did not raise')
+
+def nested_repr():
+    x = []
+    for _ in range(100000):
+        x = [x]
+    repr(x)
+
+assert threading.stack_size() == 0  # use the binary's default
+thread = threading.Thread(target=recurse)
+thread.start()
+thread.join()
+"#,
+    )
+    .unwrap();
+    let result = k.exec(1, &format!(
+        "import subprocess, sys\nr = subprocess.run([sys.executable, {:?}], capture_output=True, text=True)\nprint(r.returncode)\nprint(r.stdout, end='')\nprint(r.stderr, end='')",
+        script.path().to_str().unwrap()
+    ));
+    assert_eq!(
+        result["output"], "0\nRecursionError\nRecursionError\n",
+        "{result}"
+    );
+}
+
+#[test]
 fn agents_run_at_the_same_time() {
     // The primary can finish only once the sub-agent has run, so this passes
     // only if one agent's running execution does not hold the other's slot.

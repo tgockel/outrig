@@ -32,6 +32,7 @@ use std::time::Duration;
 // and the ELF parser they rest on. See `src/python/archive.rs` for why they are
 // shared by `include!`.
 include!("src/container/enter/elf.rs");
+include!("src/python/stack.rs");
 include!("src/python/archive.rs");
 
 const LAUNCHER: &str = "src/container/enter/launcher.rs";
@@ -172,6 +173,9 @@ const PY_RELEASE: &str = "20260901";
 const PY_VERSION: &str = "3.13.15";
 /// Per target architecture: the release's triple, the archive's SHA-256 from
 /// the release's own `SHA256SUMS`, and the interpreter's ELF `e_machine`.
+/// After digest verification, unpacking changes only PT_GNU_STACK.p_memsz
+/// (eight little-endian bytes) to 8 MiB. Every build checks that the pin has
+/// exactly one such header; a release already specifying 8 MiB is unchanged.
 const PY_PINS: &[(&str, &str, &str, u16)] = &[
     (
         "x86_64",
@@ -230,6 +234,7 @@ const WHEELS: &[Wheel] = &[Wheel {
 /// Fetch, verify, and stage the Python payload as `OUT_DIR/python.tar.zst`.
 fn python_payload(out_dir: &Path) {
     println!("cargo:rerun-if-changed=src/python/archive.rs");
+    println!("cargo:rerun-if-changed=src/python/stack.rs");
     println!("cargo:rerun-if-env-changed={PY_ARCHIVE_ENV}");
     println!("cargo:rerun-if-env-changed={REQUIRE_PYTHON}");
     let dest = out_dir.join("python.tar.zst");
