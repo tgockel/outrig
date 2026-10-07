@@ -328,31 +328,29 @@ fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u8) -> bool {
     }
 }
 
+/// Whether `value` matches `pattern`, where `*` stands for any run of
+/// characters, dots included. The literals before the first `*` and after the
+/// last are anchored to the ends of `value`.
 fn glob_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    let mut parts = pattern.split('*');
+    let Some(rest) = parts.next().and_then(|prefix| value.strip_prefix(prefix)) else {
+        return false;
+    };
+    let Some(suffix) = parts.next_back() else {
+        return rest.is_empty();
+    };
+    let Some(mut rest) = rest.strip_suffix(suffix) else {
+        return false;
+    };
+    // Taking each inner literal at its leftmost occurrence leaves the most
+    // room for the ones after it, so no match is missed by not backtracking.
+    for part in parts {
+        let Some(idx) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[idx + part.len()..];
     }
-    let mut rest = value;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            first = false;
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            let Some(stripped) = rest.strip_prefix(part) else {
-                return false;
-            };
-            rest = stripped;
-        } else {
-            let Some(idx) = rest.find(part) else {
-                return false;
-            };
-            rest = &rest[idx + part.len()..];
-        }
-        first = false;
-    }
-    pattern.ends_with('*') || rest.is_empty()
+    true
 }
 
 /// The names one attachment's DNS listener validated for each destination
@@ -7108,6 +7106,71 @@ options edns0
             NetworkAction::Deny,
             "an address glob describes addresses, so a registrable name that \
              matches it must not grant"
+        );
+    }
+
+    /// A glob's last literal belongs at the end of the name, wherever else
+    /// in the name it also appears.
+    #[test]
+    fn a_suffix_glob_matches_a_name_that_repeats_its_suffix() {
+        for (pattern, value) in [
+            ("*.evil.example", "a.evil.example.evil.example"),
+            ("*.com", "a.com.b.com"),
+            ("*.npmjs.org", "registry.npmjs.org.npmjs.org"),
+            ("*.evil.example", "a.evil.example"),
+            ("10.0.*", "10.0.3.4"),
+            ("api.*.example", "api.x.example"),
+            ("*", "anything"),
+            ("a*b*c", "abc"),
+            ("example.com", "example.com"),
+        ] {
+            assert!(glob_matches(pattern, value), "{pattern} vs {value}");
+        }
+        for (pattern, value) in [
+            ("*.com", "a.com.evil.net"),
+            ("*.npmjs.org", "npmjs.org"),
+            ("a*a", "a"),
+            ("api.*.example", "api.example"),
+            ("example.com", "example.com.evil"),
+        ] {
+            assert!(!glob_matches(pattern, value), "{pattern} vs {value}");
+        }
+    }
+
+    /// Whoever runs a denied zone's DNS can answer for any name under it, so
+    /// a name that repeats the zone must not slip past the deny.
+    #[test]
+    fn a_deny_glob_covers_a_name_that_repeats_its_zone() {
+        let denying = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let name = "x.evil.example.evil.example";
+
+        assert_eq!(
+            denying
+                .decide(
+                    addr("203.0.113.66:443"),
+                    &resolved(&[name]),
+                    &ClientAssertion::default()
+                )
+                .action,
+            NetworkAction::Deny,
+            "resolved as {name}"
+        );
+        assert_eq!(
+            denying
+                .decide(
+                    addr("203.0.113.66:443"),
+                    &ResolvedNames::default(),
+                    &ClientAssertion::tls(name.to_string())
+                )
+                .action,
+            NetworkAction::Deny,
+            "asserted as {name}"
         );
     }
 

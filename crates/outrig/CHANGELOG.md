@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `deny` glob covers every name under its zone.** A filter-mode host glob looked for the
+  literal after its last `*` at that literal's first occurrence in the name, then required the
+  name to end there, so `deny = ["*.evil.example"]` missed `x.evil.example.evil.example`. Whoever
+  runs `evil.example`'s DNS can answer for that name with a wildcard record, and the connection
+  was allowed and recorded as `allow`. That literal is now matched against the end of the name.
+  `allow` globs had the same miss in the safe direction -- `*.npmjs.org` refused a resolved
+  `registry.npmjs.org.npmjs.org` -- and now match those names too.
 - **`load_project` takes only a config this process's user owns.** Its walk up from `dir` took
   the first `.agents/outrig/config.toml` it found, so a config another user planted in a shared
   ancestor such as `/tmp` was loaded as the project's. It now returns
