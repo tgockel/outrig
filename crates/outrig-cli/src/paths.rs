@@ -197,9 +197,9 @@ impl RepoConfig {
     }
 }
 
-/// The repo config for `ls`/`logs`/`discard`/`clean`/`build`: `--config`
-/// when given (see [`explicit_repo_config`]), else the walk up from `cwd`,
-/// where finding nothing is [`OutrigError::NoRepoConfig`].
+/// The repo config for `build`: `--config` when given (see
+/// [`explicit_repo_config`]), else the walk up from `cwd`, where finding
+/// nothing is [`OutrigError::NoRepoConfig`].
 pub(crate) fn resolve_repo_config(override_path: Option<&Path>, cwd: &Path) -> Result<RepoConfig> {
     match override_path {
         Some(p) => explicit_repo_config(p, cwd),

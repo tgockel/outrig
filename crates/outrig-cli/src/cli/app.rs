@@ -36,7 +36,7 @@ struct Cli {
     global_config: Option<PathBuf>,
 
     /// Override the session root for this invocation. Default cascade:
-    /// flag > config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
+    /// flag > global config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
     #[arg(long = "session-root", global = true, value_name = "PATH")]
     session_root: Option<PathBuf>,
 
@@ -287,34 +287,20 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             }
         },
         Cmd::Ls(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(ls::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(ls::execute(args, cli.session_root.as_deref(), &global))
         }
         Cmd::Logs(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(logs::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(logs::execute(args, cli.session_root.as_deref(), &global))
         }
         Cmd::Discard(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(discard::execute(
-                args,
-                session_root,
-                repo_cfg,
-                &global,
-                &cwd,
-            ))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(discard::execute(args, cli.session_root.as_deref(), &global))
         }
         Cmd::Clean(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(clean::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(clean::execute(args, cli.session_root.as_deref(), &global))
         }
     }
 }
@@ -388,18 +374,16 @@ fn quiet_rustyline(spec: &str) -> Option<Directive> {
     })
 }
 
-/// Shared preamble for `ls`/`logs`/`discard`: cwd, the resolved global
-/// config path, and a current-thread tokio runtime ready to drive the
-/// async `execute` form of each subcommand. The repo config is resolved
-/// inside each handler because session lookups can substring-match across
-/// repos and shouldn't fail on a missing repo config.
-fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
-    let cwd = crate::paths::current_dir()?;
+/// Shared preamble for `ls`/`logs`/`discard`/`clean`: the resolved global
+/// config path and a current-thread tokio runtime ready to drive the async
+/// `execute` form of each subcommand. No repo config and no cwd: the session
+/// root is global-only, so these commands answer the same from any directory.
+fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, tokio::runtime::Runtime)> {
     let global = global_config_path(cli.global_config.as_deref());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    Ok((cwd, global, runtime))
+    Ok((global, runtime))
 }
 
 /// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the

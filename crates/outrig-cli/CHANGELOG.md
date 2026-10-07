@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The session root is the global config's, from every directory.** `outrig ls`, `logs`, `discard`,
+  and `clean` read `session-root` from the repo config found from the working directory, unvalidated
+  and as written. A relative value named a different root from each directory, `~` was a directory
+  literally named `~`, and a value `outrig run` refused as not absolute was obeyed. `run` and `mcp`
+  let a repo value win as well, so a committed config chose where this machine writes records, where
+  `clean` and `discard` delete, and which containers `clean` takes for strays. `session-root` and
+  `model-cache-root` are now global-only: a repo config that sets either is rejected at load with an
+  error naming the key. In the global config a relative value resolves against that file's
+  directory, and a leading `~` is your home directory. The session commands read only the global
+  config, so they answer the same from any directory, no longer fail beneath another user's
+  `.agents/outrig/config.toml`, and ignore `--config`. To migrate, move the key to the global
+  config; records under a root a repo chose stay reachable with `--session-root`. `model-cache-root`
+  is deprecated along with `style = "mistralrs"`, and a repo config that sets it fails to load too
+  (#336).
+
 - **A repo config may not declare a provider that carries an `api-key`.** `outrig run`,
   `outrig mcp`, and `outrig build` refuse a `.agents/outrig/config.toml`, or a `--config` file,
   that declares an `openai` or `anthropic` provider, naming the provider and the variable. A repo

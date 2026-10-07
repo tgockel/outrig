@@ -9,7 +9,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{GLOBAL_WITH_MODEL, run_outrig};
+use common::{ABSENT_IMAGE, GLOBAL_WITH_MODEL, run_outrig, utf8};
 use outrig_cli::session::SessionStore;
 
 /// #323's fixture, under `tmp`: `home/u/proj/ci/outrig.toml` declares
@@ -34,10 +34,6 @@ fn issue_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
     )
     .unwrap();
     (proj, named)
-}
-
-fn utf8(path: &Path) -> &str {
-    path.to_str().expect("utf-8")
 }
 
 /// The issue's reproduction, absolute and relative: `build` reads the named
@@ -88,7 +84,7 @@ async fn a_missing_config_is_refused() {
     let absent = tmp.path().join("no-such-global.toml");
     let typo = proj.join("ci/outrig-typo.toml");
 
-    for cmd in ["build", "run", "mcp", "ls"] {
+    for cmd in ["build", "run", "mcp"] {
         let (ok, stderr) = run_outrig(
             &proj,
             &[
@@ -147,7 +143,7 @@ async fn run_under_an_out_of_tree_config_works_in_the_cwd() {
             utf8(&file),
             "run",
             "--image",
-            "localhost/outrig-test-absent:latest",
+            ABSENT_IMAGE,
         ],
     )
     .await;

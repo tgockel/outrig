@@ -11,7 +11,7 @@ for workspace changes (outrig writes to your repo directly; see
 Sessions live under a **session root** directory. Resolution order:
 
 1. `--session-root <path>` flag (any session-touching subcommand).
-2. `session-root` key in repo or global config.
+2. `session-root` key in the global config.
 3. `<XDG_DATA_HOME>/outrig/sessions/` (default; typically
    `~/.local/share/outrig/sessions/`).
 
@@ -21,6 +21,12 @@ Set `session-root` once in `~/.outrig/config.toml` to keep sessions somewhere pe
 ```toml
 session-root = "/var/lib/outrig/sessions"
 ```
+
+A relative value resolves against the global config's directory, and a leading `~` is your home
+directory, so `session-root = "~/outrig-sessions"` works too. The key is global-only: one machine
+keeps one root, so `outrig ls` finds the same sessions from any directory, and a repo config that
+sets `session-root` is rejected at load. See
+[Reference -> Config](../reference/config.md#top-level).
 
 ## Layout under the root
 

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{default_session_root, resolve_repo_config};
+use crate::paths::default_session_root;
 use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError, Result};
 
@@ -450,45 +450,20 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
     default.to_path_buf()
 }
 
-/// Same cascade as [`resolve_session_root`], but suitable for read-only session
-/// commands (`ls`, `logs`, `discard`) that may run outside any repo. Skips the
-/// validation+merge that [`Config::load`] performs (we only need the
-/// `session-root` key) and degrades silently when the repo or global config
-/// file is missing -- the user might have neither and just want the XDG
-/// default.
-pub fn resolve_session_root_for_cli(
-    flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
-    global_cfg_path: &Path,
-    cwd: &Path,
-) -> Result<PathBuf> {
+/// Same cascade as [`resolve_session_root`], for the session commands (`ls`,
+/// `logs`, `discard`, `clean`), which may run outside any repo. `session-root`
+/// is global-only, so the global config is the only file consulted, and the
+/// answer is the same from every directory. Read with
+/// [`Config::load_global`], which resolves the key beside the file and skips
+/// validation (only this key matters here); a missing file falls through to
+/// the XDG default.
+pub fn resolve_session_root_for_cli(flag: Option<&Path>, global_cfg_path: &Path) -> Result<PathBuf> {
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let repo_cfg_path = match resolve_repo_config(repo_cfg_override, cwd) {
-        Ok(repo) => Some(repo.config_path()),
-        Err(OutrigError::NoRepoConfig) => None,
-        Err(e) => return Err(e),
-    };
-    if let Some(p) = repo_cfg_path
-        && let Some(root) = read_session_root(&p)?
-    {
-        return Ok(root);
-    }
-    if let Some(root) = read_session_root(global_cfg_path)? {
-        return Ok(root);
-    }
-    Ok(default_session_root())
-}
-
-fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {
-    let text = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).path_ctx("read", path),
-    };
-    let cfg = Config::load_from_str(&text)?;
-    Ok(cfg.session_root)
+    Ok(Config::load_global(global_cfg_path)?
+        .session_root
+        .unwrap_or_else(default_session_root))
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is

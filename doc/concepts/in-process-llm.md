@@ -191,8 +191,8 @@ model-file = "Phi-3-mini-4k-instruct-q4.gguf"   # required; the GGUF's path insi
 
 On first use, outrig downloads the named GGUF file from `https://huggingface.co/<model-id>`
 and caches it under `<XDG_CACHE_HOME>/outrig/models/` (override with the top-level
-`model-cache-root` config key; see [Reference -> Config](../reference/config.md)). Subsequent
-runs reuse the cached file.
+`model-cache-root` key in the global config; see [Reference -> Config](../reference/config.md)).
+Subsequent runs reuse the cached file.
 
 `model-file` is required with `model-id`, even when the repo ships a single `.gguf`; most
 publish several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) to pick from. It is the file's

@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Config::load_global` reads a global config on its own.** It parses the file, resolves
+  `session-root` and `model-cache-root` beside it, and stamps every path entry with its origin, but
+  neither merges nor validates: a global file's `default-model` may name a model only a repo
+  declares. A missing file loads as empty, as it does for `Config::load`. This is the read for a
+  caller that wants a machine-level key and has no repo.
+
 ### Fixed
+
+- **`session-root` and `model-cache-root` are global-only, and follow the path rule.** A repo config
+  could set either, and `merge` let its value win, so a committed file chose where this machine
+  writes session records and model downloads. `validate_as_repo`, which `Config::load` and
+  `Config::load_file` apply to the repo side, now refuses both with the new
+  `ConfigValidationError::RepoGlobalOnlyKey`, and `merge` never reads them from the repo side. In
+  the global config a relative value now resolves against that file's directory and a leading `~` is
+  the home directory, where both used to be refused as not absolute. Unlike other config paths they
+  are resolved as the file is read rather than stored as written, so a loaded config still holds
+  both absolute and re-serializes them that way; `SessionRootNotAbsolute` and
+  `ModelCacheRootNotAbsolute` now fire only for a value no file declared. `model-cache-root` is
+  deprecated along with `style = "mistralrs"`, and 0.2.0 said the deprecated keys still validate: a
+  repo config that sets it now fails to load, and the key moves to the global config.
 
 - **A repo config may not declare a provider that carries an `api-key`.** `[providers.<name>]`
   rows of `style = "openai"` or `"anthropic"` in `.agents/outrig/config.toml`, or in a file named

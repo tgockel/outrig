@@ -27,15 +27,11 @@ pub struct LsArgs {}
 pub async fn execute(
     _args: &LsArgs,
     session_root_flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
     global_cfg_path: &Path,
-    cwd: &Path,
 ) -> Result<i32> {
     let root = session::resolve_session_root_for_cli(
         session_root_flag,
-        repo_cfg_override,
         global_cfg_path,
-        cwd,
     )?;
     let store = SessionStore::new(root);
     let mut stdout = tokio::io::stdout();

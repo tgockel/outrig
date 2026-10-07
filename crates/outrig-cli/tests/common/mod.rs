@@ -706,6 +706,16 @@ provider   = "openai"
 identifier = "test-model"
 "#;
 
+/// An image no registry holds, so the stubbed podman fails on it at once.
+#[allow(dead_code)]
+pub const ABSENT_IMAGE: &str = "localhost/outrig-test-absent:latest";
+
+/// `path` as the `&str` an argument list wants.
+#[allow(dead_code)]
+pub fn utf8(path: &Path) -> &str {
+    path.to_str().expect("utf-8")
+}
+
 /// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
 /// probes and pulls fail instantly instead of hitting the network.
 #[allow(dead_code)]
@@ -738,10 +748,25 @@ pub async fn run_outrig_with_env(
     args: &[&str],
     env: &[(&str, &Path)],
 ) -> (bool, String) {
+    let output = run_outrig_output(cwd, args, env).await;
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// [`run_outrig_with_env`], returning the whole `Output` for a test that reads
+/// stdout as well.
+#[allow(dead_code)]
+pub async fn run_outrig_output(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> std::process::Output {
     let stubs = tempfile::tempdir().expect("tempdir stubs");
     let cache = tempfile::tempdir().expect("tempdir cache");
 
-    let output = tokio::time::timeout(
+    tokio::time::timeout(
         RUN_OUTRIG_TIMEOUT,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_outrig"))
             .args(args)
@@ -755,10 +780,5 @@ pub async fn run_outrig_with_env(
     )
     .await
     .expect("outrig timed out")
-    .expect("spawn outrig");
-
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    .expect("spawn outrig")
 }

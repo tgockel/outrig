@@ -51,8 +51,10 @@ config-less run. Which repo the command then runs against depends on where the f
 when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --
 note this is `~/.outrig/`, not `~/.config/outrig/`).
 
-`--session-root` resolves in this order: this flag, then `session-root` in the repo or global
-config, then `<XDG_DATA_HOME>/outrig/sessions/`.
+`--session-root` resolves in this order: this flag, then `session-root` in the global config, then
+`<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
+`clean` read no repo config at all and ignore `--config`: they find the same root from any
+directory.
 
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
@@ -380,7 +382,7 @@ Environment variables used by `outrig mcp`:
 |-------------------|-----------------------------------------------------------------|
 | `OUTRIG_LOG`      | Preferred `tracing-subscriber` filter.                          |
 | `RUST_LOG`        | Fallback tracing filter when `OUTRIG_LOG` is unset.             |
-| `XDG_DATA_HOME`   | Default base for `session-root` if not set in config.           |
+| `XDG_DATA_HOME`   | Default base for `session-root` if not set in global config.    |
 | `XDG_CONFIG_HOME` | Global config is checked before `~/.outrig/config.toml`.        |
 
 See [Usage -> outrig mcp](../usage/mcp.md) for client configuration and stdio details.
@@ -534,7 +536,7 @@ there; the run is reported in full, and the container is named on stderr.
 - `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.
-- `XDG_DATA_HOME`: default base for `session-root` if not set in config.
+- `XDG_DATA_HOME`: default base for `session-root` if not set in the global config.
 - `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 
 ## See also

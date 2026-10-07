@@ -57,7 +57,7 @@ outrig run [--agent <name>]
   this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory, which must be empty or not exist yet; symlinked from the root.
-- `--session-root <path>` (default: `session-root` config, else XDG): root directory
+- `--session-root <path>` (default: global config's `session-root`, else XDG): root directory
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Access defaults to read-only; append `:rw`

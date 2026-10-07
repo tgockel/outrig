@@ -48,7 +48,8 @@ outrig mcp self
   config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
   which repo the session runs against.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
-- `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
+- `--session-root <path>` (default: global config, then XDG data directory): root for all
+  sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Read-only unless `:rw` is given; the host
   directory must exist. Rejected with `--attach`.

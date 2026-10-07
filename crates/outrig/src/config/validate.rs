@@ -359,6 +359,9 @@ pub enum ConfigValidationError {
     )]
     RepoNetworkPolicy { key: &'static str },
 
+    #[error("repo config may not set {key}; it belongs in global config")]
+    RepoGlobalOnlyKey { key: &'static str },
+
     #[error(
         "repo config may not declare [providers.{provider}]: a style={style} \
          provider carries api-key ${{{var}}}, which belongs in global config"
@@ -703,6 +706,10 @@ pub(super) fn validate_with_options(
         }
     }
 
+    // A loaded config cannot fail these two: both keys are resolved against
+    // the global file's directory as it is read. What reaches here relative is
+    // a value no file declared -- hand-built, or from `load_from_str` -- which
+    // has no directory to resolve against.
     if let Some(path) = &cfg.session_root
         && !path.is_absolute()
     {
@@ -848,14 +855,28 @@ pub(super) fn validate_with_options(
 
 /// The rules that apply to a repo config file, checked on the unmerged value.
 ///
-/// Two today, drawing one line: what the operator's machine does stays with
-/// the operator. `[network]`'s policy keys describe the machine's egress, so a
-/// repo config may declare `mode` and nothing else. A provider's `api-key`
-/// names a host environment variable and its `base-url` says where the host
-/// process sends it, so a repo config may declare only providers that carry no
-/// key -- `style = "mistralrs"` today; a repo model may still name a global
-/// provider. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
+/// Three today, drawing one line: what the operator's machine does stays with
+/// the operator. `session-root` and `model-cache-root` pick where this machine
+/// writes -- for sessions also where `clean` and `discard` delete and what
+/// `clean` reads as a stray container -- so one machine has one of each.
+/// `[network]`'s policy keys describe the machine's egress, so a repo config
+/// may declare `mode` and nothing else. A provider's `api-key` names a host
+/// environment variable and its `base-url` says where the host process sends
+/// it, so a repo config may declare only providers that carry no key --
+/// `style = "mistralrs"` today; a repo model may still name a global provider.
+/// Checked in schema order. See
+/// [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
+    if cfg.session_root.is_some() {
+        return Err(ConfigValidationError::RepoGlobalOnlyKey {
+            key: "session-root",
+        });
+    }
+    if cfg.model_cache_root.is_some() {
+        return Err(ConfigValidationError::RepoGlobalOnlyKey {
+            key: "model-cache-root",
+        });
+    }
     if let Some(key) = cfg.network.declared_policy_key() {
         return Err(ConfigValidationError::RepoNetworkPolicy { key });
     }

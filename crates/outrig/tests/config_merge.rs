@@ -1709,22 +1709,38 @@ style = "mistralrs"
         assert!(merged.providers.contains_key("staging"));
     }
 
+    /// Both roots are global-only, so `merge` takes them from the global side
+    /// whatever the repo side carries -- including a hand-built repo value
+    /// that never met `validate_as_repo`.
     #[test]
-    fn model_cache_root_repo_overrides_global() {
+    fn roots_are_never_read_from_the_repo() {
+        let repo = || {
+            parse(
+                r#"
+session-root     = "/var/lib/repo/sessions"
+model-cache-root = "/var/cache/repo/models"
+"#,
+            )
+        };
+
+        let merged = merge(Config::default(), repo());
+        assert_eq!(merged.session_root, None);
+        assert_eq!(merged.model_cache_root, None);
+
         let global = parse(
             r#"
+session-root     = "/var/lib/global/sessions"
 model-cache-root = "/var/cache/global/models"
 "#,
         );
-        let repo = parse(
-            r#"
-model-cache-root = "/var/cache/repo/models"
-"#,
+        let merged = merge(global, repo());
+        assert_eq!(
+            merged.session_root.as_deref(),
+            Some(Path::new("/var/lib/global/sessions")),
         );
-        let merged = merge(global, repo);
         assert_eq!(
             merged.model_cache_root.as_deref(),
-            Some(Path::new("/var/cache/repo/models")),
+            Some(Path::new("/var/cache/global/models")),
         );
     }
 
@@ -2234,11 +2250,11 @@ mod config_load {
 
     /// End-to-end load of `tests/fixtures/config-full.toml` (acceptance criterion).
     /// Writes the fixture to a tempdir as the *global* config -- it carries
-    /// keyed providers, which only that file may declare -- plus the
-    /// dockerfile/context paths it references, then drives the full disk
-    /// pipeline through `Config::load`. The file sits beside the repo root, so
-    /// its relative paths resolve against the same directory a repo config's
-    /// would.
+    /// keyed providers and both roots, which only that file may declare --
+    /// plus the dockerfile/context paths it references, then drives the full
+    /// disk pipeline through `Config::load`. The file sits beside the repo
+    /// root, so its relative paths resolve against the same directory a repo
+    /// config's would.
     #[test]
     fn fixture_loads_end_to_end() {
         let tmp = tempdir().unwrap();
@@ -2263,6 +2279,14 @@ mod config_load {
         assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
+        assert_eq!(
+            cfg.session_root.as_deref(),
+            Some(Path::new("/var/lib/outrig/sessions")),
+        );
+        assert_eq!(
+            cfg.model_cache_root.as_deref(),
+            Some(Path::new("/var/cache/outrig/models")),
+        );
 
         // The only relative `model-path` in tree, and the point of keeping it
         // relative: the file the validator found is the file the loader is
@@ -2908,13 +2932,33 @@ model-path = "weights.gguf"
         assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
     }
 
-    /// The full fixture has the shape of a *global* file: it carries keyed
-    /// providers, so as a repo config it is refused, naming the first keyed
-    /// entry in map order.
+    /// The full fixture has the shape of a *global* file: it carries both
+    /// roots and keyed providers, so as a repo config it is refused. The
+    /// rules run in schema order, so the roots are named first; without them,
+    /// the first keyed provider in map order is.
     #[test]
     fn the_fixture_is_refused_as_a_repo_config() {
         let tmp = tempdir().unwrap();
         write_repo_cfg(tmp.path(), FIXTURE_FULL);
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "session-root"
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        let rootless: Vec<&str> = FIXTURE_FULL
+            .lines()
+            .filter(|line| {
+                !line.starts_with("session-root") && !line.starts_with("model-cache-root")
+            })
+            .collect();
+        write_repo_cfg(tmp.path(), &rootless.join("\n"));
 
         let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
         assert!(
@@ -2924,6 +2968,99 @@ model-path = "weights.gguf"
                     if provider == "anthropic"
             ),
             "got: {err:?}",
+        );
+    }
+
+    /// #336: where this machine writes sessions and model downloads is the
+    /// operator's call, so a repo file may set neither root. The key is what
+    /// is refused, not the value: an absolute path fails like a relative one.
+    #[test]
+    fn repo_roots_are_rejected() {
+        for (body, key) in [
+            ("session-root = \"sessions\"", "session-root"),
+            (
+                "session-root = \"/var/lib/outrig/sessions\"",
+                "session-root",
+            ),
+            ("model-cache-root = \"models\"", "model-cache-root"),
+            (
+                "model-cache-root = \"/var/cache/outrig/models\"",
+                "model-cache-root",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(tmp.path(), &format!("{body}\n"));
+
+            let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+            assert!(
+                matches!(err, ConfigValidationError::RepoGlobalOnlyKey { key: k } if k == key),
+                "{body} should be rejected, got: {err:?}",
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("{key}; it belongs in global config")),
+                "got: {err}",
+            );
+        }
+    }
+
+    /// The rule is on the repo-side value rather than on the load, so an
+    /// embedder assembling a repo `Config` by hand gets it too.
+    #[test]
+    fn validate_as_repo_rejects_a_hand_built_root() {
+        let mut cfg = Config::default();
+        cfg.validate_as_repo()
+            .expect("an empty repo config is fine");
+        cfg.model_cache_root = Some("/var/cache/outrig/models".into());
+        let err = expect_load_validation_err(cfg.validate_as_repo().unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "model-cache-root"
+                }
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// `load_global` reads the one file, resolves its roots beside it, and
+    /// stops there: no merge and no validation, since a global file's
+    /// `default-model` may name a model only a repo declares.
+    #[test]
+    fn load_global_resolves_roots_without_validating() {
+        let dir = tempdir().unwrap();
+        let path = write_global_cfg(
+            dir.path(),
+            r#"
+default-model    = "declared-by-some-repo"
+session-root     = "sessions"
+model-cache-root = "/var/cache/outrig/models"
+"#,
+        );
+
+        let cfg = Config::load_global(&path).expect("an unvalidated global file loads");
+        assert_eq!(cfg.default_model.as_deref(), Some("declared-by-some-repo"));
+        assert_eq!(cfg.session_root, Some(dir.path().join("sessions")));
+        assert_eq!(
+            cfg.model_cache_root.as_deref(),
+            Some(Path::new("/var/cache/outrig/models")),
+        );
+    }
+
+    /// Missing is empty, as it is for `load`; anything else unreadable is an
+    /// error naming the path.
+    #[test]
+    fn load_global_of_a_missing_file_is_empty_and_of_a_directory_an_error() {
+        let dir = tempdir().unwrap();
+        let absent = Config::load_global(&dir.path().join("absent.toml"))
+            .expect("a missing global file loads as empty");
+        assert_eq!(absent, Config::default());
+
+        let err = Config::load_global(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "read", path, .. } if path == dir.path()),
+            "expected a read error naming the directory, got: {err:?}",
         );
     }
 
@@ -3811,6 +3948,30 @@ container-path = "/shared"
         (repo, global, global_cfg)
     }
 
+    /// #336: the roots follow the rule every other path does, against the
+    /// global file's directory -- the only file allowed to set them -- rather
+    /// than whichever directory outrig ran from. An absolute one is as-is.
+    #[test]
+    fn global_roots_resolve_against_global_dir() {
+        let (repo, global, global_cfg) = repo_and_global(
+            r#"
+session-root     = "sessions"
+model-cache-root = "../models"
+"#,
+        );
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("relative roots load");
+        assert_eq!(cfg.session_root, Some(global.path().join("sessions")));
+        assert_eq!(cfg.model_cache_root, Some(global.path().join("../models")));
+
+        let (repo, _global, global_cfg) = repo_and_global("session-root = \"/srv/sessions\"\n");
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("an absolute root loads");
+        assert_eq!(
+            cfg.session_root.as_deref(),
+            Some(Path::new("/srv/sessions"))
+        );
+    }
+
     #[test]
     fn global_image_build_paths_resolve_against_global_dir() {
         let (repo, global, global_cfg) = global_image_project();
@@ -4364,6 +4525,27 @@ model-path = "~/models/local.gguf"
         });
     }
 
+    /// A `~` root is under the home directory, through the merged load and
+    /// `load_global` alike -- not a directory named `~` beside the global file
+    /// or beside wherever outrig ran (#336).
+    #[test]
+    fn a_tilde_root_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let (repo, _global, global_cfg) = repo_and_global(
+                r#"
+session-root     = "~/outrig-sessions"
+model-cache-root = "~"
+"#,
+            );
+            let loaded = Config::load(repo.path(), Some(&global_cfg)).expect("~ roots load");
+            let global = Config::load_global(&global_cfg).expect("the global file loads");
+            for cfg in [&loaded, &global] {
+                assert_eq!(cfg.session_root, Some(home.join("outrig-sessions")));
+                assert_eq!(cfg.model_cache_root.as_deref(), Some(home));
+            }
+        });
+    }
+
     /// `~` ignores the declaring file's directory the way an absolute path
     /// does, so one value means one directory from either file, and the
     /// existence check looks there.
@@ -4827,6 +5009,14 @@ mod repo_file_load {
         assert!(
             err.to_string()
                 .contains("[network].allow belongs in global config"),
+            "got: {err:?}",
+        );
+
+        let (repo, _outside, file) = repo_and_file("session-root = \"/var/lib/outrig/sessions\"\n");
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session-root; it belongs in global config"),
             "got: {err:?}",
         );
     }

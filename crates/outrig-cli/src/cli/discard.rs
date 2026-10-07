@@ -36,9 +36,7 @@ pub struct DiscardArgs {
 pub async fn execute(
     args: &DiscardArgs,
     session_root_flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
     global_cfg_path: &Path,
-    cwd: &Path,
 ) -> Result<i32> {
     // `--session-dir` skips the id lookup entirely, so the root is unused.
     // Resolving it anyway would surface a config-parse error on a path
@@ -48,9 +46,7 @@ pub async fn execute(
     } else {
         session::resolve_session_root_for_cli(
             session_root_flag,
-            repo_cfg_override,
             global_cfg_path,
-            cwd,
         )?
     };
     let store = SessionStore::new(root);

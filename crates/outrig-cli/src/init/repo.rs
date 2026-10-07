@@ -18,7 +18,6 @@ use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
 use outrig::config::{Agent, Config, LlmProvider, Model, Workspace};
-use outrig::error::IoPathExt;
 
 /// Idempotent. Returns `Some(image_name)` when this call wrote the
 /// repo config (the user named an image during the bootstrap), or
@@ -168,15 +167,8 @@ struct GlobalSummary {
 /// summary (the user will be prompted to run `outrig config init`); parse
 /// errors propagate so a corrupt config surfaces immediately.
 fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
-    let text = match std::fs::read_to_string(global_path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GlobalSummary::default());
-        }
-        Err(e) => return Err(e).path_ctx("read", global_path).map_err(Into::into),
-    };
-    let cfg = Config::load_from_str(&text)?;
-    // Only rows a validated load would accept. `load_from_str` parses without
+    let cfg = Config::load_global(global_path)?;
+    // Only rows a validated load would accept. `load_global` parses without
     // validating, and since `provider` became optional a broken row survives
     // parsing -- offering one as a choice would write a repo `default-model`
     // that the next load rejects outright. `model_candidates` enforces the

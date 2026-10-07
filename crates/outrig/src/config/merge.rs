@@ -14,10 +14,12 @@ use super::Config;
 ///   refuses a repo provider that carries an `api-key` before the file gets
 ///   here, and a repo value built by hand must be held to it the same way.
 /// - For top-level scalars (`default-image`, `default-agent`,
-///   `default-model`, `session-root`, `model-cache-root`,
-///   `tool-call-max`, `tool-result-max`, `subagent-depth-max`,
-///   `subagent-width-max`, `retry-budget-secs`): repo's value wins if set,
-///   else global's.
+///   `default-model`, `tool-call-max`, `tool-result-max`,
+///   `subagent-depth-max`, `subagent-width-max`, `retry-budget-secs`):
+///   repo's value wins if set, else global's.
+/// - `session-root` and `model-cache-root` are global-only: they are taken
+///   from `global` and never read from `repo`, so a repo value cannot move
+///   where this machine writes, whatever built it.
 /// - `[network].mode` follows repo precedence when the repo config declares
 ///   `mode`; a `[network]` table that declares no mode inherits the global
 ///   one. Policy keys (`default`, `allow`, `deny`) are global-only: this
@@ -33,8 +35,9 @@ use super::Config;
 /// The result is a flattened snapshot, not a config file: provenance rides
 /// along in memory but is `#[serde(skip)]`, so re-serializing a merged config
 /// emits each inherited path as the text its source file used and loses the
-/// base directory that text meant. Nothing in outrig writes a merged config
-/// back to disk.
+/// base directory that text meant. The two roots are the exception: they were
+/// resolved as they were read, so they come out absolute. Nothing in outrig
+/// writes a merged config back to disk.
 pub fn merge(global: Config, repo: Config) -> Config {
     let mut providers = global.providers;
     providers.extend(repo.providers);
@@ -64,8 +67,8 @@ pub fn merge(global: Config, repo: Config) -> Config {
         default_image: repo.default_image.or(global.default_image),
         default_agent: repo.default_agent.or(global.default_agent),
         default_model: repo.default_model.or(global.default_model),
-        session_root: repo.session_root.or(global.session_root),
-        model_cache_root: repo.model_cache_root.or(global.model_cache_root),
+        session_root: global.session_root,
+        model_cache_root: global.model_cache_root,
         tool_call_max: repo.tool_call_max.or(global.tool_call_max),
         tool_result_max: repo.tool_result_max.or(global.tool_result_max),
         subagent_depth_max: repo.subagent_depth_max.or(global.subagent_depth_max),

@@ -277,8 +277,15 @@ pub struct Config {
     pub default_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Global-only, like [`model_cache_root`](Self::model_cache_root): a repo
+    /// config that sets it fails [`validate_as_repo`](Self::validate_as_repo),
+    /// and [`merge`] never reads it from the repo side. A config read from a
+    /// file holds it resolved against that file's directory, so after any
+    /// [`load`](Self::load) it is absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_root: Option<PathBuf>,
+    /// Global-only and resolved as it is read, like
+    /// [`session_root`](Self::session_root).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_cache_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,17 +452,33 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The global config at `path` alone: parsed, with `session-root` and
+    /// `model-cache-root` resolved against its directory, and every path entry
+    /// stamped with its origin, but neither merged nor validated. A missing
+    /// file loads as empty, as it does for [`load`](Self::load).
+    ///
+    /// Unvalidated because a global file is half of a config, not a whole one:
+    /// its `default-model` may name a model the repo declares. This is the read
+    /// for a caller that wants a machine-level key and has no repo -- `outrig
+    /// ls` finding the session root from any directory.
+    pub fn load_global(path: &Path) -> Result<Self> {
+        let (path, text) = read_resolved(path)?;
+        match text {
+            Ok(text) => {
+                let src = ConfigSource::Global { path };
+                let mut cfg = Self::parse_stamped(&text, &src)?;
+                cfg.resolve_global_roots(src.base_dir());
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).path_ctx("read", &path),
+        }
+    }
+
     /// Merge `repo_cfg` over the global config at `global_path`, unvalidated.
     fn load_unvalidated(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
         let global_cfg = match global_path {
-            Some(g) => {
-                let (g, text) = read_resolved(g)?;
-                match text {
-                    Ok(text) => Self::parse_stamped(&text, &ConfigSource::Global { path: g })?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-                    Err(e) => return Err(e).path_ctx("read", &g),
-                }
-            }
+            Some(g) => Self::load_global(g)?,
             None => Self::default(),
         };
 
@@ -492,6 +515,24 @@ impl Config {
         }
     }
 
+    /// Resolve `session-root` and `model-cache-root` against `base`, the global
+    /// file's directory, now rather than stamping them like the paths above.
+    /// Both are global-only, so that is the one base either can have, and no
+    /// provenance is left to record. Resolving keeps the promise a loaded
+    /// config has always made about these two pub fields -- that they are
+    /// absolute -- which a value carried as written beside a private source
+    /// would quietly break for every caller reading the field directly. So
+    /// these two are the exception to "stored as written". A repo side needs
+    /// no such step: [`validate_as_repo`](Self::validate_as_repo) refuses both.
+    fn resolve_global_roots(&mut self, base: &Path) {
+        for path in [&mut self.session_root, &mut self.model_cache_root]
+            .into_iter()
+            .flatten()
+        {
+            *path = resolve_against(base, path);
+        }
+    }
+
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
     /// `repo_root: Some(_)` enables the on-disk existence checks for
     /// config-declared paths; `None` keeps the check pure-structural for unit
@@ -505,20 +546,22 @@ impl Config {
     /// the unmerged value.
     ///
     /// [`validate`](Self::validate) runs on the merged config, which by
-    /// construction has already taken its `[network]` policy from the global
+    /// construction has already taken its global-only keys from the global
     /// side and replaced any global provider a repo entry shadowed, and so
     /// cannot say which file declared what. These rules therefore run
-    /// per-file, before [`merge`](fn@merge). Today there are two. A repo
-    /// config may choose `[network].mode`, but `default`, `allow`, and `deny`
-    /// describe the machine's egress and stay with the operator. And a repo
-    /// config may declare only providers that carry no `api-key`: a key names
-    /// a host environment variable, and a repo that could pair one with its
-    /// own `base-url` would decide where the operator's secret is sent.
+    /// per-file, before [`merge`](fn@merge). Today there are three. A repo
+    /// config may not set `session-root` or `model-cache-root`, which choose
+    /// where this machine writes. It may choose `[network].mode`, but
+    /// `default`, `allow`, and `deny` describe the machine's egress and stay
+    /// with the operator. And it may declare only providers that carry no
+    /// `api-key`: a key names a host environment variable, and a repo that
+    /// could pair one with its own `base-url` would decide where the
+    /// operator's secret is sent.
     ///
     /// `Config::load` applies this to the repo file it reads. An embedder
     /// assembling a repo-side `Config` by hand should call it too -- `merge`
-    /// is infallible: it drops a repo policy rather than reporting it, and it
-    /// takes a repo provider as written.
+    /// is infallible: it drops a repo policy or root rather than reporting it,
+    /// and it takes a repo provider as written.
     pub fn validate_as_repo(&self) -> Result<()> {
         validate::validate_as_repo(self)?;
         Ok(())

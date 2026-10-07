@@ -157,6 +157,8 @@ pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: 
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
+pub outrig::config::ConfigValidationError::RepoGlobalOnlyKey
+pub outrig::config::ConfigValidationError::RepoGlobalOnlyKey::key: &'static str
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RepoProviderApiKey
@@ -480,6 +482,7 @@ pub fn outrig::config::Config::load_file_for_run(&std::path::Path, &std::path::P
 pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_global(&std::path::Path) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>

@@ -66,26 +66,33 @@ is `--image`, then `default-image`, then outrig's
 `--model` or `default-model` -- that is the one thing an agentless session cannot do without.
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
-project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
-subagent limits belong in the global config since they're user/machine-level. `tool-result-max`
-usually belongs there too, although repo or agent config can tighten it for a noisy project.
+project-scoped. `default-model`, `tool-call-max`, and the subagent limits belong in the global
+config since they're user/machine-level. `tool-result-max` usually belongs there too, although
+repo or agent config can tighten it for a noisy project.
 `retry-budget-secs` is a default for every remote provider; a `[providers.<name>]` row that
 sets its own overrides it, which is usually the better place since rate limits are a property
 of the endpoint.
+`session-root` and `model-cache-root` are global-only: they choose where this machine writes
+session records and model downloads, and for sessions also where `outrig clean` and
+`outrig discard` delete. A repo config that sets either is rejected at load.
 `[network].mode` can live in either file; when both set it, the repo value wins for that repo.
 A `[network]` table that declares no `mode` declares nothing, so it inherits. Network policy
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
-`~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
-config value and the default; `--session-dir <path>` (on `outrig run`/`logs`/`discard`) instead
-points at one specific session directory. See
+`~/.local/share/outrig/sessions/`). A relative value resolves against the global config's
+directory, and a leading `~` is your home directory -- see [path resolution](#path-resolution).
+Since only the global config can set it, `outrig run` and the session commands (`ls`, `logs`,
+`discard`, `clean`) find the same root from any directory, inside a repo or not. The CLI flag
+`--session-root <path>` overrides both the config value and the default; `--session-dir <path>`
+(on `outrig run`/`logs`/`discard`) instead points at one specific session directory. See
 [Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
 
 `model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
-`~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` models configured
-with `model-id` -- that's where the auto-downloaded GGUFs land. See
+`~/.cache/outrig/models/`), and a configured value resolves the way `session-root`'s does. It
+only matters for `style = "mistralrs"` models configured with `model-id` -- that's where the
+auto-downloaded GGUFs land. See
 [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
 
 `tool-call-max` is the default maximum number of tool calls in one user turn. The compiled-in
@@ -1195,9 +1202,11 @@ first row; any other takes the second. See
 [Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
-`[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, and to `host-path` in
-both `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`. Because `[workspace]` merges per key,
-a `host-path` inherited from the global file resolves beside that file, not from the repo root.
+`[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, to `host-path` in
+both `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`, and to `session-root` and
+`model-cache-root`. Because `[workspace]` merges per key, a `host-path` inherited from the global
+file resolves beside that file, not from the repo root. The two roots are global-only, so they
+always resolve beside the global config.
 
 A path whose first component is `~` starts from your home directory instead: `~` alone is the
 home directory, and `~/.cache/example` a directory inside it. Like an absolute path, it means the
@@ -1212,7 +1221,9 @@ one emits each inherited path as the literal text its source file used, without 
 directory that text was resolved against. Writing that snapshot out and loading it as a repo
 config therefore re-reads relative inherited paths against the repo root. Outrig never does
 this -- the merge result is used in memory and discarded -- but a tool that round-trips a loaded
-config through disk should resolve paths first, or keep the two files separate.
+config through disk should resolve paths first, or keep the two files separate. `session-root`
+and `model-cache-root` are the exception: having one possible base, they are resolved as they are
+read, so a loaded config holds them absolute and re-serializes them that way.
 
 The practical effect is that a global `[images.<name>]` can use the build shape: its Dockerfile
 and context live beside `~/.outrig/config.toml` and are found from any repo on the machine. One
@@ -1387,7 +1398,8 @@ image-config in the merged config but does not require agent/model/provider wiri
   `outrig` was invoked from. `identifier` is not
   allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
   `cuda:N`, or `metal`.
-- `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
+- `model-cache-root` may be set only in the global config. A relative value resolves against
+  that file's directory, and a leading `~` is your home directory; outrig creates it if missing.
 - `tool-call-max`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-max`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
@@ -1456,7 +1468,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - No `unmask` entry may contain `:`. Podman splits an unmask value on it, so a colon-joined
   entry would be several paths wearing one entry's clothes; declare one path per entry.
 - Unmask paths must not be duplicated within one `unmask` list.
-- `session-root`, if set, must be an absolute path; outrig creates it if missing.
+- `session-root` may be set only in the global config, and resolves as `model-cache-root` does;
+  outrig creates it if missing.
 - `workspace.host-path` and every `workspace.mounts[*].host-path`, if validated with a repo root,
   must exist and be a directory. Relative host paths resolve against the declaring file's
   directory, and a leading `~` is your home directory; an undeclared `workspace.host-path` is
