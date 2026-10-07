@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig__wait_results` no longer waits on a subagent you already collected that is idle.**
+  Its description told the model that a collected name came back again immediately. In fact a
+  collected name counted only once the subagent reported again, and an idle subagent reports again
+  only after `outrig__subagent_send`, which the parent cannot call while it waits. So the natural
+  pattern -- wait for one, read it, wait on every name again -- blocked until Ctrl-C, since the
+  default `min_count` needed every name. Such a subagent is now left out of the wait: it does not
+  count toward `min_count` and is not listed, and a call naming only such subagents fails with an
+  error that says to send them more work. One still working after its result was collected is
+  waited on as before. The description now says so.
 - **The walk up from the current directory takes only a config you own.** It took the first
   `.agents/outrig/config.toml` above the working directory, whoever had written it. So on a
   shared host, a config another user planted in `/tmp` or a group-writable directory became the

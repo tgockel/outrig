@@ -96,6 +96,14 @@ impl Snapshot {
             || (self.version == watermark && self.state == RunState::Idle { published: false })
     }
 
+    /// Whether a parent at `watermark` has nothing to collect and nothing
+    /// coming: the subagent is idle, and its last report is one the parent
+    /// already read. Only the parent's send changes that, since a queued round
+    /// reads as `Running` from the moment it is accepted.
+    pub fn settled(&self, watermark: u64) -> bool {
+        matches!(self.state, RunState::Idle { .. }) && !self.readable(watermark)
+    }
+
     /// What a read at `watermark` yields. `None` when not readable.
     pub fn read(&self, watermark: u64) -> Option<Outcome> {
         if !self.readable(watermark) {
@@ -499,6 +507,24 @@ mod tests {
         let s = snap(0, RunState::Idle { published: false }, None);
         assert!(s.readable(0));
         assert!(matches!(s.read(0), Some(Outcome::Error(_))));
+    }
+
+    /// Settled is the one state a waiting parent cannot see change: idle,
+    /// with the last report already collected. Anything still running, or
+    /// anything left to collect, is worth waiting on.
+    #[test]
+    fn only_idle_with_its_report_collected_is_settled() {
+        let report = Some(Outcome::Result("a".into()));
+        let collected_idle = snap(1, RunState::Idle { published: true }, report.clone());
+        assert!(collected_idle.settled(1));
+
+        let collected_running = snap(1, RunState::Running, report.clone());
+        assert!(!collected_running.settled(1), "it may report again");
+
+        assert!(!collected_idle.settled(0), "uncollected is readable");
+
+        let silent = snap(1, RunState::Idle { published: false }, report);
+        assert!(!silent.settled(1), "a silent round reads as an error");
     }
 
     /// Latest-only: three publishes then one read yields the third, and the

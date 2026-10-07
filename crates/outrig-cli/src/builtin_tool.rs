@@ -283,8 +283,10 @@ impl ToolDyn for WaitResultsTool {
          collect, then return which ones. Returns names only, not their \
          findings -- call outrig__get_result per subagent to read those, so one \
          call cannot flood your context. Use min_count to react to whichever \
-         finishes first. Drop names you have already collected, or this returns \
-         them again immediately."
+         finishes first. A ready subagent stays ready until you collect it, so \
+         this returns it again at once. One whose result you collected counts \
+         again only when it reports again; if it is idle, it is not waited on, \
+         and a call naming only such subagents fails."
             .to_string()
     }
 
@@ -301,7 +303,8 @@ impl ToolDyn for WaitResultsTool {
                     "type": "integer",
                     "minimum": 1,
                     "description": "How many must be ready before returning. \
-                                    Defaults to all of them."
+                                    Defaults to all of them; idle ones \
+                                    with nothing new do not count."
                 }
             },
             "required": ["names"],

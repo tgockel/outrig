@@ -209,8 +209,12 @@ outrig__get_result({"name": "audit-mcp"})
 ```
 
 > A subagent that is ready and left uncollected stays ready. Keep passing its name to
-> `outrig__wait_results` and every call returns it immediately and never blocks for the others --
-> drop names once they have been collected.
+> `outrig__wait_results` and every call returns it immediately and never blocks for the others.
+>
+> Once collected, a name counts again only when that subagent reports again. One still working is
+> waited on. One that is idle is not: only `outrig__subagent_send` gives it something new to
+> report, and the parent cannot send while it waits, so it neither counts toward `min_count` nor
+> appears in the answer. A call naming only such subagents fails rather than block.
 
 ### Subagents stay addressable
 

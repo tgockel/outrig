@@ -136,6 +136,15 @@ pub(crate) struct Read {
     pub(crate) claim: Claim,
 }
 
+/// Where some of the parent's subagents stand.
+#[derive(Default)]
+struct Readiness {
+    /// The readable ones, in the order the parent named them.
+    ready: Vec<String>,
+    /// How many are [settled](state::Snapshot::settled).
+    settled: usize,
+}
+
 /// One task this registry spawned, owned independently of the name it was
 /// launched under.
 ///
@@ -346,6 +355,12 @@ impl SubagentRegistry {
     /// which. Carries no payloads and moves no watermark: results can be
     /// large, and the parent decides how much of one enters its context by
     /// reading each subagent with [`Self::read`].
+    ///
+    /// A [settled](state::Snapshot::settled) name is neither waited on nor
+    /// reported. Only the parent's own send makes one readable again, and the
+    /// parent is in this call, so waiting on it would last until Ctrl-C.
+    /// `min_count` counts the other names, and a call naming only settled ones
+    /// fails.
     pub async fn wait_results(
         &self,
         names: &[String],
@@ -366,8 +381,13 @@ impl SubagentRegistry {
         }
 
         loop {
-            let ready = self.readable_among(names)?;
-            if ready.len() >= min_count {
+            // Asked again each pass: a running subagent whose report was
+            // already collected settles if its round ends without another.
+            let Readiness { ready, settled } = self.readiness(names)?;
+            if settled == names.len() {
+                return Err(nothing_to_wait_for(names));
+            }
+            if ready.len() >= min_count.min(names.len() - settled) {
                 return Ok(ready);
             }
             // Re-derive the wakeups each pass: the borrows end with the await,
@@ -385,17 +405,26 @@ impl SubagentRegistry {
     }
 
     fn readable_among(&self, names: &[String]) -> Result<Vec<String>, String> {
+        self.readiness(names).map(|readiness| readiness.ready)
+    }
+
+    /// Which of `names` have something to collect, and how many are settled,
+    /// as of one look under the lock.
+    fn readiness(&self, names: &[String]) -> Result<Readiness, String> {
         let entries = self.lock();
-        let mut ready = Vec::new();
+        let mut readiness = Readiness::default();
         for name in names {
             let entry = entries
                 .get(name)
                 .ok_or_else(|| unknown_name(name, &entries))?;
-            if entry.shared.snapshot().readable(entry.watermark) {
-                ready.push(name.clone());
+            let snapshot = entry.shared.snapshot();
+            if snapshot.readable(entry.watermark) {
+                readiness.ready.push(name.clone());
+            } else if snapshot.settled(entry.watermark) {
+                readiness.settled += 1;
             }
         }
-        Ok(ready)
+        Ok(readiness)
     }
 
     /// Block until this subagent is readable, return its outcome, and advance
@@ -1033,6 +1062,15 @@ fn width_limit_error(limit: u32) -> String {
     format!(
         "subagent width limit of {limit} reached; collect a result and release a subagent with \
          outrig__subagent_release before launching another"
+    )
+}
+
+fn nothing_to_wait_for(settled: &[String]) -> String {
+    format!(
+        "nothing to wait for: you already collected the latest result of {}, and none is \
+         working on anything. Each reports again only after outrig__subagent_send gives it more \
+         work",
+        settled.join(", ")
     )
 }
 
@@ -2015,6 +2053,96 @@ mod tests {
             .get_result("audit")
             .await
             .expect("still collectable after waiting on it");
+    }
+
+    /// #333: once the parent has collected a subagent's result and it has gone
+    /// idle, only the parent's next send makes it report again -- which the
+    /// parent cannot make while it waits. Waiting on it alongside one not yet
+    /// collected waits for that one alone, where it used to block until
+    /// Ctrl-C.
+    #[tokio::test(start_paused = true)]
+    async fn wait_results_skips_a_collected_idle_name() {
+        let (registry, _log_dir) = test_registry();
+        let collected = hand_built_entry(&registry, "audit-a");
+        collected.begin_round();
+        collected.publish(Outcome::Result(FINDINGS.to_string()));
+        let _ = collected.close_injections(true);
+        collected.end_round();
+        registry
+            .get_result("audit-a")
+            .await
+            .expect("collect the report");
+        let working = hand_built_entry(&registry, "audit-b");
+        working.begin_round();
+
+        let names = vec!["audit-a".to_string(), "audit-b".to_string()];
+        let mut wait = std::pin::pin!(registry.wait_results(&names, 2));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), &mut wait)
+                .await
+                .is_err(),
+            "audit-b is still working, so the wait is for it"
+        );
+
+        working.publish(Outcome::Result(FINDINGS.to_string()));
+        let ready = tokio::time::timeout(WAIT_TIMEOUT, wait)
+            .await
+            .expect("a collected idle name must not hold the wait");
+        assert_eq!(ready, Ok(vec!["audit-b".to_string()]));
+    }
+
+    /// A collected subagent is waited on only while it can still report: while
+    /// its round runs, and again once a send queues another -- the prompt
+    /// counts as a round from the moment it is accepted. In between it is
+    /// settled, and a wait with nothing else to wait for fails.
+    #[tokio::test(start_paused = true)]
+    async fn wait_results_waits_on_a_collected_name_only_while_it_can_report() {
+        let (registry, _log_dir) = test_registry();
+        let probe = hand_built_entry(&registry, "probe");
+        probe.begin_round();
+        probe.publish(Outcome::Result(FINDINGS.to_string()));
+        registry
+            .get_result("probe")
+            .await
+            .expect("collect the report");
+
+        let names = vec!["probe".to_string()];
+        let mut wait = std::pin::pin!(registry.wait_results(&names, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), &mut wait)
+                .await
+                .is_err(),
+            "a round still running may report again"
+        );
+
+        let _ = probe.close_injections(true);
+        probe.end_round();
+        let err = tokio::time::timeout(WAIT_TIMEOUT, wait)
+            .await
+            .expect("the round ending ends the wait")
+            .expect_err("nothing is left to wait for");
+        assert!(
+            err.contains("probe") && err.contains("outrig__subagent_send"),
+            "got: {err}"
+        );
+
+        registry
+            .send("probe", "and the tests too".to_string())
+            .expect("delivered");
+        let mut wait = std::pin::pin!(registry.wait_results(&names, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), &mut wait)
+                .await
+                .is_err(),
+            "the round the send queued may report"
+        );
+
+        probe.begin_round();
+        probe.publish(Outcome::Result(FINDINGS.to_string()));
+        let ready = tokio::time::timeout(WAIT_TIMEOUT, wait)
+            .await
+            .expect("the new report ends the wait");
+        assert_eq!(ready, Ok(vec!["probe".to_string()]));
     }
 
     /// What `probe` has published when its parent reads it below.
