@@ -275,6 +275,9 @@ pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::path: alloc:
 pub outrig::config::ConfigValidationError::UnmaskPathRelative
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::image: alloc::string::String
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceContainerNotAbsolute
+pub outrig::config::ConfigValidationError::WorkspaceContainerNotAbsolute::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceContainerRoot
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostMissing
 pub outrig::config::ConfigValidationError::WorkspaceHostMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceHostMissing::path: std::path::PathBuf

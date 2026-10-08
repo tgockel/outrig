@@ -200,6 +200,17 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    // No `declared_in` on these two: only `host-path` records the file it came
+    // from, and `container-path` is inherited from the global config apart
+    // from it.
+    #[error("workspace container-path {path:?} must be absolute")]
+    #[non_exhaustive]
+    WorkspaceContainerNotAbsolute { path: PathBuf },
+
+    #[error("workspace container-path must not be /")]
+    #[non_exhaustive]
+    WorkspaceContainerRoot {},
+
     // The five below restate `MountRuleViolation` in workspace terms, so their
     // `declared_in` means exactly what the variant it is mapped from means.
     #[error(
@@ -606,6 +617,7 @@ pub(super) fn validate_with_options(
     options: ValidationOptions<'_>,
 ) -> Result<(), ConfigValidationError> {
     validate_workspace_host_path(cfg, repo_root)?;
+    validate_workspace_container_path(cfg)?;
     validate_workspace_mounts(cfg, repo_root)?;
 
     if let Some(name) = &cfg.default_image
@@ -1443,6 +1455,24 @@ fn validate_workspace_host_path(
     }
     if !resolved.is_dir() {
         return Err(ConfigValidationError::WorkspaceHostNotDirectory { path, declared_in });
+    }
+    Ok(())
+}
+
+/// Hold the primary `container-path` to the shape [`check_mount_list`] asks of
+/// every extra mount: absolute, and not `/`. Podman refuses a relative one only
+/// once it creates the container, after the image is built; it takes `/`, and
+/// the workspace then covers the image's whole root filesystem. Structural, so
+/// it runs with or without a repo root.
+fn validate_workspace_container_path(cfg: &Config) -> Result<(), ConfigValidationError> {
+    let path = cfg.workspace.container_path();
+    if !path.is_absolute() {
+        return Err(ConfigValidationError::WorkspaceContainerNotAbsolute {
+            path: path.to_path_buf(),
+        });
+    }
+    if path == Path::new("/") {
+        return Err(ConfigValidationError::WorkspaceContainerRoot {});
     }
     Ok(())
 }

@@ -127,7 +127,7 @@ access         = "read-write"
 
 `host-path = "."` (the default) mounts your whole repo. You can narrow this -- e.g.
 `host-path = "src"` mounts only the source dir. The primary workspace is always read-write and
-becomes the container workdir.
+becomes the container workdir. Its `container-path` must be absolute and cannot be `/`.
 
 outrig never picks your home directory on its own. With `host-path` undeclared, the workspace is
 the repo root -- the directory holding `.agents/outrig/`, or the current directory when no repo

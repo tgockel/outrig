@@ -720,6 +720,44 @@ container-path = "/"
         );
     }
 
+    /// The primary `container-path` is held to the extra mounts' shape rule.
+    /// Unchecked, a relative one loaded and reached podman, which refused it
+    /// only after the image was built (#341). No repo root: the rule is
+    /// structural, so `validate(None)` applies it too.
+    #[test]
+    fn workspace_container_path_must_be_absolute() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "workspace"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::WorkspaceContainerNotAbsolute { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("workspace"));
+            }
+            other => panic!("expected WorkspaceContainerNotAbsolute, got: {other:?}"),
+        }
+    }
+
+    /// Podman takes `/`, and the workspace then covers the image's whole root
+    /// filesystem.
+    #[test]
+    fn workspace_container_path_must_not_be_root() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::WorkspaceContainerRoot { .. }),
+            "expected WorkspaceContainerRoot, got: {err:?}",
+        );
+    }
+
     #[test]
     fn workspace_mount_duplicate_container_path_errors() {
         let cfg = parse(
@@ -2448,6 +2486,32 @@ mod config_load {
             repo.path().join("sub"),
         );
         assert_eq!(cfg.workspace.container_path(), Path::new("/src"));
+    }
+
+    /// A repo that declares no `container-path` inherits the global one, and the
+    /// shape rule holds it there too -- on the build path as well, since the
+    /// rule sits outside the LLM checks `outrig build` skips.
+    #[test]
+    fn inherited_global_workspace_container_path_must_be_absolute() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            "[workspace]\ncontainer-path = \"workspace\"\n",
+        );
+
+        for err in [
+            Config::load(repo.path(), Some(&global_path)).unwrap_err(),
+            Config::load_for_build(repo.path(), Some(&global_path)).unwrap_err(),
+        ] {
+            match expect_load_validation_err(err) {
+                ConfigValidationError::WorkspaceContainerNotAbsolute { path, .. } => {
+                    assert_eq!(path, std::path::PathBuf::from("workspace"));
+                }
+                other => panic!("expected WorkspaceContainerNotAbsolute, got: {other:?}"),
+            }
+        }
     }
 
     /// A workspace that never went through `Config::load` has no recorded

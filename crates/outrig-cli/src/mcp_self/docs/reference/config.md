@@ -754,7 +754,7 @@ access         = "read-write"
   existing directory. A relative value resolves against the directory of the
   file that declared it -- see [path resolution](#path-resolution).
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
-  workspace is mounted in the container.
+  workspace is mounted in the container, an absolute path other than `/`.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
 - `mounts[*].host-path` (path, required): host directory to mount. Relative paths
   resolve against the directory of the file that declared the entry -- see
@@ -1510,7 +1510,8 @@ image-config in the merged config but does not require agent/model/provider wiri
   must exist and be a directory. Relative host paths resolve against the declaring file's
   directory, and a leading `~` is your home directory; an undeclared `workspace.host-path` is
   `.`, the repo root.
-- Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
+- `workspace.container-path` and every `workspace.mounts[*].container-path` must be absolute and
+  must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.
 - Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.

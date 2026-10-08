@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Config::validate` holds the primary `[workspace].container-path` to the mount rule.** Every
+  `[[workspace.mounts]]` `container-path` had to be absolute and not `/`, but nothing read the
+  primary one. A relative value validated, and the session failed when podman created the
+  container -- after the image build and the session record -- with podman's `invalid container
+  path` error, which names neither the key nor the file. Podman takes `/`, and the workspace then
+  covers the image's whole root filesystem. Both are now refused, so `Config::load`,
+  `load_for_run`, and `load_for_build` refuse them -- the last though a build never mounts the
+  workspace. Two new `ConfigValidationError` variants report it: `WorkspaceContainerNotAbsolute`,
+  carrying the `path` as written, and `WorkspaceContainerRoot`. Neither carries a `declared_in`,
+  since a `container-path` records no source. The rule is structural, so `Config::validate(None)`
+  applies it too, and a `Workspace` built with a relative `container-path` now fails there rather
+  than at launch.
+
 - **A name a client sends in more than one read is still read.** The network interceptor read a
   client's opening bytes once, so a TLS `ClientHello` or HTTP request head that arrived in pieces
   was never parsed. Under `default = "allow"`, `deny = ["*.evil.example"]` then let the connection

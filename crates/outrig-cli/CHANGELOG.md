@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `[workspace] container-path` that is relative or `/` is refused when the config loads.** A
+  relative one loaded, and `outrig run` failed only when podman created the container, after the
+  image build, with podman's `invalid container path` error, which names neither the key nor the
+  file. `/` was taken, and the repo then covered the image's whole root filesystem. `outrig run`,
+  `outrig mcp`, and `outrig build` now refuse both at load, as they already refused them on an
+  extra mount, with an error naming the key and the value. Fixed in `outrig` (#341).
+
 - **A name a container sends in more than one piece is still read.** Under `--network audit` or
   `filter`, the interceptor read a connection's opening bytes once, so a TLS `ClientHello` or
   HTTP request head that arrived in pieces lost its name: a `deny` entry only that name matched

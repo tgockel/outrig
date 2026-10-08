@@ -1383,8 +1383,9 @@ impl Workspace {
         self.source = None;
     }
 
-    /// Declare `container-path`. Carries no provenance -- a container path is
-    /// absolute and resolves against nothing.
+    /// Declare `container-path`. Carries no provenance -- a container path
+    /// resolves against nothing. [`Config::validate`] requires it absolute and
+    /// not `/`.
     pub fn set_container_path(&mut self, container_path: impl Into<PathBuf>) {
         self.container_path = Some(container_path.into());
     }
