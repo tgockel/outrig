@@ -941,8 +941,8 @@ SELinux, read-only roots, mount policy, or network egress filtering.
 
 ### `[images.<name>.mcp]`
 
-Map of MCP server entries, **keyed on server name**. Each entry is one of two shapes via a
-serde-untagged dispatch:
+Map of MCP server entries, **keyed on server name**. Each entry is one of two shapes, told
+apart by type -- an array is the short form, a table the full form:
 
 ```toml
 [images.coding.mcp]
@@ -1011,6 +1011,10 @@ image, or declare any other MCP command that should run inside the container.
   model gets a timeout error in place of a result. Any transport, any placement. For a server
   whose tools run builds or test suites; `initialize` and `tools/list` are not affected -- they
   have a fixed 120-second bound each.
+
+Any other key in a full-form entry is an error, as it is in every other table. That matters
+more here than elsewhere: an entry whose `command` is misspelled has none, so beside `sidecar`
+or `image` it would otherwise be an entrypoint-stdio server.
 
 Notes:
 

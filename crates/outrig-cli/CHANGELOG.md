@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A misspelled key in an `[images.<name>.mcp]` table entry is an error.** Every other table
+  rejected unknown keys, but this one dropped them: `enviroment = { ... }` started the server
+  with no environment, and a misspelled `command` beside `sidecar` or `image` quietly ran the
+  container's ENTRYPOINT as the server instead. Loading now fails at the misspelled key and
+  lists the keys an entry accepts. The same holds for an image's `org.outrig.mcp` label and a
+  standalone image's `image.toml`, and `get_config_schema` now says so. Fixed in `outrig`
+  (#340).
+
 - **An MCP server whose `tools/list` pages never end fails startup at once.** A server that kept
   handing back a `nextCursor` -- the one it was sent, a cycle of them, or a fresh one forever --
   held `outrig run`, `outrig mcp`, and `outrig image build`'s live test for the full 120-second

@@ -369,6 +369,8 @@ pub fn outrig::config::McpServerSpec::with_call_timeout_secs(self, u64) -> Self
 pub fn outrig::config::McpServerSpec::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
 pub fn outrig::config::McpServerSpec::with_sidecar(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::with_view(self, outrig::config::SidecarView) -> Self
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::McpServerSpec
+pub fn outrig::config::McpServerSpec::deserialize<D>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
 #[non_exhaustive] pub enum outrig::config::MistralrsDeviceSpec
 pub outrig::config::MistralrsDeviceSpec::Cpu
 pub outrig::config::MistralrsDeviceSpec::Cuda(usize)

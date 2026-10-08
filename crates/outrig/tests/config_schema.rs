@@ -500,6 +500,66 @@ default = "ask"
         );
     }
 
+    /// One typo per table shape. Each used to parse: the `enviroment` entry
+    /// started with no env, and a `comand` beside `sidecar` or `image` turned
+    /// an exec-stdio entry into entrypoint-stdio.
+    #[test]
+    fn mcp_table_unknown_fields_are_rejected_by_name() {
+        let cases = [
+            (
+                "enviroment",
+                r#"build = { command = ["cargo-mcp"], enviroment = { GH_TOKEN = "${GITHUB_TOKEN}" } }"#,
+            ),
+            (
+                "comand",
+                r#"lint = { comand = ["mcp-lint"], sidecar = "tools" }"#,
+            ),
+            (
+                "comand",
+                r#"grep = { comand = ["mcp-grep"], image = "ghcr.io/example/grep:1" }"#,
+            ),
+            (
+                "arg",
+                r#"serve = { image = "ghcr.io/example/fs:1", arg = ["/workspace"] }"#,
+            ),
+        ];
+        for (key, entry) in cases {
+            let bad = format!(
+                r#"
+[images.c]
+dockerfile = "D"
+context    = "ctx"
+
+[images.c.mcp]
+{entry}
+"#
+            );
+            let err = Config::load_from_str(&bad).unwrap_err();
+            let OutrigError::Config(toml_err) = err else {
+                panic!("expected OutrigError::Config for {entry}, got: {err:?}");
+            };
+            let msg = toml_err.to_string();
+            assert!(
+                msg.contains(&format!("unknown field `{key}`")),
+                "error should name `{key}` in {entry}, got: {msg}",
+            );
+        }
+    }
+
+    /// The schema `outrig mcp` hands an agent says the same thing the parser
+    /// does: a table entry takes only its own keys.
+    #[test]
+    fn mcp_table_schema_denies_additional_properties() {
+        let schema = serde_json::to_value(schemars::schema_for!(McpServerSpec)).unwrap();
+        let table = schema["anyOf"]
+            .as_array()
+            .expect("an untagged enum schema is an anyOf")
+            .iter()
+            .find(|branch| branch["type"] == "object")
+            .expect("one branch is the table form");
+        assert_eq!(table["additionalProperties"], false, "{table}");
+    }
+
     #[test]
     fn network_entry_unknown_fields_are_rejected() {
         let bad = r#"

@@ -679,9 +679,8 @@ mod tests {
 
     #[test]
     fn full_spec_with_empty_env_round_trips_as_full() {
-        // Guards the untagged ordering (Short before Full) plus the always-
-        // serialized `env`: an empty-env Full must not collapse to Short on the
-        // way back through the label.
+        // A Full with nothing but `command` must come back through the label
+        // as Full, not as the Short it is equivalent to.
         let mut mcp = BTreeMap::new();
         mcp.insert("build".to_string(), full(&["cargo-mcp"], &[]));
         let cfg = standalone(mcp, None, None, &[]);
@@ -849,6 +848,17 @@ mod tests {
     fn parse_mcp_table_rejects_bad_json() {
         let err = parse_mcp_table(r#"{"fs": ["#).unwrap_err();
         assert!(matches!(err, EmbeddedImageConfigError::Json(_)));
+    }
+
+    #[test]
+    fn parse_mcp_table_rejects_unknown_table_keys() {
+        let err = parse_mcp_table(r#"{"build":{"command":["cargo-mcp"],"enviroment":{"A":"b"}}}"#)
+            .unwrap_err();
+        assert!(matches!(err, EmbeddedImageConfigError::Json(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("unknown field `enviroment`"),
+            "{err}"
+        );
     }
 
     #[test]

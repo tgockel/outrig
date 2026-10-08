@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`McpServerSpec` rejects a table key it does not know, and names it.** The enum was
+  `#[serde(untagged)]` without `deny_unknown_fields`, so a table-form entry dropped unknown keys:
+  `enviroment = {...}` started the server with no env, and `comand` beside `sidecar` or `image`
+  left no command, making the entry entrypoint-stdio. `Deserialize` is now written by hand and
+  dispatches on type -- an array is `Short`, a table `Full` -- so a stray key fails with
+  ``unknown field `comand`, expected one of ...`` at that key's span. A bare untagged
+  `deny_unknown_fields` would only have said no variant matched. This holds wherever a spec is
+  parsed: either config file, an `org.outrig.mcp` label (`EmbeddedImageConfigError::Json`), and
+  a standalone `image.toml`'s `[mcp]`. The derived JSON schema's table branch now carries
+  `additionalProperties: false`. Serialization is unchanged. (#340)
+
 - **A `tools/list` whose pages never end fails at once instead of paging until its deadline.**
   `McpClient::list_tools` paged through rmcp's `list_all_tools`, which follows `nextCursor` until
   the server omits it and keeps every page, so a server that echoed the cursor it was sent was

@@ -7,12 +7,15 @@ mod merge;
 mod validate;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef};
@@ -2398,8 +2401,10 @@ impl ImageConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
+/// `Deserialize` is written by hand below; these serde attributes drive
+/// `Serialize` and the JSON schema.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
 #[non_exhaustive]
 pub enum McpServerSpec {
     Short(Vec<String>),
@@ -2410,8 +2415,9 @@ pub enum McpServerSpec {
         /// path sees a non-empty command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<Vec<String>>,
-        /// Always serialized (no skip) so a `Full` entry can't collapse into
-        /// the `Short` shape on a round-trip.
+        /// Always serialized, even empty. It always has been, and the
+        /// `org.outrig.mcp` label it lands in is part of an image's cache
+        /// key, so eliding it now would rebuild every image stamped since.
         #[serde(default)]
         env: BTreeMap<String, EnvValue>,
         /// The sidecar declared under `[sidecars.<sc>]` that hosts this
@@ -2450,6 +2456,68 @@ pub enum McpServerSpec {
         )]
         call_timeout_secs: Option<u64>,
     },
+}
+
+/// Dispatches on the value's own type -- an array is `Short`, a table `Full`
+/// -- rather than through `#[serde(untagged)]`. Untagged tries each variant
+/// and, when none fits, reports only that none did; a table read directly
+/// names the key it rejects, ``unknown field `comand` ``, as every other
+/// table in the config does.
+impl<'de> Deserialize<'de> for McpServerSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+        struct Table {
+            command: Option<Vec<String>>,
+            #[serde(default)]
+            env: BTreeMap<String, EnvValue>,
+            sidecar: Option<String>,
+            image: Option<String>,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default)]
+            view: SidecarView,
+            call_timeout_secs: Option<u64>,
+        }
+
+        struct SpecVisitor;
+
+        impl<'de> Visitor<'de> for SpecVisitor {
+            type Value = McpServerSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an argv array or an MCP server table")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(McpServerSpec::Short)
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let t = Table::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(McpServerSpec::Full {
+                    command: t.command,
+                    env: t.env,
+                    sidecar: t.sidecar,
+                    image: t.image,
+                    args: t.args,
+                    view: t.view,
+                    call_timeout_secs: t.call_timeout_secs,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
+    }
 }
 
 impl McpServerSpec {
@@ -2740,5 +2808,24 @@ mod tests {
                 "{home:?}",
             );
         }
+    }
+
+    /// `McpServerSpec` serializes through its derive and deserializes through
+    /// a hand-written table struct, so every key has two spellings to agree.
+    /// No field here is at its default, so none is elided on the way out.
+    #[test]
+    fn every_mcp_table_key_round_trips() {
+        let spec = McpServerSpec::Full {
+            command: Some(vec!["mcp-fs".to_string()]),
+            env: BTreeMap::from([("TOKEN".to_string(), EnvValue::EnvRef("T".to_string()))]),
+            sidecar: Some("tools".to_string()),
+            image: Some("ghcr.io/example/fs:1".to_string()),
+            args: vec!["/workspace".to_string()],
+            view: SidecarView::Primary,
+            call_timeout_secs: Some(30),
+        };
+
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<McpServerSpec>(&json).unwrap(), spec);
     }
 }
