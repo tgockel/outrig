@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An MCP server whose `tools/list` pages never end fails startup at once.** A server that kept
+  handing back a `nextCursor` -- the one it was sent, a cycle of them, or a fresh one forever --
+  held `outrig run`, `outrig mcp`, and `outrig image build`'s live test for the full 120-second
+  `tools/list` bound while its listing grew. A cursor an earlier page already sent, or a listing
+  still paging after 1,000 pages, now fails startup straight away with the server's stderr in
+  the error. Fixed in `outrig` (#339).
+
 - **With the host's resolver down, a container's lookups fail instead of hanging.** Under
   `--network audit` or `filter`, a lookup no host resolver answered got no reply at all, so every
   name a tool looked up waited out its resolver library's own timeouts and retries before failing.

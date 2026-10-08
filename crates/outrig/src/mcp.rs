@@ -17,14 +17,14 @@
 //! [`STARTUP_TIMEOUT`], and `tools/call` gets the client's configurable
 //! deadline (see [`McpClient::with_call_timeout`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, RequestId,
-    ServerResult,
+    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
+    PaginatedRequestParams, RequestId, ServerResult,
 };
 use rmcp::service::{
     Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError, serve_client,
@@ -47,6 +47,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// -- which is why it is minutes rather than seconds. Past it the server is
 /// presumed hung, and startup fails the way it does for a server that crashed.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many `tools/list` pages a server may send before its listing is
+/// refused. No server a model could use comes near it -- most send every tool
+/// on one page -- so one still paging here is minting cursors, not listing
+/// tools, and would otherwise grow the listing until [`STARTUP_TIMEOUT`].
+const TOOLS_LIST_PAGE_CEILING: usize = 1000;
 
 /// The `reason` a dropped call's `notifications/cancelled` carries.
 const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
@@ -300,12 +306,14 @@ impl McpClient {
         &self.name
     }
 
-    /// Issue an MCP `tools/list` (paginating internally) and translate the
-    /// results into our own [`McpTool`] type. Every page together gets
-    /// the same fixed bound `initialize` does, 120 seconds; a listing that
-    /// outlives it fails with
-    /// [`McpFailureKind::Timeout`]. A failure carries the server's stderr
-    /// tail.
+    /// Issue an MCP `tools/list`, following its pages until the server stops
+    /// sending a `nextCursor`, and translate the results into our own
+    /// [`McpTool`] type. Every page together gets the same fixed bound
+    /// `initialize` does, 120 seconds; a listing that outlives it fails with
+    /// [`McpFailureKind::Timeout`]. One whose pages would never end -- a
+    /// `nextCursor` an earlier page already sent, or a server still paging
+    /// after 1000 pages -- fails at once with [`McpFailureKind::Protocol`]. A
+    /// failure carries the server's stderr tail.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
         self.list_tools_within(STARTUP_TIMEOUT).await
     }
@@ -314,9 +322,9 @@ impl McpClient {
     /// timeout without waiting out the real one. No cancel goes upstream on
     /// expiry: every caller abandons a server whose listing failed.
     async fn list_tools_within(&self, bound: Duration) -> Result<Vec<McpTool>> {
-        let source = match tokio::time::timeout(bound, self.service.list_all_tools()).await {
+        let source = match tokio::time::timeout(bound, self.list_every_page()).await {
             Ok(Ok(tools)) => return Ok(tools.into_iter().map(tool_from_rmcp).collect()),
-            Ok(Err(source)) => session_error_from_rmcp(&source),
+            Ok(Err(source)) => source,
             Err(_) => McpSessionError::new(
                 McpFailureKind::Timeout,
                 format!("no tools/list response within {bound:?}"),
@@ -330,6 +338,45 @@ impl McpClient {
             // exists for a writer that has just exited.
             stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
         })
+    }
+
+    /// Every page of `tools/list`, in order. rmcp's `list_all_tools` pages
+    /// until the server omits `nextCursor`, so a server that echoes the cursor
+    /// it was sent would be paged forever. Here a cursor any earlier page
+    /// already sent -- the echo, or a longer cycle -- is refused before it is
+    /// requested again, and so is a listing past [`TOOLS_LIST_PAGE_CEILING`].
+    /// Neither message quotes the cursor: the server chose it.
+    async fn list_every_page(
+        &self,
+    ) -> std::result::Result<Vec<rmcp::model::Tool>, McpSessionError> {
+        let mut tools = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cursor = None;
+        for page in 1..=TOOLS_LIST_PAGE_CEILING {
+            let listed = self
+                .service
+                .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+                .await
+                .map_err(|source| session_error_from_rmcp(&source))?;
+            tools.extend(listed.tools);
+            let Some(next) = listed.next_cursor else {
+                return Ok(tools);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(McpSessionError::new(
+                    McpFailureKind::Protocol,
+                    format!(
+                        "tools/list page {page} handed back a nextCursor an earlier page \
+                         already had, so its pages would never end"
+                    ),
+                ));
+            }
+            cursor = Some(next);
+        }
+        Err(McpSessionError::new(
+            McpFailureKind::Protocol,
+            format!("tools/list was still paging after {TOOLS_LIST_PAGE_CEILING} pages"),
+        ))
     }
 
     /// Issue an MCP `tools/call`. `args` must be a JSON object (forwarded as
@@ -980,25 +1027,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// An [`McpClient`] whose transport is an in-memory pipe to [`Stalling`]
-    /// rather than a podman child, with the receiver for the cancels the
-    /// server is sent and the directory its stderr file lives in. The client
-    /// still owes a child, so it gets one that does nothing.
-    async fn client_against_stalling_server() -> (
-        McpClient,
-        tokio::sync::mpsc::UnboundedReceiver<String>,
-        tempfile::TempDir,
-    ) {
+    /// An [`McpClient`] whose transport is an in-memory pipe to `server`
+    /// rather than a podman child, with the directory its stderr file lives
+    /// in. The client still owes a child, so it gets one that does nothing.
+    async fn client_against<S: rmcp::ServerHandler>(server: S) -> (McpClient, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let stderr_path = dir.path().join("svc.stderr");
         std::fs::write(&stderr_path, "still indexing\n").expect("write stderr");
 
-        let (cancels, heard) = tokio::sync::mpsc::unbounded_channel();
-        let (service, _serving) = serve_in_memory(Stalling {
-            calls: Default::default(),
-            cancels,
-        })
-        .await;
+        let (service, _serving) = serve_in_memory(server).await;
         let child = Cmd::new("sleep")
             .arg("600")
             .spawn_owned(
@@ -1014,6 +1051,22 @@ pub(crate) mod tests {
             stderr_path,
             call_timeout: effective_mcp_call_timeout(None, None),
         };
+        (client, dir)
+    }
+
+    /// [`client_against`] a [`Stalling`] server, with the receiver for the
+    /// cancels it is sent.
+    async fn client_against_stalling_server() -> (
+        McpClient,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tempfile::TempDir,
+    ) {
+        let (cancels, heard) = tokio::sync::mpsc::unbounded_channel();
+        let (client, dir) = client_against(Stalling {
+            calls: Default::default(),
+            cancels,
+        })
+        .await;
         (client, heard, dir)
     }
 
@@ -1029,29 +1082,128 @@ pub(crate) mod tests {
     async fn a_tools_list_that_never_comes_times_out_with_the_stderr_tail() {
         let (client, _heard, _dir) = client_against_stalling_server().await;
 
-        let err = client
-            .list_tools_within(Duration::from_millis(100))
-            .await
-            .expect_err("a listing that never comes must fail");
-
-        let OutrigError::McpToolsListFailed {
-            name,
-            source,
-            stderr_tail,
-            ..
-        } = &err
-        else {
-            panic!("expected McpToolsListFailed, got {err:?}");
-        };
-        assert_eq!(name, "svc");
-        assert_eq!(source.kind, McpFailureKind::Timeout);
+        let source = list_failure(
+            client.list_tools_within(Duration::from_millis(100)).await,
+            McpFailureKind::Timeout,
+        );
         assert!(
             source
                 .message
                 .contains("no tools/list response within 100ms"),
             "{source}"
         );
+    }
+
+    /// The source of a listing that failed as `McpToolsListFailed` of `kind`,
+    /// carrying the name and stderr tail [`client_against`] gave its client.
+    fn list_failure(listed: Result<Vec<McpTool>>, kind: McpFailureKind) -> McpSessionError {
+        let err = listed.expect_err("the listing must fail");
+        let OutrigError::McpToolsListFailed {
+            name,
+            source,
+            stderr_tail,
+            ..
+        } = err
+        else {
+            panic!("expected McpToolsListFailed, got {err:?}");
+        };
+        assert_eq!(name, "svc");
+        assert_eq!(source.kind, kind, "{source}");
         assert!(stderr_tail.contains("still indexing"), "{stderr_tail:?}");
+        source
+    }
+
+    /// The other end of an in-memory pipe for `tools/list` paging. Page `n`
+    /// (counting from 1) carries one tool, `t<n>`, and the `nextCursor`
+    /// `next_cursor(n)` names; `asked` counts the pages requested.
+    struct Paging {
+        next_cursor: fn(usize) -> Option<String>,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for Paging {
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            let page = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let tool = rmcp::model::Tool::new(format!("t{page}"), "", serde_json::Map::new());
+            Ok(rmcp::model::ListToolsResult {
+                next_cursor: (self.next_cursor)(page),
+                ..rmcp::model::ListToolsResult::with_all_items(vec![tool])
+            })
+        }
+    }
+
+    /// A client against a [`Paging`] server, its listing, and how many pages
+    /// the server was asked for.
+    async fn list_paging(
+        next_cursor: fn(usize) -> Option<String>,
+    ) -> (Result<Vec<McpTool>>, usize) {
+        let asked = std::sync::Arc::default();
+        let (client, _dir) = client_against(Paging {
+            next_cursor,
+            asked: std::sync::Arc::clone(&asked),
+        })
+        .await;
+        let listed = client.list_tools().await;
+        (listed, asked.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_paged_tools_list_is_gathered_in_order() {
+        let (listed, asked) = list_paging(|page| (page < 3).then(|| format!("p{page}"))).await;
+
+        let names: Vec<String> = listed
+            .expect("a listing that ends succeeds")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(names, ["t1", "t2", "t3"]);
+        assert_eq!(asked, 3);
+    }
+
+    /// #339's fixture: a server that hands back the cursor it was sent would
+    /// be paged forever, every page's tools appended.
+    #[tokio::test]
+    async fn a_tools_list_that_echoes_its_cursor_fails_at_the_repeat() {
+        let (listed, asked) = list_paging(|_| Some("same".to_string())).await;
+
+        let source = list_failure(listed, McpFailureKind::Protocol);
+        assert!(
+            source
+                .message
+                .contains("tools/list page 2 handed back a nextCursor an earlier page"),
+            "{source}"
+        );
+        assert_eq!(asked, 2, "the repeated cursor is never requested again");
+    }
+
+    /// Not just the last cursor: any earlier one closes a loop.
+    #[tokio::test]
+    async fn a_tools_list_whose_cursors_cycle_fails_at_the_repeat() {
+        let (listed, asked) = list_paging(|page| Some(["b", "a"][page % 2].to_string())).await;
+
+        let source = list_failure(listed, McpFailureKind::Protocol);
+        assert!(source.message.contains("tools/list page 3 "), "{source}");
+        assert_eq!(asked, 3);
+    }
+
+    /// A fresh cursor every page repeats nothing, so the ceiling is what ends
+    /// it.
+    #[tokio::test]
+    async fn a_tools_list_that_never_ends_fails_at_the_page_ceiling() {
+        let (listed, asked) = list_paging(|page| Some(format!("p{page}"))).await;
+
+        let source = list_failure(listed, McpFailureKind::Protocol);
+        assert!(
+            source
+                .message
+                .contains("tools/list was still paging after 1000 pages"),
+            "{source}"
+        );
+        assert_eq!(asked, TOOLS_LIST_PAGE_CEILING);
     }
 
     /// Past its deadline a call fails as a timeout *and* the server hears

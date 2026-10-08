@@ -499,7 +499,9 @@ Every request outrig sends a server has a deadline, so a server that stops answe
 bounded wait rather than the session:
 
 - `initialize` and `tools/list` get 120 seconds each. A server that misses either fails startup
-  the way a crashed one does, with the stderr it has written so far.
+  the way a crashed one does, with the stderr it has written so far. A `tools/list` whose pages
+  would never end -- one that hands back a `nextCursor` it already sent, or is still paging after
+  1,000 pages -- fails startup the same way, without waiting out its 120 seconds.
 - `tools/call` gets the server's own `call-timeout-secs`, else the top-level
   `mcp-call-timeout-secs`, else 10 minutes. A call that runs past it is cancelled at the server
   with `notifications/cancelled`, and the model gets a timeout error in place of a result. The

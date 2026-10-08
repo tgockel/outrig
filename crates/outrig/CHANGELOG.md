@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `tools/list` whose pages never end fails at once instead of paging until its deadline.**
+  `McpClient::list_tools` paged through rmcp's `list_all_tools`, which follows `nextCursor` until
+  the server omits it and keeps every page, so a server that echoed the cursor it was sent was
+  paged -- its tools appended each time -- until the 120-second `tools/list` bound. It now pages
+  the listing itself: a `nextCursor` any earlier page already sent, or a listing still paging
+  after 1000 pages, fails at once as `OutrigError::McpToolsListFailed` whose source is an
+  `McpSessionError` of kind `McpFailureKind::Protocol`, with the server's stderr tail. (#339)
+
 - **A lookup the network interceptor cannot forward is answered SERVFAIL, and one unusable
   resolver no longer ends the list.** When no host resolver answered, the DNS listener logged the
   failure at debug and sent the container nothing, so every lookup waited out the client's own
