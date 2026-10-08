@@ -62,10 +62,10 @@ import select
 import shlex
 import shutil
 import signal
-import site
 import struct
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import traceback
@@ -740,11 +740,16 @@ class _Loop(asyncio.SelectorEventLoop):
 # them back, after the standard library, so that a project file named like a standard module --
 # `types.py` -- cannot replace one this program imports later.
 #
-# `pip` is the payload's own. The payload is mounted read-only, so pip installs into the user site
-# instead, `~/.local/lib/python3.13/site-packages`, which is on `sys.path` from the start. It is
-# made here if it is missing: an import that finds no directory at a path remembers that, and would
-# not look again when pip later made one there. Its `.pth` files are not read, so nothing
-# installed runs when the interpreter starts.
+# `pip` is the payload's own, and installs into an environment of this interpreter's own: a virtual
+# environment laid over the payload, made under `HOME` when the interpreter starts
+# (`~/.local/share/outrig/python3.13`), since the payload itself is mounted read-only. No other
+# Python in the container reads that directory, and this interpreter reads no other Python's
+# installs. The user site, `~/.local/lib/python3.13/site-packages`, would be read by an image Python
+# of the same version too, ahead of its own site-packages, so a dependency pip pulled in for this
+# interpreter would have replaced the one the image installed for the project. The environment's
+# `site-packages` is made here if it is missing: an import that finds no directory at a path
+# remembers that, and would not look again when pip later made one there. Its `.pth` files are not
+# read, so nothing installed runs when the interpreter starts.
 #
 # Compiled code never loads. This is a static build, with no way to load a shared object, so a
 # compiled module fails however it was installed -- as `Dynamic loading not supported` when its
@@ -755,36 +760,97 @@ class _Loop(asyncio.SelectorEventLoop):
 _WORKSPACE = None
 # This interpreter's version, as the host is told it and the agent reads it.
 _VERSION = sys.version.split()[0]
+# Its minor version, which names the environment's directories, as `3.13`.
+_MINOR = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-# The `pip` on the agent's `PATH`: this interpreter's pip, started clear of every `PYTHON*`
-# variable but `PYTHONUSERBASE`. The image sets the others for its own Python, and one such as
-# `PYTHONHOME` stops this one starting at all; `PYTHONUSERBASE` says where pip installs, which this
-# interpreter reads as well. Cleared for pip and what it starts in turn, such as a build, and for
-# nothing else the agent runs, so the image's Python still gets them. The first Python runs
-# isolated, so they cannot stop it either. The second runs with `-P`, since `-m` would otherwise put
-# the working directory -- the workspace -- ahead of everything, where a project's `pip.py` would
-# run instead of pip and its `types.py` would stop it starting; not `-I`, which would also turn off
-# the user site pip falls back to.
+# The `pip` on the agent's `PATH`: this interpreter's pip, run through the environment's interpreter
+# link so that it installs there, and started clear of every `PYTHON*` variable. The image sets
+# those for its own Python, and one such as `PYTHONHOME` stops this one starting at all. Cleared for
+# pip and what it starts in turn, such as a build, and for nothing else the agent runs, so the
+# image's Python still gets them. Both Pythons run isolated: the first so the variables cannot stop
+# it; the second so that `-m` does not put the working directory -- the workspace -- ahead of
+# everything, where a project's `pip.py` would run instead of pip and its `types.py` would stop it
+# starting, and so that `--user`, with no user site in view, fails rather than installing where this
+# interpreter does not look.
 _PIP = """#!/bin/sh
 exec {python} -I -c '
 import os, sys
-env = {{k: v for k, v in os.environ.items() if not k.startswith("PYTHON") or k == "PYTHONUSERBASE"}}
-os.execve(sys.executable, [sys.executable, "-P", "-m", "pip", *sys.argv[1:]], env)
+env = {{k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}}
+os.execve(sys.executable, [sys.executable, "-I", "-m", "pip", *sys.argv[1:]], env)
 ' "$@"
 """
+
+# The environment's interpreter link. Its `bin/` goes on `PATH` for the scripts pip installs there,
+# so the name is one no image provides: `python3.13` would shadow the image's own Python of that
+# version.
+_LINK = "outrig-python"
+
+
+def _replace(path, make):
+    """Put the entry `make` creates at `path`, whole or not at all: made under a name beside it and
+    renamed over it, so an interpreter starting at the same time under the same `HOME` never finds
+    it missing or half made."""
+    made = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{os.getpid()}")
+    make(made)
+    os.replace(made, path)
+
+
+def _write(path, data, mode):
+    """Write `data` to a new file at `path` with `mode`."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        _write_all(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _make_environment():
+    """Lay this interpreter's environment over the payload, under `~/.local/share/outrig`, with
+    `pip` beside it. Returns its interpreter link, its `site-packages`, and the directories for
+    `PATH` in order: `pip`'s own, then the environment's `bin/`, where the scripts pip installs
+    land. Every part is made or replaced whole, so interpreters starting together under one `HOME`
+    all find it complete. A process run through the link sees this environment and the payload,
+    and no user site."""
+    share = os.path.expanduser("~/.local/share/outrig")
+    root = os.path.join(share, f"python{_MINOR}")
+    bin_dir = os.path.join(root, "bin")
+    site_packages = os.path.join(root, "lib", f"python{_MINOR}", "site-packages")
+    pip = os.path.join(share, "bin")
+    for directory in (bin_dir, site_packages, pip):
+        os.makedirs(directory, exist_ok=True)
+    # The system site stays out, which also keeps the user site out of every process run through
+    # the link, `sys.executable -m pip` included: pip would otherwise count a dependency an image
+    # Python of this version installed for the user as met, and this interpreter cannot import it.
+    # The payload's own site-packages, where pip lives, comes in through a `.pth` file instead.
+    config = (
+        f"home = {os.path.dirname(sys.executable)}\n"
+        "include-system-site-packages = false\n"
+        f"version = {_VERSION}\n"
+    )
+    _replace(os.path.join(root, "pyvenv.cfg"), lambda made: _write(made, config.encode(), 0o644))
+    payload = f"{sysconfig.get_path('purelib')}\n".encode()
+    _replace(os.path.join(site_packages, "outrig.pth"), lambda made: _write(made, payload, 0o644))
+    link = os.path.join(bin_dir, _LINK)
+    _replace(link, lambda made: os.symlink(sys.executable, made))
+    script = _PIP.format(python=shlex.quote(link)).encode()
+    for name in ("pip", "pip3", f"pip{_MINOR}"):
+        _replace(os.path.join(pip, name), lambda made: _write(made, script, 0o755))
+    return link, site_packages, [pip, bin_dir]
 
 
 def _open_imports():
     """Put the workspace and pip's install location on `sys.path`, and pip on `PATH`.
 
-    `pip` goes first on `PATH`, from a directory of its own under the user base, so it means this
-    interpreter's pip while `python3` still means the image's own Python; the scripts pip installs
-    follow it. Every process the interpreter starts inherits the `PATH`, and nothing else in the
-    container sees it.
+    `pip` goes first on `PATH`, from a directory of its own, so it means this interpreter's pip
+    while `python3` still means the image's own Python; the environment's `bin/`, where the scripts
+    pip installs land, follows it. Every process the interpreter starts inherits the `PATH`, and
+    nothing else in the container sees it.
 
     That `pip` is `_PIP`, not the payload's own script, which would start this Python in whatever
-    `PYTHON*` variables the image sets for its own.
+    `PYTHON*` variables the image sets for its own. `sys.executable` becomes the environment's
+    link, so `sys.executable -m pip` installs there as well, and a process started from it -- a
+    `multiprocessing` child, a subprocess -- imports the same packages.
     """
     global _WORKSPACE
     try:
@@ -792,32 +858,14 @@ def _open_imports():
         sys.path.append(_WORKSPACE)
     except OSError as e:
         _diag(f"the working directory is not importable: {e!r}")
-    user_site = site.getusersitepackages()
     try:
-        os.makedirs(user_site, exist_ok=True)
+        link, site_packages, bins = _make_environment()
     except OSError as e:
-        _diag(f"packages pip installs will not import: {user_site} could not be made: {e!r}")
-    sys.path.append(user_site)
-    front = []
-    pip = os.path.join(site.getuserbase(), "share", "outrig", "bin")
-    script = _PIP.format(python=shlex.quote(sys.executable)).encode()
-    try:
-        os.makedirs(pip, exist_ok=True)
-        for name in ("pip", "pip3", f"pip{sys.version_info.major}.{sys.version_info.minor}"):
-            # Written beside the script and renamed over it, so an interpreter starting at the same
-            # time under the same `HOME` never finds it missing or half written.
-            path, made = os.path.join(pip, name), os.path.join(pip, f".{name}.{os.getpid()}")
-            fd = os.open(made, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
-            try:
-                _write_all(fd, script)
-            finally:
-                os.close(fd)
-            os.replace(made, path)
-        front.append(pip)
-    except OSError as e:
-        _diag(f"`pip` is not on PATH: {e!r}")
-    front.append(os.path.join(site.getuserbase(), "bin"))
-    os.environ["PATH"] = os.pathsep.join([*front, os.environ.get("PATH", os.defpath)])
+        _diag(f"packages pip installs will not import: the environment could not be made: {e!r}")
+        return
+    sys.path.append(site_packages)
+    sys.executable = link
+    os.environ["PATH"] = os.pathsep.join([*bins, os.environ.get("PATH", os.defpath)])
 
 
 def _image_python():
@@ -954,9 +1002,12 @@ class Python:
       `importlib.util.find_spec(name)` says whether a module is anywhere on `sys.path` without
       importing it.
     - `pip install` adds pure-Python packages, which import at once, with no restart. This `pip`
-      is the interpreter's own: it installs into the user site, which is on `sys.path`, and puts a
-      package's scripts on `PATH`. An image Python of the same version reads that user site too.
-      `pip install --target DIR` works as well, once `DIR` is appended to `sys.path`.
+      is the interpreter's own: it installs into an environment of this interpreter's under your
+      home, which is on `sys.path` and which no other Python in the container reads, and puts a
+      package's scripts on `PATH`. `sys.executable -m pip` installs there too. `pip install
+      --target DIR` works as well, once `DIR` is appended to `sys.path`. What the image's own
+      Python has installed, or installs with `python3 -m pip`, is not on this interpreter's
+      `sys.path`.
     - Modules in the workspace -- the directory the interpreter started in, `workspace` below --
       import too. It comes after the standard library on `sys.path`, so a file of yours named like
       a standard module does not replace it.

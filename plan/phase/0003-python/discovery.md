@@ -108,9 +108,11 @@ one the interpreter program imports later.
 **Decided in `0003-10`: installing pure-Python packages works.** OutRig's security model allows
 the agent to install, and the payload carries pip. What stood in the way was placement: pip could
 not write into the read-only payload, so it installed into the user site, which an isolated
-interpreter never reads. The interpreter now reads it, made at start so that a package pip adds
-mid-session imports without a restart, and puts the payload's `pip` -- alone, so `python3` still
-means the image's -- first on the `PATH` its programs inherit. A compiled package is still the
+interpreter never reads, and which an image Python of the same version reads ahead of its own
+packages (#466). The interpreter now lays an environment of its own over the payload under `HOME`,
+made at start so that a package pip adds mid-session imports without a restart, installs there,
+and puts the payload's `pip` -- alone, so `python3` still means the image's -- first on the `PATH`
+its programs inherit. A compiled package is still the
 wall above, and `plan/next/use-the-images-python.md` records the route around it: running the
 agent's interpreter on the image's own Python.
 

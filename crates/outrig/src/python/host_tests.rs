@@ -800,19 +800,19 @@ mod e2e {
     use crate::container::{Container, ContainerLaunchSpec};
     use crate::image::ImageTag;
     use crate::python::payload;
-    use crate::python::testing::{ALPINE, PIP_PROBE, pull_alpine};
+    use crate::python::testing::{ALPINE, PIP_PROBE, PYTHON_ALPINE, pull};
 
-    /// A running alpine with its user bootstrapped, and the payload mounted
+    /// A running `image` with its user bootstrapped, and the payload mounted
     /// as every session mounts it when `with_payload`.
-    async fn alpine(with_payload: bool) -> Container {
-        pull_alpine().await;
+    async fn session(image: &str, with_payload: bool) -> Container {
+        pull(image).await;
         let mut launch = ContainerLaunchSpec::default();
         if with_payload {
             launch
                 .mounts
                 .push(payload::mount().await.expect("the payload"));
         }
-        let mut container = Container::start(&ImageTag::new(ALPINE), launch)
+        let mut container = Container::start(&ImageTag::new(image), launch)
             .await
             .expect("the container starts");
         container
@@ -824,7 +824,7 @@ mod e2e {
 
     #[tokio::test]
     async fn the_interpreter_starts_in_a_session_container_and_answers() {
-        let container = alpine(true).await;
+        let container = session(ALPINE, true).await;
         let interpreter = within(Interpreter::start(&container, Events::off()))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -843,21 +843,54 @@ mod e2e {
             .expect("the container stops");
     }
 
-    /// The payload is read-only in a session, so a plain `pip install` puts a
-    /// package in the user site -- which the interpreter reads, so it imports
-    /// at once, with no restart and no `--user`.
+    /// The payload is read-only in a session, and a plain `pip install` puts a
+    /// package in the interpreter's environment under the container user's
+    /// home -- which the interpreter reads, so it imports at once, with no
+    /// restart and no `--user`.
     #[tokio::test]
     async fn a_plain_pip_install_imports_at_once_in_a_session_container() {
-        let container = alpine(true).await;
+        let container = session(ALPINE, true).await;
         let interpreter = within(Interpreter::start(&container, Events::off()))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
         let installed = "pip('install', '--no-index', wheel('/tmp', 'outrig_probe'))\n\
                          import outrig_probe\n\
-                         home = os.path.expanduser('~/.local/')\n\
+                         home = os.path.expanduser('~/.local/share/outrig/')\n\
                          print(outrig_probe.ANSWER, outrig_probe.__file__.startswith(home))";
         assert_eq!(run(&interpreter, installed).await, ok("42 True\n"));
+        drop(interpreter);
+        container
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("the container stops");
+    }
+
+    /// An image Python of the payload's version shares the container user's
+    /// `HOME` with the agent's interpreter, and not a site: what the agent's
+    /// `pip` installs is not that Python's, and what that Python installs for
+    /// the user is not the agent's.
+    #[tokio::test]
+    async fn the_agents_pip_and_the_images_python_do_not_share_a_site() {
+        let container = session(PYTHON_ALPINE, true).await;
+        let interpreter = within(Interpreter::start(&container, Events::off()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
+        let agents = "pip('install', '--no-index', wheel('/tmp', 'outrig_probe'))\n\
+                      import outrig_probe\n\
+                      theirs = subprocess.run(['python3', '-c', 'import outrig_probe'], capture_output=True)\n\
+                      print(runtime.python.image_python, outrig_probe.ANSWER, theirs.returncode != 0)";
+        assert_eq!(
+            run(&interpreter, agents).await,
+            ok("/usr/local/bin/python3 42 True\n")
+        );
+        let images = "import importlib.util\n\
+                      pip('install', '--no-index', '--user', wheel('/tmp', 'outrig_image'), python='python3')\n\
+                      theirs = subprocess.run(['python3', '-c', 'import outrig_image; print(outrig_image.ANSWER)'], \
+                                              capture_output=True, text=True)\n\
+                      print(theirs.stdout.strip(), importlib.util.find_spec('outrig_image'))";
+        assert_eq!(run(&interpreter, images).await, ok("42 None\n"));
         drop(interpreter);
         container
             .stop(Duration::from_secs(2))
@@ -869,7 +902,7 @@ mod e2e {
     /// rather than when the ready timeout would.
     #[tokio::test]
     async fn an_image_without_the_payload_is_a_startup_error_naming_the_cause() {
-        let container = alpine(false).await;
+        let container = session(ALPINE, false).await;
         let message = startup_error(within(Interpreter::start(&container, Events::off())).await);
         assert!(
             message.contains(&format!("{}/bin/python3", payload::PAYLOAD_MOUNT))

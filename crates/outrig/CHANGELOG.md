@@ -49,11 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `help()` prints a short guide instead of starting pydoc's interactive utility.
   `runtime.python` says what the interpreter can import and where code that needs more can run.
   Modules in the workspace import, after the standard library. Plain `pip install` adds
-  pure-Python packages: `pip` is the interpreter's own, it installs into the user site, and the
-  package imports without a restart. Compiled code cannot load in the static interpreter, and a
-  failed import says so -- naming the compiled file, or for a module found nowhere, saying that
-  `pip install` works for pure-Python packages only -- along with the image's own Python as the
-  place to run such code.
+  pure-Python packages: `pip` is the interpreter's own, it installs into an environment of the
+  interpreter's under the container user's home, which no other Python in the image reads, and
+  the package imports without a restart. Compiled code cannot load in the static interpreter,
+  and a failed import says so -- naming the compiled file, or for a module found nowhere, saying
+  that `pip install` works for pure-Python packages only -- along with the image's own Python as
+  the place to run such code.
 
   The conversation is kept whole, and each model call is sent part of it. `round` commits each
   turn -- one model call and the tool results it asked for -- as it completes, so a round that

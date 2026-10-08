@@ -95,10 +95,10 @@ const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootst
 
 /// What the payload's `python3` is started with, ahead of the agent id. `-I`
 /// isolates it: no `PYTHON*` variable or other configuration the image carries
-/// reaches it, and neither the working directory nor the user site is on
-/// `sys.path` until the program puts them there, after the standard library
-/// (`_open_imports`). The user site's location still follows `HOME` and
-/// `PYTHONUSERBASE`, as pip's does, since pip installs there.
+/// reaches it, and neither the working directory nor the environment pip
+/// installs into is on `sys.path` until the program puts them there, after the
+/// standard library (`_open_imports`). That environment is made under `HOME`,
+/// which the program still reads.
 pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 
 /// The primary agent's id: the program's one argument, and the agent every

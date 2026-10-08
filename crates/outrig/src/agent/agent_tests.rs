@@ -3954,7 +3954,7 @@ mod e2e {
 
     use super::*;
     use crate::container::ExecOptions;
-    use crate::python::testing::{ALPINE, pull_alpine};
+    use crate::python::testing::{ALPINE, pull};
     use crate::{LaunchSpec, Outrig};
 
     /// The public entry end to end: `start` finds the payload in a launched
@@ -3964,7 +3964,7 @@ mod e2e {
     /// session its containers are named for, readable by its owner alone.
     #[tokio::test]
     async fn a_round_runs_its_source_in_the_session_container() {
-        pull_alpine().await;
+        pull(ALPINE).await;
         let session = tempfile::tempdir().expect("a session dir");
         let outrig = Outrig::launch(&LaunchSpec::from_image(
             ALPINE,

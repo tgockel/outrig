@@ -3524,10 +3524,10 @@ fn a_pure_python_module_in_the_workspace_imports() {
 }
 
 /// `pip` on `PATH` is the interpreter's own, and what it installs imports in
-/// the running interpreter, without a restart. `--user` is explicit only
-/// because the payload is writable on the host, and this test must not write
-/// into it; in a session it is read-only, and pip picks the user site itself,
-/// which the e2e suite checks.
+/// the running interpreter, without a restart. It installs into an environment
+/// of the interpreter's under `HOME`, never into the payload, which is writable
+/// on the host; `sys.executable -m pip` installs there too, and a console
+/// script it installs runs from `PATH`.
 #[test]
 fn pip_installs_a_pure_package_that_imports_at_once() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -3543,23 +3543,45 @@ fn pip_installs_a_pure_package_that_imports_at_once() {
         ..Start::default()
     });
     k.output(1, PIP_PROBE);
-    // Variables an image sets for its own Python, which would stop this one's pip starting, or
-    // stop it installing to the user site. Its own Python still gets them.
+    // A variable an image sets for its own Python, which would stop this one's pip starting. Its
+    // own Python still gets it.
     k.output(
         4,
-        "os.environ.update(PYTHONHOME='/nonexistent', PYTHONNOUSERSITE='1')\n\
+        "os.environ['PYTHONHOME'] = '/nonexistent'\n\
          subprocess.run(['sh', '-c', 'test \"$PYTHONHOME\" = /nonexistent'], check=True)\n\
          None",
     );
     let installed = format!(
-        "pip('install', '--user', '--no-index', wheel({wheels:?}, 'outrig_probe'))\n\
-         import outrig_probe, shutil\n\
-         (outrig_probe.ANSWER, outrig_probe.__file__.startswith({home:?}), \
-          shutil.which('pip') == os.path.expanduser('~/.local/share/outrig/bin/pip'))",
+        "pip('install', '--no-index', wheel({wheels:?}, 'outrig_probe', 'outrig-probe'))\n\
+         import outrig_probe, shutil, sys\n\
+         (outrig_probe.ANSWER, \
+          outrig_probe.__file__.startswith({home:?} + '/.local/share/outrig/python3.'), \
+          shutil.which('pip') == os.path.expanduser('~/.local/share/outrig/bin/pip'), \
+          sys.executable.endswith('/bin/outrig-python'))",
         wheels = wheels.path(),
         home = home.path(),
     );
-    assert_eq!(k.output(2, &installed), "(42, True, True)\n");
+    assert_eq!(k.output(2, &installed), "(42, True, True, True)\n");
+    // The scripts pip installs, `sys.executable`, and a `multiprocessing` child spawned from it
+    // run the environment's interpreter, which honors the image's variables as any Python would;
+    // and `python -m` puts the working directory first, so pip runs clear of the planted files,
+    // as it would anywhere. The child imports the probe to unpickle its target, which only the
+    // environment's `site-packages` holds, so exiting clean is the proof; what it prints goes to
+    // the interpreter's own stdout, not the execution's.
+    let through = format!(
+        "del os.environ['PYTHONHOME']\n\
+         pip('install', '--no-index', wheel({wheels:?}, 'outrig_exec'), python=sys.executable, \
+             cwd={wheels:?})\n\
+         import multiprocessing, outrig_exec\n\
+         child = multiprocessing.get_context('spawn').Process(target=outrig_probe.main)\n\
+         child.start()\n\
+         child.join()\n\
+         (subprocess.run(['outrig-probe'], capture_output=True, text=True).stdout, \
+          os.path.dirname(outrig_exec.__file__) == os.path.dirname(outrig_probe.__file__), \
+          child.exitcode)",
+        wheels = wheels.path(),
+    );
+    assert_eq!(k.output(5, &through), "('42\\n', True, 0)\n");
     // `--target` is not in the way either.
     let target = format!(
         "import sys\n\
@@ -3571,6 +3593,69 @@ fn pip_installs_a_pure_package_that_imports_at_once() {
         wheels = wheels.path(),
     );
     assert_eq!(k.output(3, &target), "42\n");
+    // Interpreters under one `HOME` share the environment.
+    let mut other = Interpreter::spawn(&Start {
+        home: Some(home.path()),
+        ..Start::default()
+    });
+    assert_eq!(
+        other.output(1, "import outrig_probe\noutrig_probe.ANSWER"),
+        "42\n"
+    );
+}
+
+/// What another Python installs for the container user -- the image's own,
+/// with `python3 -m pip install --user` -- is not this interpreter's: the user
+/// site is off `sys.path`, and a module put there does not import. Nor does
+/// this interpreter's `pip install --user` put anything there: it is refused.
+/// And pip run as `sys.executable -m pip` does not see the user site either,
+/// so a dependency found only there is unmet, rather than counted as met for
+/// a package this interpreter then cannot import.
+#[test]
+fn the_user_site_is_not_read() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let wheels = tempfile::tempdir().expect("tempdir");
+    let mut k = Interpreter::spawn(&Start {
+        home: Some(home.path()),
+        ..Start::default()
+    });
+    k.output(1, PIP_PROBE);
+    let planted = "import importlib.util, site, sys\n\
+                   user_site = site.getusersitepackages()\n\
+                   os.makedirs(user_site)\n\
+                   open(os.path.join(user_site, 'outrig_user.py'), 'w').write('ANSWER = 42\\n')\n\
+                   (user_site.startswith(os.path.expanduser('~/.local/lib/python3.')), \
+                    user_site in sys.path, importlib.util.find_spec('outrig_user'))";
+    assert_eq!(k.output(2, planted), "(True, False, None)\n");
+    let failed = error_of(&k.exec(3, "import outrig_user"));
+    assert!(
+        failed.contains("ModuleNotFoundError: No module named 'outrig_user'"),
+        "{failed}"
+    );
+    let refused = format!(
+        "try:\n\
+         \x20   pip('install', '--no-index', '--user', wheel({wheels:?}, 'outrig_refused'))\n\
+         except RuntimeError as e:\n\
+         \x20   refused = \"Can not perform a '--user' install\" in str(e)\n\
+         (refused, sorted(os.listdir(user_site)))",
+        wheels = wheels.path(),
+    );
+    assert_eq!(k.output(4, &refused), "(True, ['outrig_user.py'])\n");
+    let unmet = format!(
+        "import zipfile\n\
+         zipfile.ZipFile(wheel({wheels:?}, 'outrig_dep')).extractall(user_site)\n\
+         try:\n\
+         \x20   pip('install', '--no-index', wheel({wheels:?}, 'outrig_top', requires='outrig_dep'), \
+                 python=sys.executable, cwd={wheels:?})\n\
+         except RuntimeError as e:\n\
+         \x20   unmet = 'No matching distribution found for outrig' in str(e)\n\
+         child = subprocess.run([sys.executable, '-c', 'import site, sys; \
+                                 print(site.ENABLE_USER_SITE, site.getusersitepackages() in sys.path)'], \
+                                capture_output=True, text=True)\n\
+         (unmet, importlib.util.find_spec('outrig_top'), child.stdout)",
+        wheels = wheels.path(),
+    );
+    assert_eq!(k.output(5, &unmet), "(True, None, 'False False\\n')\n");
 }
 
 /// Bounding what the model sees of a value does not bound the value: it

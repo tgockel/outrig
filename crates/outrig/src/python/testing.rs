@@ -45,8 +45,10 @@ pub(crate) fn ok(output: &str) -> Outcome {
 
 /// The `HOME` an interpreter run on the host gets unless its test gives one of
 /// its own: one directory per user under the system's temporary directory.
-/// The interpreter makes pip's user site under `HOME` as it starts, and that
-/// must never land in the real home of whoever runs the tests.
+/// The interpreter makes the environment pip installs into under `HOME` as it
+/// starts, and that must never land in the real home of whoever runs the tests.
+/// Nor may the user site the tests find to show it is not read, so the
+/// harnesses also clear `PYTHONUSERBASE`, which `site` honors even under `-I`.
 pub(crate) fn host_home() -> PathBuf {
     std::env::temp_dir().join(format!("outrig-test-home-{}", nix::unistd::getuid()))
 }
@@ -97,8 +99,9 @@ pub(crate) struct Start<'a> {
 }
 
 /// The payload's `python3` as the host-side harnesses run it: `HOME` set for
-/// tests and pip's variable cleared, every stream piped, and a process group
-/// of its own, so a harness's `Drop` reaches the children it starts.
+/// tests and `PYTHONUSERBASE` cleared (see [`host_home`]), every stream piped,
+/// and a process group of its own, so a harness's `Drop` reaches the children
+/// it starts.
 pub(crate) fn python_command(home: Option<&Path>) -> Command {
     let mut command = Command::new(python());
     command
@@ -310,41 +313,64 @@ pub(crate) async fn round_trip(interpreter: &Interpreter, fake: &mut Fake) {
 #[cfg(feature = "e2e")]
 pub(crate) const ALPINE: &str = "docker.io/library/alpine:latest";
 
-/// Make sure [`ALPINE`] is present locally.
+/// An image whose own Python is the payload's version, so the two would share
+/// a user site.
 #[cfg(feature = "e2e")]
-pub(crate) async fn pull_alpine() {
-    crate::image::pull_image(&crate::image::ImageTag::new(ALPINE))
+pub(crate) const PYTHON_ALPINE: &str = "docker.io/library/python:3.13-alpine";
+
+/// Make sure `image` is present locally: pulled once per test binary, since
+/// every e2e test asks and a pull of a present image is still a registry
+/// round trip.
+#[cfg(feature = "e2e")]
+pub(crate) async fn pull(image: &str) {
+    static PULLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    if PULLED.lock().unwrap().iter().any(|pulled| pulled == image) {
+        return;
+    }
+    crate::image::pull_image(&crate::image::ImageTag::new(image))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+    PULLED.lock().unwrap().push(image.to_owned());
 }
 
 // ---------------------------------------------------------------------------- pip
 
-/// Python binding `wheel(directory, module)`, which writes a pure-Python wheel
-/// whose one module holds `ANSWER = 42` and returns its path, and `pip(*args)`,
-/// which runs the `pip` on `PATH` and raises with everything it said if it
-/// fails. A wheel installed with `--no-index` needs no network.
+/// Python binding `wheel(directory, module, script=None, requires=None)`,
+/// which writes a pure-Python wheel whose one module holds `ANSWER = 42` and a
+/// `main()` that prints it, as the console script `script` when one is named
+/// and requiring the distribution `requires` when one is, and returns its
+/// path; and `pip(*args, python=None, **options)`, which runs the `pip` on
+/// `PATH`, or `python -m pip`, with `options` for `subprocess.run`, and raises
+/// with everything it said if it fails. A wheel installed with `--no-index`
+/// needs no network.
 pub(crate) const PIP_PROBE: &str = r#"
 import os, subprocess, zipfile
 
-def wheel(directory, module):
+def wheel(directory, module, script=None, requires=None):
     dist = f"{module}-1.0.dist-info"
     path = os.path.join(directory, f"{module}-1.0-py3-none-any.whl")
+    metadata = f"Metadata-Version: 2.1\nName: {module}\nVersion: 1.0\n"
+    if requires:
+        metadata += f"Requires-Dist: {requires}\n"
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr(f"{module}.py", "ANSWER = 42\n")
-        z.writestr(f"{dist}/METADATA", f"Metadata-Version: 2.1\nName: {module}\nVersion: 1.0\n")
+        z.writestr(f"{module}.py", "ANSWER = 42\n\ndef main():\n    print(ANSWER)\n")
+        z.writestr(f"{dist}/METADATA", metadata)
         z.writestr(
             f"{dist}/WHEEL",
             "Wheel-Version: 1.0\nGenerator: outrig-tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
+        if script:
+            z.writestr(f"{dist}/entry_points.txt", f"[console_scripts]\n{script} = {module}:main\n")
         z.writestr(f"{dist}/RECORD", "")
     return path
 
-def pip(*args):
+def pip(*args, python=None, **options):
+    command = [python, "-m", "pip"] if python else ["pip"]
     run = subprocess.run(
-        ["pip", "--isolated", "--disable-pip-version-check", "--no-cache-dir", *args],
+        [*command, "--isolated", "--disable-pip-version-check", "--no-cache-dir", *args],
         capture_output=True,
         text=True,
+        **options,
     )
     if run.returncode:
         raise RuntimeError(f"pip {args} exited {run.returncode}:\n{run.stdout}{run.stderr}")

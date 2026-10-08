@@ -320,7 +320,6 @@ pub(crate) fn fixture_dir() -> &'static Path {
             .args(["-I", "-c", INSTALL])
             .args([&sources, &wheels, &target])
             .env("HOME", host_home())
-            .env_remove("PYTHONUSERBASE")
             .output()
             .expect("the payload's Python runs");
         assert!(
