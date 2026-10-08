@@ -40,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lookup the network interceptor cannot forward is answered SERVFAIL, and one unusable
+  resolver no longer ends the list.** When no host resolver answered, the DNS listener logged the
+  failure at debug and sent the container nothing, so every lookup waited out the client's own
+  timeouts -- by glibc's defaults, 5 seconds a try and two tries. It now replies SERVFAIL (QR,
+  the query's opcode and RD, RA, RCODE 2) echoing the transaction id and question, which a stub
+  resolver matches its answer against; a query whose question did not parse gets the header
+  alone, and a datagram with QR already set gets nothing. The first such lookup per attachment is
+  logged at `warn` with every resolver's failure, and each resolver's failure at debug.
+  Each resolver is now asked over a socket connected to it, so one that refuses -- a stopped
+  systemd-resolved stub -- fails at once instead of after the 5-second forward timeout, and a
+  socket that cannot be bound for one resolver is that resolver's failure: an IPv6 `nameserver`
+  listed first on a kernel booted with `ipv6.disable=1` used to end the forward for every
+  lookup. (#354)
+
 - **Every MCP request has a deadline, and an abandoned `tools/call` is cancelled at the server.**
   `McpClient` sent `initialize`, `tools/list`, and `tools/call` with rmcp's default of no timeout,
   so a server that accepted stdin and never answered held startup or a call forever.

@@ -176,6 +176,13 @@ host in full. When `/etc/resolv.conf` is missing or names no nameserver, the lis
 upstream servers systemd-resolved lists in `/run/systemd/resolve/resolv.conf` instead. If
 neither file names a resolver, setup fails rather than choosing one on the host's behalf.
 
+Each lookup goes to those resolvers one at a time until one answers. One the host cannot reach at
+all, such as an IPv6 server on a kernel booted without IPv6, is passed over at once, and so is one
+that refuses the lookup; one that stays silent is passed over after 5 seconds. A lookup none of
+them answers is answered SERVFAIL rather than not at all, so the tool that asked is told the
+lookup failed -- at once, when every resolver refused -- and `outrig` warns about the first such
+lookup in each container.
+
 Filter policy lives in the global config only:
 
 ```toml

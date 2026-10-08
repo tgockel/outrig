@@ -2739,6 +2739,11 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
 /// per resolver, so one name a resolver is slow to answer must hold up only
 /// the client that asked for it. At most [`DNS_IN_FLIGHT`] run at once.
 ///
+/// The first lookup no resolver answers is warned about; every resolver's
+/// failure is logged at debug by [`forward_dns`] regardless. A host whose
+/// resolver is down fails every lookup the container makes, and one line says
+/// so as well as a line apiece would.
+///
 /// Returns an error when the listener stopped taking queries before it was
 /// asked to; see [`after_listener_failure`].
 async fn dns_loop(
@@ -2751,12 +2756,24 @@ async fn dns_loop(
     let resolvers: Arc<[SocketAddr]> = resolvers.into();
     let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
+    let mut warned = false;
     let ended = loop {
         tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
             // Takes each finished lookup back out of the set, which is what
             // frees its slot.
-            Some(_) = lookups.join_next() => {}
+            Some(done) = lookups.join_next() => {
+                if let Ok(Err(e)) = done
+                    && !warned
+                {
+                    warned = true;
+                    tracing::warn!(
+                        target: "outrig::network",
+                        "no host resolver answered a container lookup, which got SERVFAIL \
+                         ({e}); later ones are logged at debug"
+                    );
+                }
+            }
             // With the set full, the next query stays in the socket until a
             // lookup finishes rather than being read with nowhere to go.
             received = recv_query(&socket, &mut buf), if lookups.len() < DNS_IN_FLIGHT => {
@@ -2773,7 +2790,7 @@ async fn dns_loop(
                 let (socket, resolvers, bindings) =
                     (socket.clone(), resolvers.clone(), bindings.clone());
                 lookups.spawn(async move {
-                    answer_dns(&socket, &raw, peer, asked, &resolvers, &bindings).await;
+                    answer_dns(&socket, &raw, peer, asked, &resolvers, &bindings).await
                 });
             }
         }
@@ -2789,7 +2806,8 @@ async fn dns_loop(
 }
 
 /// Forwards one query and sends `peer` whatever validly answers it, from
-/// `asked`, the address the query was sent to.
+/// `asked`, the address the query was sent to. When no resolver answers,
+/// `peer` is sent a SERVFAIL instead and the forward's failure is returned.
 async fn answer_dns(
     socket: &UdpSocket,
     raw: &[u8],
@@ -2797,7 +2815,7 @@ async fn answer_dns(
     asked: Asked,
     resolvers: &[SocketAddr],
     bindings: &Bindings,
-) {
+) -> io::Result<()> {
     let query = dns_query(raw);
     tracing::debug!(
         target: "outrig::network",
@@ -2819,9 +2837,13 @@ async fn answer_dns(
                 response.len()
             );
             let _ = send_answer(socket, &response, peer, asked).await;
+            Ok(())
         }
         Err(e) => {
-            tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
+            if let Some(servfail) = dns_servfail(raw, query.as_ref()) {
+                let _ = send_answer(socket, &servfail, peer, asked).await;
+            }
+            Err(e)
         }
     }
 }
@@ -2965,30 +2987,54 @@ fn record_dns_bindings(bindings: &Bindings, name: &str, response: &[u8]) {
 /// the same packet already parsed, or `None` when it did not parse -- an
 /// unparsable query is still forwarded, but nothing it comes back with is
 /// accepted as an answer.
+///
+/// Whatever stops one resolver answering is that resolver's failure, and the
+/// next is tried: a host can list an IPv6 server first on a kernel with no
+/// IPv6, and the socket it would be asked from cannot even be bound. When
+/// none answers, the error names each one's failure, since the first can be
+/// the one that explains the rest.
 async fn forward_dns(
     raw: &[u8],
     query: Option<&DnsQuery>,
     resolvers: &[SocketAddr],
 ) -> io::Result<Vec<u8>> {
-    let mut last_err = None;
+    let mut failures = Vec::new();
     for resolver in resolvers {
-        let bind_addr = if resolver.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-        };
-        let socket = UdpSocket::bind(bind_addr).await?;
-        if let Err(e) = socket.send_to(raw, resolver).await {
-            last_err = Some(e);
-            continue;
-        }
-        match recv_dns_answer(&socket, query, *resolver).await {
+        match ask_resolver(raw, query, *resolver).await {
             Ok(response) => return Ok(response),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                tracing::debug!(target: "outrig::network", "dns forward to {resolver} failed: {e}");
+                failures.push(format!("{resolver}: {e}"));
+            }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DNS resolvers configured")))
+    Err(if failures.is_empty() {
+        io::Error::new(io::ErrorKind::NotFound, "no DNS resolvers configured")
+    } else {
+        io::Error::other(failures.join("; "))
+    })
+}
+
+/// One resolver's turn at `raw`. The socket is connected to it, which is what
+/// has the kernel report a refusal -- a stopped resolver's port answering
+/// with ICMP -- so a resolver that is not there fails now rather than after
+/// `DNS_TIMEOUT`. Connected, it also takes datagrams from nowhere else;
+/// [`recv_dns_answer`] checks the source all the same, as evidence it holds
+/// rather than a filter it assumes.
+async fn ask_resolver(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolver: SocketAddr,
+) -> io::Result<Vec<u8>> {
+    let bind_addr = if resolver.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(resolver).await?;
+    socket.send(raw).await?;
+    recv_dns_answer(&socket, query, resolver).await
 }
 
 /// Waits out the whole timeout for a datagram that actually answers `query`,
@@ -3722,6 +3768,33 @@ impl DnsQuery {
 /// truncation, and a success RCODE.
 fn dns_response_is_bindable(datagram: &[u8]) -> bool {
     dns_flags(datagram).is_some_and(|flags| flags & 0x0200 == 0 && flags & 0x000f == 0)
+}
+
+/// The reply to a query no resolver answered: SERVFAIL, so its client stops
+/// asking rather than waiting out every try its own timeout allows -- by
+/// glibc's defaults, two of 5 seconds each. It echoes the transaction id and
+/// the question, which a stub matches an answer against (glibc discards one
+/// whose question differs from its query's). `query` is `raw` parsed, as
+/// [`forward_dns`] takes it; a query that did not parse gets the header
+/// alone, since where its question ends is not known.
+///
+/// `None` for a datagram too short to hold a header, and for one that is
+/// itself an answer: that is not a query, and is owed nothing.
+fn dns_servfail(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
+    let flags = dns_flags(raw)?;
+    if raw.len() < 12 || flags & 0x8000 != 0 {
+        return None;
+    }
+    let end = query.map_or(12, |query| query.question.end);
+    let mut reply = raw[..end].to_vec();
+    // QR; the query's opcode and RD; RA; RCODE 2.
+    let flags = 0x8000 | (flags & 0x7900) | 0x0080 | 2;
+    reply[2..4].copy_from_slice(&flags.to_be_bytes());
+    // The one question echoed, or none. No answer, authority or additional
+    // records: an EDNS record the query carried is not echoed either.
+    reply[4..6].copy_from_slice(&u16::from(query.is_some()).to_be_bytes());
+    reply[6..12].fill(0);
+    Some(reply)
 }
 
 fn dns_txid(packet: &[u8]) -> Option<u16> {
@@ -6161,6 +6234,20 @@ mod tests {
         ))
     }
 
+    /// An address a query is refused at, and the socket holding it, which
+    /// has to outlive every use of the address. The socket is connected to
+    /// its own address, so it takes datagrams from nowhere else and the
+    /// kernel refuses what is sent there. Holding the port, rather than
+    /// binding one and letting it go, keeps any other socket from taking it
+    /// in the meantime -- the forward's own included, which would then be
+    /// sent its own query and wait out `DNS_TIMEOUT` for an answer.
+    fn refusing_resolver() -> (std::net::UdpSocket, SocketAddr) {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let addr = held.local_addr().expect("refusing addr");
+        held.connect(addr).expect("connect to itself");
+        (held, addr)
+    }
+
     /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
     /// detach allows. The loop has to abandon every one it has in flight, or
     /// every detach racing a lookup would abort the task and report the abort
@@ -6254,6 +6341,35 @@ mod tests {
             resolved_names(&bindings, ip("198.51.100.9")),
             resolved(&["fast.test"])
         );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A lookup no resolver answers is answered all the same, with SERVFAIL,
+    /// so its client fails now rather than waiting out its own timeout. The
+    /// answer has to be one the client takes for the answer to its query, or
+    /// it waits all the same.
+    #[tokio::test]
+    async fn a_lookup_no_resolver_answers_gets_servfail() {
+        let (_held, refusing) = refusing_resolver();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_loop(vec![refusing], empty_bindings()).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x1234, "example.test").await;
+
+        let mut reply = [0u8; 512];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .expect("a lookup no resolver answered got no reply")
+            .expect("receive reply");
+        let reply = &reply[..n];
+        assert!(
+            asked("example.test").answered_by(listener, from, reply),
+            "the reply does not answer the query"
+        );
+        assert_eq!(dns_flags(reply), Some(0x8182), "QR, RD, RA, SERVFAIL");
 
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
@@ -8188,6 +8304,64 @@ options edns0
         .expect("dns exchange");
 
         assert_eq!(response, reply);
+    }
+
+    /// A resolver that is not there is passed over at once and the next one
+    /// asked: its refusal reaches the forward, rather than leaving it to wait
+    /// out `DNS_TIMEOUT` for an answer that will never come.
+    #[tokio::test]
+    async fn forward_dns_moves_past_a_resolver_that_refuses() {
+        let (_held, refusing) = refusing_resolver();
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let resolver_addr = resolver.local_addr().expect("resolver addr");
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let answer = dns_packet(
+            0x1234,
+            DNS_RESPONSE_FLAGS,
+            "example.test",
+            &[Rr::A("example.test", [198, 51, 100, 7], 60)],
+        );
+        let sent = answer.clone();
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (_, client) = resolver.recv_from(&mut buf).await.expect("recv query");
+            let _ = resolver.send_to(&sent, client).await;
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_dns(
+                &query,
+                Some(&asked("example.test")),
+                &[refusing, resolver_addr],
+            ),
+        )
+        .await
+        .expect("a resolver that refused was waited out")
+        .expect("the next resolver answers");
+
+        assert_eq!(response, answer);
+    }
+
+    /// A SERVFAIL echoes only what the interceptor knows of its query: a
+    /// question it could not parse is left out, and a datagram that is no
+    /// query gets nothing.
+    #[test]
+    fn dns_servfail_echoes_only_what_it_can() {
+        // Two questions, so `dns_question` refuses it.
+        let mut unparsable = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        unparsable[5] = 2;
+        assert!(dns_query(&unparsable).is_none());
+        let reply = dns_servfail(&unparsable, None).expect("a header to answer");
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8182), "QR, RD, RA, SERVFAIL");
+        assert_eq!(reply[4..12], [0; 8], "no question echoed, no records");
+
+        let answer = dns_packet(0x1234, DNS_RESPONSE_FLAGS, "example.test", &[]);
+        assert_eq!(dns_servfail(&answer, dns_query(&answer).as_ref()), None);
+        assert_eq!(dns_servfail(&unparsable[..11], None), None);
     }
 
     /// Lateness exists only in the timed read: a client that says nothing

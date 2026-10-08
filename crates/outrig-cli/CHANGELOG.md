@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **With the host's resolver down, a container's lookups fail instead of hanging.** Under
+  `--network audit` or `filter`, a lookup no host resolver answered got no reply at all, so every
+  name a tool looked up waited out its resolver library's own timeouts and retries before failing.
+  It is now answered SERVFAIL, at once when the resolver refuses (systemd-resolved stopped, say),
+  and `outrig` warns about the first one in each container. A host `/etc/resolv.conf` listing an
+  IPv6 nameserver first on a kernel booted with `ipv6.disable=1` failed every lookup; that
+  resolver is now passed over. Fixed in `outrig` (#354).
+
 - **An MCP server that never answers no longer holds a session forever.** A server that took
   stdin and never spoke MCP -- `fs = ["cat"]` was enough -- kept `outrig run`, `outrig mcp`, and
   `outrig image build`'s live test at `MCP <name>: initializing` until interrupted, and a tool
