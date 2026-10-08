@@ -83,12 +83,9 @@ pub struct LabeledContainer {
 pub async fn execute(
     args: &CleanArgs,
     session_root_flag: Option<&Path>,
-    global_cfg_path: &Path,
+    global_override: Option<&Path>,
 ) -> Result<i32> {
-    let root = session::resolve_session_root_for_cli(
-        session_root_flag,
-        global_cfg_path,
-    )?;
+    let root = session::resolve_session_root_for_cli(session_root_flag, global_override)?;
     let store = SessionStore::new(root);
     // Only when asked: with the flag off, `clean` still needs nothing but
     // podman, and buildah is never invoked. When it is asked, the listings

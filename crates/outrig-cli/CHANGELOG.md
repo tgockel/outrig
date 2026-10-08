@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `--global-config` that does not exist is an error.** A path the flag named with nothing
+  there was read as an empty global config, so a typo surfaced as some other failure, or as none:
+  `outrig run` reported the agent's `model` as naming no `[models.<name>]`, and a global
+  `[network] mode = "filter"` was dropped without a word, so the session started with Podman's
+  default networking. Every command that reads the global config now stops with an error naming
+  the path: `outrig run`, `outrig mcp`, and `outrig build`; `outrig image add` when it bootstraps
+  a repo config; and `ls`, `logs`, `discard`, and `clean` when they look up the session root,
+  which `--session-root` or `--session-dir` skips. Only the default location may be missing. If
+  you passed a nonexistent path to run without a global config, pass `--global-config /dev/null`
+  instead, or point `XDG_CONFIG_HOME` at an empty directory. `outrig init` and `outrig config
+  init` write the file the flag names, so it need not exist for them (#342).
+
 - **Ctrl-C cancels a slash command.** Nothing heard a Ctrl-C while a slash command ran, so a
   `/sidecar add` waiting on an image build or on a server that never answers `initialize` held
   the session until it ended on its own -- two minutes, for a server stuck in `initialize`.

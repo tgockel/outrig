@@ -1,4 +1,5 @@
-//! `--config <path>` through the binary, without a container runtime.
+//! `--config <path>` and `--global-config <path>` through the binary, without
+//! a container runtime.
 //!
 //! Not `e2e`-gated, for the reason `builtin_default.rs` gives: each assertion
 //! is settled before the first podman call, or by the stub
@@ -9,7 +10,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{ABSENT_IMAGE, GLOBAL_WITH_MODEL, run_outrig, utf8};
+use common::{ABSENT_IMAGE, GLOBAL_WITH_MODEL, run_outrig, run_outrig_with_env, utf8};
 use outrig_cli::session::SessionStore;
 
 /// #323's fixture, under `tmp`: `home/u/proj/ci/outrig.toml` declares
@@ -42,14 +43,13 @@ fn issue_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
 async fn build_reads_the_named_file() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, named) = issue_fixture(tmp.path());
-    let absent = tmp.path().join("no-such-global.toml");
 
     for config in [utf8(&named), "ci/outrig.toml"] {
         let (ok, stderr) = run_outrig(
             &proj,
             &[
                 "--global-config",
-                utf8(&absent),
+                "/dev/null",
                 "--config",
                 config,
                 "build",
@@ -76,7 +76,8 @@ async fn build_reads_the_named_file() {
 }
 
 /// A `--config` that names nothing is a mistake to report, not a config-less
-/// session to start, in every command that reads the flag.
+/// session to start, in every command that reads the flag. It is reported
+/// ahead of a `--global-config` that names nothing either.
 #[tokio::test]
 async fn a_missing_config_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -108,7 +109,76 @@ async fn a_missing_config_is_refused() {
             )),
             "`outrig {cmd}` must name the missing path:\n{stderr}",
         );
+        assert!(
+            !stderr.contains("--global-config"),
+            "`outrig {cmd}` must report --config first:\n{stderr}",
+        );
     }
+}
+
+/// #342's reproduction: the repo's agent runs on a model only the global
+/// config declares, and `--global-config` misspells that file. Every command
+/// that reads the global config stops at the flag and names the path. It
+/// used to read the missing file as an empty config, and `run` then blamed
+/// the agent's model.
+#[tokio::test]
+async fn a_missing_global_config_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".agents/outrig")).unwrap();
+    fs::write(
+        repo.join(".agents/outrig/config.toml"),
+        "default-agent = \"smoke\"\n\n[agents.smoke]\nmodel = \"fast\"\n",
+    )
+    .unwrap();
+    let global = tmp.path().join("config.toml");
+    fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let typo = tmp.path().join("confg.toml");
+    // Where the default session root would be, were a command to get that far.
+    let data = tmp.path().join("data");
+    let env = [("XDG_DATA_HOME", data.as_path())];
+
+    for cmd in ["run", "mcp", "build", "ls"] {
+        let (ok, stderr) =
+            run_outrig_with_env(&repo, &["--global-config", utf8(&typo), cmd], &env).await;
+
+        assert!(
+            !ok,
+            "`outrig {cmd}` must refuse a missing --global-config:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "--global-config {} does not exist",
+                typo.display()
+            )),
+            "`outrig {cmd}` must name the missing path:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("does not match any"),
+            "`outrig {cmd}` must not read the missing file as empty:\n{stderr}",
+        );
+    }
+    assert!(!data.exists(), "no command got as far as a session");
+
+    // The file the flag meant: the agent's model resolves, and the run gets
+    // as far as the stubbed podman.
+    let (ok, stderr) = run_outrig_with_env(
+        &repo,
+        &[
+            "--global-config",
+            utf8(&global),
+            "run",
+            "--image",
+            ABSENT_IMAGE,
+        ],
+        &env,
+    )
+    .await;
+    assert!(
+        !ok,
+        "the stubbed podman cannot start a container:\n{stderr}"
+    );
+    assert!(!stderr.contains("does not match any"), "{stderr}");
 }
 
 /// An out-of-tree `--config` runs against the repo the command runs from.

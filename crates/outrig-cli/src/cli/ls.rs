@@ -27,12 +27,9 @@ pub struct LsArgs {}
 pub async fn execute(
     _args: &LsArgs,
     session_root_flag: Option<&Path>,
-    global_cfg_path: &Path,
+    global_override: Option<&Path>,
 ) -> Result<i32> {
-    let root = session::resolve_session_root_for_cli(
-        session_root_flag,
-        global_cfg_path,
-    )?;
+    let root = session::resolve_session_root_for_cli(session_root_flag, global_override)?;
     let store = SessionStore::new(root);
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();

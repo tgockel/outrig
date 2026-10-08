@@ -17,7 +17,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{GLOBAL_WITH_MODEL, run_outrig};
+use common::{GLOBAL_WITH_MODEL, run_outrig, run_outrig_with_env};
 
 /// Write a repo config and a global config into a fresh tempdir repo.
 fn repo_with(config_toml: &str) -> tempfile::TempDir {
@@ -43,17 +43,17 @@ fn global_arg(repo: &Path) -> String {
 async fn a_bare_directory_now_fails_only_on_the_model() {
     let repo = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
-    let absent = repo.path().join("no-such-global.toml");
+    // No `--global-config`, and nothing where the default would be.
+    let config_home = tempfile::tempdir().expect("tempdir config home");
 
-    let (ok, stderr) = run_outrig(
+    let (ok, stderr) = run_outrig_with_env(
         repo.path(),
         &[
-            "--global-config",
-            absent.to_str().expect("utf-8"),
             "--session-root",
             sessions.path().to_str().expect("utf-8"),
             "run",
         ],
+        &[("XDG_CONFIG_HOME", config_home.path())],
     )
     .await;
 

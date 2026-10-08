@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::default_session_root;
+use crate::paths::{default_session_root, resolve_global_config};
 use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError, Result};
 
@@ -455,13 +455,19 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
 /// is global-only, so the global config is the only file consulted, and the
 /// answer is the same from every directory. Read with
 /// [`Config::load_global`], which resolves the key beside the file and skips
-/// validation (only this key matters here); a missing file falls through to
-/// the XDG default.
-pub fn resolve_session_root_for_cli(flag: Option<&Path>, global_cfg_path: &Path) -> Result<PathBuf> {
+/// validation (only this key matters here); a missing default file falls
+/// through to the XDG default. `global_override` is `--global-config` as
+/// given, resolved only without `flag`: given the flag, the global config is
+/// neither read nor checked.
+pub fn resolve_session_root_for_cli(
+    flag: Option<&Path>,
+    global_override: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    Ok(Config::load_global(global_cfg_path)?
+    let global = resolve_global_config(global_override)?;
+    Ok(Config::load_global(&global)?
         .session_root
         .unwrap_or_else(default_session_root))
 }

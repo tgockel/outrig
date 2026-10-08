@@ -16,7 +16,7 @@ use crate::error::{OutrigError, Result};
 use crate::hf::HfTreeFetcher;
 use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
-use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
+use crate::paths::{find_repo_root_from, repo_config_path, resolve_global_config, write_atomic};
 use outrig::config::{Agent, Config, ImageConfig, LlmProvider, Model, Workspace, merge};
 
 /// Idempotent. Returns `Some(image_name)` when this call wrote the
@@ -57,9 +57,11 @@ pub async fn ensure(
 /// bootstrap writes it as `default-image` rather than asking for one.
 /// Returns the resolved repo root paired with `name`, or, when that is
 /// `None` and the bootstrap ran, the name it asked for.
+/// `global_override` is `--global-config`, which only the bootstrap reads: one
+/// that names nothing is refused before the bootstrap asks anything.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
-    global_path: &Path,
+    global_override: Option<&Path>,
     name: Option<String>,
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
@@ -72,6 +74,7 @@ pub async fn resolve_or_bootstrap(
     match find_repo_root_from(cwd) {
         Ok(root) => Ok((root, name)),
         Err(OutrigError::NoRepoConfig) => {
+            let global_path = resolve_global_config(global_override)?;
             eprintln!(
                 "[outrig] no .agents/outrig/config.toml found in {} or any parent.",
                 cwd.display()
@@ -80,7 +83,7 @@ pub async fn resolve_or_bootstrap(
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
-            let name = write_repo_config(cwd, global_path, name, prompt, hf).await?;
+            let name = write_repo_config(cwd, &global_path, name, prompt, hf).await?;
             Ok((cwd.to_path_buf(), Some(name)))
         }
         Err(other) => Err(other.into()),

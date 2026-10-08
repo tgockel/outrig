@@ -37,17 +37,10 @@ build-args = { GH_TOKEN = "${GITHUB_TOKEN}" }
         "FROM scratch\nARG GH_TOKEN\nRUN false\n",
     )
     .unwrap();
-    let absent = tmp.path().join("no-such-global.toml");
 
     let (ok, stderr) = run_outrig_with_env(
         &repo,
-        &[
-            "--global-config",
-            absent.to_str().unwrap(),
-            "build",
-            "--image",
-            "coding",
-        ],
+        &["--global-config", "/dev/null", "build", "--image", "coding"],
         &[("GITHUB_TOKEN", Path::new(SECRET))],
     )
     .await;

@@ -332,12 +332,32 @@ pub(crate) fn default_session_root() -> PathBuf {
     std::env::temp_dir().join("outrig-sessions")
 }
 
+/// Where the global config is, unchecked: `init` and `config init` write it
+/// there. A command that reads it goes through [`resolve_global_config`].
 pub(crate) fn global_config_path(override_path: Option<&Path>) -> PathBuf {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_default();
     global_config_path_with(override_path, xdg.as_deref(), &home)
+}
+
+/// [`global_config_path`] for a command that reads the file. `--global-config`
+/// names a file outright, so one that does not exist is an error, not an empty
+/// config for a typo to run on; only the default may be missing. Anything that
+/// does exist is left to the read, which reports a directory or a file it
+/// cannot open, and reads `/dev/null` as empty. Call it where the file is about
+/// to be read: a command that never reads it never checks the flag.
+pub(crate) fn resolve_global_config(override_path: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = override_path
+        && matches!(path.try_exists(), Ok(false))
+    {
+        return Err(OutrigError::Configuration(format!(
+            "--global-config {} does not exist",
+            path.display()
+        )));
+    }
+    Ok(global_config_path(override_path))
 }
 
 fn global_config_path_with(
@@ -697,5 +717,47 @@ mod tests {
         let home = Path::new("/home/alice");
         let p = global_config_path_with(None, None, home);
         assert_eq!(p, Path::new("/home/alice/.outrig/config.toml"));
+    }
+
+    /// #342: `--global-config` names a file outright, so one that is not there
+    /// -- a typo, a directory that is missing, a dangling link -- is refused,
+    /// naming the path. Whatever is there goes on to the read, `/dev/null`
+    /// included, and the default is never checked.
+    #[test]
+    fn explicit_global_config_that_does_not_exist_is_refused() {
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("config.toml");
+        fs::write(&file, b"").unwrap();
+        let link = tmp.path().join("link.toml");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let dangling = tmp.path().join("dangling.toml");
+        std::os::unix::fs::symlink(tmp.path().join("gone.toml"), &dangling).unwrap();
+
+        for missing in [
+            tmp.path().join("confg.toml"),
+            tmp.path().join("no-such-dir/config.toml"),
+            dangling,
+        ] {
+            let err = resolve_global_config(Some(&missing)).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "configuration: --global-config {} does not exist",
+                    missing.display()
+                ),
+            );
+        }
+        for present in [
+            file,
+            link,
+            tmp.path().to_path_buf(),
+            PathBuf::from("/dev/null"),
+        ] {
+            assert_eq!(resolve_global_config(Some(&present)).unwrap(), present);
+        }
+        assert_eq!(
+            resolve_global_config(None).unwrap(),
+            global_config_path(None)
+        );
     }
 }

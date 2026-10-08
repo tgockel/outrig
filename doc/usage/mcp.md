@@ -47,7 +47,8 @@ outrig mcp self
 - `--config <path>` (default: walks up from cwd; if not found, run config-less): read the repo
   config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
   which repo the session runs against.
-- `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
+- `--global-config <path>` (default: `~/.outrig/config.toml`, skipped if missing): read the global
+  config from this file, which has to exist.
 - `--session-root <path>` (default: global config, then XDG data directory): root for all
   sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the

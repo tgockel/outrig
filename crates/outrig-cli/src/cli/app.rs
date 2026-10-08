@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
@@ -16,7 +16,7 @@ use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
 use crate::error::{CliError, Result};
 use crate::paths::{
-    RepoConfig, global_config_path, resolve_repo_config, resolve_repo_config_optional,
+    RepoConfig, resolve_global_config, resolve_repo_config, resolve_repo_config_optional,
 };
 use crate::{config_init, image_setup, init};
 
@@ -288,19 +288,19 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         },
         Cmd::Ls(args) => {
             let (global, runtime) = session_cmd_ctx(cli)?;
-            runtime.block_on(ls::execute(args, cli.session_root.as_deref(), &global))
+            runtime.block_on(ls::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Logs(args) => {
             let (global, runtime) = session_cmd_ctx(cli)?;
-            runtime.block_on(logs::execute(args, cli.session_root.as_deref(), &global))
+            runtime.block_on(logs::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Discard(args) => {
             let (global, runtime) = session_cmd_ctx(cli)?;
-            runtime.block_on(discard::execute(args, cli.session_root.as_deref(), &global))
+            runtime.block_on(discard::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Clean(args) => {
             let (global, runtime) = session_cmd_ctx(cli)?;
-            runtime.block_on(clean::execute(args, cli.session_root.as_deref(), &global))
+            runtime.block_on(clean::execute(args, cli.session_root.as_deref(), global))
         }
     }
 }
@@ -374,16 +374,16 @@ fn quiet_rustyline(spec: &str) -> Option<Directive> {
     })
 }
 
-/// Shared preamble for `ls`/`logs`/`discard`/`clean`: the resolved global
-/// config path and a current-thread tokio runtime ready to drive the async
+/// Shared preamble for `ls`/`logs`/`discard`/`clean`: `--global-config` as
+/// given and a current-thread tokio runtime ready to drive the async
 /// `execute` form of each subcommand. No repo config and no cwd: the session
 /// root is global-only, so these commands answer the same from any directory.
-fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, tokio::runtime::Runtime)> {
-    let global = global_config_path(cli.global_config.as_deref());
+/// The global config is resolved only where a command reads it.
+fn session_cmd_ctx(cli: &Cli) -> Result<(Option<&Path>, tokio::runtime::Runtime)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    Ok((global, runtime))
+    Ok((cli.global_config.as_deref(), runtime))
 }
 
 /// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the
@@ -401,7 +401,8 @@ fn repo_cmd_ctx(
     } else {
         resolve_repo_config_optional(cli.config.as_deref(), &cwd)?
     };
-    let global_config = global_config_path(cli.global_config.as_deref());
+    // After the repo config, so a bad `--config` is the error reported.
+    let global_config = resolve_global_config(cli.global_config.as_deref())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

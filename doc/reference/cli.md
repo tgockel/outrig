@@ -51,10 +51,17 @@ config-less run. Which repo the command then runs against depends on where the f
 when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --
 note this is `~/.outrig/`, not `~/.config/outrig/`).
 
+Only the default may be missing: a machine with no global config runs on the repo config alone. A
+path the flag names has to exist wherever outrig reads the global config, and one that does not
+is an error naming it, not an empty global config. To run without a global config whatever the
+default holds, pass `--global-config /dev/null`. `outrig init` and `outrig config init` write the
+file the flag names, so for them it need not exist yet.
+
 `--session-root` resolves in this order: this flag, then `session-root` in the global config, then
 `<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
 `clean` read no repo config at all and ignore `--config`: they find the same root from any
-directory.
+directory. Given `--session-root`, or `--session-dir` for `logs` and `discard`, they read no
+global config either, so a `--global-config` path is not checked.
 
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also

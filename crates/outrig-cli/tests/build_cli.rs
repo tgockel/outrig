@@ -340,8 +340,7 @@ async fn a_self_referencing_tmpdir_build_arg_arrives_unchanged() {
 
     let out = try_capture(
         Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .args(["--global-config"])
-            .arg(tmp.path().join("nonexistent-global.toml"))
+            .args(["--global-config", "/dev/null"])
             .args(["build", "--image", "coding"])
             .current_dir(tmp.path())
             .env("TMPDIR", "rel")

@@ -20,9 +20,7 @@ use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use crate::paths::{
-    global_config_path, image_dir, image_dir_rel, repo_config_path, write_atomic_all,
-};
+use crate::paths::{image_dir, image_dir_rel, repo_config_path, write_atomic_all};
 use outrig::config::{ConfigValidationError, check_build_image_name};
 use outrig::error::IoPathExt;
 
@@ -40,11 +38,10 @@ pub async fn run(
     name: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
     let (repo_root, name) =
-        init_repo::resolve_or_bootstrap(cwd, &global_path, name, &mut prompt, &mut hf).await?;
+        init_repo::resolve_or_bootstrap(cwd, global_override, name, &mut prompt, &mut hf).await?;
     run_with(&repo_root, name, force, &mut prompt).await
 }
 

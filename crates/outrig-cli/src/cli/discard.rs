@@ -36,18 +36,15 @@ pub struct DiscardArgs {
 pub async fn execute(
     args: &DiscardArgs,
     session_root_flag: Option<&Path>,
-    global_cfg_path: &Path,
+    global_override: Option<&Path>,
 ) -> Result<i32> {
     // `--session-dir` skips the id lookup entirely, so the root is unused.
-    // Resolving it anyway would surface a config-parse error on a path
-    // that doesn't need the config at all.
+    // Resolving it anyway would surface a config-parse error, or a missing
+    // `--global-config`, on a path that doesn't need the config at all.
     let root = if args.session_dir.is_some() {
         PathBuf::new()
     } else {
-        session::resolve_session_root_for_cli(
-            session_root_flag,
-            global_cfg_path,
-        )?
+        session::resolve_session_root_for_cli(session_root_flag, global_override)?
     };
     let store = SessionStore::new(root);
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

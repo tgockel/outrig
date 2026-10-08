@@ -163,20 +163,105 @@ async fn a_tilde_root_is_under_home_for_run_and_ls() {
 }
 
 /// The flag is the whole answer when given: the global file is not read, so a
-/// broken one cannot get in its way.
+/// broken one cannot get in its way, and neither can a `--global-config` that
+/// names nothing (#342).
 #[test]
 fn the_flag_wins_without_reading_the_global_config() {
     let tmp = tempfile::tempdir().unwrap();
     let broken = tmp.path().join("config.toml");
     fs::write(&broken, "session-root = [").unwrap();
+    let missing = tmp.path().join("confg.toml");
     let flag = tmp.path().join("flagged");
 
-    assert_eq!(
-        session::resolve_session_root_for_cli(Some(&flag), &broken).unwrap(),
-        flag,
+    for global in [&broken, &missing] {
+        assert_eq!(
+            session::resolve_session_root_for_cli(Some(&flag), Some(global)).unwrap(),
+            flag,
+        );
+        assert!(
+            session::resolve_session_root_for_cli(None, Some(global)).is_err(),
+            "without the flag {} is read",
+            global.display(),
+        );
+    }
+}
+
+/// #342: a `--global-config` that does not exist is refused where the file
+/// is read -- finding the session root -- and nowhere else. Each command that
+/// would read it stops, names the path, and leaves the record alone.
+/// `--session-root` and `--session-dir` mean the file is never consulted, so
+/// they go on as before.
+#[tokio::test]
+async fn a_missing_global_config_is_refused_only_where_it_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let typo = tmp.path().join("confg.toml");
+    let root = tmp.path().join("sessions");
+    let sid = record(&root, "20261008T100000-aaaa");
+    let dir = root.join(sid.as_str());
+    // Where the default root would be, were the missing file read as empty.
+    let data = tmp.path().join("data");
+    let env = [("XDG_DATA_HOME", data.as_path())];
+
+    for cmd in [
+        &["ls"][..],
+        &["logs", sid.as_str()],
+        &["discard", "-y", sid.as_str()],
+        &["clean", "-y"],
+    ] {
+        let args = [&["--global-config", utf8(&typo)][..], cmd].concat();
+        let out = run_outrig_output(tmp.path(), &args, &env).await;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{cmd:?} must fail:\n{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "--global-config {} does not exist",
+                typo.display()
+            )),
+            "{cmd:?} must name the missing path:\n{stderr}",
+        );
+    }
+    assert!(dir.join("session.json").is_file(), "nothing was discarded");
+
+    let out = run_outrig_output(
+        tmp.path(),
+        &[
+            "--global-config",
+            utf8(&typo),
+            "--session-root",
+            utf8(&root),
+            "ls",
+        ],
+        &env,
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains(sid.as_str()), "{stdout}");
+
+    let out = run_outrig_output(
+        tmp.path(),
+        &[
+            "--global-config",
+            utf8(&typo),
+            "discard",
+            "-y",
+            "--session-dir",
+            utf8(&dir),
+        ],
+        &env,
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        session::resolve_session_root_for_cli(None, &broken).is_err(),
-        "without the flag the global file is read",
+        !dir.join("session.json").exists(),
+        "the record is discarded"
     );
 }
