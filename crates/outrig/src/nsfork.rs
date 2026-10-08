@@ -69,6 +69,24 @@ const CTRL_LEN: usize = cmsg_space(size_of::<[RawFd; MAX_FDS]>());
 #[repr(C, align(8))]
 struct CmsgBuf([u8; CTRL_LEN]);
 
+/// Why [`fork_collect`] has no [`Status`] to hand back.
+#[derive(Debug)]
+pub(crate) enum CollectError {
+    /// The socketpair or the fork failed: no child ever ran.
+    Spawn(io::Error),
+    /// The child ran, but its reply could not be received, was malformed, or
+    /// never came -- it died first.
+    Reply(io::Error),
+}
+
+impl From<CollectError> for io::Error {
+    fn from(err: CollectError) -> Self {
+        match err {
+            CollectError::Spawn(e) | CollectError::Reply(e) => e,
+        }
+    }
+}
+
 /// Run `child` in a forked child process and collect the message it sends back
 /// over the socketpair, plus any descriptors attached to it. `child` receives
 /// its end of the socket, must send exactly one message (see [`send_status`]),
@@ -77,14 +95,14 @@ struct CmsgBuf([u8; CTRL_LEN]);
 ///
 /// Errors only when the fork machinery itself failed or the child never
 /// replied -- a child that reports a failure through its [`Status`] still
-/// returns `Ok`.
-pub(crate) fn fork_collect<F>(child: F) -> io::Result<(Status, Vec<OwnedFd>)>
+/// returns `Ok`. A child killed before replying is named by its signal.
+pub(crate) fn fork_collect<F>(child: F) -> Result<(Status, Vec<OwnedFd>), CollectError>
 where
     F: FnOnce(RawFd),
 {
     let mut sv = [0 as RawFd; 2];
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sv.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
+        return Err(CollectError::Spawn(io::Error::last_os_error()));
     }
 
     let pid = unsafe { libc::fork() };
@@ -92,7 +110,7 @@ where
         let err = io::Error::last_os_error();
         close_fd(sv[0]);
         close_fd(sv[1]);
-        return Err(err);
+        return Err(CollectError::Spawn(err));
     }
 
     if pid == 0 {
@@ -108,10 +126,28 @@ where
 
     // Reaping our own child doesn't race tokio's process driver: it only
     // waits on pids it spawned itself.
+    // A failed wait leaves the status at 0, which reads as a plain exit.
     let mut wait_status = 0;
     let _ = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
 
     received
+        .and_then(|reply| reply.ok_or_else(|| silent_child(wait_status)))
+        .map_err(CollectError::Reply)
+}
+
+/// The error for a child that closed its socket without replying, naming the
+/// signal that killed it when its `wait_status` says one did.
+fn silent_child(wait_status: libc::c_int) -> io::Error {
+    let message = if libc::WIFSIGNALED(wait_status) {
+        let sig = libc::WTERMSIG(wait_status);
+        let name = nix::sys::signal::Signal::try_from(sig)
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|_| format!("signal {sig}"));
+        format!("namespace helper was killed by {name} before reporting a status")
+    } else {
+        "namespace helper exited without reporting a status".to_string()
+    };
+    io::Error::new(io::ErrorKind::UnexpectedEof, message)
 }
 
 /// Report that the child stopped at `step`, with `errno`, passing nothing
@@ -167,9 +203,10 @@ pub(crate) fn send_status(sock: RawFd, payload: Status, fds: &[RawFd]) -> io::Re
     Ok(())
 }
 
-/// Receive one status message and the descriptors that came with it. The
-/// descriptors arrive owned, so a caller that drops them closes them.
-fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
+/// Receive one status message and the descriptors that came with it, or
+/// `None` if the peer closed its end without sending one. The descriptors
+/// arrive owned, so a caller that drops them closes them.
+fn recv_status(sock: RawFd) -> io::Result<Option<(Status, Vec<OwnedFd>)>> {
     let mut payload = [0u8; 8];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
@@ -187,10 +224,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
         return Err(io::Error::last_os_error());
     }
     if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "namespace helper exited without reporting a status",
-        ));
+        return Ok(None);
     }
 
     let status = Status::from_bytes(payload);
@@ -198,7 +232,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Ok((status, out));
+            return Ok(Some((status, out)));
         }
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
             return Err(io::Error::new(
@@ -215,7 +249,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
             out.push(OwnedFd::from_raw_fd(*data.add(i)));
         }
     }
-    Ok((status, out))
+    Ok(Some((status, out)))
 }
 
 /// `setns(2)` as an [`io::Result`]. Safe to call from a forked child.
@@ -349,6 +383,23 @@ mod tests {
     #[test]
     fn fork_collect_errors_when_the_child_never_replies() {
         let err = fork_collect(|_sock| {}).expect_err("silent child");
+        let CollectError::Reply(err) = err else {
+            panic!("a silent child is a reply failure: {err:?}");
+        };
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("exited without"), "{err}");
+    }
+
+    #[test]
+    fn fork_collect_names_the_signal_that_killed_a_silent_child() {
+        let err = fork_collect(|_sock| unsafe {
+            libc::raise(libc::SIGKILL);
+        })
+        .expect_err("killed child");
+        let CollectError::Reply(err) = err else {
+            panic!("a killed child is a reply failure: {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("killed by SIGKILL"), "{err}");
     }
 }

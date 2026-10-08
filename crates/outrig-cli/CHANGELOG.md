@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A bootstrap helper that dies before replying says why.** If the forked helper that writes
+  the runtime user into a container was killed before replying (the OOM killer, a signal),
+  startup failed with `bootstrapping the runtime user failed at fork: Success (os error 0)`. It
+  now fails at `receive the helper's reply` and names the signal, e.g. `namespace helper was
+  killed by SIGKILL before reporting a status`. Fixed in `outrig` (#357).
+
 - **`outrig init` asks again for a workspace path a load would refuse, and writes no repo config
   the next load would refuse.** The repo phase -- which `outrig image add` also runs in a repo with
   no config -- wrote `host-path` and `container-path` as typed, so a directory that doesn't

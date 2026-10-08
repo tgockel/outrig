@@ -82,7 +82,7 @@ impl NsStep {
             NsStep::SetnsMount => "setns(CLONE_NEWNS)",
             NsStep::OpenPasswd => "open /etc/passwd",
             NsStep::OpenGroup => "open /etc/group",
-            NsStep::Reply => "hand back the opened files",
+            NsStep::Reply => "receive the helper's reply",
             NsStep::Mkdir => "mkdir the home directory",
             NsStep::Chown => "chown the home directory",
             NsStep::OpenHome => "open the home directory",
@@ -109,38 +109,39 @@ impl From<nsfork::EnterStep> for NsStep {
     }
 }
 
-/// A failure entering the namespace or acting inside it.
-#[derive(Debug, Clone, Copy)]
+/// A failure entering the namespace or acting inside it. Only the parent
+/// builds these: the child reports `(step, errno)`, which is all it can send.
+#[derive(Debug)]
 pub(super) struct NsError {
     pub(super) step: NsStep,
-    errno: i32,
+    pub(super) source: io::Error,
 }
 
 impl NsError {
-    fn new(step: NsStep, err: &io::Error) -> Self {
-        Self {
-            step,
-            errno: err.raw_os_error().unwrap_or(0),
-        }
+    fn new(step: NsStep, source: io::Error) -> Self {
+        Self { step, source }
     }
 
-    /// `step`, with the errno of the syscall that just failed. Safe to call
-    /// from a forked child.
-    fn last(step: NsStep) -> Self {
-        Self {
-            step,
-            errno: nsfork::errno(),
-        }
+    fn errno(step: NsStep, errno: i32) -> Self {
+        Self::new(step, io::Error::from_raw_os_error(errno))
     }
+}
 
-    pub(super) fn io(self) -> io::Error {
-        io::Error::from_raw_os_error(self.errno)
+/// A helper that never ran failed at the fork; one that ran but never replied
+/// -- killed first, say -- failed at the reply. Either way the error is kept
+/// whole: a helper that died has no errno to keep instead.
+impl From<nsfork::CollectError> for NsError {
+    fn from(err: nsfork::CollectError) -> Self {
+        match err {
+            nsfork::CollectError::Spawn(e) => NsError::new(NsStep::Fork, e),
+            nsfork::CollectError::Reply(e) => NsError::new(NsStep::Reply, e),
+        }
     }
 }
 
 impl std::fmt::Display for NsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.step.label(), self.io())
+        write!(f, "{}: {}", self.step.label(), self.source)
     }
 }
 
@@ -243,8 +244,7 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
             return;
         }
         let _ = nsfork::send_status(sock, nsfork::Status::OK, &[passwd_fd, group_fd]);
-    })
-    .map_err(|e| NsError::new(NsStep::Fork, &e))?;
+    })?;
 
     check_reply(status)?;
     let mut fds = fds.into_iter();
@@ -256,10 +256,7 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
         // A success status with the wrong descriptor count can't happen
         // unless the wire protocol changed under us; the fds we did get are
         // owned, so returning drops them.
-        _ => Err(NsError {
-            step: NsStep::Reply,
-            errno: libc::EPROTO,
-        }),
+        _ => Err(NsError::errno(NsStep::Reply, libc::EPROTO)),
     }
 }
 
@@ -278,11 +275,10 @@ pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(
         }
         let status = match make_home(&dirs, uid, gid) {
             Ok(()) => nsfork::Status::OK,
-            Err(e) => nsfork::Status::failed(e.step as u32, e.errno),
+            Err((step, errno)) => nsfork::Status::failed(step as u32, errno),
         };
         let _ = nsfork::send_status(sock, status, &[]);
-    })
-    .map_err(|e| NsError::new(NsStep::Fork, &e))?;
+    })?;
 
     check_reply(status)
 }
@@ -313,27 +309,24 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 /// points -- the bind-mounted workspace included. Opening with `O_DIRECTORY |
 /// O_NOFOLLOW` and changing ownership through that descriptor settles both in
 /// one step, with no window between the check and the `chown`.
-fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), NsError> {
+fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), (NsStep, i32)> {
     for dir in dirs {
         let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
         if rc == -1 && nsfork::errno() != libc::EEXIST {
-            return Err(NsError::last(NsStep::Mkdir));
+            return Err((NsStep::Mkdir, nsfork::errno()));
         }
     }
     // Only a home of `/` itself lays out no paths at all.
     let Some(home) = dirs.last() else {
-        return Err(NsError {
-            step: NsStep::Mkdir,
-            errno: libc::EINVAL,
-        });
+        return Err((NsStep::Mkdir, libc::EINVAL));
     };
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe { libc::open(home.as_ptr(), flags) };
     if fd == -1 {
-        return Err(NsError::last(NsStep::OpenHome));
+        return Err((NsStep::OpenHome, nsfork::errno()));
     }
     let result = if unsafe { libc::fchown(fd, uid, gid) } == -1 {
-        Err(NsError::last(NsStep::Chown))
+        Err((NsStep::Chown, nsfork::errno()))
     } else {
         Ok(())
     };
@@ -344,7 +337,7 @@ fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), NsError> {
 /// The container's namespace files, opened in the parent so that a failure to
 /// open them never involves a child at all.
 fn open_ns(pid: u32) -> Result<nsfork::UserMountNs, NsError> {
-    nsfork::UserMountNs::open(pid).map_err(|(file, e)| NsError::new(file.into(), &e))
+    nsfork::UserMountNs::open(pid).map_err(|(file, e)| NsError::new(file.into(), e))
 }
 
 /// Report `step`, with `errno`, to the parent. Runs in the forked child:
@@ -357,14 +350,9 @@ fn check_reply(status: nsfork::Status) -> Result<(), NsError> {
     if status.step == 0 {
         return Ok(());
     }
-    let step = NsStep::from_code(status.step).ok_or(NsError {
-        step: NsStep::Reply,
-        errno: libc::EPROTO,
-    })?;
-    Err(NsError {
-        step,
-        errno: status.errno,
-    })
+    let step = NsStep::from_code(status.step)
+        .ok_or_else(|| NsError::errno(NsStep::Reply, libc::EPROTO))?;
+    Err(NsError::errno(step, status.errno))
 }
 
 /// A path the child can pass to `mkdir`/`chown`. Fails only on an interior
@@ -373,10 +361,8 @@ fn check_reply(status: nsfork::Status) -> Result<(), NsError> {
 /// name may come from the container's own file, so this stays a `Result`
 /// rather than an `expect`.
 fn cstring(path: &Path) -> Result<CString, NsError> {
-    CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| NsError {
-        step: NsStep::Mkdir,
-        errno: libc::EINVAL,
-    })
+    CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| NsError::errno(NsStep::Mkdir, libc::EINVAL))
 }
 
 #[cfg(test)]
@@ -405,7 +391,27 @@ mod tests {
         }
         let err = open_user_db(std::process::id()).expect_err("own mount namespace");
         assert_eq!(err.step, NsStep::SetnsMount, "unexpected step: {err}");
-        assert_eq!(err.io().raw_os_error(), Some(libc::EPERM), "{err}");
+        assert_eq!(err.source.raw_os_error(), Some(libc::EPERM), "{err}");
+    }
+
+    /// A helper that died without replying carries no errno; its message has
+    /// to survive, and the step is the reply, not the fork that worked (#357).
+    #[test]
+    fn a_helper_that_never_replied_keeps_its_message() {
+        let err = NsError::from(nsfork::CollectError::Reply(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "namespace helper was killed by SIGKILL before reporting a status",
+        )));
+        assert_eq!(err.step, NsStep::Reply, "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("killed by SIGKILL"), "{shown}");
+        assert!(!shown.contains("os error 0"), "{shown}");
+
+        let err = NsError::from(nsfork::CollectError::Spawn(io::Error::from_raw_os_error(
+            libc::EAGAIN,
+        )));
+        assert_eq!(err.step, NsStep::Fork, "{err}");
+        assert_eq!(err.source.raw_os_error(), Some(libc::EAGAIN), "{err}");
     }
 
     #[test]
@@ -421,6 +427,7 @@ mod tests {
     fn make_home_at(home: &Path) -> Result<(), NsError> {
         let (uid, gid) = own_ids();
         make_home(&mkdir_p_paths(home).expect("paths"), uid, gid)
+            .map_err(|(step, errno)| NsError::errno(step, errno))
     }
 
     fn own_ids() -> (u32, u32) {
@@ -490,7 +497,7 @@ mod tests {
 
             let err = make_home_at(&home).expect_err(shape);
             assert_eq!(err.step, NsStep::OpenHome, "{shape}: {err}");
-            let errno = err.io().raw_os_error();
+            let errno = err.source.raw_os_error();
             assert_eq!(errno, Some(libc::ENOTDIR), "{shape}: {err}");
             let after = std::fs::symlink_metadata(&home).expect("stat").file_type();
             assert_eq!(
@@ -552,6 +559,6 @@ mod tests {
         std::fs::write(tmp.path().join("home"), "").expect("write");
         let err = make_home_at(&tmp.path().join("home/dev")).expect_err("file at /home");
         assert_eq!(err.step, NsStep::Mkdir, "{err}");
-        assert_eq!(err.io().raw_os_error(), Some(libc::ENOTDIR), "{err}");
+        assert_eq!(err.source.raw_os_error(), Some(libc::ENOTDIR), "{err}");
     }
 }

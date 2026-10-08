@@ -955,7 +955,7 @@ impl Container {
 
         let pid = self.pid().await?;
         let db = namespace::open_user_db(pid)
-            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
+            .map_err(|e| self.bootstrap_failed(e.step.label(), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
@@ -977,7 +977,7 @@ impl Container {
         }
         let home = userdb::home_dir(&user_name);
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.io()))?;
+            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.source))?;
         self.reconcile_home(&db, &home).await?;
 
         self.log_bootstrap(&format!(

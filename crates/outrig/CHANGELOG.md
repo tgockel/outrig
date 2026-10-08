@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A namespace helper that dies before replying fails the bootstrap with the reason.**
+  `Container::bootstrap_user` reported a helper killed before it replied (the OOM killer, a
+  signal) as `OutrigError::BootstrapNamespace` failing at `fork` with `Success (os error 0)`: the
+  error kept only an errno, and a helper that never replied has none. The error now keeps its
+  message and names the step as `receive the helper's reply`, and that message names the signal
+  that killed the helper. A `fork` failure still names `fork` and its errno. The same message
+  reaches network attach and detach, whose helpers already passed the error through. (#357)
+
 - **`Config::validate` holds the primary `[workspace].container-path` to the mount rule.** Every
   `[[workspace.mounts]]` `container-path` had to be absolute and not `/`, but nothing read the
   primary one. A relative value validated, and the session failed when podman created the

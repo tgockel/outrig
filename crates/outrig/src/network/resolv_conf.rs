@@ -409,7 +409,7 @@ fn run_in<F>(place: &Place, body: F) -> io::Result<(Status, Vec<OwnedFd>)>
 where
     F: FnOnce(RawFd, &CStr),
 {
-    match place {
+    let collected = match place {
         Place::Container(pid) => {
             let ns = nsfork::UserMountNs::open(*pid).map_err(|(file, e)| {
                 let which = match file {
@@ -428,7 +428,8 @@ where
         }
         #[cfg(test)]
         Place::Host(path) => nsfork::fork_collect(|sock| body(sock, path)),
-    }
+    };
+    Ok(collected?)
 }
 
 /// Where a resolver helper stopped. The numbering is the wire format between
