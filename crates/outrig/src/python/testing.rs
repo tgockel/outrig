@@ -470,3 +470,143 @@ def pip(*args, python=None, **options):
     if run.returncode:
         raise RuntimeError(f"pip {args} exited {run.returncode}:\n{run.stdout}{run.stderr}")
 "#;
+
+/// Builds, into the directory it is given, the wheels and the source distribution the install
+/// tests point pip at: `pure` and `other`, pure-Python wheels whose module holds `ANSWER = 42`;
+/// `universal`, a `py2.py3-none-any` wheel whose WHEEL file lists the two tags on two lines, as
+/// `bdist_wheel` writes it; `compiled`, tagged for this interpreter and platform, which pip
+/// accepts; `mislabeled`,
+/// tagged pure Python with an extension module among its files; `needs_compiled`, pure and
+/// requiring `compiled`; `sdistonly`, a source distribution and nothing else; `evil`, a source
+/// distribution whose build backend marks the file `OUTRIG_CANARY` names when it runs; and
+/// `needs_url`, pure and depending on `evil` by URL. The directory the wheels end up in is the
+/// second argument, for that URL.
+const WHEELS: &str = r#"
+import io, os, pathlib, sys, sysconfig, tarfile, zipfile
+
+out, final = sys.argv[1], sys.argv[2]
+plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+cp = f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def wheel(name, tag, tags=None, purelib=True, requires=None, extra=()):
+    """A wheel named for `tag`, whose WHEEL file lists `tags` -- one line per Python tag, as
+    `bdist_wheel` writes a compressed tag -- or `tag` alone."""
+    dist = f"{name}-1.0.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    if requires:
+        metadata += f"Requires-Dist: {requires}\n"
+    with zipfile.ZipFile(os.path.join(out, f"{name}-1.0-{tag}.whl"), "w") as z:
+        z.writestr(f"{name}.py", "ANSWER = 42\n")
+        for member, data in extra:
+            z.writestr(member, data)
+        z.writestr(f"{dist}/METADATA", metadata)
+        z.writestr(
+            f"{dist}/WHEEL",
+            f"Wheel-Version: 1.0\nGenerator: outrig-tests\n"
+            f"Root-Is-Purelib: {'true' if purelib else 'false'}\n"
+            + "".join(f"Tag: {t}\n" for t in tags or [tag]),
+        )
+        z.writestr(f"{dist}/RECORD", "")
+
+
+wheel("pure", "py3-none-any")
+wheel("other", "py3-none-any")
+wheel("universal", "py2.py3-none-any", tags=["py2-none-any", "py3-none-any"])
+wheel("compiled", f"{cp}-{cp}-{plat}", purelib=False)
+wheel("mislabeled", "py3-none-any", extra=[("mislabeled_ext.so", b"\x7fELF, or so it says")])
+wheel("needs_compiled", "py3-none-any", requires="compiled")
+
+def sdist(name, members):
+    with tarfile.open(os.path.join(out, f"{name}-1.0.tar.gz"), "w:gz") as t:
+        for member, data in members:
+            info = tarfile.TarInfo(f"{name}-1.0/{member}")
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+
+
+sdist("sdistonly", [
+    ("PKG-INFO", b"Metadata-Version: 2.1\nName: sdistonly\nVersion: 1.0\n"),
+    ("sdistonly.py", b"ANSWER = 1\n"),
+])
+# A source distribution whose in-tree build backend leaves a mark when it runs -- the code a
+# build executes on the host -- and a pure wheel that depends on it by URL, where it will lie
+# once the wheels are in place.
+sdist("evil", [
+    ("PKG-INFO", b"Metadata-Version: 2.1\nName: evil\nVersion: 1.0\n"),
+    ("pyproject.toml", b'[build-system]\nrequires = []\nbuild-backend = "evil_backend"\n'
+                       b'backend-path = ["."]\n[project]\nname = "evil"\nversion = "1.0"\n'),
+    ("evil_backend.py", b"import os\nopen(os.environ.get('OUTRIG_CANARY', os.devnull), 'w').close()\n"),
+])
+wheel("needs_url", "py3-none-any", requires=f"evil @ {pathlib.Path(final, 'evil-1.0.tar.gz').as_uri()}")
+"#;
+
+/// The directory of test wheels [`WHEELS`] builds, made once per content under the system's
+/// temporary directory, for pip's `--find-links`.
+pub(crate) fn wheel_links() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let key = blake3::hash(WHEELS.as_bytes());
+        let dir = std::env::temp_dir().join(format!(
+            "outrig-test-wheels-{}-{}",
+            nix::unistd::getuid(),
+            &key.to_hex()[..16]
+        ));
+        if dir.join("done").is_file() {
+            return dir;
+        }
+        let stage = tempfile::Builder::new()
+            .prefix(".outrig-wheels-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("a staging directory");
+        let output = Command::new(python())
+            .args(["-I", "-c", WHEELS])
+            .arg(stage.path())
+            .arg(&dir)
+            .env("HOME", host_home())
+            .output()
+            .expect("the payload's Python runs");
+        assert!(
+            output.status.success(),
+            "building the test wheels failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(stage.path().join("done"), b"").expect("mark the wheels done");
+        match std::fs::rename(stage.path(), &dir) {
+            Ok(()) => {}
+            Err(_) if dir.join("done").is_file() => {}
+            Err(e) => panic!("move the wheels to {}: {e}", dir.display()),
+        }
+        dir
+    })
+}
+
+/// pip's environment for a test install: no index, `links` for `--find-links` -- as a `file://`
+/// URI, since pip splits the variable on whitespace and a temporary directory may hold a space
+/// -- and no configuration file, so a developer's `pip.conf` reaches nothing.
+pub(crate) fn pip_env(links: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    [
+        ("PIP_NO_INDEX", std::ffi::OsString::from("1")),
+        ("PIP_FIND_LINKS", std::ffi::OsString::from(file_uri(links))),
+        ("PIP_CONFIG_FILE", std::ffi::OsString::from("/dev/null")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (std::ffi::OsString::from(k), v))
+    .collect()
+}
+
+/// `path`, absolute, as a `file://` URI with every byte outside the unreserved set and `/`
+/// percent-encoded, as `pathlib.Path.as_uri` writes one.
+pub(crate) fn file_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(char::from(*byte));
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri
+}

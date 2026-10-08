@@ -2793,6 +2793,7 @@ mod measurements {
             factory: "outrig_fixture:service_client",
             env: &[("OUTRIG_FIXTURE_SERVICE", service.socket())],
             serialize,
+            ..Bind::default()
         };
         let mut one = Relay::start();
         one.bind_opts("fx", &bind);

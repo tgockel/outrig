@@ -98,12 +98,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Spikes: the risky parts of hosted objects, proven before they are built on**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-18` | A binding's process dies with its owner                            |
-
 **The owner's API**
 
 | Task      | What it settles                                                    |

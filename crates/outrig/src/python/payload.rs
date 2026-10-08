@@ -114,7 +114,7 @@ pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
 
 /// The user's cache directory, or a configuration error naming `what` could
 /// not be placed.
-fn cache_dir(what: &str) -> Result<PathBuf> {
+pub(super) fn cache_dir(what: &str) -> Result<PathBuf> {
     cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")).ok_or_else(|| {
         OutrigError::Configuration(format!(
             "cannot place the {what}: neither an absolute XDG_CACHE_HOME nor HOME is set"
@@ -182,8 +182,8 @@ fn runnable_from(path: &Path) -> Result<()> {
 }
 
 /// The lock that serializes unpacking `dir`, beside it.
-fn lock_path(dir: &Path) -> PathBuf {
-    let name = dir.file_name().expect("the payload directory has a name");
+pub(super) fn lock_path(dir: &Path) -> PathBuf {
+    let name = dir.file_name().expect("the directory has a name");
     dir.with_file_name(format!(".{}.lock", name.to_string_lossy()))
 }
 
@@ -192,7 +192,15 @@ fn lock_path(dir: &Path) -> PathBuf {
 /// 128 MiB window and writes about 170 MB, so concurrent first launches must
 /// not each do it.
 fn unpack_once(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
-    let parent = dir.parent().expect("the unpack directory has a parent");
+    locked_once(dir, || unpack(archive, dir, subtree))
+}
+
+/// Run `build`, which creates `dir`, unless `dir` exists by the time this
+/// holds the lock beside it: of concurrent callers one builds and the rest
+/// find its result. `build` makes `dir` appear whole or not at all -- a stage
+/// renamed into place, as [`unpack`] does.
+pub(super) fn locked_once(dir: &Path, build: impl FnOnce() -> Result<()>) -> Result<()> {
+    let parent = dir.parent().expect("the directory has a parent");
     std::fs::create_dir_all(parent).path_ctx("create", parent)?;
     let lock = lock_path(dir);
     let file = std::fs::File::create(&lock).path_ctx("create", &lock)?;
@@ -202,7 +210,7 @@ fn unpack_once(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
-    unpack(archive, dir, subtree)
+    build()
 }
 
 /// What a build that degraded to an empty archive says at session start.

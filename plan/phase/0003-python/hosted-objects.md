@@ -93,10 +93,11 @@ Each binding runs in its own process on the host -- the literal host, not a cont
 same embedded static CPython the container's interpreter uses. It is a supervised child of the Rust
 owner: started before the interpreter, in a process group of its own, with a parent-death signal on
 which it kills that group, so the owner's death ends it and every program it started. At shutdown
-the owner kills the group itself. `lifecycle.md` describes the close sequence, `0003-18` proves the
-supervision, and `0003-20` builds it. The process starts with `-I`, so neither its working directory
-nor the user site is on its import path: it imports the standard library, the vendored RPyC
-("Transport"), and its package directory, and nothing the agent can write from the container.
+the owner kills the group itself. `lifecycle.md` describes the close sequence, `0003-18` proved the
+supervision and built it as a crate-private module, and `0003-20` connects it to the session. The
+process starts with `-I`, so neither its working directory nor the user site is on its import
+path: it imports the standard library, the vendored RPyC ("Transport"), and its package directory,
+and nothing the agent can write from the container.
 
 One process per binding, rather than one for all of them:
 
@@ -131,12 +132,22 @@ now records the decision and what it grants.
 `~/.cache/outrig/bindings/<hash>/`: once per set, under a lock, and renamed into place when it is
 complete (`0003-18`). Two rules limit what the install does on the host:
 
-- **Wheels only** (`--only-binary=:all:`). pip never builds from source, so no package's build code
-  runs on the host.
+- **Wheels only** (`--only-binary=:all:`), with pip's own source-distribution step disabled for
+  the run. `--only-binary` constrains what pip resolves from an index, and a wheel may declare a
+  dependency by URL on a source archive, which pip would fetch and whose build backend it would
+  run to read its metadata. With the step disabled no package's build code runs on the host, and
+  such a dependency fails with the reason instead (`0003-18`).
 - **Every wheel is pure Python**: its platform tag is `any`, its ABI tag `none`, and its Python tag
   includes Python 3, as in `py3-none-any` or `py2.py3-none-any`. A wheel with any other tags is
   refused with the reason: one with compiled parts could be loaded by neither the binding process
-  nor the container's interpreter.
+  nor the container's interpreter. So is a wheel tagged pure Python that carries an extension
+  module among its files, since a tag is the publisher's claim.
+
+`requires` holds requirement specifiers -- a name, extras, a version specifier, markers -- and
+never a path or a URL: the cache is keyed by the requirement text, and a path whose file changes
+would keep serving its first install. The install reads the user's pip configuration, so an index
+URL, a proxy or a certificate configured for pip applies to it; the key stays the requirement set,
+so changing the configured index reinstalls nothing (`0003-18`).
 
 GitPython 3.2.0 passes: it and its two dependencies, `gitdb` and `smmap`, are all `py3-none-any`. A
 pure-Python package published only as a source distribution does not, and cannot be hosted until a
@@ -651,6 +662,15 @@ pure-Python client that is hosted like any library. The trait idea is
     connection frees its object only when no connection holds it. Its `## Decisions` record
     the measurements of the binding as a service client, and that a method call is two
     requests.
-  - `0003-18`: `kill -9` of the owner leaves nothing in the binding's process group, a requirement
-    set is installed once, a compiled wheel is refused with the reason, and the cache imports
-    inside a container.
+  - `0003-18` -- confirmed: `kill -9` of the owner during a call that started a grandchild
+    leaves nothing in the binding's process group within 5 s; an owner killed between the fork
+    and the setting of the parent-death signal leaves no binding; a tokio pool thread's exit
+    signals nothing the supervisor started; `SIGINT` to the owner's group leaves the binding
+    serving; frames for two agents interleave with an event line and a held decision request on
+    one binding's stdio; a requirement set installs once; a compiled wheel pip would install, an
+    sdist-only requirement and a pure-tagged wheel carrying an extension module are each refused
+    with the reason and leave nothing in the cache; a binding that ignores `SIGTERM` is killed
+    with its group after the grace and reported empty; the cache imports read-only inside a
+    container; and GitPython 3.2.0 installs from the index, pure Python throughout, and a `Repo`
+    the binding built answers `head.commit.hexsha`. Its `## Decisions` record what the spike
+    found beyond the task.

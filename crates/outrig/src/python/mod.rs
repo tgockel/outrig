@@ -13,8 +13,10 @@
 //! reaches that.
 
 pub(crate) mod host;
+pub(crate) mod install;
 pub(crate) mod payload;
 pub(crate) mod recovery;
+pub(crate) mod supervisor;
 
 mod stack {
     use crate::container::enter::elf::{ElfKind, elf_interp};
@@ -47,3 +49,7 @@ mod interpreter_tests;
 #[cfg(test)]
 #[path = "binding_tests.rs"]
 mod binding_tests;
+
+#[cfg(test)]
+#[path = "supervisor_tests.rs"]
+mod supervisor_tests;

@@ -2,13 +2,15 @@
 //! the host, standing in for the one `0003-21` puts in `host.rs`.
 //!
 //! The interpreter is started as `interpreter_tests.rs` starts it, with the vendored RPyC's
-//! directory as its second argument; each binding runs `binding.py` with that directory, the
-//! fixture package, and a factory. `rpc` lines from the interpreter go to the binding they name,
-//! lines from a binding go back with the binding's name added, and everything else the
-//! interpreter says is handed to the test. The relay counts the lines each way and remembers the
+//! directory as its second argument; each binding is started through `supervisor.rs`, as a
+//! session will start it, over the fixture package with a factory. `rpc` lines from the
+//! interpreter go to the binding they name, lines from a binding go back with the binding's name
+//! added, and everything else the interpreter says is handed to the test, as are a binding's
+//! event lines and decision requests. The relay counts the lines each way and remembers the
 //! longest, which is how a test checks the frame bound held in transit.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command};
@@ -20,17 +22,16 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 use super::host::PRIMARY;
 use super::payload;
+use super::supervisor::{self, Binding, Decision, Spec, Stopped};
 use super::testing::{Start, capture, host_home, interpreter_command, python, python_command};
 
 /// How long any one reply may take. A 64 MiB result crosses in a few seconds on a loaded runner.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The binding program as the payload's `-c` argument, staged by `build.rs` as `host.rs`'s
-/// `PROGRAM` is.
-pub(crate) const BINDING: &str = include_str!(concat!(env!("OUT_DIR"), "/binding.bootstrap"));
 
 /// The binding program's source, for the test that reads its handler table.
 pub(crate) const BINDING_SOURCE: &str = include_str!("binding.py");
@@ -60,6 +61,8 @@ pub(crate) const FIXTURE_SOURCE: &str = r#"
 import itertools
 import os
 import pickle
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -362,6 +365,49 @@ class Root(Records):
         gc.collect()
         return self._kept[name][0]() is not None
 
+    def sleep_child(self, seconds, started=None):
+        """Run `sleep seconds` as a child of this process and wait for it: a call in flight whose
+        grandchild the owner must end with the binding. `started` is a file created once the
+        child runs."""
+        child = subprocess.Popen(["sleep", str(seconds)])
+        if started:
+            open(started, "w").close()
+        return child.wait()
+
+    def event(self, payload):
+        """Publish `payload` as an event line, through the binding program's own primitive."""
+        import __main__
+
+        __main__._event(payload)
+
+    def decide(self, payload):
+        """Hold this call until the owner answers `payload`, through the binding program's own
+        primitive, and return the answer."""
+        import __main__
+
+        return __main__._decide(payload)
+
+    def decide_path(self, raw):
+        """`decide` with a path the host made from the bytes `raw`, as a library reports a file
+        name: not UTF-8 when the bytes are not."""
+        import __main__
+
+        return __main__._decide({"path": os.fsdecode(raw)})
+
+    def env(self, name):
+        return os.environ.get(name)
+
+    def child_env(self, name):
+        """`name` as a program this process starts sees it."""
+        run = subprocess.run(["sh", "-c", f"echo ${name}"], capture_output=True, text=True)
+        return run.stdout.strip()
+
+    def sys_path(self):
+        return tuple(sys.path)
+
+    def pgid(self):
+        return os.getpgrp()
+
     def method(self, x, y=1):
         return x + y
 
@@ -471,6 +517,33 @@ class Root(Records):
 
 
 def make():
+    return Root()
+
+
+def make_stubborn():
+    """A binding that ignores SIGTERM, with a child that ignores it too: what only SIGKILL ends.
+    Set here, on the main thread, where `signal.signal` is allowed."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    subprocess.Popen(["sh", "-c", 'trap "" TERM; sleep 1000'])
+    return Root()
+
+
+def make_failing():
+    """A factory that starts a program and then raises, writing its process group to
+    `OUTRIG_FIXTURE_PGID_FILE` first, so a test can look for what it left behind."""
+    subprocess.Popen(["sleep", "1000"])
+    with open(os.environ["OUTRIG_FIXTURE_PGID_FILE"], "w") as f:
+        f.write(str(os.getpgrp()))
+    raise RuntimeError("the factory failed on purpose")
+
+
+def make_slow():
+    """A factory that starts a program, writes its process group to `OUTRIG_FIXTURE_PGID_FILE`,
+    and then takes longer than any owner waits."""
+    subprocess.Popen(["sleep", "1000"])
+    with open(os.environ["OUTRIG_FIXTURE_PGID_FILE"], "w") as f:
+        f.write(str(os.getpgrp()))
+    time.sleep(1000)
     return Root()
 "#;
 
@@ -735,16 +808,24 @@ impl Traffic {
 pub(crate) struct Bind<'a> {
     /// The factory, as `module:callable`, in the fixture package.
     pub(crate) factory: &'a str,
-    /// Extra environment variables for the process.
+    /// Extra environment variables for the process, on top of this process's own. With none,
+    /// the binding inherits the environment, as one under the CLI does.
     pub(crate) env: &'a [(&'a str, &'a str)],
+    /// Exactly the process's environment, as an embedder gives one; in place of `env`.
+    pub(crate) exact_env: Option<&'a [(&'a str, &'a str)]>,
     /// `--serialize`: one call at a time across the binding's connections.
     pub(crate) serialize: bool,
+    /// The package directory, the fixture's when `None`.
+    pub(crate) packages: Option<&'a Path>,
+    /// The process's working directory.
+    pub(crate) cwd: Option<&'a Path>,
 }
 
-struct BindingProcess {
-    child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
-    stderr: Arc<Mutex<String>>,
+/// A binding the relay started, with the lines of it that only the test reads.
+struct Bound {
+    binding: Binding,
+    events: mpsc::Receiver<Value>,
+    decisions: mpsc::Receiver<Decision>,
 }
 
 pub(crate) struct Relay {
@@ -754,7 +835,11 @@ pub(crate) struct Relay {
     /// Messages read while looking for another, kept in order for the next `recv`.
     pending: VecDeque<Value>,
     stderr: Arc<Mutex<String>>,
-    bindings: Arc<Mutex<HashMap<String, BindingProcess>>>,
+    /// Each binding's stdin, for the pump that forwards the interpreter's `rpc` lines.
+    targets: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
+    bindings: HashMap<String, Bound>,
+    /// Where the bindings live: their pipes and their reaping are registered with it.
+    runtime: Runtime,
     pub(crate) stats: Arc<Stats>,
 }
 
@@ -782,24 +867,28 @@ impl Relay {
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin is piped")));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = capture(child.stderr.take().expect("stderr is piped"));
-        let bindings = Arc::new(Mutex::new(HashMap::new()));
+        let targets = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(Stats::default());
         let (tx, other) = channel();
         {
-            let (stdin, bindings, stats) = (
-                Arc::clone(&stdin),
-                Arc::clone(&bindings),
-                Arc::clone(&stats),
-            );
-            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, bindings, stats));
+            let (stdin, targets, stats) =
+                (Arc::clone(&stdin), Arc::clone(&targets), Arc::clone(&stats));
+            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, targets, stats));
         }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime for the bindings");
         let mut relay = Self {
             interpreter: child,
             stdin,
             other,
             pending: VecDeque::new(),
             stderr,
-            bindings,
+            targets,
+            bindings: HashMap::new(),
+            runtime,
             stats,
         };
         let ready = relay.recv();
@@ -821,7 +910,7 @@ impl Relay {
             &Bind {
                 factory,
                 env,
-                serialize: false,
+                ..Bind::default()
             },
         );
     }
@@ -832,52 +921,64 @@ impl Relay {
             name,
             &Bind {
                 factory,
-                env: &[],
                 serialize: true,
+                ..Bind::default()
             },
         );
     }
 
-    /// Start binding `name`'s process as `bind` says, and wait for it to be ready.
+    /// Start binding `name`'s process as `bind` says, through the supervisor, and wait for it to
+    /// be ready.
     pub(crate) fn bind_opts(&mut self, name: &str, bind: &Bind) {
-        let mut command = python_command(None);
-        command
-            .args(["-I", "-c", BINDING])
-            .arg(rpyc_dir())
-            .arg(fixture_dir())
-            .arg(bind.factory);
-        if bind.serialize {
-            command.arg("--serialize");
-        }
-        let mut child = command
-            .envs(bind.env.iter().copied())
-            .spawn()
-            .expect("the binding starts");
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin is piped")));
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = capture(child.stderr.take().expect("stderr is piped"));
-        let (ready_tx, ready_rx) = channel();
+        let owned = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect()
+        };
+        let exact = match bind.exact_env {
+            Some(given) => Some(owned(given)),
+            None if bind.env.is_empty() => None,
+            None => Some(std::env::vars_os().chain(owned(bind.env)).collect()),
+        };
+        let spec = Spec {
+            python: python(),
+            rpyc_dir: rpyc_dir(),
+            packages: match bind.packages {
+                Some(packages) => packages,
+                None => fixture_dir(),
+            },
+            factory: bind.factory,
+            serialize: bind.serialize,
+            cwd: bind.cwd,
+            env: exact.as_deref(),
+            probe: None,
+        };
+        let mut binding = self
+            .runtime
+            .block_on(supervisor::start(spec))
+            .unwrap_or_else(|e| panic!("binding {name:?} did not start: {e}"));
+        let rpc = binding.take_rpc();
+        let events = binding.take_events();
+        let decisions = binding.take_decisions();
+        self.targets
+            .lock()
+            .expect("targets lock")
+            .insert(name.to_string(), binding.sender());
         {
             let (name, stdin, stats) = (
                 name.to_string(),
                 Arc::clone(&self.stdin),
                 Arc::clone(&self.stats),
             );
-            std::thread::spawn(move || pump_binding(name, stdout, stdin, ready_tx, stats));
+            std::thread::spawn(move || pump_binding(name, rpc, stdin, stats));
         }
-        match ready_rx.recv_timeout(TIMEOUT) {
-            Ok(()) => {}
-            Err(_) => panic!(
-                "binding {name:?} did not greet; its stderr: {}",
-                stderr.lock().expect("stderr lock")
-            ),
-        }
-        self.bindings.lock().expect("bindings lock").insert(
+        self.bindings.insert(
             name.to_string(),
-            BindingProcess {
-                child,
-                stdin,
-                stderr,
+            Bound {
+                binding,
+                events,
+                decisions,
             },
         );
     }
@@ -889,9 +990,57 @@ impl Relay {
 
     /// Write one raw line to binding `name`'s stdin, as the host would.
     pub(crate) fn inject_to_binding(&mut self, name: &str, message: Value) {
-        let bindings = self.bindings.lock().expect("bindings lock");
-        let binding = bindings.get(name).expect("a started binding");
-        write_line(&binding.stdin, &message);
+        let sender = self
+            .targets
+            .lock()
+            .expect("targets lock")
+            .get(name)
+            .cloned()
+            .expect("a started binding");
+        let _ = sender.blocking_send(message);
+    }
+
+    /// The next event line binding `name` writes, within `within`.
+    pub(crate) fn event(&mut self, name: &str, within: Duration) -> Value {
+        let bound = self.bindings.get_mut(name).expect("a started binding");
+        self.runtime
+            .block_on(async { tokio::time::timeout(within, bound.events.recv()).await })
+            .unwrap_or_else(|_| panic!("no event from binding {name:?} within {within:?}"))
+            .expect("the binding's event lines")
+    }
+
+    /// The next decision request binding `name` writes, within `within`.
+    pub(crate) fn decision(&mut self, name: &str, within: Duration) -> Decision {
+        let bound = self.bindings.get_mut(name).expect("a started binding");
+        self.runtime
+            .block_on(async { tokio::time::timeout(within, bound.decisions.recv()).await })
+            .unwrap_or_else(|_| panic!("no decision request from {name:?} within {within:?}"))
+            .expect("the binding's decision requests")
+    }
+
+    /// Answer binding `name`'s decision `id`.
+    pub(crate) fn answer(&mut self, name: &str, id: u64, answer: Value) {
+        let bound = self.bindings.get(name).expect("a started binding");
+        self.runtime
+            .block_on(bound.binding.answer(id, answer))
+            .expect("the binding takes the answer");
+    }
+
+    /// Stop binding `name` as a session's shutdown would, with `grace` between the signals.
+    pub(crate) fn stop_binding(&mut self, name: &str, grace: Duration) -> Stopped {
+        self.targets.lock().expect("targets lock").remove(name);
+        let bound = self.bindings.remove(name).expect("a started binding");
+        self.runtime.block_on(bound.binding.stop(grace))
+    }
+
+    /// Close binding `name`'s stdin, as the owner's death does.
+    pub(crate) fn close_binding_stdin(&mut self, name: &str) {
+        self.targets.lock().expect("targets lock").remove(name);
+        self.bindings
+            .get_mut(name)
+            .expect("a started binding")
+            .binding
+            .close_stdin();
     }
 
     /// The next message from the interpreter that is not an `rpc` line: one held back by
@@ -1093,8 +1242,8 @@ impl Relay {
     }
 
     pub(crate) fn binding_pid(&self, name: &str) -> u32 {
-        let bindings = self.bindings.lock().expect("bindings lock");
-        bindings.get(name).expect("a started binding").child.id()
+        let bound = self.bindings.get(name).expect("a started binding");
+        bound.binding.pid().as_raw() as u32
     }
 
     /// The binding process's resident set, in KiB, as `/proc` reports it.
@@ -1123,14 +1272,13 @@ impl Relay {
         self.stderr.lock().expect("stderr lock").clone()
     }
 
-    /// Every binding's stderr, labeled.
+    /// The last of every binding's stderr, labeled.
     pub(crate) fn binding_stderr(&self) -> String {
-        let bindings = self.bindings.lock().expect("bindings lock");
         let mut text = String::new();
-        for (name, binding) in bindings.iter() {
-            let said = binding.stderr.lock().expect("stderr lock");
+        for (name, bound) in &self.bindings {
+            let said = bound.binding.stderr();
             if !said.is_empty() {
-                text.push_str(&format!("[{name}] {said}"));
+                text.push_str(&format!("[{name}] {said}\n"));
             }
         }
         text
@@ -1139,17 +1287,18 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
+        // The bindings first, stopped on the runtime that reaps them; the runtime itself goes
+        // last, with the struct, so nothing is left unreaped.
+        self.targets.lock().expect("targets lock").clear();
+        for (_, bound) in self.bindings.drain() {
+            let _ = self
+                .runtime
+                .block_on(bound.binding.stop(Duration::from_millis(200)));
+        }
         if let Ok(pid) = i32::try_from(self.interpreter.id()) {
             let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
         }
         let _ = self.interpreter.wait();
-        let mut bindings = self.bindings.lock().expect("bindings lock");
-        for binding in bindings.values_mut() {
-            if let Ok(pid) = i32::try_from(binding.child.id()) {
-                let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-            }
-            let _ = binding.child.wait();
-        }
     }
 }
 
@@ -1158,7 +1307,7 @@ fn pump_interpreter(
     stdout: impl Read,
     tx: Sender<Result<Value, String>>,
     stdin: Arc<Mutex<ChildStdin>>,
-    bindings: Arc<Mutex<HashMap<String, BindingProcess>>>,
+    targets: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
     stats: Arc<Stats>,
 ) {
     for line in BufReader::with_capacity(1 << 20, stdout).lines() {
@@ -1197,16 +1346,12 @@ fn pump_interpreter(
                 .between(agent, name)
                 .record(line.len(), message["id"].as_u64(), true, closed);
         }
-        let target = binding.as_str().and_then(|name| {
-            bindings
-                .lock()
-                .expect("bindings lock")
-                .get(name)
-                .map(|binding| Arc::clone(&binding.stdin))
-        });
+        let target = binding
+            .as_str()
+            .and_then(|name| targets.lock().expect("targets lock").get(name).cloned());
         match target {
             Some(target) => {
-                write_line(&target, &message);
+                let _ = target.blocking_send(message);
             }
             None => {
                 write_line(
@@ -1221,34 +1366,22 @@ fn pump_interpreter(
     }
 }
 
-/// Route a binding's lines: `rpc` lines to the interpreter with the binding's name added, its
-/// greeting to whoever waits for it.
+/// Forward a binding's `rpc` lines, as the supervisor hands them over, to the interpreter with
+/// the binding's name added.
 fn pump_binding(
     name: String,
-    stdout: impl Read,
+    mut rpc: mpsc::Receiver<Value>,
     interpreter: Arc<Mutex<ChildStdin>>,
-    ready: Sender<()>,
     stats: Arc<Stats>,
 ) {
-    for line in BufReader::with_capacity(1 << 20, stdout).lines() {
-        let Ok(line) = line else { return };
-        let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
-            eprintln!("binding {name:?} wrote a line that is not a message: {line:?}");
-            continue;
-        };
-        if message["t"] == "rpc" {
-            message["binding"] = json!(name);
-            let len = write_line(&interpreter, &message);
-            stats.to_interpreter.record(len);
-            if let Some(agent) = message["agent"].as_str() {
-                stats
-                    .between(agent, &name)
-                    .record(len, message["id"].as_u64(), false, false);
-            }
-        } else if message["t"] == "ready" {
-            let _ = ready.send(());
-        } else {
-            eprintln!("binding {name:?} said: {message}");
+    while let Some(mut message) = rpc.blocking_recv() {
+        message["binding"] = json!(name);
+        let len = write_line(&interpreter, &message);
+        stats.to_interpreter.record(len);
+        if let Some(agent) = message["agent"].as_str() {
+            stats
+                .between(agent, &name)
+                .record(len, message["id"].as_u64(), false, false);
         }
     }
 }

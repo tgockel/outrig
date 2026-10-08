@@ -334,17 +334,24 @@ task still running in it, is `0003-25`'s, which builds the release and tests eac
 
 `Drop` does not run when the owner is killed with SIGKILL, and a process's children outlive it by
 default. So what a session starts on the host is tied to the owner by the operating system rather
-than by Rust. `0003-18` proves the arrangement and `0003-20` builds it:
+than by Rust. `0003-18` proved the arrangement and built its supervisor
+(`crates/outrig/src/python/supervisor.rs`); `0003-20` connects it to the session:
 
 - **Each binding runs in its own process group**, so one signal to the group reaches the binding
   and everything it started -- a git process, a hook, a credential helper.
-- **The binding asks for a parent-death signal**, and the owner starts it from a thread that lives
-  as long as the session. Linux sends that signal when the *thread* that started the process
-  exits, not when the whole owner does, so a binding started from a pool thread would be signaled
-  as soon as that thread exited.
-- **The binding kills its own group when the signal arrives.** The parent-death setting is cleared
-  in a forked child, so nothing the binding starts inherits it; the binding acts for all of them
-  by killing the group it leads.
+- **The owner sets a parent-death signal on the binding**, `SIGHUP`, between fork and exec, and
+  starts every binding from one thread that lives as long as the process. Linux sends that signal
+  when the *thread* that started the process exits, not when the whole owner does, so a binding
+  started from a pool thread would be signaled as soon as that thread exited. The signal stays
+  blocked until the binding program has installed its handler, so a death in between is pending
+  rather than lost; and after setting it the child checks that its parent is still the owner,
+  and exits if not, since the signal is never sent to a process whose parent was already gone.
+- **The binding kills its own group when the signal arrives**: SIGTERM to the group, a second,
+  SIGKILL to the group, itself included. The parent-death setting is cleared in a forked child,
+  so nothing the binding starts inherits it; the binding acts for all of them by killing the
+  group it leads. End of input on its stdin -- the owner's death closes the pipe -- does the
+  same, as a second detector. SIGTERM keeps its default disposition in the binding, so while the
+  owner lives only the owner's own stop decides when the group ends.
 - **Containers keep the existing cleanup** (`crates/outrig/src/container/mod.rs`): an explicit stop
   on the normal path, a detached `podman rm -f` from `Drop` when the future that was to run the
   stop is dropped, and a sweep from the panic hook.
@@ -353,14 +360,19 @@ than by Rust. `0003-18` proves the arrangement and `0003-20` builds it:
   exits -- unless native code holding the GIL keeps its reader thread from running, in which case
   it runs until the container is removed.
 
-Abrupt death is tested with `kill -9` of the owner during a slow hosted call: afterwards, nothing
-may remain in the binding's group.
+Abrupt death is tested with `kill -9` of the owner during a slow hosted call that started a
+grandchild: afterwards, nothing remains in the binding's group (`0003-18`).
 
 What this does not cover, stated rather than implied:
 
 - **A descendant that leaves the group.** A program that moves itself to a new process group or
   session is reached by neither the group kill nor the parent-death signal. A cgroup would still
   include it; none is used in this phase.
+- **A group proven empty needs a reaping PID 1.** Only `kill(-pgid, 0)` answering that no process
+  exists proves the group empty, and a killed member stays in its group as a zombie until its
+  parent reaps it. The binding is reaped by the owner, its children by init once the binding is
+  gone -- milliseconds under systemd -- so on a host whose PID 1 does not reap orphans the proof
+  fails with nothing running, and the report says not proven stopped rather than guess.
 - **The container after the owner's death.** None of the container cleanup runs after SIGKILL, and
   the container is podman's rather than a child of the owner, so it keeps running -- with the
   workspace mounted and whatever the agent started in it -- until someone removes it.
@@ -502,8 +514,9 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 
 - The default drain deadline -- `0003-19`'s design fork -- and whether anything other than the
   owner's argument may change it.
-- The grace between SIGTERM and SIGKILL for a binding's group, and whether it counts against the
-  deadline.
+- Whether anything but the owner's argument may change the grace between SIGTERM and SIGKILL for
+  a binding's group. `0003-18` made it 5 s, counted after the drain deadline rather than against
+  it, which `0003-19` and `0003-21` do the counting for.
 - Whether a round still being driven at the close ends at once, or runs on with its submissions
   refused until the model yields or the owner drops it. `0003-19` settles it.
 - Whether a callback a draining call makes into the container should be refused after the close
@@ -513,10 +526,13 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 
 ## Unverified
 
-- The parent-death signal's semantics -- sent when the creating thread exits, cleared in a forked
-  child, and not sent at all if the parent is already gone when it is requested -- are read from
-  `prctl(2)`, not run. The last is a race between the owner's death and a binding's start that
-  `0003-18` has to cover.
+- The parent-death signal's semantics were run by `0003-18`'s tests: a process started from a
+  tokio pool thread was signaled when that thread exited and a binding started from the
+  supervisor's thread was not; an owner killed between the fork and the setting of the signal
+  left a child that found its parent changed and exited; and a signal blocked before exec and
+  sent before the handler existed was delivered when the handler's installer unblocked it. Still
+  read rather than run: that the setting is cleared in a forked child, which the group kill makes
+  moot.
 - That a group kill reaches everything a binding starts holds only for descendants that stay in
   the group. Which programs a hosted library starts that leave it was not surveyed.
 - The time `shutdown` takes after the deadline was not measured. The container stop is the largest

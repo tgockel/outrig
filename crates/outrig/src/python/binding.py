@@ -6,9 +6,21 @@ arguments -- the vendored RPyC's directory, the binding's package directory, and
 root of every connection. A fourth argument, `--serialize`, is for a library that is not
 thread-safe: the binding then runs one request at a time across all its connections, in the order
 they arrived, except that a callback's nested request runs at once on the thread whose turn it is,
-and that `ping` and `close` never wait. Its stdin and stdout carry NDJSON: RPyC frames tagged by
-agent and connection, split into bounded parts (`rpc` lines), and a `ready` line once the factory
-has returned. Everything else it writes goes to stderr, where the owner logs it.
+and that `ping` and `close` never wait.
+
+Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by agent and
+connection, split into bounded parts (`rpc` lines), both ways; a `ready` line once the factory has
+returned; `event` lines, which `0003-21` fills with a request's events; `decision` lines, each a
+request held on its serving thread until the owner's answer arrives under the same id, which
+`0003-22` asks for; and `control` lines from the owner, which `0003-21` gives a meaning. Everything
+else it writes goes to stderr, where the owner logs it.
+
+The process is a supervised child of the owner, in a process group of its own, started with a
+parent-death signal (`SIGHUP`) the owner set before exec and left blocked until `main` has
+installed the handler for it. When that signal arrives, or stdin reaches its end -- the owner's
+death closes the pipe -- the binding ends everything it started: SIGTERM to its group, a short
+grace, SIGKILL to its group, itself included. SIGTERM keeps its default disposition, so while the
+owner lives its stop alone -- SIGTERM to the group, a grace, SIGKILL -- decides when the group ends.
 
 Each connection is served on a thread of its own. The objects handed out to one agent live in one
 table its connections share, so a proxy resolves on whichever of them it arrives on and on no other
@@ -44,10 +56,13 @@ import importlib
 import itertools
 import json
 import os
+import queue
 import select
+import signal
 import struct
 import sys
 import threading
+import time
 import traceback
 import types
 
@@ -71,6 +86,8 @@ FLUSHER = b"\n"
 _PROTO_IN = None
 _PROTO_OUT = None
 _send_lock = threading.Lock()
+# Bytes in one protocol line toward the owner, which drops a longer one unread.
+LINE_MAX = 1 << 20
 
 
 def _write_all(fd, data):
@@ -95,10 +112,130 @@ def _diag(text):
         _write_all(2, f"outrig-binding: {text}\n".encode("utf-8", "backslashreplace"))
 
 
-def _send(message):
-    line = (json.dumps(message) + "\n").encode("utf-8")
+def _encode(message):
+    return (json.dumps(message) + "\n").encode("utf-8")
+
+
+def _write(line):
     with _send_lock:
         _write_all(_PROTO_OUT, line)
+
+
+def _send(message):
+    _write(_encode(message))
+
+
+# ---------------------------------------------------------------------------- the owner
+
+# The signal the owner's death delivers: `PR_SET_PDEATHSIG`, set by the owner between fork and
+# exec and blocked until `main` has installed the handler, so a death in between is pending
+# rather than lost.
+DEATH_SIGNAL = signal.SIGHUP
+# How long the programs this process started have to leave on SIGTERM before SIGKILL, once the
+# owner is gone and nobody else will send it.
+DEATH_GRACE = 1.0
+_dying = threading.Lock()  # taken by the one call to `_die` that runs
+
+
+def _die(reason):
+    """End this process and everything it started: SIGTERM to the process group, a grace, SIGKILL
+    to the group, itself included. Once: the owner's death arrives as the signal and as the end
+    of stdin together, and the signal can interrupt the sleep. Main thread only, where
+    `signal.signal` is allowed; the signal handler and `_read` both run there. `killpg` cannot
+    fail here: this process is a member of its own group, and may always signal itself."""
+    if not _dying.acquire(blocking=False):
+        return
+    _diag(f"{reason}; stopping the process group")
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.killpg(os.getpgrp(), signal.SIGTERM)
+    time.sleep(DEATH_GRACE)
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+    os._exit(1)
+
+
+# ---------------------------------------------------------------------------- events and decisions
+
+_decision_ids = itertools.count(1)
+# id -> the queue its serving thread waits on for the owner's answer. Serving threads add entries
+# and the reading thread pops them with no lock: each is one dict operation, atomic under the GIL.
+_decisions = {}
+
+
+# How deep a payload may nest. The owner's JSON reader stops at 128 levels, the envelope's
+# included, and drops the line unread.
+DEPTH_MAX = 32
+
+
+def _check(value, depth=0):
+    """Refuse what the owner's JSON reader would not take -- a type JSON has no form for, a key
+    that is not a string, an integer past 64 bits, a float that is not finite, nesting past
+    `DEPTH_MAX` -- since a line the owner drops unread would leave a decision waiting for ever."""
+    if depth > DEPTH_MAX:
+        raise ValueError(f"the payload nests more than {DEPTH_MAX} levels deep")
+    if value is None or isinstance(value, (bool, str)):
+        return
+    if isinstance(value, int):
+        if not -(1 << 63) <= value < (1 << 64):
+            raise ValueError(f"the integer {value} is past what the owner reads")
+    elif isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("a float in the payload must be finite")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"a key in the payload must be a string, not {type(key).__name__}")
+            _check(item, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check(item, depth + 1)
+    else:
+        raise ValueError(f"the payload may not hold a {type(value).__name__}")
+
+
+def _line(kind, payload, **fields):
+    """A `kind` line carrying `payload`'s keys beside `fields`, encoded, within the owner's
+    bound, and of what the owner reads. `payload` may name neither `t` nor a field: a payload's
+    `id` would otherwise take a decision's place, and its `t` the line's kind."""
+    reserved = {"t", *fields}.intersection(payload)
+    if reserved:
+        raise ValueError(f"the {kind} payload may not carry {sorted(reserved)}")
+    _check(payload)
+    try:
+        # Encoded as UTF-8 rather than escaped: a lone surrogate, which `os.fsdecode` makes of a
+        # byte that is not UTF-8, would otherwise cross as an escape the owner's reader refuses.
+        text = json.dumps({"t": kind, **fields, **payload}, ensure_ascii=False, allow_nan=False)
+        line = (text + "\n").encode("utf-8")
+    except (UnicodeEncodeError, ValueError) as e:
+        raise ValueError(f"the {kind} payload holds text that is not UTF-8: {e}") from None
+    if len(line) > LINE_MAX:
+        raise ValueError(f"the {kind} line is {len(line)} bytes, past the {LINE_MAX}-byte bound")
+    return line
+
+
+def _event(payload):
+    """Publish `payload`, a dict, to the owner as an `event` line."""
+    _write(_line("event", payload))
+
+
+def _decide(payload):
+    """Ask the owner to decide `payload`, a dict, holding the calling thread -- and the request
+    it is serving -- until the answer arrives; returns the answer. A payload the owner would
+    not take -- one past the line bound, or not JSON -- raises here, before anything waits."""
+    did = next(_decision_ids)
+    line = _line("decision", payload, id=did)
+    waiter = _decisions[did] = queue.SimpleQueue()
+    try:
+        _write(line)
+    except BaseException:
+        _decisions.pop(did, None)
+        raise
+    return waiter.get()
+
+
+def _control(message):
+    """A control line from the owner. `0003-21` gives the first one, the closed flag, its
+    meaning; until then every one is noted and nothing more."""
+    _diag(f"a control line nothing handles yet: {json.dumps(message)}")
 
 
 # ---------------------------------------------------------------------------- frames
@@ -1115,10 +1252,23 @@ class Connections:
 
 
 def _handle(connections, line):
-    """Route one protocol line to its connection, or say on stderr why it could not be."""
+    """Route one protocol line by its kind: an `rpc` line to its connection, a decision's answer
+    to the thread holding the request, a control line to `_control`; or say on stderr why it
+    could not be."""
     message = json.loads(line)
-    if not isinstance(message, dict) or message.get("t") != "rpc":
-        raise ValueError(f"not an rpc message: {line[:200]!r}")
+    kind = message.get("t") if isinstance(message, dict) else None
+    if kind == "decision":
+        waiter = _decisions.pop(message.get("id"), None)
+        if waiter is None:
+            _diag(f"an answer to decision {message.get('id')!r}, which nothing awaits")
+        else:
+            waiter.put(message.get("answer"))
+        return
+    if kind == "control":
+        _control(message)
+        return
+    if kind != "rpc":
+        raise ValueError(f"not a protocol message: {line[:200]!r}")
     agent, cid = message.get("agent"), message.get("id")
     if not isinstance(agent, str) or type(cid) is not int:
         raise ValueError("an rpc message without an agent and an integer id")
@@ -1175,6 +1325,10 @@ def main():
     os.close(devnull)
     os.dup2(2, 1)
     sys.__stdout__.reconfigure(line_buffering=True)
+    # The owner set the parent-death signal before exec and left it blocked; with the handler in
+    # place, a death since then is delivered now. Before the factory, which may start programs.
+    signal.signal(DEATH_SIGNAL, lambda *_: _die("the owner is gone"))
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {DEATH_SIGNAL})
     # After the standard library, so neither directory can replace a module this program imports.
     sys.path.append(rpyc_dir)
     sys.path.append(packages)
@@ -1190,7 +1344,7 @@ def main():
     connections = Connections(Binding, root_object)
     _send({"t": "ready"})
     _read(connections)
-    os._exit(0)
+    _die("the owner closed the protocol")
 
 
 if __name__ == "__main__":

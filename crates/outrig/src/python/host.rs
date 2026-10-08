@@ -120,10 +120,10 @@ const REPLY_LINE_MAX: usize = 16 << 20;
 const REPLY_BUFFER_KEPT: usize = 64 << 10;
 
 /// The longest stderr line logged whole; the rest of a longer one is cut.
-const STDERR_LINE_MAX: usize = 4 << 10;
+pub(super) const STDERR_LINE_MAX: usize = 4 << 10;
 
 /// How many stderr lines are kept to explain an exit.
-const STDERR_TAIL_LINES: usize = 20;
+pub(super) const STDERR_TAIL_LINES: usize = 20;
 
 /// How long, once its stdout has closed, the exec client has to exit and its
 /// stderr to drain before the exit is described without them.
@@ -1306,7 +1306,7 @@ async fn exit_cause(
 /// bytes and discarding the rest of a longer one. Returns how many bytes were
 /// discarded, or `None` at end of stream. A final line without a newline
 /// counts.
-async fn next_line<R: AsyncBufRead + Unpin>(
+pub(super) async fn next_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
     max: usize,
