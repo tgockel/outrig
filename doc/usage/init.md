@@ -89,6 +89,10 @@ ASCII suggests `standard` instead. The image-config name becomes the repository 
 built from it, so a name typed here that can't be one is asked for again; see
 [`outrig image add`](image.md#outrig-image-add) for the rule.
 
+The workspace answers are held to the rules a config load applies: `host-path` must name an
+existing directory, resolved against the repo root, and `container-path` must be absolute and not
+`/`. An answer that breaks one is asked for again, after a line saying which.
+
 The model section reads your global `~/.outrig/config.toml` and lists the available models.
 Answering "yes" walks the same model-definition prompts as `outrig config init`, except the
 new `[models.<name>]` entries land in the repo config (referencing the global providers).
@@ -107,8 +111,9 @@ it doesn't, picking is needed to avoid a config with no resolvable model (defaul
 `[Y/n]`).
 
 If no `default-model` is set anywhere -- globally or at the repo level -- the agent
-prompt forces an explicit `model` selection. That guarantees the resulting config
-validates and `outrig run` will work.
+prompt forces an explicit `model` selection. With no model defined anywhere there is
+nothing to pick: outrig says so and writes the agent without a `model`, and `outrig run`
+refuses the config until you add one.
 
 Finally the image-config loop:
 
@@ -139,6 +144,12 @@ container-path = "/workspace"
 # inherits default-model from the global config
 preamble = "You are a careful coding assistant."
 ```
+
+Before writing the file, outrig reads it the way the next `outrig run` will: merged over your
+global config and validated. If that would fail, nothing is written, and the error says why --
+a global `default-model` that names no model, for one. Two things count as settled: the
+image-config `image add` writes next, which `default-image` -- or an agent in your global
+config -- may name, and the agent's `model` when no model is defined anywhere, as above.
 
 The global `~/.outrig/config.toml` is written by
 [`outrig config init`](config.md#outrig-config-init); the per-image Dockerfile and

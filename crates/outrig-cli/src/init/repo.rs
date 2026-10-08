@@ -17,7 +17,7 @@ use crate::hf::HfTreeFetcher;
 use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
-use outrig::config::{Agent, Config, LlmProvider, Model, Workspace};
+use outrig::config::{Agent, Config, ImageConfig, LlmProvider, Model, Workspace, merge};
 
 /// Idempotent. Returns `Some(image_name)` when this call wrote the
 /// repo config (the user named an image during the bootstrap), or
@@ -89,9 +89,11 @@ pub async fn resolve_or_bootstrap(
 
 /// Walks the three repo-config sections (image / model / agent),
 /// builds a [`Config`], serializes to TOML, and writes atomically via
-/// [`write_atomic`]. Section headers signal each transition so
-/// the prompts don't bleed together. A given `image_name` is written as
-/// `default-image` without asking for one. Returns the name written.
+/// [`write_atomic`] once [`check_loads`] finds the next load would take
+/// it; when that finds otherwise, nothing is written. Section headers
+/// signal each transition so the prompts don't bleed together. A given
+/// `image_name` is written as `default-image` without asking for one.
+/// Returns the name written.
 async fn write_repo_config(
     repo_root: &Path,
     global_path: &Path,
@@ -126,31 +128,76 @@ async fn write_repo_config(
         Some(name) => name,
         None => image_add::ask_name(prompt, repo_root).await?,
     };
-    let ws_default = Workspace::default();
-    let host_path = prompt
-        .ask_string(&HOST_PATH_FIELD, &ws_default.host_path().to_string_lossy())
-        .await?;
-    let container_path = prompt
-        .ask_string(
-            &CONTAINER_PATH_FIELD,
-            &ws_default.container_path().to_string_lossy(),
-        )
-        .await?;
+    let workspace = ask_workspace(prompt, repo_root).await?;
 
+    // The agent `ask_agent_model` said is written without a model, when no
+    // model exists anywhere; settled before `render` consumes both.
+    let modelless_agent = (model_choices.models.is_empty() && global.models.is_empty())
+        .then(|| agent_name.clone());
     let toml_text = render(
         agent_name,
         agent_model,
         image_name.clone(),
-        host_path,
-        container_path,
+        workspace,
         model_choices,
         preamble,
     )?;
     let cfg_path = repo_config_path(repo_root);
+    check_loads(
+        &toml_text,
+        repo_root,
+        global_path,
+        &image_name,
+        modelless_agent.as_deref(),
+    )
+    .map_err(|e| {
+        OutrigError::Configuration(format!(
+            "not writing {}: merged with {}, it would not load: {e}",
+            cfg_path.display(),
+            global_path.display()
+        ))
+    })?;
     write_atomic(&cfg_path, &toml_text)?;
     eprintln!();
     eprintln!("[outrig] wrote {}", cfg_path.display());
     Ok(image_name)
+}
+
+/// Asks for the workspace's two paths, each until the rules a load holds
+/// them to accept it, so a mistyped one is asked for again here rather than
+/// refused by the next `outrig run`. Each check can fail only the answer it
+/// follows: the probe holds the workspace and nothing else, and the
+/// `container-path` check runs without a repo root, so the `host-path`
+/// already taken is not looked for on disk again. With the global config in
+/// the probe, a fault no answer can fix would be asked about forever. The
+/// defaults always pass -- `.` is the repo root, and `/workspace` is
+/// absolute.
+async fn ask_workspace(prompt: &mut impl PromptSource, repo_root: &Path) -> Result<Workspace> {
+    let default = Workspace::default();
+    let mut probe = Config::default();
+    loop {
+        let host_path = prompt
+            .ask_string(&HOST_PATH_FIELD, &default.host_path().to_string_lossy())
+            .await?;
+        probe.workspace.set_host_path(host_path);
+        match probe.validate(Some(repo_root)) {
+            Ok(()) => break,
+            Err(e) => eprintln!("[outrig] {e}"),
+        }
+    }
+    loop {
+        let container_path = prompt
+            .ask_string(
+                &CONTAINER_PATH_FIELD,
+                &default.container_path().to_string_lossy(),
+            )
+            .await?;
+        probe.workspace.set_container_path(container_path);
+        match probe.validate(None) {
+            Ok(()) => return Ok(probe.workspace),
+            Err(e) => eprintln!("[outrig] {e}"),
+        }
+    }
 }
 
 /// Snapshot of the parts of the global config we surface in the model
@@ -353,8 +400,7 @@ fn render(
     agent_name: String,
     agent_model: Option<String>,
     image_name: String,
-    host_path: String,
-    container_path: String,
+    workspace: Workspace,
     model_choices: RepoModelChoices,
     preamble: String,
 ) -> Result<String> {
@@ -368,11 +414,49 @@ fn render(
     cfg.default_image = Some(image_name);
     cfg.default_agent = Some(agent_name);
     cfg.default_model = model_choices.default_model;
-    cfg.workspace = Workspace::new(host_path, container_path);
+    cfg.workspace = workspace;
     cfg.models = model_choices.models;
     cfg.agents = agents;
     toml::to_string_pretty(&cfg)
         .map_err(|e| OutrigError::Configuration(format!("rendering repo config: {e}")).into())
+}
+
+/// Whether the next load would take `text`, asked before it is written: the
+/// steps [`Config::load`] takes -- parse, the repo-file rules, merge over the
+/// global config at `global_path`, validate against `repo_root` -- run on the
+/// rendered text. Unlike a load, nothing is stamped with its source, and
+/// nothing needs to be: an unstamped `host-path` resolves against
+/// `repo_root` as a repo-stamped one does, and the wizard writes no image or
+/// mount paths.
+///
+/// Two things are knowingly unresolved here, and the check takes them as
+/// settled. `pending_image` is the image the `image add` after this writes,
+/// so a stand-in takes its place: whatever names it -- `default-image`, or a
+/// global agent's `image` -- resolves, while a reference to any other image
+/// no config declares is still refused. And `modelless_agent`, the agent
+/// written without a model when no model exists anywhere, has none to use,
+/// which [`ask_agent_model`] has said; it is left out with the
+/// `default-agent` that names it, so any of the global config's own agents
+/// still answer for theirs.
+fn check_loads(
+    text: &str,
+    repo_root: &Path,
+    global_path: &Path,
+    pending_image: &str,
+    modelless_agent: Option<&str>,
+) -> outrig::error::Result<()> {
+    let repo = Config::load_from_str(text)?;
+    repo.validate_as_repo()?;
+    let mut merged = merge(Config::load_global(global_path)?, repo);
+    merged.images.insert(
+        pending_image.to_string(),
+        ImageConfig::from_image_name(pending_image),
+    );
+    if let Some(agent) = modelless_agent {
+        merged.agents.remove(agent);
+        merged.default_agent = None;
+    }
+    merged.validate(Some(repo_root))
 }
 
 // ---- prompt fields --------------------------------------------------------
@@ -388,15 +472,16 @@ const CONFIGURE_NOW_FIELD: Field = Field {
 
 const HOST_PATH_FIELD: Field = Field {
     name: "Workspace host-path",
-    description: "Path on the host that gets bind-mounted into the container. \
-                  Resolved relative to the repo root.",
+    description: "Path on the host that gets bind-mounted into the container: an \
+                  existing directory, resolved relative to the repo root.",
     options: &[],
     doc_link: "doc/concepts/workspace.md",
 };
 
 const CONTAINER_PATH_FIELD: Field = Field {
     name: "Workspace container-path",
-    description: "Path inside the container where the host workspace is mounted.",
+    description: "Path inside the container where the host workspace is mounted: \
+                  absolute, and not /.",
     options: &[],
     doc_link: "doc/concepts/workspace.md",
 };

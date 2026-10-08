@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig init` asks again for a workspace path a load would refuse, and writes no repo config
+  the next load would refuse.** The repo phase -- which `outrig image add` also runs in a repo with
+  no config -- wrote `host-path` and `container-path` as typed, so a directory that doesn't
+  exist, or a relative or `/` container path, was written, reported done, and refused only by
+  the next `outrig run` or `outrig build`. Each is now asked for again, after a line saying what
+  is wrong. The finished file is then read the way the next `outrig run` will read it, merged
+  over the global config, and nothing is written if that would fail: the error names both files
+  and the reason, such as a global `default-model` that names no model. Two things count as
+  settled: the image-config `image add` writes next, whatever names it, and the agent's `model`
+  when no model is defined anywhere, which `init` already says it writes without. `outrig config
+  init` validates the global config it writes, too (#348).
+
 - **A `[workspace] container-path` that is relative or `/` is refused when the config loads.** A
   relative one loaded, and `outrig run` failed only when podman created the container, after the
   image build, with podman's `invalid container path` error, which names neither the key nor the

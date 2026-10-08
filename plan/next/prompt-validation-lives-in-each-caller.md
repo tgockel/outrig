@@ -9,7 +9,8 @@ answer checked against anything else is checked by its caller instead, in a hand
 prints the refusal with `eprintln!` and calls `ask_string` again:
 
 - `config_init.rs`: `ask_required`, the GGUF model-file pick, and the default-model pick
-- `init/repo.rs`: `ask_agent_model` and `pick_global_model`
+- `init/repo.rs`: `ask_agent_model`, `pick_global_model`, and `ask_workspace`'s two loops, added
+  for #348
 - `image_setup/add.rs`: `ask_name`, added for #184
 
 The refusals bypass the stream a `TerminalPrompt` is built over, so no scripted test can see

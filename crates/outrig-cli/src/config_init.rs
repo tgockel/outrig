@@ -18,7 +18,7 @@ use crate::error::{OutrigError, Result};
 use crate::hf::{self, HfTreeFetcher};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::paths::{global_config_path, write_atomic};
-use outrig::config::{AnthropicOptions, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
+use outrig::config::{AnthropicOptions, ApiKeyRef, Config, LlmProvider, Model, OpenAiOptions};
 
 /// Public entry: resolve the path, pick a `PromptSource` via
 /// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
@@ -59,6 +59,11 @@ pub async fn run_with(
     let default_model = prompt_default_model(prompt, &models).await?;
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
+    // With no repo root: a global config serves every repo, so no one root is
+    // the one to check its paths against. Nothing the prompts above accept
+    // fails this today, so it guards the module doc's promise rather than
+    // standing in for a prompt that asks again.
+    Config::load_from_str(&toml_text)?.validate(None)?;
     write_atomic(path, &toml_text)?;
     Ok(())
 }
