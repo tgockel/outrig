@@ -248,14 +248,19 @@ file never got are counted in a warning at exit.
 
 ### Reading it in a browser
 
-`scripts/render-session.py` turns a session directory into one HTML page. It reads
-`session.json`, `logs/events.jsonl`, and `logs/network.jsonl` when there is one, and shows the
-session; whether its record is whole; the tokens each round used; a timeline of the rounds, with
-each round's model calls, turns, executions, and messages linked by their ids; every execution's
-source, output, and traceback; the messages; and the connections. Nothing on the page runs and
-nothing on it loads from anywhere.
+`scripts/render-session.py` turns a session into one HTML page. It takes a session id, or enough
+of one to name a single session, as `outrig logs` does, and finds it under the
+[session root](#where-sessions-live) the way `outrig` does; `--session-root <path>` looks under
+another. It takes a session directory as well. It reads `session.json`, `logs/events.jsonl`, and
+`logs/network.jsonl` when there is one, and shows the session; whether its record is whole; the
+tokens each round used; a timeline of the rounds, with each round's model calls, turns,
+executions, and messages linked by their ids; every execution's source, output, and traceback;
+the messages; and the connections. Nothing on the page runs and nothing on it loads from
+anywhere.
 
 ```sh
+$ uv run --script scripts/render-session.py 3f2a
+/home/me/.local/share/outrig/sessions/20260501T134412-3f2a/report.html
 $ uv run --script scripts/render-session.py /tmp/my-debug-run
 /tmp/my-debug-run/report.html
 ```

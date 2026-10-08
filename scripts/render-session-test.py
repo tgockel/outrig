@@ -26,6 +26,7 @@ skipping.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -44,6 +45,18 @@ UV = os.environ.get("UV") or shutil.which("uv")
 EVENTS = Path("logs") / "events.jsonl"
 NETWORK = Path("logs") / "network.jsonl"
 REPORT = "report.html"
+
+
+@functools.cache
+def uv_keeps() -> dict[str, str]:
+    """Where `uv` keeps its cache and its Pythons, so that a run given a home of its own does not
+    look for them there and provision both again."""
+
+    def ask(*words: str) -> str:
+        done = subprocess.run([UV, *words], capture_output=True, text=True, check=True)
+        return done.stdout.strip()
+
+    return {"UV_CACHE_DIR": ask("cache", "dir"), "UV_PYTHON_INSTALL_DIR": ask("python", "dir")}
 
 
 def payload(marker: str) -> str:
@@ -459,15 +472,17 @@ class RenderSession(unittest.TestCase):
         network: list[dict] | None = None,
         session: object = None,
         tail: bytes = b"",
+        where: Path | None = None,
     ) -> None:
+        where = where or self.dir
         lines = []
         for n, event in enumerate(events, 1):
             kind, data, *subject = event
             lines.append(json.dumps(envelope(n, kind, data, *subject)) + "\n")
-        (self.dir / EVENTS).write_bytes("".join(lines).encode() + tail)
+        (where / EVENTS).write_bytes("".join(lines).encode() + tail)
         if network is not None:
             text = "".join(json.dumps(r) + "\n" for r in network)
-            (self.dir / NETWORK).write_text(text)
+            (where / NETWORK).write_text(text)
         if session is None:
             session = {
                 "id": "20261001T120000-f00d",
@@ -475,19 +490,50 @@ class RenderSession(unittest.TestCase):
                 "container_name": "outrig-x",
                 "image_tag": "alpine",
                 "working_dir": "/repo",
-                "session_dir": str(self.dir),
+                "session_dir": str(where),
             }
         if session is not False:
             body = session if isinstance(session, str) else json.dumps(session)
-            (self.dir / "session.json").write_text(body)
+            (where / "session.json").write_text(body)
 
-    def run_renderer(self, *args: str | Path) -> subprocess.CompletedProcess[str]:
-        env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    def record(self, where: Path) -> Path:
+        """A session that recorded, at `where` rather than at `self.dir`."""
+        (where / "logs").mkdir(parents=True)
+        self.write(ordinary(), where=where)
+        return where
+
+    def elsewhere(self) -> tuple[Path, dict[str, str | None]]:
+        """A home directory of this test's own, and the environment that puts the renderer in it,
+        so that nothing of the developer's is read; `uv` keeps its own directories."""
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        env: dict[str, str | None] = {
+            "HOME": str(home),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            **uv_keeps(),
+        }
+        return home, env
+
+    def run_renderer(
+        self,
+        *args: str | Path,
+        env: dict[str, str | None] | None = None,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the renderer as a person does. `env` is laid over the environment, a None in it
+        taking a variable away; `cwd` is where it runs, the repo being where a test runs."""
+        environment = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+        for name, value in (env or {}).items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
         return subprocess.run(
             [UV, "run", "--quiet", "--script", RENDERER, *args],
             capture_output=True,
             text=True,
-            env=env,
+            env=environment,
+            cwd=cwd,
             timeout=300,
         )
 
@@ -803,18 +849,142 @@ class RenderSession(unittest.TestCase):
         self.assertIn("refusing to write the page over", result.stderr)
         self.assertEqual(log.read_bytes(), before)
 
+    # -- naming a session by its id, as the outrig subcommands take one ----------------------
+
+    def rendered(self, result: subprocess.CompletedProcess[str], session: Path) -> None:
+        """`result` rendered `session`, and wrote the page into it."""
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(session / REPORT))
+        self.assertIn("Done.", (session / REPORT).read_text())
+
+    def test_an_id_is_looked_up_under_the_default_session_root(self) -> None:
+        home, env = self.elsewhere()
+        session = self.record(home / "data" / "outrig" / "sessions" / "20261006T192731-cc23")
+        self.rendered(self.run_renderer("20261006T192731-cc23", env=env, cwd=home), session)
+
+    def test_part_of_an_id_is_enough_when_it_names_one_session(self) -> None:
+        home, env = self.elsewhere()
+        root = home / "data" / "outrig" / "sessions"
+        session = self.record(root / "20261006T192731-cc23")
+        self.record(root / "20261006T201500-0b8e")
+        self.rendered(self.run_renderer("cc23", env=env, cwd=home), session)
+
+    def test_part_of_an_id_that_names_two_sessions_lists_them(self) -> None:
+        home, env = self.elsewhere()
+        root = home / "data" / "outrig" / "sessions"
+        self.record(root / "20261006T192731-cc23")
+        self.record(root / "20261006T201500-0b8e")
+        result = self.run_renderer("20261006", env=env, cwd=home)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('ambiguous session "20261006"; candidates:', result.stderr)
+        self.assertIn("20261006T192731-cc23", result.stderr)
+        self.assertIn("20261006T201500-0b8e", result.stderr)
+
+    def test_an_id_no_session_has_is_not_blamed_on_the_config(self) -> None:
+        home, env = self.elsewhere()
+        root = home / "data" / "outrig" / "sessions"
+        self.record(root / "20261006T192731-cc23")
+        result = self.run_renderer("ffff", env=env, cwd=home)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f'no session matching "ffff" under {root}', result.stderr)
+        self.assertNotIn("[events]", result.stderr)
+
+    def test_no_session_root_yet_says_so(self) -> None:
+        home, env = self.elsewhere()
+        result = self.run_renderer("cc23", env=env, cwd=home)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"no session root at {home / 'data' / 'outrig' / 'sessions'}", result.stderr)
+
+    def test_a_session_kept_elsewhere_is_found_through_its_link(self) -> None:
+        home, env = self.elsewhere()
+        kept = self.record(home / "debug-run")
+        root = home / "data" / "outrig" / "sessions"
+        root.mkdir(parents=True)
+        (root / "20261006T192731-cc23").symlink_to(kept)
+        self.rendered(self.run_renderer("cc23", env=env, cwd=home), root / "20261006T192731-cc23")
+        self.assertTrue((kept / REPORT).is_file())
+
+    def test_the_session_root_flag_wins(self) -> None:
+        home, env = self.elsewhere()
+        config = home / "config" / "outrig" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('session-root = "/nowhere"\n')
+        session = self.record(home / "kept" / "20261006T192731-cc23")
+        result = self.run_renderer("cc23", "--session-root", home / "kept", env=env, cwd=home)
+        self.rendered(result, session)
+
+    def test_the_global_config_names_the_session_root(self) -> None:
+        home, env = self.elsewhere()
+        session = self.record(home / "kept" / "20261006T192731-cc23")
+        config = home / "config" / "outrig" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(f'session-root = "{home / "kept"}"\n')
+        self.rendered(self.run_renderer("cc23", env=env, cwd=home), session)
+
+    def test_without_xdg_the_global_config_is_under_home(self) -> None:
+        home, env = self.elsewhere()
+        env["XDG_CONFIG_HOME"] = None
+        session = self.record(home / "kept" / "20261006T192731-cc23")
+        (home / ".outrig").mkdir()
+        (home / ".outrig" / "config.toml").write_text(f'session-root = "{home / "kept"}"\n')
+        self.rendered(self.run_renderer("cc23", env=env, cwd=home), session)
+
+    def test_the_repo_config_found_above_the_working_directory_wins(self) -> None:
+        home, env = self.elsewhere()
+        session = self.record(home / "kept" / "20261006T192731-cc23")
+        config = home / "config" / "outrig" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('session-root = "/nowhere"\n')
+        repo = home / "repo"
+        (repo / ".agents" / "outrig").mkdir(parents=True)
+        (repo / ".agents" / "outrig" / "config.toml").write_text(
+            f'session-root = "{home / "kept"}"\n'
+        )
+        (repo / "deep" / "er").mkdir(parents=True)
+        self.rendered(self.run_renderer("cc23", env=env, cwd=repo / "deep" / "er"), session)
+
+    def test_a_config_that_does_not_parse_is_named(self) -> None:
+        home, env = self.elsewhere()
+        config = home / "config" / "outrig" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("session-root =\n")
+        result = self.run_renderer("cc23", env=env, cwd=home)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"reading {config}", result.stderr)
+
+    def test_a_directory_given_by_path_needs_no_lookup(self) -> None:
+        home, env = self.elsewhere()
+        config = home / "config" / "outrig" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("session-root =\n")
+        self.write(ordinary())
+        self.rendered(self.run_renderer(self.dir, env=env, cwd=home), self.dir)
+
     # -- being pointed at the wrong thing ----------------------------------------------------
 
     def test_a_session_that_did_not_record_says_how_to(self) -> None:
         result = self.run_renderer(self.dir)
         self.assertEqual(result.returncode, 1)
+        self.assertIn("Only `outrig run-new` records one", result.stderr)
         self.assertIn('[events] mode = "record"', result.stderr)
+
+    def test_a_path_that_is_not_a_directory_is_not_blamed_on_the_config(self) -> None:
+        result = self.run_renderer(self.dir / "nope")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{self.dir / 'nope'} is not a directory", result.stderr)
+        self.assertNotIn("[events]", result.stderr)
 
     def test_the_logs_directory_points_at_its_parent(self) -> None:
         self.write(ordinary())
         result = self.run_renderer(self.dir / "logs")
         self.assertEqual(result.returncode, 1)
         self.assertIn("pass the session directory above it", result.stderr)
+
+    def test_the_log_itself_points_at_its_session(self) -> None:
+        self.write(ordinary())
+        result = self.run_renderer(self.dir / EVENTS)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"pass the session directory, {self.dir}, not the log itself", result.stderr)
 
 
 if __name__ == "__main__":

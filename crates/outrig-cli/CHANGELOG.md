@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file is readable by its owner only, and finished before the container stops; a warning at exit
   counts any events it could not take. Off by default, with no flag yet, and `run` ignores it.
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py
-  <session-dir>` renders a recording to one HTML page, written beside it as `report.html`.
+  <session>` renders a recording to one HTML page, written beside it as `report.html`; it takes
+  a session id as `outrig logs` does, or a session directory.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

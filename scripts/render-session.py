@@ -3,14 +3,18 @@
 # requires-python = ">=3.12"
 # dependencies = ["jinja2>=3.1"]
 # ///
-"""Render an OutRig session directory to one self-contained HTML page.
+"""Render an OutRig session to one self-contained HTML page.
 
-    uv run --script scripts/render-session.py <session-dir> [--out PATH]
+    uv run --script scripts/render-session.py <session> [--session-root PATH] [--out PATH]
 
-Reads `session.json`, `logs/events.jsonl` -- whose schema is `doc/reference/events.md` -- and
-`logs/network.jsonl` when there is one. `doc/usage/sessions.md` says what the page shows. It goes
-to `<session-dir>/report.html` unless `--out` says otherwise, readable by its owner only, since it
-holds what `events.jsonl` holds; its path is printed.
+`<session>` is a session directory, or a session id -- or enough of one to name a single session,
+as `outrig logs` takes it -- looked up under the session root, found the way `outrig` finds it:
+`--session-root`, else `session-root` in the repo's `.agents/outrig/config.toml` or in the global
+config, else `$XDG_DATA_HOME/outrig/sessions`. Reads `session.json`, `logs/events.jsonl` -- whose
+schema is `doc/reference/events.md` -- and `logs/network.jsonl` when there is one.
+`doc/usage/sessions.md` says what the page shows. It goes to `<session>/report.html` unless
+`--out` says otherwise, readable by its owner only, since it holds what `events.jsonl` holds; its
+path is printed.
 
 Everything the page shows was written by a model, by code a model wrote, by a user, or by a
 container -- source, tracebacks, captured output, message bodies, the host a connection claimed
@@ -39,6 +43,7 @@ import math
 import os
 import sys
 import tempfile
+import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -51,6 +56,7 @@ EVENTS = Path("logs") / "events.jsonl"
 NETWORK = Path("logs") / "network.jsonl"
 SESSION = Path("session.json")
 REPORT = "report.html"
+REPO_CONFIG = Path(".agents") / "outrig" / "config.toml"
 # The token table's usage columns: each field as the record names it, and as the page does.
 USAGE = (
     ("input_tokens", "input"),
@@ -904,29 +910,83 @@ def fail(message: str) -> int:
     return 1
 
 
+def session_root() -> Path:
+    """Where sessions live, decided as `outrig` decides it: the `session-root` key of the repo
+    config -- the nearest `.agents/outrig/config.toml` at or above the working directory -- else
+    of the global config, else the platform's data directory. A config file that is there but
+    cannot be read, or whose `session-root` is not a string, raises `ValueError` naming it."""
+    cwd = Path.cwd()
+    repo = next(filter(Path.is_file, (d / REPO_CONFIG for d in (cwd, *cwd.parents))), None)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    user = (Path(xdg) / "outrig" if xdg else Path.home() / ".outrig") / "config.toml"
+    for config in filter(Path.exists, [repo, user] if repo else [user]):
+        try:
+            root = tomllib.loads(config.read_text(encoding="utf-8")).get("session-root")
+        except (OSError, ValueError) as e:
+            raise ValueError(f"reading {config}: {e}") from e
+        if isinstance(root, str):
+            return Path(root)
+        if root is not None:
+            raise ValueError(f"reading {config}: session-root is not a string")
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "outrig" / "sessions"
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "outrig" / "data" / "sessions"
+    data = os.environ.get("XDG_DATA_HOME")
+    return (Path(data) if data else Path.home() / ".local" / "share") / "outrig" / "sessions"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
-        "session_dir", type=Path, help="the session directory, which holds session.json"
+        "session",
+        help="a session directory, or a session id -- or enough of one to name a single "
+        "session -- looked up under the session root",
     )
     parser.add_argument(
-        "--out", type=Path, help=f"where to write the page (default: <session-dir>/{REPORT})"
+        "--session-root",
+        type=Path,
+        help="where sessions live (default: as outrig decides it, from the session-root key of "
+        "the repo or global config, else <XDG_DATA_HOME>/outrig/sessions)",
+    )
+    parser.add_argument(
+        "--out", type=Path, help=f"where to write the page (default: <session>/{REPORT})"
     )
     args = parser.parse_args(argv)
 
-    directory: Path = args.session_dir
+    session: str = args.session
+    directory = Path(session)
+    if not directory.is_dir():
+        if directory.name == EVENTS.name and directory.is_file():
+            return fail(
+                f"pass the session directory, {directory.parent.parent}, not the log itself"
+            )
+        if any(sep in session for sep in (os.sep, os.altsep) if sep):
+            return fail(f"{session} is not a directory")
+        try:
+            root = args.session_root or session_root()
+        except ValueError as e:
+            return fail(str(e))
+        if not root.is_dir():
+            return fail(f"no session root at {root}")
+        directory = root / session
+        if not directory.is_dir():
+            names = sorted(p.name for p in root.iterdir() if p.is_dir() and session in p.name)
+            if not names:
+                return fail(f'no session matching "{session}" under {root}')
+            if len(names) > 1:
+                listed = "".join(f"\n  {name}" for name in names)
+                return fail(f'ambiguous session "{session}"; candidates:{listed}')
+            directory = root / names[0]
     if not (directory / EVENTS).is_file():
         if (directory / EVENTS.name).is_file():
             return fail(
                 f"{directory} looks like a logs directory; pass the session directory above it"
             )
-        if directory.name == EVENTS.name and directory.is_file():
-            return fail(
-                f"pass the session directory, {directory.parent.parent}, not the log itself"
-            )
         return fail(
-            f"no {EVENTS} in {directory}. A session records one only when its config has "
-            '[events] mode = "record"'
+            f"no {EVENTS} in {directory}. Only `outrig run-new` records one, and only when its "
+            'config has [events] mode = "record"'
         )
     out: Path = args.out or directory / REPORT
     inputs = [directory / EVENTS, directory / NETWORK, directory / SESSION]
