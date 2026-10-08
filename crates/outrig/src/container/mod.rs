@@ -594,7 +594,7 @@ impl Container {
     /// read-write and used as the working directory; extra mounts never
     /// affect `-w`.
     pub async fn start(image: &ImageTag, launch: ContainerLaunchSpec) -> Result<Self> {
-        let name = format!("outrig-{}", runtime_id());
+        let name = format!("outrig-{}", mint_session_id());
         Self::start_named(image, launch, name, None).await
     }
 
@@ -1980,7 +1980,11 @@ fn discharge(attempt: &str) {
     tracked().remove(attempt);
 }
 
-fn runtime_id() -> String {
+/// A session id in the shape `outrig run` mints: a UTC timestamp,
+/// `yyyymmddTHHMMSS`, then four hex digits of randomness. [`Container::start`]
+/// names its container by one, and `Outrig::launch` mints one when its
+/// `LaunchSpec` names no session.
+pub(crate) fn mint_session_id() -> String {
     use jiff::Zoned;
     use rand::Rng;
 

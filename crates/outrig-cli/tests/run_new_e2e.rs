@@ -281,6 +281,41 @@ fn ctrl_c(leader: &str) {
     assert!(kill.success());
 }
 
+/// SIGKILL `pid` alone: outrig dying with no chance to clean up. The container
+/// is podman's, not a child, so it keeps running.
+fn sigkill(pid: &str) {
+    let kill = std::process::Command::new("kill")
+        .args(["-KILL", "--", pid])
+        .status()
+        .expect("kill -KILL");
+    assert!(kill.success());
+}
+
+/// The id the banner named: the word after `[outrig] session id: `, ahead of
+/// the hint in parentheses.
+fn banner_session_id(stderr: &Mutex<String>) -> String {
+    stderr
+        .lock()
+        .expect("unpoisoned")
+        .lines()
+        .find_map(|line| line.strip_prefix("[outrig] session id: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the banner names the session")
+        .to_string()
+}
+
+/// `podman rm -f` of a container on drop, so an assertion that fails between
+/// a kill and the tidy-up leaves nothing behind.
+struct RemoveOnDrop(String);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("podman")
+            .args(["rm", "-f", &self.0])
+            .output();
+    }
+}
+
 /// The phase's premise, through the binary: a name bound in one round is still
 /// bound in the rounds after. Between them, a Ctrl-C at the prompt returns to
 /// the prompt, and a Ctrl-C during an `await` that would never finish stops
@@ -381,7 +416,8 @@ async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
     )
     .expect("the record parses");
     let container = record["container_name"].as_str().expect("a name");
-    assert!(container.starts_with("outrig-"), "{record:#}");
+    let id = record["id"].as_str().expect("an id");
+    assert_eq!(container, format!("outrig-{id}"), "{record:#}");
     assert!(
         stderr.contains(&format!("ready in {container}")),
         "{stderr}"
@@ -505,6 +541,22 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
         events.last().map(|e| e["type"].clone()),
         Some(json!("org.outrig.agent.stopped")),
         "{text}"
+    );
+    // Under the session's own id, the one `session.json` and `outrig ls` show.
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(session_dir.join("session.json")).expect("a record"),
+    )
+    .expect("the record parses");
+    let id = record["id"].as_str().expect("an id");
+    assert_eq!(
+        record["container_name"],
+        json!(format!("outrig-{id}")),
+        "{record:#}"
+    );
+    let source = json!(format!("/outrig/session/{id}"));
+    assert!(
+        events.iter().all(|e| e["source"] == source),
+        "every record names the session by its id: {text}"
     );
     let typed: Vec<&Value> = events
         .iter()
@@ -673,6 +725,89 @@ async fn end_of_input_shows_everything_already_sent() {
         .collect();
     let sent: Vec<String> = (0..BURST).map(|i| format!("m{i}")).collect();
     assert_eq!(shown, sent);
+}
+
+/// What a `kill -9` of outrig leaves (#469): a container named `outrig-<sid>`
+/// and labeled `org.outrig.session=<sid>`, both in `session.json`, so that
+/// with the record gone `outrig clean` finds it as a stray. A running stray is
+/// reported, never removed, for `run` and `run-new` alike; the primary runs
+/// with `--rm`, so a stopped one is gone on its own, and removing a stopped
+/// labeled stray is the sweep `mcp_sidecar_smoke.rs` covers.
+#[tokio::test]
+async fn a_killed_session_leaves_a_labeled_stray_clean_can_find() {
+    let (addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let session = Session::start(repo.path(), sessions.path());
+    wait_for(&session.stderr, "(Ctrl-D to exit", TEST_TIMEOUT).await;
+
+    let sid = banner_session_id(&session.stderr);
+    let container = format!("outrig-{sid}");
+    let tidy = RemoveOnDrop(container.clone());
+    assert!(
+        session
+            .stderr
+            .lock()
+            .expect("unpoisoned")
+            .contains(&format!("ready in {container}")),
+        "the banner names the container for the session"
+    );
+    assert_eq!(
+        podman_names(&format!("label=org.outrig.session={sid}")),
+        container,
+        "exactly the primary carries the session label"
+    );
+    let session_dir = sessions.path().join(&sid);
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(session_dir.join("session.json")).expect("a record"),
+    )
+    .expect("the record parses");
+    assert_eq!(record["id"], json!(sid), "{record:#}");
+    assert_eq!(record["container_name"], json!(container), "{record:#}");
+
+    sigkill(&session.pid);
+    let (status, _, _) = session.exit(false).await;
+    use std::os::unix::process::ExitStatusExt as _;
+    assert_eq!(status.signal(), Some(9), "{status}");
+    assert_eq!(
+        podman_names(&format!("name={container}")),
+        container,
+        "podman's container outlives outrig"
+    );
+
+    // With the record gone, as a later `clean` or a person removing the
+    // directory leaves it, the label is all that ties the container to the
+    // session.
+    std::fs::remove_dir_all(&session_dir).expect("remove the record");
+    let out = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--global-config")
+        .arg(repo.path().join("no-such-global.toml"))
+        .arg("--session-root")
+        .arg(sessions.path())
+        .args(["clean", "-y", "--older-than", "2s", "--session", &sid])
+        .output()
+        .await
+        .expect("outrig clean");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[outrig] skipped running labeled containers (no session record):\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("  {container}  session {sid}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no stopped sessions or stray containers older than 2s"),
+        "{stderr}"
+    );
+
+    drop(tidy);
+    wait_until(STEP_TIMEOUT, "the container to be removed", || {
+        podman_names(&format!("name={container}")).is_empty()
+    })
+    .await;
 }
 
 /// Lines refused as input ends are still reported: the answer to what was

@@ -22,7 +22,7 @@ use crate::container::{
     Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
     ContainerWorkspace, ExecOptions, LABEL_SESSION, LABEL_SIDECAR, PrimaryView,
     embedded::{self, McpDeclarationSource},
-    enter,
+    enter, mint_session_id,
     sidecar::{self, Placement, SessionMcpPlan},
 };
 use crate::error::{IoPathExt, OutrigError, Result, SidecarUnwindFailure};
@@ -434,8 +434,8 @@ impl From<&NetworkConfig> for NetworkSpec {
 }
 
 /// Description of one container launch: image source, optional workspace
-/// mount, MCP servers to start inside, and the directory to land per-server
-/// stderr in.
+/// mount, MCP servers to start inside, the directory to land per-server
+/// stderr in, and the session id the containers are named and labeled for.
 #[non_exhaustive]
 pub struct LaunchSpec {
     pub(crate) source: LaunchSource,
@@ -446,6 +446,16 @@ pub struct LaunchSpec {
     pub embedded_mcp_policy: EmbeddedMcpPolicy,
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub sidecars: Vec<SidecarSpec>,
+    /// The id the session's containers carry. The primary is named
+    /// `outrig-<id>` and labeled `org.outrig.session=<id>`; a sidecar is
+    /// `outrig-<id>-<name>` with the same label; the event log's `source` is
+    /// `/outrig/session/<id>`, and the network audit's session id is `<id>`.
+    /// `None` has [`Outrig::launch`] mint one, `yyyymmddTHHMMSS-xxxx` in UTC,
+    /// as `outrig run` does. Podman names must match
+    /// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so an id must be non-empty and use only
+    /// ASCII letters, digits, `_`, `.`, and `-`; `launch` refuses any other
+    /// before it builds or unpacks anything.
+    pub session_id: Option<String>,
     pub log_dir: PathBuf,
 }
 
@@ -480,6 +490,7 @@ impl LaunchSpec {
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             sidecars: Vec::new(),
+            session_id: None,
             log_dir,
         }
     }
@@ -500,6 +511,7 @@ impl LaunchSpec {
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             sidecars: Vec::new(),
+            session_id: None,
             log_dir,
         }
     }
@@ -595,6 +607,7 @@ impl LaunchSpec {
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             sidecars,
+            session_id: None,
             log_dir,
         })
     }
@@ -645,6 +658,12 @@ impl LaunchSpec {
         self
     }
 
+    /// Name the session; see [`LaunchSpec::session_id`].
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
+        self
+    }
+
     /// Declare a sidecar to start with the session. Launch-time sidecars are
     /// abort-only: any sidecar failure fails the launch and tears down
     /// everything already started (a library caller holds the `Result` and
@@ -654,6 +673,69 @@ impl LaunchSpec {
         self.sidecars.push(sidecar);
         self
     }
+}
+
+/// The id the session's containers carry: the spec's, checked, or one minted
+/// in the shape `outrig run` uses.
+fn resolve_session_id(spec: &LaunchSpec) -> Result<String> {
+    match &spec.session_id {
+        Some(id) => {
+            check_session_id(id)?;
+            Ok(id.clone())
+        }
+        None => Ok(mint_session_id()),
+    }
+}
+
+/// Whether `id` can name a container. Podman takes
+/// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, and the `outrig-` prefix supplies the first
+/// character, so the id itself may use the rest of the class.
+fn check_session_id(id: &str) -> Result<()> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    if id.is_empty() || !id.chars().all(allowed) {
+        return Err(OutrigError::Configuration(format!(
+            "session id {id:?} cannot name the session's containers: it must be non-empty and \
+             use only ASCII letters, digits, `_`, `.`, and `-`, since the primary is named \
+             `outrig-<id>`"
+        )));
+    }
+    Ok(())
+}
+
+/// The primary's `podman run` inputs for `session_id`: its name,
+/// `outrig-<id>`, and its launch spec, carrying the session label and
+/// `python` among its mounts.
+fn primary_launch(
+    spec: &LaunchSpec,
+    session_id: &str,
+    python: ContainerMount,
+) -> (String, ContainerLaunchSpec) {
+    let launch = ContainerLaunchSpec {
+        workspace: spec.workspace.as_ref().map(|workspace| {
+            ContainerWorkspace::new(
+                workspace.host.clone(),
+                workspace.container.clone(),
+                MountAccess::ReadWrite,
+            )
+        }),
+        mounts: spec
+            .mounts
+            .iter()
+            .map(|mount| {
+                ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
+            })
+            .chain([python])
+            .collect(),
+        capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+        devices: spec.security.devices.clone(),
+        no_new_privileges: spec.security.no_new_privileges,
+        unmask: spec.security.unmask.clone(),
+        labels: BTreeMap::from([(LABEL_SESSION.to_string(), session_id.to_string())]),
+        // The programmatic path never hosts entrypoint-stdio servers, so
+        // it never uses the primary-view placement.
+        primary_view: None,
+    };
+    (format!("outrig-{session_id}"), launch)
 }
 
 /// Split a planned session into the primary MCP map and the launch-time
@@ -793,18 +875,27 @@ impl Outrig {
     /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
     ///
+    /// The container is named `outrig-<id>` and labeled `org.outrig.session=<id>`
+    /// for the spec's session id, or for one minted here when the spec names
+    /// none; see [`LaunchSpec::session_id`].
+    ///
     /// The container gets OutRig's static CPython read-only at
     /// `/outrig/python`, whatever the image holds. The interpreter is embedded
     /// in this build; the first launch on a machine unpacks it under the user's
     /// cache directory. Before any image build, this fails if the workspace or
-    /// a mount is placed at or under `/outrig`, which OutRig reserves, or if
-    /// the build could not embed the payload.
+    /// a mount is placed at or under `/outrig`, which OutRig reserves, if the
+    /// session id cannot name a container, or if the build could not embed
+    /// the payload.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
         let workspace = spec.workspace.iter().map(|workspace| &workspace.container);
         let mounts = spec.mounts.iter().map(|mount| &mount.container);
         for destination in workspace.chain(mounts) {
             payload::reject_reserved(destination)?;
         }
+        // Before the payload is unpacked and before any image build, for the
+        // reason `reject_reserved` is: an id podman cannot name costs nothing
+        // to refuse here and a build to refuse at `podman run`.
+        let session_id = resolve_session_id(spec)?;
         let python = payload::mount().await?;
 
         let image_tag = match &spec.source {
@@ -824,32 +915,8 @@ impl Outrig {
             LaunchSource::Image { tag } => ImageTag::new(tag.clone()),
         };
 
-        let launch = ContainerLaunchSpec {
-            workspace: spec.workspace.as_ref().map(|workspace| {
-                ContainerWorkspace::new(
-                    workspace.host.clone(),
-                    workspace.container.clone(),
-                    MountAccess::ReadWrite,
-                )
-            }),
-            mounts: spec
-                .mounts
-                .iter()
-                .map(|mount| {
-                    ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
-                })
-                .chain([python])
-                .collect(),
-            capabilities: ContainerCapabilities::from(&spec.security.capabilities),
-            devices: spec.security.devices.clone(),
-            no_new_privileges: spec.security.no_new_privileges,
-            unmask: spec.security.unmask.clone(),
-            labels: BTreeMap::new(),
-            // The programmatic path never hosts entrypoint-stdio servers, so
-            // it never uses the primary-view placement.
-            primary_view: None,
-        };
-        let mut container = Container::start(&image_tag, launch).await?;
+        let (name, launch) = primary_launch(spec, &session_id, python);
+        let mut container = Container::start_named(&image_tag, launch, name, None).await?;
         container.bootstrap_user().await?;
 
         let network = match spec.network.mode {
@@ -1679,6 +1746,78 @@ mod tests {
             .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
 
         assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
+    }
+
+    #[test]
+    fn builder_names_the_session() {
+        let spec =
+            LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir()).with_session_id("abc");
+
+        assert_eq!(spec.session_id.as_deref(), Some("abc"));
+    }
+
+    /// OutRig's payload mount as `payload::mount()` hands it over, without
+    /// unpacking anything.
+    fn python_stand_in() -> ContainerMount {
+        ContainerMount::shared_read_only("/host/python", "/outrig/python")
+    }
+
+    #[test]
+    fn a_chosen_session_id_names_and_labels_the_primary() {
+        let spec =
+            LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir()).with_session_id("abc");
+
+        let id = resolve_session_id(&spec).expect("a valid id");
+        let (name, launch) = primary_launch(&spec, &id, python_stand_in());
+
+        assert_eq!(name, "outrig-abc");
+        assert_eq!(
+            launch.labels,
+            BTreeMap::from([(LABEL_SESSION.to_string(), "abc".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_minted_session_id_has_the_cli_shape_and_labels_the_primary() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir());
+        assert_eq!(spec.session_id, None, "the constructors choose no id");
+
+        let id = resolve_session_id(&spec).expect("minted");
+        let shape = regex::Regex::new(r"^\d{8}T\d{6}-[0-9a-f]{4}$").expect("a regex");
+        assert!(shape.is_match(&id), "{id}");
+
+        let (name, launch) = primary_launch(&spec, &id, python_stand_in());
+        assert_eq!(name.strip_prefix("outrig-"), Some(id.as_str()));
+        assert_eq!(
+            launch.labels[LABEL_SESSION], id,
+            "the label is the name's suffix"
+        );
+    }
+
+    #[test]
+    fn a_session_id_podman_cannot_name_is_refused_as_configuration() {
+        for bad in ["", "a b", "a/b", "sid\u{e9}"] {
+            let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir())
+                .with_session_id(bad);
+            match resolve_session_id(&spec) {
+                Err(OutrigError::Configuration(msg)) => {
+                    assert!(msg.contains(&format!("{bad:?}")), "{msg}");
+                }
+                Ok(id) => panic!("{bad:?} was accepted as {id:?}"),
+                Err(other) => panic!("{bad:?} was refused as {other:?}"),
+            }
+        }
+    }
+
+    /// Through the public entry: refused before the payload is unpacked or
+    /// podman is asked for anything, as the image that is never pulled shows.
+    #[tokio::test]
+    async fn launch_refuses_a_bad_session_id_before_starting_anything() {
+        let spec = LaunchSpec::from_image("localhost/never-pulled", BTreeMap::new(), log_dir())
+            .with_session_id("a b");
+
+        let err = Outrig::launch(&spec).await.err().expect("refused");
+        assert!(matches!(err, OutrigError::Configuration(_)), "{err}");
     }
 
     fn tools_sidecar() -> SidecarSpec {

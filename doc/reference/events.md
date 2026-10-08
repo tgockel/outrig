@@ -48,7 +48,7 @@ names are lower-case letters and digits only, so everything OutRig-specific is i
 |-------------------|-----------------------------------------------------------------------|
 | `specversion`     | `"1.0"`.                                                              |
 | `id`              | A decimal string counting from `"1"`, in the order of the file.       |
-| `source`          | `/outrig/session/<id>`, the session as its containers name it.        |
+| `source`          | `/outrig/session/<id>`, the id `session.json` and `outrig ls` show.   |
 | `type`            | `org.outrig.` and the event's name, as listed below.                  |
 | `subject`         | `agent/primary` for an event of the agent's; absent otherwise.        |
 | `time`            | When OutRig recorded it: RFC 3339, UTC, to the millisecond.           |
@@ -56,8 +56,8 @@ names are lower-case letters and digits only, so everything OutRig-specific is i
 | `data`            | The event's fields, listed below.                                     |
 
 `source` and `id` together are unique, as CloudEvents requires. The session id in `source` is the
-one the session's containers are named for, which `network.jsonl` records as `outrig.session_id`.
-For `run-new` that is not yet the id in `session.json`, whose `container_name` links the two.
+session's own: the one `session.json` and `outrig ls` show, which its containers are named for and
+`network.jsonl` records as `outrig.session_id`.
 
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`.

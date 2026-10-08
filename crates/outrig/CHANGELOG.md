@@ -146,7 +146,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The mode merges like `[network].mode`, and `outrig run` ignores it. Event types and the writer
   are private: the config key and `shutdown` are the whole new surface.
 
+- **`LaunchSpec::with_session_id` names the session.** The primary is named `outrig-<id>` and
+  labeled `org.outrig.session=<id>`, a sidecar `outrig-<id>-<name>` with the same label, the event
+  log's `source` is `/outrig/session/<id>`, and the network audit's session id is `<id>`. An id
+  podman cannot name -- empty, or outside ASCII letters, digits, `_`, `.`, and `-` -- fails
+  `launch` before it builds or unpacks anything. Without one, `launch` mints an id of the shape
+  `outrig run` uses, as it always has. `outrig run-new` passes its session id, so its container is
+  `outrig-<sid>` and `outrig clean` can find one an abrupt exit left behind (#469).
+
 ### Changed
+
+- **`Outrig::launch` labels its primary `org.outrig.session=<id>`**, with the id its name carries.
+  The sidecars it starts already carried it; the primary did not, so `outrig clean` could not
+  find a library session's primary once no record named it. A machine-wide `clean` now lists a
+  library session's running primary as a stray with no record, and removes a stopped one older
+  than the cutoff, which `--rm` leaves behind only when its own cleanup failed.
 
 - **`outrig` depends on `rig-core` and `reqwest`**, privately: no type of either appears in the
   public API. Through their `rustls` features the library now links `aws-lc-sys`, whose build

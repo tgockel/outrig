@@ -433,7 +433,8 @@ podman label `org.outrig.session=<session-id>`, and sidecars additionally carry
 (A library caller declares the same containers with `SidecarSpec`, which mirrors this block
 minus `start` and `on-failure` -- a spec starts when `Outrig::add_sidecar` is called, and
 launch-time sidecars are abort-only. Naming, labels, and lifecycle coupling are identical,
-so `outrig clean` sweeps a library session's strays the same way.)
+so `outrig clean` sweeps a library session's strays the same way. The session id is the one
+`LaunchSpec::with_session_id` names, or one OutRig mints when the spec names none.)
 
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
 after the primary and stop before it, and the same four cleanup layers -- explicit stop, the

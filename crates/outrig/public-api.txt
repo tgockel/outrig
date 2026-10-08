@@ -1083,6 +1083,7 @@ pub outrig::LaunchSpec::mcp: alloc::collections::btree::map::BTreeMap<alloc::str
 pub outrig::LaunchSpec::mounts: alloc::vec::Vec<outrig::MountSpec>
 pub outrig::LaunchSpec::network: outrig::NetworkSpec
 pub outrig::LaunchSpec::security: outrig::SecuritySpec
+pub outrig::LaunchSpec::session_id: core::option::Option<alloc::string::String>
 pub outrig::LaunchSpec::sidecars: alloc::vec::Vec<outrig::SidecarSpec>
 pub outrig::LaunchSpec::workspace: core::option::Option<outrig::WorkspaceSpec>
 impl outrig::LaunchSpec
@@ -1096,6 +1097,7 @@ pub fn outrig::LaunchSpec::with_mounts(self, impl core::iter::traits::collect::I
 pub fn outrig::LaunchSpec::with_network_filter(self, outrig::config::NetworkPolicy) -> Self
 pub fn outrig::LaunchSpec::with_network_mode(self, outrig::config::NetworkMode) -> Self
 pub fn outrig::LaunchSpec::with_security(self, outrig::SecuritySpec) -> Self
+pub fn outrig::LaunchSpec::with_session_id(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::LaunchSpec::with_sidecar(self, outrig::SidecarSpec) -> Self
 pub fn outrig::LaunchSpec::with_workspace(self, outrig::WorkspaceSpec) -> Self
 pub fn outrig::LaunchSpec::without_workspace(self) -> Self

@@ -364,8 +364,10 @@ What this does not cover, stated rather than implied:
 - **The container after the owner's death.** None of the container cleanup runs after SIGKILL, and
   the container is podman's rather than a child of the owner, so it keeps running -- with the
   workspace mounted and whatever the agent started in it -- until someone removes it.
-  `outrig clean` reports a running stray rather than removing it, and cannot see `run-new`'s at
-  all, which carries no session label yet (#469).
+  `outrig clean` reports a running stray rather than removing it. Since #469 the container is
+  labeled `org.outrig.session=<sid>` and named `outrig-<sid>`, so `run-new`'s is found as `run`'s
+  is; the id is the `LaunchSpec`'s, minted when the caller names none, and `0003-19`'s builder
+  takes it with the rest of the spec.
 
 ## The interpreter's death ends the session
 
@@ -508,9 +510,6 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
   rather than run. The row above lets it run, as part of a call allowed to finish. Refusing it
   would stop agent code running in a session that is ending, at the cost of failing a call that
   could have returned. `0003-21`'s callback tests are where a reason either way would show.
-- Whether the session labels its container, so that `outrig clean` can find it after an abrupt
-  death. #469 waits for the library to have a session identity, and the session API is the
-  obvious place for one.
 
 ## Unverified
 

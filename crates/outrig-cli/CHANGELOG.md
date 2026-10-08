@@ -21,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included; the model's own text goes to stderr. If the interpreter exits, the session ends with
   status 1. It starts no MCP server and no sidecar, since the model could not
   call them and a server in the primary container would sit beside the interpreter as the same
-  user, holding its resolved secrets. Its session is recorded like `run`'s. It takes `--agent`,
-  `--model`, `--image` (a configured image-config only), and `--session-dir`. Ctrl-C while its
+  user, holding its resolved secrets. Its session is recorded like `run`'s, in a container named
+  `outrig-<sid>` and labeled `org.outrig.session=<sid>`, so `outrig clean` finds one an abrupt
+  exit left behind. It takes `--agent`, `--model`, `--image` (a configured image-config only),
+  and `--session-dir`. Ctrl-C while its
   Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
   model reads how it ended; a second Ctrl-C stops waiting for it, and a Ctrl-C at the prompt then
   stops the Python it left running, counting as the first of the two that exit. With no Python

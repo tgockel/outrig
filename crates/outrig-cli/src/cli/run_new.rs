@@ -17,11 +17,13 @@
 //!
 //! The session is recorded like any other, in the order that keeps
 //! `session.json` honest: the record is written once the interpreter is up,
-//! carrying the container name [`PythonAgent`] reports. `Outrig::launch`
-//! chooses that name itself, and `discard` and `clean` read it to tell a live
-//! session from a finished one, so a record written earlier would have to hold
-//! a name that is not yet true. Until it is written, the session directory is
-//! held by a lock instead, so nothing else starts a session in it meanwhile.
+//! carrying the container name [`PythonAgent`] reports, so a live record
+//! always has a container behind it. The container is `outrig-<sid>`, labeled
+//! `org.outrig.session=<sid>`, as `run`'s is: the session id reaches
+//! [`Outrig::launch`] through its `LaunchSpec`, and `discard` and `clean` read
+//! the name back to tell a live session from a finished one. Until the record
+//! is written, the session directory is held by a lock instead, so nothing
+//! else starts a session in it meanwhile.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -140,9 +142,9 @@ pub async fn execute(
     })
     .await;
 
-    // Written only now, with the name the container really has. A session that
-    // failed to start is recorded too, and at once finalized, so it is never a
-    // live record without a container.
+    // Written only now, once the container runs under the name recorded. A
+    // session that failed to start is recorded too, and at once finalized, so
+    // it is never a live record without a container.
     if let Err(e) = store.create(&sid, args.session_dir.as_deref(), &mut session) {
         if let Ok((outrig, agent)) = started {
             shut_down(outrig, agent).await;
@@ -323,7 +325,8 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
     ));
     session.image_tag = image.tag.to_string();
 
-    let (spec, skipped) = launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir).await?;
+    let (spec, skipped) =
+        launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &session.id).await?;
     if !skipped.is_empty() {
         eprintln!(
             "[outrig] run-new starts no MCP servers; not started: {}",
@@ -351,6 +354,8 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
 
 /// The launch for `image_cfg_name`, running the already-ensured `tag`, with no
 /// MCP server and no sidecar in it -- and the names of the servers left out.
+/// Its container is named for `sid` and carries it as `org.outrig.session`, as
+/// `run`'s is.
 ///
 /// The image-config is replaced by one naming `tag`, keeping only its
 /// security, so the image that runs is the one the session records and
@@ -365,6 +370,7 @@ async fn launch_spec(
     tag: &ImageTag,
     repo_root: &Path,
     log_dir: PathBuf,
+    sid: &SessionId,
 ) -> Result<(LaunchSpec, Vec<String>)> {
     let mut pinned = cfg.clone();
     pinned.sidecars.clear();
@@ -377,7 +383,8 @@ async fn launch_spec(
     }
     let spec = LaunchSpec::from_config(&pinned, image_cfg_name, repo_root, log_dir)
         .await?
-        .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+        .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore)
+        .with_session_id(sid.as_str());
     Ok((spec, skipped))
 }
 
@@ -466,6 +473,8 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
     /// label, and names what it left out. Were `leaky` started, resolving its
     /// unset `${..}` alone would fail the launch. The image-config, here a
     /// Dockerfile, is pinned to the tag already ensured and keeps its security.
+    /// The spec carries the session id, so the container is named and labeled
+    /// for it.
     #[tokio::test]
     async fn the_launch_starts_no_mcp_server_and_no_sidecar() {
         let cfg = Config::load_from_str(WITH_SERVERS).expect("config parses");
@@ -473,16 +482,19 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         let repo = tempfile::tempdir().expect("a repo dir");
 
         let tag = ImageTag::new("docker.io/library/alpine:latest");
+        let sid = SessionId("20260925T000000-abcd".to_string());
         let (spec, skipped) = launch_spec(
             &cfg,
             "primary",
             &tag,
             repo.path(),
             repo.path().join("logs"),
+            &sid,
         )
         .await
         .expect("lowers without touching podman");
 
+        assert_eq!(spec.session_id.as_deref(), Some("20260925T000000-abcd"));
         assert!(spec.mcp.is_empty(), "{:?}", spec.mcp.keys());
         assert!(spec.sidecars.is_empty(), "a sidecar would start");
         assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
