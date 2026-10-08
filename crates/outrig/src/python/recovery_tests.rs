@@ -10,8 +10,11 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::super::host::{ExecId, Execution, Interpreter, Outcome, PRIMARY, Unknown};
-use super::super::testing::{Fake, ok, round_trip, start_on_host, within};
-use super::{ATTEMPTS, GaveUp, Press, Presses, Settled, Timings, Verdict, Waited, Waiting, settle};
+use super::super::testing::{Fake, ok, round_trip, slot_freed, start_on_host, within};
+use super::{
+    ATTEMPTS, GaveUp, Press, Presses, Settled, Timings, Verdict, Waited, Waiting, settle,
+    stop_abandoned,
+};
 use crate::events::{kinds, of_kind, opened, recorded};
 
 /// The defaults, with checks close enough together that a test waiting for
@@ -460,6 +463,45 @@ async fn a_refusal_behind_an_abandoned_execution_checks_it() {
     );
 }
 
+/// With nobody waiting, the user's stop reaches the execution holding the
+/// slot: a cancel, and an interrupt aimed at its own code, with no check
+/// between. Once it has replied there is nothing left to stop.
+#[tokio::test(start_paused = true)]
+async fn a_stop_with_nobody_waiting_cancels_the_holder_and_aims_an_interrupt_at_it() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let execution = submitted(&interpreter, &mut fake).await;
+    let holder = execution.id();
+    assert_eq!(
+        execution.stop_waiting(),
+        Outcome::Unknown(Unknown::Unresolved { id: holder })
+    );
+
+    assert_eq!(stop_abandoned(&interpreter), Some(holder));
+    assert_eq!(fake.expect("cancel").await["id"], json!(holder));
+    let request = fake.expect("interrupt").await;
+    assert_eq!(request["id"], json!(holder));
+    assert_eq!(request["runaway"], false, "{request}");
+
+    fake.result(holder, interrupted("CancelledError")).await;
+    round_trip(&interpreter, &mut fake).await;
+    assert_eq!(stop_abandoned(&interpreter), None);
+    // Nothing more was sent: the next request is the next submission.
+    let next = interpreter.submit("more()").expect("submitted");
+    fake.exec(next.id()).await;
+}
+
+/// A stop is for an execution nobody waits for. One a call is still waiting
+/// on is that call's to stop, through its presses, and is left alone.
+#[tokio::test(start_paused = true)]
+async fn a_stop_does_not_reach_an_execution_a_call_still_waits_on() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let execution = submitted(&interpreter, &mut fake).await;
+    assert_eq!(stop_abandoned(&interpreter), None);
+    // Nothing was sent: the next request the fake sees is the round trip's.
+    round_trip(&interpreter, &mut fake).await;
+    fake.ok(execution.id(), "done\n").await;
+}
+
 // ---------------------------------------------------------------------------- the real interpreter
 
 async fn settle_real(interpreter: &Interpreter, source: &str) -> (ExecId, Settled) {
@@ -583,11 +625,57 @@ async fn a_press_ends_an_await_that_never_resolves() {
     );
 }
 
+/// The case of #468: code that catches its cancellation and waits again holds
+/// the slot once a second press gives up on it, and nothing a call does can
+/// reach it. A stop with nobody waiting cancels it again, the slot comes back
+/// with its reply a late result, and the next submission runs.
+#[tokio::test]
+async fn a_stop_ends_an_execution_that_caught_its_first_cancel() {
+    let interpreter = start_on_host().await;
+    let presses = Presses::default();
+    let execution = interpreter
+        .submit(
+            "try:\n    await asyncio.get_running_loop().create_future()\n\
+             except asyncio.CancelledError:\n    pass\n\
+             await asyncio.get_running_loop().create_future()",
+        )
+        .expect("submitted");
+    let id = execution.id();
+    let _waiting = presses.waiting_on(id);
+    let settled = settling(&interpreter, execution, &presses, quick());
+    // Once the loop has run the body to its first await.
+    within(interpreter.inventory()).await.expect("an inventory");
+    presses.press();
+    // Once the cancel has been delivered, and caught.
+    within(interpreter.inventory()).await.expect("an inventory");
+    presses.press();
+    let settled = within(settled).await.expect("settled");
+    assert_eq!(
+        settled.outcome,
+        Outcome::Unknown(Unknown::Unresolved { id })
+    );
+
+    assert_eq!(stop_abandoned(&interpreter), Some(id));
+    slot_freed(&interpreter).await;
+    let late = interpreter.take_late();
+    assert_eq!(late.len(), 1, "{late:?}");
+    assert_eq!(late[0].id, id);
+    assert!(
+        matches!(&late[0].outcome, Outcome::Error { traceback, .. } if traceback.contains("CancelledError")),
+        "{late:?}"
+    );
+    assert_eq!(
+        settle_real(&interpreter, "1 + 1").await.1.outcome,
+        ok("2\n")
+    );
+}
+
 // ---------------------------------------------------------------------------- the event log
 
 /// What the host did while it waited is recorded as it did it: what the
 /// probe found the namespace holding, each probe the loop did not answer, each
-/// interrupt sent, and the giving up.
+/// interrupt sent, and the giving up -- and after it, the user's stop of what
+/// was abandoned.
 #[tokio::test(start_paused = true)]
 async fn what_the_host_did_while_waiting_is_recorded() {
     let dir = tempfile::tempdir().expect("a log dir");
@@ -610,6 +698,9 @@ async fn what_the_host_did_while_waiting_is_recorded() {
     }
     still_quiet(&mut fake, clock, clock + 5.0).await;
     within(settled).await.expect("settled");
+    assert_eq!(stop_abandoned(&interpreter), Some(id));
+    fake.expect("cancel").await;
+    fake.expect("interrupt").await;
     // The log is closed on a running clock, or its deadline passes at once.
     tokio::time::resume();
     events.close().await.expect("nothing lost");
@@ -620,6 +711,7 @@ async fn what_the_host_did_while_waiting_is_recorded() {
         expected.extend(["exec.probe.failed", "exec.interrupt.sent"]);
     }
     expected.extend(["exec.probe.failed", "exec.abandoned"]);
+    expected.extend(["exec.cancel.sent", "exec.interrupt.sent"]);
     assert_eq!(kinds(&records), expected);
     assert_eq!(
         *of_kind(&records, "inventory.observed")[0],

@@ -87,6 +87,9 @@ pub struct PythonAgent {
     user: UserChannel,
     /// What the model has been told of what waits there. Shared with the tool.
     announcer: Announcer,
+    /// The interpreter itself, for what is asked of it between rounds:
+    /// [`PythonAgent::stop_held`].
+    interpreter: Interpreter,
 }
 
 impl PythonAgent {
@@ -182,12 +185,32 @@ impl PythonAgent {
     /// reaches the model later. Each returns what it did, as a sentence for
     /// the user.
     ///
-    /// It returns `None` when no Python is running -- the model is being
-    /// called, or no round is -- and does nothing. Dropping the round's future
-    /// is how to stop one there.
+    /// It returns `None` when no call is waiting on Python -- the model is
+    /// being called, or no round is -- and does nothing. Dropping the round's
+    /// future is how to stop one there. Python left holding the interpreter
+    /// with nothing waiting on it, after a second call or a dropped round, is
+    /// [`PythonAgent::stop_held`]'s, between rounds.
     pub fn interrupter(&self) -> impl Fn() -> Option<String> + Send + Sync + 'static {
         let interrupts = self.interrupts.clone();
         move || interrupts.press()
+    }
+
+    /// Stop the execution left holding the interpreter with nothing waiting
+    /// for it -- what Ctrl-C at the prompt does -- and say so, as a sentence
+    /// for the user; `None`, doing nothing, when there is none.
+    ///
+    /// A second [`PythonAgent::interrupter`] call leaves one that way, as does
+    /// dropping a round's future while a call waits on it; every submission is
+    /// refused behind it until it ends. This cancels it and interrupts it,
+    /// which ends one suspended on an await or blocked in a call of its own.
+    /// For one that never started, because code an earlier execution left
+    /// running holds the event loop, the interrupt lands in that code instead,
+    /// as a first [`PythonAgent::interrupter`] call's would, and ending it is
+    /// what lets the execution start. Code that catches both keeps the
+    /// interpreter: call again, or end the session. How it ended reaches the
+    /// model with the next call's result.
+    pub fn stop_held(&self) -> Option<String> {
+        self.interrupts.stop_held(&self.interpreter)
     }
 
     /// The user's end of the agent's `user` channel: how what the user types
@@ -238,8 +261,8 @@ impl PythonAgent {
     ///
     /// A round whose future is dropped before it returns keeps everything
     /// before it and its completed tool calls the same way. Python it was
-    /// waiting on keeps running, so stopping that is
-    /// [`PythonAgent::interrupter`]'s.
+    /// waiting on keeps running, and holds the interpreter until it ends;
+    /// [`PythonAgent::stop_held`] stops it.
     pub async fn round(&mut self) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
         let Some(announcement) = self.announcer.opening().await? else {
             return Ok(None);
@@ -311,7 +334,7 @@ impl PythonAgent {
         let window = Window::DEFAULT;
         let history = History::new(interpreter.clone(), window);
         let tool = SubmitPython::new(
-            interpreter,
+            interpreter.clone(),
             resolved.tool_result_max_bytes,
             announcer.clone(),
         );
@@ -373,6 +396,7 @@ impl PythonAgent {
             interrupts,
             user,
             announcer,
+            interpreter,
         })
     }
 }

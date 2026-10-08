@@ -154,9 +154,11 @@ recorded as a `model.call` of its own, right after the `model.failover` that mov
   that asked for it.
 - `memory.exhausted` -- an execution raised `MemoryError`, beside its `exec.completed`: `execid`.
   The traceback is that event's `error`.
-- `exec.cancel.sent` -- `execid`. A cancel sent, which a first Ctrl-C does.
+- `exec.cancel.sent` -- `execid`. A cancel sent, which Ctrl-C does: the first on code a call waits
+  on, and one at the prompt on code left holding the interpreter.
 - `exec.interrupt.sent` -- `execid` and `runaway`. An interrupt sent: by a Ctrl-C on code blocked
-  in a call, or by OutRig on code keeping a CPU busy (`runaway`).
+  in a call, or at the prompt on code left holding the interpreter, or by OutRig on code keeping a
+  CPU busy (`runaway`).
 - `exec.probe.failed` -- a liveness check the event loop did not answer: `execid`, and `verdict`,
   which is `blocked`, `spinning`, or `starved`.
 - `exec.abandoned` -- OutRig stopped waiting for an execution, which keeps the interpreter until

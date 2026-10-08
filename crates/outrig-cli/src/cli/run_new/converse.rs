@@ -67,7 +67,10 @@ type Shared<'a> = Mutex<&'a mut PythonAgent>;
 /// reads how the code ended. With no Python running it drops the round's
 /// future, and with it the guard, so the agent -- its conversation and its
 /// interpreter -- stays with the session rather than going down with the
-/// future. Nothing then starts a round until the user types again.
+/// future. Nothing then starts a round until the user types again. At the
+/// prompt, a Ctrl-C stops Python an earlier one left holding the interpreter,
+/// through [`PythonAgent::stop_held`], and counts as the first of the two that
+/// exit, so Ctrl-C Ctrl-C leaves whether or not the code could be stopped.
 ///
 /// SIGINT is received through one listener for the whole session rather than
 /// a fresh `ctrl_c()` per wait, which would miss a press landing between two
@@ -131,11 +134,14 @@ pub(super) async fn converse(agent: &mut PythonAgent) -> Result<i32> {
                     }
                     round = None;
                     term.stderr.write_all(INTERRUPT_NOTICE).await?;
+                } else if last_was_interrupt {
+                    term.stderr.write_all(b"\n").await?;
+                    return Ok(0);
+                } else if let Some(said) = agent.lock().await.stop_held() {
+                    // No round holds the lock.
+                    term.note(&format!("\n[outrig] {said} (Ctrl-C again exits)")).await?;
                 } else {
                     term.stderr.write_all(b"\n").await?;
-                    if last_was_interrupt {
-                        return Ok(0);
-                    }
                 }
                 last_was_interrupt = true;
                 term.prompt().await?;

@@ -35,6 +35,17 @@ pub(crate) async fn within<F: Future>(step: F) -> F::Output {
         .unwrap_or_else(|_| panic!("a step took longer than {TIMEOUT:?}"))
 }
 
+/// Wait for the slot an execution nobody was waiting for held to come back,
+/// polling, since nothing on the host announces it.
+pub(crate) async fn slot_freed(interpreter: &Interpreter) {
+    within(async {
+        while interpreter.abandoned().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
 /// A clean run that printed `output` and nothing else.
 pub(crate) fn ok(output: &str) -> Outcome {
     Outcome::Ok(Report {

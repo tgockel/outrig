@@ -86,6 +86,18 @@ impl Interrupts {
         })
     }
 
+    /// Stop the execution left holding `interpreter`'s slot with nothing
+    /// waiting for it, and say so as a sentence for the user; `None` if there
+    /// is none. What [`PythonAgent::stop_held`](crate::PythonAgent::stop_held)
+    /// does, phrased beside what a press says.
+    pub(crate) fn stop_held(&self, interpreter: &Interpreter) -> Option<String> {
+        let holder = recovery::stop_abandoned(interpreter)?;
+        Some(format!(
+            "stopping execution {holder}, which holds the interpreter with nothing waiting for \
+             it -- the model will see how it ended with a later call"
+        ))
+    }
+
     /// Whether the user has stopped a call in the current turn.
     pub(crate) fn turn_stopped(&self) -> bool {
         self.turn_stopped.load(Ordering::SeqCst)

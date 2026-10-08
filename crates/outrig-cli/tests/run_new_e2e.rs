@@ -704,3 +704,87 @@ async fn lines_refused_as_input_ends_are_still_reported() {
         "nothing was delivered, so no round ran"
     );
 }
+
+/// Code that caught its cancellation holds the interpreter after a second
+/// Ctrl-C gives up on it, and every submission is refused behind it (#468). A
+/// Ctrl-C at the prompt stops it, and the next line's Python runs, with how
+/// the holder ended reported ahead of its result. Code that catches that too
+/// keeps the interpreter, and the second of two Ctrl-Cs at the prompt still
+/// exits.
+#[tokio::test]
+async fn a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running() {
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_stubborn",
+            "open('running', 'w').close()\n\
+             try:\n    await asyncio.get_running_loop().create_future()\n\
+             except asyncio.CancelledError:\n    open('caught', 'w').close()\n\
+             try:\n    await asyncio.get_running_loop().create_future()\n\
+             finally:\n    open('ended', 'w').close()",
+        ),
+        text_reply("gave up"),
+        submit("toolu_next", "print('again')"),
+        text_reply("ran again"),
+        submit(
+            "toolu_unkillable",
+            "open('holding', 'w').close()\nwhile True:\n    try:\n        \
+             await asyncio.get_running_loop().create_future()\n    except BaseException:\n        \
+             pass",
+        ),
+        text_reply("gave up again"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("wait").await;
+    wait_for_file(&repo.path().join("running"), TEST_TIMEOUT).await;
+    ctrl_c(&session.pid);
+    wait_for_file(&repo.path().join("caught"), STEP_TIMEOUT).await;
+    ctrl_c(&session.pid);
+    wait_for(&session.stderr, "gave up", STEP_TIMEOUT).await;
+    // The round after the reply finds nothing new, and the prompt is drawn.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // At the prompt, with execution 1 holding the interpreter.
+    ctrl_c(&session.pid);
+    wait_for(&session.stderr, "nothing waiting for it", STEP_TIMEOUT).await;
+    wait_for(&session.stderr, "(Ctrl-C again exits)", STEP_TIMEOUT).await;
+    wait_for_file(&repo.path().join("ended"), STEP_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    session.type_line("again").await;
+    wait_for(&session.stderr, "ran again", STEP_TIMEOUT).await;
+
+    // Code nothing stops: two Ctrl-Cs give up on it, and two more at the
+    // prompt -- the first stopping nothing -- end the session.
+    session.type_line("hold").await;
+    wait_for_file(&repo.path().join("holding"), STEP_TIMEOUT).await;
+    ctrl_c(&session.pid);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ctrl_c(&session.pid);
+    wait_for(&session.stderr, "gave up again", STEP_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ctrl_c(&session.pid);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ctrl_c(&session.pid);
+    let (status, stdout, stderr) = session.exit(false).await;
+    assert!(status.success(), "{status}: {stderr}");
+    assert_eq!(
+        stdout, "",
+        "the agent sent nothing; its commentary is on stderr"
+    );
+    assert_eq!(
+        stderr.matches("nothing waiting for it").count(),
+        2,
+        "one stop per held execution: {stderr}"
+    );
+
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 6, "three rounds of two calls");
+    let unknown = tool_result(&recorded[1], "toolu_stubborn");
+    assert!(unknown.contains("interrupted it twice"), "{unknown}");
+    let next = tool_result(&recorded[3], "toolu_next");
+    assert!(next.contains("CancelledError"), "{next}");
+    assert!(next.contains("[this call]\nagain\n"), "{next}");
+}

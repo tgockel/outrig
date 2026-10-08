@@ -282,12 +282,25 @@ loop turn after the probe's reply -- and nothing relies on it.
 more is the host's one chance to look at that execution again. It checks, interrupts it if it is
 spinning, and tells the model what it found.
 
+**Stopping an abandoned execution is the user's alone.** The check behind a refusal never cancels,
+since a suspended execution may be a long wait rather than a dead one. A Ctrl-C at the prompt, with
+no call waiting, cancels the execution holding the slot and aims an interrupt at its own code, with
+no check between. The check a press runs is for what an aimed interrupt cannot do: widen to
+whatever spins on the loop, and give the model a verdict. The aimed interrupt needs no evidence to
+be safe, since the handler declines it everywhere but in that execution's own code -- with the
+exception the handler's third condition makes: for an execution that has not started, it lands in
+whatever keeps it from starting. So stopping an abandoned execution that never got to start ends
+the earlier task holding the loop, as a first press would. A spin another execution's task left is
+still the refusal check's. Code that catches both keeps the slot; what a further press means is
+the front end's to decide.
+
 ### Every shape, and what happens
 
 - **A wedge in the execution's body.** Interrupted, by the host after a check or by Ctrl-C. An
   error result with a traceback; the slot is freed, and the next submission runs.
 - **An await that never resolves.** The host never acts, since the loop answers. Ctrl-C cancels
-  it: `CancelledError`, and the slot is freed.
+  it: `CancelledError`, and the slot is freed. Code that catches that and waits again keeps the
+  slot once a second Ctrl-C gives up on it; a Ctrl-C at the prompt cancels it again.
 - **A spin in code an imported module defines.** Awaited from a submission, it is found through
   the submission's frames. Run as a task -- `create_task`, `gather` -- it is found as a task agent
   code started. Either way it is interrupted like any other.
@@ -317,7 +330,7 @@ spinning, and tells the model what it found.
 - **Agent code that pumps the loop by hand.** The loop's own frames come before the agent's, so the
   interrupt declines there, where it could lose a callback. Only a cancel can reach it.
 - **An interrupt the code catches.** The host tries three times, then stops waiting; a second
-  Ctrl-C stops waiting at once.
+  Ctrl-C stops waiting at once, and a Ctrl-C at the prompt stops the code again.
 - **Nothing executing.** Nothing is sent. A request naming an execution that holds nothing changes
   nothing, and neither does a SIGINT nobody armed.
 

@@ -102,12 +102,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PythonAgent::interrupter` returns a function another task can call while a round runs -- what
   Ctrl-C does. The first call cancels the Python the round is waiting on, and interrupts it too if
   its event loop has stopped turning; the model reads how it ended and the round goes on, with the
-  turn's later calls not run. A second call stops waiting for it. With no Python running it
-  returns `None` and does nothing. Separately, code that keeps its event loop from turning while a
-  CPU stays busy is taken for a runaway after about half a minute and interrupted without anyone
-  asking, while code waiting on a subprocess, a sleep, or a read is left to finish. The
-  interpreter's `podman exec` client runs in a process group of its own, so the terminal's Ctrl-C
-  does not end it.
+  turn's later calls not run. A second call stops waiting for it. With no call waiting on Python
+  it returns `None` and does nothing. `PythonAgent::stop_held`, between rounds, stops Python left
+  holding the interpreter with nothing waiting on it -- after a second call, or a dropped round --
+  with a cancel and an interrupt, and says so; how it ended reaches the model with the next call.
+  Separately, code that keeps its event loop from turning while a CPU stays busy is taken for a
+  runaway after about half a minute and interrupted without anyone asking, while code waiting on a
+  subprocess, a sleep, or a read is left to finish. The interpreter's `podman exec` client runs in
+  a process group of its own, so the terminal's Ctrl-C does not end it.
 
   The interpreter lowers its own `RLIMIT_DATA` soft limit at start, to half the memory the
   container can see: its cgroup's limit, or `MemTotal`. Python that allocates past it gets a

@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user, holding its resolved secrets. Its session is recorded like `run`'s. It takes `--agent`,
   `--model`, `--image` (a configured image-config only), and `--session-dir`. Ctrl-C while its
   Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
-  model reads how it ended; a second Ctrl-C stops waiting for it. With no Python running, Ctrl-C
-  ends the round, and unlike `run`'s, the conversation before it is kept. Each model call is sent
-  the session's first two rounds, the six before the current one, and the current one; the
-  agent's Python holds the whole conversation in `runtime.history`, and
+  model reads how it ended; a second Ctrl-C stops waiting for it, and a Ctrl-C at the prompt then
+  stops the Python it left running, counting as the first of the two that exit. With no Python
+  running, Ctrl-C ends the round, and unlike `run`'s, the conversation before it is kept. Each
+  model call is sent the session's first two rounds, the six before the current one, and the
+  current one; the agent's Python holds the whole conversation in `runtime.history`, and
   `runtime.context.promote` sends a turn again until `runtime.context.demote`. Each call is held
   to the model's context window, `[models.<name>].context-window` or an assumed 128,000 tokens,
   leaving out what does not fit; a turn too large to send on its own ends its round, naming it,

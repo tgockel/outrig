@@ -710,9 +710,11 @@ impl Interpreter {
     /// which ends one that has stopped yielding or is blocked in a call such
     /// as `waitpid`. Sent only while `id` holds the slot.
     ///
-    /// It lands only in agent code: in `id`'s own, or, with `runaway`, in
+    /// It lands only in agent code: in `id`'s own; or, with `runaway`, in
     /// whatever agent code is keeping the loop from turning -- a task another
-    /// execution left running, say. It does nothing to an execution suspended
+    /// execution left running, say; or, while `id` has not started, in
+    /// whatever keeps it from starting, which is such a task too, since ending
+    /// it is what lets `id` start. It does nothing to an execution suspended
     /// on an await, whose remedy is [`Interpreter::cancel`].
     pub(crate) fn interrupt(&self, id: ExecId, runaway: bool) {
         self.stop(

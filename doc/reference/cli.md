@@ -403,7 +403,11 @@ stops waiting for it instead; it keeps the interpreter until it finishes, later 
 refused until then, and its result reaches the model with a later call. Ctrl-C while no Python
 runs -- the model is being called -- ends the round and returns to the prompt. The conversation
 keeps everything before the round, and what the round had already run. At the prompt, one Ctrl-C
-starts a fresh line and a second exits.
+starts a fresh line and a second exits. Python left holding the interpreter -- code that caught
+its cancellation, say, after a second Ctrl-C -- is stopped by a Ctrl-C at the prompt instead:
+cancelled again, and interrupted if it is blocked in a call of its own, with how it ended reaching
+the model with its next call. That press counts as the first of the two, so a second Ctrl-C still
+exits whether or not the code could be stopped.
 
 Python that keeps its event loop from turning while a CPU stays busy, such as `while True: pass`,
 is interrupted after about half a minute without anyone pressing anything, and the model reads

@@ -27,7 +27,7 @@ use crate::config::{Config, LlmProvider};
 use crate::events::{self, Events};
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
-use crate::python::testing::{ok, start_on_host, start_on_host_with, within};
+use crate::python::testing::{ok, slot_freed, start_on_host, start_on_host_with, within};
 
 const KEY: &str = "sk-ant-mock-key";
 
@@ -3820,8 +3820,8 @@ async fn ctrl_c_ends_an_await_that_never_resolves_and_the_model_reads_it() {
     assert_eq!(tool_result(&recorded[3], "toolu_next"), "2\n");
 }
 
-/// With no Python running there is nothing for Ctrl-C to reach here; the
-/// caller stops a round there by dropping it.
+/// With no Python running there is nothing for Ctrl-C to reach here, during
+/// a round or at the prompt; the caller stops a round there by dropping it.
 #[tokio::test]
 async fn ctrl_c_with_no_python_running_does_nothing() {
     let (mut agent, _requests) = agent_over(
@@ -3833,8 +3833,10 @@ async fn ctrl_c_with_no_python_running_does_nothing() {
     .await;
     let interrupt = agent.interrupter();
     assert_eq!(interrupt(), None);
+    assert_eq!(agent.stop_held(), None);
     assert_eq!(round(&mut agent, "bind").await, "bound");
     assert_eq!(interrupt(), None);
+    assert_eq!(agent.stop_held(), None);
 }
 
 /// Stopping one call in a turn stops the turn: the model wrote the next call
@@ -3909,9 +3911,12 @@ async fn ctrl_c_on_a_blocking_run_says_what_it_leaves_running() {
 }
 
 /// Pressed twice, the call stops waiting: the model is told the outcome is
-/// unknown and not to run it again, and the execution keeps the slot.
+/// unknown and not to run it again, and the execution keeps the slot, so the
+/// next submission is refused behind it. The stop with nobody waiting --
+/// Ctrl-C at the prompt -- cancels it again (#468), and the round after runs
+/// its code, with how the holder ended reported ahead of the result.
 #[tokio::test]
-async fn ctrl_c_twice_stops_waiting_and_the_model_is_told() {
+async fn ctrl_c_twice_stops_waiting_and_a_stop_at_the_prompt_ends_it() {
     let running = Running::new();
     let caught = running.then(
         "try:\n    await asyncio.get_running_loop().create_future()\n\
@@ -3927,6 +3932,8 @@ async fn ctrl_c_twice_stops_waiting_and_the_model_is_told() {
             text_reply("gave up"),
             submit("toolu_next", "1"),
             text_reply("refused"),
+            submit("toolu_again", "2"),
+            text_reply("ran"),
         ],
     )
     .await;
@@ -3938,14 +3945,59 @@ async fn ctrl_c_twice_stops_waiting_and_the_model_is_told() {
         second.starts_with("no longer waiting for execution"),
         "{second}"
     );
-
     assert_eq!(round(&mut agent, "try again").await, "refused");
+
+    let said = agent
+        .stop_held()
+        .expect("an execution was left holding the interpreter");
+    assert!(said.starts_with("stopping execution"), "{said}");
+    slot_freed(&agent.interpreter).await;
+    assert_eq!(agent.stop_held(), None);
+    assert_eq!(round(&mut agent, "once more").await, "ran");
+
     let recorded = mock_http::drain(&mut requests);
     let unknown = tool_result(&recorded[1], "toolu_stubborn");
     assert!(unknown.contains("interrupted it twice"), "{unknown}");
     assert!(unknown.contains("Do not run it again"), "{unknown}");
     let refused = tool_result(&recorded[3], "toolu_next");
     assert!(refused.starts_with("Not run: execution"), "{refused}");
+    let again = tool_result(&recorded[5], "toolu_again");
+    assert!(again.contains("has since finished: it raised"), "{again}");
+    assert!(again.contains("CancelledError"), "{again}");
+    assert!(again.contains("[this call]\n2\n"), "{again}");
+}
+
+/// A round dropped while its code blocks in a call -- `time.sleep` here --
+/// leaves that code holding the interpreter, and a cancel cannot reach a call
+/// that never yields. The stop interrupts it, and the next round runs.
+#[tokio::test]
+async fn a_stop_breaks_the_blocking_call_a_dropped_round_left_running() {
+    let running = Running::new();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_STOP_BLOCKED",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_sleep", &running.then("import time\ntime.sleep(60)")),
+            submit("toolu_next", "2"),
+            text_reply("ran"),
+        ],
+    )
+    .await;
+
+    dropped_round(&mut agent, "sleep", running.reached()).await;
+    let said = agent
+        .stop_held()
+        .expect("an execution was left holding the interpreter");
+    assert!(said.starts_with("stopping execution"), "{said}");
+    slot_freed(&agent.interpreter).await;
+
+    assert_eq!(round(&mut agent, "again").await, "ran");
+    let recorded = mock_http::drain(&mut requests);
+    let next = tool_result(&recorded[2], "toolu_next");
+    assert!(next.contains("has since finished: it raised"), "{next}");
+    assert!(next.contains("KeyboardInterrupt"), "{next}");
+    assert!(next.contains("[this call]\n2\n"), "{next}");
 }
 
 #[cfg(feature = "e2e")]

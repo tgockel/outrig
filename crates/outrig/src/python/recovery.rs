@@ -36,6 +36,19 @@
 //! for it. Each press is counted against the execution it was made during, so
 //! none reaches the next one.
 //!
+//! With no call waiting, a request reaches the execution left holding the
+//! slot -- by a press that gave up, or by a round that was dropped -- as
+//! often as it is asked ([`stop_abandoned`]): a cancel, and an interrupt
+//! aimed at the execution's own code, with no check between. The check a
+//! press runs is for what an aimed interrupt cannot do: widen to whatever
+//! spins on the loop, and give the model a verdict. The aimed interrupt
+//! itself needs no evidence to be safe, since the interpreter declines it
+//! everywhere but in that execution's own code -- with the one exception
+//! [`Interpreter::interrupt`] records: for an execution that has not
+//! started, it lands in whatever keeps it from starting, which may be a
+//! task an earlier execution left running. Nobody is waiting, so there is
+//! no giving up.
+//!
 //! # When the interpreter cannot answer at all
 //!
 //! Native code that holds the GIL starves the thread that answers
@@ -376,6 +389,24 @@ async fn rescue(interpreter: &Interpreter, holder: ExecId, timings: &Timings) ->
         interpreter.interrupt(holder, true);
     }
     verdict
+}
+
+/// Stop the execution holding the slot with nobody waiting for it -- recorded
+/// [`Unresolved`](super::host::Unknown::Unresolved), or whose [`Execution`]
+/// was dropped -- and say which; `None`, sending nothing, when there is none.
+/// The user's request, which the host never makes on its own: [`rescue`] is
+/// what it does on its own account, and that never cancels.
+///
+/// Both remedies go, with no check between (see the module docs): the cancel
+/// for an execution suspended on an await, and an interrupt aimed at its own
+/// code for one blocked in a call of its own or spinning in its own body.
+/// Where each lands, and what a reply racing them means, is
+/// [`Interpreter::cancel`]'s and [`Interpreter::interrupt`]'s.
+pub(crate) fn stop_abandoned(interpreter: &Interpreter) -> Option<ExecId> {
+    let holder = interpreter.abandoned()?;
+    interpreter.cancel(holder);
+    interpreter.interrupt(holder, false);
+    Some(holder)
 }
 
 /// Stop waiting for `execution`, for `why`: say so in `waited`, and record it.
