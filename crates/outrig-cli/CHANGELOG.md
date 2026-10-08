@@ -61,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A name a container sends in more than one piece is still read.** Under `--network audit` or
+  `filter`, the interceptor read a connection's opening bytes once, so a TLS `ClientHello` or
+  HTTP request head that arrived in pieces lost its name: a `deny` entry only that name matched
+  let the connection through, and its `network.jsonl` record showed `service` `"-"` and no host
+  -- or, for a `Host:` line cut short, just the part of the name that had arrived. The
+  interceptor now reads until the record or the head is complete, for at most 750 ms after its
+  first bytes, before it decides or forwards anything. A client whose first bytes begin a request
+  head it never finishes, such as an inline `GET key` to Redis, now waits up to those 750 ms.
+  Fixed in `outrig` (#353).
+
 - **A misspelled key in an `[images.<name>.mcp]` table entry is an error.** Every other table
   rejected unknown keys, but this one dropped them: `enviroment = { ... }` started the server
   with no environment, and a misspelled `command` beside `sidecar` or `image` quietly ran the

@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A name a client sends in more than one read is still read.** The network interceptor read a
+  client's opening bytes once, so a TLS `ClientHello` or HTTP request head that arrived in pieces
+  was never parsed. Under `default = "allow"`, `deny = ["*.evil.example"]` then let the connection
+  through, and its `network.jsonl` record carried `service = "-"` and no `server_name` or
+  `outrig.host`. No attacker is needed: a client may write its opening in pieces, and a
+  post-quantum key share takes a current `ClientHello` past 1500 bytes. The interceptor now keeps
+  reading until the TLS record or the request head is complete, for at most 750 ms after its
+  first bytes and 16 KiB in all, both in the window it gives a new connection and when a client
+  speaks only after that window; in the second case nothing is forwarded until the name has been
+  judged. A `Host:` line now counts only once it is finished and only in the head, so a read that
+  ended in `Host: www.evil.exa` no longer claims `www.evil.exa`, a `Host:` line in a request body
+  claims nothing, and bytes that are not UTF-8 elsewhere in the request -- a binary body sent
+  with the head -- no longer hide it. A client whose first bytes start a request head it never
+  finishes, such as an inline `GET key` to Redis, now waits up to 750 ms before they are
+  forwarded. (#353)
+
 - **`McpServerSpec` rejects a table key it does not know, and names it.** The enum was
   `#[serde(untagged)]` without `deny_unknown_fields`, so a table-form entry dropped unknown keys:
   `enviroment = {...}` started the server with no env, and `comand` beside `sidecar` or `image`

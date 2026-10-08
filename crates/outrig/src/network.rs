@@ -76,6 +76,8 @@ const SO_ORIGINAL_DST: libc::c_int = 80;
 /// that file, and a stand-in read from it would let the container make any
 /// address it liked the host, under a label the policy allows.
 const PASTA_HOST_STAND_IN: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
+/// How long the sniff waits for a client's first bytes, and [`read_opening`]
+/// for the rest of a TLS record or request head they begin.
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2344,9 +2346,10 @@ struct Sniffed {
 }
 
 /// Reads the client's opening bytes, giving up after [`SNIFF_TIMEOUT`] so a
-/// silent client cannot stall its own connection indefinitely. A client that
-/// waits out this window asserts nothing here; [`bridge`] re-checks whatever
-/// it says later.
+/// silent client cannot stall its own connection indefinitely. Once they
+/// begin, [`read_opening`] reads the rest of them. A client that waits out
+/// this window asserts nothing here; [`bridge`] re-checks whatever it says
+/// later.
 async fn sniff_client_stream<S: AsyncRead + Unpin>(client: &mut S) -> Sniffed {
     let mut buf = vec![0; SNIFF_BUFFER];
     let Ok(Ok(n)) = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf)).await else {
@@ -2355,12 +2358,39 @@ async fn sniff_client_stream<S: AsyncRead + Unpin>(client: &mut S) -> Sniffed {
     if n == 0 {
         return Sniffed::default();
     }
+    let Ok(n) = read_opening(client, &mut buf, n).await else {
+        return Sniffed::default();
+    };
     // Right-sized rather than truncated: these bytes are held for the life of
     // the connection, and a truncated buffer keeps its whole capacity.
     Sniffed {
         assertion: sniff_client_bytes(&buf[..n]).unwrap_or_default(),
         initial: buf[..n].to_vec(),
     }
+}
+
+/// Reads on after the `n` bytes `buf` already holds until they make up the
+/// whole TLS record or HTTP request head they begin, so a name split across
+/// reads is parsed whole. It reads no further when they begin neither, when
+/// `buf` is full, when the client closes, or [`SNIFF_TIMEOUT`] after it was
+/// called: an opening that looks unfinished may be a client waiting on the
+/// server. Returns how many bytes `buf` then holds.
+async fn read_opening<S: AsyncRead + Unpin>(
+    client: &mut S,
+    buf: &mut [u8],
+    mut n: usize,
+) -> io::Result<usize> {
+    let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
+    while n < buf.len() && opening_unfinished(&buf[..n]) {
+        // A read the deadline cancels has taken nothing from the client, and
+        // every earlier read is already counted in `n`.
+        match tokio::time::timeout_at(deadline, client.read(&mut buf[n..])).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => n += read,
+            Ok(Err(e)) => return Err(e),
+        }
+    }
+    Ok(n)
 }
 
 /// What the audit record for one connection is built from. [`proxy`] updates
@@ -2605,8 +2635,9 @@ struct LateRecheck<'a> {
 
 /// Copies both directions until either side closes. When `recheck` is set the
 /// client's first bytes -- which arrived too late for the sniff window -- are
-/// run back through the policy before any of them reach upstream, and the
-/// connection is torn down if the name they carry now denies.
+/// read whole by [`read_opening`] and run back through the policy before any
+/// of them reach upstream, and the connection is torn down if the name they
+/// carry now denies.
 async fn bridge(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
@@ -2645,7 +2676,10 @@ async fn bridge(
                 // Scoped so the sniff buffer is not held for the life of the
                 // copy loop below.
                 let mut buf = vec![0; SNIFF_BUFFER];
+                // Unbounded: the client may be waiting for the server to
+                // speak first. Only the rest of what it begins is bounded.
                 let n = client_rx.read(&mut buf).await?;
+                let n = read_opening(&mut client_rx, &mut buf, n).await?;
                 if n > 0 {
                     // `recheck` is only set when the sniff window closed with
                     // no assertion, so an empty one here re-derives the
@@ -3615,22 +3649,57 @@ fn sniff_client_bytes(bytes: &[u8]) -> Option<ClientAssertion> {
     tls_sni(bytes).map(ClientAssertion::tls)
 }
 
+/// The methods that open the HTTP requests [`http_host`] reads a claim from.
+const HTTP_METHODS: &[&[u8]] = &[
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"PATCH ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"CONNECT ",
+];
+
+/// Whether `bytes` begin a TLS record or an HTTP request head and do not yet
+/// hold all of it. The record's header gives its length; the head ends at its
+/// first empty line.
+fn opening_unfinished(bytes: &[u8]) -> bool {
+    match bytes {
+        [22, _, _, high, low, record @ ..] => {
+            record.len() < usize::from(u16::from_be_bytes([*high, *low]))
+        }
+        [22, ..] => true,
+        [] => false,
+        _ => {
+            HTTP_METHODS
+                .iter()
+                .any(|method| bytes.starts_with(method) || method.starts_with(bytes))
+                && !bytes
+                    .split_inclusive(|&byte| byte == b'\n')
+                    .any(|line| line == b"\n" || line == b"\r\n")
+        }
+    }
+}
+
 fn http_host(bytes: &[u8]) -> Option<String> {
-    const METHODS: &[&[u8]] = &[
-        b"GET ",
-        b"POST ",
-        b"PUT ",
-        b"PATCH ",
-        b"DELETE ",
-        b"HEAD ",
-        b"OPTIONS ",
-        b"CONNECT ",
-    ];
-    if !METHODS.iter().any(|method| bytes.starts_with(method)) {
+    if !HTTP_METHODS.iter().any(|method| bytes.starts_with(method)) {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    for line in text.lines() {
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        // Only the head's whole lines count: one the bytes end inside may
+        // hold part of a name, and the head ends at its first empty line.
+        let Some(line) = line.strip_suffix(b"\n") else {
+            break;
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        // Line by line, so bytes elsewhere that are not UTF-8 hide nothing.
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
@@ -6056,6 +6125,48 @@ mod tests {
         assert_eq!(record["conn_state"], "S0");
     }
 
+    /// #353's case end to end: under `default = "allow"`, a `ClientHello`
+    /// whose record header arrives alone is still denied by the name it
+    /// carries, and recorded with it.
+    #[tokio::test]
+    async fn a_client_hello_split_across_reads_is_denied_and_recorded_by_its_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, _upstream) = upstream_once().await;
+        let policy = Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        ));
+        let connection = tokio::spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            None,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            policy,
+            CancellationToken::new(),
+        ));
+
+        write_in_two(&mut client, &tls_client_hello("www.evil.example"), 5).await;
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("a denied connection ends")
+            .expect("connection task");
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], "deny[0]");
+        assert_eq!(record["service"], "ssl");
+        assert_eq!(record["server_name"], "www.evil.example");
+        assert_eq!(record["outrig.host"], "www.evil.example");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(record["orig_bytes"], 0);
+    }
+
     /// Only the stand-in moves, and only to the alias's host.
     #[test]
     fn only_the_host_stand_in_is_dialed_elsewhere() {
@@ -7388,6 +7499,66 @@ options edns0
         assert_eq!(assertion.asserted_host(), Some("registry.npmjs.org"));
     }
 
+    /// A `Host:` line a read ended partway through holds part of a name, and
+    /// claiming that part would let `*.evil.example` miss `www.evil.exa`.
+    #[test]
+    fn a_host_line_cut_short_is_not_a_claim() {
+        assert_eq!(
+            sniff_client_bytes(b"GET / HTTP/1.1\r\nHost: www.evil.exa"),
+            None
+        );
+        // Ended by a bare `\n`, it is one.
+        let assertion =
+            sniff_client_bytes(b"GET / HTTP/1.1\nHost: www.evil.example\n").expect("http sniff");
+        assert_eq!(assertion.asserted_host(), Some("www.evil.example"));
+    }
+
+    /// The claim is the head's `Host:` line, wherever it sits among bytes
+    /// that are not text, and never a line of the body.
+    #[test]
+    fn only_the_request_head_is_read_for_a_host() {
+        for request in [
+            &b"POST /upload HTTP/1.1\r\nHost: www.evil.example\r\n\r\n\xff\xfe\x00\x01"[..],
+            b"GET / HTTP/1.1\r\nCookie: \xff\r\nHost: www.evil.example\r\n\r\n",
+        ] {
+            let assertion = sniff_client_bytes(request).expect("http sniff");
+            assert_eq!(assertion.http_host.as_deref(), Some("www.evil.example"));
+        }
+        assert_eq!(
+            sniff_client_bytes(
+                b"POST / HTTP/1.1\r\nContent-Length: 24\r\n\r\nHost: www.evil.example\r\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_opening_is_unfinished_until_its_record_or_head_has_arrived() {
+        for whole in [
+            tls_client_hello("registry.npmjs.org"),
+            http_request("registry.npmjs.org"),
+            b"GET / HTTP/1.1\nHost: registry.npmjs.org\n\n".to_vec(),
+        ] {
+            for end in 1..whole.len() {
+                assert!(
+                    opening_unfinished(&whole[..end]),
+                    "{:?} is not all of it",
+                    &whole[..end]
+                );
+            }
+            assert!(!opening_unfinished(&whole), "{whole:?} is all of it");
+        }
+        // Bytes that begin neither are as complete as they will get from the
+        // first one: an ssh banner, a postgres `SSLRequest`, a memcached get.
+        for other in [
+            &b"SSH-2.0-OpenSSH_9.6\r\n"[..],
+            b"\x00\x00\x00\x08\x04\xd2\x16\x2f",
+            b"get key\r\n",
+        ] {
+            assert!(!opening_unfinished(other), "{other:?}");
+        }
+    }
+
     #[test]
     fn audit_record_uses_zeek_conn_field_names() {
         let record = AuditRecord::new(
@@ -8404,6 +8575,90 @@ options edns0
         writer.abort();
     }
 
+    /// Writes `bytes` as two pieces split at `at`, the second 10 ms after the
+    /// first -- long enough that a read taken between them returns only the
+    /// first.
+    async fn write_in_two<W: AsyncWrite + Unpin>(client: &mut W, bytes: &[u8], at: usize) {
+        let _ = client.write_all(&bytes[..at]).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = client.write_all(&bytes[at..]).await;
+    }
+
+    /// Wherever the opening is split, the name is read from all of it, and
+    /// the read ends when the rest arrives rather than when the window does.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_split_across_reads_is_read_whole() {
+        let hello = tls_client_hello("www.evil.example");
+        let request = http_request("www.evil.example");
+        for (whole, parser) in [(&hello, "tls"), (&request, "http")] {
+            for at in 1..whole.len() {
+                let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+                let sent = whole.clone();
+                let writer = tokio::spawn(async move {
+                    write_in_two(&mut client_side, &sent, at).await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+
+                let started = tokio::time::Instant::now();
+                let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+                assert_eq!(
+                    sniffed.assertion.asserted_host(),
+                    Some("www.evil.example"),
+                    "{parser} split at {at}"
+                );
+                assert_eq!(&sniffed.initial, whole, "{parser} split at {at}");
+                assert!(started.elapsed() < SNIFF_TIMEOUT, "{parser} split at {at}");
+                writer.abort();
+            }
+        }
+    }
+
+    /// The window bounds when the opening may begin, not when it must end:
+    /// one that starts just inside it still gets the time to finish.
+    #[tokio::test(start_paused = true)]
+    async fn an_opening_begun_at_the_end_of_the_window_is_read_whole() {
+        let hello = tls_client_hello("www.evil.example");
+        let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+        let sent = hello.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(SNIFF_TIMEOUT * 9 / 10).await;
+            let _ = client_side.write_all(&sent[..5]).await;
+            tokio::time::sleep(SNIFF_TIMEOUT / 2).await;
+            let _ = client_side.write_all(&sent[5..]).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+        assert_eq!(sniffed.assertion.sni.as_deref(), Some("www.evil.example"));
+        assert_eq!(sniffed.initial, hello);
+        writer.abort();
+    }
+
+    /// A beginning nothing completes is also what a client waiting on the
+    /// server looks like, so it is not waited on past the window.
+    #[tokio::test(start_paused = true)]
+    async fn an_opening_nothing_completes_is_given_up_on_when_the_window_closes() {
+        let hello = tls_client_hello("www.evil.example");
+        for beginning in [&hello[..5], b"GET key\r\n"] {
+            let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+            let sent = beginning.to_vec();
+            let writer = tokio::spawn(async move {
+                let _ = client_side.write_all(&sent).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+
+            let started = tokio::time::Instant::now();
+            let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+            assert!(started.elapsed() < SNIFF_TIMEOUT * 2, "{beginning:?}");
+            assert_eq!(sniffed.initial, beginning);
+            assert_eq!(sniffed.assertion, ClientAssertion::default());
+            writer.abort();
+        }
+    }
+
     /// Two loopback pairs standing in for the container side and the upstream
     /// side of one bridged connection.
     async fn bridged_pair() -> (TcpStream, TcpStream, TcpStream, TcpStream) {
@@ -8524,6 +8779,113 @@ options edns0
         let expected = hello.clone();
         tokio::spawn(async move {
             let _ = client.write_all(&hello).await;
+            let _ = client.shutdown().await;
+        });
+        let reader = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let _ = upstream_server.read_to_end(&mut seen).await;
+            seen
+        });
+
+        bridge(
+            &mut bridged_client,
+            &mut upstream,
+            &[],
+            Some(LateRecheck {
+                dst: addr("203.0.113.66:443"),
+                resolved: &resolved,
+                policy: &policy,
+            }),
+            &mut outcome,
+        )
+        .await;
+
+        assert_eq!(outcome.decision.action, NetworkAction::Allow);
+        assert_eq!(outcome.assertion.sni.as_deref(), Some("fine.example"));
+        assert_eq!(outcome.bytes_tx, expected.len() as u64);
+        assert_eq!(reader.await.expect("upstream reader"), expected);
+    }
+
+    /// A late opening split across reads is read whole before any of it
+    /// moves: the five bytes that arrive alone name nothing, and forwarding
+    /// them would leave the rest to be read without its record header.
+    #[tokio::test]
+    async fn a_late_client_hello_split_across_reads_still_denies() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let (mut client, mut bridged_client, mut upstream, mut upstream_server) =
+            bridged_pair().await;
+        let mut outcome = allowed_outcome();
+        let resolved = ResolvedNames::default();
+
+        let hello = tls_client_hello("www.evil.example");
+        let writer = tokio::spawn(async move {
+            write_in_two(&mut client, &hello, 5).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        // Bounded, so a recheck that misses the name fails here rather than
+        // bridging to an upstream that never closes.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge(
+                &mut bridged_client,
+                &mut upstream,
+                &[],
+                Some(LateRecheck {
+                    dst: addr("203.0.113.66:443"),
+                    resolved: &resolved,
+                    policy: &policy,
+                }),
+                &mut outcome,
+            ),
+        )
+        .await
+        .expect("a denied bridge ends");
+
+        assert_eq!(outcome.decision.action, NetworkAction::Deny);
+        assert_eq!(outcome.decision.rule, "deny[0]");
+        assert_eq!(outcome.assertion.sni.as_deref(), Some("www.evil.example"));
+        assert_eq!(outcome.bytes_tx, 0);
+
+        drop(upstream);
+        let mut seen = Vec::new();
+        upstream_server
+            .read_to_end(&mut seen)
+            .await
+            .expect("read upstream");
+        assert!(
+            seen.is_empty(),
+            "no client bytes may reach a denied upstream"
+        );
+        writer.abort();
+    }
+
+    /// Held until it is whole, a late opening still reaches upstream exactly
+    /// once and in order.
+    #[tokio::test]
+    async fn a_late_opening_split_across_reads_is_forwarded_whole() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let (mut client, mut bridged_client, mut upstream, mut upstream_server) =
+            bridged_pair().await;
+        let mut outcome = allowed_outcome();
+        let resolved = ResolvedNames::default();
+
+        let hello = tls_client_hello("fine.example");
+        let expected = hello.clone();
+        tokio::spawn(async move {
+            write_in_two(&mut client, &hello, 5).await;
             let _ = client.shutdown().await;
         });
         let reader = tokio::spawn(async move {
