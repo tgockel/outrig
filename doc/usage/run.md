@@ -214,7 +214,8 @@ tools) and `shell` is unavailable. Full details in
    The default mode skips this step entirely.
 7. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
-   handshake, and discover tools via `tools/list`.
+   handshake, and discover tools via `tools/list`. Each of those two gets 120 seconds; a server
+   that misses either fails startup, with its stderr in the error.
 8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
    an agentless session resolves as though the agent had no keys set), pick the
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
@@ -514,15 +515,18 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   before that prompt. Say what you still need rather than referring back to them. A local model's
   reply that had already streamed in full is kept, even if Ctrl-C lands while its output is still
   being written. It stops the agent *waiting*, not work already handed to the container: a
-  `shell__exec` that started a build runs to completion, and any
+  `shell__exec` that started a build may run to completion, and any
   [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn, as
   does a result the turn read from one of them but did not keep.
 
   Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
   over, belong to the session and not to the turn, so they stay up for the next prompt; what
-  Ctrl-C abandons is the request in flight over one of them. A server that is midway through
-  the work runs it to completion and simply has no one to answer. Ending the session, with
-  Ctrl-D, is what stops those.
+  Ctrl-C abandons is the request in flight over one of them. outrig sends that server
+  `notifications/cancelled` for it, but cancellation is advisory: a server that ignores it runs
+  the work to completion and simply has no one to answer. Ending the session, with Ctrl-D, is
+  what stops those. A tool call that nobody interrupts is bounded too: past its
+  [`call-timeout-secs`](../reference/config.md#imagesnamemcp) (10 minutes unless configured), it
+  is cancelled the same way and the model is told it timed out.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
 - **Ctrl-C** at the prompt discards whatever is typed on that line and draws a fresh `> `. A

@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex};
 use rmcp::ServerHandler;
 use rmcp::model::{CacheScope, CallToolRequestParams, ProtocolVersion};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_MS, sealed};
 use crate::error::OutrigError;
+use crate::mcp::tests::serve_in_memory;
 use crate::mcp_content::mcp_content_tests::{MIXED_RENDERING, rmcp_mixed_result, rmcp_rich_tool};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::process_tests::with_captured_tracing_at;
@@ -30,6 +32,9 @@ struct FakeClient {
     received: Mutex<Vec<(String, Value)>>,
     /// Canned response per backend tool name.
     responses: HashMap<String, CallResponse>,
+    /// Backend tools whose call never answers, each with the token it cancels
+    /// on entering the call and the token its drop cancels.
+    hangs: HashMap<String, (CancellationToken, CancellationToken)>,
 }
 
 impl FakeClient {
@@ -71,6 +76,18 @@ impl FakeClient {
         self
     }
 
+    /// Make `tool_name`'s call wait forever: it cancels `entered` once the call
+    /// is with this client, and `dropped` once the proxy gives up on it.
+    fn hang(
+        mut self,
+        tool_name: &str,
+        entered: CancellationToken,
+        dropped: CancellationToken,
+    ) -> Self {
+        self.hangs.insert(tool_name.to_string(), (entered, dropped));
+        self
+    }
+
     fn respond_err(mut self, tool_name: &str, msg: &str) -> Self {
         self.responses.insert(
             tool_name.to_string(),
@@ -93,6 +110,11 @@ impl BackingClient for FakeClient {
 
     async fn call_tool(&self, name: &str, args: Value) -> crate::error::Result<McpToolResult> {
         self.received.lock().unwrap().push((name.to_string(), args));
+        if let Some((entered, dropped)) = self.hangs.get(name) {
+            let _dropped = dropped.clone().drop_guard();
+            entered.cancel();
+            std::future::pending::<()>().await;
+        }
         match self.responses.get(name) {
             Some(Ok(r)) => Ok(r.clone()),
             Some(Err(e)) => Err(OutrigError::Configuration(e.to_string())),
@@ -627,18 +649,7 @@ async fn dispatch_call_forwards_every_block_intact() {
 /// sides share outrig's types would not pass.
 #[tokio::test]
 async fn a_client_sees_the_mixed_result_through_the_proxy() {
-    let proxy = mixed_proxy().await;
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-
-    let server = tokio::spawn(async move {
-        let running = rmcp::service::serve_server(proxy, server_io)
-            .await
-            .expect("serve the proxy");
-        running.waiting().await
-    });
-    let client = rmcp::service::serve_client((), client_io)
-        .await
-        .expect("connect to the proxy");
+    let (client, server) = serve_in_memory(mixed_proxy().await).await;
 
     let listed = client.list_all_tools().await.expect("tools/list");
     assert_eq!(listed.len(), 1);
@@ -667,6 +678,46 @@ async fn a_client_sees_the_mixed_result_through_the_proxy() {
         "result-level `_meta` survives the whole path"
     );
     assert_eq!(result.is_error, Some(false));
+
+    client.cancel().await.expect("client shutdown");
+    let _ = server.await;
+}
+
+/// rmcp answers a client's `notifications/cancelled` by firing the handler's
+/// token and nothing more, so the proxy has to race it: the backing call is
+/// dropped, and dropping a real [`McpClient`](crate::McpClient) call is what
+/// forwards the cancel to the server behind it.
+#[tokio::test]
+async fn a_client_cancel_drops_the_backing_call() {
+    let (entered, dropped) = (CancellationToken::new(), CancellationToken::new());
+    let fs = FakeClient::new("fs")
+        .with_tool("slow")
+        .hang("slow", entered.clone(), dropped.clone());
+    let proxy = ProxyServer::build(vec![Arc::new(fs)])
+        .await
+        .expect("build proxy");
+    let (client, server) = serve_in_memory(proxy).await;
+
+    let request = rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+        call("fs__slow", json!({})),
+    ));
+    let handle = client
+        .send_cancellable_request(request, rmcp::service::PeerRequestOptions::no_options())
+        .await
+        .expect("send tools/call");
+    // Cancel only once the call is with the backing client, or there would be
+    // no backing call to drop.
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.cancelled())
+        .await
+        .expect("the call reaches the backing client");
+    handle
+        .cancel(Some("the client stopped waiting".to_string()))
+        .await
+        .expect("send the cancel");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), dropped.cancelled())
+        .await
+        .expect("the proxy drops the backing call when its client cancels");
 
     client.cancel().await.expect("client shutdown");
     let _ = server.await;

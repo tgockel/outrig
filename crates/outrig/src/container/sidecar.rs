@@ -18,10 +18,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::{
     Config, ContainerSecurity, ImageConfig, McpServerSpec, MountConfig, SidecarOnFailure,
-    SidecarStart, SidecarView, SidecarWorkspaceAccess,
+    SidecarStart, SidecarView, SidecarWorkspaceAccess, effective_mcp_call_timeout,
 };
 use crate::container::embedded::McpDeclarationSource;
 use crate::error::{OutrigError, Result};
@@ -119,6 +120,12 @@ pub struct SessionMcpPlan {
     pub servers: BTreeMap<String, PlacedServer>,
     /// Sidecars by name -- named blocks plus anonymous ones.
     pub sidecars: BTreeMap<String, SidecarPlan>,
+    /// The config's top-level `mcp-call-timeout-secs`: the `tools/call`
+    /// deadline for every server that does not declare its own. Carried
+    /// beside the servers rather than written into each spec, so a label
+    /// server merged in later gets it too and `show-merged` shows only what
+    /// each entry declared.
+    pub mcp_call_timeout_secs: Option<u64>,
 }
 
 impl SessionMcpPlan {
@@ -171,6 +178,15 @@ impl SessionMcpPlan {
     /// merge, so an image is never inspected for a label nothing consumes.
     pub fn sidecar_honors_labels(&self, sidecar: &SidecarPlan) -> bool {
         !sidecar.anonymous && self.entrypoint_server_in(sidecar).is_none()
+    }
+
+    /// The `tools/call` deadline for `placed`: its own `call-timeout-secs`,
+    /// else this plan's [`mcp_call_timeout_secs`](Self::mcp_call_timeout_secs),
+    /// else [`DEFAULT_MCP_CALL_TIMEOUT_SECS`](crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS).
+    /// What a connected [`McpClient`](crate::McpClient) is handed through
+    /// [`with_call_timeout`](crate::McpClient::with_call_timeout).
+    pub fn call_timeout(&self, placed: &PlacedServer) -> Duration {
+        effective_mcp_call_timeout(placed.spec.call_timeout_secs(), self.mcp_call_timeout_secs)
     }
 }
 
@@ -358,7 +374,10 @@ pub(crate) fn bootstrap_needed(
 /// not in the plan and never starts. Blocks are top-level and shared, so most
 /// of them belong to some *other* image-config.
 pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan {
-    let mut plan = SessionMcpPlan::default();
+    let mut plan = SessionMcpPlan {
+        mcp_call_timeout_secs: cfg.mcp_call_timeout_secs,
+        ..SessionMcpPlan::default()
+    };
 
     let referenced = image_cfg.mcp.values().filter_map(|spec| spec.sidecar());
     for sc in referenced {
@@ -463,6 +482,7 @@ pub fn merge_sidecar_labels(
                     // anything to carry across.
                     args: Vec::new(),
                     view: crate::config::SidecarView::None,
+                    call_timeout_secs: spec.call_timeout_secs(),
                 },
                 source: McpDeclarationSource::ImageLabel,
                 placement: Placement::Sidecar(sidecar.to_string()),
@@ -589,6 +609,113 @@ image = "mcp-tools"
         assert_eq!(
             fs.spec.normalize().0,
             vec!["label-fs".to_string(), "/data".to_string()]
+        );
+    }
+
+    /// The `tools/call` deadline cascades most specific first -- a server's
+    /// own key, then the session's, then the built-in default -- and is read
+    /// after the merge, so a label server is covered by the session's too.
+    #[test]
+    fn the_call_timeout_cascades_from_server_to_session_to_default() {
+        let mut plan = plan_of(
+            r#"
+mcp-call-timeout-secs = 900
+
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[images.x.mcp]
+fs    = ["fs-mcp"]
+build = { command = ["cargo-mcp"], call-timeout-secs = 1800 }
+"#,
+        );
+        merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([("lint".to_string(), short(&["lint-mcp"]))]),
+        );
+
+        assert_eq!(
+            plan.call_timeout(&plan.servers["build"]),
+            Duration::from_secs(1800),
+            "a server's own key wins"
+        );
+        assert_eq!(
+            plan.call_timeout(&plan.servers["fs"]),
+            Duration::from_secs(900),
+            "the session's covers a server without one"
+        );
+        assert_eq!(
+            plan.call_timeout(&plan.servers["lint"]),
+            Duration::from_secs(900),
+            "and a server merged in from a label"
+        );
+
+        plan.mcp_call_timeout_secs = None;
+        assert_eq!(
+            plan.call_timeout(&plan.servers["fs"]),
+            Duration::from_secs(crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS),
+            "with neither, the built-in default"
+        );
+    }
+
+    /// The label rewrite rebuilds each entry's spec; the deadline the image
+    /// author set has to come across with the command and env.
+    #[test]
+    fn a_sidecar_label_keeps_its_call_timeout() {
+        let mut plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[sidecars.tools]
+image = "mcp-tools"
+"#,
+        );
+        merge_sidecar_labels(
+            &mut plan,
+            "tools",
+            BTreeMap::from([(
+                "build".to_string(),
+                McpServerSpec::exec(["cargo-mcp"]).with_call_timeout_secs(1800),
+            )]),
+        )
+        .expect("merge succeeds");
+
+        assert_eq!(plan.servers["build"].spec.call_timeout_secs(), Some(1800));
+        assert_eq!(
+            plan.call_timeout(&plan.servers["build"]),
+            Duration::from_secs(1800)
+        );
+    }
+
+    /// A config entry replaces a same-named label entry whole: a deadline
+    /// only the label declared does not survive the replacement.
+    #[test]
+    fn a_config_entry_drops_the_labels_call_timeout() {
+        let mut plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[images.x.mcp]
+build = ["cargo-mcp"]
+"#,
+        );
+        merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([(
+                "build".to_string(),
+                McpServerSpec::exec(["cargo-mcp"]).with_call_timeout_secs(1800),
+            )]),
+        );
+
+        assert_eq!(plan.servers["build"].spec.call_timeout_secs(), None);
+        assert_eq!(
+            plan.call_timeout(&plan.servers["build"]),
+            Duration::from_secs(crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS)
         );
     }
 

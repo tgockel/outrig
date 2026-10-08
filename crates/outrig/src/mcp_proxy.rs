@@ -475,12 +475,23 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
         Err(McpError::method_not_found::<ListPromptsRequestMethod>())
     }
 
+    /// rmcp answers a client's `notifications/cancelled` by firing `ctx.ct`
+    /// and nothing more -- the handler runs on regardless. Racing it drops the
+    /// backing call, and a dropped [`McpClient::call_tool`] forwards the
+    /// cancel to the server behind it. rmcp sends whatever this returns, and
+    /// the client has stopped listening, so the result only has to be honest.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
-        Ok(self.dispatch_call(request).await.into())
+        let result = tokio::select! {
+            result = self.dispatch_call(request) => result,
+            () = ctx.ct.cancelled() => CallToolResult::error(vec![ContentBlock::text(
+                "outrig: the call was cancelled by the client",
+            )]),
+        };
+        Ok(result.into())
     }
 }
 

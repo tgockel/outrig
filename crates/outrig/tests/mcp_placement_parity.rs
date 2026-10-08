@@ -237,3 +237,41 @@ fn entrypoint_in_sidecar_rejects_args_the_block_already_declares() {
         "got: {err:?}"
     );
 }
+
+/// `call-timeout-secs` is a table-form key like `env`: the builder reaches it
+/// from either shape, promoting `Short` the way every other setter does, and
+/// the result is what the TOML parses to.
+#[test]
+fn with_call_timeout_secs_equals_what_the_toml_parses_to() {
+    let cfg = image_block(
+        r#"
+  [images.coding.mcp]
+  build = { command = ["cargo-mcp"], call-timeout-secs = 1800 }
+"#,
+    );
+    let built = McpServerSpec::exec(["cargo-mcp"]).with_call_timeout_secs(1800);
+    assert_eq!(cfg.images["coding"].mcp["build"], built);
+    assert_eq!(built.call_timeout_secs(), Some(1800));
+
+    let promoted = McpServerSpec::Short(vec!["cargo-mcp".to_string()]).with_call_timeout_secs(1800);
+    assert_eq!(promoted, built, "a Short entry is promoted, not ignored");
+    assert_eq!(
+        McpServerSpec::Short(vec!["cargo-mcp".to_string()]).call_timeout_secs(),
+        None
+    );
+}
+
+/// The key is written only when set, so an entry without it -- every entry
+/// stamped into an image label before it existed -- serializes byte for byte
+/// as it did.
+#[test]
+fn call_timeout_secs_round_trips_and_is_elided_when_unset() {
+    let with = McpServerSpec::exec(["cargo-mcp"]).with_call_timeout_secs(30);
+    let json = serde_json::to_string(&with).expect("serialize");
+    assert!(json.contains(r#""call-timeout-secs":30"#), "{json}");
+    let back: McpServerSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, with);
+
+    let without = serde_json::to_string(&McpServerSpec::exec(["cargo-mcp"])).expect("serialize");
+    assert!(!without.contains("call-timeout"), "{without}");
+}

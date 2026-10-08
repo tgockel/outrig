@@ -169,12 +169,22 @@ pub enum OutrigError {
     #[error(transparent)]
     McpStartupFailed(Box<McpStartupFailure>),
 
-    #[error("mcp server {name:?} tools/list failed: {source}")]
+    /// The server came up but its `tools/list` failed -- the session broke,
+    /// the server answered with an error, or the listing outlived its
+    /// deadline. Carries the server's stderr tail, as
+    /// [`McpStartupFailure`] does, since a listing is still startup.
+    #[error(
+        "mcp server {name:?} tools/list failed: {source}\n  \
+         stderr ({stderr_path}):\n{stderr_tail}",
+        stderr_path = stderr_path.display(),
+    )]
     #[non_exhaustive]
     McpToolsListFailed {
         name: String,
         #[source]
         source: McpSessionError,
+        stderr_path: PathBuf,
+        stderr_tail: String,
     },
 
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
@@ -679,10 +689,16 @@ mod tests {
         let listed = OutrigError::McpToolsListFailed {
             name: "fs".to_string(),
             source: McpSessionError::new(McpFailureKind::Timeout, "request timeout after 5s"),
+            stderr_path: PathBuf::from("/logs/fs.stderr"),
+            stderr_tail: "still indexing".to_string(),
         };
         let rendered = listed.to_string();
         assert!(rendered.contains(r#""fs""#), "{rendered}");
         assert!(rendered.contains("request timeout after 5s"), "{rendered}");
+        assert!(
+            rendered.contains("/logs/fs.stderr") && rendered.contains("still indexing"),
+            "a listing is still startup, so it shows what the server said: {rendered}"
+        );
 
         let source = listed
             .source()

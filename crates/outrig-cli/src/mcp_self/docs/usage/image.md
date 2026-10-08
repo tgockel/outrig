@@ -346,13 +346,15 @@ $ outrig image build rust-dev
 ```
 
 After the build, outrig reads the stamped `org.outrig.mcp` label back off the built image and
-validates it (every server name well-formed, every command non-empty). By default it then starts
+validates it (every server name well-formed, every command non-empty, every `call-timeout-secs`
+between 1 and 3600). By default it then starts
 the image, and for each declared MCP server initializes it and calls `tools/list`, reporting the
 tool count per server. The image is built locally; nothing is pushed.
 
 Ctrl-C (or SIGTERM, or SIGHUP) once the image is built stops and removes that validation
 container before outrig exits, with `130`, `143`, or `129`. A server that never answers its
-`initialize` is the usual reason to press it. During the build itself, Ctrl-C reaches buildah
+`initialize` no longer needs it: the test gives up on it after 120 seconds, and on a
+`tools/list` after another 120. During the build itself, Ctrl-C reaches buildah
 directly, which removes the working containers it created; see
 [Cancelling a build](https://tgockel.github.io/outrig/usage/build.html#cancelling-a-build).
 
@@ -364,8 +366,9 @@ The command exits nonzero -- printing `error: ...` -- in these cases:
   invalid `[mcp]` table, a partial `[build]`): caught before the build runs.
 - **The stamped `org.outrig.mcp` label is missing or malformed**: read back off the built image
   and validated after the build, even with `--no-test`.
-- **A declared MCP server cannot initialize or return `tools/list`**: caught during the live
-  test. `--no-test` skips this check (the per-server stderr is captured in the error message).
+- **A declared MCP server cannot initialize or return `tools/list`**, including one that does
+  not answer either within 120 seconds: caught during the live test. `--no-test` skips this
+  check (the per-server stderr is captured in the error message).
 
 ### `--no-test`
 

@@ -10,23 +10,46 @@
 //! The child handle is owned by [`McpClient`] (not by rmcp's transport
 //! wrapper) so [`McpClient::shutdown`] can implement the close-stdin -> wait
 //! grace -> kill sequence the MCP spec calls for.
+//!
+//! Every request has a deadline. rmcp's own helpers send with none, so a
+//! server that accepts stdin and never answers would otherwise hold startup
+//! or a turn for as long as it liked: `initialize` and `tools/list` each get
+//! [`STARTUP_TIMEOUT`], and `tools/call` gets the client's configurable
+//! deadline (see [`McpClient::with_call_timeout`]).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::{RoleClient, RunningService, serve_client};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, RequestId,
+    ServerResult,
+};
+use rmcp::service::{
+    Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError, serve_client,
+};
 use serde_json::Value;
 
-use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue};
+use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue, effective_mcp_call_timeout};
 use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a server has to answer `initialize`, and then again to finish
+/// answering `tools/list`, every page included. The `initialize` clock starts
+/// at the spawn of the transport, so it covers `podman exec` or `podman start
+/// --attach` as well as the server's own start, and a server that fetches
+/// itself on first launch (`npx -y`, `uvx`) spends its download inside it too
+/// -- which is why it is minutes rather than seconds. Past it the server is
+/// presumed hung, and startup fails the way it does for a server that crashed.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `reason` a dropped call's `notifications/cancelled` carries.
+const ABANDONED_REASON: &str = "outrig stopped waiting for this call";
 
 /// On `Drop` without an explicit [`McpClient::shutdown`], the child is owned by
 /// outrig's process layer: it is SIGKILLed synchronously and reaped by the
@@ -45,11 +68,21 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// reaches the process holding this client and not the transport. It belongs
 /// to the session rather than to whatever request a Ctrl-C abandons, and
 /// [`McpClient::shutdown`] or a drop is what ends it.
+///
+/// A call that is dropped before its answer lands -- a turn a Ctrl-C
+/// abandoned, a proxied call its own client cancelled -- sends the server
+/// `notifications/cancelled`, as one that outlives its deadline does.
+/// Cancellation is advisory: a server may finish the work anyway, and its
+/// answer is discarded.
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
     service: RunningService<RoleClient, ()>,
     child: Owned,
+    /// Kept so a failure after the handshake can show what the server said,
+    /// the way a failed handshake already does.
+    stderr_path: PathBuf,
+    call_timeout: Duration,
 }
 
 impl McpClient {
@@ -65,6 +98,10 @@ impl McpClient {
     /// The `name` is used both for the stderr filename and for diagnostic
     /// messages; callers should pass the server's local config name (e.g.
     /// `"fs"`).
+    ///
+    /// The `tools/call` deadline is `server_cfg`'s own `call-timeout-secs`, else
+    /// the default; a session's `mcp-call-timeout-secs` is the caller's to
+    /// resolve and apply with [`with_call_timeout`](Self::with_call_timeout).
     pub async fn connect_via_podman_exec(
         container: &Container,
         server_cfg: &McpServerSpec,
@@ -109,15 +146,20 @@ impl McpClient {
         // working directory has come up for one yet.
         let exec_cmd =
             container.build_exec_argv(&command, &ExecOptions::new().with_resolved_env(env));
-        Self::connect_stdio_cmd(
+        let client = Self::connect_stdio_cmd(
             exec_cmd,
             name,
             declaration_source,
             log_dir,
             container.transcript(),
             &command,
+            STARTUP_TIMEOUT,
         )
-        .await
+        .await?;
+        Ok(client.with_call_timeout(effective_mcp_call_timeout(
+            server_cfg.call_timeout_secs(),
+            None,
+        )))
     }
 
     /// Connect an entrypoint-stdio server: spawn
@@ -132,6 +174,10 @@ impl McpClient {
     /// exits and takes the container with it (`--rm`). A server that ignores
     /// EOF gets the *attach child* SIGKILLed, which does not stop the
     /// container itself -- session teardown's `Container::stop` covers that.
+    ///
+    /// There is no spec here to read a `call-timeout-secs` from: the
+    /// `tools/call` deadline starts at the default, for the caller to replace
+    /// with [`with_call_timeout`](Self::with_call_timeout).
     pub async fn connect_via_podman_start(
         container: &Container,
         name: &str,
@@ -157,14 +203,16 @@ impl McpClient {
             log_dir,
             container.transcript(),
             &argv,
+            STARTUP_TIMEOUT,
         )
         .await
     }
 
     /// Transport-agnostic connection tail: spawn `cmd` with piped stdio and
     /// stderr redirected to `<log_dir>/<name>.stderr`, then drive the MCP
-    /// `initialize` handshake. `display_command` is what a startup failure
-    /// reports as the attempted command.
+    /// `initialize` handshake, giving the server `initialize_within` to
+    /// answer. `display_command` is what a startup failure reports as the
+    /// attempted command.
     async fn connect_stdio_cmd(
         cmd: Cmd,
         name: &str,
@@ -172,6 +220,7 @@ impl McpClient {
         log_dir: &Path,
         transcript: Option<Transcript>,
         display_command: &[String],
+        initialize_within: Duration,
     ) -> Result<Self> {
         tokio::fs::create_dir_all(log_dir)
             .await
@@ -204,26 +253,46 @@ impl McpClient {
         // `IntoTransport for (R, W)` impl. Going through
         // `rmcp::transport::TokioChildProcess::new` would spawn its own child
         // internally, leaving us no `Child` handle for graceful shutdown.
-        let service = match serve_client((), (stdout, stdin)).await {
-            Ok(s) => s,
-            Err(source) => {
-                return Err(enrich_startup_error(
-                    name,
-                    declaration_source,
-                    display_command,
-                    &stderr_path,
-                    &mut child,
-                    source,
-                )
-                .await);
+        let handshake =
+            tokio::time::timeout(initialize_within, serve_client((), (stdout, stdin))).await;
+        let source: Box<dyn std::error::Error + Send + Sync> = match handshake {
+            Ok(Ok(service)) => {
+                return Ok(Self {
+                    name: name.to_string(),
+                    service,
+                    child,
+                    stderr_path,
+                    call_timeout: effective_mcp_call_timeout(None, None),
+                });
             }
+            Ok(Err(source)) => Box::new(source),
+            // rmcp drives the handshake inline, so the elapsed future took the
+            // transport with it: the server's stdin is closed by the time
+            // `enrich_startup_error` waits on it.
+            Err(_) => Box::new(McpSessionError::new(
+                McpFailureKind::Timeout,
+                format!("no `initialize` response within {initialize_within:?}"),
+            )),
         };
+        Err(enrich_startup_error(
+            name,
+            declaration_source,
+            display_command,
+            &stderr_path,
+            &mut child,
+            source,
+        )
+        .await)
+    }
 
-        Ok(Self {
-            name: name.to_string(),
-            service,
-            child,
-        })
+    /// Replace the `tools/call` deadline. The cascade -- a server's own
+    /// `call-timeout-secs`, then the session's `mcp-call-timeout-secs`, then
+    /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`](crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS)
+    /// -- is resolved by the caller, which is
+    /// the one that has the session's config.
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
     }
 
     /// The local name this client was constructed with (e.g. `"fs"`).
@@ -232,15 +301,35 @@ impl McpClient {
     }
 
     /// Issue an MCP `tools/list` (paginating internally) and translate the
-    /// results into our own [`McpTool`] type.
+    /// results into our own [`McpTool`] type. Every page together gets
+    /// the same fixed bound `initialize` does, 120 seconds; a listing that
+    /// outlives it fails with
+    /// [`McpFailureKind::Timeout`]. A failure carries the server's stderr
+    /// tail.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
-        let tools = self.service.list_all_tools().await.map_err(|source| {
-            OutrigError::McpToolsListFailed {
-                name: self.name.clone(),
-                source: session_error_from_rmcp(&source),
-            }
-        })?;
-        Ok(tools.into_iter().map(tool_from_rmcp).collect())
+        self.list_tools_within(STARTUP_TIMEOUT).await
+    }
+
+    /// [`Self::list_tools`] with the bound named, so a test can reach the
+    /// timeout without waiting out the real one. No cancel goes upstream on
+    /// expiry: every caller abandons a server whose listing failed.
+    async fn list_tools_within(&self, bound: Duration) -> Result<Vec<McpTool>> {
+        let source = match tokio::time::timeout(bound, self.service.list_all_tools()).await {
+            Ok(Ok(tools)) => return Ok(tools.into_iter().map(tool_from_rmcp).collect()),
+            Ok(Err(source)) => session_error_from_rmcp(&source),
+            Err(_) => McpSessionError::new(
+                McpFailureKind::Timeout,
+                format!("no tools/list response within {bound:?}"),
+            ),
+        };
+        Err(OutrigError::McpToolsListFailed {
+            name: self.name.clone(),
+            source,
+            stderr_path: self.stderr_path.clone(),
+            // Read once: the server may still be running, and the settle wait
+            // exists for a writer that has just exited.
+            stderr_tail: read_stderr_tail_settling_for(&self.stderr_path, Duration::ZERO).await,
+        })
     }
 
     /// Issue an MCP `tools/call`. `args` must be a JSON object (forwarded as
@@ -250,6 +339,13 @@ impl McpClient {
     /// The response's content blocks, structured content, and `_meta` are
     /// carried through intact; `is_error` mirrors the server's flag. See
     /// [`McpToolResult::render_text`] for the single-string view.
+    ///
+    /// A call that outlives its deadline (see
+    /// [`with_call_timeout`](Self::with_call_timeout)) is cancelled at the
+    /// server and fails with [`McpFailureKind::Timeout`]; one whose future is
+    /// dropped first is cancelled the same way. A response other than a tool result --
+    /// an `input_required` or a task, neither of which the protocol revision
+    /// this client negotiates can produce -- is [`McpFailureKind::Protocol`].
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<McpToolResult> {
         let arguments = match args {
             Value::Object(map) => Some(map),
@@ -261,16 +357,45 @@ impl McpClient {
             }
         };
 
-        let mut request = CallToolRequestParams::new(name.to_string());
+        let mut params = CallToolRequestParams::new(name.to_string());
         if let Some(arguments) = arguments {
-            request = request.with_arguments(arguments);
+            params = params.with_arguments(arguments);
         }
-        let result = self
+        let handle = self
             .service
-            .call_tool(request)
+            .send_request_with_option(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
             .await
             .map_err(|source| OutrigError::McpService(session_error_from_rmcp(&source)))?;
-        Ok(result_from_rmcp(result))
+        // The deadline is ours rather than rmcp's: on expiry the dropped wait
+        // leaves the guard armed, and it sends the cancel -- the same path a
+        // caller's own drop takes, so there is one sender and one reason.
+        let guard = CancelOnDrop::new(handle.peer.clone(), handle.id.clone());
+        let bound = self.call_timeout;
+        let answered = tokio::time::timeout(bound, handle.await_response())
+            .await
+            .map_err(|_| {
+                // Read by the model as often as by a person, so it says what
+                // happened to the work and where a longer deadline is set.
+                OutrigError::McpService(McpSessionError::new(
+                    McpFailureKind::Timeout,
+                    format!(
+                        "no tools/call response within {bound:?}, so the call was cancelled; \
+                         the server's `call-timeout-secs` sets how long its calls may run"
+                    ),
+                ))
+            })?;
+        guard.disarm();
+        match answered
+            .map_err(|source| OutrigError::McpService(session_error_from_rmcp(&source)))?
+        {
+            ServerResult::CallToolResult(result) => Ok(result_from_rmcp(result)),
+            _ => Err(OutrigError::McpService(session_error_from_rmcp(
+                &ServiceError::UnexpectedResponse,
+            ))),
+        }
     }
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP
@@ -315,6 +440,46 @@ impl McpClient {
                 Ok(())
             }
         }
+    }
+}
+
+/// Owes the server a `notifications/cancelled` for one request until
+/// disarmed. rmcp's `RequestHandle` has no `Drop`, so a request future dropped
+/// mid-flight would otherwise leave the server working on an answer nobody
+/// will read.
+struct CancelOnDrop {
+    owed: Option<(Peer<RoleClient>, RequestId)>,
+}
+
+impl CancelOnDrop {
+    fn new(peer: Peer<RoleClient>, id: RequestId) -> Self {
+        Self {
+            owed: Some((peer, id)),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.owed = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some((peer, id)) = self.owed.take() else {
+            return;
+        };
+        // `Drop` cannot await, so the notice goes on a task of its own -- and
+        // spawning outside a runtime panics, so a drop during runtime teardown,
+        // with no one left to deliver it, owes nothing. Bounded like the rest
+        // of the transport's goodbyes: a wedged pipe must not keep it alive.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let notice =
+                CancelledNotificationParam::new(Some(id), Some(ABANDONED_REASON.to_string()));
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, peer.notify_cancelled(notice)).await;
+        });
     }
 }
 
@@ -377,7 +542,7 @@ async fn enrich_startup_error(
     command: &[String],
     stderr_path: &Path,
     child: &mut Owned,
-    source: rmcp::service::ClientInitializeError,
+    source: Box<dyn std::error::Error + Send + Sync>,
 ) -> OutrigError {
     let exit_status = match tokio::time::timeout(CHILD_EXIT_CEILING, child.wait()).await {
         Ok(Ok(status)) => Some(status),
@@ -386,12 +551,19 @@ async fn enrich_startup_error(
     let exit = format_exit(exit_status);
     let stderr_tail = read_stderr_tail_settled(stderr_path).await;
 
-    if !exit_status.is_some_and(|s| s.success()) {
+    let what = match exit_status {
+        Some(status) if status.success() => None,
+        Some(_) => Some(format!("terminated before initialize ({exit})")),
+        // A handshake that timed out against a server ignoring its closed
+        // stdin: it did not terminate, and saying so would send the reader
+        // looking for a crash.
+        None => Some("never completed initialize and is still running".to_string()),
+    };
+    if let Some(what) = what {
         tracing::error!(
             target: "outrig::mcp",
             server = name,
-            "mcp server {name:?} terminated before initialize ({exit}); \
-             see {} for details",
+            "mcp server {name:?} {what}; see {} for details",
             stderr_path.display()
         );
     }
@@ -403,7 +575,7 @@ async fn enrich_startup_error(
         exit,
         stderr_path: stderr_path.to_path_buf(),
         stderr_tail,
-        source: Box::new(source),
+        source,
     }))
 }
 
@@ -463,7 +635,10 @@ async fn read_stderr_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
         file.seek(SeekFrom::End(-(MAX as i64))).await?;
     }
     let mut buf = Vec::with_capacity(len.min(MAX) as usize);
-    file.read_to_end(&mut buf).await?;
+    // Capped on the read as well as the seek: a server still running -- the
+    // `tools/list` failure path reads its file live -- can append between
+    // the two, and an uncapped read would follow it.
+    file.take(MAX).read_to_end(&mut buf).await?;
     Ok(buf)
 }
 
@@ -554,7 +729,7 @@ fn session_error_from_rmcp(source: &rmcp::service::ServiceError) -> McpSessionEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn transport_error() -> rmcp::transport::DynamicTransportError {
@@ -656,8 +831,16 @@ mod tests {
             .arg_shown_as("TOKEN", "TOKEN=${FETCH_TOKEN}")
             .env_hidden("TOKEN", "s3cret");
 
-        let connected =
-            McpClient::connect_stdio_cmd(cmd, "svc", None, dir.path(), Some(transcript), &[]).await;
+        let connected = McpClient::connect_stdio_cmd(
+            cmd,
+            "svc",
+            None,
+            dir.path(),
+            Some(transcript),
+            &[],
+            STARTUP_TIMEOUT,
+        )
+        .await;
         assert!(
             connected.is_err(),
             "a server that exits at once fails the handshake"
@@ -666,6 +849,276 @@ mod tests {
         let text = std::fs::read_to_string(&log).expect("read transcript");
         assert!(text.contains("--env 'TOKEN=${FETCH_TOKEN}'"), "{text}");
         assert!(!text.contains("s3cret"), "{text}");
+    }
+
+    /// #338's repro without podman: `cat` echoes `initialize` back as if it
+    /// were the server's own request and never answers it. The handshake
+    /// must give up at its bound and fail the way a crashed server does --
+    /// named, with what the server wrote to stderr -- rather than wait
+    /// forever. The stderr line also keeps the failure from waiting out the
+    /// settle ceiling for a tail that is never coming.
+    #[tokio::test]
+    async fn an_initialize_that_never_comes_fails_within_its_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cmd = Cmd::new("sh").args(["-c", "echo listening on stdin >&2; exec cat"]);
+
+        let started = std::time::Instant::now();
+        let err = McpClient::connect_stdio_cmd(
+            cmd,
+            "svc",
+            None,
+            dir.path(),
+            None,
+            &["cat".to_string()],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a server that never answers initialize must not connect");
+        let elapsed = started.elapsed();
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.name, "svc");
+        let cause = failure
+            .source
+            .downcast_ref::<McpSessionError>()
+            .unwrap_or_else(|| panic!("a timeout is classified: {:?}", failure.source));
+        assert_eq!(cause.kind, McpFailureKind::Timeout);
+        assert!(
+            failure.stderr_tail.contains("listening on stdin"),
+            "the tail shows what the server said: {:?}",
+            failure.stderr_tail
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(r#"mcp server "svc""#)
+                && rendered.contains("no `initialize` response within 200ms"),
+            "{rendered}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "gave up after {elapsed:?}, not at its bound"
+        );
+    }
+
+    /// `server` on one end of an in-memory pipe and a bare rmcp client on the
+    /// other, handshake done; the task serves until the client goes away.
+    pub(crate) async fn serve_in_memory<S: rmcp::ServerHandler>(
+        server: S,
+    ) -> (RunningService<RoleClient, ()>, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(async move {
+            let running = rmcp::service::serve_server(server, server_io)
+                .await
+                .expect("serve in memory");
+            let _ = running.waiting().await;
+        });
+        let client = serve_client((), client_io)
+            .await
+            .expect("connect in memory");
+        (client, serving)
+    }
+
+    /// The other end of an in-memory pipe. It answers `initialize` and a
+    /// `tools/call` to `quick` at once, holds every other request until the
+    /// client cancels it, and reports each `notifications/cancelled` it is sent
+    /// on `cancels`, by the name of the call it names.
+    #[derive(Clone)]
+    struct Stalling {
+        calls: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<RequestId, String>>>,
+        cancels: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    impl rmcp::ServerHandler for Stalling {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<rmcp::model::PaginatedRequestParams>,
+            ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+            ctx.ct.cancelled().await;
+            Err(rmcp::ErrorData::internal_error("cancelled", None))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            self.calls
+                .lock()
+                .unwrap()
+                .insert(ctx.id.clone(), request.name.to_string());
+            if request.name == "quick" {
+                return Ok(rmcp::model::CallToolResult::success(vec![
+                    rmcp::model::ContentBlock::text("done"),
+                ])
+                .into());
+            }
+            ctx.ct.cancelled().await;
+            Err(rmcp::ErrorData::internal_error("cancelled", None))
+        }
+
+        async fn on_cancelled(
+            &self,
+            notification: CancelledNotificationParam,
+            _ctx: rmcp::service::NotificationContext<rmcp::service::RoleServer>,
+        ) {
+            let call = notification
+                .request_id
+                .and_then(|id| self.calls.lock().unwrap().get(&id).cloned())
+                .unwrap_or_else(|| "an unknown request".to_string());
+            let _ = self.cancels.send(call);
+        }
+    }
+
+    /// An [`McpClient`] whose transport is an in-memory pipe to [`Stalling`]
+    /// rather than a podman child, with the receiver for the cancels the
+    /// server is sent and the directory its stderr file lives in. The client
+    /// still owes a child, so it gets one that does nothing.
+    async fn client_against_stalling_server() -> (
+        McpClient,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stderr_path = dir.path().join("svc.stderr");
+        std::fs::write(&stderr_path, "still indexing\n").expect("write stderr");
+
+        let (cancels, heard) = tokio::sync::mpsc::unbounded_channel();
+        let (service, _serving) = serve_in_memory(Stalling {
+            calls: Default::default(),
+            cancels,
+        })
+        .await;
+        let child = Cmd::new("sleep")
+            .arg("600")
+            .spawn_owned(
+                StdioSpec::bidirectional(),
+                crate::process::Termination::Kill,
+            )
+            .expect("spawn a stand-in transport");
+
+        let client = McpClient {
+            name: "svc".to_string(),
+            service,
+            child,
+            stderr_path,
+            call_timeout: effective_mcp_call_timeout(None, None),
+        };
+        (client, heard, dir)
+    }
+
+    /// The name of the call the next cancel the server is sent names.
+    async fn next_cancel(heard: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .expect("the server is sent a cancel")
+            .expect("the server is still up")
+    }
+
+    #[tokio::test]
+    async fn a_tools_list_that_never_comes_times_out_with_the_stderr_tail() {
+        let (client, _heard, _dir) = client_against_stalling_server().await;
+
+        let err = client
+            .list_tools_within(Duration::from_millis(100))
+            .await
+            .expect_err("a listing that never comes must fail");
+
+        let OutrigError::McpToolsListFailed {
+            name,
+            source,
+            stderr_tail,
+            ..
+        } = &err
+        else {
+            panic!("expected McpToolsListFailed, got {err:?}");
+        };
+        assert_eq!(name, "svc");
+        assert_eq!(source.kind, McpFailureKind::Timeout);
+        assert!(
+            source
+                .message
+                .contains("no tools/list response within 100ms"),
+            "{source}"
+        );
+        assert!(stderr_tail.contains("still indexing"), "{stderr_tail:?}");
+    }
+
+    /// Past its deadline a call fails as a timeout *and* the server hears
+    /// about it -- the work it was doing is for an answer nobody will read.
+    #[tokio::test]
+    async fn a_tools_call_past_its_deadline_is_cancelled_at_the_server() {
+        let (client, mut heard, _dir) = client_against_stalling_server().await;
+        let client = client.with_call_timeout(Duration::from_millis(100));
+
+        let err = client
+            .call_tool("slow", Value::Null)
+            .await
+            .expect_err("a call past its deadline must fail");
+
+        let OutrigError::McpService(source) = &err else {
+            panic!("expected McpService, got {err:?}");
+        };
+        assert_eq!(source.kind, McpFailureKind::Timeout);
+        assert!(
+            source
+                .message
+                .contains("no tools/call response within 100ms"),
+            "{source}"
+        );
+        assert_eq!(next_cancel(&mut heard).await, "slow");
+    }
+
+    /// The drop guard: a call abandoned by its caller -- a Ctrl-C mid-turn, a
+    /// proxied client's cancel -- reaches the server as a cancel too, long
+    /// before its own deadline would have.
+    #[tokio::test]
+    async fn a_dropped_tools_call_is_cancelled_at_the_server() {
+        let (client, mut heard, _dir) = client_against_stalling_server().await;
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.call_tool("slow", Value::Null),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the call should still be pending");
+
+        assert_eq!(next_cancel(&mut heard).await, "slow");
+    }
+
+    /// And an answered call owes nothing: the guard is disarmed. Proven by
+    /// order rather than by waiting on silence -- a cancel for `quick` would
+    /// cross the pipe before the one a later dropped call earns.
+    #[tokio::test]
+    async fn an_answered_tools_call_sends_no_cancel() {
+        let (client, mut heard, _dir) = client_against_stalling_server().await;
+
+        let result = client
+            .call_tool("quick", Value::Null)
+            .await
+            .expect("an answered call succeeds");
+        assert_eq!(result.render_text(), "done");
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.call_tool("slow", Value::Null),
+        )
+        .await;
+        assert_eq!(
+            next_cancel(&mut heard).await,
+            "slow",
+            "the first cancel is for the dropped call, not the answered one"
+        );
     }
 
     #[test]
@@ -741,6 +1194,44 @@ mod tests {
         assert!(payload.ends_with(tail.trim_end().as_bytes()));
     }
 
+    /// The `tools/list` failure path reads the stderr of a server that is still
+    /// running, so the read itself is capped: a writer appending throughout
+    /// cannot stretch the "tail" into the megabytes it wrote meanwhile.
+    #[tokio::test]
+    async fn a_tail_read_while_the_server_writes_stays_capped() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.stderr");
+        std::fs::write(&path, vec![b'a'; 10_000]).unwrap();
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (path, stop) = (path.clone(), stop.clone());
+            move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                // Bounded, so a fast disk cannot fill up before the reads end.
+                for _ in 0..4096 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    file.write_all(&[b'b'; 4096]).unwrap();
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            let tail = read_stderr_bytes(&path).await.unwrap();
+            assert!(tail.len() <= 2048, "read {} bytes", tail.len());
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+
     /// The defect this exists for: the process that exits and the process that
     /// writes the useful stderr are not always the same one. For a container
     /// whose entrypoint cannot be resolved, `podman start --attach` returns
@@ -812,9 +1303,9 @@ mod tests {
             "-c".to_string(),
             "echo boom 1>&2; exit 7".to_string(),
         ];
-        let source = rmcp::service::ClientInitializeError::ConnectionClosed(
+        let source = Box::new(rmcp::service::ClientInitializeError::ConnectionClosed(
             "expect initialize response".to_string(),
-        );
+        ));
 
         let err = enrich_startup_error(
             "svc",

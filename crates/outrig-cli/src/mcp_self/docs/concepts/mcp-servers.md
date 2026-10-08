@@ -272,6 +272,10 @@ define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
 
+A label entry may carry `call-timeout-secs`, since the image's author knows how long its tools
+run (see [What if a server hangs?](#what-if-a-server-hangs)). The placement keys and `args` are
+rejected in a label.
+
 For build-from-Dockerfile repo images, `outrig build` also stamps the cache image with the same
 merged `org.outrig.mcp` label it would use at startup. The startup overlay still runs, but is
 idempotent for those repo-local entries. This means `outrig image inspect <name>:<hash>` can show
@@ -322,9 +326,10 @@ is:
 4. **Register with Rig** -- each discovered tool becomes a `McpToolAdapter` that implements Rig's
    dynamic-tool trait. The agent now has access to it.
 
-All servers come up before the REPL accepts any input. If any server fails to initialize,
-`outrig run` reports the error on stderr and exits before the REPL starts -- you don't get partial
-sandboxes.
+All servers come up before the REPL accepts any input. If any server fails to initialize --
+including one that [stops answering](#what-if-a-server-hangs) -- `outrig run` reports the error
+on stderr, with the server's stderr so far, and exits before the REPL starts. You don't get
+partial sandboxes.
 
 When the REPL terminates (Ctrl-D, Ctrl-C, or LLM error), outrig closes each server's stdin in
 turn, waits up to 5 seconds for the process to exit, then stops the containers -- sidecars
@@ -487,6 +492,26 @@ servers that are reentrant-safe: no fixed listening port, global pidfile, or exc
 lock unless the server is explicitly designed to coordinate multiple copies. If a server
 cannot run twice, the second copy should fail clearly during startup and its stderr log
 will show the underlying conflict.
+
+## What if a server hangs?
+
+Every request outrig sends a server has a deadline, so a server that stops answering costs a
+bounded wait rather than the session:
+
+- `initialize` and `tools/list` get 120 seconds each. A server that misses either fails startup
+  the way a crashed one does, with the stderr it has written so far.
+- `tools/call` gets the server's own `call-timeout-secs`, else the top-level
+  `mcp-call-timeout-secs`, else 10 minutes. A call that runs past it is cancelled at the server
+  with `notifications/cancelled`, and the model gets a timeout error in place of a result. The
+  session goes on, and the server stays connected.
+
+A call outrig stops waiting for early is cancelled the same way: one in a turn interrupted with
+Ctrl-C, or one whose `outrig mcp` client sent its own cancel. Cancellation is advisory -- the MCP
+spec lets a server finish the work anyway -- so a tool with side effects may still complete them.
+
+Raise `call-timeout-secs` on a server whose tools legitimately run long, such as a build or a
+test suite, rather than the session-wide default; see
+[Reference -> Config](../reference/config.md#imagesnamemcp).
 
 ## Picking which servers to include
 

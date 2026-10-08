@@ -15,7 +15,8 @@ use super::Config;
 ///   here, and a repo value built by hand must be held to it the same way.
 /// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `tool-call-max`, `tool-result-max`,
-///   `subagent-depth-max`, `subagent-width-max`, `retry-budget-secs`):
+///   `subagent-depth-max`, `subagent-width-max`, `retry-budget-secs`,
+///   `mcp-call-timeout-secs`):
 ///   repo's value wins if set, else global's.
 /// - `session-root` and `model-cache-root` are global-only: they are taken
 ///   from `global` and never read from `repo`, so a repo value cannot move
@@ -74,6 +75,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         subagent_depth_max: repo.subagent_depth_max.or(global.subagent_depth_max),
         subagent_width_max: repo.subagent_width_max.or(global.subagent_width_max),
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
+        mcp_call_timeout_secs: repo.mcp_call_timeout_secs.or(global.mcp_call_timeout_secs),
         network,
         providers,
         models,

@@ -1563,6 +1563,7 @@ pub async fn connect_mcp_clients(
         match result {
             Ok(client) => {
                 span.done(format!("MCP {mcp_name}: initialized"));
+                let client = client.with_call_timeout(mcp_plan.call_timeout(placed));
                 connected.push((sidecar_name, Arc::new(client)));
             }
             Err(e) => {

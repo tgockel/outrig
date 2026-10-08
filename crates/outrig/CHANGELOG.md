@@ -23,7 +23,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declares. A missing file loads as empty, as it does for `Config::load`. This is the read for a
   caller that wants a machine-level key and has no repo.
 
+- **A `tools/call` deadline you can set per server and per session.** `McpServerSpec` gains a
+  `call-timeout-secs` table key (`call_timeout_secs()`, `with_call_timeout_secs`), and `Config` a
+  top-level `mcp_call_timeout_secs`, merged repo over global. The most specific wins, read after
+  every merge: a server's own key, then the session's, then `DEFAULT_MCP_CALL_TIMEOUT_SECS` (600).
+  Both are validated to 1..=`MCP_CALL_TIMEOUT_SECS_CEILING` (3600) as
+  `ConfigValidationError::McpCallTimeoutSecsZero` / `McpCallTimeoutSecsTooLarge`, including by
+  `load_for_build`. An `org.outrig.mcp` label and a standalone `image.toml` may carry the key and
+  are held to the same range (`EmbeddedImageConfigError::CallTimeoutOutOfRange`,
+  `StandaloneImageTomlError::CallTimeoutOutOfRange`). The value travels through
+  `SidecarServerSpec::with_call_timeout_secs`, `LaunchSpec::mcp_call_timeout_secs` /
+  `with_mcp_call_timeout_secs`, and `SessionMcpPlan::mcp_call_timeout_secs` /
+  `call_timeout(&PlacedServer)`, and reaches a client through `McpClient::with_call_timeout`;
+  `Outrig::launch` and `add_sidecar` apply it to every server they connect. An unset key
+  serializes as before, so existing labels and cache keys are unchanged. (#338)
+
 ### Fixed
+
+- **Every MCP request has a deadline, and an abandoned `tools/call` is cancelled at the server.**
+  `McpClient` sent `initialize`, `tools/list`, and `tools/call` with rmcp's default of no timeout,
+  so a server that accepted stdin and never answered held startup or a call forever.
+  `initialize` and the whole of `tools/list` now get 120 seconds each: a missed `initialize` is
+  `OutrigError::McpStartupFailed` whose source is an `McpSessionError` of kind
+  `McpFailureKind::Timeout`, with the usual exit status and stderr tail, and
+  `McpToolsListFailed` gains `stderr_path` and `stderr_tail` for every listing failure.
+  `tools/call` gets the deadline set with `McpClient::with_call_timeout`; past it the server is
+  sent `notifications/cancelled` and the call fails as `McpService` of kind
+  `McpFailureKind::Timeout`. A call whose future is dropped first -- a turn abandoned with Ctrl-C,
+  a proxied call its client cancelled -- now sends the same notification; rmcp's request handle
+  has no `Drop`, so before nothing did. `ProxyServer` races each `tools/call` against the
+  client's cancellation and drops the backing call when it fires. `call_tool` no longer drives
+  rmcp's `input_required` rounds: a reply other than a tool result is `McpFailureKind::Protocol`,
+  which the 2025-11-25 revision outrig negotiates never produces. (#338)
 
 - **`session-root` and `model-cache-root` are global-only, and follow the path rule.** A repo config
   could set either, and `merge` let its value win, so a committed file chose where this machine

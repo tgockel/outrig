@@ -102,6 +102,13 @@ pub outrig::config::ConfigValidationError::McpArgsWithCommand::server: alloc::st
 pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement
 pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge::max: u64
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge::path: alloc::string::String
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsTooLarge::value: u64
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::max: u64
+pub outrig::config::ConfigValidationError::McpCallTimeoutSecsZero::path: alloc::string::String
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpInlineImageEmpty::server: alloc::string::String
@@ -335,6 +342,7 @@ pub fn outrig::config::LlmProvider::style(&self) -> &'static str
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::McpServerSpec::Full::call_timeout_secs: core::option::Option<u64>
 pub outrig::config::McpServerSpec::Full::command: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::McpServerSpec::Full::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub outrig::config::McpServerSpec::Full::image: core::option::Option<alloc::string::String>
@@ -343,6 +351,7 @@ pub outrig::config::McpServerSpec::Full::view: outrig::config::SidecarView
 pub outrig::config::McpServerSpec::Short(alloc::vec::Vec<alloc::string::String>)
 impl outrig::config::McpServerSpec
 pub fn outrig::config::McpServerSpec::args(&self) -> &[alloc::string::String]
+pub fn outrig::config::McpServerSpec::call_timeout_secs(&self) -> core::option::Option<u64>
 pub fn outrig::config::McpServerSpec::command(&self) -> core::option::Option<&[alloc::string::String]>
 pub fn outrig::config::McpServerSpec::entrypoint(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::entrypoint_in_sidecar(impl core::convert::Into<alloc::string::String>) -> Self
@@ -356,6 +365,7 @@ pub fn outrig::config::McpServerSpec::normalize(&self) -> (alloc::vec::Vec<alloc
 pub fn outrig::config::McpServerSpec::sidecar(&self) -> core::option::Option<&str>
 pub fn outrig::config::McpServerSpec::view(&self) -> outrig::config::SidecarView
 pub fn outrig::config::McpServerSpec::with_args(self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
+pub fn outrig::config::McpServerSpec::with_call_timeout_secs(self, u64) -> Self
 pub fn outrig::config::McpServerSpec::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
 pub fn outrig::config::McpServerSpec::with_sidecar(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::with_view(self, outrig::config::SidecarView) -> Self
@@ -462,6 +472,7 @@ pub outrig::config::Config::default_agent: core::option::Option<alloc::string::S
 pub outrig::config::Config::default_image: core::option::Option<alloc::string::String>
 pub outrig::config::Config::default_model: core::option::Option<alloc::string::String>
 pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
+pub outrig::config::Config::mcp_call_timeout_secs: core::option::Option<u64>
 pub outrig::config::Config::model_cache_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
@@ -616,11 +627,13 @@ pub fn outrig::config::Workspace::new(impl core::convert::Into<std::path::PathBu
 pub fn outrig::config::Workspace::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 pub fn outrig::config::Workspace::set_container_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
 pub fn outrig::config::Workspace::set_host_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
+pub const outrig::config::DEFAULT_MCP_CALL_TIMEOUT_SECS: u64
 pub const outrig::config::DEFAULT_RETRY_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
+pub const outrig::config::MCP_CALL_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::MODEL_ALIAS_DEPTH_MAX: usize
 pub const outrig::config::REQUEST_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::RETRY_BUDGET_SECS_CEILING: u64
@@ -636,6 +649,10 @@ pub mod outrig::container::embedded
 #[non_exhaustive] pub enum outrig::container::embedded::EmbeddedImageConfigError
 pub outrig::container::embedded::EmbeddedImageConfigError::ArgsInLabel
 pub outrig::container::embedded::EmbeddedImageConfigError::ArgsInLabel::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange
+pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange::max: u64
+pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::CallTimeoutOutOfRange::value: u64
 pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand
 pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand::server: alloc::string::String
 pub outrig::container::embedded::EmbeddedImageConfigError::InvalidMcpServerName
@@ -656,6 +673,10 @@ pub outrig::container::embedded::StandaloneImageTomlError::ArgsInLabel
 pub outrig::container::embedded::StandaloneImageTomlError::ArgsInLabel::server: alloc::string::String
 pub outrig::container::embedded::StandaloneImageTomlError::BuildFieldMissing
 pub outrig::container::embedded::StandaloneImageTomlError::BuildFieldMissing::field: &'static str
+pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange
+pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange::max: u64
+pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::CallTimeoutOutOfRange::value: u64
 pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand
 pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand::server: alloc::string::String
 pub outrig::container::embedded::StandaloneImageTomlError::InvalidMcpServerName
@@ -716,9 +737,11 @@ pub outrig::container::sidecar::PlacedServer::placement: outrig::container::side
 pub outrig::container::sidecar::PlacedServer::source: outrig::container::embedded::McpDeclarationSource
 pub outrig::container::sidecar::PlacedServer::spec: outrig::config::McpServerSpec
 #[non_exhaustive] pub struct outrig::container::sidecar::SessionMcpPlan
+pub outrig::container::sidecar::SessionMcpPlan::mcp_call_timeout_secs: core::option::Option<u64>
 pub outrig::container::sidecar::SessionMcpPlan::servers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::container::sidecar::PlacedServer>
 pub outrig::container::sidecar::SessionMcpPlan::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::container::sidecar::SidecarPlan>
 impl outrig::container::sidecar::SessionMcpPlan
+pub fn outrig::container::sidecar::SessionMcpPlan::call_timeout(&self, &outrig::container::sidecar::PlacedServer) -> core::time::Duration
 pub fn outrig::container::sidecar::SessionMcpPlan::entrypoint_server_in(&self, &outrig::container::sidecar::SidecarPlan) -> core::option::Option<(&alloc::string::String, &outrig::container::sidecar::PlacedServer)>
 pub fn outrig::container::sidecar::SessionMcpPlan::servers_in(&self, &str) -> impl core::iter::traits::iterator::Iterator<Item = (&alloc::string::String, &outrig::container::sidecar::PlacedServer)>
 pub fn outrig::container::sidecar::SessionMcpPlan::sidecar_honors_labels(&self, &outrig::container::sidecar::SidecarPlan) -> bool
@@ -891,6 +914,8 @@ pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error
 #[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
 pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String
 pub outrig::error::OutrigError::McpToolsListFailed::source: outrig::error::McpSessionError
+pub outrig::error::OutrigError::McpToolsListFailed::stderr_path: std::path::PathBuf
+pub outrig::error::OutrigError::McpToolsListFailed::stderr_tail: alloc::string::String
 pub outrig::error::OutrigError::NetworkAttachNotUndone(alloc::boxed::Box<outrig::error::NetworkAttachFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::NetworkAuditUnwritten
 pub outrig::error::OutrigError::NetworkAuditUnwritten::container: alloc::string::String
@@ -1090,17 +1115,21 @@ pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self,
 #[non_exhaustive] pub enum outrig::SidecarServerSpec
 #[non_exhaustive] pub outrig::SidecarServerSpec::Entrypoint
 pub outrig::SidecarServerSpec::Entrypoint::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::SidecarServerSpec::Entrypoint::call_timeout_secs: core::option::Option<u64>
 pub outrig::SidecarServerSpec::Entrypoint::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 #[non_exhaustive] pub outrig::SidecarServerSpec::ExecStdio
+pub outrig::SidecarServerSpec::ExecStdio::call_timeout_secs: core::option::Option<u64>
 pub outrig::SidecarServerSpec::ExecStdio::command: alloc::vec::Vec<alloc::string::String>
 pub outrig::SidecarServerSpec::ExecStdio::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 impl outrig::SidecarServerSpec
 pub fn outrig::SidecarServerSpec::args(&self) -> &[alloc::string::String]
+pub fn outrig::SidecarServerSpec::call_timeout_secs(&self) -> core::option::Option<u64>
 pub fn outrig::SidecarServerSpec::command(&self) -> core::option::Option<&[alloc::string::String]>
 pub fn outrig::SidecarServerSpec::entrypoint(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::SidecarServerSpec::env(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub fn outrig::SidecarServerSpec::exec(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::SidecarServerSpec::is_entrypoint(&self) -> bool
+pub fn outrig::SidecarServerSpec::with_call_timeout_secs(self, u64) -> Self
 pub fn outrig::SidecarServerSpec::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
 #[non_exhaustive] pub enum outrig::SidecarView
 pub outrig::SidecarView::None
@@ -1136,6 +1165,7 @@ pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>)
 pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
 pub outrig::LaunchSpec::log_dir: std::path::PathBuf
 pub outrig::LaunchSpec::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
+pub outrig::LaunchSpec::mcp_call_timeout_secs: core::option::Option<u64>
 pub outrig::LaunchSpec::mounts: alloc::vec::Vec<outrig::MountSpec>
 pub outrig::LaunchSpec::network: outrig::NetworkSpec
 pub outrig::LaunchSpec::security: outrig::SecuritySpec
@@ -1147,6 +1177,7 @@ pub async fn outrig::LaunchSpec::from_config(&outrig::config::Config, &str, &std
 pub fn outrig::LaunchSpec::from_image(impl core::convert::Into<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>, std::path::PathBuf) -> Self
 pub fn outrig::LaunchSpec::with_capabilities(self, outrig::CapabilitySpec) -> Self
 pub fn outrig::LaunchSpec::with_embedded_mcp_policy(self, outrig::EmbeddedMcpPolicy) -> Self
+pub fn outrig::LaunchSpec::with_mcp_call_timeout_secs(self, u64) -> Self
 pub fn outrig::LaunchSpec::with_mount(self, outrig::MountSpec) -> Self
 pub fn outrig::LaunchSpec::with_mounts(self, impl core::iter::traits::collect::IntoIterator<Item = outrig::MountSpec>) -> Self
 pub fn outrig::LaunchSpec::with_network_filter(self, outrig::config::NetworkPolicy) -> Self
@@ -1168,6 +1199,7 @@ pub async fn outrig::McpClient::connect_via_podman_start(&outrig::container::Con
 pub async fn outrig::McpClient::list_tools(&self) -> outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>
 pub fn outrig::McpClient::name(&self) -> &str
 pub async fn outrig::McpClient::shutdown(self) -> outrig::error::Result<()>
+pub fn outrig::McpClient::with_call_timeout(self, core::time::Duration) -> Self
 impl outrig::mcp_proxy::BackingClient for outrig::McpClient
 pub fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
 pub fn outrig::McpClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send

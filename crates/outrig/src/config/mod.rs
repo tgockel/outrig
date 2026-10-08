@@ -22,8 +22,9 @@ pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
 };
 pub(crate) use validate::{
-    check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
-    is_valid_mcp_server_name, mcp_command_is_empty,
+    check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image, check_sidecar_name,
+    check_view_exclusions, is_valid_mcp_server_name, mcp_call_timeout_secs_in_range,
+    mcp_command_is_empty,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
@@ -146,6 +147,39 @@ pub const RETRY_BUDGET_SECS_CEILING: u64 = 3600;
 /// be answered. A `0` on the budget means "do not retry" and stays legal; the
 /// keys differ because one counts attempts and the other bounds a single one.
 pub const REQUEST_TIMEOUT_SECS_CEILING: u64 = 3600;
+
+/// How long one MCP `tools/call` may run before outrig gives up on it, sends
+/// the server `notifications/cancelled`, and hands the model a timeout in
+/// place of a result. Ten minutes, like [`DEFAULT_RETRY_BUDGET_SECS`]: long
+/// enough for a build or a test run, short enough that a server which will
+/// never answer gives the turn back inside the session. A server's own
+/// `call-timeout-secs` and the top-level `mcp-call-timeout-secs` override it,
+/// in that order.
+///
+/// `initialize` and `tools/list` are not covered: they are bounded by a fixed
+/// startup deadline, because nothing a server does at startup should take as
+/// long as a tool may.
+pub const DEFAULT_MCP_CALL_TIMEOUT_SECS: u64 = 600;
+/// Upper bound accepted for `call-timeout-secs` and `mcp-call-timeout-secs`.
+/// The same hour, floor, and reasoning as [`REQUEST_TIMEOUT_SECS_CEILING`]: a
+/// `0` is an immediate timeout rather than none, so it is rejected.
+pub const MCP_CALL_TIMEOUT_SECS_CEILING: u64 = 3600;
+
+/// The `tools/call` deadline for one server: its own `call-timeout-secs`, else
+/// the session's `mcp-call-timeout-secs`, else
+/// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`]. Most specific wins, and the values are
+/// read after every merge, so a label entry a config entry replaced brings
+/// nothing with it.
+pub(crate) fn effective_mcp_call_timeout(
+    per_server: Option<u64>,
+    session_default: Option<u64>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        per_server
+            .or(session_default)
+            .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECS),
+    )
+}
 
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
@@ -304,6 +338,11 @@ pub struct Config {
     /// [`DEFAULT_RETRY_BUDGET_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_budget_secs: Option<u64>,
+    /// Default `tools/call` deadline for every MCP server, in seconds. A
+    /// server's own `call-timeout-secs` overrides this. See
+    /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_call_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
 
@@ -2400,6 +2439,16 @@ pub enum McpServerSpec {
         /// it serializes exactly as before.
         #[serde(default, skip_serializing_if = "SidecarView::is_none")]
         view: SidecarView,
+        /// This server's `tools/call` deadline in seconds, overriding the
+        /// top-level `mcp-call-timeout-secs`. Last and elided when unset, so
+        /// an entry without it serializes -- into a label too -- exactly as
+        /// before. See [`DEFAULT_MCP_CALL_TIMEOUT_SECS`].
+        #[serde(
+            default,
+            rename = "call-timeout-secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        call_timeout_secs: Option<u64>,
     },
 }
 
@@ -2473,6 +2522,20 @@ impl McpServerSpec {
         })
     }
 
+    /// This server's own `tools/call` deadline in seconds, replacing whatever
+    /// the session default would have given it.
+    pub fn with_call_timeout_secs(self, secs: u64) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full {
+                call_timeout_secs: slot,
+                ..
+            } = spec
+            {
+                *slot = Some(secs);
+            }
+        })
+    }
+
     /// The one `Full` literal in this impl: the two constructors and the
     /// `Short` promotion below all route through it, so a field added to the
     /// variant is filled in exactly one place.
@@ -2484,6 +2547,7 @@ impl McpServerSpec {
             image,
             args: Vec::new(),
             view: SidecarView::None,
+            call_timeout_secs: None,
         }
     }
 
@@ -2563,6 +2627,17 @@ impl McpServerSpec {
         match self {
             Self::Short(_) => SidecarView::None,
             Self::Full { view, .. } => *view,
+        }
+    }
+
+    /// This server's own `tools/call` deadline in seconds, if it declares
+    /// one. Always `None` for `Short`; the session default then applies.
+    pub fn call_timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full {
+                call_timeout_secs, ..
+            } => *call_timeout_secs,
         }
     }
 

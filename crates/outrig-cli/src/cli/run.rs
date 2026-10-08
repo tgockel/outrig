@@ -880,7 +880,7 @@ async fn connect_added_sidecar_servers(
         )
         .await
         {
-            Ok(client) => Arc::new(client),
+            Ok(client) => Arc::new(client.with_call_timeout(state.mcp_plan.call_timeout(placed))),
             Err(e) => {
                 failure = Some(e.into());
                 break;

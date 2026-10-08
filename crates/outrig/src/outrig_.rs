@@ -15,8 +15,9 @@ use tokio::process::Child;
 use crate::config::{
     CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
     McpServerSpec, MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart,
-    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_sidecar_image,
-    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
+    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
+    check_sidecar_image, check_sidecar_name, check_view_exclusions, effective_mcp_call_timeout,
+    is_valid_mcp_server_name,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
@@ -173,6 +174,9 @@ pub enum SidecarServerSpec {
     ExecStdio {
         command: Vec<String>,
         env: BTreeMap<String, EnvValue>,
+        /// This server's `tools/call` deadline in seconds; see
+        /// [`SidecarServerSpec::with_call_timeout_secs`].
+        call_timeout_secs: Option<u64>,
     },
     /// The container's own `ENTRYPOINT`, spoken to over `podman start
     /// --attach --interactive`. `args` are its positional arguments, which is
@@ -183,6 +187,9 @@ pub enum SidecarServerSpec {
     Entrypoint {
         args: Vec<String>,
         env: BTreeMap<String, EnvValue>,
+        /// This server's `tools/call` deadline in seconds; see
+        /// [`SidecarServerSpec::with_call_timeout_secs`].
+        call_timeout_secs: Option<u64>,
     },
 }
 
@@ -193,6 +200,7 @@ impl SidecarServerSpec {
         Self::ExecStdio {
             command: command.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         }
     }
 
@@ -203,6 +211,7 @@ impl SidecarServerSpec {
         Self::Entrypoint {
             args: args.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         }
     }
 
@@ -214,6 +223,35 @@ impl SidecarServerSpec {
             Self::ExecStdio { env: slot, .. } | Self::Entrypoint { env: slot, .. } => *slot = env,
         }
         self
+    }
+
+    /// This server's own `tools/call` deadline in seconds, in place of the
+    /// session's. Mirrors [`McpServerSpec::with_call_timeout_secs`], and is
+    /// range-checked the same way when the sidecar starts.
+    pub fn with_call_timeout_secs(mut self, secs: u64) -> Self {
+        match &mut self {
+            Self::ExecStdio {
+                call_timeout_secs: slot,
+                ..
+            }
+            | Self::Entrypoint {
+                call_timeout_secs: slot,
+                ..
+            } => *slot = Some(secs),
+        }
+        self
+    }
+
+    /// This server's own `tools/call` deadline in seconds, if it declares one.
+    pub fn call_timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::ExecStdio {
+                call_timeout_secs, ..
+            }
+            | Self::Entrypoint {
+                call_timeout_secs, ..
+            } => *call_timeout_secs,
+        }
     }
 
     /// The argv to exec, or `None` for the entrypoint form.
@@ -446,6 +484,11 @@ pub struct LaunchSpec {
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub sidecars: Vec<SidecarSpec>,
     pub log_dir: PathBuf,
+    /// The `tools/call` deadline in seconds for every server, primary or
+    /// sidecar, that does not declare its own -- the config's top-level
+    /// `mcp-call-timeout-secs`. `None` is
+    /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`](crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS).
+    pub mcp_call_timeout_secs: Option<u64>,
 }
 
 impl LaunchSpec {
@@ -480,6 +523,7 @@ impl LaunchSpec {
             mcp,
             sidecars: Vec::new(),
             log_dir,
+            mcp_call_timeout_secs: None,
         }
     }
 
@@ -500,6 +544,7 @@ impl LaunchSpec {
             mcp,
             sidecars: Vec::new(),
             log_dir,
+            mcp_call_timeout_secs: None,
         }
     }
 
@@ -595,6 +640,7 @@ impl LaunchSpec {
             mcp,
             sidecars,
             log_dir,
+            mcp_call_timeout_secs: config.mcp_call_timeout_secs,
         })
     }
 
@@ -653,6 +699,14 @@ impl LaunchSpec {
         self.sidecars.push(sidecar);
         self
     }
+
+    /// The `tools/call` deadline in seconds for every server that does not
+    /// declare its own: the library's `mcp-call-timeout-secs`. Range-checked
+    /// by [`Outrig::launch`].
+    pub fn with_mcp_call_timeout_secs(mut self, secs: u64) -> Self {
+        self.mcp_call_timeout_secs = Some(secs);
+        self
+    }
 }
 
 /// Split a planned session into the primary MCP map and the launch-time
@@ -683,14 +737,20 @@ fn plan_to_launch_parts(
         let servers = match plan.entrypoint_server_in(sc) {
             Some((name, placed)) => BTreeMap::from([(
                 name.clone(),
-                SidecarServerSpec::entrypoint(sidecar::entrypoint_args(&placed.spec, sc).to_vec())
+                carry_call_timeout(
+                    SidecarServerSpec::entrypoint(
+                        sidecar::entrypoint_args(&placed.spec, sc).to_vec(),
+                    )
                     .with_env(placed.spec.env().clone()),
+                    &placed.spec,
+                ),
             )]),
             None => plan
                 .servers_in(&sc.name)
                 .map(|(name, placed)| {
                     let (command, env) = placed.spec.normalize();
-                    (name.clone(), SidecarServerSpec::exec(command).with_env(env))
+                    let server = SidecarServerSpec::exec(command).with_env(env);
+                    (name.clone(), carry_call_timeout(server, &placed.spec))
                 })
                 .collect(),
         };
@@ -716,6 +776,16 @@ fn plan_to_launch_parts(
         });
     }
     (mcp, sidecars)
+}
+
+/// `server` with `declared`'s own `call-timeout-secs`, if it has one. The
+/// session default is not copied in: it travels on [`LaunchSpec`] and is
+/// resolved per server at connect time.
+fn carry_call_timeout(server: SidecarServerSpec, declared: &McpServerSpec) -> SidecarServerSpec {
+    match declared.call_timeout_secs() {
+        Some(secs) => server.with_call_timeout_secs(secs),
+        None => server,
+    }
 }
 
 /// Resolve a sidecar image ref like `--image`: a sibling `[images.<name>]`
@@ -784,6 +854,9 @@ pub struct Outrig {
     tools: Vec<ToolHandle>,
     network: Option<NetworkInterceptor>,
     log_dir: PathBuf,
+    /// [`LaunchSpec::mcp_call_timeout_secs`], kept for the servers
+    /// [`Outrig::add_sidecar`] connects after launch.
+    mcp_call_timeout_secs: Option<u64>,
 }
 
 impl Outrig {
@@ -792,6 +865,20 @@ impl Outrig {
     /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
+        // Before anything starts: a deadline out of range is a spec error,
+        // not a server that fails every call once the session is up.
+        if let Some(value) = spec.mcp_call_timeout_secs {
+            check_mcp_call_timeout_secs("LaunchSpec mcp-call-timeout-secs", value)?;
+        }
+        for (name, server) in &spec.mcp {
+            if let Some(value) = server.call_timeout_secs() {
+                check_mcp_call_timeout_secs(
+                    &format!("mcp server {name:?} call-timeout-secs"),
+                    value,
+                )?;
+            }
+        }
+
         let image_tag = match &spec.source {
             LaunchSource::Build {
                 dockerfile,
@@ -905,7 +992,11 @@ impl Outrig {
                 &spec.log_dir,
                 &BTreeMap::new(),
             )
-            .await?;
+            .await?
+            .with_call_timeout(effective_mcp_call_timeout(
+                server.spec.call_timeout_secs(),
+                spec.mcp_call_timeout_secs,
+            ));
             tools.extend(tool_handles(name, client.list_tools().await?));
             clients.insert(name.clone(), Arc::new(client));
         }
@@ -918,6 +1009,7 @@ impl Outrig {
             tools,
             network,
             log_dir: spec.log_dir.clone(),
+            mcp_call_timeout_secs: spec.mcp_call_timeout_secs,
         };
         for sidecar in &spec.sidecars {
             if let Err(e) = outrig.add_sidecar(sidecar.clone()).await {
@@ -1047,7 +1139,9 @@ impl Outrig {
             .await);
         }
 
-        match connect_sidecar_servers(&container, &spec, &self.log_dir).await {
+        match connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
+            .await
+        {
             Ok((clients, tools)) => {
                 self.sidecars.insert(spec.name.clone(), container);
                 self.clients
@@ -1310,6 +1404,15 @@ fn validate_sidecar_spec<C, S>(
                 spec.name
             )));
         }
+        if let Some(value) = server.call_timeout_secs() {
+            check_mcp_call_timeout_secs(
+                &format!(
+                    "sidecar {:?} mcp server {name:?} call-timeout-secs",
+                    spec.name
+                ),
+                value,
+            )?;
+        }
         if existing_clients.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "sidecar {:?}: mcp server name {name:?} is already connected in this \
@@ -1404,10 +1507,13 @@ async fn unwound(
 /// Connect every server in `spec` against the started sidecar and index its
 /// tools. On failure every client connected so far (including the failing
 /// one, when it got that far) is shut down before the error propagates.
+/// `session_call_timeout_secs` is the session's `tools/call` deadline for a
+/// server that declares none of its own.
 async fn connect_sidecar_servers(
     container: &Container,
     spec: &SidecarSpec,
     log_dir: &Path,
+    session_call_timeout_secs: Option<u64>,
 ) -> Result<(BTreeMap<String, McpClient>, Vec<ToolHandle>)> {
     let mut clients: BTreeMap<String, McpClient> = BTreeMap::new();
     let mut tools: Vec<ToolHandle> = Vec::new();
@@ -1442,7 +1548,10 @@ async fn connect_sidecar_servers(
             }
         };
         let client = match connected {
-            Ok(client) => client,
+            Ok(client) => client.with_call_timeout(effective_mcp_call_timeout(
+                server.call_timeout_secs(),
+                session_call_timeout_secs,
+            )),
             Err(e) => {
                 shutdown_partial_clients(clients).await;
                 return Err(e);
@@ -1864,6 +1973,28 @@ view = "primary"
         );
     }
 
+    /// A hand-built sidecar server gets the range a config entry does: a `0`
+    /// would fail every call the moment the sidecar was up.
+    #[test]
+    fn validate_rejects_an_out_of_range_call_timeout() {
+        for secs in [0, 3601] {
+            let spec = SidecarSpec::from_image("tools", "img:1").with_server_spec(
+                "lint",
+                SidecarServerSpec::exec(["mcp-lint"]).with_call_timeout_secs(secs),
+            );
+            let err = validate_alone(&spec).expect_err("out of range");
+            assert!(
+                err.to_string().contains("call-timeout-secs"),
+                "{secs}: {err}"
+            );
+        }
+        let spec = SidecarSpec::from_image("tools", "img:1").with_server_spec(
+            "lint",
+            SidecarServerSpec::exec(["mcp-lint"]).with_call_timeout_secs(3600),
+        );
+        validate_alone(&spec).expect("the ceiling itself is in range");
+    }
+
     /// A build without the musl target embeds no launcher, so a
     /// `view = "primary"` spec has to fail before any container exists --
     /// naming the artifact rather than surfacing an opaque podman error.
@@ -1912,6 +2043,41 @@ shell = ["bash", "-lc", "sh"]
         let names: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
         assert_eq!(names, ["fs", "shell"]);
         assert!(sidecars.is_empty(), "no placement -> no sidecars");
+    }
+
+    /// Each server's own `call-timeout-secs` survives the lowering into
+    /// whichever spec carries it -- the primary map, a named sidecar's exec
+    /// server, an anonymous exec sidecar, an entrypoint host. The rebuilt
+    /// `SidecarServerSpec`s are the place it could silently drop.
+    #[test]
+    fn from_config_carries_each_servers_call_timeout() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs    = { command = ["mcp-fs"], call-timeout-secs = 30 }
+lint  = { command = ["mcp-lint"], sidecar = "tools", call-timeout-secs = 60 }
+plain = { command = ["mcp-plain"], sidecar = "tools" }
+anon  = { command = ["mcp-anon"], image = "anon-img", call-timeout-secs = 90 }
+gh    = { image = "gh-mcp", call-timeout-secs = 120 }
+[sidecars.tools]
+image = "mcp-tools"
+"#,
+        );
+
+        assert_eq!(mcp["fs"].call_timeout_secs(), Some(30));
+        let server = |name: &str| {
+            sidecars
+                .iter()
+                .find_map(|sc| sc.servers.get(name))
+                .unwrap_or_else(|| panic!("{name} lowers into some sidecar: {sidecars:?}"))
+        };
+        assert_eq!(server("lint").call_timeout_secs(), Some(60));
+        assert_eq!(server("plain").call_timeout_secs(), None);
+        assert_eq!(server("anon").call_timeout_secs(), Some(90));
+        assert!(server("gh").is_entrypoint());
+        assert_eq!(server("gh").call_timeout_secs(), Some(120));
     }
 
     #[test]

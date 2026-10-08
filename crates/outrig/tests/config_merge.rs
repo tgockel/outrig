@@ -1596,6 +1596,95 @@ retry-budget-secs = 60
         assert_eq!(merged.retry_budget_secs, Some(60));
     }
 
+    /// `0` is an immediate deadline rather than none, exactly as for
+    /// `request-timeout-secs`, and the message says so for the same reason.
+    #[test]
+    fn top_level_mcp_call_timeout_secs_zero_errors() {
+        let cfg = parse("mcp-call-timeout-secs = 0\n");
+        let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
+        match err {
+            ConfigValidationError::McpCallTimeoutSecsZero { path, max } => {
+                assert_eq!(path, "top-level mcp-call-timeout-secs");
+                assert_eq!(max, 3600);
+                assert!(rendered.contains("immediate timeout"), "{rendered}");
+            }
+            other => panic!("expected McpCallTimeoutSecsZero, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_mcp_call_timeout_secs_too_large_errors() {
+        let cfg = parse("mcp-call-timeout-secs = 3601\n");
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, max } => {
+                assert_eq!(path, "top-level mcp-call-timeout-secs");
+                assert_eq!(value, 3601);
+                assert_eq!(max, 3600);
+            }
+            other => panic!("expected McpCallTimeoutSecsTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_server_call_timeout_secs_out_of_range_names_the_entry() {
+        for (secs, zero) in [(0, true), (3601, false)] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], call-timeout-secs = {secs} }}
+"#
+            ));
+            let path = match expect_validation_err(&cfg, None) {
+                ConfigValidationError::McpCallTimeoutSecsZero { path, .. } if zero => path,
+                ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, .. } if !zero => {
+                    assert_eq!(value, secs);
+                    path
+                }
+                other => panic!("{secs}: expected an out-of-range call timeout, got: {other:?}"),
+            };
+            assert_eq!(path, "images.coding.mcp.build.call-timeout-secs");
+        }
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_bounds_are_inclusive() {
+        for secs in [1, 3600] {
+            let cfg = parse(&format!(
+                r#"
+mcp-call-timeout-secs = {secs}
+
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], call-timeout-secs = {secs} }}
+"#
+            ));
+            cfg.validate(None)
+                .unwrap_or_else(|e| panic!("{secs}s is inside the bound, got: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_repo_overrides_global() {
+        let global = parse("mcp-call-timeout-secs = 60\n");
+        let repo = parse("mcp-call-timeout-secs = 1800\n");
+        assert_eq!(merge(global, repo).mcp_call_timeout_secs, Some(1800));
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_falls_back_to_global() {
+        let global = parse("mcp-call-timeout-secs = 60\n");
+        assert_eq!(merge(global, parse("")).mcp_call_timeout_secs, Some(60));
+    }
+
     #[test]
     fn top_level_tool_result_max_too_small_errors() {
         let cfg = parse(
@@ -2554,6 +2643,25 @@ context    = "coding"
             .expect("build load does not require default-model to resolve");
         assert_eq!(cfg.default_model.as_deref(), Some("phantom"));
         assert!(cfg.images.contains_key("coding"));
+    }
+
+    /// The deadline sits outside the `validate_llm` gate `outrig build` turns
+    /// off: a build that stamps a server's entry into a label is the last
+    /// chance to refuse a deadline every session would then fail on.
+    #[test]
+    fn build_load_still_validates_mcp_call_timeouts() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "mcp-call-timeout-secs = 0\n");
+
+        let err = Config::load_for_build(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::McpCallTimeoutSecsZero { ref path, .. }
+                    if path == "top-level mcp-call-timeout-secs"
+            ),
+            "build load must still validate the call deadline",
+        );
     }
 
     #[test]

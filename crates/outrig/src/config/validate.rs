@@ -20,10 +20,11 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
-    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
-    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
+    Config, ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec,
+    MistralrsDeviceSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
+    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -349,6 +350,16 @@ pub enum ConfigValidationError {
          it could be answered"
     )]
     RequestTimeoutSecsZero { path: String, max: u64 },
+
+    #[error("{path} must be between 1 and {max} seconds; got {value}")]
+    McpCallTimeoutSecsTooLarge { path: String, value: u64, max: u64 },
+
+    #[error(
+        "{path} must be between 1 and {max} seconds; got 0, which is an immediate \
+         timeout rather than a disabled one -- every tools/call would fail before \
+         it could be answered"
+    )]
+    McpCallTimeoutSecsZero { path: String, max: u64 },
 
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
@@ -691,6 +702,12 @@ pub(super) fn validate_with_options(
                     server: server_name.clone(),
                 });
             }
+            if let Some(value) = spec.call_timeout_secs() {
+                check_mcp_call_timeout_secs(
+                    &format!("images.{image_name}.mcp.{server_name}.call-timeout-secs"),
+                    value,
+                )?;
+            }
         }
 
         // Only the sidecars this image-config actually names: a declared block
@@ -736,6 +753,9 @@ pub(super) fn validate_with_options(
     }
     if let Some(value) = cfg.retry_budget_secs {
         validate_retry_budget_secs("top-level retry-budget-secs", value)?;
+    }
+    if let Some(value) = cfg.mcp_call_timeout_secs {
+        check_mcp_call_timeout_secs("top-level mcp-call-timeout-secs", value)?;
     }
     validate_network_policy(cfg)?;
 
@@ -1743,6 +1763,31 @@ fn validate_request_timeout_secs(path: &str, value: u64) -> Result<(), ConfigVal
         });
     }
     Ok(())
+}
+
+/// The `call-timeout-secs` / `mcp-call-timeout-secs` range rule, shared with
+/// the label and `image.toml` reads and the library's hand-built specs, so
+/// every route a deadline can arrive by refuses the same values.
+pub(crate) fn check_mcp_call_timeout_secs(
+    path: &str,
+    value: u64,
+) -> Result<(), ConfigValidationError> {
+    if mcp_call_timeout_secs_in_range(value) {
+        return Ok(());
+    }
+    let (path, max) = (path.to_string(), MCP_CALL_TIMEOUT_SECS_CEILING);
+    Err(if value == 0 {
+        ConfigValidationError::McpCallTimeoutSecsZero { path, max }
+    } else {
+        ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, max }
+    })
+}
+
+/// The one statement of the range [`check_mcp_call_timeout_secs`] enforces,
+/// for the label and `image.toml` reads, which report it in their own error
+/// types.
+pub(crate) fn mcp_call_timeout_secs_in_range(value: u64) -> bool {
+    (1..=MCP_CALL_TIMEOUT_SECS_CEILING).contains(&value)
 }
 
 fn validate_tool_result_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {

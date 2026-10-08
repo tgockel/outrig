@@ -319,13 +319,18 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command in the container its placement names -- or, for entrypoint-stdio servers,
    `podman start --attach --interactive` the held container, whose lifetime now equals
-   the server's -- and run the MCP `initialize` handshake.
+   the server's -- and run the MCP `initialize` handshake. A server that has not answered
+   within 120 seconds fails startup, with its stderr in the error.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
-   each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
+   each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below. Each
+   backing server's `tools/list` gets 120 seconds too.
 8. **Serve MCP.** Without `--listen`, rmcp's stdio transport reads JSON-RPC frames
    from the process stdin and writes responses to stdout. With `--listen`, rmcp's
    Streamable HTTP service accepts POST/SSE traffic at `/mcp`. The proxy dispatches
-   `tools/call` to the right backing server in both modes.
+   `tools/call` to the right backing server in both modes, under that server's
+   [`call-timeout-secs`](../reference/config.md#imagesnamemcp) (10 minutes unless configured).
+   A client's `notifications/cancelled` for a call is forwarded to the backing server, and so
+   is outrig's own when a call runs past its deadline; the client gets a timeout error.
 
 If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.

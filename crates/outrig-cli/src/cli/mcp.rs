@@ -746,6 +746,10 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             if !view.is_none() {
                 table.insert("view", view.as_str().into());
             }
+            if let Some(secs) = spec.call_timeout_secs() {
+                // In range by validation, so well inside an `i64`.
+                table.insert("call-timeout-secs", (secs as i64).into());
+            }
             toml_edit::Value::InlineTable(table)
         }
     }
@@ -930,6 +934,36 @@ mod tests {
             !rendered.contains("view"),
             "default view should be elided: {rendered}"
         );
+    }
+
+    /// A server's own deadline is an override, so a copied-out entry has to
+    /// keep it -- and one that declares none must not gain a value it never
+    /// set, or it would stop following the session's.
+    #[test]
+    fn show_merged_carries_a_declared_call_timeout_and_elides_an_unset_one() {
+        let plan = plan_from_toml(
+            r#"
+[images.x.mcp]
+build = { command = ["cargo-mcp"], call-timeout-secs = 1800 }
+fs    = { command = ["mcp-fs"] }
+"#,
+        );
+
+        let rendered = render_merged_mcp(&plan);
+        assert!(
+            rendered.contains(r#"build = { command = ["cargo-mcp"], call-timeout-secs = 1800 }"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"fs = { command = ["mcp-fs"] }"#),
+            "{rendered}"
+        );
+        let reparsed: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, McpServerSpec>,
+        > = toml::from_str(&rendered).expect("rendered output parses as config");
+        assert_eq!(reparsed["mcp"]["build"].call_timeout_secs(), Some(1800));
+        assert_eq!(reparsed["mcp"]["fs"].call_timeout_secs(), None);
     }
 
     /// A plan built exactly the way production builds it: parse a whole

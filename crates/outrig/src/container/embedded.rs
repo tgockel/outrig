@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::config::{McpServerSpec, is_valid_mcp_server_name, mcp_command_is_empty};
+use crate::config::{
+    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, is_valid_mcp_server_name,
+    mcp_call_timeout_secs_in_range, mcp_command_is_empty,
+};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 
@@ -130,6 +133,16 @@ pub enum EmbeddedImageConfigError {
          ENTRYPOINT and is repo-config-only"
     )]
     ArgsInLabel { server: String },
+
+    #[error(
+        "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
+         got {value}"
+    )]
+    CallTimeoutOutOfRange {
+        server: String,
+        value: u64,
+        max: u64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +184,16 @@ pub enum StandaloneImageTomlError {
          ENTRYPOINT and is repo-config-only"
     )]
     ArgsInLabel { server: String },
+
+    #[error(
+        "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
+         got {value}"
+    )]
+    CallTimeoutOutOfRange {
+        server: String,
+        value: u64,
+        max: u64,
+    },
 }
 
 pub fn parse_standalone_image_toml(
@@ -422,6 +445,15 @@ fn parse_mcp_table(
                 server: server.clone(),
             });
         }
+        if let Some(value) = spec.call_timeout_secs()
+            && !mcp_call_timeout_secs_in_range(value)
+        {
+            return Err(EmbeddedImageConfigError::CallTimeoutOutOfRange {
+                server: server.clone(),
+                value,
+                max: MCP_CALL_TIMEOUT_SECS_CEILING,
+            });
+        }
     }
     Ok(mcp)
 }
@@ -526,6 +558,15 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     server: server.clone(),
                 });
             }
+            if let Some(value) = spec.call_timeout_secs()
+                && !mcp_call_timeout_secs_in_range(value)
+            {
+                return Err(StandaloneImageTomlError::CallTimeoutOutOfRange {
+                    server: server.clone(),
+                    value,
+                    max: MCP_CALL_TIMEOUT_SECS_CEILING,
+                });
+            }
         }
 
         Ok(Self {
@@ -587,6 +628,7 @@ mod tests {
             sidecar: None,
             image: None,
             args: Vec::new(),
+            call_timeout_secs: None,
         }
     }
 
@@ -884,6 +926,33 @@ mod tests {
         ));
     }
 
+    /// Unlike `args` and the placement keys, a deadline is the image author's
+    /// to set: they know how long their server's tools run. It is held to the
+    /// same range a config entry is, so a label cannot hand a session a
+    /// deadline every call would fail on.
+    #[test]
+    fn parse_mcp_table_carries_a_call_timeout_in_range() {
+        let mcp =
+            parse_mcp_table(r#"{"build": {"command": ["cargo-mcp"], "call-timeout-secs": 1800}}"#)
+                .expect("an in-range deadline parses");
+        assert_eq!(mcp["build"].call_timeout_secs(), Some(1800));
+
+        for secs in [0, 3601] {
+            let err = parse_mcp_table(&format!(
+                r#"{{"build": {{"command": ["cargo-mcp"], "call-timeout-secs": {secs}}}}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EmbeddedImageConfigError::CallTimeoutOutOfRange { ref server, value, max: 3600 }
+                        if server == "build" && value == secs
+                ),
+                "{secs}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn embedded_mcp_missing_label_is_empty() {
         let mcp =
@@ -1132,5 +1201,39 @@ mod tests {
             err,
             StandaloneImageTomlError::PlacementInLabel { server } if server == "fs"
         ));
+    }
+
+    /// `outrig image build` checks the range before it stamps the label, so
+    /// it cannot build an image every runtime would then refuse -- and a value
+    /// that passes survives the trip through the label.
+    #[test]
+    fn standalone_image_toml_range_checks_a_call_timeout_and_stamps_it() {
+        let toml = |secs: u64| {
+            format!(
+                r#"
+                [image]
+                ref = "rust-dev"
+
+                [mcp]
+                build = {{ command = ["cargo-mcp"], call-timeout-secs = {secs} }}
+                "#
+            )
+        };
+        for secs in [0, 3601] {
+            let err = parse_standalone_image_toml(&toml(secs)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StandaloneImageTomlError::CallTimeoutOutOfRange { ref server, value, .. }
+                        if server == "build" && value == secs
+                ),
+                "{secs}: {err:?}"
+            );
+        }
+
+        let cfg = parse_standalone_image_toml(&toml(1800)).expect("in range");
+        let labels = standalone_config_to_labels(&cfg).expect("stamp labels");
+        let read = parse_mcp_table(&labels[LABEL_MCP]).expect("read the label back");
+        assert_eq!(read["build"].call_timeout_secs(), Some(1800));
     }
 }

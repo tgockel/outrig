@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line-at-a-time reader. `RUST_LOG=debug` does not record what you type: the editor's own debug
   output stays at `warn` unless the filter names `rustyline`. See
   [Line editing and history](../../doc/usage/run.md#line-editing-and-history).
+- **`call-timeout-secs` and `mcp-call-timeout-secs` set how long a tool call may run.** A
+  `tools/call` that outlives its deadline is cancelled at the server and comes back to the model
+  as a timeout error; the session goes on. The deadline is the server's own `call-timeout-secs`
+  (on the table form of an `[images.<name>.mcp]` entry, or in an image's `org.outrig.mcp`
+  label), else the top-level `mcp-call-timeout-secs` (either config file; repo wins), else 600
+  seconds. Both accept 1 to 3600. Raise it on a server whose tools run builds or test suites. A
+  primary-hosted entry's key is part of the image's stamped label, so changing it rebuilds a
+  repo-built image, as changing its `env` does. See
+  [What if a server hangs?](../../doc/concepts/mcp-servers.md#what-if-a-server-hangs) (#338).
 
 ### Changed
 
@@ -51,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. (#478)
 
 ### Fixed
+
+- **An MCP server that never answers no longer holds a session forever.** A server that took
+  stdin and never spoke MCP -- `fs = ["cat"]` was enough -- kept `outrig run`, `outrig mcp`, and
+  `outrig image build`'s live test at `MCP <name>: initializing` until interrupted, and a tool
+  that blocked held its turn the same way. `initialize` and `tools/list` now fail after 120
+  seconds each, with the server's exit status and stderr in the error, and a tool call after its
+  deadline (above). A call Ctrl-C abandons mid-turn, and a call an `outrig mcp` client cancels,
+  are now cancelled at the backing server with `notifications/cancelled` instead of left
+  running; the server may still finish the work, since cancellation is advisory (#338).
 
 - **The session root is the global config's, from every directory.** `outrig ls`, `logs`, `discard`,
   and `clean` read `session-root` from the repo config found from the working directory, unvalidated

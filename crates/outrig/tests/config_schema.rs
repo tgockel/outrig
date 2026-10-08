@@ -139,6 +139,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.subagent_depth_max, Some(4));
         assert_eq!(cfg.subagent_width_max, Some(6));
         assert_eq!(cfg.retry_budget_secs, Some(300));
+        assert_eq!(cfg.mcp_call_timeout_secs, Some(900));
 
         let LlmProvider::OpenAi {
             base_url,
@@ -302,6 +303,8 @@ srv = { command = ["bin", "arg1"] }
             build_env["CARGO_HOME"],
             EnvValue::Literal("/workspace/.cargo".to_string()),
         );
+        assert_eq!(coding_ctr.mcp["build"].call_timeout_secs(), None);
+        assert_eq!(coding_ctr.mcp["tests"].call_timeout_secs(), Some(1800));
     }
 
     #[test]

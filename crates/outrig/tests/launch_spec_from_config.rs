@@ -228,3 +228,31 @@ image-name = "localhost/outrig-unused:latest"
     assert_eq!(ws.container, Path::new("/workspace"));
     assert_eq!(spec.network.mode, NetworkMode::Filter);
 }
+
+/// The top-level `mcp-call-timeout-secs` is a session default, not a property
+/// of any one server: it travels on the spec beside the servers, for
+/// `Outrig::launch` and `Outrig::add_sidecar` to resolve each server against.
+/// A server's own key stays on its entry.
+#[tokio::test]
+async fn lowering_carries_the_session_call_timeout_beside_the_servers() {
+    let cfg = parse(
+        r#"
+mcp-call-timeout-secs = 900
+
+[images.primary]
+image-name = "localhost/outrig-unused:latest"
+
+[images.primary.mcp]
+fs    = ["mcp-fs"]
+build = { command = ["cargo-mcp"], call-timeout-secs = 1800 }
+"#,
+    );
+
+    let spec = lower(&cfg).await;
+    assert_eq!(spec.mcp_call_timeout_secs, Some(900));
+    assert_eq!(spec.mcp["fs"].call_timeout_secs(), None);
+    assert_eq!(spec.mcp["build"].call_timeout_secs(), Some(1800));
+
+    let unset = lower(&config_with_network(DEFAULT_NETWORK)).await;
+    assert_eq!(unset.mcp_call_timeout_secs, None);
+}

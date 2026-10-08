@@ -26,14 +26,15 @@ default-image = "coding"
 default-agent = "coding"
 
 # global config (~/.outrig/config.toml):
-default-model      = "fast"
-session-root       = "/var/lib/outrig/sessions"       # optional; defaults to XDG data dir
-model-cache-root   = "/var/cache/outrig/models"       # optional; defaults to XDG cache dir
-tool-call-max      = 100                              # optional; defaults to 50
-tool-result-max    = 262144                           # optional; defaults to 256 KiB
-subagent-depth-max = 3                                # optional; defaults to 3
-subagent-width-max = 8                                # optional; defaults to 8
-retry-budget-secs  = 600                              # optional; defaults to 600
+default-model         = "fast"
+session-root          = "/var/lib/outrig/sessions"    # optional; defaults to XDG data dir
+model-cache-root      = "/var/cache/outrig/models"    # optional; defaults to XDG cache dir
+tool-call-max         = 100                           # optional; defaults to 50
+tool-result-max       = 262144                        # optional; defaults to 256 KiB
+subagent-depth-max    = 3                             # optional; defaults to 3
+subagent-width-max    = 8                             # optional; defaults to 8
+retry-budget-secs     = 600                           # optional; defaults to 600
+mcp-call-timeout-secs = 600                           # optional; defaults to 600
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -42,22 +43,23 @@ allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
 deny  = ["*:22"]                                      # optional; global only
 ```
 
-| Key                  | Type    | Required               | Where  | Description               |
-|----------------------|---------|------------------------|--------|---------------------------|
-| `default-image`      | string  | no                     | repo   | Default `--image`.        |
-| `default-agent`      | string  | no                     | repo   | Default `--agent`.        |
-| `default-model`      | string  | if agent omits `model` | global | Fallback model name.      |
-| `session-root`       | path    | no                     | global | Sessions root dir.        |
-| `model-cache-root`   | path    | no                     | global | GGUF download cache dir.  |
-| `tool-call-max`      | integer | no                     | global | Per-turn tool-call max.   |
-| `tool-result-max`    | integer | no                     | global | Per-tool-result byte max. |
-| `subagent-depth-max` | integer | no                     | global | Max subagent nesting.     |
-| `subagent-width-max` | integer | no                     | global | Max live subagents/agent. |
-| `retry-budget-secs`  | integer | no                     | global | LLM retry budget (secs).  |
-| `network.mode`       | string  | no                     | either | Network mode.             |
-| `network.default`    | string  | no                     | global | Filter fallback action.   |
-| `network.allow`      | array   | no                     | global | Filter allow entries.     |
-| `network.deny`       | array   | no                     | global | Filter deny entries.      |
+| Key                     | Type    | Required               | Where  | Description               |
+|-------------------------|---------|------------------------|--------|---------------------------|
+| `default-image`         | string  | no                     | repo   | Default `--image`.        |
+| `default-agent`         | string  | no                     | repo   | Default `--agent`.        |
+| `default-model`         | string  | if agent omits `model` | global | Fallback model name.      |
+| `session-root`          | path    | no                     | global | Sessions root dir.        |
+| `model-cache-root`      | path    | no                     | global | GGUF download cache dir.  |
+| `tool-call-max`         | integer | no                     | global | Per-turn tool-call max.   |
+| `tool-result-max`       | integer | no                     | global | Per-tool-result byte max. |
+| `subagent-depth-max`    | integer | no                     | global | Max subagent nesting.     |
+| `subagent-width-max`    | integer | no                     | global | Max live subagents/agent. |
+| `retry-budget-secs`     | integer | no                     | global | LLM retry budget (secs).  |
+| `mcp-call-timeout-secs` | integer | no                     | either | MCP tools/call deadline.  |
+| `network.mode`          | string  | no                     | either | Network mode.             |
+| `network.default`       | string  | no                     | global | Filter fallback action.   |
+| `network.allow`         | array   | no                     | global | Filter allow entries.     |
+| `network.deny`          | array   | no                     | global | Filter deny entries.      |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -72,6 +74,11 @@ repo or agent config can tighten it for a noisy project.
 `retry-budget-secs` is a default for every remote provider; a `[providers.<name>]` row that
 sets its own overrides it, which is usually the better place since rate limits are a property
 of the endpoint.
+`mcp-call-timeout-secs` is how long an MCP `tools/call` may run before outrig cancels it at the
+server and hands the model a timeout in place of a result -- 1 to 3600, default 600. It is the
+default for every server in the session, sidecars and image-label servers included; a server's
+own [`call-timeout-secs`](#imagesnamemcp) overrides it, and in either file the repo value wins.
+The server is sent `notifications/cancelled`, which it may or may not act on.
 `session-root` and `model-cache-root` are global-only: they choose where this machine writes
 session records and model downloads, and for sessions also where `outrig clean` and
 `outrig discard` delete. A repo config that sets either is rejected at load.
@@ -938,6 +945,7 @@ shell = ["bash", "-lc", "exec shell-mcp-command"]
 # Full form -- table with command + optional env
 fs = { command = ["mcp-server-filesystem", "/workspace"] }
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
+tests = { command = ["test-mcp"], call-timeout-secs = 1800 }
 
 # Full form with a placement key -- runs in a sidecar container
 lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
@@ -990,6 +998,13 @@ image, or declare any other MCP command that should run inside the container.
   The `args` written here and the elements the sidecar image declares end up meaning different
   paths -- see [Concepts -> MCP Servers](../concepts/mcp-servers.md#primary-filesystem-view).
 
+- `call-timeout-secs` (integer, optional, default: the top-level
+  [`mcp-call-timeout-secs`](#top-level), else `600`): how long one `tools/call` to this
+  server may run, 1 to 3600. Past it outrig sends the server `notifications/cancelled` and the
+  model gets a timeout error in place of a result. Any transport, any placement. For a server
+  whose tools run builds or test suites; `initialize` and `tools/list` are not affected -- they
+  have a fixed 120-second bound each.
+
 Notes:
 
 - The first element of `command` must be on `$PATH` inside the container, or absolute.
@@ -1001,12 +1016,14 @@ Notes:
   resolved from the host environment at MCP startup and shown only as the reference -- see the
   subsection below.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
-  repo-config-only and rejected in labels). Repo config entries override image entries by
-  server name; see
+  repo-config-only and rejected in labels; `call-timeout-secs` is allowed). Repo config entries
+  override image entries by server name, wholesale -- a label's `call-timeout-secs` does not
+  survive a config entry of the same name that omits it; see
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
 - Build-from-Dockerfile repo images are stamped with the merged `org.outrig.mcp` label on cache
   misses, so `outrig image inspect <name>:<content-hash>` can show their declared repo-local MCP
-  entries without starting a container.
+  entries without starting a container. The label is part of the image's cache key, so changing
+  a primary-hosted entry's `env` or `call-timeout-secs` rebuilds the image.
 
 ## `[sidecars.<sc>]`
 
@@ -1259,6 +1276,7 @@ tool-result-max    = 262144                      # optional; default = 256 KiB
 subagent-depth-max = 3                           # optional; default = 3
 subagent-width-max = 8                           # optional; default = 8
 retry-budget-secs  = 600                         # optional; default = 600
+mcp-call-timeout-secs = 600                      # optional; default = 600
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -1351,6 +1369,7 @@ build-args = { NODE_VERSION = "20" }
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
+  tests = { command = ["test-mcp"], call-timeout-secs = 1800 }
 ```
 
 ## Validation rules
@@ -1411,6 +1430,9 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `request-timeout-secs`, if set on a remote provider, must be between `1` and `3600` seconds.
   Unlike `retry-budget-secs`, `0` is **not** legal: it is an immediate timeout rather than a
   disabled one, so every request would fail before it could be answered.
+- `mcp-call-timeout-secs` at the top level and `call-timeout-secs` on an MCP entry, if set,
+  must be between `1` and `3600` seconds. `0` is not legal, for the same reason as
+  `request-timeout-secs`. `outrig build` checks both too.
 - `[network].mode`, if set, must be `default`, `audit`, or `filter`. `filter` additionally
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
@@ -1430,6 +1452,9 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An entrypoint host hosts exactly one MCP server and must be `start = "auto"`.
 - `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
   placement keys: labels declare exec-stdio servers, whose arguments belong in `command`.
+- `call-timeout-secs` in an `org.outrig.mcp` label or a standalone `image.toml` is held to the
+  same `1` to `3600` range: `outrig image build` refuses it before stamping the label, and a
+  session refuses a label that carries one out of range.
 - `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory,
   or your home directory for a leading `~` (build path only). The error names both the path as
   written and the file that declared it.
