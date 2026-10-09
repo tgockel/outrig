@@ -7,8 +7,8 @@ namespace and history between them. The two share one request machinery -- ids, 
 handles, strict decoding, repair, events (`work.md`) -- and differ in lifetime, which is the
 distinction `work.md` opens with: an agent and a piece of work do not live equally long.
 
-It is built on `work.md`'s explicit child API. `0003-24` provides `outrig.schema`; `0003-25` the
-request child, its handles, release and limits; `0003-26` the decorator; and `0003-29` the class.
+It is built on `work.md`'s explicit child API. `0003-25` provides `outrig.schema`; `0003-26` the
+request child, its handles, release and limits; `0003-27` the decorator; and `0003-30` the class.
 The design was settled in planning on 2026-10-01, and revised on 2026-10-02 after the design
 critique: a request method is marked with `@outrig.agent` rather than by its body, a trailing
 round counts no attempt, and an instance counts against `children-max`. On 2026-10-05, after the
@@ -106,21 +106,21 @@ way.
 named `<Class><Method>Message` -- `FooAgentBuzzMessage(foo, bar)` -- with fields in parameter
 order and each parameter's default kept as its field's default. The signature already says what
 the message holds, so asking for a dataclass beside it would be a second declaration of the same
-thing. Every parameter is annotated, with a type `outrig.schema` takes (`0003-24`), and a missing
+thing. Every parameter is annotated, with a type `outrig.schema` takes (`0003-25`), and a missing
 annotation is refused. `*args` and `**kwargs` are refused, since a message has one fixed shape.
 
-The generated class is declared through `0003-24` as any dataclass is -- `make_dataclass`, with no
+The generated class is declared through `0003-25` as any dataclass is -- `make_dataclass`, with no
 source of its own -- so the type is checked at class creation, the request is decoded strictly in
 the child, and the schema text in the child's instructions comes from the same renderer. It is
 reachable on the class under its own name, so parent code can construct one by hand.
 
 **The reply type is the return annotation**, required, and a reply is decoded against it strictly
-on the parent's side (`0003-24`), as a work child's completion is. `-> None` declares a request
+on the parent's side (`0003-25`), as a work child's completion is. `-> None` declares a request
 answered with no value; the child still replies, because the reply is what settles the handle.
 
 **Both are bound by name in the child.** `Thing`, `SomethingElse` and `FooAgentBuzzMessage`, with
 the dataclasses they use, are bound into the child's namespace under their class names, as
-`0003-25` binds a result type, so `d.body.foo` reads and `Thing(...)` constructs. Two distinct
+`0003-26` binds a result type, so `d.body.foo` reads and `Thing(...)` constructs. Two distinct
 classes with one `__name__` -- `a.Thing` on one method and `b.Thing` on another -- are refused at
 class creation naming both methods, because one name holds one class in the child. The crossing
 is `messages.md`'s: field values and a type identifier, decoded into the child's own instances.
@@ -138,7 +138,7 @@ serializable subset with the check channel contracts use (`_check_subset`,
 `interpreter.py:1442`), so a hosted reference or an open file is refused in the constructor with
 nothing launched. Then it schedules `runtime.spawn(name, prompt=<the class docstring>,
 model=model, inputs=inputs, requests=<the channels>)` as a task on the constructing kernel's event
-loop and returns the instance. The spawn is `0003-25`'s, with the channels derived from the
+loop and returns the instance. The spawn is `0003-26`'s, with the channels derived from the
 declaration ("Explicit plumbing"). A subclass with an `__init__` of its own calls
 `super().__init__(**inputs, model=...)`; one without passes its keywords through. `model` is the
 one keyword the base keeps for itself, so no input is named `model`.
@@ -172,7 +172,7 @@ host call:
 - At class creation: every rule of "The declaration" and "Message and reply types".
 - In the constructor, synchronously: an input outside the subset, and a constructor called outside
   every execution's context -- on a thread started with `_thread.start_new_thread`, or in a pool's
-  `initializer` -- which raises as `outrig.runtime` does there (`0003-24`).
+  `initializer` -- which raises as `outrig.runtime` does there (`0003-25`).
 - At `ready()` and at the first handle, because they are the host's answers and the host is asked
   in the background: an unknown `model=`, with the configured names listed; a parent already at
   `subagent-depth-max`; the session at `children-max`, which is `AgentLimitReached` ("Limits and
@@ -224,14 +224,14 @@ await d.fail("no such file")         # settles the handle with AgentRequestFaile
 `reply` is the request child's `complete`. Its value is checked against the reply type, strictly,
 and when it fails the problems are raised in the child's code with their JSON paths, bounded, so the
 child can correct the value and reply again; each failed reply counts one attempt toward the
-request's limit ("The child's rounds"). It returns once the value is accepted, as `0003-25`'s
+request's limit ("The child's rounds"). It returns once the value is accepted, as `0003-26`'s
 `complete` does. `fail(message)` settles the handle with `AgentRequestFailed` carrying the message,
 for a request the child cannot answer -- a file that is not there, an instruction it cannot follow
 -- so that the parent learns why instead of holding an open request until it cancels it. A
 reply to a request that
 has settled -- answered already, cancelled, released -- is refused and evented, and after
 `h.cancel()` it raises `RequestCancelled`. `reply` and `fail` are methods of request deliveries,
-`0003-25`'s `RequestDelivery` subclass of `Delivery`; `id` is on every delivery, the user channel's
+`0003-26`'s `RequestDelivery` subclass of `Delivery`; `id` is on every delivery, the user channel's
 included, since the interpreter already posts each message under an id (`_deliver`,
 `interpreter.py:1725`).
 
@@ -244,7 +244,7 @@ answer "the one outstanding request" was rejected ("Rejected alternatives"), so 
 ## The child's rounds
 
 A request child is driven by the host as every child is: a Rust runner calls the model and
-submits the child's Python (`0003-25`). What the request machinery adds is when a round starts and
+submits the child's Python (`0003-26`). What the request machinery adds is when a round starts and
 what the model is told.
 
 **A request arriving while the child is idle starts a round.** `PythonAgent::round`
@@ -295,7 +295,7 @@ host knows because it delivers and settles each one, and compares ids where `Tol
 counts (`execution-and-rounds.md`, "A round", for what else changes). Such a round counts no
 attempt against any request (below).
 
-Five consequences, which `0003-25` tests:
+Five consequences, which `0003-26` tests:
 
 - **A child that answered anything in a round gets the next round, whatever arrived meanwhile.**
   Every reply removes a request's id from the summary, so a round that answers one of several
@@ -375,7 +375,7 @@ spending rounds carries no real penalty of its own -- the token budget bounds sp
 wait may be legitimate, since a request can wait on a build or a test run; and the child's own
 long waits happen inside an execution, where no round ends, so a round that ends with a request
 open is not evidence that the child has stopped working on it. The alternative, no limit on
-invalid replies either, is `0003-25`'s fork 13.
+invalid replies either, is `0003-26`'s fork 13.
 
 **The requests unsettled on one child are bounded by `requests-max`**, default 256, counting
 unread and received-and-unanswered alike, and a call past it raises `AgentLimitReached` at the
@@ -406,7 +406,7 @@ by either, it stays settled.
 **Releasing the instance closes the child's subtree** the way `lifecycle.md`'s "Releasing a child"
 says: its own children -- instances it constructed, decorated calls in flight -- are released the
 same way, its pending escalations are cancelled, its running execution is interrupted, and its
-forwarded hosted calls finish, or are reported `unknown` if their binding dies. `0003-25` builds
+forwarded hosted calls finish, or are reported `unknown` if their binding dies. `0003-26` builds
 and tests that; the class adds nothing to it beyond the requests that settle.
 
 **The GC backstop.** An instance collected unreleased is released by the runtime. `outrig.Agent`
@@ -446,10 +446,10 @@ measured, and no model calls.
 
 - **Depth.** The child is one level below the agent that constructed it, and an instance
   constructed by an agent at `subagent-depth-max` fails at `ready()` and the first handle.
-- **Tokens.** The per-tree token budget (`0003-25`) covers the child's rounds. A child that has
+- **Tokens.** The per-tree token budget (`0003-26`) covers the child's rounds. A child that has
   spent it starts no further model call, and each of its outstanding requests settles with the
   budget error; the instance stays until it is released.
-- **Children.** An instance's child counts against `children-max` (default 64; `0003-25`) while
+- **Children.** An instance's child counts against `children-max` (default 64; `0003-26`) while
   it is resident -- launching, working, idle, or wedged -- because what that limit bounds is the
   thread and the memory, which an idle instance holds too. Construction past the cap fails from
   the constructor's background launch: `AgentLimitReached`, an `outrig.AgentError`, surfaces at
@@ -459,11 +459,11 @@ measured, and no model calls.
   idle instance would not count against, is `potential/resource-scheduling.md` ("Rejected
   alternatives").
 - **Model requests.** The child's model calls take permits from `model-concurrency-max` (default
-  8; `0003-25`), one per provider request, held only while the request is in flight and never
+  8; `0003-26`), one per provider request, held only while the request is in flight and never
   while the child's code runs, so an instance whose child awaits children of its own holds no
   permit while it waits. A round that would be the ninth request in flight waits in the queue for
   a permit, and releasing the instance while it waits removes it from the queue.
-- **Requests.** `requests-max` (default 256; `0003-25`) bounds the requests unsettled on one
+- **Requests.** `requests-max` (default 256; `0003-26`) bounds the requests unsettled on one
   child: held before the child exists, waiting unread, or received and unanswered. A method call
   past it raises `AgentLimitReached` at the call and sends nothing, as `foo.fizz(1)` raises
   `TypeError` there; a reply, a `fail`, `h.cancel()` or the release frees the place. Nothing
@@ -479,7 +479,7 @@ measured, and no model calls.
   see what was spent while it was open. Upward, the child's usage is added to the instance's total,
   which its released event carries, and to the skill invocation and the main agent's round under
   which the instance was constructed, with spend after that round yielded published as usage
-  events naming it (`0003-25`, fork 8).
+  events naming it (`0003-26`, fork 8).
 
 A child's thread is not the main thread, so a child whose code wedges is contained and not
 recoverable (`agent-placement.md`); its requests wait until the instance is released, and the
@@ -510,7 +510,7 @@ on an instance is a request.
 
 ## Explicit plumbing
 
-The class is a thin layer over `0003-25`'s request child, and the layer underneath is reachable:
+The class is a thin layer over `0003-26`'s request child, and the layer underneath is reachable:
 
 ```python
 child = await runtime.spawn(
@@ -577,7 +577,7 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
 - `validate=` on a request method. The method's `@outrig.agent` is the place it would attach;
   what it receives beyond the decoded reply is open, since a method has the instance's inputs as
   well as the call's arguments. Deferred; strict decoding is the only check on a reply in
-  `0003-29`, and the decorator refuses the keyword on a method until then.
+  `0003-30`, and the decorator refuses the keyword on a method until then.
 - Progress from an agent class. A submission has `h.progress`; a class request has nothing between
   sent and settled. `plan/next/progress-channels-on-agent-classes.md` records the shapes.
 - Whether every long wait in a request child should be ended by a new request. `runtime.wait` is,
@@ -591,15 +591,15 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
 
 - Nothing on this page has run. The class machinery -- `__init_subclass__` collecting the marked
   methods, the generated dataclass, the background spawn -- has not been prototyped, and the first
-  evidence is `0003-29`'s acceptance.
+  evidence is `0003-30`'s acceptance.
 - The GC backstop's timing under asyncio was reasoned from CPython's reference counting and cyclic
   collector, not measured: a pending task that references the instance keeps it alive, a cycle
   defers collection to the collector's next pass, and a finalizer that runs at interpreter exit
   may find the loop closed. The acceptance uses `gc.collect()`, which says nothing about when the
   collector runs unprompted.
-- That `make_dataclass` output passes `0003-24`'s declaration and schema path -- `get_type_hints`
+- That `make_dataclass` output passes `0003-25`'s declaration and schema path -- `get_type_hints`
   resolves a generated class's annotations in the namespace of its `__module__`, which the
-  generator has to set -- is `0003-24`'s added acceptance item, not a result.
+  generator has to set -- is `0003-25`'s added acceptance item, not a result.
 - The announcer generalization. `announcement` (`channel.rs:98-115`) knows a channel by name and
   count only; saying "requests" for a request channel needs the `pending` protocol message to
   carry each channel's kind, or the host to remember the kinds it declared. Neither exists. The

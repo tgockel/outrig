@@ -1,4 +1,4 @@
-# 0003-27 -- Skills import as modules from pluggable sources
+# 0003-28 -- Skills import as modules from pluggable sources
 
 ## Context
 
@@ -60,7 +60,7 @@ whose files arrive when they are used.
   catalog and reported with its code: `metadata-invalid`, or `duplicate-metadata-block` for two
   `script` blocks, as PEP 723 requires of tools.
 - **The preamble** lists each skill's name and description, per fork 5, and names `outrig.skills`
-  as how to use one. `0003-28` adds what a `/name` message asks.
+  as how to use one. `0003-29` adds what a `/name` message asks.
 - **`outrig.skills.read(name)`** returns a skill's `SKILL.md` body, the accessor `skills.md` leaves
   to this task -- for an instruction-only skill the agent judges relevant, or for an executable
   skill's own instructions.
@@ -72,11 +72,11 @@ whose files arrive when they are used.
   settled (`skills.md`). The skill's directory is never on `sys.path`, so a skill's `json.py` is
   `outrig_skills.<name>.json` and nothing else. The loader supplies a resource reader, so
   `importlib.resources.files()` on the package reads data files through the same fetch, and it
-  answers `get_source`, so tracebacks show a skill's lines and `0003-26`'s body check can read a
+  answers `get_source`, so tracebacks show a skill's lines and `0003-27`'s body check can read a
   declaration made in a skill. What `__file__` is, per fork 6.
 - **A digest per skill**, recorded with the skill's name and source as `__outrig_skill__` on its
   package when the package is imported. Fetching any further file of a skill whose digest has
-  since changed raises `skill-changed`, so two versions of one skill are never mixed; `0003-28`'s
+  since changed raises `skill-changed`, so two versions of one skill are never mixed; `0003-29`'s
   `invoke` checks the same digest. `outrig.skills.reload(name)` removes exactly
   `outrig_skills.<name>` and its dotted descendants from `sys.modules` -- never by string prefix,
   which would take `review_diff` along with `review` -- and imports afresh. References to the old
@@ -174,12 +174,12 @@ whose files arrive when they are used.
    resources, the digest and reload, and the dependency check. The host side can be tested with
    no import at all: the preamble lists the skills, and `read` returns a body. The loader needs the
    host side's sources to fetch from. Split, the loader becomes a task between this one and
-   `0003-28`, numbered by `/groom-plan`, and its acceptance items go with it.
+   `0003-29`, numbered by `/groom-plan`, and its acceptance items go with it.
 
 ## Dependencies
 
 - **Hard: `0003-19`.** The trait and the builder method belong to the embedding API.
-- **Hard: `0003-24`.** `outrig.skills` is part of the `outrig` package.
+- **Hard: `0003-25`.** `outrig.skills` is part of the `outrig` package.
 - **Soft: `0003-16`.** A fetch is a request a kernel thread blocks on while the reader thread
   brings the answer, and `0003-16`'s `rpc` message kind is the first such request; reuse its
   mechanism where it fits.

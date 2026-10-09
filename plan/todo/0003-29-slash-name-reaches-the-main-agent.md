@@ -1,4 +1,4 @@
-# 0003-28 -- `/name` reaches the main agent as a call it makes
+# 0003-29 -- `/name` reaches the main agent as a call it makes
 
 ## Context
 
@@ -33,7 +33,7 @@ An instruction-only skill, one with no `skill.py`, needs none of this. Its direc
 body loaded when the skill is used, and the agent reads it as it reads any message.
 
 `run-new`'s REPL matches `/help` and `/quit` in `crates/outrig-cli/src/cli/run_new/converse.rs`,
-`0003-22` adds `/approve` and `/deny`, and any other `/word` is an unknown command today.
+`0003-23` adds `/approve` and `/deny`, and any other `/word` is an unknown command today.
 
 This is also the task where the phase's parts first run together. The phase's exit criteria ask
 for a skill that uses a binding, runs typed children in parallel with one of them repaired, and
@@ -53,7 +53,7 @@ agent's history like anything else it ran.
   the body of a user-channel message, a `str`, and the `Delivery` names the resolved skill in a new
   optional field -- `None` on every other message; the field's spelling is this task's, and
   `messages.md` suggests `skill`. The `SKILL.md` body is not delivered with it: that would cost
-  context on every directive, and the agent reads the body with `outrig.skills.read` (`0003-27`)
+  context on every directive, and the agent reads the body with `outrig.skills.read` (`0003-28`)
   when the parameter help is not enough. For an instruction-only skill, the body is its `SKILL.md`
   body followed by the line as typed, read through the skill's source, with the skill named the
   same way. The embedding API gains a way to send a message naming a skill, so an embedder's front
@@ -78,7 +78,7 @@ agent's history like anything else it ran.
   text the parser child receives. `invoke` reads it in the interpreter from the source the loader
   holds, with the specification's regular expression and `tomllib`, or the loader records it on
   `__outrig_skill__`; which is this task's. A key naming no field is reported when the class is
-  derived. If `0003-27`'s block parser reports `parameters` as an unknown key, this task teaches it
+  derived. If `0003-28`'s block parser reports `parameters` as an unknown key, this task teaches it
   the key.
 - **`outrig.skills.invoke(name, text, *, reload=False)`** imports the skill, derives
   `<Skill>Params`, runs `parse_params` on `text` -- raising `SkillNeedsClarification` when it
@@ -91,7 +91,7 @@ agent's history like anything else it ran.
   child released, or the running entry interrupted. Whether the handle is `work.md`'s type or a
   narrower one is this task's.
 - **`parse_params` is a typed agent call**, declared by the runtime per skill with `@outrig.agent`
-  (`0003-26`): one input, `text: str`, bound into the child's namespace and never interpolated
+  (`0003-27`): one input, `text: str`, bound into the child's namespace and never interpolated
   into the instructions; the result type `<Skill>Params | Clarification`; and a docstring made of
   the runtime's fixed instruction -- that `text` is what the user typed after `/<name>`, exact
   options or prose; that the child completes with the instance it means when the text determines
@@ -107,12 +107,12 @@ agent's history like anything else it ran.
   result by the request's id, and if that round ends the same way the call settles with
   `CompletionRejected`, whose reason is that the child ended without completing, and the child is
   released; the parser never idles with the call open. The child counts against `children-max`
-  (`0003-25`), so a launch past it raises `AgentLimitReached` from `invoke` at once, and its usage
+  (`0003-26`), so a launch past it raises `AgentLimitReached` from `invoke` at once, and its usage
   is attributed to it and added to the invocation and the round. Fork 1 is whether a skill may
   name a model for it.
 - **`Clarification` and `SkillNeedsClarification`**, both in `outrig.skills`. `Clarification` is a
   `@dataclass(frozen=True, kw_only=True)` with one field, `question: str`, the parser's second
-  result. The union decodes as `0003-24`'s rule has it: a completion is taken only when exactly
+  result. The union decodes as `0003-25`'s rule has it: a completion is taken only when exactly
   one member accepts it. The members are told apart by their keys, so a `<Skill>Params` field
   named `question` would make them overlap, and the derivation fails with `signature-unsupported`
   naming it, before any child is spawned. When the parser completes with a `Clarification`, the
@@ -136,7 +136,7 @@ agent's history like anything else it ran.
   lacks, `entry-not-found` for an `entry` the module does not define -- which discovery cannot check
   without running Python -- `signature-unsupported` as above, and `unknown-skill`. Each is raised
   before anything is called and before any child is spawned.
-- **`skill-changed` at `invoke`**, checked against `0003-27`'s digest. `reload=True` reloads first,
+- **`skill-changed` at `invoke`**, checked against `0003-28`'s digest. `reload=True` reloads first,
   as `outrig.skills.reload` does; it is a Python keyword of `invoke`, never a skill parameter. A
   reload while an invocation of the same skill runs, per fork 3.
 - **Invocation events**, emitted by the runtime rather than by the skill -- the host when it
@@ -152,7 +152,7 @@ agent's history like anything else it ran.
   events carry the invocation's id and the rejection. A parse that completes with a
   `Clarification` ends it at the same point, the parse call's settled event carrying the
   invocation's id and the `Clarification`. The invocation is the link between a call
-  and the main agent's round that `0003-25`'s spend chain leaves for this task: a child's usage is
+  and the main agent's round that `0003-26`'s spend chain leaves for this task: a child's usage is
   added to the invocation it ran under, and from there to the round (`typed-agents.md`).
 - **Correlation.** While an invocation runs -- from the call to `invoke`, so the parse call is
   inside it -- the boundary events of the hosted calls made in it and the start events of the
@@ -319,20 +319,20 @@ model makes of a directive is not measured here.
 
 ## Dependencies
 
-- **Hard: `0003-21`.** Injection passes a binding's host reference, which needs bindings in the
+- **Hard: `0003-22`.** Injection passes a binding's host reference, which needs bindings in the
   kernel.
-- **Hard: `0003-22`.** `/approve` and `/deny` are built-ins a skill's name can collide with, and
+- **Hard: `0003-23`.** `/approve` and `/deny` are built-ins a skill's name can collide with, and
   the end-to-end acceptance meets an escalated call.
-- **Hard: `0003-23`.** The end-to-end acceptance's escalation comes from the evaluator, whose
+- **Hard: `0003-24`.** The end-to-end acceptance's escalation comes from the evaluator, whose
   usage it checks is kept apart.
-- **Hard: `0003-26`.** The parse is a typed agent call: `parse_params(text) -> <Skill>Params |
+- **Hard: `0003-27`.** The parse is a typed agent call: `parse_params(text) -> <Skill>Params |
   Clarification` is declared with `@outrig.agent`, its child is spawned and released as a
-  decorated call's is, and its completion is decoded strictly -- the union by `0003-24`'s rule,
+  decorated call's is, and its completion is decoded strictly -- the union by `0003-25`'s rule,
   through it -- and repaired by the decorator's path, so no `invoke(name, text)` works without
   it. The end-to-end acceptance also runs typed children
-  through it. Through it, `0003-25`'s children, `children-max`, and the spend chain the invocation
+  through it. Through it, `0003-26`'s children, `children-max`, and the spend chain the invocation
   joins.
-- **Hard: `0003-27`.** The catalog the REPL matches against, the loader, the digest and
+- **Hard: `0003-28`.** The catalog the REPL matches against, the loader, the digest and
   `outrig.skills.read` are its.
 
 ## See also

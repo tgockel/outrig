@@ -14,8 +14,8 @@ settled in the planning round of 2026-09-30, and the round of 2026-10-09 made ho
 awaitable through a facade over the same transport ("Calls are awaited"), after `0003-17` had
 proved the pool it rests on. `0003-16` through `0003-18` are spikes that test the riskiest parts
 first -- `0003-16` ran the transport and the interception on the host, with both sides started by
-tests, and its `## Decisions` records what held -- and `0003-20`, the facade task
-(`plan/next/a-hosted-object-is-awaited.md`), and `0003-21` build the rest.
+tests, and its `## Decisions` records what held -- and `0003-20`, `0003-21` and `0003-22` build
+the rest.
 
 GitPython is the example throughout, and nothing here is specific to it. No mechanism on this page
 names a library, a type, or a parameter: there are no per-library schemas, classification tables,
@@ -511,7 +511,7 @@ The cost is the one the default avoids: under `serialize = true`, a call that bl
 holds every other call to that binding for an hour, from every kernel. `0003-20` delivers the
 setting; `0003-17` proved both modes, starting the binding program with `--serialize`, which is
 how the setting reaches it. The lock is granted in arrival order and is re-entrant for the thread
-holding it; a waiter holds a ticket, which `0003-21` drops when a cancel names its request or
+holding it; a waiter holds a ticket, which `0003-22` drops when a cancel names its request or
 when the session closes.
 
 **Why every binding is not serialized.** Until the review of 2026-10-02 this page said the
@@ -569,9 +569,9 @@ session then closes and reports as at shutdown
 (`plan/next/interpreter-restart-with-a-reset-notice.md`).
 
 **A call that outlives its caller runs to completion.** A call still running in its binding when
-its kernel is released (`0003-25`, through `Kernel.close_hosted`, which closes the kernel's pool
+its kernel is released (`0003-26`, through `Kernel.close_hosted`, which closes the kernel's pool
 and wakes every call waiting on it), or when the connection that carried it closes for another
-reason -- the relay closing it after a frame that did not fit (`0003-21`), the interpreter's
+reason -- the relay closing it after a frame that did not fit (`0003-22`), the interpreter's
 death -- cannot be stopped: RPyC has no cancel, so the binding runs it on its thread until it
 returns, and the reply reaches nobody. Its caller is told `unknown`, since its wait ended with no
 result, while the call's outcome event records `returned` or `raised` when the reply comes, and
@@ -687,7 +687,7 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
 - How a relative tagged path resolves. The config's general rule is the directory of the file that
   declared it; `0003-20` states it for `[bindings]`.
 - What a binding process dying mid-session does. Its calls in flight are `unknown`; whether the
-  session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-21`'s.
+  session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-22`'s.
 - Whether the facade's `async for` fetches a returned container in batches with RPyC's
   `buffiter`, which would make one request per batch rather than per item.
 - Whether a plain-function callback may make a hosted call through `_sync()` at all, or only a
@@ -719,7 +719,7 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   callers `unknown`, leaves the binding to finish the calls, and leaves its table gone; and a
   proxy released on one connection frees its object only when no connection holds it. All four
   held, so fork 4's alternative -- one connection per kernel and binding, with replies out of
-  order -- was not measured. What stood in for the outcome event, which `0003-21` builds, was
+  order -- was not measured. What stood in for the outcome event, which `0003-22` builds, was
   the binding's record of the finished call and the reply crossing to a closed connection.
 - The two CVEs are described from their published advisories. `0003-16` sent each one's request
   by hand -- a comparison naming `__getattribute__`, and a host method copying and pickling a
@@ -731,9 +731,8 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   `smmap` are `py3-none-any` was checked by downloading them for the payload's platform tag.
 - That building a kernel cannot resolve a binding is reasoned from the interpreter's startup order
   and `_open`, not observed.
-- The facade's claims, which the facade task (`plan/next/a-hosted-object-is-awaited.md`) tests:
-  that an interrupt or a cancel reaches a worker's wait, since `Kernel._wake` today finds a wait
-  by the kernel thread's ident and
+- The facade's claims, which `0003-21` tests: that an interrupt or a cancel reaches a worker's
+  wait, since `Kernel._wake` today finds a wait by the kernel thread's ident and
   `interruptible` is read from the calling thread's frames, so the facade must register its waits
   by the awaiting execution and mark them interruptible on its behalf; that a worker runs under a
   copy of the awaiting task's context, so `outrig.runtime` and an invocation id resolve on it and

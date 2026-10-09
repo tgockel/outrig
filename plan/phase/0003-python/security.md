@@ -19,7 +19,7 @@ host, with the same static CPython and whatever environment the binding was give
 
 None of this is built yet. `0003-18` is a spike that proves binding processes and their supervision,
 and `0003-20` builds them, with the declarations, the approval of repo-declared ones, and same-path
-mounts; `0003-21` builds the interception and its events, and `0003-22` the policy. `SECURITY.md`'s
+mounts; `0003-22` builds the interception and its events, and `0003-23` the policy. `SECURITY.md`'s
 "Known boundaries" gains its entry with `0003-20`: a binding acts with the host user's authority,
 and the default -- allow, published as events -- runs every call and publishes it.
 

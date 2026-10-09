@@ -2,7 +2,7 @@
 
 ## Context
 
-`requests-max` (`0003-25`; `work.md`, "Limits belong outside generated code") bounds the requests
+`requests-max` (`0003-26`; `work.md`, "Limits belong outside generated code") bounds the requests
 unsettled on one child, 256 by default, and a `request()` or `submit()` past it raises
 `AgentLimitReached` at once. Nothing waits outside the child's queue, and nothing in the API lets
 a sender wait for room: a parent that fans out faster than its child answers either catches the

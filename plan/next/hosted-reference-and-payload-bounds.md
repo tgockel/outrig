@@ -3,7 +3,7 @@
 ## Context
 
 `0003-16` bounds a frame on the interpreter pipe, so one message cannot take unbounded memory in
-the relay, and `0003-21` gives each binding a bounded queue. Those are transport limits. Nothing
+the relay, and `0003-22` gives each binding a bounded queue. Those are transport limits. Nothing
 limits what a connection uses inside the binding process, which runs on the host, outside the
 container's cgroup and the interpreter's memory ceiling:
 

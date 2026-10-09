@@ -4,7 +4,7 @@
 
 A skill's `skill.py` may declare `dependencies` in its PEP 723 `# /// script` block. Phase 0003
 checks them against what the interpreter can import and fails the invocation, naming each unmet
-requirement; it never installs (`0003-27`, `plan/phase/0003-python/skills.md`). The agent can
+requirement; it never installs (`0003-28`, `plan/phase/0003-python/skills.md`). The agent can
 then run `pip install` itself, which installs pure-Python packages into its interpreter's own
 environment under the container's network policy.
 

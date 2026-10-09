@@ -6,9 +6,9 @@ Calling it sends the work to a fresh child agent and returns a handle; awaiting 
 result checked against that type, so ordinary Python can fan such calls out, gather them, and
 combine what they return -- usually from a skill (`skills.md`).
 
-It is built on `work.md`'s explicit child API, which ships beside it. `0003-24` provides
-`import outrig` and `outrig.schema`; `0003-25` the children, their handles, completion and limits;
-and `0003-26` the decorator. The design was settled in planning on 2026-09-30, and the call form
+It is built on `work.md`'s explicit child API, which ships beside it. `0003-25` provides
+`import outrig` and `outrig.schema`; `0003-26` the children, their handles, completion and limits;
+and `0003-27` the decorator. The design was settled in planning on 2026-09-30, and the call form
 was changed on 2026-10-01 when the second declared form was added: `agent-classes.md`, a class
 whose instance is one long-lived child answering typed requests. On 2026-10-02, after the design
 critique, the body check was dropped in favor of ignoring the body, the trailing round stopped
@@ -46,7 +46,7 @@ mean anything ("Open questions").
 interpreter that defined the classes, and a name that does not resolve fails the declaration
 rather than the first call. Every parameter's type, and the result's, must be one `outrig.schema`
 takes: the serializable subset of `messages.md`, plus `Literal` and `Annotated`. The additions are
-`0003-24`'s, and the maintainer's schema below needs both. The subset as `0003-08` built it does not
+`0003-25`'s, and the maintainer's schema below needs both. The subset as `0003-08` built it does not
 cover `Literal`: checked against the payload, its contract check refuses `ReviewResult` at
 `Verdict.status`.
 
@@ -223,7 +223,7 @@ field's `description`.
 ## Completion is a Python call
 
 **Decided in planning (2026-09-30): the child completes by calling
-`await runtime.complete(value)` in its own code**, the spelling being `0003-25`'s. The maintainer's
+`await runtime.complete(value)` in its own code**, the spelling being `0003-26`'s. The maintainer's
 reason: the result can be built from objects that live only in Python and never pass through the
 model. A child that found its problems with code completes with the structure that code built,
 instead of the model writing it out a second time as the arguments of a tool call. The child's
@@ -278,7 +278,7 @@ def review_policy(result: ReviewResult, section: str) -> list[str]:
 ```
 
 `@outrig.agent(validate=review_policy)` on the declaration attaches it; the spelling is
-`0003-26`'s. A validator receives the inputs so that it can check evidence against them: here,
+`0003-27`'s. A validator receives the inputs so that it can check evidence against them: here,
 that each note's location names a file the section changes. **The location check covers only
 `notes`**, because pre-existing issues and questions may legitimately point outside the diff.
 
@@ -364,7 +364,7 @@ giving co-hosted agents different grants would be presentation only, so none is 
 - **Tools.** `submit_python`, as for every agent.
 - **No user channel.** The user addresses the primary agent only (`messages.md`), so a child's
   messages come from its parent.
-- **Children and model requests.** Two session-wide limits, both `0003-25`'s (`work.md`).
+- **Children and model requests.** Two session-wide limits, both `0003-26`'s (`work.md`).
   `children-max` (default 64) bounds the children resident in the session, idle ones included; a
   call past it fails at once -- its handle settles with `AgentLimitReached` and no child is made
   -- rather than waiting for a place. `model-concurrency-max` (default 8) bounds the model
@@ -602,7 +602,7 @@ waiting (`work.md`, "Limits belong outside generated code").
   reliably than other constraints, so the decoder would check the pattern again either way.
 - How a child builds its result: whether the result type's classes are bound into its namespace
   beside the inputs, so that it can construct an instance, or it completes with the JSON form the
-  schema text describes. `0003-25` decides.
+  schema text describes. `0003-26` decides.
 - What a validator that raises, rather than returning problems, does to the call. It is a defect
   in the parent's code, which argues for settling the call with it rather than counting an attempt
   against the child.

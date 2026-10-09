@@ -45,7 +45,7 @@ CocoClaw and any other embedder start a system the same way.
   and model to run. A model that cannot be resolved, or a secret that cannot be, fails the start
   before any container starts, as `PythonAgent::check` lets `run-new` fail today. OutRig keeps
   the operator's layer of the configuration beside the merged one and reads the operator's policy
-  and the evaluator's model from it, so a repository's config cannot redefine either (`0003-22`).
+  and the evaluator's model from it, so a repository's config cannot redefine either (`0003-23`).
   The CLI's operator layer is its global config; a `Config` an embedder passes counts as the
   operator's layer.
 - **A secret resolver.** A hook the session calls to resolve each `${VAR}` its configuration

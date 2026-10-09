@@ -2,7 +2,7 @@
 
 ## Shipped
 
-Two session-wide limits (`0003-25`; `agent-classes.md`, "Limits and placement"; `work.md`).
+Two session-wide limits (`0003-26`; `agent-classes.md`, "Limits and placement"; `work.md`).
 `children-max`, default 64, counts resident children, wedged ones included until they are
 actually reclaimed; a launch past it raises `AgentLimitReached` at once and never waits for a
 release only the caller could make. `model-concurrency-max`, default 8, bounds model requests in

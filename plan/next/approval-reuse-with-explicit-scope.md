@@ -2,7 +2,7 @@
 
 ## Context
 
-`0003-22` holds a call that an `escalate` rule matches until the escalation handler answers. The
+`0003-23` holds a call that an `escalate` rule matches until the escalation handler answers. The
 CLI prints the request with an id and takes `/approve <id>` or `/deny <id>`, and each answer
 settles one pending call. Phase 0003 reuses no approval
 (`plan/phase/0003-python/boundary-policy.md`), so forty escalated calls in a loop mean forty
@@ -31,7 +31,7 @@ scope -- resource, arguments, binding, policy version and lifetime -- and a way 
 
 - Whether every escalation may be approved with a scope, or only those a rule marks reusable.
 - The REPL spelling for a scope, and for listing and revoking the approvals still in effect.
-- Whether an escalation the evaluator raised (`0003-23`) may be approved with a scope.
+- Whether an escalation the evaluator raised (`0003-24`) may be approved with a scope.
 
 ## Acceptance
 

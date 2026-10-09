@@ -1,4 +1,4 @@
-# 0003-30 -- The docs describe the system that now exists
+# 0003-31 -- The docs describe the system that now exists
 
 ## Context
 
@@ -6,10 +6,10 @@ This task was `0003-16` until the planning round of 2026-09-30 renumbered it to 
 tasks it documents, and `0003-29` until the round of 2026-10-01 added
 `0003-29-an-agent-class-answers-requests` before it. The finished tasks `0003-01` and `0003-02`
 refer to it by its first number, as the task that documents what `run-new` does, and the queue as
-committed before 2026-10-01 refers to it by the second; in the current queue, `0003-29` is the
+committed before 2026-10-01 refers to it by the second; in the current queue, `0003-30` is the
 agent-class task. A third renumbering, in the planning round of 2026-10-09, inserted the facade
-task (`plan/next/a-hosted-object-is-awaited.md`) before the relay task and shifted `0003-21`
-through `0003-30` by one.
+task, `0003-21`, before the relay task, `0003-22`, and shifted the tasks then numbered `0003-21`
+through `0003-30` by one, which made this task `0003-31`.
 
 `doc/` is design-first: `.claude/CLAUDE.md` says subsystem pages carry `TODO: Incomplete` until
 their implementation exists. Individual tasks drop their own markers as behavior becomes real,
@@ -30,7 +30,7 @@ Note these pages are symlinks into `crates/outrig-cli/src/mcp_self/docs/`, so ed
 shipped tool output.
 
 The phase also grew after this task was first written. Hosted objects and boundary policy, the
-embedding API, skills and typed agents all ship in it (`0003-16` through `0003-29`), and each
+embedding API, skills and typed agents all ship in it (`0003-16` through `0003-30`), and each
 implementing task documents its own behavior when it is done. What none of them owns is a
 reader's account across them: the config reference as a whole, the REPL's new commands in one
 place, a concepts page a person reads before declaring a binding, and `SECURITY.md` saying the same
@@ -62,18 +62,18 @@ MCP now sits, and what a binding lets an agent do on the host.
   `[policy.evaluator]`, with what a repo config may and may not set there, and that the policy and
   the evaluator's model are read from the operator's layer -- the global config, or the `Config`
   an embedder passes; `[events]`, with its precedence rule: a `mode` the global config sets stands,
-  and a repo's applies only when the global config says nothing (`0003-22`); `subagent-width-max`
+  and a repo's applies only when the global config says nothing (`0003-23`); `subagent-width-max`
   as `run`'s key, which the new loop does not read; `subagent-depth-max`, which applies to both
   loops; `children-max` (default 64), which counts resident children, wedged ones included until
   they are reclaimed, and `model-concurrency-max` (default 8), which bounds model requests in
-  flight -- the session-wide limits `0003-25` adds, neither of which bounds CPU or memory inside an
+  flight -- the session-wide limits `0003-26` adds, neither of which bounds CPU or memory inside an
   admitted kernel; and the per-tree token budget.
 - **`doc/reference/events.md` extended with every event type the phase added after `0003-13`**:
   the session states and the in-memory stream's gap reporting (`0003-19`), a hosted request's
-  receipt, decision, dispatch and outcome (`0003-21`, `0003-22`), the evaluator's verdicts and
-  usage (`0003-23`), `agent.request.*` (`0003-25`), `agent.call.*` (`0003-26`),
-  `agent.instance.*` (`0003-29`), and `skill.directive.received` and `skill.invocation.*`
-  (`0003-28`), each with its category.
+  receipt, decision, dispatch and outcome (`0003-22`, `0003-23`), the evaluator's verdicts and
+  usage (`0003-24`), `agent.request.*` (`0003-26`), `agent.call.*` (`0003-27`),
+  `agent.instance.*` (`0003-30`), and `skill.directive.received` and `skill.invocation.*`
+  (`0003-29`), each with its category.
 - **`doc/reference/cli.md` lists `/approve <id>`, `/deny <id>` and `/name text`** among
   `run-new`'s commands, with what each does, that a pending request waits until it is answered,
   interrupted or the session closes, and that built-in commands win over a skill's name. For
@@ -130,7 +130,7 @@ MCP now sits, and what a binding lets an agent do on the host.
    stops being readable.
 2. **Whether `doc/concepts/subagents.md` is touched here -- Recommended: yes, with a pointer.**
    The page describes `run`'s subagents, a system that still works under `run`, so it stays. It
-   gains a note that `run-new`'s children (`0003-25`) are a different system, described in the
+   gains a note that `run-new`'s children (`0003-26`) are a different system, described in the
    Python-runtime concepts page, and that the width cap it states is `run`'s alone: `run-new`'s
    children are not under it, and are bounded by `children-max` and `model-concurrency-max`.
 
@@ -138,12 +138,12 @@ MCP now sits, and what a binding lets an agent do on the host.
 
 - **Hard: `0003-13`.** It wrote `doc/reference/events.md`, which this task extends with every
   event type the later tasks add.
-- **Hard: `0003-22`.** `/approve`, `/deny` and `[policy]` must exist before the reference
+- **Hard: `0003-23`.** `/approve`, `/deny` and `[policy]` must exist before the reference
   documents them.
-- **Hard: `0003-23`.** `[policy.evaluator]` must exist before the reference documents it.
-- **Hard: `0003-26`.** The typed-agent half of the concepts page describes `@outrig.agent`.
-- **Hard: `0003-28`.** `/name` and the skills half of the concepts page need the directive.
-- **Hard: `0003-29`.** The concepts page describes `outrig.Agent`, request channels and release,
+- **Hard: `0003-24`.** `[policy.evaluator]` must exist before the reference documents it.
+- **Hard: `0003-27`.** The typed-agent half of the concepts page describes `@outrig.agent`.
+- **Hard: `0003-29`.** `/name` and the skills half of the concepts page need the directive.
+- **Hard: `0003-30`.** The concepts page describes `outrig.Agent`, request channels and release,
   and the events reference gains the `agent.instance.*` family.
 - **Soft: every earlier task**, each of which drops its own markers. This one is done last.
 

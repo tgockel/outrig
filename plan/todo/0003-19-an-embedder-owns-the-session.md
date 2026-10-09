@@ -70,7 +70,7 @@ public module, and `run-new` uses that module and nothing else of the loop.
 - **A round's closing line names what is still running.** The outcome carries the background
   tasks still running in the agent's kernel when the round ended -- the `asyncio` tasks it left
   under names -- and `run-new` prints them in the round's closing line, so a prompt that returns
-  is not presented as done (`embedding.md`). `0003-21` adds hosted requests in flight and `0003-25`
+  is not presented as done (`embedding.md`). `0003-22` adds hosted requests in flight and `0003-26`
   children with a round running, to the same line.
 - **The in-memory stream, public**: `emit` also hands each numbered event to every subscriber
   given to the builder, in id order. A subscriber that falls behind loses events and is told how
@@ -97,7 +97,7 @@ public module, and `run-new` uses that module and nothing else of the loop.
   distinct kinds, or one kind with a field that says which -- each naming the attempt, and an
   attempt id is unique within its session, so two sessions in one process never update each
   other's attempts. Aggregates are derived from unique attempts, recomputed after a replacement,
-  and a parent's inclusive total is never summed with a child's; `0003-25` inherits the rule when
+  and a parent's inclusive total is never summed with a child's; `0003-26` inherits the rule when
   children arrive. `0003-15` landed the retry and failover events without either id, and this
   task adds them before those events become public with the stream.
 - **The history and view types grow without a break.** The turn, the round, the per-call manifest
@@ -114,7 +114,7 @@ public module, and `run-new` uses that module and nothing else of the loop.
   - The report says that admission closed, whether owned execution is proven stopped, an outcome
     for each execution live at the close -- `ok` or `error` if its result arrived, `unknown` if
     not -- the last sequence the stream published, and how many events each subscriber missed.
-    `0003-21` adds hosted calls to it and `0003-25` child work, the rest of what `lifecycle.md`'s
+    `0003-22` adds hosted calls to it and `0003-26` child work, the rest of what `lifecycle.md`'s
     report lists.
   - After the close, a new round returns a documented error, and a submission the model makes is
     refused with it (fork 3 for a round already running). The interpreter's exit closes admission
@@ -145,7 +145,7 @@ public module, and `run-new` uses that module and nothing else of the loop.
 - **Totals derive from unique attempts.** A test totals a session's usage from its unique
   attempts and from the per-attempt events and gets the same number, and shows that adding a
   round's inclusive total to the per-call entries beneath it counts each attempt twice. The same
-  test shape holds a parent's total apart from a child's once `0003-25` adds children.
+  test shape holds a parent's total apart from a child's once `0003-26` adds children.
 - **A late usage record replaces a null once, and a replay agrees.** Attempt N's event carries
   null usage; a record of 7 for N arriving afterward replaces it, and the round's total changes
   once, to 7; a second record for N, of 9, is refused and evented, and the total stays 7. The two
@@ -226,7 +226,7 @@ public module, and `run-new` uses that module and nothing else of the loop.
 4. **The default drain deadline -- Open.** `shutdown` takes the deadline as an argument, so the
    question is the value `run-new` passes and whether the library offers a default. A few seconds
    lets an execution that is finishing report, and keeps exiting prompt. Thirty seconds, RPyC's
-   default request timeout, lets a slow hosted call (`0003-21`) finish rather than end `unknown`,
+   default request timeout, lets a slow hosted call (`0003-22`) finish rather than end `unknown`,
    at the cost of a session that can take that long to exit.
 5. **Whether `on_submit` survives -- Recommended: events replace it.** `embedding.md` notes that
    the `exec.submitted` event carries what `on_submit` shows, so `run-new` prints each submission

@@ -6,7 +6,7 @@ RPyC 6.0.2's protocol has twenty request handlers (`rpyc/core/consts.py`), and n
 cancels a request. So when agent code is interrupted during a hosted call, `0003-17` raises
 where the call is awaited, saying the call's outcome on the host is unknown, and the binding
 process keeps running the call until it returns; its reply is dropped when it comes, and
-`0003-21` records the call's outcome then as `returned` or `raised`
+`0003-22` records the call's outcome then as `returned` or `raised`
 (`plan/phase/0003-python/lifecycle.md`). At shutdown a running call is given until the drain
 deadline, and then the binding's process group is killed.
 

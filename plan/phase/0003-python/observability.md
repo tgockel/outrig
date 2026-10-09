@@ -227,29 +227,29 @@ report lists are events too (`lifecycle.md`).
 **The boundary, once there is one.** The integration-audit category has no producer until hosted
 objects are built, and then three tasks add one each:
 
-- `0003-21`: each hosted request's receipt, dispatch and outcome, sharing its id -- binding, agent,
+- `0003-22`: each hosted request's receipt, dispatch and outcome, sharing its id -- binding, agent,
   operation, member, host type, bounded previews, the outcome (`returned`, `raised`, `refused`,
   `cancelled` or `unknown`, as `lifecycle.md` defines them), duration, and the call a callback ran
   under;
-- `0003-22`: each request's decision -- a rule's action with the rule's position and layer, the
+- `0003-23`: each request's decision -- a rule's action with the rule's position and layer, the
   `default`, or the approver's answer -- with the effective policy's version; and each escalation
   with its answer, its cancellation, or the late answer that changed nothing;
-- `0003-23`: each evaluator verdict, as a request's decision, and each evaluation's usage,
+- `0003-24`: each evaluator verdict, as a request's decision, and each evaluation's usage,
   attributed apart from the agent's, so a judge's tokens never appear in a round's total.
 
 Three more tasks add events beside them that are execution diagnostics, not integration audit:
 
-- `0003-25`: each request a child is given -- a submission, or a request on one of its request
+- `0003-26`: each request a child is given -- a submission, or a request on one of its request
   channels -- as one family, `agent.request.sent`, `received`, `replied`, `invalid`, `failed`,
   `cancelled` and `settled`, with request and reply bodies as bounded previews;
   `agent.call.started` and `agent.call.settled` only as the wrapper around a decorated call
-  (`0003-26`). The child's model usage is attributed to the child's round and added to the skill
+  (`0003-27`). The child's model usage is attributed to the child's round and added to the skill
   invocation it ran under and to the main agent's round; a request's settled event names the
   rounds it spanned;
-- `0003-28`: each skill invocation, which the hosted calls made inside it carry as context, not as
+- `0003-29`: each skill invocation, which the hosted calls made inside it carry as context, not as
   authority. Invocation events are not an audit of what a skill did; only boundary events record
   every crossing (`skills.md`);
-- `0003-29`: each agent instance -- `agent.instance.started`, `ready`, `released` and
+- `0003-30`: each agent instance -- `agent.instance.started`, `ready`, `released` and
   `collected`, the last when the runtime releases an instance that was collected unreleased.
   Execution diagnostics like the rest, with any body they carry as a bounded preview.
 
@@ -365,7 +365,7 @@ maintainer, 2026-10-02): the global config's value stands.** When the global con
 nothing. The reason is whose file it is: the record is the user's own recording of their own
 session, and a cloned project must not switch it on -- retaining the conversation and the argument
 previews the user did not ask to keep -- or off. This is the same shape as the policy layer, and
-`0003-22` lands it with that layer. There is no per-session CLI flag yet;
+`0003-23` lands it with that layer. There is no per-session CLI flag yet;
 `plan/next/run-new-flag-parity.md` holds `--events`. Opt-in because the record holds the
 conversation.
 
@@ -427,7 +427,7 @@ for it, which `history.md` records.
   description of `scripts/` widened to say it holds one thing meant for a user.
 - Whether every event carries a causal parent -- which model turn produced which execution -- or
   whether ordering alone is enough. Hosted requests carry one, because a callback names the call it
-  ran under (`0003-21`); for the rest, ordering is enough to read and not enough to query.
+  ran under (`0003-22`); for the rest, ordering is enough to read and not enough to query.
 - How far a subscriber may fall behind before it loses events, and whether an embedder may choose
   that per subscriber.
 

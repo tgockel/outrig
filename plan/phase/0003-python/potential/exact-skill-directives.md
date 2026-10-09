@@ -4,7 +4,7 @@
 
 A `/name text` line reaches the main agent as text on its user channel, with the resolved skill
 named on the `Delivery`, and the agent's code calls `outrig.skills.invoke(name, text)`
-(`skills.md`, "From `/name` to a call"; `0003-28`). `invoke` derives a parameter dataclass,
+(`skills.md`, "From `/name` to a call"; `0003-29`). `invoke` derives a parameter dataclass,
 `<Skill>Params`, from the entry's signature, and a typed agent call, `parse_params(text)`, maps
 the text to an instance under the entry's docstring and parameter help; `invoke(name,
 params=<Skill>Params(...))` skips the model. The model maps the user's words to the skill's
@@ -40,5 +40,5 @@ and what the model turn costs in latency and tokens.
 
 ## When
 
-After `0003-28` lands and the typed mapping has been used for a while. If its variance on exact
+After `0003-29` lands and the typed mapping has been used for a while. If its variance on exact
 lines is near zero, the alternative is not worth a second execution path.

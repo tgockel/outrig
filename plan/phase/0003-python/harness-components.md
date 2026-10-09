@@ -74,7 +74,7 @@ in 0.2.0 and has since been removed from this line. The new loop never had it, s
 
 **Designed, not yet ported** -- `builtin_tool.rs`, `self_tool.rs`, `subagent/`. These are
 MCP-shaped, and their Python equivalents now have designs rather than a gap: `work.md` and
-`typed-agents.md` for the subagent surface, queued as `0003-25` and `0003-26`, and
+`typed-agents.md` for the subagent surface, queued as `0003-26` and `0003-27`, and
 `discovery.md` for self-documentation. None of the three files is ported; `self_tool.rs` would
 bring the 1,100-line `mcp_self/` corpus with it.
 

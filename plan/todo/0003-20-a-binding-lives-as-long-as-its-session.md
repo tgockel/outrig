@@ -7,7 +7,7 @@ and OutRig installs its packages, starts its process, builds the object with its
 it to the agent, and stops it at shutdown. Nothing is bound by default. `0003-18` proved the
 process, its supervision and the install on their own, and `0003-19` gave the session an owner and
 a builder. This task connects them to configuration, the builder, the container and the agent's
-orientation. The relay that lets agent code call the object is `0003-21`'s.
+orientation. The relay that lets agent code call the object is `0003-22`'s.
 
 A declaration, with GitPython as the example:
 
@@ -87,7 +87,7 @@ session mounts has one path on both sides.
 - **Start order**: approval, install, then the binding processes started and each factory run,
   then the interpreter. A factory that raises fails start with an error naming the binding and the
   exception's type and message, and the bindings already started are stopped. A binding process
-  that exits later in the session is `0003-21`'s to handle (its fork 3).
+  that exits later in the session is `0003-22`'s to handle (its fork 3).
 - **Same paths.** When any binding exists, the workspace and every extra mount are mounted at their
   host paths, and a `container-path` that differs from its host path is a config error naming the
   key. A binding process starts in the workspace's host directory, which is then the interpreter's

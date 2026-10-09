@@ -39,17 +39,17 @@ change closes Rust's gate and stops the relay forwarding to every binding, toget
 is admitted by one and not the other. The bindings learn of the close afterward:
 
 - **Rust's gate**, one per session, decides executions, child launches, and the boundary requests
-  held for a decision -- those a rule escalated or sent to the evaluator. `0003-22` builds it for
+  held for a decision -- those a rule escalated or sent to the evaluator. `0003-23` builds it for
   three races: an interrupt, a close, and an approval that arrives late. Whichever reaches the gate
   first decides. "Closed" and "allowed" cannot both win, so an allow that arrives after the close
   is recorded and changes nothing.
 - **The relay** orders the requests a rule allows against the close. Rules run in the binding
-  process (`0003-22`'s fork 1), so such a request never passes through Rust's gate, and the relay
+  process (`0003-23`'s fork 1), so such a request never passes through Rust's gate, and the relay
   is the last point the owner holds it. A request the relay had not forwarded when it stopped --
   one in its queue, or one that arrives later -- is refused in Rust and reaches no binding. One it
   had forwarded belongs to the drain: the owner cannot take it back, its binding may read it and
   invoke its target after `close_admission()` has returned, the drain waits for it, and its
-  outcome is the one the binding reports (`0003-21`).
+  outcome is the one the binding reports (`0003-22`).
 - **Each binding process's closed flag** is installed asynchronously. The relay enqueues a control
   line behind the frames it had forwarded, without waiting -- a binding that has stopped reading,
   with a full pipe, does not delay the close -- and the binding sets its flag when it reads the
@@ -120,7 +120,7 @@ nothing is left waiting.
 
 A child's waiters are all settled alike: an `await` on its handle, a `runtime.wait` or
 `asyncio.wait` over it, and a second await of the same handle each raise the same documented
-error, whose name is `0003-25`'s. No partial or unvalidated result is returned as a success. A
+error, whose name is `0003-26`'s. No partial or unvalidated result is returned as a success. A
 child whose result was validated before the close stays settled with it, because a settled result
 does not change (`work.md`).
 
@@ -175,7 +175,7 @@ the session.
   process is left in its group. Invoked: not itself a call; a call it was serving is a row below.
   Effects: whatever its calls did stands.
 
-**Hosted calls and callbacks** (`0003-21`)
+**Hosted calls and callbacks** (`0003-22`)
 
 - *Waiting for a free connection* -- in the container, because every connection in its kernel's
   pool for the binding has a call in flight (`0003-17`). Its job is queued in the pool's executor
@@ -212,7 +212,7 @@ the session.
   stop, and the outer call ends with its binding as above. Invoked: yes, the outer call's target.
   Effects: as for a running call.
 
-**Pending approvals and evaluations** (`0003-22`, `0003-23`)
+**Pending approvals and evaluations** (`0003-23`, `0003-24`)
 
 - *Being evaluated* -- a policy rule or the evaluator is still deciding. Outcome: `cancelled`, never
   invoked; the evaluation is abandoned and the caller gets the closing error; a verdict that
@@ -221,7 +221,7 @@ the session.
   handler's cancellation; a later answer is recorded and ignored; the caller gets the closing
   error. Invoked: no. Effects: none possible.
 
-**Child work** (`0003-25`)
+**Child work** (`0003-26`)
 
 - *Running.* Outcome: cancelled -- the child's round makes no further model call, and a completion
   the child submitted but that was not yet accepted is not accepted now; every waiter is settled
@@ -235,7 +235,7 @@ the session.
   item's result does. Invoked: the child's own hosted calls have rows of their own. Effects:
   whatever those calls did stands.
 
-**Agent instances** (`0003-29`)
+**Agent instances** (`0003-30`)
 
 - *Launching* -- the instance was constructed and its child is not yet ready (`agent-classes.md`).
   Outcome: it never becomes ready; `ready()` and the first handle raise the closing error, and a
@@ -332,7 +332,7 @@ launched -- the way a session close does, while the rest of the session runs on:
 
 An execution that never yields cannot be interrupted on a child's thread, and runs until the
 session ends (`typed-agents.md`). What becomes of the released child's kernel, and of a background
-task still running in it, is `0003-25`'s, which builds the release and tests each item above.
+task still running in it, is `0003-26`'s, which builds the release and tests each item above.
 
 ## Descendants, and the owner's abrupt death
 
@@ -520,13 +520,13 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
   owner's argument may change it.
 - Whether anything but the owner's argument may change the grace between SIGTERM and SIGKILL for
   a binding's group. `0003-18` made it 5 s, counted after the drain deadline rather than against
-  it, which `0003-19` and `0003-21` do the counting for.
+  it, which `0003-19` and `0003-22` do the counting for.
 - Whether a round still being driven at the close ends at once, or runs on with its submissions
   refused until the model yields or the owner drops it. `0003-19` settles it.
 - Whether a callback a draining call makes into the container should be refused after the close
   rather than run. The row above lets it run, as part of a call allowed to finish. Refusing it
   would stop agent code running in a session that is ending, at the cost of failing a call that
-  could have returned. `0003-21`'s callback tests are where a reason either way would show.
+  could have returned. `0003-22`'s callback tests are where a reason either way would show.
 
 ## Unverified
 
@@ -543,5 +543,5 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
   known part: about ten seconds today, because the primary's `sleep` is PID 1 and discards
   SIGTERM, so podman waits out its grace (#255).
 - None of the close table has run, and neither has a release. Each row's behavior is acceptance
-  for the task that adds it; a release's is `0003-25`'s, and an instance's release, the finalizer
-  path included, is `0003-29`'s.
+  for the task that adds it; a release's is `0003-26`'s, and an instance's release, the finalizer
+  path included, is `0003-30`'s.

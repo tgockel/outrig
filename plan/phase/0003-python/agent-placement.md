@@ -7,7 +7,7 @@ them rather than one per agent, and what that choice costs.
 
 The first milestone ran a single agent. It was settled then anyway, because an interpreter
 written around module globals cannot host a second agent without being rewritten, and the
-interpreter was being ported regardless. Children arrive with `0003-25`, `0003-26` and `0003-29`:
+interpreter was being ported regardless. Children arrive with `0003-26`, `0003-27` and `0003-30`:
 `runtime.spawn`, `@outrig.agent` and the agent classes under `outrig.Agent` (`work.md`,
 `typed-agents.md`, `agent-classes.md`) create each child as a kernel in this interpreter, which is
 the placement this page decides.

@@ -1,4 +1,4 @@
-# 0003-24 -- `outrig` imports in every kernel, and decodes results strictly
+# 0003-25 -- `outrig` imports in every kernel, and decodes results strictly
 
 ## Context
 
@@ -62,7 +62,7 @@ becomes a declared dataclass only when it has exactly the declared shape.
 - **Schema text**: a JSON Schema rendering with every `doc()` text intact as `description`, each
   `Literal` as an `enum`, each dataclass an object with `additionalProperties: false` and every
   field without a default in `required`, and `dict[str, T]` an object whose `additionalProperties`
-  is `T`'s schema. `0003-25` and `0003-26` put this text in a child's instructions.
+  is `T`'s schema. `0003-26` and `0003-27` put this text in a child's instructions.
 - A way to declare a type, checking it at once; to decode a JSON value against it; and to render
   its schema text. Their spellings are this task's, and `help(outrig.schema)` documents them.
 
@@ -99,7 +99,7 @@ becomes a declared dataclass only when it has exactly the declared shape.
   not a dataclass -- naming the field, and so does a hint that does not resolve.
 - **A dataclass built at runtime declares, decodes and renders.** One made with
   `dataclasses.make_dataclass`, so it has no source, declares without error, decodes its JSON form
-  to an instance, and renders schema text listing its fields; `0003-29`'s generated message type
+  to an instance, and renders schema text listing its fields; `0003-30`'s generated message type
   is one.
 - **Channel contracts take the same types** (with fork 4's recommendation): a channel whose
   contract is a dataclass with a `Literal` field and an `Annotated` one is accepted, a message that

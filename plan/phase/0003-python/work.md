@@ -7,9 +7,9 @@ creates a child, gives it work, and finds out what happened.
 
 **Decided in planning (2026-09-30, extended 2026-10-01): every way in ships in this phase, the
 declared forms built on the explicit API.** The explicit API -- `runtime.spawn`, `child.submit`,
-request channels, the handle, release -- is `0003-25`. `@outrig.agent` (`typed-agents.md`) is
-`0003-26`, implemented on it: each decorated call spawns a fresh child, submits one piece of work,
-and releases the child when the result settles. `outrig.Agent` (`agent-classes.md`) is `0003-29`,
+request channels, the handle, release -- is `0003-26`. `@outrig.agent` (`typed-agents.md`) is
+`0003-27`, implemented on it: each decorated call spawns a fresh child, submits one piece of work,
+and releases the child when the result settles. `outrig.Agent` (`agent-classes.md`) is `0003-30`,
 implemented on it too: an instance is one long-lived child, each method marked `@outrig.agent` a
 typed request channel, released with the instance. The 0.2.x subagent system already solved
 several of these problems in ways worth keeping rather than rediscovering, and the sections below
@@ -80,7 +80,7 @@ request carries, the type its reply carries, and a description the child's instr
 returns a handle; `pending()` counts the requests the child has not yet taken. In the child, `await
 runtime.channels["fizz"].receive()` gives a delivery with an `id` and a `body`, and `await
 d.reply(value)` or `await d.fail(message)` on it settles the handle that sent it. The spellings are
-`0003-25`'s, `0003-26`'s and `0003-29`'s.
+`0003-26`'s, `0003-27`'s and `0003-30`'s.
 
 **Why all of them.** A fresh child per call is the right default for independent typed work.
 Nothing from one call is present in the next, a `gather` over a hundred sections needs no lifetime
@@ -120,7 +120,7 @@ What a handle has to expose, and why each one is on the list rather than inferre
   cancels a waiter, never the request.
 - **Status** separate from result -- a submission queued behind another, running, accepted or
   failed; a request waiting for the child to take it, received, accepted or failed; a child
-  running, idle, wedged or released; the spellings are `0003-25`'s --
+  running, idle, wedged or released; the spellings are `0003-26`'s --
   because "no result yet" and "failed without publishing" are different answers and today's
   system already distinguishes them. For a channel request it also says whether the child has
   taken the request yet, which decides what cancelling it does.
@@ -163,7 +163,7 @@ each is answered once. The two kinds of child answer differently, and never mix:
   The kind is fixed at spawn.
 
 `runtime.complete`, `reply` and `fail` are all awaited: each returns once the request has settled,
-or raises its problems (`0003-25`, fork 3).
+or raises its problems (`0003-26`, fork 3).
 
 **Rejected: `runtime.complete` answering "the one outstanding request" in a request child.** It
 would have let the class form reuse the work child's completion, and it is racy and confusing:
@@ -175,7 +175,7 @@ does not say a task is finished, that a result belongs to the request that asked
 any claim in it was checked. `messages.md` is deliberate that sending on the user channel "is not
 a lifecycle operation," and that stays true: ordinary chat must not be forced into a result
 schema. **Decided in planning (2026-09-30): a work child completes with a Python call,
-`await runtime.complete(value)` in its own code** (the spelling is `0003-25`'s), not with a model
+`await runtime.complete(value)` in its own code** (the spelling is `0003-26`'s), not with a model
 tool. The result can then be built from objects that live only in Python and never pass through
 the model, and the child's only model tool stays `submit_python`. `typed-agents.md` has the
 reasoning, including why a tool would not have provided enforcement by the provider for a
@@ -260,7 +260,7 @@ value, or with a documented exception for a rejected completion or reply, a `fai
 cancellation, a release, a budget exhausted before the child answered, or the session closing.
 The exceptions share one base, `outrig.AgentError`, over `CompletionRejected`, `AgentReleased`,
 `AgentRequestFailed`, `RequestCancelled` and the budget and closing errors, so a caller that wants
-"anything went wrong" has one name for it; the spellings are `0003-25`'s. A parent in an ordinary
+"anything went wrong" has one name for it; the spellings are `0003-26`'s. A parent in an ordinary
 `await job` is released by all of them -- it does not have to be watching a status field to learn
 that its request ended. Re-awaiting a settled failure is as stable as re-awaiting a settled
 success.
@@ -320,7 +320,7 @@ what keeps abandoned requests from holding an instance without bound ("The handl
 
 The first two keys are session-wide and `requests-max` is per child; all three are read when the
 session starts, with top-level defaults and `[agents.<name>]` overrides as `subagent-depth-max` has,
-and are `0003-25`'s. What none of them bounds is what a child's own code does with CPU and memory
+and are `0003-26`'s. What none of them bounds is what a child's own code does with CPU and memory
 once its kernel is admitted: every child is a thread in one interpreter process, under one memory
 ceiling and one GIL (`agent-placement.md`), and a child that allocates or loops without yielding is
 bounded only by `runtime-protection.md`. A scheduler for active work -- children *working* at once,
@@ -336,14 +336,14 @@ the number of kernels in a session unbounded, and the design critique of 2026-10
 both points -- an idle child counts, because the limit bounds memory and threads, and a launch
 past it fails rather than waits -- and the waiting cap stays rejected.
 
-**Spend.** A per-tree token budget is new, built with the children in `0003-25`. With usage now
+**Spend.** A per-tree token budget is new, built with the children in `0003-26`. With usage now
 read rather than discarded (`observability.md`) it is expressible for the first time, and a tree
 that can spawn children is where an unbounded one costs most. A request whose child runs out
 before answering settles with a budget error. A child's model usage is attributed to the child's
 round and added to the skill invocation the child ran under and to the main agent's round. A round
 in a request child may answer several requests; its usage is attributed to the round and not
 divided among them, and each request's settled event names the rounds it spanned, which is
-`0003-25`'s fork.
+`0003-26`'s fork.
 
 ## What the parent sees
 
@@ -393,7 +393,7 @@ cancelled waiter cancel the work after all, which the handle's shielding exists 
 the last request settles and no reference to the instance remains, the finalizer releases the
 child. A module-level instance in a reloaded skill lives until it is collected. However the
 release is reached, every request outstanding on the instance settles with `AgentReleased`.
-`0003-25` builds and tests the release and `0003-29` the instance. This page's part is the rule
+`0003-26` builds and tests the release and `0003-30` the instance. This page's part is the rule
 those depend on: every terminal outcome settles a request exactly once.
 
 ## Open questions
@@ -407,11 +407,11 @@ those depend on: every terminal outcome settles a request exactly once.
   have every wait ended by them.
 - Whether a request method on an agent class takes `validate=` as a declaration does: where it is
   named, since a method has no decorator argument of its own, and whether the validator receives
-  the request body, as a declaration's validator receives the inputs. `0003-29` leaves it open.
+  the request body, as a declaration's validator receives the inputs. `0003-30` leaves it open.
 
 ## Unverified
 
 - Everything about the existing subagent system cited here is read from `doc/concepts/subagents.md`
   and the 0.2.x implementation, which this phase does not port. It is prior art, not a foundation.
-- No part of this has been built. The first milestone ran one agent, and `0003-25` is where the
+- No part of this has been built. The first milestone ran one agent, and `0003-26` is where the
   first evidence about whether these are the right operations will come from.
