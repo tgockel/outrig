@@ -45,6 +45,7 @@ axum               = { workspace = true, features = ["http1", "tokio"] }
 blake3             = { workspace = true, features = ["std"] }
 futures-util       = { workspace = true, features = ["std", "async-await", "async-await-macro"] }
 heck               = { workspace = true }
+http               = { workspace = true, features = ["std"] }
 ignore             = { workspace = true }
 jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 nix                = { workspace = true, features = ["user", "fs", "process", "signal", "net", "uio"] }

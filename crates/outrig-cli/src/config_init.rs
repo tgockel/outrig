@@ -60,9 +60,10 @@ pub async fn run_with(
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
     // With no repo root: a global config serves every repo, so no one root is
-    // the one to check its paths against. Nothing the prompts above accept
-    // fails this today, so it guards the module doc's promise rather than
-    // standing in for a prompt that asks again.
+    // the one to check its paths against. One answer the prompts above accept
+    // can fail this: a `base-url` that is not an http:// or https:// URL. It
+    // ends the wizard here with nothing written, rather than with a config the
+    // next load refuses; asking again at the prompt instead is #347.
     Config::load_from_str(&toml_text)?.validate(None)?;
     write_atomic(path, &toml_text)?;
     Ok(())

@@ -41,6 +41,9 @@ pub fn outrig::config::ConfigSource::config_path(&self) -> std::path::PathBuf
 #[non_exhaustive] pub enum outrig::config::ConfigValidationError
 pub outrig::config::ConfigValidationError::AgentMissingModel
 pub outrig::config::ConfigValidationError::AgentMissingModel::agent: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BaseUrlInvalid
+pub outrig::config::ConfigValidationError::BaseUrlInvalid::detail: alloc::string::String
+pub outrig::config::ConfigValidationError::BaseUrlInvalid::path: alloc::string::String
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid::image: alloc::string::String
 pub outrig::config::ConfigValidationError::CapabilityDropAddConflict

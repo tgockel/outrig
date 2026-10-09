@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A request the HTTP client will not send is final at once.** A `base-url` with a typo'd scheme,
+  such as `htps://`, loaded, and every LLM call was then retried for the whole
+  `retry-budget-secs` -- ten minutes by default, not the 30 seconds an endpoint that never answers
+  gets -- before the turn ended. A redirect loop that reached reqwest's limit of ten hops was
+  retried the same way. Both now fail on the first attempt and end `outrig run` as a `401` does,
+  since no resend can satisfy them; a failover chain moves to its next model at once. A
+  `base-url` that is not an `http://` or `https://` URL is also refused when the config loads,
+  with an error naming the key. That check is fixed in `outrig` (#343).
+
 - **A `--global-config` that does not exist is an error.** A path the flag named with nothing
   there was read as an empty global config, so a typo surfaced as some other failure, or as none:
   `outrig run` reported the agent's `model` as naming no `[models.<name>]`, and a global

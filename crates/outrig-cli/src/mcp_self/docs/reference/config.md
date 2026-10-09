@@ -1411,6 +1411,9 @@ image-config in the merged config but does not require agent/model/provider wiri
   time -- see "Always parses, even without `--features local-llm`" above.
 - Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
+- Every `providers.<name>.base-url` (on a remote style) must be an `http://` or `https://` URL.
+  The error says what is wrong -- no scheme, another scheme, no parse -- without quoting the
+  value, which may carry credentials. `outrig build` does not check it.
 - Every `[models.<name>]` whose provider has a remote style must set
   `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
   `revision`, `context-length`, `device`. The error names the style of the

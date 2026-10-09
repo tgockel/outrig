@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Config::validate` refuses a provider `base-url` that is not an `http://` or `https://`
+  URL.** The key took any string, so a typo'd scheme such as `htps://` loaded, and every request
+  to the provider then failed -- in `outrig run`, only after ten minutes of retries. A remote
+  provider's `base-url` must now parse as a URI with an `http` or `https` scheme. A new
+  `ConfigValidationError` variant reports it: `BaseUrlInvalid`, carrying the `path` and a
+  `detail` that says what is wrong without quoting the value, which can carry credentials. It is
+  a provider rule, so `load_for_build` skips it as it skips the others. (#343)
+
 - **A container no longer carries the host's proxy variables.** podman's `--http-proxy` is on
   unless turned off, and it copied `http_proxy`, `https_proxy`, `ftp_proxy`, `no_proxy`, and
   their uppercase forms from outrig's environment into every container `Container::start`,

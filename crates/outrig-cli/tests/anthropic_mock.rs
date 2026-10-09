@@ -20,8 +20,9 @@
 //!   `completion_model` (what `build_agent` uses) and
 //!   `CompletionModel::with_model` (which would silently cap replies at 2048);
 //! * the shared retry client covers this provider too -- including that a
-//!   `Retry-After` sets the wait, and that a spent budget ends the turn
-//!   without taking the session with it;
+//!   `Retry-After` sets the wait, that a spent budget ends the turn without
+//!   taking the session with it, and that a redirect loop, which no wait can
+//!   clear, is final at once;
 //! * a `200` carrying no usable content is retried above the HTTP client,
 //!   which is the only place it is visible at all, and ends the turn rather
 //!   than the session when it persists;
@@ -922,6 +923,43 @@ async fn a_rejected_api_key_stays_fatal() {
         drain_recorded(&mut requests).len(),
         1,
         "a 401 is terminal at both retry layers",
+    );
+}
+
+/// A redirect loop is terminal at the transport: reqwest follows it to its
+/// limit and gives up, and a replay would do the same. So it is sent once --
+/// one request and the redirects reqwest follows -- and stays fatal, as a
+/// `401` does, rather than ending only the turn. The budget is the shipped
+/// default, so a loop that is retried runs into the timeout.
+#[tokio::test]
+async fn a_redirect_loop_is_fatal_at_once() {
+    let (addr, mut requests) = start_mock_http(vec![
+        CannedResponse::status(307, json!({})).with_header("Location", "/v1/messages"),
+    ])
+    .await;
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_one_turn(
+            addr,
+            "OUTRIG_TEST_ANTHROPIC_REDIRECT_LOOP",
+            MODEL,
+            Some(1024),
+            vec![],
+        ),
+    )
+    .await
+    .expect("a redirect loop must not be retried for the whole budget")
+    .expect_err("no resend can satisfy a redirect loop, so it must not end up an Ok turn");
+
+    assert!(
+        err.to_string().contains("redirect"),
+        "the error should say a redirect failed: {err}",
+    );
+    let sent = drain_recorded(&mut requests).len();
+    assert!(
+        (2..=11).contains(&sent),
+        "one request and the redirects reqwest follows, once: {sent}",
     );
 }
 

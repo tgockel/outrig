@@ -1578,8 +1578,8 @@ identifier = "gpt-4o-mini"
     /// `mistralrs_provider_rejects_unknown_keys` is where that rule is proven
     /// in general; this pins the key it was found through.
     ///
-    /// What is only here: a bare provider still reaches the `(None, None)` arm
-    /// of the validation match. There is no timeout to check, rather than a
+    /// What is only here: a bare provider still reaches the `(None, None, None)`
+    /// arm of the validation match. There is no timeout to check, rather than a
     /// timeout that checks out.
     #[test]
     fn mistralrs_provider_rejects_request_timeout_secs() {
@@ -1605,6 +1605,104 @@ style = "mistralrs"
         assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
         cfg.validate(None)
             .expect("mistralrs carries no timeout to validate");
+    }
+
+    /// A config whose one provider, of `style`, sends to `base_url`.
+    fn with_base_url(style: &str, base_url: &str) -> Config {
+        parse(&format!(
+            r#"
+default-model = "fast"
+
+[providers.remote]
+style    = "{style}"
+base-url = "{base_url}"
+api-key  = "${{REMOTE_API_KEY}}"
+
+[models.fast]
+provider   = "remote"
+identifier = "some-model"
+"#
+        ))
+    }
+
+    /// A scheme reqwest will not send to loads as a string and then fails
+    /// every request, so it is refused at load, on both remote styles. The
+    /// message names the key, the scheme, and what would be accepted.
+    #[test]
+    fn provider_base_url_with_another_scheme_errors() {
+        for style in ["openai", "anthropic"] {
+            let err =
+                expect_validation_err(&with_base_url(style, "htps://127.0.0.1:18081/v1"), None);
+            let rendered = err.to_string();
+            match err {
+                ConfigValidationError::BaseUrlInvalid { path, detail, .. } => {
+                    assert_eq!(path, "providers.remote.base-url");
+                    assert!(
+                        detail.contains(r#""htps""#),
+                        "the detail should name the scheme, got: {detail}"
+                    );
+                    assert!(
+                        rendered.contains("http:// or https://"),
+                        "the message should say what is accepted, got: {rendered}"
+                    );
+                }
+                other => panic!("expected BaseUrlInvalid for {style}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// No URL at all: a host with no scheme, a scheme with no host, nothing.
+    #[test]
+    fn provider_base_url_that_is_not_a_url_errors() {
+        for base_url in ["api.openai.com/v1", "localhost:11434", "https://", ""] {
+            match expect_validation_err(&with_base_url("openai", base_url), None) {
+                ConfigValidationError::BaseUrlInvalid { path, .. } => {
+                    assert_eq!(path, "providers.remote.base-url");
+                }
+                other => panic!("expected BaseUrlInvalid for {base_url:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// A `base-url` can carry credentials in its userinfo, so the refusal says
+    /// what is wrong without quoting the value.
+    #[test]
+    fn a_refused_provider_base_url_is_not_echoed() {
+        let err = expect_validation_err(
+            &with_base_url(
+                "openai",
+                "htps://gateway-user:SECRET-PASS@gateway.example/v1",
+            ),
+            None,
+        );
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, ConfigValidationError::BaseUrlInvalid { .. }),
+            "expected BaseUrlInvalid, got: {err:?}"
+        );
+        for secret in ["SECRET-PASS", "gateway-user"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} must not be echoed: {rendered}"
+            );
+        }
+    }
+
+    /// Both schemes pass, in either case -- rig's parser and reqwest's both
+    /// match them case-insensitively -- and so does userinfo, which a gateway
+    /// may require.
+    #[test]
+    fn provider_base_url_accepts_http_and_https() {
+        for base_url in [
+            "http://localhost:11434/v1",
+            "https://api.openai.com/v1",
+            "HTTPS://API.EXAMPLE.COM/v1",
+            "https://gateway-user:secret@gateway.example/v1",
+        ] {
+            with_base_url("openai", base_url)
+                .validate(None)
+                .unwrap_or_else(|e| panic!("{base_url:?} is an http(s) URL, got: {e:?}"));
+        }
     }
 
     #[test]
@@ -2707,6 +2805,35 @@ context    = "coding"
             .expect("build load does not require default-model to resolve");
         assert_eq!(cfg.default_model.as_deref(), Some("phantom"));
         assert!(cfg.images.contains_key("coding"));
+    }
+
+    /// The `base-url` rule is a provider rule, inside the `validate_llm` gate:
+    /// a run refuses a scheme reqwest will not send to, and a build, which
+    /// sends nothing, loads the same files.
+    #[test]
+    fn build_load_allows_a_base_url_a_run_refuses() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            r#"
+[providers.remote]
+style    = "openai"
+base-url = "htps://127.0.0.1:18081/v1"
+api-key  = "${REMOTE_API_KEY}"
+"#,
+        );
+
+        let strict_err = Config::load(repo.path(), Some(&global_path)).unwrap_err();
+        match expect_load_validation_err(strict_err) {
+            ConfigValidationError::BaseUrlInvalid { path, .. } => {
+                assert_eq!(path, "providers.remote.base-url");
+            }
+            other => panic!("expected BaseUrlInvalid, got: {other:?}"),
+        }
+        Config::load_for_build(repo.path(), Some(&global_path))
+            .expect("a build sends no request, so it does not check where one would go");
     }
 
     /// The deadline sits outside the `validate_llm` gate `outrig build` turns

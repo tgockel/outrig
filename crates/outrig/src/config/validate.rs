@@ -362,6 +362,12 @@ pub enum ConfigValidationError {
     )]
     RequestTimeoutSecsZero { path: String, max: u64 },
 
+    // `detail` says what is wrong without quoting the value, which can carry
+    // credentials in its userinfo.
+    #[error("{path} must be an http:// or https:// URL; {detail}")]
+    #[non_exhaustive]
+    BaseUrlInvalid { path: String, detail: String },
+
     #[error("{path} must be between 1 and {max} seconds; got {value}")]
     McpCallTimeoutSecsTooLarge { path: String, value: u64, max: u64 },
 
@@ -801,21 +807,26 @@ pub(super) fn validate_with_options(
             // Deliberately without a `_` arm, matching the model loop below: a
             // new provider style has to stop here and say whether it retries
             // and whether it speaks HTTP at all.
-            let (retry_budget_secs, request_timeout_secs) = match provider {
+            let (base_url, retry_budget_secs, request_timeout_secs) = match provider {
                 LlmProvider::OpenAi {
+                    base_url,
                     retry_budget_secs,
                     request_timeout_secs,
                     ..
                 }
                 | LlmProvider::Anthropic {
+                    base_url,
                     retry_budget_secs,
                     request_timeout_secs,
                     ..
-                } => (*retry_budget_secs, *request_timeout_secs),
-                // In-process: no HTTP layer, so nothing to retry and no
-                // request to time out.
-                LlmProvider::Mistralrs { .. } => (None, None),
+                } => (Some(base_url), *retry_budget_secs, *request_timeout_secs),
+                // In-process: no HTTP layer, so no address to send to, nothing
+                // to retry, and no request to time out.
+                LlmProvider::Mistralrs { .. } => (None, None, None),
             };
+            if let Some(value) = base_url {
+                validate_base_url(&format!("providers.{provider_name}.base-url"), value)?;
+            }
             if let Some(value) = retry_budget_secs {
                 validate_retry_budget_secs(
                     &format!("providers.{provider_name}.retry-budget-secs"),
@@ -1793,6 +1804,37 @@ fn validate_request_timeout_secs(path: &str, value: u64) -> Result<(), ConfigVal
         });
     }
     Ok(())
+}
+
+/// Hold a remote provider's `base-url` to what a request can be sent to: it
+/// must parse as the `http::Uri` rig builds each request from, and name `http`
+/// or `https`, the only schemes reqwest sends to. Anything else loads as a
+/// string and then fails every request -- in rig's request builder if it does
+/// not parse, with reqwest's `builder error` if its scheme is another -- and
+/// neither error names the key.
+///
+/// `http::Uri` rather than the `url` crate reqwest parses with: the first is
+/// already in this crate's tree, and the second would bring IDNA tables into
+/// it. What only `url` refuses -- a port past 65535, say -- is left to the
+/// first request, which the CLI's retry loop fails at once rather than
+/// retrying.
+///
+/// The detail never quotes the value, which can carry credentials in its
+/// userinfo. Naming the scheme is safe: `http::Uri` reads one only where `://`
+/// follows it, so it ends before any userinfo begins.
+fn validate_base_url(path: &str, value: &str) -> Result<(), ConfigValidationError> {
+    let detail = match value.parse::<http::Uri>() {
+        Err(e) => format!("it does not parse ({e})"),
+        Ok(uri) => match uri.scheme_str() {
+            Some("http" | "https") => return Ok(()),
+            Some(scheme) => format!("its scheme is {scheme:?}"),
+            None => "it has no scheme".to_string(),
+        },
+    };
+    Err(ConfigValidationError::BaseUrlInvalid {
+        path: path.to_string(),
+        detail,
+    })
 }
 
 /// The `call-timeout-secs` / `mcp-call-timeout-secs` range rule, shared with

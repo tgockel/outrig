@@ -340,7 +340,8 @@ stops, timing out or losing its connection mid-request -- is retried until it su
 the retry budget runs out. The budget is `retry-budget-secs` on the provider, falling back
 to the top-level value and then to ten minutes. Everything else, including the rest of the
 `4xx` family, is final on the first try: a `401` will not become a `200` on the second
-attempt.
+attempt. So is a call the HTTP client refuses to make -- a redirect loop that reaches its
+limit of ten hops, or a URL it cannot send to -- because each replay is refused the same way.
 
 A call that never reaches the endpoint at all is retried on a much shorter leash. A refused
 connection, an unresolvable host, or a TLS mismatch usually means the address is wrong
@@ -370,8 +371,9 @@ The distinction is per request, not per turn, and it latches: once a call has pr
 response, the full budget applies for the rest of that request. A call that connects, gets
 a `503`, and then cannot reconnect for its retry is a provider having a bad minute -- not an
 address that was never right -- and it keeps the full budget. The practical effect of the
-split is that a typo in `base-url` ends the turn in seconds, naming the connection failure,
-rather than after ten minutes of retry lines.
+split is that a typo in `base-url`'s host ends the turn in seconds, naming the connection
+failure, rather than after ten minutes of retry lines. A `base-url` that is not an `http://`
+or `https://` URL does not get that far: the config is refused when it loads, naming the key.
 
 When the server says how long to wait, outrig waits that long. This is the reason the retry
 lives in outrig's own HTTP client rather than around the model call: a `Retry-After` header

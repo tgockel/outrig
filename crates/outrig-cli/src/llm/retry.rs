@@ -620,6 +620,12 @@ where
                 }
                 (err, retry_after)
             }
+            // A request that cannot succeed as sent fails the same way however
+            // often it is sent, so it is final at once rather than spending the
+            // budget -- and with it a failover chain's -- on replays.
+            Err(error) if is_permanent(&error) => {
+                return Err(HttpError::Instance(Box::new(error)));
+            }
             // Read timeouts, connection resets, and the like -- all
             // retry-worthy, and none of them carry a `Retry-After`.
             Err(error) => {
@@ -690,6 +696,14 @@ where
 /// explicit list of the standard ones misses.
 fn is_retryable_status(status: StatusCode) -> bool {
     status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
+}
+
+/// A transport error that no replay of the same request can clear: one reqwest
+/// could not build, or a redirect its policy refused to follow -- a loop that
+/// reached its limit, say. Every other transport error is a timeout, a dropped
+/// connection, or the like, which can.
+fn is_permanent(error: &reqwest::Error) -> bool {
+    error.is_builder() || error.is_redirect()
 }
 
 /// Pre-jitter backoff in seconds: `base_delay * 2^attempt`, capped at
@@ -782,7 +796,9 @@ fn is_transient(err: &HttpError) -> bool {
         HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
             is_retryable_status(*code)
         }
-        HttpError::Instance(_) => true,
+        HttpError::Instance(inner) => !inner
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_permanent),
         _ => false,
     }
 }
@@ -809,13 +825,21 @@ fn is_transient(err: &HttpError) -> bool {
 /// [`chain_exhausted_label`]: super::failover::chain_exhausted_label
 /// [`HttpError`]: CompletionError::HttpError
 ///
-/// Note the deliberate reach: a wrong `base-url` fails with a connection error,
-/// which is transient by this predicate, so an unreachable endpoint ends the
-/// turn rather than the session. That is right for a REPL -- the message names
-/// the connection failure and the user can fix the config or `/quit` -- and the
-/// *wait* before it no longer follows the full budget: an endpoint that never
-/// answered is bounded by [`CONNECT_BUDGET`], so a typo costs seconds rather
-/// than minutes. The classification is the decision; the wait was the bug.
+/// Note the deliberate reach: a `base-url` naming the wrong host fails with a
+/// connection error, which is transient by this predicate, so an unreachable
+/// endpoint ends the turn rather than the session. That is right for a REPL --
+/// the message names the connection failure and the user can fix the config or
+/// `/quit` -- and the *wait* before it no longer follows the full budget: an
+/// endpoint that never answered is bounded by [`CONNECT_BUDGET`], so a typo
+/// costs seconds rather than minutes. The classification is the decision; the
+/// wait was the bug.
+///
+/// The reach stops short of a request reqwest refuses to send at all: a scheme
+/// other than `http` or `https`, a URL it cannot parse, a redirect loop that
+/// reached its limit. [`send_with_retry`] returns that at once, and it is
+/// terminal here for the reason a `401` is -- no resend can satisfy it. A
+/// config cannot carry the scheme typo that was the usual way in: a load
+/// refuses it.
 ///
 /// Returning the label rather than a `bool` keeps the classification and the
 /// thing to print together: a caller cannot decide this is recoverable without
@@ -1621,6 +1645,49 @@ mod tests {
         assert!(
             elapsed >= policy.budget - policy.max_delay,
             "the full budget must be spent, not {elapsed:?} of it",
+        );
+    }
+
+    /// A URL reqwest refuses to send fails the same way on every replay, so the
+    /// loop returns it at once, with its budget unspent, and calls it what it
+    /// is: not something a wait or a resend could clear. The URL has a typo'd
+    /// scheme (#343). reqwest refuses it before it opens a socket, so the
+    /// paused clock counts only the waits the loop took.
+    #[tokio::test(start_paused = true)]
+    async fn a_url_reqwest_refuses_is_final_at_once() {
+        let started = tokio::time::Instant::now();
+        let err = send_with_retry::<Bytes>(
+            test_client(),
+            loop_policy(),
+            Method::POST,
+            format!("htps://127.0.0.1:{REFUSED_PORT}/v1/chat/completions")
+                .parse()
+                .expect("http parses any scheme"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .err()
+        .expect("reqwest refuses an htps:// URL");
+
+        assert_eq!(started.elapsed(), Duration::ZERO, "no wait was taken");
+        let HttpError::Instance(inner) = &err else {
+            panic!("a transport error: {err}")
+        };
+        assert!(
+            inner
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_builder),
+            "{err}"
+        );
+        let err = CompletionError::HttpError(err);
+        assert!(
+            !is_recoverable(&err),
+            "a chain must not call it recoverable"
+        );
+        assert!(
+            label_of(err).is_none(),
+            "the REPL must not call it transient"
         );
     }
 
