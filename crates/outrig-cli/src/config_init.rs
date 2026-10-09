@@ -314,7 +314,7 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
     loop {
         let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
         let style = STYLES[style_idx].0;
-        let name = prompt.ask_string(&PROVIDER_NAME_FIELD, style).await?;
+        let name = ask_unused_name(prompt, &PROVIDER_NAME_FIELD, style, &out, "provider").await?;
         let provider = prompt_provider_body(prompt, style).await?;
         out.insert(name, provider);
 
@@ -410,7 +410,7 @@ pub(crate) async fn prompt_models_loop(
     let mut new_providers: BTreeMap<String, LlmProvider> = BTreeMap::new();
 
     loop {
-        let name = prompt.ask_string(&MODEL_NAME_FIELD, "fast").await?;
+        let name = ask_unused_name(prompt, &MODEL_NAME_FIELD, "fast", &out, "model").await?;
 
         // Print providers defined so far (existing + any added inline) so
         // the user has the list at hand for the next prompt.
@@ -756,5 +756,33 @@ async fn ask_required(prompt: &mut impl PromptSource, field: &Field) -> Result<S
             return Ok(answer);
         }
         eprintln!("[outrig] this field requires a value");
+    }
+}
+
+/// Asks `field` for a name `taken` holds no entry under, asking again after a
+/// line naming the clash: the caller inserts the answer, and a taken name
+/// would replace the earlier entry's answers without a word. The suggestion
+/// is `base`, or the first of `base-2`, `base-3`, ... still free, so Enter
+/// always gives a name of its own.
+async fn ask_unused_name<V>(
+    prompt: &mut impl PromptSource,
+    field: &Field,
+    base: &str,
+    taken: &BTreeMap<String, V>,
+    kind: &str,
+) -> Result<String> {
+    let suggestion = std::iter::once(base.to_string())
+        .chain((2..).map(|n| format!("{base}-{n}")))
+        .find(|name| !taken.contains_key(name))
+        .expect("an unbounded sequence of names holds a free one");
+    loop {
+        let answer = prompt.ask_string(field, &suggestion).await?;
+        if !taken.contains_key(&answer) {
+            return Ok(answer);
+        }
+        eprintln!(
+            "[outrig] a {kind} named `{answer}` is already defined; defined: {}",
+            taken.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
     }
 }

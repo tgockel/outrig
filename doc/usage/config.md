@@ -50,6 +50,10 @@ $ outrig config init
 [outrig] wrote ~/.outrig/config.toml
 ```
 
+Each provider and each model needs a name of its own. A name already given in this run is asked
+for again, after a line saying so, and the suggested name moves on: a second `openai` provider is
+offered `openai-2`, and a second model `fast-2`.
+
 The prompts that follow depend on the style you pick.
 
 `anthropic` asks the same connection questions with its own defaults

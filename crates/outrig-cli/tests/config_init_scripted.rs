@@ -550,3 +550,69 @@ async fn no_models_writes_providers_only() {
         "missing provider:\n{text}"
     );
 }
+
+/// #346: a second provider of one style is offered `<style>-2`, and a name
+/// already given is asked for again rather than replacing the first entry.
+#[tokio::test]
+async fn a_repeated_provider_name_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // style (openai), name (openai), base-url A, env-var, add another (y);
+    // style (openai), name `openai` -- taken, so asked again -- then the
+    // default (openai-2), base-url B, env-var, no extra provider, NO model.
+    let script = b"\n\nhttps://a.example/v1\n\ny\n\nopenai\n\nhttps://b.example/v1\n\nn\nn\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    for expected in [
+        "[providers.openai]\nstyle = \"openai\"\nbase-url = \"https://a.example/v1\"",
+        "[providers.openai-2]\nstyle = \"openai\"\nbase-url = \"https://b.example/v1\"",
+    ] {
+        assert!(text.contains(expected), "missing {expected}:\n{text}");
+    }
+    assert_eq!(
+        shown
+            .matches("? Provider name [default: openai-2]: ")
+            .count(),
+        2,
+        "the taken name must be asked for again:\n{shown}"
+    );
+}
+
+/// #346: a second model is offered `fast-2`, and a name already given is
+/// asked for again rather than replacing the first entry.
+#[tokio::test]
+async fn a_repeated_model_name_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // Provider defaults (4), no extra provider, define a model; name (fast),
+    // provider, identifier gpt-a, add another (y); name `fast` -- taken, so
+    // asked again -- then the default (fast-2), provider, identifier gpt-b,
+    // no extra model, default-model name (fast).
+    let script = b"\n\n\n\n\n\n\n\ngpt-a\ny\nfast\n\n\ngpt-b\nn\n\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    for expected in [
+        "default-model = \"fast\"",
+        "[models.fast]\nprovider = \"openai\"\nidentifier = \"gpt-a\"",
+        "[models.fast-2]\nprovider = \"openai\"\nidentifier = \"gpt-b\"",
+    ] {
+        assert!(text.contains(expected), "missing {expected}:\n{text}");
+    }
+    assert_eq!(
+        shown.matches("? Model name [default: fast-2]: ").count(),
+        2,
+        "the taken name must be asked for again:\n{shown}"
+    );
+}

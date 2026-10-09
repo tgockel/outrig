@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig config init` no longer drops a provider or model whose name repeats.** Each name
+  prompt suggested the same default every time -- the style for a provider, `fast` for a model
+  -- so a second `openai` provider or a second model left at that default replaced the first,
+  and nothing said so. With a model lost, the default-model prompt then asked about the one
+  model left. A name already given in the run is now asked for again, after a line naming the
+  ones defined, and the suggestion moves on to the first free `<name>-2`, `<name>-3`, ... The
+  model prompts in `outrig init`'s repo phase do the same; a repo model may still share a
+  global model's name, which it overrides. (#346)
+
 - **A request the HTTP client will not send is final at once.** A `base-url` with a typo'd scheme,
   such as `htps://`, loaded, and every LLM call was then retried for the whole
   `retry-budget-secs` -- ten minutes by default, not the 30 seconds an endpoint that never answers
