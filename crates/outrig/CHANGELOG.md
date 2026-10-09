@@ -163,6 +163,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outrig run` uses, as it always has. `outrig run-new` passes its session id, so its container is
   `outrig-<sid>` and `outrig clean` can find one an abrupt exit left behind (#469).
 
+- **A thread the agent's code starts, and an item it gives a thread pool, are billed to the
+  execution that started them**, as a task and `asyncio.to_thread` already were. What they
+  print, the children they run, a callback and the report of one that raises, and the report of
+  an exception a thread did not catch land in that execution's result, or in its background once
+  it has reported. A pool's
+  own threads carry no execution, so two executions sharing one each see only their own items.
+  A thread started with `_thread.start_new_thread` and a pool's `initializer` still reach the
+  interpreter's stderr, recorded as `output.unattributed` (#474).
+
 ### Changed
 
 - **`Outrig::launch` labels its primary `org.outrig.session=<id>`**, with the id its name carries.

@@ -22,9 +22,10 @@ Five things here are load-bearing rather than incidental:
 - **Output is attributed to the execution that caused it**, not merely to its agent. A context
   variable names the execution, and asyncio copies it into every task the execution starts, so
   a task an earlier execution left running is billed to that execution rather than to whichever
-  holds the slot. Each execution has a pipe of its own for the same reason: a child process's
-  bytes carry no writer identity, so the descriptor it inherited is the only attribution there
-  is.
+  holds the slot. A thread carries the context it was started in, and an item a thread pool runs
+  the one it was submitted from. Each execution has a pipe of its own for the same reason: a
+  child process's bytes carry no writer identity, so the descriptor it inherited is the only
+  attribution there is.
 - **Output is bounded at the descriptor, not at `print`.** Each execution's pipe is drained on
   its own thread against `OUTPUT_MAX`, and a result never waits for a descendant that still
   holds the pipe open.
@@ -44,6 +45,7 @@ import asyncio
 import base64
 import builtins
 import collections
+import concurrent.futures.thread
 import contextlib
 import contextvars
 import dataclasses
@@ -56,6 +58,7 @@ import itertools
 import json
 import math
 import mmap
+import multiprocessing.pool
 import os
 import resource
 import select
@@ -94,8 +97,9 @@ os.dup2(_devnull, 0)
 os.close(_devnull)
 
 # fd 1 joins fd 2 on the exec's stderr. What reaches either without passing through the
-# dispatcher below -- `os.write(1, ...)`, `os.system`, a thread no execution started -- cannot be
-# billed to any agent, and the host records it instead of dropping it.
+# dispatcher below -- `os.write(1, ...)`, `os.system`, a thread started with `_thread` rather than
+# `threading`, a pool's `initializer` -- cannot be billed to any agent, and the host records it
+# instead of dropping it.
 os.dup2(2, 1)
 sys.__stdout__.reconfigure(line_buffering=True)
 
@@ -167,8 +171,8 @@ def _send(message):
 # ---------------------------------------------------------------------------- output
 
 # The execution a write belongs to. Set at the top of an execution's task, so every task that
-# execution creates carries it, and so does `asyncio.to_thread`, which copies the context. A
-# thread started any other way starts with none.
+# execution creates carries it, and so does `asyncio.to_thread`, which copies the context. So do
+# a thread it starts and an item it gives a thread pool, through the patches after the fork hooks.
 _CURRENT = contextvars.ContextVar("outrig_execution", default=None)
 
 
@@ -581,6 +585,244 @@ os.register_at_fork(
     after_in_parent=_after_fork_in_parent,
     after_in_child=_after_fork_in_child,
 )
+
+# A thread runs in a copy of the context it was started in, and so is billed to the execution
+# that started it. This is Python 3.14's `thread_inherit_context`, except that the report of an
+# exception the thread did not catch is made in that context too, rather than lost to stderr, and
+# that a thread a pool starts for itself is left out, as `_pools_own` says. A thread started with
+# `_thread.start_new_thread`, which bypasses `Thread.start`, carries none.
+_thread_start = threading.Thread.start
+_thread_bootstrap_inner = threading.Thread._bootstrap_inner
+# 3.14 runs a thread's `run` inside `Thread._context`, which `start` fills by the flag's setting.
+_THREAD_RUNS_IN_CONTEXT = sys.version_info >= (3, 14)
+
+# The modules whose pools start threads for themselves: `ThreadPoolExecutor`'s workers, and a
+# `multiprocessing.pool`'s workers and the threads that tend its queues and run its callbacks.
+_POOL_MODULES = frozenset({"concurrent.futures.thread", "multiprocessing.pool"})
+
+
+def _launched(thread):
+    """Whether `thread`'s system thread exists: in `_limbo` until it takes its identity, then in
+    `_active` until it ends, read under the lock `threading` keeps them with."""
+    with threading._active_limbo_lock:
+        return thread in threading._limbo or thread._ident in threading._active
+
+
+def _pools_own(thread):
+    """Whether `thread` is one a standard library pool starts for itself.
+
+    A pool's worker is not the work it runs. Started for the first submission that needed it, it
+    serves every later one, and the context it was started in would bill all of their work to the
+    first -- which is what 3.14's flag, copying per thread, does to a pool. So a pool's own thread
+    starts with no execution, and each item runs in the context it was submitted from, below. A
+    thread is known by its target's module, read only when the target is a plain function or a
+    method of one, so no callable the agent wrote is asked anything.
+    """
+    target = getattr(thread, "_target", None)
+    if type(target) is types.MethodType:
+        target = target.__func__
+    return type(target) is types.FunctionType and target.__module__ in _POOL_MODULES
+
+
+@functools.wraps(_thread_start)
+def _attributed_thread_start(self):
+    own = _pools_own(self)
+    if not own:
+        self._outrig_context = contextvars.copy_context()
+    if _THREAD_RUNS_IN_CONTEXT and self._context is None:
+        # Set either way, since the flag is on by default in a free-threaded build: an empty one
+        # for a pool's thread, and for any other a copy of its own, because a context can be
+        # entered by one frame at a time and the bootstrap runs inside the other.
+        self._context = contextvars.Context() if own else contextvars.copy_context()
+    try:
+        _thread_start(self)
+    except BaseException:
+        # `start` raises before the thread exists -- the system refused one, or it was started
+        # twice -- or after, interrupted while waiting for it to come up. Only a thread that runs
+        # takes its context off, so one that never will is relieved of it here.
+        if not _launched(self):
+            self.__dict__.pop("_outrig_context", None)
+        raise
+
+
+@functools.wraps(_thread_bootstrap_inner)
+def _attributed_bootstrap_inner(self):
+    # Taken off the thread, so a `Thread` kept after its thread has ended holds no execution.
+    context = self.__dict__.pop("_outrig_context", None)
+    if context is None:
+        _thread_bootstrap_inner(self)
+    else:
+        context.run(_thread_bootstrap_inner, self)
+
+
+threading.Thread.start = _attributed_thread_start
+threading.Thread._bootstrap_inner = _attributed_bootstrap_inner
+
+
+def _submitted(fn):
+    """`fn`, run in a copy of the context it was handed over in. `None` stays `None`.
+
+    A new copy for each call, because `map` runs one function on several workers at once, and a
+    context can be entered by only one thread at a time.
+    """
+    if fn is None:
+        return None
+    context = contextvars.copy_context()
+
+    def submitted(*args, **kwargs):
+        return context.copy().run(fn, *args, **kwargs)
+
+    return submitted
+
+
+# `ThreadPoolExecutor` is what `loop.run_in_executor` submits to by default, and
+# `asyncio.to_thread` through that. Its work item is made inside `submit`, on the submitting
+# thread, so the item carries the context it runs in, and what the pool was given is left as it
+# was: 3.14's `InterpreterPoolExecutor` hands it to another interpreter, where a closure cannot go.
+_WorkItem = concurrent.futures.thread._WorkItem
+_work_item_init = _WorkItem.__init__
+_work_item_run = _WorkItem.run
+
+
+@functools.wraps(_work_item_init)
+def _attributed_work_item_init(self, *args, **kwargs):
+    _work_item_init(self, *args, **kwargs)
+    self.context = contextvars.copy_context()
+
+
+@functools.wraps(_work_item_run)
+def _attributed_work_item_run(self, *args):
+    return self.context.run(_work_item_run, self, *args)
+
+
+_WorkItem.__init__ = _attributed_work_item_init
+_WorkItem.run = _attributed_work_item_run
+
+
+def _attributing(method):
+    """`method`, with the function it is given -- its first argument, or `func` -- run as
+    `_submitted` runs it."""
+
+    @functools.wraps(method)
+    def attributing(self, *args, **kwargs):
+        if args:
+            args = (_submitted(args[0]), *args[1:])
+        elif "func" in kwargs:
+            kwargs["func"] = _submitted(kwargs["func"])
+        return method(self, *args, **kwargs)
+
+    return attributing
+
+
+# A `concurrent.futures` future's callbacks, a process pool's included, run in the context they
+# were added in, as an asyncio future's do: they run on whichever thread finishes the work, which
+# is a pool's own, or one a process pool started for whoever made it.
+_LOGGER = concurrent.futures._base.LOGGER
+_add_done_callback = concurrent.futures.Future.add_done_callback
+
+
+def _logged(fn, future):
+    """`fn(future)` as `Future` calls a done callback: an exception is logged, and not raised."""
+    try:
+        fn(future)
+    except Exception:
+        _LOGGER.exception("exception calling callback for %r", future)
+
+
+def _attributed_done_callback(fn):
+    """`fn`, run once in a copy of the context it was added in, and reported there if it raises.
+
+    `Future` logs a callback's exception itself, but only once the callback's context has been
+    left for the work's, so the report would be billed to whoever submitted the work. Logged here
+    instead, and nothing reaches `Future`. The context is let go of once the callback has run: a
+    future keeps its callbacks for as long as it is kept, and a callback kept by nothing else
+    should not keep the execution that added it.
+    """
+    context = contextvars.copy_context()
+
+    def callback(future):
+        nonlocal context
+        run, context = context, None
+        if run is None:
+            # Called again, which `Future` never does: in whatever context there is.
+            run = contextvars.copy_context()
+        run.run(_logged, fn, future)
+
+    return callback
+
+
+@functools.wraps(_add_done_callback)
+def _attributed_add_done_callback(self, fn):
+    _add_done_callback(self, _attributed_done_callback(fn))
+
+
+concurrent.futures.Future.add_done_callback = _attributed_add_done_callback
+
+# What a `multiprocessing.pool.ThreadPool` is given reaches a worker through these four methods,
+# which `apply`, `map`, `starmap` and the rest call. `ThreadPool` alone: a process `Pool` pickles
+# what it is given, and a context cannot be.
+_ThreadPool = multiprocessing.pool.ThreadPool
+_ThreadPool.apply_async = _attributing(_ThreadPool.apply_async)
+_ThreadPool.imap = _attributing(_ThreadPool.imap)
+_ThreadPool.imap_unordered = _attributing(_ThreadPool.imap_unordered)
+_ThreadPool._map_async = _attributing(_ThreadPool._map_async)
+
+# Callbacks stay in this process whichever pool runs the work, so every pool's, a process pool's
+# included, are wrapped where its results are made. A result keeps its callbacks for as long as it
+# is kept, so their context is let go of when the result settles, whether or not it ran either:
+# its event is set then, after whichever callback it ran, and at once for a `map` of nothing.
+_apply_result_init = multiprocessing.pool.ApplyResult.__init__
+
+
+class _Settled(threading.Event):
+    """An `ApplyResult`'s event, set when the result settles: the moment its callbacks' context can
+    be let go of."""
+
+    def __init__(self, release):
+        super().__init__()
+        self.release = release
+
+    def set(self):
+        self.release()
+        super().set()
+
+
+def _settling(callback, error_callback):
+    """`callback` and `error_callback`, each run in a copy of the context they were given in, and
+    the function that lets go of it. `None` stays `None`."""
+    context = contextvars.copy_context()
+
+    def release():
+        nonlocal context
+        context = None
+
+    def attributed(fn):
+        if fn is None:
+            return None
+
+        def settled(value):
+            run = context
+            if run is None:
+                # After the result settled, which `multiprocessing.pool` never does: in whatever
+                # context there is.
+                run = contextvars.copy_context()
+            return run.run(fn, value)
+
+        return settled
+
+    return attributed(callback), attributed(error_callback), release
+
+
+@functools.wraps(_apply_result_init)
+def _attributed_apply_result_init(self, pool, callback, error_callback):
+    callback, error_callback, release = _settling(callback, error_callback)
+    _apply_result_init(self, pool, callback, error_callback)
+    # Replaced before the work is queued, which the caller does next, so nothing has set the
+    # event it replaces.
+    self._event = _Settled(release)
+
+
+multiprocessing.pool.ApplyResult.__init__ = _attributed_apply_result_init
 
 
 def _attributed_exception(loop, context):

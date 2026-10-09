@@ -583,24 +583,42 @@ fn generated_code_cannot_forge_a_protocol_message() {
 
 #[test]
 fn what_no_execution_wrote_goes_to_stderr_and_no_result() {
-    // A raw descriptor write names no writer, and a thread started with
-    // `threading` begins with no execution in its context. Both land on the
-    // stream the host records as diagnostics, never in some result.
+    // A raw descriptor write names no writer. A thread started with `_thread`,
+    // beneath `threading`, and a pool's initializer, which runs on a worker
+    // outside every item, begin with no execution in their context. All land
+    // on the stream the host records as diagnostics, never in some result --
+    // while the pools' items are the execution's.
     let mut k = Interpreter::start();
     let out = k.output(
         1,
         &py(r#"
-            import os, threading
+            import _thread, concurrent.futures, multiprocessing.pool, os
             os.write(1, b'RAW-ONE\n')
             os.write(2, b'RAW-TWO\n')
-            t = threading.Thread(target=print, args=('FROM-A-THREAD',))
-            t.start()
-            t.join()
+            done = _thread.allocate_lock()
+            done.acquire()
+            def bare():
+                print('FROM-A-BARE-THREAD')
+                done.release()
+            _thread.start_new_thread(bare, ())
+            done.acquire()
+            executor = concurrent.futures.ThreadPoolExecutor(
+                1, initializer=print, initargs=('FROM-AN-EXECUTOR-INITIALIZER',))
+            executor.submit(print, 'FROM-AN-EXECUTOR-ITEM').result()
+            pool = multiprocessing.pool.ThreadPool(
+                1, initializer=print, initargs=('FROM-A-POOL-INITIALIZER',))
+            pool.apply(print, ('FROM-A-POOL-ITEM',))
             'done'
             "#),
     );
-    assert_eq!(out, "'done'\n");
-    for needle in ["RAW-ONE", "RAW-TWO", "FROM-A-THREAD"] {
+    assert_eq!(out, "FROM-AN-EXECUTOR-ITEM\nFROM-A-POOL-ITEM\n'done'\n");
+    for needle in [
+        "RAW-ONE",
+        "RAW-TWO",
+        "FROM-A-BARE-THREAD",
+        "FROM-AN-EXECUTOR-INITIALIZER",
+        "FROM-A-POOL-INITIALIZER",
+    ] {
         k.await_stderr(needle);
     }
 }
@@ -912,6 +930,266 @@ fn an_exit_raised_in_a_background_task_ends_only_that_task() {
     assert_eq!(
         k.output(2, "type(leaving.exception()).__name__"),
         "'SystemExit'\n"
+    );
+}
+
+#[test]
+fn a_thread_is_billed_to_the_execution_that_started_it() {
+    // Everything the thread causes is the execution's: its prints, a child it
+    // runs, and the report of an exception it did not catch. What it writes
+    // once the execution has reported is that execution's background.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import subprocess, sys, threading
+            def work():
+                print('FROM-A-THREAD')
+                subprocess.run([sys.executable, '-c', 'print("FROM-ITS-CHILD")'])
+                raise ValueError('the thread failed')
+            t = threading.Thread(target=work)
+            t.start()
+            t.join()
+            go = threading.Event()
+            def later():
+                go.wait()
+                print('LATE-THREAD')
+            late = threading.Thread(target=later)
+            late.start()
+            "#),
+    );
+    assert!(out.starts_with("FROM-A-THREAD\nFROM-ITS-CHILD\n"), "{out}");
+    assert!(out.contains("ValueError: the thread failed"), "{out}");
+
+    let result = k.exec(2, "go.set()\nlate.join()\nprint('MINE')");
+    assert_eq!(result["output"], "MINE\n", "{result}");
+    assert_eq!(
+        result["background"],
+        json!([{"id": 1, "output": "LATE-THREAD\n", "dropped": 0}])
+    );
+}
+
+#[test]
+fn pool_items_are_billed_to_the_execution_that_submitted_them() {
+    // Each pool's worker is started for 1 and serves 2 as well. An item, or a
+    // callback, is billed to the execution that submitted it, whichever
+    // worker runs it and however late -- and two items of one `map`, running
+    // at the same time on two workers, each in a copy of its own.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import concurrent.futures, multiprocessing.pool, threading
+            loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(1)
+            pool = multiprocessing.pool.ThreadPool(1)
+            executor.submit(print, 'EXECUTOR-1').result()
+            await loop.run_in_executor(None, print, 'DEFAULT-1')
+            pool.apply(print, ('POOL-1',))
+            go = threading.Event()
+            def later():
+                go.wait()
+                print('EXECUTOR-LATE-1')
+            executor.submit(later)
+            None
+            "#),
+    );
+    assert_eq!(out, "EXECUTOR-1\nDEFAULT-1\nPOOL-1\n");
+
+    // The late item holds the executor's one worker until 2 releases it, so it
+    // writes while 2 runs, before 2's own item.
+    let result = k.exec(
+        2,
+        &py(r#"
+            go.set()
+            executor.submit(print, 'EXECUTOR-2').result()
+            await loop.run_in_executor(None, print, 'DEFAULT-2')
+            await asyncio.to_thread(print, 'TO-THREAD-2')
+            pool.map(print, ['MAP-2'])
+            pool.apply_async(int, callback=lambda _: print('CALLBACK-2')).wait()
+            list(pool.imap(print, ['IMAP-2']))
+            None
+            "#),
+    );
+    assert_eq!(
+        text(&result["output"]),
+        "EXECUTOR-2\nDEFAULT-2\nTO-THREAD-2\nMAP-2\nCALLBACK-2\nIMAP-2\n",
+        "{result}"
+    );
+    assert_eq!(result["dropped"], 0);
+    assert_eq!(
+        result["background"],
+        json!([{"id": 1, "output": "EXECUTOR-LATE-1\n", "dropped": 0}])
+    );
+
+    // The barrier holds each item until the other is running too. Its timeout
+    // is a hang guard, never waited out when both items are running. Each line
+    // is one write: `print` makes two, and two threads' can interleave.
+    let guard = TIMEOUT.as_secs() / 2;
+    let out = k.output(
+        3,
+        &py(&format!(
+            r#"
+            import sys
+            wide = multiprocessing.pool.ThreadPool(2)
+            meet = threading.Barrier(2, timeout={guard})
+            def together(text):
+                meet.wait()
+                sys.stdout.write(text + '\n')
+            wide.map(together, ['WIDE-3A', 'WIDE-3B'], chunksize=1)
+            None
+            "#
+        )),
+    );
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["WIDE-3A", "WIDE-3B"], "{out}");
+}
+
+#[test]
+fn a_callback_is_billed_to_the_execution_that_added_it() {
+    // A callback runs on whichever thread finishes the work: a pool's own
+    // worker, inside work 1 submitted, or a process pool's manager thread,
+    // which 1 started. Each of these is 2's, and so is the report of one that
+    // raises, which `Future` would log once the callback's context had been
+    // left for 1's. `shutdown()` waits for the callbacks: a worker runs them
+    // inside `set_result`, and the manager thread finishes every item first.
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import concurrent.futures, multiprocessing, threading
+            fork = multiprocessing.get_context('fork')
+            executor = concurrent.futures.ThreadPoolExecutor(1)
+            processes = concurrent.futures.ProcessPoolExecutor(1, mp_context=fork)
+            pool = fork.Pool(1)
+            go = threading.Event()
+            pending = executor.submit(go.wait)
+            processes.submit(abs, -1).result()
+            pool.apply(abs, (-1,))
+            None
+            "#),
+    );
+    assert_eq!(out, "");
+
+    let result = k.exec(
+        2,
+        &py(r#"
+            pending.add_done_callback(lambda _: print('EXECUTOR-DONE-2'))
+            pending.add_done_callback(lambda _: 1 / 0)
+            go.set()
+            executor.shutdown()
+            processes.submit(abs, -1).add_done_callback(lambda _: print('PROCESSES-DONE-2'))
+            processes.shutdown()
+            pool.apply_async(abs, (-1,), callback=lambda _: print('POOL-CALLBACK-2')).wait()
+            None
+            "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    let out = text(&result["output"]);
+    assert!(
+        out.starts_with("EXECUTOR-DONE-2\nexception calling callback for <Future"),
+        "{out}"
+    );
+    assert!(out.contains("ZeroDivisionError"), "{out}");
+    assert!(
+        out.ends_with("PROCESSES-DONE-2\nPOOL-CALLBACK-2\n"),
+        "{out}"
+    );
+    assert_eq!(result["background"], json!([]));
+}
+
+/// A future or a result keeps its callbacks for as long as it is kept, so a
+/// callback lets go of the context it was added in once it has run, and a
+/// result's pair once the result has settled -- whether it ran one of them,
+/// neither, or settled at once as a `map` of nothing does -- and keeps nothing
+/// of its execution. The workers are joined first: a result is available
+/// before the worker that produced it has let go of its item.
+#[test]
+fn a_callback_that_has_run_holds_no_context() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import concurrent.futures, contextvars, gc, multiprocessing.pool, threading, weakref
+            class Marker:
+                pass
+            marker = contextvars.ContextVar('marker')
+            executor = concurrent.futures.ThreadPoolExecutor(1)
+            pool = multiprocessing.pool.ThreadPool(1)
+            def register():
+                held = Marker()
+                marker.set(held)
+                go = threading.Event()
+                future = executor.submit(go.wait)
+                future.add_done_callback(lambda _: None)
+                go.set()
+                future.result()
+                ran = pool.apply_async(
+                    abs, (-1,), callback=lambda _: None, error_callback=lambda _: None)
+                unused = pool.apply_async(abs, (-1,), error_callback=lambda _: None)
+                empty = pool.map_async(
+                    abs, [], callback=lambda _: None, error_callback=lambda _: None)
+                for result in (ran, unused, empty):
+                    result.wait()
+                return weakref.ref(held), future, ran, unused, empty
+            kept = contextvars.copy_context().run(register)
+            executor.shutdown()
+            pool.close()
+            pool.join()
+            gc.collect()
+            print('marker released:', kept[0]() is None)
+            "#),
+    );
+    assert_eq!(out, "marker released: True\n");
+}
+
+/// `start` can raise before a thread exists -- the system refused one -- or
+/// after one does, interrupted while waiting for it to come up. A thread that
+/// never runs never takes its context off, so `start` does; one that runs is
+/// billed as any other.
+#[test]
+fn a_thread_that_never_started_holds_no_execution() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import threading
+            real = threading._start_joinable_thread
+            def refuse(*args, **kwargs):
+                raise RuntimeError("can't start new thread")
+            threading._start_joinable_thread = refuse
+            refused = threading.Thread(target=print, args=('NEVER',))
+            try:
+                refused.start()
+            except RuntimeError as e:
+                print('refused:', e)
+            finally:
+                threading._start_joinable_thread = real
+            print('context kept:', '_outrig_context' in refused.__dict__)
+
+            class Interrupted(threading.Event):
+                waits = 0
+                def wait(self, timeout=None):
+                    self.waits += 1
+                    if self.waits == 1:
+                        raise RuntimeError('interrupted while waiting')
+                    return super().wait(timeout)
+            late = threading.Thread(target=print, args=('LATE-BUT-MINE',))
+            late._started = Interrupted()
+            try:
+                late.start()
+            except RuntimeError as e:
+                raised = e
+            threading.Event.wait(late._started)
+            late.join()
+            print('start raised:', raised)
+            "#),
+    );
+    assert_eq!(
+        out,
+        "refused: can't start new thread\ncontext kept: False\nLATE-BUT-MINE\n\
+         start raised: interrupted while waiting\n"
     );
 }
 

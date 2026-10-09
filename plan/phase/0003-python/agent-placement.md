@@ -103,6 +103,28 @@ A background `create_task`
   task eat B's result quota, which is exactly the defect `kernel-findings` #2 fixed for one
   agent and co-hosting would otherwise reintroduce.
 
+A `threading.Thread`
+: Python 3.13 starts a thread with an empty context, so the interpreter patches `Thread.start` to
+  copy the starter's context and run the thread in it, as 3.14's `thread_inherit_context` flag
+  does. The patch goes one step further: the report of an exception the thread did not catch is
+  made in that context too, so the model sees why its thread died. A thread is billed to the
+  execution that started it, as a task is, and after that execution has reported, to its backlog.
+
+`loop.run_in_executor`, `asyncio.to_thread`, and the thread pools
+: A pool's worker is not the work it runs. One started for the first submission that needed it
+  serves every later one, so the starter's context would bill every later execution's items to
+  the first -- worse than billing nothing, and 3.14's flag, copying per thread, does exactly that.
+  So a thread those pools start for themselves -- `ThreadPoolExecutor`'s and
+  `multiprocessing.pool.ThreadPool`'s, known by its target's module -- begins with an empty
+  context, and each item runs in a copy of the context it was submitted from. `run_in_executor`
+  submits to the former, and `asyncio.to_thread` through it.
+
+  A callback runs on whichever thread finishes the work -- a pool's own worker, or a thread a
+  process pool started for whoever made it -- so it too runs in a copy of the context it was added
+  in: a `concurrent.futures` future's, as an asyncio future's does, and a `multiprocessing.pool`
+  result's, for either kind of pool. A future's callback that raises is reported in that context
+  too, where `Future` would log it once the callback's context had been left for the work's.
+
 `subprocess.run([...])`, and `asyncio.create_subprocess_exec`, which goes through it
 : A pipe per **execution**, supplied as the default `stdout` and `stderr` by one patch on
   `Popen.__init__`, which reads the same contextvar. `stdout=sys.stdout` is treated as the
@@ -131,10 +153,11 @@ A background `create_task`
 Verified with two agents printing, spawning background tasks, and running subprocesses at the same
 time: every line landed in its own agent. That experiment established attribution **between**
 agents. The harder half -- one agent's old execution emitting while a new one runs -- is now
-tested too, in `crates/outrig/src/python/interpreter_tests.rs`, for a task and for a child
-process. For both, the new execution's output is exact, it drops nothing, and every byte of the
-old one's output is billed to the old one. The child case uses a child that writes only after
-the new execution has started, 20,000 bytes against a 16 KiB budget.
+tested too, in `crates/outrig/src/python/interpreter_tests.rs`, for a task, a child process, a
+thread, and an item in a pool both executions share. In each case the new execution's output is
+exact, it drops nothing, and every byte of the old one's output is billed to the old one. The
+child case uses a child that writes only after the new execution has started, 20,000 bytes
+against a 16 KiB budget.
 
 The same holds for a child a background task starts after its execution reported, and for an
 exception nobody retrieved from such a task, which asyncio reports from wherever the task happens
@@ -142,11 +165,18 @@ to be collected.
 
 What stays unattributed, stated rather than implied:
 
-- **A thread started with `threading`, and `loop.run_in_executor`.** Python 3.13 starts a thread
-  with an empty context, so there is no execution to bill; the output goes to stderr, never to
-  another execution. `asyncio.to_thread` copies the context and is attributed. Copying the
-  context into every thread would misattribute a pool's workers to whichever execution created
-  them.
+- **A thread started with `_thread.start_new_thread`, and a pool's `initializer`.** The first
+  bypasses `Thread.start`; the second runs on a worker, outside every item. Each starts with an
+  empty context, so there is no execution to bill; the output goes to stderr, never to another
+  execution.
+- **A thread that serves many executions**, such as one a library starts on first use and keeps,
+  is billed to the execution that started it, whoever it is working for. Only the standard
+  library's thread pools are known to be pools, and only theirs are billed per item.
+- **A process pool's workers**, forked when the pool was made or first used, are billed to the
+  execution that forked them, whoever submits the work: a child's bytes carry only the descriptor
+  it inherited. A pool made in one execution and used from the next bills the next's output to
+  the first, so make one pool per execution
+  (`plan/next/process-pool-workers-are-billed-to-their-creator.md`).
 - **A `fileno()` kept past its execution.** The number is closed when the execution reports and
   may be reused by the next one's pipe.
 - **`contextlib.redirect_stdout`.** It rebinds `sys.stdout` for the whole process, so one agent's
