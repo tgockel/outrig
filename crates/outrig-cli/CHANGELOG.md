@@ -28,8 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two behavior changes to know about. A multi-line paste now arrives as **one** prompt with the
   line breaks intact, where it previously became one turn per line. And `Ctrl-C` at the prompt
   discards the typed line rather than raising a signal; a second `Ctrl-C` with nothing entered in
-  between still exits, and `Ctrl-C` during a turn is unchanged. `Ctrl-C` during a slash command
-  still cannot interrupt it (#345).
+  between still exits, and `Ctrl-C` during a turn is unchanged.
 
   Scripted use is unchanged: piped stdin, a redirected file, a terminal on stdin other than the
   one you are typing at, and `TERM` set to `dumb`, `cons25`, or `emacs` all keep the previous
@@ -60,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error. (#478)
 
 ### Fixed
+
+- **Ctrl-C cancels a slash command.** Nothing heard a Ctrl-C while a slash command ran, so a
+  `/sidecar add` waiting on an image build or on a server that never answers `initialize` held
+  the session until it ended on its own -- two minutes, for a server stuck in `initialize`.
+  Ctrl-C now cancels the command, prints `[outrig] interrupted`, and returns to the prompt, as it
+  does for a turn; a second Ctrl-C exits. An interrupted add is undone like a failed one: its
+  container is removed, the containers already running keep their network interception, and the
+  add can be run again. SIGTERM or SIGHUP during an add's network attach also no longer drops
+  the session's interceptor ahead of teardown, which then had nothing to shut down. (#345)
 
 - **The host's proxy, password included, no longer reaches the agent.** podman copied
   `HTTPS_PROXY`, `http_proxy`, `NO_PROXY`, and the other proxy variables from outrig's

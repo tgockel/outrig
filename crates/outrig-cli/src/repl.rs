@@ -100,7 +100,9 @@ impl Repl {
     /// ["add", "tools"])`, `("tools", [])`. `Some(text)` is printed to
     /// stderr (side effects are the caller's); `None` means the command is
     /// unknown and the REPL prints the notice. `commands` supplies the
-    /// caller commands' `/help` lines.
+    /// caller commands' `/help` lines. An interrupt drops an in-flight
+    /// `on_command` future just as it does an `on_prompt` one, under the same
+    /// rule: what it moves out of shared state goes back on drop.
     pub async fn run<P, PFut, C, CFut>(
         banner: &str,
         commands: &[HelpEntry],
@@ -238,13 +240,24 @@ impl Repl {
                     ("help", true) => {
                         write_stderr_line(&mut stderr, &help_text).await?;
                     }
-                    _ => match on_command(name.to_string(), args).await {
-                        Some(text) => write_stderr_line(&mut stderr, &text).await?,
-                        None => {
-                            // `raw`, not name + args: the notice echoes
-                            // the input as typed.
-                            let notice = format!("[outrig] unknown command: /{raw}");
-                            write_stderr_line(&mut stderr, &notice).await?;
+                    // Raced like a turn: a command can wait on podman or on a
+                    // server that never answers, and SIGINT has no default to
+                    // fall back on once the session installed its handlers.
+                    // Unraced, a Ctrl-C here reached no listener at all.
+                    _ => tokio::select! {
+                        text = on_command(name.to_string(), args) => match text {
+                            Some(text) => write_stderr_line(&mut stderr, &text).await?,
+                            None => {
+                                // `raw`, not name + args: the notice echoes
+                                // the input as typed.
+                                let notice = format!("[outrig] unknown command: /{raw}");
+                                write_stderr_line(&mut stderr, &notice).await?;
+                            }
+                        },
+                        _ = interrupt() => {
+                            stderr.write_all(INTERRUPT_NOTICE).await?;
+                            stderr.flush().await?;
+                            last_was_interrupt = true;
                         }
                     },
                 }
@@ -483,5 +496,39 @@ mod tests {
         );
         let stderr = String::from_utf8(stderr).expect("stderr utf-8");
         assert!(stderr.contains("[outrig] interrupted"), "{stderr:?}");
+    }
+
+    /// A slash command is cancelled the way a turn is (#345): a command still
+    /// waiting -- on an image pull, or on a server that never answers
+    /// `initialize` -- is dropped, and the next Ctrl-C at the prompt exits.
+    #[tokio::test]
+    async fn an_interrupted_command_arms_the_next_interrupt_at_the_prompt() {
+        let (source, rest) = script(vec![
+            line("/sidecar add slow"),
+            LineEvent::Interrupted,
+            line("must never be read"),
+        ]);
+
+        let mut stderr = Vec::new();
+        Repl::run_loop(
+            source,
+            Vec::new(),
+            &mut stderr,
+            || future::ready(()),
+            "",
+            &[],
+            |_: String| future::ready(Result::Ok(String::new())),
+            |_, _| future::pending::<Option<String>>(),
+        )
+        .await
+        .expect("the loop must end cleanly");
+
+        assert_eq!(
+            rest.borrow().len(),
+            1,
+            "the interrupt after a cancelled command must exit",
+        );
+        let stderr = String::from_utf8(stderr).expect("stderr utf-8");
+        assert_eq!(stderr, "\n[outrig] interrupted\n");
     }
 }

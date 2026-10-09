@@ -31,7 +31,7 @@ use tokio::time::timeout;
 mod common;
 use common::{
     CannedResponse, E2E_TIMEOUT, fixture_mcp_fs_dir, next_recorded, podman_names, start_mock_http,
-    stream_lines, wait_for_stderr_value,
+    stream_lines, wait_for_stderr_value, wait_until_gone,
 };
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
@@ -1058,6 +1058,103 @@ preamble = "test"
     );
 }
 
+/// `outrig run` in a process group of its own, as a shell runs a foreground
+/// job, so a signal sent to that group reaches outrig and what shares its
+/// group, and not this test. Both output streams are collected as they arrive.
+struct GroupRun {
+    child: tokio::process::Child,
+    group: Pid,
+    stdin: tokio::process::ChildStdin,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
+    streams: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl GroupRun {
+    fn spawn(repo: &Path, sessions: &Path, session_dir: &Path, extra_args: &[&str]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--session-root")
+            .arg(sessions)
+            .arg("run")
+            .arg("--session-dir")
+            .arg(session_dir)
+            .args(extra_args)
+            .current_dir(repo)
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .env("OUTRIG_LOG", "info")
+            .env("XDG_CONFIG_HOME", xdg_config_home(repo))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn outrig");
+        let group = Pid::from_raw(child.id().expect("outrig is running") as i32);
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = Arc::new(Mutex::new(String::new()));
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let streams = [
+            tokio::spawn(stream_lines(
+                child.stdout.take().expect("stdout piped"),
+                stdout.clone(),
+                "stdout",
+            )),
+            tokio::spawn(stream_lines(
+                child.stderr.take().expect("stderr piped"),
+                stderr.clone(),
+                "stderr",
+            )),
+        ];
+        Self {
+            child,
+            group,
+            stdin,
+            stdout,
+            stderr,
+            streams,
+        }
+    }
+
+    async fn write_line(&mut self, line: &str) {
+        self.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write to outrig's stdin");
+    }
+
+    /// A Ctrl-C, sent the way a terminal sends it: to the whole group.
+    fn sigint(&self) {
+        killpg(self.group, Signal::SIGINT).expect("signal outrig's group");
+    }
+
+    /// End the session with EOF, the way Ctrl-D does, and require a clean
+    /// exit. Returns everything outrig wrote to stderr.
+    async fn finish(self) -> String {
+        let Self {
+            mut child,
+            stdin,
+            stderr,
+            streams,
+            ..
+        } = self;
+        drop(stdin);
+        let status = timeout(E2E_TIMEOUT, child.wait())
+            .await
+            .expect("outrig exited in time")
+            .expect("wait for outrig");
+        for stream in streams {
+            let _ = stream.await;
+        }
+        let stderr = stderr.lock().unwrap().clone();
+        assert!(
+            status.success(),
+            "outrig run exited with {status:?}; stderr: {stderr}"
+        );
+        stderr
+    }
+}
+
 /// A Ctrl-C mid-turn abandons the turn and nothing else: the next prompt's
 /// tool call still reaches the MCP server (#335). The `SIGINT` goes to the
 /// whole process group, as a terminal sends it. That used to reach every
@@ -1079,56 +1176,18 @@ async fn run_sigint_to_the_group_mid_turn_keeps_the_mcp_transports() {
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let session_dir = tempfile::tempdir().expect("tempdir session");
 
-    // A group of its own, as a shell gives a foreground job, so the signal
-    // below reaches outrig and what shares its group, and not this test.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
-        .arg("--session-root")
-        .arg(sessions.path())
-        .arg("run")
-        .arg("--session-dir")
-        .arg(session_dir.path())
-        .current_dir(repo_dir.path())
-        .env("OUTRIG_TEST_KEY", "test-key")
-        .env("OUTRIG_LOG", "info")
-        .env("XDG_CONFIG_HOME", xdg_config_home(repo_dir.path()))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn outrig");
-    let group = Pid::from_raw(child.id().expect("outrig is running") as i32);
-    let mut stdin = child.stdin.take().expect("stdin piped");
-    let stdout = Arc::new(Mutex::new(String::new()));
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let stdout_task = tokio::spawn(stream_lines(
-        child.stdout.take().expect("stdout piped"),
-        stdout.clone(),
-        "stdout",
-    ));
-    let stderr_task = tokio::spawn(stream_lines(
-        child.stderr.take().expect("stderr piped"),
-        stderr.clone(),
-        "stderr",
-    ));
+    let mut run = GroupRun::spawn(repo_dir.path(), sessions.path(), session_dir.path(), &[]);
 
-    let container = wait_for_stderr_value(stderr.clone(), "[outrig] container started:").await;
-    wait_for_stderr_value(stderr.clone(), "[outrig] entering REPL").await;
-    stdin
-        .write_all(b"take your time\n")
-        .await
-        .expect("write prompt");
+    let container = wait_for_stderr_value(run.stderr.clone(), "[outrig] container started:").await;
+    wait_for_stderr_value(run.stderr.clone(), "[outrig] entering REPL").await;
+    run.write_line("take your time").await;
     // The model call is in flight, and the mock never answers it.
     next_recorded(&mut requests).await;
 
-    killpg(group, Signal::SIGINT).expect("signal outrig's group");
-    wait_for_stderr_value(stderr.clone(), "[outrig] interrupted").await;
+    run.sigint();
+    wait_for_stderr_value(run.stderr.clone(), "[outrig] interrupted").await;
 
-    stdin
-        .write_all(b"list the workspace\n")
-        .await
-        .expect("write prompt");
+    run.write_line("list the workspace").await;
     next_recorded(&mut requests).await;
     let with_result = next_recorded(&mut requests).await;
     let messages = with_result.messages();
@@ -1148,23 +1207,146 @@ async fn run_sigint_to_the_group_mid_turn_keeps_the_mcp_transports() {
         json_contains_str(result, ".agents"),
         "the result is not the workspace listing: {messages_json}"
     );
-    wait_for_stderr_value(stdout.clone(), "I listed the workspace.").await;
+    wait_for_stderr_value(run.stdout.clone(), "I listed the workspace.").await;
 
-    // EOF ends the session the way Ctrl-D does.
-    drop(stdin);
-    let status = timeout(E2E_TIMEOUT, child.wait())
-        .await
-        .expect("outrig exited in time")
-        .expect("wait for outrig");
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    assert!(
-        status.success(),
-        "outrig run exited with {status:?}; stderr: {}",
-        stderr.lock().unwrap()
-    );
+    run.finish().await;
     let left = podman_names(&format!("name={container}")).await;
     assert!(left.is_empty(), "container still exists: {left:?}");
+}
+
+/// [`write_smoke_config`] plus a `start = "manual"` sidecar hosting one server
+/// that never answers `initialize`: `sleep` reads nothing and writes nothing,
+/// so `/sidecar add slow` waits on it for the whole initialize bound.
+fn write_slow_sidecar_config(repo: &Path, mock_addr: &str) {
+    write_config(
+        repo,
+        mock_addr,
+        r#"
+default-agent = "smoke"
+"#,
+        // Appended inside `[images.smoke.mcp]`, so the entry comes first.
+        r#"
+  hang = { command = ["sleep", "infinity"], sidecar = "slow" }
+
+[sidecars.slow]
+image = "smoke"
+start = "manual"
+
+[agents.smoke]
+model = "fast"
+preamble = "test"
+"#,
+    );
+}
+
+/// Ctrl-C during `/sidecar add` cancels the add and leaves the session as it
+/// was (#345). The add here waits on a server that never answers `initialize`,
+/// which used to hold the REPL for the whole initialize bound, because the
+/// signal reached no listener at all.
+///
+/// Cancelling has to give back everything the add had taken: the sidecar
+/// container goes, the primary stays intercepted, and the sidecar's attachment
+/// goes with its container. Without that last part the retry below gets the
+/// same container name and is refused as already attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_sigint_mid_sidecar_add_cancels_it_and_a_retry_starts_over() {
+    common::init_tracing();
+
+    let (mock_addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_slow_sidecar_config(repo_dir.path(), &mock_addr.to_string());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let hang_log = session_dir.path().join("logs/hang.stderr");
+
+    let mut run = GroupRun::spawn(
+        repo_dir.path(),
+        sessions.path(),
+        session_dir.path(),
+        &["--network", "audit"],
+    );
+
+    let primary = wait_for_stderr_value(run.stderr.clone(), "[outrig] container started:").await;
+    let sidecar = format!("{primary}-slow");
+    wait_for_stderr_value(run.stderr.clone(), "[outrig] entering REPL").await;
+
+    run.write_line("/sidecar add slow").await;
+    wait_for_server_connect(&hang_log, &run.stderr).await;
+    run.sigint();
+    wait_for_interrupt_count(&run.stderr, 1).await;
+
+    // Removed by the sidecar's `Drop`, in the background.
+    wait_until_gone(std::slice::from_ref(&sidecar)).await;
+    let resolv = Command::new("podman")
+        .args(["exec", &primary, "cat", "/etc/resolv.conf"])
+        .output()
+        .await
+        .expect("podman exec cat resolv.conf");
+    assert!(
+        resolv.status.success(),
+        "podman exec into the primary failed: {}",
+        String::from_utf8_lossy(&resolv.stderr)
+    );
+    let resolv = String::from_utf8_lossy(&resolv.stdout);
+    assert!(
+        resolv.contains("nameserver 127.0.0.1"),
+        "the primary lost its interception with the add: {resolv}"
+    );
+
+    std::fs::remove_file(&hang_log).expect("remove the first add's server log");
+    run.write_line("/sidecar add slow").await;
+    wait_for_server_connect(&hang_log, &run.stderr).await;
+    run.sigint();
+    wait_for_interrupt_count(&run.stderr, 2).await;
+
+    let stderr = run.finish().await;
+    assert!(!stderr.contains("sidecar add failed"), "{stderr}");
+    wait_until_gone(&[primary, sidecar]).await;
+}
+
+/// Wait until a `/sidecar add` is waiting on its server's `initialize`. The
+/// server's stderr log is created by the connect, which runs after the
+/// interceptor attach, so its appearing means everything before it has
+/// succeeded. A failed add never gets that far, so its line fails fast.
+async fn wait_for_server_connect(log: &Path, stderr: &Arc<Mutex<String>>) {
+    timeout(E2E_TIMEOUT, async {
+        while !log.exists() {
+            let failed = stderr.lock().unwrap().contains("sidecar add failed");
+            assert!(
+                !failed,
+                "the add failed before it connected: {}",
+                stderr.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the add never connected: {}", stderr.lock().unwrap()));
+}
+
+/// Wait until stderr carries `count` interrupt notices.
+async fn wait_for_interrupt_count(stderr: &Arc<Mutex<String>>, count: usize) {
+    timeout(E2E_TIMEOUT, async {
+        loop {
+            let seen = stderr
+                .lock()
+                .unwrap()
+                .matches("[outrig] interrupted")
+                .count();
+            if seen >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "stderr lacked interrupt notice {count}: {}",
+            stderr.lock().unwrap()
+        )
+    });
 }
 
 /// A completion asking for `fs__list_directory` on `/workspace`, as `call_1`.

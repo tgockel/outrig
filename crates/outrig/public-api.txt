@@ -1053,6 +1053,7 @@ pub struct outrig::network::NetworkInterceptor
 impl outrig::network::NetworkInterceptor
 pub async fn outrig::network::NetworkInterceptor::attach(&mut self, &outrig::container::Container) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::detach(&mut self, &str) -> outrig::error::Result<()>
+pub fn outrig::network::NetworkInterceptor::drop_attachment(&mut self, &str) -> bool
 pub async fn outrig::network::NetworkInterceptor::new(&std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
 pub async fn outrig::network::NetworkInterceptor::shutdown(self) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::start(&outrig::container::Container, &std::path::Path, &str) -> outrig::error::Result<Self>

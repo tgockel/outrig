@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Outrig::launch` and `add_sidecar` apply it to every server they connect. An unset key
   serializes as before, so existing labels and cache keys are unchanged. (#338)
 
+- **`NetworkInterceptor::drop_attachment` lets go of one container without awaiting.** It does
+  to one attachment what dropping the interceptor does to all of them: the container's loops are
+  aborted, its resolver is put back before the call returns, and its redirect table is deleted
+  in the background. Nothing is reported, and the name is free to `attach` again. It is for code
+  that cannot await, such as a destructor unwinding an attach that was never committed. `detach`
+  is still the form that confirms the undo. (#345)
+
 ### Fixed
 
 - **A container no longer carries the host's proxy variables.** podman's `--http-proxy` is on

@@ -161,6 +161,18 @@ fn netns_has_outrig_table(pid: u32) -> bool {
     String::from_utf8_lossy(&output.stdout).contains("outrig_")
 }
 
+/// Wait for the reaper to delete a dropped attachment's redirect table.
+async fn wait_for_table_reaped(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while netns_has_outrig_table(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the redirect table should be deleted by the reaper"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn record_host(record: &Value) -> Option<&str> {
     record.get("outrig.host").and_then(Value::as_str)
 }
@@ -816,14 +828,61 @@ async fn a_dropped_interceptor_has_put_the_resolver_back() {
         before,
         "the resolver is back before the drop returns"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while netns_has_outrig_table(pid) {
-        assert!(
-            Instant::now() < deadline,
-            "the redirect table should be deleted by the reaper"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_table_reaped(pid).await;
+    assert_no_host_shell_ran(&container);
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// `drop_attachment` is that drop for one container: the resolver is back
+/// when it returns, the table goes through the reaper, and the name is free --
+/// an attach of the same container afterwards is not refused as already
+/// attached, which is what an interrupted `/sidecar add` relies on to be
+/// retried (#345).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_attachment_frees_its_name_and_puts_the_resolver_back() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    assert_ne!(read_resolv_conf(&container), before);
+
+    assert!(interceptor.drop_attachment(container.name()));
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "the resolver is back before drop_attachment returns"
+    );
+    assert!(
+        !interceptor.drop_attachment(container.name()),
+        "nothing is left attached to drop"
+    );
+    wait_for_table_reaped(pid).await;
+
+    interceptor
+        .attach(&container)
+        .await
+        .expect("the dropped attachment's name is free to attach again");
+    assert_ne!(read_resolv_conf(&container), before);
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    assert_eq!(read_resolv_conf(&container), before);
     assert_no_host_shell_ran(&container);
 
     container

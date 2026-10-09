@@ -673,6 +673,20 @@ impl NetworkInterceptor {
         teardown_result(teardown_attachment(container, attachment).await)
     }
 
+    /// Drops one container's attachment rather than detaching it: what this
+    /// interceptor's own `Drop` does to every attachment, done to one. Its
+    /// loops are aborted and its undo is handed to a detached reaper, so
+    /// nothing is awaited and nothing is reported. Returns whether `container`
+    /// was attached.
+    ///
+    /// For a caller that cannot await -- a destructor unwinding an attach that
+    /// was never committed, say. [`detach`](Self::detach) is the form to use
+    /// wherever awaiting is possible: it confirms the undo and says what it
+    /// could not discharge. Either way the name is free to attach again.
+    pub fn drop_attachment(&mut self, container: &str) -> bool {
+        self.attachments.remove(container).is_some()
+    }
+
     /// Detaches every attachment, reporting what none of them could
     /// discharge. One container's failure does not skip another's teardown.
     pub async fn shutdown(mut self) -> Result<()> {

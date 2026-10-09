@@ -297,6 +297,73 @@ async fn sigint_mid_callback_returns_to_prompt() {
     );
 }
 
+/// SIGINT cancels a slash command still in flight the way it cancels a turn,
+/// and the line after it is read and run (#345). It used to reach no listener
+/// at all, so the command held the REPL until it finished on its own.
+#[tokio::test]
+async fn sigint_mid_command_returns_to_prompt() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w.write_all(b"/slow\nnext\n").await.unwrap();
+    let (stdout_w, mut stdout_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+
+    let notify = Arc::new(Notify::new());
+    let notify_cb = notify.clone();
+    let interrupt = move || {
+        let n = notify_cb.clone();
+        async move { n.notified().await }
+    };
+
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let started_tx_cell: std::sync::Mutex<Option<oneshot::Sender<()>>> =
+        std::sync::Mutex::new(Some(started_tx));
+    let on_command = move |_: String, _: Vec<String>| {
+        let tx = started_tx_cell.lock().unwrap().take();
+        async move {
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+            future::pending::<Option<String>>().await
+        }
+    };
+
+    let run_handle = tokio::spawn(async move {
+        Repl::run_with(
+            BufReader::new(stdin_r),
+            stdout_w,
+            stderr_w,
+            interrupt,
+            "",
+            &[],
+            |line: String| future::ready(Ok(format!("echo: {line}"))),
+            on_command,
+        )
+        .await
+    });
+
+    started_rx.await.expect("on_command must signal start");
+    notify.notify_one();
+
+    let mut stderr_buf = Vec::new();
+    let drain = read_until_contains(&mut stderr_r, &mut stderr_buf, "interrupted");
+    timeout(TEST_TIMEOUT, drain)
+        .await
+        .expect("must observe interrupted notice within timeout");
+    let mut stdout_buf = Vec::new();
+    let drain = read_until_contains(&mut stdout_r, &mut stdout_buf, "echo: next");
+    timeout(TEST_TIMEOUT, drain)
+        .await
+        .expect("the line after the cancelled command must run");
+
+    drop(stdin_w);
+
+    timeout(TEST_TIMEOUT, run_handle)
+        .await
+        .expect("run_with must finish")
+        .expect("spawn join")
+        .expect("run_with must succeed");
+}
+
 /// One dispatcher serves every caller command; it receives the command name
 /// plus whitespace-split args and its `Some(..)` text lands on stderr with a
 /// REPL-appended newline.

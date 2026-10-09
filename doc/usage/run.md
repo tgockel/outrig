@@ -469,7 +469,8 @@ names and already-running sidecars are errors, and there is no `/sidecar stop` i
 ```
 
 A failed add -- image missing, server crashing on connect -- is reported on stderr and changes
-nothing: the container set, tool list, and conversation stay as they were.
+nothing: the container set, tool list, and conversation stay as they were. An add interrupted
+with Ctrl-C changes nothing either, and either one can simply be run again.
 
 ## Subagents
 
@@ -527,6 +528,10 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   what stops those. A tool call that nobody interrupts is bounded too: past its
   [`call-timeout-secs`](../reference/config.md#imagesnamemcp) (10 minutes unless configured), it
   is cancelled the same way and the model is told it timed out.
+- **Ctrl-C** during a slash command cancels it the same way, with the same `[outrig] interrupted`.
+  A `/sidecar add` waiting on an image or on a server that never answers `initialize` stops
+  there, and whatever it had started goes: the sidecar container is removed in the background
+  and its tools never appear. The session is left as a failed add leaves it.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
 - **Ctrl-C** at the prompt discards whatever is typed on that line and draws a fresh `> `. A
