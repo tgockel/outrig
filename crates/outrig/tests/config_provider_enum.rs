@@ -73,8 +73,9 @@ max-tokens = 16384
 }
 
 /// `request-timeout-secs` and `retry-budget-secs` are the optional connection
-/// fields, and unknown keys are rejected by the tagged enum rather than
-/// silently ignored.
+/// fields, and an unknown key is refused by the tagged enum rather than
+/// silently ignored -- which a config file's load turns into a warning naming
+/// it.
 #[test]
 fn anthropic_provider_field_rules() {
     let cfg = parse(
@@ -121,20 +122,25 @@ base-url = "https://api.anthropic.com"
         );
     }
 
-    let err = Config::load_from_str(
-        r#"
+    let with_max_tokens = r#"
 [providers.claude]
 style      = "anthropic"
 base-url   = "https://api.anthropic.com"
 api-key    = "${ANTHROPIC_API_KEY}"
 max-tokens = 4096
-"#,
-    )
-    .expect_err("unknown provider field should fail");
+"#;
+    let err = toml::from_str::<Config>(with_max_tokens).expect_err("unknown provider field");
     assert!(
         err.to_string().contains("max-tokens"),
         "error should name the unknown field, got: {err}"
     );
+    let cfg = parse(with_max_tokens);
+    let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+    assert_eq!(keys, ["providers.claude.max-tokens"]);
+    assert!(matches!(
+        cfg.providers["claude"],
+        LlmProvider::Anthropic { .. }
+    ));
 }
 
 #[test]
@@ -204,16 +210,18 @@ identifier = "claude-sonnet-4-6"
     }
 }
 
-/// Unknown keys are an error everywhere in this schema, and `mistralrs` was
-/// the one place that was not true: as a unit variant it had no field set for
+/// Every table in this schema refuses an unknown key, and `mistralrs` was the
+/// one place that was not true: as a unit variant it had no field set for
 /// `deny_unknown_fields` to check against, so a key copied off a remote
-/// provider -- or an outright typo -- parsed clean and was discarded.
+/// provider -- or an outright typo -- parsed clean and was discarded without
+/// a word.
 ///
 /// Driven through `toml::from_str::<Config>` as well as `Config::load_from_str`
-/// on purpose. The loader wraps the deserializer and adds error handling of its
-/// own, so only the bare `Deserialize` path shows that the *derive* is what
-/// refuses the key. An empty braced variant either gives `deny_unknown_fields`
-/// something to check or it does not, and this is the test that says which.
+/// on purpose. The loader sets the refused key aside with a warning, so only
+/// the bare `Deserialize` path shows that the *derive* is what refuses it. An
+/// empty braced variant either gives `deny_unknown_fields` something to check
+/// or it does not, and this is the test that says which. The warning is the
+/// loader's half: it can only name a key the derive refused.
 #[test]
 fn mistralrs_provider_rejects_unknown_keys() {
     for key in [
@@ -231,11 +239,10 @@ style = "mistralrs"
         );
         let name = key.split_whitespace().next().expect("key name");
 
-        let err = Config::load_from_str(&toml).expect_err("unknown key should fail");
-        assert!(
-            err.to_string().contains(name),
-            "load_from_str should name {name}, got: {err}",
-        );
+        let cfg = parse(&toml);
+        let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key().to_owned()).collect();
+        assert_eq!(keys, [format!("providers.local.{name}")]);
+        assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
 
         let err = toml::from_str::<Config>(&toml).expect_err("unknown key should fail");
         assert!(

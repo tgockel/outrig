@@ -20,6 +20,10 @@ pub struct DockerfileValidation {
 pub struct ConfigValidation {
     pub valid: bool,
     pub errors: Vec<ValidationMessage>,
+    /// What the load would set aside rather than fail on -- a key outrig does
+    /// not know, which `outrig run` warns about and ignores. Never makes the
+    /// config invalid on its own.
+    pub warnings: Vec<ValidationMessage>,
 }
 
 pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
@@ -65,10 +69,26 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
 }
 
 pub fn validate_config(toml: &str) -> ConfigValidation {
-    match Config::load_from_str(toml).and_then(|cfg| cfg.validate(None).map(|()| cfg)) {
-        Ok(_) => ConfigValidation {
+    let (warnings, result) = match Config::load_from_str(toml) {
+        // `load_from_str` sets aside nothing but unknown keys.
+        Ok(cfg) => (
+            cfg.warnings()
+                .iter()
+                .map(|w| ValidationMessage {
+                    code: "unknown_config_key",
+                    message: format!("unknown key `{}`, ignored", w.key()),
+                    line: Some(w.line()),
+                })
+                .collect(),
+            cfg.validate(None),
+        ),
+        Err(err) => (Vec::new(), Err(err)),
+    };
+    match result {
+        Ok(()) => ConfigValidation {
             valid: true,
             errors: Vec::new(),
+            warnings,
         },
         Err(err) => ConfigValidation {
             valid: false,
@@ -77,6 +97,7 @@ pub fn validate_config(toml: &str) -> ConfigValidation {
                 message: err.to_string(),
                 line: None,
             }],
+            warnings,
         },
     }
 }
@@ -86,6 +107,7 @@ pub fn validate_image_toml(toml: &str) -> ConfigValidation {
         Ok(_) => ConfigValidation {
             valid: true,
             errors: Vec::new(),
+            warnings: Vec::new(),
         },
         Err(err) => ConfigValidation {
             valid: false,
@@ -94,6 +116,7 @@ pub fn validate_image_toml(toml: &str) -> ConfigValidation {
                 message: err.to_string(),
                 line: None,
             }],
+            warnings: Vec::new(),
         },
     }
 }
@@ -202,6 +225,28 @@ context = "."
         );
         assert!(!out.valid);
         assert!(out.errors[0].message.contains("invalid mcp server name"));
+    }
+
+    /// The key `outrig run` would warn about and ignore is a warning here
+    /// too, with its line, and the fragment is still valid.
+    #[test]
+    fn config_validator_warns_on_an_unknown_key() {
+        let out = validate_config(
+            r#"
+[images.c]
+image-name = "docker.io/library/debian:stable"
+contex     = "."
+"#,
+        );
+        assert!(out.valid, "an unknown key alone is not invalid: {out:?}");
+        assert_eq!(
+            out.warnings,
+            [ValidationMessage {
+                code: "unknown_config_key",
+                message: "unknown key `images.c.contex`, ignored".to_string(),
+                line: Some(4),
+            }],
+        );
     }
 
     #[test]

@@ -165,10 +165,9 @@ impl RepoConfig {
     }
 
     pub(crate) fn load(&self, global: &Path) -> Result<Config> {
-        match &self.file {
-            Some(file) => Config::load_file(file, &self.root, Some(global)),
-            None => Config::load(&self.root, Some(global)),
-        }
+        let cfg = self.load_unvalidated(global)?;
+        cfg.validate(Some(&self.root))?;
+        Ok(cfg)
     }
 
     pub(crate) fn load_for_run(
@@ -177,23 +176,35 @@ impl RepoConfig {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Config> {
-        match &self.file {
-            Some(file) => Config::load_file_for_run(
-                file,
-                &self.root,
-                Some(global),
-                agent_flag,
-                model_override,
-            ),
-            None => Config::load_for_run(&self.root, Some(global), agent_flag, model_override),
-        }
+        let cfg = self.load_unvalidated(global)?;
+        cfg.validate_for_run(Some(&self.root), agent_flag, model_override)?;
+        Ok(cfg)
     }
 
     pub(crate) fn load_for_build(&self, global: &Path) -> Result<Config> {
-        match &self.file {
-            Some(file) => Config::load_file_for_build(file, &self.root, Some(global)),
-            None => Config::load_for_build(&self.root, Some(global)),
-        }
+        let cfg = self.load_unvalidated(global)?;
+        cfg.validate_for_build(Some(&self.root))?;
+        Ok(cfg)
+    }
+
+    /// Both files read and merged, with whatever either set aside reported
+    /// before the caller validates: a key set aside can be why a rule then
+    /// fails, and its warning is what explains that error.
+    fn load_unvalidated(&self, global: &Path) -> Result<Config> {
+        let cfg = match &self.file {
+            Some(file) => Config::load_file_unvalidated(file, Some(global)),
+            None => Config::load_unvalidated(&self.root, Some(global)),
+        }?;
+        report_config_warnings(&cfg);
+        Ok(cfg)
+    }
+}
+
+/// One `[outrig] warning:` line on stderr for each key the load of `cfg` set
+/// aside. stderr because `outrig mcp` speaks JSON-RPC on stdout.
+pub(crate) fn report_config_warnings(cfg: &Config) {
+    for warning in cfg.warnings() {
+        eprintln!("[outrig] warning: {warning}");
     }
 }
 

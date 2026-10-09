@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A config key outrig does not know is a warning, not an error.** A global config shared with
+  a newer outrig -- the 0.3 line's `[events]`, a model's `context-window`, a provider's
+  `role-alternation` -- stopped every command that reads config, `run`, `mcp`, `build`, `ls`,
+  `logs`, `discard`, `clean`, and `init` among them, at ``unknown field `events` ``. Each now
+  prints ``[outrig] warning: <file>:<line>: unknown key `events`, ignored`` on stderr and goes
+  on, whichever config file the key is in. In the global config a value outrig cannot read -- a
+  wrong type, an unknown `style`, a missing required key -- is skipped the same way, with the
+  smallest entry holding it; in a repo or `--config` file it is still an error. A warning comes
+  before any validation error it explains: a misspelled `provider` is warned about, then its
+  model is refused for having none. Still errors: anything in `[network]` or a `security` table,
+  a TOML syntax error, and an unquoted dotted name such as `[models.opus-4.7]`. `outrig mcp
+  self`'s `validate_config` returns the warnings in a new `warnings` array. (#507)
+
 - **A cache miss during `outrig run` and `outrig mcp` startup shows the build as it happens.**
   `[outrig] ensuring image <tag>` used to be followed by silence for as long as `buildah build`
   took, which on a first run looked like a hang. The build's output (or the `podman pull` for an
@@ -135,13 +148,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head it never finishes, such as an inline `GET key` to Redis, now waits up to those 750 ms.
   Fixed in `outrig` (#353).
 
-- **A misspelled key in an `[images.<name>.mcp]` table entry is an error.** Every other table
-  rejected unknown keys, but this one dropped them: `enviroment = { ... }` started the server
-  with no environment, and a misspelled `command` beside `sidecar` or `image` quietly ran the
-  container's ENTRYPOINT as the server instead. Loading now fails at the misspelled key and
-  lists the keys an entry accepts. The same holds for an image's `org.outrig.mcp` label and a
-  standalone image's `image.toml`, and `get_config_schema` now says so. Fixed in `outrig`
-  (#340).
+- **A misspelled key in an `[images.<name>.mcp]` table entry is named.** Every other table
+  refused unknown keys, but this one dropped them without a word: `enviroment = { ... }` started
+  the server with no environment, and a misspelled `command` beside `sidecar` or `image` quietly
+  ran the container's ENTRYPOINT as the server instead. A config file's load now warns about the
+  misspelled key by name, as it does in every table (#507), and an image's `org.outrig.mcp` label
+  or a standalone image's `image.toml` fails at the key and lists the keys an entry accepts.
+  `get_config_schema` now says so. Fixed in `outrig` (#340).
 
 - **An MCP server whose `tools/list` pages never end fails startup at once.** A server that kept
   handing back a `nextCursor` -- the one it was sent, a cycle of them, or a fresh one forever --

@@ -1573,8 +1573,9 @@ identifier = "gpt-4o-mini"
     }
 
     /// A `mistralrs` provider has no HTTP layer, so a remote connection key
-    /// written on one is a mistake rather than a setting -- and it is refused
-    /// rather than swallowed. `config_provider_enum.rs`'s
+    /// written on one is a mistake rather than a setting -- and it is named
+    /// rather than swallowed: the type refuses it, and a load sets it aside
+    /// with a warning. `config_provider_enum.rs`'s
     /// `mistralrs_provider_rejects_unknown_keys` is where that rule is proven
     /// in general; this pins the key it was found through.
     ///
@@ -1583,17 +1584,21 @@ identifier = "gpt-4o-mini"
     /// timeout that checks out.
     #[test]
     fn mistralrs_provider_rejects_request_timeout_secs() {
-        let err = Config::load_from_str(
-            r#"
+        let with_timeout = r#"
 [providers.local]
 style                = "mistralrs"
 request-timeout-secs = 0
-"#,
-        )
-        .expect_err("a remote connection key is not a mistralrs key");
+"#;
+        let err = toml::from_str::<Config>(with_timeout)
+            .expect_err("a remote connection key is not a mistralrs key");
         assert!(
             err.to_string().contains("request-timeout-secs"),
             "error should name the rejected key, got: {err}"
+        );
+        let cfg = parse(with_timeout);
+        assert_eq!(
+            cfg.warnings()[0].key(),
+            "providers.local.request-timeout-secs"
         );
 
         let cfg = parse(
@@ -3563,9 +3568,8 @@ context    = "ctx"
     }
 
     #[test]
-    fn sidecar_unknown_key_rejected() {
-        let err = Config::load_from_str(
-            r#"
+    fn sidecar_unknown_key_is_a_warning() {
+        let with_restart = r#"
 [images.coding]
 dockerfile = "D"
 context    = "ctx"
@@ -3573,13 +3577,15 @@ context    = "ctx"
   [sidecars.tools]
   image   = "mcp-tools"
   restart = "always"
-"#,
-        )
-        .expect_err("unknown sidecar key must be rejected");
+"#;
+        let err = toml::from_str::<Config>(with_restart).expect_err("the type refuses the key");
         assert!(
             err.to_string().contains("restart"),
             "error should name the unknown key: {err}"
         );
+        let cfg = parse(with_restart);
+        assert_eq!(cfg.warnings()[0].key(), "sidecars.tools.restart");
+        assert_eq!(cfg.sidecars["tools"].image, "mcp-tools");
     }
 
     #[test]
@@ -5370,6 +5376,425 @@ preamble = "hi"
         assert!(
             cfg.images.is_empty(),
             "the planted repo config stays unread"
+        );
+    }
+}
+
+/// A config file's load sets aside what it cannot use, with a warning naming
+/// the file and line: a key no table has, from any file, and -- from the
+/// global file alone, which every outrig on the machine reads -- a value that
+/// does not deserialize.
+mod lenient_load {
+    use super::*;
+
+    use outrig::config::ConfigWarningKind;
+
+    fn keys(cfg: &Config) -> Vec<&str> {
+        cfg.warnings().iter().map(|w| w.key()).collect()
+    }
+
+    fn reasons(cfg: &Config) -> Vec<&str> {
+        cfg.warnings()
+            .iter()
+            .map(|w| match w.kind() {
+                ConfigWarningKind::InvalidValue { reason, .. } => reason.as_str(),
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The shape of a global config written for 0.3, read by this build: it
+    /// loads and validates, with one warning per key it does not know.
+    #[test]
+    fn a_global_config_for_a_newer_outrig_loads_and_validates() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+default-model = "fast"
+
+[events]
+mode = "record"
+
+[providers.openai]
+style            = "openai"
+base-url         = "https://api.openai.com/v1"
+api-key          = "${OPENAI_API_KEY}"
+role-alternation = "strict"
+
+[models.fast]
+provider       = "openai"
+identifier     = "gpt-4o-mini"
+context-window = 128000
+"#,
+        );
+        write_repo_cfg(tmp.path(), "");
+
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("it loads and validates");
+        assert_eq!(
+            keys(&cfg),
+            [
+                "events",
+                "providers.openai.role-alternation",
+                "models.fast.context-window"
+            ],
+        );
+        for warning in cfg.warnings() {
+            assert_eq!(warning.file(), Some(global.as_path()));
+            assert_eq!(*warning.kind(), ConfigWarningKind::UnknownKey);
+        }
+        assert_eq!(
+            cfg.warnings()[0].to_string(),
+            format!("{}:4: unknown key `events`, ignored", global.display()),
+        );
+    }
+
+    /// A repo file's warning names the repo file, and the merge keeps both
+    /// sides': the global file's first.
+    #[test]
+    fn each_files_warnings_name_it_and_survive_the_merge() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "from-global = 1\n");
+        write_repo_cfg(tmp.path(), "\nfrom-repo = 1\n");
+
+        let cfg = Config::load_for_build(tmp.path(), Some(&global)).expect("loads");
+        let found: Vec<_> = cfg
+            .warnings()
+            .iter()
+            .map(|w| (w.key(), w.file().map(Path::to_path_buf), w.line()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("from-global", Some(global.clone()), 1),
+                (
+                    "from-repo",
+                    Some(tmp.path().join(".agents/outrig/config.toml")),
+                    2,
+                ),
+            ],
+        );
+    }
+
+    /// From the global file, a value that does not deserialize is dropped
+    /// with the smallest entry that holds it. Here that is a whole provider:
+    /// its `style` goes first, and then the table that cannot stand without
+    /// it, whose warning says the `style` was ignored rather than missing. The
+    /// run's own provider and model are untouched, so the merged config still
+    /// validates.
+    #[test]
+    fn a_global_value_that_does_not_deserialize_is_dropped() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            &format!(
+                "default-model = \"fast\"
+{PROVIDER_AND_FAST_MODEL}
+[providers.newer]
+style    = \"openai-responses\"
+base-url = \"https://example.com/v1\"
+api-key  = \"${{KEY}}\"
+"
+            ),
+        );
+        write_repo_cfg(tmp.path(), "");
+
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("loads without the provider");
+        assert!(!cfg.providers.contains_key("newer"));
+        assert!(cfg.providers.contains_key("openai"));
+        assert_eq!(keys(&cfg), ["providers.newer", "providers.newer.style"]);
+        let reasons = reasons(&cfg);
+        assert_eq!(reasons[0], "its `style` was ignored");
+        assert!(
+            reasons[1].contains("unknown variant `openai-responses`"),
+            "{reasons:?}"
+        );
+        assert!(
+            cfg.warnings()[1]
+                .to_string()
+                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected one of `openai`, `anthropic`, `mistralrs`"),
+            "{}",
+            cfg.warnings()[1],
+        );
+    }
+
+    /// A literal key in the global config is refused as it always was -- the
+    /// provider is never loaded -- and its warning, printed on every run, does
+    /// not repeat the key, whatever shape it has: bare, behind a shell-style
+    /// default, or with a character the error escapes.
+    #[test]
+    fn a_dropped_api_key_is_not_repeated_in_its_warning() {
+        let tmp = tempdir().unwrap();
+        for key in [
+            "sk-secret-key-123",
+            "${KEY:-sk-secret-key-123}",
+            "sk-secret\\tkey-123",
+        ] {
+            let global = write_global_cfg(
+                tmp.path(),
+                &format!(
+                    "[providers.leaky]\nstyle    = \"openai\"\n\
+                     base-url = \"https://api.openai.com/v1\"\napi-key  = \"{key}\"\n"
+                ),
+            );
+
+            let cfg = Config::load_global(&global).expect("loads without the provider");
+            assert!(cfg.providers.is_empty());
+            let [warning] = cfg.warnings() else {
+                panic!("{key}: expected one warning, got {:?}", cfg.warnings());
+            };
+            assert_eq!(warning.key(), "providers.leaky");
+            let shown = warning.to_string();
+            assert!(!shown.contains("secret"), "{key}: {shown}");
+            assert!(
+                shown.ends_with(
+                    "`providers.leaky` ignored: api-key is not a \"${VAR}\" reference \
+                     (VAR must match ^[A-Z_][A-Z0-9_]*$)"
+                ),
+                "{shown}"
+            );
+        }
+    }
+
+    /// Only the entry whose error quotes an `api-key` gets the redacted reason:
+    /// another entry's warning keeps its own, even beside a one-letter key.
+    #[test]
+    fn another_entrys_reason_is_its_own() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[providers.p]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "x"
+
+[models.m]
+provider   = "p"
+identifier = "x"
+max-tokens = "big"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        assert_eq!(keys(&cfg), ["providers.p", "models.m.max-tokens"]);
+        assert_eq!(
+            reasons(&cfg)[1],
+            "invalid type: string \"big\", expected u32",
+        );
+    }
+
+    /// An array element is named by its index in the file, though an element
+    /// before it was dropped first, and a field missing from the file is
+    /// called missing.
+    #[test]
+    fn array_indices_are_the_files_own() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[[workspace.mounts]]
+host-path = "/a"
+
+[[workspace.mounts]]
+host-path      = "/b"
+container-path = "/b"
+
+[[workspace.mounts]]
+host-path      = "/c"
+container-path = "/c"
+acess          = "read-write"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        let found: Vec<_> = cfg.warnings().iter().map(|w| (w.key(), w.line())).collect();
+        assert_eq!(
+            found,
+            [
+                ("workspace.mounts[0]", 2),
+                ("workspace.mounts[2].acess", 12)
+            ]
+        );
+        let ConfigWarningKind::InvalidValue { reason, .. } = cfg.warnings()[0].kind() else {
+            panic!("expected InvalidValue, got {:?}", cfg.warnings()[0]);
+        };
+        assert_eq!(reason, "missing field `container-path`");
+        let hosts: Vec<_> = cfg.workspace.mounts.iter().map(|m| m.host_path()).collect();
+        assert_eq!(hosts, [Path::new("/b"), Path::new("/c")]);
+    }
+
+    /// `[[providers]]` is an array where a table of providers belongs; the
+    /// global load drops it and goes on.
+    #[test]
+    fn a_global_array_where_a_table_belongs_is_dropped() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            "session-root = \"sessions\"\n\n[[providers]]\nstyle = \"openai\"\n",
+        );
+
+        let cfg = Config::load_global(&global).expect("loads without it");
+        assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.session_root, Some(tmp.path().join("sessions")));
+        assert!(
+            cfg.warnings().iter().any(|w| w.key() == "providers"),
+            "{:?}",
+            cfg.warnings()
+        );
+    }
+
+    /// Smallest means the key when the rest of its table stands, one table of
+    /// an array of tables, and the whole key for any other array: an argv
+    /// short one argument would run something else.
+    #[test]
+    fn a_dropped_value_takes_the_smallest_entry_with_it() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+max-tokens = "plenty"
+
+[images.c]
+image-name = "docker.io/library/debian:stable"
+
+[images.c.mcp]
+fs = { command = ["mcp-fs", 5] }
+
+[[workspace.mounts]]
+host-path      = "/a"
+container-path = "/a"
+
+[[workspace.mounts]]
+host-path = "/b"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        assert_eq!(
+            keys(&cfg),
+            [
+                "models.fast.max-tokens",
+                "images.c.mcp.fs.command",
+                "workspace.mounts[1]"
+            ],
+        );
+        assert_eq!(
+            cfg.models["fast"].identifier.as_deref(),
+            Some("gpt-4o-mini")
+        );
+        assert_eq!(cfg.models["fast"].max_tokens, None);
+        assert_eq!(cfg.workspace.mounts.len(), 1);
+        assert_eq!(cfg.workspace.mounts[0].host_path(), Path::new("/a"));
+    }
+
+    /// A key set aside can be why a rule fails: a misspelled `provider` leaves
+    /// its model with none. The unvalidated loads hand back the warning that
+    /// explains it, for a caller to show before the validation error the
+    /// validated loads return.
+    #[test]
+    fn the_unvalidated_loads_keep_the_warning_a_validation_error_needs() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        let typo = r#"
+default-model = "typo"
+
+[models.typo]
+provder    = "openai"
+identifier = "gpt-4o-mini"
+"#;
+        write_repo_cfg(tmp.path(), typo);
+        let file = tmp.path().join("ci.toml");
+        fs::write(&file, typo).unwrap();
+
+        for cfg in [
+            Config::load_unvalidated(tmp.path(), Some(&global)).expect("parses"),
+            Config::load_file_unvalidated(&file, Some(&global)).expect("parses"),
+        ] {
+            assert_eq!(keys(&cfg), ["models.typo.provder"]);
+            let err = expect_validation_err(&cfg, Some(tmp.path()));
+            assert!(
+                matches!(&err, ConfigValidationError::ModelSourceMissing { .. }),
+                "got: {err:?}"
+            );
+        }
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::ModelSourceMissing { .. }
+            ),
+            "the validated load fails the same rule",
+        );
+    }
+
+    /// A repo file, or one named by `--config`, sets aside only unknown keys:
+    /// the same bad value fails its load, as it always has.
+    #[test]
+    fn a_repo_value_that_does_not_deserialize_still_fails() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        let bad = r#"
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+max-tokens = "plenty"
+"#;
+        write_repo_cfg(tmp.path(), bad);
+        let err = Config::load_for_build(tmp.path(), Some(&global)).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+
+        let file = tmp.path().join("ci.toml");
+        fs::write(&file, bad).unwrap();
+        let err = Config::load_file_for_build(&file, tmp.path(), Some(&global)).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+    }
+
+    /// `[network]` and the `security` tables set nothing aside, even from the
+    /// global file: what they leave out, a container gets.
+    #[test]
+    fn strict_tables_fail_from_the_global_file_too() {
+        let tmp = tempdir().unwrap();
+        for body in [
+            "[network]\nmode = \"filtr\"\n",
+            "[network]\nmod = \"filter\"\n",
+            "[network]\ndeny = [{ host = \"example.com\", port = \"https\" }]\n",
+            "[images.c]\nimage-name = \"debian\"\n[images.c.security]\ncap-drop = \"ALL\"\n",
+            "[sidecars.s]\nimage = \"tools\"\n[sidecars.s.security]\ncap-dorp = [\"ALL\"]\n",
+        ] {
+            let global = write_global_cfg(tmp.path(), body);
+            let err = Config::load_global(&global).expect_err(body);
+            assert!(matches!(err, OutrigError::Config(_)), "{body}: {err:?}");
+        }
+    }
+
+    /// A syntax error leaves nothing to read, so it fails even the global
+    /// file: running without it would drop every provider and any
+    /// `[network]` policy.
+    #[test]
+    fn a_syntax_error_fails_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "[providers.openai\nstyle = \"openai\"\n");
+        let err = Config::load_global(&global).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+    }
+
+    /// A misquoted name is still the error it was, hint and all, from either
+    /// file: setting its stray key aside would leave a nameless half-entry.
+    #[test]
+    fn a_misquoted_name_still_fails_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            "[models.opus-4.7]\nprovider = \"openai\"\nidentifier = \"x\"\n",
+        );
+        let err = Config::load_global(&global).unwrap_err();
+        assert!(
+            matches!(err, OutrigError::ConfigDottedKey { .. }),
+            "got: {err:?}"
         );
     }
 }
