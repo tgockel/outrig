@@ -37,7 +37,8 @@ Issues that bear on **host integrity** are in scope, for example:
 - A path by which a container escapes the rootless-podman boundary to reach host files or
   processes outside the configured workspace mount(s).
 - OutRig leaking host secrets, credentials, or environment into the container when not
-  configured to.
+  configured to, including through a podman default OutRig leaves in place, such as
+  `--http-proxy`.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
 - A name the container merely asserts -- a TLS `ClientHello` SNI or an HTTP `Host:` header --
   satisfying a hostname `allow` entry. A hostname rule grants only against a destination the
@@ -75,6 +76,9 @@ Issues that bear on **host integrity** are in scope, for example:
   image is as trusted as the primary image. It is opt-in, defaults to `"none"`, and remains a
   container (cgroups, seccomp, network policy, and `no-new-privileges` still apply; only the
   mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
+- A proxy handed to an MCP server through its `env` is the agent's to read, credentials
+  included, and a filter policy that allows it allows whatever it will reach. See
+  [Containers](doc/concepts/containers.md#the-containers-environment).
 - Network filtering is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a

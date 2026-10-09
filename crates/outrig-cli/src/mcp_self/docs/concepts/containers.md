@@ -538,7 +538,9 @@ only when it declares `devices`, and `--security-opt=unmask=<path>` flags only w
 `unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
 `org.outrig.sidecar`). Every container gets `--image-volume=ignore`, so its image's `VOLUME`s
 create no volumes; see
-[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names).
+[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names). Every container
+also gets `--http-proxy=false`, so podman copies none of the host's proxy variables into it; see
+[The container's environment](#the-containers-environment).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode
@@ -580,6 +582,37 @@ correct quoting from the caller; setting `PWD` instead changes the variable with
 process, so anything calling `getcwd` never notices. A library caller sets it with
 `ExecOptions::with_workdir`; see the crate docs for `Outrig::exec_stdio` and
 `Outrig::exec_capture`.
+
+## The container's environment
+
+A container's environment is its image's `ENV`, the `container` and `HOSTNAME` podman sets in
+any container, the `HOME` outrig sets, and the `env` entries the config and `outrig run --env`
+give its MCP servers. Nothing is copied from the host's own environment unless your
+`containers.conf` sets `env_host` and asks podman to copy all of it. That includes the
+proxy variables podman otherwise copies from the environment it runs in -- `http_proxy`,
+`https_proxy`, `ftp_proxy`, `no_proxy`, and their uppercase forms -- because a proxy URL can
+carry a `user:password@` that everything the agent runs could then read. outrig passes
+`--http-proxy=false` to every container it starts.
+
+Behind a proxy, name it on the servers that need it. A `${VAR}` reference takes the value from
+your environment when the server starts:
+
+```toml
+[images.coding.mcp.shell]
+command = ["bash", "-lc", "exec shell-mcp-command"]
+env     = { HTTPS_PROXY = "${HTTPS_PROXY}", NO_PROXY = "${NO_PROXY}" }
+```
+
+`outrig run --env 'HTTPS_PROXY=${HTTPS_PROXY}'` does the same for every server in one session,
+single-quoted so your shell leaves the reference for outrig. See
+[the value syntax](../reference/config.md#mcp-env-value-syntax) for how each form reaches podman.
+
+A proxy named this way is the agent's to read, credentials included: every process the server
+starts inherits it. Under a `filter` [network policy](../reference/config.md#network), traffic
+sent through the proxy reaches the interceptor as a connection to the proxy, so the policy rules
+on the proxy's host and port rather than on what lies behind it -- allowing the proxy allows
+whatever it will reach. A Dockerfile `ENV` works for a proxy that needs no password, but it is
+baked into the image, so keep credentials out of it.
 
 ## See also
 

@@ -541,6 +541,10 @@ there; the run is reported in full, and the container is named on stderr.
 - `XDG_DATA_HOME`: default base for `session-root` if not set in the global config.
 - `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 
+These are read on the host. None of them, nor any other host variable such as `HTTPS_PROXY`,
+reaches a container unless an MCP server's `env` or `--env` names it; see
+[Containers -> The container's environment](../concepts/containers.md#the-containers-environment).
+
 ## See also
 
 - [Usage](../usage/README.md) -- narrative for each subcommand.

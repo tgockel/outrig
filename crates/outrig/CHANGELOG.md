@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A container no longer carries the host's proxy variables.** podman's `--http-proxy` is on
+  unless turned off, and it copied `http_proxy`, `https_proxy`, `ftp_proxy`, `no_proxy`, and
+  their uppercase forms from outrig's environment into every container `Container::start`,
+  `start_named`, and `create_initialized` made -- so into `Outrig::launch`'s primary and every
+  `add_sidecar` -- where a proxy URL's `user:password@` was readable by everything run there.
+  Every container now gets `--http-proxy=false`. A process that needs the proxy names it, through
+  `ExecOptions::with_resolved_env` or `ContainerCreateOptions::with_resolved_env` with
+  `EnvValue::EnvRef("HTTPS_PROXY")`: the route an MCP server's `env` takes. (#455)
+
 - **A namespace helper that dies before replying fails the bootstrap with the reason.**
   `Container::bootstrap_user` reported a helper killed before it replied (the OOM killer, a
   signal) as `OutrigError::BootstrapNamespace` failing at `fork` with `Success (os error 0)`: the

@@ -61,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The host's proxy, password included, no longer reaches the agent.** podman copied
+  `HTTPS_PROXY`, `http_proxy`, `NO_PROXY`, and the other proxy variables from outrig's
+  environment into every container -- the primary of `outrig run` and `outrig mcp`, every
+  sidecar, and `outrig image build`'s validation container -- so a proxy URL such as
+  `http://user:secret@proxy:3128` was readable by every tool the agent ran. None of them reaches
+  a container now. Behind a proxy, name it on the MCP servers that need it, with
+  `env = { HTTPS_PROXY = "${HTTPS_PROXY}" }` or `outrig run --env 'HTTPS_PROXY=${HTTPS_PROXY}'`;
+  a server that reached the network only through the copied proxy has none until you do. Fixed
+  in `outrig` (#455).
+
 - **A bootstrap helper that dies before replying says why.** If the forked helper that writes
   the runtime user into a container was killed before replying (the OOM killer, a signal),
   startup failed with `bootstrapping the runtime user failed at fork: Success (os error 0)`. It

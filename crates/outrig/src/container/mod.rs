@@ -1749,7 +1749,8 @@ fn build_podman_create_cmd(
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
 /// extra bind mounts, keep-id, workspace workdir, capability policy, device
-/// passthrough, the hardening tail, and `--image-volume=ignore`.
+/// passthrough, the hardening tail, `--http-proxy=false`, and
+/// `--image-volume=ignore`.
 /// `--security-opt=no-new-privileges` is part of that tail only when the
 /// launch spec keeps it, and each `unmask` entry follows it as a second
 /// `--security-opt`.
@@ -1818,6 +1819,12 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     if launch.primary_view.is_some() {
         cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
     }
+    // podman copies the client's `http_proxy`, `https_proxy`, `ftp_proxy`,
+    // `no_proxy` and their uppercase forms into the container unless told not
+    // to, and the client inherits outrig's environment -- so a proxy URL's
+    // `user:password@` was readable by everything the agent ran (#455). A
+    // container gets a proxy only from an `env` entry that names it.
+    cmd = cmd.arg("--http-proxy=false");
     // No volume for the image's `VOLUME`s: the path keeps what the image's
     // layers put there, and a write to it lands in the container's own layer,
     // which `--rm` removes with it. An anonymous volume is not removed with
@@ -2569,6 +2576,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2627,6 +2635,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2673,6 +2682,7 @@ mod tests {
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2734,6 +2744,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--dns",
@@ -2774,6 +2785,7 @@ mod tests {
                 "outrig-test-fetch",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2783,6 +2795,31 @@ mod tests {
                 "local:test",
             ]
         );
+    }
+
+    /// Both launch paths turn off podman's proxy forwarding; see
+    /// `append_launch_flags` (#455).
+    #[test]
+    fn no_container_takes_the_host_proxy() {
+        let image = ImageTag::new("local:test");
+        let run = argv(build_podman_run_cmd(
+            &image,
+            "outrig-test",
+            &ContainerLaunchSpec::default(),
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
+        let create = argv(build_podman_create_cmd(
+            &ContainerCreateOptions::new(image, ContainerLaunchSpec::default(), "outrig-test"),
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
+        for (path, args) in [("run", run), ("create", create)] {
+            assert!(
+                args.iter().any(|a| a == "--http-proxy=false"),
+                "`podman {path}` would copy the host's proxy into the container: {args:?}"
+            );
+        }
     }
 
     /// `args` is the trailing argv: strictly after the image ref, so podman
@@ -2810,6 +2847,7 @@ mod tests {
                 "outrig-test-fs",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--env",
@@ -2886,6 +2924,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--entrypoint",
                 "/outrig-enter",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--env",
@@ -2931,6 +2970,7 @@ mod tests {
                 "outrig-test-noview",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2976,6 +3016,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3023,6 +3064,7 @@ mod tests {
                 "--cap-drop=MKNOD",
                 "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3062,6 +3104,7 @@ mod tests {
                 "--device=/dev/fuse",
                 "--device=/dev/kvm",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3103,6 +3146,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
                 "--security-opt=unmask=ALL",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3154,6 +3198,7 @@ mod tests {
                 "--device=/dev/net/tun",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3193,6 +3238,7 @@ mod tests {
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3238,6 +3284,7 @@ mod tests {
                 "--cap-drop=ALL",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3278,6 +3325,7 @@ mod tests {
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--security-opt=unmask=/proc/*",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
