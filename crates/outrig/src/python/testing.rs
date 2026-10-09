@@ -79,10 +79,6 @@ impl Flag {
         Self { _dir: dir, path }
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// The path as a Python string literal.
     pub(crate) fn py(&self) -> String {
         format!("{:?}", self.path.to_str().expect("a UTF-8 temp path"))

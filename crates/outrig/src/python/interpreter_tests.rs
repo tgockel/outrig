@@ -1429,10 +1429,13 @@ fn the_cpu_clock_tells_a_spinning_loop_from_a_blocked_one() {
         used / started.elapsed().as_secs_f64()
     };
 
+    // The path is the shell's `$1`, not part of its program: a temporary directory may hold
+    // a space.
     let blocked = format!(
         "import os, subprocess\nos.write(2, b'WAITING\\n')\n\
-         subprocess.run(['sh', '-c', 'while [ ! -e {path} ]; do sleep 0.01; done'])\n'done'",
-        path = flag.path().display()
+         subprocess.run(['sh', '-c', 'while [ ! -e \"$1\" ]; do sleep 0.01; done', 'sh', {path}])\n\
+         'done'",
+        path = flag.py()
     );
     k.submit(1, &blocked);
     k.await_stderr("WAITING");
@@ -1458,8 +1461,9 @@ fn an_interrupt_ends_a_blocking_run_but_not_what_it_started() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pidfile = dir.path().join("grandchild");
     let source = format!(
-        "import subprocess\nsubprocess.run(['sh', '-c', 'sleep 60 & echo $! > {path}; wait'])",
-        path = pidfile.display()
+        "import subprocess\n\
+         subprocess.run(['sh', '-c', 'sleep 60 & echo $! > \"$1\"; wait', 'sh', {path:?}])",
+        path = pidfile.to_str().expect("a UTF-8 temp path")
     );
     k.submit(1, &source);
     let grandchild: u32 = eventually(
