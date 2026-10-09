@@ -301,6 +301,10 @@ pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::path: std:
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory
 pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::path: std::path::PathBuf
+#[non_exhaustive] pub enum outrig::config::ConfigWarningKind
+#[non_exhaustive] pub outrig::config::ConfigWarningKind::InvalidValue
+pub outrig::config::ConfigWarningKind::InvalidValue::reason: alloc::string::String
+pub outrig::config::ConfigWarningKind::UnknownKey
 #[non_exhaustive] pub enum outrig::config::EnvValue
 pub outrig::config::EnvValue::EnvRef(alloc::string::String)
 pub outrig::config::EnvValue::Literal(alloc::string::String)
@@ -498,14 +502,27 @@ pub fn outrig::config::Config::load(&std::path::Path, core::option::Option<&std:
 pub fn outrig::config::Config::load_file(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_file_for_build(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_file_for_run(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file_unvalidated(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_global(&std::path::Path) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_unvalidated(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>
+pub fn outrig::config::Config::validate_for_build(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
+pub fn outrig::config::Config::validate_for_run(&self, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_workspace_mounts(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
+pub fn outrig::config::Config::warnings(&self) -> &[outrig::config::ConfigWarning]
+#[non_exhaustive] pub struct outrig::config::ConfigWarning
+impl outrig::config::ConfigWarning
+pub fn outrig::config::ConfigWarning::file(&self) -> core::option::Option<&std::path::Path>
+pub fn outrig::config::ConfigWarning::key(&self) -> &str
+pub fn outrig::config::ConfigWarning::kind(&self) -> &outrig::config::ConfigWarningKind
+pub fn outrig::config::ConfigWarning::line(&self) -> usize
+impl core::fmt::Display for outrig::config::ConfigWarning
+pub fn outrig::config::ConfigWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::config::ContainerSecurity
 pub outrig::config::ContainerSecurity::cap_add: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::ContainerSecurity::cap_drop: alloc::vec::Vec<alloc::string::String>

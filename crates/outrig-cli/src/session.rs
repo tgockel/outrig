@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{default_session_root, resolve_global_config};
+use crate::paths::{default_session_root, report_config_warnings, resolve_global_config};
 use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError, Result};
 
@@ -466,10 +466,9 @@ pub fn resolve_session_root_for_cli(
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let global = resolve_global_config(global_override)?;
-    Ok(Config::load_global(&global)?
-        .session_root
-        .unwrap_or_else(default_session_root))
+    let global = Config::load_global(&resolve_global_config(global_override)?)?;
+    report_config_warnings(&global);
+    Ok(global.session_root.unwrap_or_else(default_session_root))
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is

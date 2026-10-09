@@ -16,7 +16,10 @@ use crate::error::{OutrigError, Result};
 use crate::hf::HfTreeFetcher;
 use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
-use crate::paths::{find_repo_root_from, repo_config_path, resolve_global_config, write_atomic};
+use crate::paths::{
+    find_repo_root_from, repo_config_path, report_config_warnings, resolve_global_config,
+    write_atomic,
+};
 use outrig::config::{Agent, Config, ImageConfig, LlmProvider, Model, Workspace, merge};
 
 /// Idempotent. Returns `Some(image_name)` when this call wrote the
@@ -214,10 +217,12 @@ struct GlobalSummary {
 }
 
 /// Best-effort load of the global config. A missing file yields an empty
-/// summary (the user will be prompted to run `outrig config init`); parse
-/// errors propagate so a corrupt config surfaces immediately.
+/// summary (the user will be prompted to run `outrig config init`); what the
+/// load sets aside is reported as it would be for `outrig run`, and an error
+/// propagates so a corrupt config surfaces immediately.
 fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
     let cfg = Config::load_global(global_path)?;
+    report_config_warnings(&cfg);
     // Only rows a validated load would accept. `load_global` parses without
     // validating, and since `provider` became optional a broken row survives
     // parsing -- offering one as a choice would write a repo `default-model`

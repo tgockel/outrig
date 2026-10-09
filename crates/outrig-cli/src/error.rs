@@ -48,8 +48,9 @@ pub enum CliError {
     /// Rig refused to build the request because no output-token ceiling was
     /// set. Its own wording names `max_tokens`, which is the field on the wire
     /// and not a key any outrig config can carry -- the model and agent tables
-    /// are `rename_all = "kebab-case"`, so `max_tokens` would be rejected as an
-    /// unknown field. Say `max-tokens` instead, and say where it goes.
+    /// are `rename_all = "kebab-case"`, so `max_tokens` would be an unknown
+    /// key, ignored with a warning. Say `max-tokens` instead, and say where it
+    /// goes.
     ///
     /// `build_agent` supplies a fallback ceiling on the native Anthropic path,
     /// so this should not be reachable there. It stays for the paths that have

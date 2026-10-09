@@ -185,7 +185,10 @@ tools) and `shell` is unavailable. Full details in
    becomes the workspace root and config comes from the global file only (see
    [Config-less runs](#config-less-runs)). A config found that another user owns is refused, not
    read (see [Reference -> CLI](../reference/cli.md#global-flags)). Startup names the config
-   file it read and the workspace it will mount before anything is built or started.
+   file it read and the workspace it will mount before anything is built or started. A key this
+   outrig does not know -- a typo, or one a newer outrig reads from the same global config -- is
+   ignored with a `[outrig] warning:` line naming the file and line (see
+   [Reference -> Config](../reference/config.md#what-a-load-sets-aside)).
 2. **Resolve image.** Uses explicit `--image` first. If that value matches
    `[images.<name>]`, OutRig uses the config block; otherwise it must already
    exist in local Podman images. Without explicit `--image`, agent `image` and

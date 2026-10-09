@@ -32,6 +32,8 @@ use super::Config;
 ///   the built-in default. Extra `workspace.mounts` are concatenated so
 ///   user-level resource mounts and repo-level resource mounts both
 ///   participate.
+/// - [`warnings`](Config::warnings) are concatenated, global first, so
+///   whatever either load set aside is still reported.
 ///
 /// The result is a flattened snapshot, not a config file: provenance rides
 /// along in memory but is `#[serde(skip)]`, so re-serializing a merged config
@@ -64,6 +66,9 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut network = global.network;
     network.apply_repo_overrides(&repo.network);
 
+    let mut warnings = global.warnings;
+    warnings.extend(repo.warnings);
+
     Config {
         default_image: repo.default_image.or(global.default_image),
         default_agent: repo.default_agent.or(global.default_agent),
@@ -83,5 +88,6 @@ pub fn merge(global: Config, repo: Config) -> Config {
         workspace,
         images,
         sidecars,
+        warnings,
     }
 }
