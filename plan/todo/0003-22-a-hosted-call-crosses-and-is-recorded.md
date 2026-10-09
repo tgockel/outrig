@@ -1,12 +1,11 @@
-# 0003-21 -- A hosted call crosses the boundary and is recorded
+# 0003-22 -- A hosted call crosses the boundary and is recorded
 
 ## Context
 
 After `0003-20` a session can declare, approve, install, start and stop a binding, and the agent is
 told that it exists, but agent code cannot reach it: `0003-16` and `0003-17` proved the transport
 and its threading through a relay that exists only in tests. This task puts the relay in `host.rs`,
-binds the facade of the facade task (`plan/next/a-hosted-object-is-awaited.md`) under each
-binding's name in every kernel, and records every request.
+binds `0003-21`'s facade under each binding's name in every kernel, and records every request.
 
 Today `host.rs` speaks to the interpreter alone. Its reader task parses each line into
 `enum Reply` and hands it to whoever waits for it, what the host sends is built ad hoc with
@@ -18,11 +17,11 @@ the inventory probe, an execution's result, or another binding's frames.
 
 `boundary-policy.md` makes the default with no policy configured allow, published as events:
 every request runs and is recorded. `observability.md` puts those records in the integration-audit
-category, which `0003-13` defined without a producer, and `0003-22` adds its decisions to the same
+category, which `0003-13` defined without a producer, and `0003-23` adds its decisions to the same
 events. What counts as one
 request is `0003-16`'s inventory: an attribute read, a call, or one step of an iteration is one
 boundary request, recorded as events that share its id -- its receipt, its dispatch and its
-outcome, with `0003-22`'s decisions between the first two -- while reference counting is
+outcome, with `0003-23`'s decisions between the first two -- while reference counting is
 bookkeeping, recorded only when the interception refuses it. `lifecycle.md` has the rows this task
 makes true: a call the relay had not forwarded at the close never reaches its binding, a call it
 had forwarded is the binding's to finish and drains, and one still running at the deadline is
@@ -40,18 +39,18 @@ drained, then killed and reported.
 
 - **The relay in `host.rs`**: an `rpc` kind in `enum Reply` and in what the host sends, tagged by
   agent and binding, carried between the interpreter and `0003-18`'s supervisor for every agent the
-  host has opened -- today the primary, and later `0003-25`'s children through the same path. Each
+  host has opened -- today the primary, and later `0003-26`'s children through the same path. Each
   binding has a bounded queue, so a binding that stops reading delays only the calls waiting on it
   (fork 1).
-- **Stubs**: the facade of the facade task (`plan/next/a-hosted-object-is-awaited.md`), bound
-  under each binding's name in every kernel, the primary and every kernel opened later, before
+- **Stubs**: `0003-21`'s facade, bound under each binding's name in every kernel, the primary
+  and every kernel opened later, before
   `_boot` is taken, so the inventory lists no stub. The first `await` opens the connection and
   fetches the root, on the worker thread. `async for` makes one request per item, `__iter__` then
   one `__next__` each, as RPyC's proxies do, rather than batches through `buffiter`: one request
   then stands for one item, and a batch size chosen by the request is
   `plan/next/hosted-reference-and-payload-bounds.md`'s concern. The runtime keeps its own
   reference to each kernel's stubs, apart from the global names the agent sees, so `repo = None`
-  or `del repo` changes nothing the runtime uses; `0003-28`'s injection reads the stub from there.
+  or `del repo` changes nothing the runtime uses; `0003-29`'s injection reads the stub from there.
 - **From tests to sessions**: `0003-16`'s interception and argument rules and `0003-17`'s
   threading, callbacks, interrupts, connection pool and `serialize = true`, run by every session
   with a binding rather than by tests alone; and the vendored RPyC mounted read-only into the
@@ -73,8 +72,8 @@ drained, then killed and reported.
   the parent call's id for a request made inside a callback. A callback's own invocation is an
   event, its parent the call it was passed to.
   - **The outcome is one of five.** `returned`; `raised`, with the exception's type; `refused`,
-    with the reason -- here the interception or admission closed, and from `0003-22` and
-    `0003-23` a rule, the approver or the evaluator; `cancelled`, never invoked, with the
+    with the reason -- here the interception or admission closed, and from `0003-23` and
+    `0003-24` a rule, the approver or the evaluator; `cancelled`, never invoked, with the
     reason interrupted or the close; and `unknown`, forwarded with no reply, because its binding
     was killed at shutdown or its process died (fork 3). "Interrupted" is a reason attached to
     `cancelled`, or a note on a later `returned` or `raised`; it is not an outcome of its own.
@@ -82,7 +81,7 @@ drained, then killed and reported.
     interrupt raises where the call is awaited, by waking the worker's wait, and the relay sends
     the binding a cancel line naming the request. A request the binding has not started --
     waiting for the serialize lock in a binding declared `serialize = true` (`0003-17`) -- is
-    dropped and recorded `cancelled`, as is one `0003-22` holds for a decision. One already
+    dropped and recorded `cancelled`, as is one `0003-23` holds for a decision. One already
     invoked runs on, since RPyC has no request that stops a call; its reply, when it comes,
     records `returned` or `raised` with the note that the caller had been interrupted, and
     `unknown` is recorded only if no reply comes before the binding is killed or dies. A call
@@ -96,8 +95,8 @@ drained, then killed and reported.
     so `except` on the library's own classes does not catch it; a refused attribute read raises
     one that is also an `AttributeError`, so `except AttributeError` at the `await` catches it.
     `hasattr` and `getattr` with a default cannot see it: a proxy's lookup builds a path and
-    raises nothing until awaited (the facade task, `plan/next/a-hosted-object-is-awaited.md`).
-  - The operations form a fixed vocabulary, taken from the inventory, which `0003-22`'s rules match.
+    raises nothing until awaited (`0003-21`).
+  - The operations form a fixed vocabulary, taken from the inventory, which `0003-23`'s rules match.
   - A preview is built from by-value data only. An object is named by its type and an opaque
     reference id, never by its `repr`, which would run code.
   - A raised call's event carries the host's traceback text, bounded, which the agent's error does
@@ -120,9 +119,9 @@ drained, then killed and reported.
   it when it observed the flag -- one waiting for the serialize lock in a binding declared
   `serialize = true` (`0003-17`), which until then may take the lock and run; and `unknown` when
   the binding's group is killed first. The flag decides the requests a binding's own rules allow,
-  which until `0003-22` adds rules that hold a request for Rust's gate is every request. An allow
+  which until `0003-23` adds rules that hold a request for Rust's gate is every request. An allow
   Rust's gate issued before the close is still honored when it reaches the binding after the flag
-  (`0003-22`).
+  (`0003-23`).
 - **A call waiting for a free connection at the close** has not been sent (`0003-17`). The close
   reaches the interpreter too, whose reader thread wakes every such call; each raises the closing
   error and is `cancelled`, with the close as the reason.
@@ -255,10 +254,10 @@ drained, then killed and reported.
    make a refusal faster than running the call would be. It cannot overtake the bytes already in
    the pipe ahead of it, and writing it proves nothing about when the binding reads it, so nothing
    in the owner's accounting depends on it. It costs nothing per request. The flag decides only
-   what the binding's own rules allow (`0003-22`'s fork 1): a request held for a decision is
+   what the binding's own rules allow (`0003-23`'s fork 1): a request held for a decision is
    Rust's gate's, and an allow the gate issued before the close is honored even when it reaches
    the binding after the line. The alternative, asking the owner before each invocation over
-   `0003-18`'s decision line, adds a round trip to every attribute read, and `0003-22`'s fork 1,
+   `0003-18`'s decision line, adds a round trip to every attribute read, and `0003-23`'s fork 1,
    which keeps rules in the binding so that an allow costs no round trip, assumes it is not taken.
 3. **A binding process that exits mid-session -- Recommended: the session goes on without it.**
    `hosted-objects.md` leaves this to `0003-20` and this task. The binding's calls in flight are
@@ -271,7 +270,7 @@ drained, then killed and reported.
    request's id.** A receipt published before the target runs is in the stream before the owner
    can die mid-call, so a subscriber that had consumed it knows the call was made, which an event
    written only when the request ends cannot give it; a long call is visible while it runs; and
-   it is how `boundary-policy.md` and `0003-22` already describe the record, with the decision as
+   it is how `boundary-policy.md` and `0003-23` already describe the record, with the decision as
    one more event between receipt and dispatch. Published means in the in-memory stream
    (`observability.md`), in sequence, before the invocation; it does not run any subscriber. A
    subscriber that falls behind loses events in a counted gap, and can hold a receipt, lose the
@@ -292,8 +291,7 @@ drained, then killed and reported.
   puts into sessions.
 - **Hard: 0003-20.** Bindings that start, stop and are described; and through it, `0003-19`'s
   admission and report, and `0003-19`'s stream.
-- **Hard: the facade task (`plan/next/a-hosted-object-is-awaited.md`, numbered by
-  `/groom-plan`).** The facade this task binds in every kernel.
+- **Hard: 0003-21.** The facade this task binds in every kernel.
 
 ## See also
 
@@ -302,8 +300,8 @@ drained, then killed and reported.
   allow, published as events.
 - `plan/phase/0003-python/observability.md` and `plan/phase/0003-python/lifecycle.md` -- the
   integration-audit category, and the rows this task makes true.
-- `plan/next/a-hosted-object-is-awaited.md` -- the facade task: the proxy this task binds, what an
-  `await` resolves, and what raises instead of crossing.
+- `plan/todo/0003-21-a-hosted-object-is-awaited.md` -- the facade task: the proxy this task
+  binds, what an `await` resolves, and what raises instead of crossing.
 - `crates/outrig/src/python/host.rs` -- `enum Reply` and `dispatch`, which the relay extends.
 - `plan/next/event-audience-projections.md`, `plan/next/mandatory-audit-sink.md` and
   `plan/next/cancel-a-running-hosted-call.md` -- deferred: fields per audience, a subscriber whose

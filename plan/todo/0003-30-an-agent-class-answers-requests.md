@@ -1,8 +1,8 @@
-# 0003-29 -- An agent class answers requests
+# 0003-30 -- An agent class answers requests
 
 ## Context
 
-By this task a parent has two ways to make a child do typed work, and both are built. `0003-25`
+By this task a parent has two ways to make a child do typed work, and both are built. `0003-26`
 gives it `runtime.spawn`, and with `requests=` a *request child*: a kernel whose parent sends
 requests on named channels with `child.channels[name].request(body)` and gets a handle for each,
 and whose own code takes each request with `receive()` and answers by its delivery --
@@ -10,10 +10,10 @@ and whose own code takes each request with `receive()` and answers by its delive
 The same task gives the handle its rules (`await`, `cancel()`, `done()`, `result()`, `status`,
 `future`), the per-request attempt limit, the end-of-round summary rule that opens a round naming
 unanswered requests, the request event family, release with `AgentReleased`, the token budget,
-`children-max`, `model-concurrency-max` and `requests-max`, and the close rows. `0003-26` gives
+`children-max`, `model-concurrency-max` and `requests-max`, and the close rows. `0003-27` gives
 the decorator -- the mark on a declaration, whose body is ignored, with the docstring required and
-the types declared through `0003-24` -- and the composition of a child's instructions from a
-docstring, an input manifest and schema text. `0003-24` declares types, decodes strictly and
+the types declared through `0003-25` -- and the composition of a child's instructions from a
+docstring, an input manifest and schema text. `0003-25` declares types, decodes strictly and
 renders schema text.
 
 What is missing is the form the maintainer wants to write: a class whose instance is one
@@ -40,7 +40,7 @@ done, more = await runtime.wait({fizz, b1, b2})
 
 This task is a thin layer over `spawn(requests=...)`: the class derives the `requests=` dict from
 its methods, the constructor schedules the spawn in the background, a method call is `request()`
-on the named endpoint with the message built from its arguments, and `release()` is `0003-25`'s
+on the named endpoint with the message built from its arguments, and `release()` is `0003-26`'s
 release. Nothing about how a request is carried, checked, repaired, limited or evented is new
 here; what is new is the declaration, the instance's lifetime, and the readiness between them.
 
@@ -57,7 +57,7 @@ its context kept; releasing the instance ends the child.
   docstring; a method marked `@outrig.agent` without a docstring; `@outrig.agent(model=...)` on a
   method, with a message pointing at the constructor's `model=`, and `validate=` on one (fork 2);
   a marked method with a parameter
-  without an annotation, or with a type `0003-24` refuses; one with no return annotation; one with
+  without an annotation, or with a type `0003-25` refuses; one with no return annotation; one with
   `*args` or `**kwargs`; a marked method named `user`, or named as one of `outrig.Agent`'s own
   members; a subclass restating a request method with another signature, or replacing one with an
   unmarked method or an unmarked method with one; two distinct classes with one `__name__` among a
@@ -67,9 +67,9 @@ its context kept; releasing the instance ends the child.
   alone.
 - **Message and reply types.** No parameter: `None`; one: its type; several: a frozen dataclass
   `<Class><Method>Message` with fields in parameter order and defaults kept, built with
-  `make_dataclass` and declared through `0003-24`, reachable on the class under its name. The reply
+  `make_dataclass` and declared through `0003-25`, reachable on the class under its name. The reply
   type is the return annotation. Both, with the dataclasses they use, are bound by name in the
-  child's namespace as `0003-25` binds a result type.
+  child's namespace as `0003-26` binds a result type.
 - **Construction.** `FooAgent(**inputs, model=...)` checks each input against the serializable
   subset synchronously and raises in the constructor on a failure; then schedules
   `runtime.spawn(name, prompt=<the class docstring>, model=, inputs=, requests=)` as a task on the
@@ -87,12 +87,12 @@ its context kept; releasing the instance ends the child.
   receive a delivery and answer by `reply` or `fail`; and that this child has no
   `runtime.complete`, which is absent from its runtime and whose call raises naming `reply`.
 - **Calling.** A method call binds its arguments to the signature, checks each against its
-  parameter's type, builds the message, sends it on the channel, and returns `0003-25`'s handle.
+  parameter's type, builds the message, sends it on the channel, and returns `0003-26`'s handle.
   `inspect.iscoroutinefunction` on the method is false, and `help(foo)` and `help(foo.fizz)` say
   that a call sends a request and returns a handle. `runtime.wait` takes the handles directly. A
   call with `requests-max` requests unsettled on the instance raises `AgentLimitReached` at the
   call and sends nothing.
-- **The child's loop**, which is `0003-25`'s with the announcer's noun generalized: a request
+- **The child's loop**, which is `0003-26`'s with the announcer's noun generalized: a request
   arriving while the child is idle starts a round; one arriving during a round is announced on
   the next tool result as `N requests are waiting on runtime.channels["fizz"]`, which moves no
   baseline; at the end of every round the host compares the child's live queue state -- unread
@@ -110,7 +110,7 @@ its context kept; releasing the instance ends the child.
   `reply` raise `RequestCancelled` after it.
 - **Release.** `await foo.release()`, idempotent, and `async with`. Every outstanding request
   settles `AgentReleased`; a reply during or after the release is refused and evented; the subtree
-  is closed as `0003-25`'s release closes one; a call on a released instance raises
+  is closed as `0003-26`'s release closes one; a call on a released instance raises
   `AgentReleased` and sends nothing.
 - **The GC backstop.** A finalizer on the instance schedules `release()` on the constructing
   kernel's event loop when the instance is collected unreleased, evented as a collection. The
@@ -121,11 +121,11 @@ its context kept; releasing the instance ends the child.
   `__qualname__` and module digest, the child's id, the input manifest and the declared channels;
   `agent.instance.ready`, with the launch's outcome; `agent.instance.released`, with how, the
   requests it settled and the instance's usage total; `agent.instance.collected`. A method call
-  produces `0003-25`'s request events and no `agent.call.*` event. All are execution diagnostics
+  produces `0003-26`'s request events and no `agent.call.*` event. All are execution diagnostics
   with bounded body previews (`observability.md`).
 - **`lifecycle.md`'s rows for agent instances**, tested here: a launching instance at the close is
   never ready, and `ready()` and the first handle raise the closing error; an idle or working one
-  is released, with its requests settled as `0003-25`'s request row says; a collection during the
+  is released, with its requests settled as `0003-26`'s request row says; a collection during the
   close is recorded and does nothing further; the report lists the outstanding requests.
 - `crates/outrig/public-api.txt` regenerated.
 
@@ -202,7 +202,7 @@ its context kept; releasing the instance ends the child.
   `agent.instance.ready`, three `agent.request.sent`, and for each request `received`, `replied`
   and `settled` naming the rounds it spanned, then `agent.instance.released`.
 - `crates/outrig/public-api.txt` regenerated, its additions limited to the instance events; the
-  request family is `0003-25`'s.
+  request family is `0003-26`'s.
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
 
 ## Design forks
@@ -225,17 +225,17 @@ its context kept; releasing the instance ends the child.
 The shape of a channel declaration (`outrig.Request`, or a tuple without a description), where
 `reply` and `fail` live (`RequestDelivery`), the spend of a round that answers several requests,
 the end-of-round summary rule, `requests-max`, and the attempt limit that counts invalid replies
-only are `0003-25`'s decisions, and this task does not reopen them.
+only are `0003-26`'s decisions, and this task does not reopen them.
 
 ## Dependencies
 
-- **Hard: `0003-25`.** The request child, `request()` and `pending()`, the handle, `reply` and
+- **Hard: `0003-26`.** The request child, `request()` and `pending()`, the handle, `reply` and
   `fail`, the attempt limit and the end-of-round summary rule, the request events, release and
   `AgentReleased`, the token budget, `children-max`, `requests-max` and `AgentLimitReached`,
   `model-concurrency-max`, and the close rows this task's instance rows are listed with.
-- **Hard: `0003-26`.** The decorator as the mark, the instruction composition from a docstring,
+- **Hard: `0003-27`.** The decorator as the mark, the instruction composition from a docstring,
   an input manifest and schema text, and `model=` resolution through config.
-- **Hard: `0003-24`.** Declaring a type, the generated dataclass through `make_dataclass`, strict
+- **Hard: `0003-25`.** Declaring a type, the generated dataclass through `make_dataclass`, strict
   decoding, and schema text.
 
 ## See also

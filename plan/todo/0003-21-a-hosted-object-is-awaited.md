@@ -1,4 +1,4 @@
-# A hosted object is awaited
+# 0003-21 -- A hosted object is awaited
 
 ## Context
 
@@ -87,8 +87,8 @@ without an `await`; and no agent code writes `asyncio.to_thread` for one.
   created lazily. A job is built on the loop thread at await time, so it carries what a worker's
   frames cannot: the awaiting execution from `_CURRENT`, `interruptible` from the awaiting frames
   through `_agent_code_outward`, the awaiting task, and the future. The worker runs under a copy
-  of the awaiting task's context, so `_CURRENT`, `outrig.runtime` (`0003-24`) and an invocation
-  id (`0003-28`) resolve on it and its output is attributed. It takes a connection as `0003-17`'s
+  of the awaiting task's context, so `_CURRENT`, `outrig.runtime` (`0003-25`) and an invocation
+  id (`0003-29`) resolve on it and its output is attributed. It takes a connection as `0003-17`'s
   `to_thread` workers did: four per kernel and binding, and a fifth job waits in the executor's
   queue, with no thread and no stack, until a worker is free. `runtime.wait` returns on a message
   during a long call, and a timer in another task fires.
@@ -125,7 +125,7 @@ without an `await`; and no agent code writes `asyncio.to_thread` for one.
   `relay.rs`: `pair()` returning `(self.nested, 1)`, `call_with_nested(fn)`, `call_twice(fn, x)`,
   and `iterable()` returning a generator. The header comment of `interpreter.py`'s hosted-objects
   section, and the comments in `binding.py`, `interpreter.py`, `payload.rs`, `relay.rs`,
-  `supervisor.rs` and `binding_tests.rs` that name `0003-21`, `0003-22` or `0003-25`, are
+  `supervisor.rs` and `binding_tests.rs` that name `0003-22`, `0003-23` or `0003-26`, are
   updated to the renumbered tasks.
 
 ## Acceptance
@@ -153,7 +153,7 @@ without an `await`; and no agent code writes `asyncio.to_thread` for one.
   `getattr` and `call`; the proxy type has no local `send`, `throw` or `close`.
 - `hasattr(stub, "missing")` is `True` and `getattr(stub, "missing", None)` is a path, not
   `None`; `await stub.missing` raises an error `except AttributeError` catches, and so does
-  `await stub._private`, whose error is OutRig's refusal (`0003-21`).
+  `await stub._private`, whose error is OutRig's refusal (`0003-22`).
 - `async with stub.manager:` raising inside records `__exit__` with the exception type and text
   by value, as `ordinary_use` does today.
 - A 10 s awaited call in a task leaves the loop running: `inv` answers, a timer in another task

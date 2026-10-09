@@ -80,7 +80,7 @@ The two ends differ, because each offers what its direction's contract allows:
   is empty: a reply is addressed to a request, and a message that names none has nowhere to go.
 
 Queues are bounded here as on every channel, and a request channel's bound is `requests-max`
-itself (default 256, per child, `0003-25`): it counts every request of the child's that has not
+itself (default 256, per child, `0003-26`): it counts every request of the child's that has not
 settled -- queued, or received and not yet answered -- and a `request()` past it raises
 `AgentLimitReached` at once. Nothing waits on the sender's side; cancelling, settling or releasing
 frees the count (`agent-classes.md`).
@@ -125,7 +125,7 @@ declared unions, and dataclasses whose every field is drawn from the same subset
 NaN are excluded because not every encoding carries them faithfully. A declaration outside the
 subset is an error at construction, not a failure at first send.
 
-A typed result needs two more, `Literal` and `Annotated`, which `0003-24` adds for
+A typed result needs two more, `Literal` and `Annotated`, which `0003-25` adds for
 `outrig.schema` (`typed-agents.md`). Whether channel contracts take them too is that task's fork,
 recommended yes, so that a channel and a result type never accept different types.
 
@@ -156,7 +156,7 @@ delivery.id           # the delivery's id; a reply names it
 delivery.body         # the message itself
 delivery.sender       # who sent it -- "user" on the user channel
 delivery.received_at  # when it arrived, in UTC
-delivery.skill        # the skill a /name directive resolved to, else None (0003-28)
+delivery.skill        # the skill a /name directive resolved to, else None (0003-29)
 ```
 
 **Decided in `0003-08`: one method returning a `Delivery`, over two.** An earlier draft proposed a
@@ -171,7 +171,7 @@ an id beside the queue, and the envelope exposes it rather than inventing a seco
 channel the envelope is a `RequestDelivery`, a `Delivery` subclass that adds `await reply(value)`
 and `await fail(message)`, so code that handles deliveries from any channel sees one shape and the
 two methods exist only where a reply can go. Putting them on every `Delivery` and raising on a
-channel that is not a request channel is `0003-25`'s fork.
+channel that is not a request channel is `0003-26`'s fork.
 
 ## Delivery rules
 
@@ -288,7 +288,7 @@ optional field on the `Delivery`, `skill`, naming the skill the application reso
 other message it is `None`. The field comes from the application for the same reason `sender`
 does: a body that begins `/review-diff` is a body with some text in it, and only the application
 knows that it resolved a directive. The preamble tells the agent that such a message asks it to
-run the skill. The field's name is `0003-28`'s.
+run the skill. The field's name is `0003-29`'s.
 
 ## A worked relationship
 

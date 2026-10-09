@@ -159,11 +159,11 @@ written against.
 - A typed child's result is validated, and an invalid one is repaired without re-running the
   work that produced it.
 - One child answers several requests without losing its context: an agent class's instance
-  takes a second request whose round reads what the first one bound (`0003-29`).
+  takes a second request whose round reads what the first one bound (`0003-30`).
 - `/name text` runs a skill's entry through the main agent, its parameters mapped from the text
   by a typed agent call, visible in its history.
 - A skill that uses a binding, runs typed children in parallel with one repaired, and meets an
-  escalated call works end to end through `run-new` (`0003-28`).
+  escalated call works end to end through `run-new` (`0003-29`).
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` all exit 0.
 
 ## Linked subsystems
@@ -172,11 +172,11 @@ written against.
 `doc/concepts/subagents.md`, `doc/reference/config.md`, `doc/reference/cli.md`, and
 `SECURITY.md` -- the MCP pages most of all, since this phase demotes MCP from the way an agent
 acts to one integration surface among others. Hosted objects, policy, skills and the session API
-have no `doc/` page yet; `0003-30` writes them.
+have no `doc/` page yet; `0003-31` writes them.
 
 ## Tasks
 
-`0003-01` through `0003-30`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
+`0003-01` through `0003-31`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
 the per-step index. They cover the deliverables above; the subjects listed as out of scope below
 have design pages or `plan/next/` entries and no tasks.
 
@@ -189,7 +189,7 @@ channel that replaces it is `0003-08`.
 processes before the tasks that build on it, and a spike that fails its acceptance stops and
 reports to the maintainer rather than changing the design on its own. Close behavior is built with
 each resource: the task that adds a resource adds its row to `lifecycle.md`'s close table.
-`0003-30`, the documentation, comes last.
+`0003-31`, the documentation, comes last.
 
 ## Out of scope
 
@@ -215,7 +215,7 @@ each resource: the task that adds a resource adds its row to `lifecycle.md`'s cl
   request channels. `messages.md` designs the general layer so the shape does not have to change
   later; children have no `user` channel in this phase
   (`plan/next/children-have-a-user-channel.md`).
-- A scheduler over children's active work. Three limits ship instead (`0003-25`). Two are
+- A scheduler over children's active work. Three limits ship instead (`0003-26`). Two are
   session-wide: `children-max` (default 64) counts resident children, wedged ones included until
   they are reclaimed, and a launch past it raises `AgentLimitReached` at once rather than waiting;
   and `model-concurrency-max` (default 8) bounds model requests in flight, a permit held per

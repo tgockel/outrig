@@ -17,7 +17,7 @@ bound the container side applies to itself, which is not the kind the binding ca
 
 - The binding refuses to start a connection past a per-agent count, with a close notice naming
   the limit, and the limit is read from the owner at start rather than compiled in.
-- Closed ids are forgotten once the owner says the kernel is gone (`0003-25`'s release), so a
+- Closed ids are forgotten once the owner says the kernel is gone (`0003-26`'s release), so a
   long session with many children does not keep a set of every id it ever saw.
 
 ## Acceptance

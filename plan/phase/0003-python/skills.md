@@ -7,8 +7,8 @@ code, how one loads as a module, and how a line like `/review-diff a.py b.py` be
 main agent makes. The design was settled in planning on 2026-09-30; on 2026-10-02 the parse of a
 directive's text was changed from a deterministic parser to a typed agent call ("Rejected
 alternatives"), and on 2026-10-05 that parser gained a second result, a `Clarification` the agent
-turns into a question for the user ("How `invoke` parses"). `0003-27` builds the sources,
-discovery, the loader and the preamble; `0003-28` builds the directive, the parameter dataclass,
+turns into a question for the user ("How `invoke` parses"). `0003-28` builds the sources,
+discovery, the loader and the preamble; `0003-29` builds the directive, the parameter dataclass,
 the parse, the clarification and injection.
 
 Two rules govern the rest.
@@ -88,7 +88,7 @@ For each skill a source lists, discovery reads two things.
 rule -- 1 to 64 lowercase letters, digits and hyphens, with no hyphen first, last, or next to
 another -- and `description` must be present. A skill that fails either is reported as
 `metadata-invalid` and left out. Parsing frontmatter with a YAML crate or with a subset that takes
-only scalars is `0003-27`'s fork. Either way the parser reads untrusted text on the host, so it
+only scalars is `0003-28`'s fork. Either way the parser reads untrusted text on the host, so it
 refuses YAML anchors and aliases, or limits how far they expand, and bounds the size of its input
 and the time it spends parsing; that requirement is part of the same fork.
 
@@ -158,7 +158,7 @@ container before it is used, and a directive can arrive in any round.
 
 Bodies are not in the preamble. An instruction-only skill's body enters the context when a
 directive delivers it, or when the agent reads it because it judged the skill relevant (the
-accessor is `0003-27`'s). An executable skill's parameters are learned from `help()` on its
+accessor is `0003-28`'s). An executable skill's parameters are learned from `help()` on its
 `<Skill>Params` class, which lists each field with its type, default and help, and from `help()`
 on its module once loaded.
 
@@ -269,7 +269,7 @@ of its text. Only the main agent receives directives, since children have no use
 (`work.md`).
 
 A directive for a skill with a `skill.py` does not deliver its `SKILL.md` body, which would cost
-context on every directive. The agent reads that body through `0003-27`'s accessor when the
+context on every directive. The agent reads that body through `0003-28`'s accessor when the
 parameter help is not enough.
 
 **The agent calls `invoke`.** The preamble says what such a message asks, and the ordinary
@@ -284,7 +284,7 @@ await outrig.skills.invoke(d.skill, d.body.partition(" ")[2])
 starts when `invoke` is called, `await` gives the entry's return value or raises what it raised,
 and an agent with something to do meanwhile keeps the handle, which `h.cancel()` ends -- the
 parser child released, or the running entry interrupted. The field's name and `invoke`'s exact
-signature are `0003-28`'s.
+signature are `0003-29`'s.
 
 ### How `invoke` parses
 
@@ -330,7 +330,7 @@ async def parse_params(text: str) -> ReviewDiffParams | Clarification:
 
 The text is the call's input, bound into the child's namespace as `text` and never interpolated
 into the instructions. The instructions are the runtime's fixed text, whose wording is
-`0003-28`'s, followed by the entry's docstring; the field types and the parameter help reach the
+`0003-29`'s, followed by the entry's docstring; the field types and the parameter help reach the
 child as the result type's schema text, as they do for every typed call.
 
 The fixed text says which result is right. The child completes with a `<Skill>Params` when the
@@ -343,7 +343,7 @@ naming paths, and an empty `paths` would review every changed file, so the right
 question, not the default. `Clarification` is a frozen dataclass in `outrig.skills` with one
 field, `question: str`, the question to put to the user in the user's terms.
 
-Either result is decoded strictly, as a declared union is (`0003-24`): a completion is taken only
+Either result is decoded strictly, as a declared union is (`0003-25`): a completion is taken only
 when exactly one member accepts it, and a key that matches no field, a value outside a `Literal`, or
 a string where an `int` is declared is raised back to the child with its path, and it completes
 again, up to the attempt limit. The two members are told apart by their keys, so a `<Skill>Params`
@@ -397,7 +397,7 @@ model: an agent that already understood the text, or that asked the user after a
 `invoke`, so bound parameters are still injected and the invocation's events are still emitted.
 `params` is checked against the field types as a typed call checks its inputs, and an instance of
 another skill's class is refused. The class is reachable through `outrig.skills` (the accessor's
-spelling is `0003-28`'s), and `help()` on it lists the fields with their types, defaults and help.
+spelling is `0003-29`'s), and `help()` on it lists the fields with their types, defaults and help.
 
 Either way, **the instance is on the invocation's `skill.invocation.started` event**, with whether
 a child parsed it or the caller passed it ("Events"), so how the user's words became arguments is
@@ -507,7 +507,7 @@ calls into its modules are not traced. Only its hosted calls are evented, per re
 hosted call is: each request's events are published on the session's stream
 (`boundary-policy.md`), and the CLI writes them to `events.jsonl` only when `[events] mode =
 "record"`. A direct helper call produces boundary events and no invocation events. The names are
-candidates, and `0003-28` defines their schema in `observability.md`'s envelope.
+candidates, and `0003-29` defines their schema in `observability.md`'s envelope.
 
 The states one invocation passes through, as explanation rather than enum names: directive
 received, delivered, loading, deriving, parsing, running, then returned, raised or cancelled -- or
@@ -596,9 +596,9 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
 ## Open questions
 
 - How an embedder's sources rank against the project's and the user's. An ordered list in which
-  the first source holding a name wins extends "the project wins"; `0003-27` decides.
+  the first source holding a name wins extends "the project wins"; `0003-28` decides.
 - How an embedder's front end sends a directive. The skill is named on the message the host posts,
-  so the session's user channel needs a way to name one (`embedding.md`, `0003-28`).
+  so the session's user channel needs a way to name one (`embedding.md`, `0003-29`).
 - How the preamble bounds a large catalog. The standard puts a skill's metadata at about 100
   tokens, so a hundred skills is about 10,000 tokens on every round. Listing a capped number with a
   count, and answering the rest from `outrig.skills`, would follow `discovery.md`'s inventory.
@@ -622,7 +622,7 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
 - **The typed parse has not run.** That a model fills `ReviewDiffParams` from
   `a.py b.py --max-parallel 2 --allow-partial`, and from prose, is the design's expectation, and
   so is that it returns a `Clarification` for `just the auth changes` and not for `two at a time`;
-  `0003-28`'s acceptance runs the mechanism with a mock model, which proves the transport and the
+  `0003-29`'s acceptance runs the mechanism with a mock model, which proves the transport and the
   decoding and not the model's reading, so how often a real model's result matches what the user
   meant, and how often it asks when it need not, is unmeasured. The deterministic parser this
   replaced was checked under the payload's Python before it was dropped, and that check is what

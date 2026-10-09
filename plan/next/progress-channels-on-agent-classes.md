@@ -4,7 +4,7 @@
 
 A submission's handle has `h.progress`, a one-way endpoint the parent reads for `Delivery`
 envelopes of what the child reports while it works (`work.md`; the `progress` row of
-`messages.md`'s worked example). A request on an agent class (`agent-classes.md`, `0003-29`)
+`messages.md`'s worked example). A request on an agent class (`agent-classes.md`, `0003-30`)
 returns a handle with no `progress` in 0.3: the class derives its request channels from its
 `async def` methods, and nothing on it declares a channel running the other way.
 
@@ -23,7 +23,7 @@ reporting on.
 
 ## Open questions
 
-- Whether `runtime.wait` watches it. `0003-25`'s fork says no for `h.progress`, because a parent
+- Whether `runtime.wait` watches it. `0003-26`'s fork says no for `h.progress`, because a parent
   with many children reporting progress would have every wait ended by them; the same reasoning
   applies here.
 

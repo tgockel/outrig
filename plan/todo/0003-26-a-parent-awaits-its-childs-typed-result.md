@@ -1,4 +1,4 @@
-# 0003-25 -- A parent awaits its child's typed result
+# 0003-26 -- A parent awaits its child's typed result
 
 ## Context
 
@@ -16,7 +16,7 @@ Planning settled what was open there:
   child's Python, so a child keeps working while its parent's code does something else.
 - **Completion is a Python call in the child**, `await runtime.complete(value)`, whose spelling was
   left open (fork 3). A result can then be built from objects that never pass through the model. The
-  call decodes with `0003-24`, problems go back to the child to fix, and only the final answer is
+  call decodes with `0003-25`, problems go back to the child to fix, and only the final answer is
   repaired: the executions before it are never run again. A child whose round ends without
   completing is asked once more, in a round that counts no attempt; if that round ends without a
   completion too, the submission settles with `CompletionRejected`; a decorated call's child is
@@ -24,13 +24,13 @@ Planning settled what was open there:
   opens a round for a child of either kind follows one rule, the end-of-round summary
   (`agent-classes.md`, "The child's rounds").
 - **Every request has an id and a reply type, and there are two child kinds that never mix.** A
-  *work child* -- `spawn` then `submit`, or a decorated call (`0003-26`) -- has its inputs bound as
+  *work child* -- `spawn` then `submit`, or a decorated call (`0003-27`) -- has its inputs bound as
   variables, one active submission at a time, and answers with `await runtime.complete(value)`. A
-  *request child* -- `spawn(..., requests=...)`, or an instance of an agent class (`0003-29`) --
+  *request child* -- `spawn(..., requests=...)`, or an instance of an agent class (`0003-30`) --
   receives each request on a request channel and answers it by id with `await d.reply(value)`
   or `await d.fail(message)`, and has no `runtime.complete`. One machinery serves both: a handle per
-  request, strict decoding (`0003-24`), repair, the attempt limit and the events. The class form is
-  `0003-29`'s, a thin layer over what this task builds. Rejected: `complete` answering "the one
+  request, strict decoding (`0003-25`), repair, the attempt limit and the events. The class form is
+  `0003-30`'s, a thin layer over what this task builds. Rejected: `complete` answering "the one
   outstanding request" of a request child -- with two received, which one it answers depends on
   timing.
 - **Two session-wide limits beside depth and the token budget**, decided on 2026-10-02 after the
@@ -79,19 +79,19 @@ including when the session closes.
   type and a bounded preview -- in its instructions. `requests` makes a request child; without it
   the child is a work child. The child's orientation leaves out the user channel and says how to
   answer: `runtime.complete` in a work child, `receive` and `reply` in a request child. Skills
-  reach a child once `0003-27` adds its import finder, which serves the whole interpreter.
+  reach a child once `0003-28` adds its import finder, which serves the whole interpreter.
 - **A work child takes submissions.** `child.submit(inputs, result=T)` binds `inputs`, a dict of
   names to values, as variables in the child's namespace; `work.md`'s example, one dataclass
   instance, is the case of a single input, and the final spelling is this task's. Values are
   checked against the serializable subset, so a hosted reference is refused; the child reaches the
-  same bindings by name. `T` is declared through `0003-24` at the call. The submission's round
+  same bindings by name. `T` is declared through `0003-25` at the call. The submission's round
   opens with each input's name, type and a bounded preview, and with `T`'s schema text. It returns
   a handle. A work child runs one submission at a time (fork 4), answers with `runtime.complete`,
-  and has no request channels; a decorated call (`0003-26`) is one submission to a fresh work
+  and has no request channels; a decorated call (`0003-27`) is one submission to a fresh work
   child.
 - **A request child answers requests.** `requests` maps channel names to
   `outrig.Request(request_type, reply_type, doc=...)`, or to a bare `(request_type, reply_type)`
-  tuple, the same without a description; both types are declared through `0003-24`, and `user` is
+  tuple, the same without a description; both types are declared through `0003-25`, and `user` is
   not a channel name. The parent's end is `child.channels[name]`: `request(body) -> handle` checks
   `body` against the request type and sends it, and `pending()` counts the requests the child has
   not yet taken, as every endpoint's does. The child's end is `runtime.channels[name]`: `receive()`
@@ -127,17 +127,17 @@ including when the session closes.
   child"). Its work is cancelled -- the running submission, and every request waiting or received
   and unanswered -- and every waiter on it settled with `AgentReleased`; its own children are
   released the same way; its hosted calls waiting for an approval or an evaluation are cancelled
-  through `0003-22`'s gate and the handler's signal; its running execution is interrupted, and a
+  through `0003-23`'s gate and the handler's signal; its running execution is interrupted, and a
   child that never yields is wedged (fork 7); and its forwarded hosted calls run on in their
   bindings and are reported with their outcome, or `unknown` if their binding dies. What becomes
   of its kernel and of background tasks still running there, per fork 9. A decorated call's child
-  is released this way once its call settles (`0003-26`), and an agent class's child when its
-  instance is released or collected (`0003-29`).
+  is released this way once its call settles (`0003-27`), and an agent class's child when its
+  instance is released or collected (`0003-30`).
 - **A Rust runner per child**, running its rounds through the session's round loop, with the
   child's own history store and its own events.
 - **The attempt limit, per request, counting invalid answers only.** `await
   runtime.complete(value)` in a work child and `await d.reply(value)` in a request child decode
-  with `0003-24`; problems are raised in the child's execution with their JSON paths, so the child
+  with `0003-25`; problems are raised in the child's execution with their JSON paths, so the child
   can fix the value and answer again. Each invalid answer counts one attempt against its request,
   and past the limit, 3 by default, that request's handle settles with `CompletionRejected`,
   carrying the last value and its problems, and the child is not asked about it again. Earlier
@@ -177,7 +177,7 @@ including when the session closes.
   result by the submission's id. If that round ends without a completion that passed too, the
   summary is unchanged since it opened, and instead of idling the submission settles with
   `CompletionRejected` whose message says the child ended without completing. A decorated call's
-  child is then released, as its call has settled (`0003-26`); an explicit work child stays idle,
+  child is then released, as its call has settled (`0003-27`); an explicit work child stays idle,
   and a submission queued behind the failed one opens its own round next, a new submission being
   a change in the summary. The invalid-answer attempt limit above is separate. Decided on
   2026-10-05 after the follow-up review;
@@ -198,9 +198,9 @@ including when the session closes.
   total of each round above it in the tree, up to the main agent's round whose execution made the
   outermost call, reported per fork 8. A round that answers several requests is attributed to the
   round and not divided among them (fork 12); `agent.request.settled` names the rounds the request
-  spanned, so a reader can see what was spent while it was open. `0003-28` adds the skill
+  spanned, so a reader can see what was spent while it was open. `0003-29` adds the skill
   invocation the work ran under to the same chain. The evaluator's usage is never added
-  (`0003-23`).
+  (`0003-24`).
 - **Depth.** `subagent-depth-max` is enforced at spawn, the main agent being depth 1: a spawn
   from an agent already at the limit is refused rather than made to wait, since waiting cannot
   change a depth.
@@ -209,19 +209,19 @@ including when the session closes.
   working, idle, and wedged (fork 7) until the session ends, since a wedged kernel is still a
   thread and its memory; a released child leaves the count when its kernel is gone (fork 9), not
   when the release is requested. A launch past the cap raises `AgentLimitReached` at once and
-  never waits: `spawn` raises it, a decorated call's handle settles with it (`0003-26`), and an
-  instance's `ready()` and first handle raise it (`0003-29`); the record shows no spawn for it.
+  never waits: `spawn` raises it, a decorated call's handle settles with it (`0003-27`), and an
+  instance's `ready()` and first handle raise it (`0003-30`); the record shows no spawn for it.
 - **`model-concurrency-max`**, default 8: a session-wide bound on model requests in flight, with
   a cancellation-safe queue. A permit is held per provider request -- one attempt, from send to
   the end of its response or its failure, a retry taking a new one -- and for nothing else: never
   during an execution, so a parent whose code awaits a child holds none, and a tree deeper than
   the permit count completes. Every model request the session makes takes one, the main agent's
-  rounds and the evaluator's calls (`0003-23`) included. A hosted call held for the evaluator's
+  rounds and the evaluator's calls (`0003-24`) included. A hosted call held for the evaluator's
   verdict is inside an execution and holds no permit, so no deadlock follows. A request made with
   every permit held waits in a queue in arrival order; a caller cancelled while queued -- its
   child released, the session closing -- is removed from the queue without a permit being leaked
   or the queue left inconsistent. The queue holds at most one entry per agent's round, and the
-  evaluator's own cap (`0003-23`) bounds its entries, so `children-max` and that cap bound it.
+  evaluator's own cap (`0003-24`) bounds its entries, so `children-max` and that cap bound it.
   Neither this nor `children-max` bounds the CPU or memory a child's own code uses once its
   kernel is admitted; that is `runtime-protection.md`'s and
   `plan/phase/0003-python/potential/resource-scheduling.md`'s.
@@ -229,7 +229,7 @@ including when the session closes.
   submission running or queued, a request held before the child exists, waiting unread, or
   received and unanswered -- checked at `request()` and `submit()` in the sender. A call past it
   raises `AgentLimitReached` at once, with nothing sent and no `agent.request.sent`; an instance's
-  method call raises it at the call (`0003-29`). Nothing waits outside the child's queue (fork
+  method call raises it at the call (`0003-30`). Nothing waits outside the child's queue (fork
   10). A reply, a `fail`, a completion, `h.cancel()` or the release frees the place; a request
   whose caller stopped waiting counts until then. Decided on 2026-10-05 after the follow-up
   review.
@@ -251,7 +251,7 @@ including when the session closes.
   `agent.request.cancelled`; `agent.request.settled`, with the outcome, the attempts and the
   rounds the request spanned; an answer refused because its request had settled (fork 3); and
   release, naming every child it ended and every request it settled. `agent.call.started` and
-  `agent.call.settled` are `0003-26`'s wrapper around a decorated call, and nothing else emits
+  `agent.call.settled` are `0003-27`'s wrapper around a decorated call, and nothing else emits
   them; there is no `agent.completion.*` family. A child's own executions and model rounds carry
   its own `subject`, so `0003-14` renders it as an agent, and its progress messages are evented as
   `0003-13` defines for messages between agents.
@@ -308,7 +308,7 @@ including when the session closes.
   code awaits a child whose code awaits a grandchild completes, each level's execution waiting
   while holding no permit, and the record shows the three rounds' requests one after another.
 - **An evaluation and a round take turns.** With `model-concurrency-max = 1` and a rule that
-  sends the fixture binding's call to the evaluator (`0003-23`), the round's model requests and
+  sends the fixture binding's call to the evaluator (`0003-24`), the round's model requests and
   the evaluator's request are never in flight at the same time, and both complete: the
   evaluator's `allow` admits the call, the call returns, and the round ends.
 - **An exhausted token budget raises a typed error** in the waiter, and the child makes no model
@@ -435,18 +435,18 @@ including when the session closes.
    `prompt` is how a child learns what it needs, and the parent can pass on any project rule from
    the preamble. Inheriting the preamble would add every project rule to every child's
    instructions, at the cost of context in each one.
-2. **Whether the request-child plumbing moves to `0003-29` -- Recommended: no.** With
+2. **Whether the request-child plumbing moves to `0003-30` -- Recommended: no.** With
    `spawn(..., requests=...)`, the request channel, the handle, the attempt limit and the request
    events built here, the class is a thin layer: it derives the channels from the methods and owns
-   the instance's lifetime. Building the plumbing in `0003-29` would put one machinery's tests in
+   the instance's lifetime. Building the plumbing in `0003-30` would put one machinery's tests in
    two tasks, and the explicit form is usable without a class, as `work.md`'s explicit API is
    usable without the decorator. If this task is too large, the depth limit, the token budget,
    `children-max`, `model-concurrency-max` and `requests-max` are the parts that can move to a task
-   of their own between this one and `0003-26`, numbered by `/groom-plan`, with the acceptance
+   of their own between this one and `0003-27`, numbered by `/groom-plan`, with the acceptance
    items that test them.
 3. **The completion call -- Recommended: `await runtime.complete(value)`, and `await d.reply(value)`
    the same way, each returning once the value is accepted and raising with the problems
-   otherwise.** Waiting for acceptance lets `0003-26`'s validator, which runs in the parent, answer
+   otherwise.** Waiting for acceptance lets `0003-27`'s validator, which runs in the parent, answer
    through the same call the decoder does. An answer after the handle has settled raises and is
    evented, rather than revising the result: `work.md` allows recording it as an update or
    refusing it, and refusing is the simpler of the two that cannot change a settled result.
@@ -456,7 +456,7 @@ including when the session closes.
 5. **What the token budget covers -- Recommended: one budget per session, counting every model
    call of every child and their descendants, and not the main agent's rounds**, which the user
    starts and can stop. A budget per `spawn` would not bound a loop that spawns. The evaluator's
-   usage is `0003-23`'s and is not counted.
+   usage is `0003-24`'s and is not counted.
 6. **How a child builds its result -- Recommended: the result type and the dataclasses it uses
    are bound into the child's namespace by their class names, beside the inputs, and the
    completion call takes an instance or its JSON form.** `typed-agents.md` leaves this to this
@@ -466,7 +466,7 @@ including when the session closes.
    with the structure that code built. Because the child reaches a class by its `__name__`, two
    distinct classes with one `__name__` -- among one submission's types, or across a request
    child's channels and inputs -- are an error at `submit`, `spawn` or `request`, naming both,
-   rather than one replacing the other without notice; `0003-29`'s generated message types are
+   rather than one replacing the other without notice; `0003-30`'s generated message types are
    bound and checked the same way.
 7. **A wedged child -- Recommended: its status says it is wedged, and it stays in the session's
    record of children until the session ends.** Its thread cannot be interrupted
@@ -559,13 +559,13 @@ including when the session closes.
 - **Hard: `0003-13`.** A child's events go to the stream, under the child's own `subject`.
 - **Hard: `0003-19`.** The runner is the session's round loop run for a child, and close and
   shutdown are the session's.
-- **Hard: `0003-22`.** Releasing a child cancels its held requests through that task's gate and
-  the handler's signal. Through it, `0003-21`, whose facades in every kernel give a child its
+- **Hard: `0003-23`.** Releasing a child cancels its held requests through that task's gate and
+  the handler's signal. Through it, `0003-22`, whose facades in every kernel give a child its
   parent's bindings, and whose forwarded calls a release lets run on, reporting `unknown` only if
   their binding dies.
-- **Hard: `0003-23`.** The evaluator whose call takes a permit, which the acceptance item on
+- **Hard: `0003-24`.** The evaluator whose call takes a permit, which the acceptance item on
   `model-concurrency-max = 1` exercises.
-- **Hard: `0003-24`.** Completions and replies decode with `outrig.schema`, and a submission's or
+- **Hard: `0003-25`.** Completions and replies decode with `outrig.schema`, and a submission's or
   a request channel's instructions carry its schema text.
 - **Soft: `0003-15`.** A child resolves its own model, alias failover included, and its rounds
   retry as the main agent's do.

@@ -2,7 +2,7 @@
 
 ## Shipped
 
-The one-shot end (`0003-25`; `work.md`, "A request settles once"; `typed-agents.md`, "Validation and
+The one-shot end (`0003-26`; `work.md`, "A request settles once"; `typed-agents.md`, "Validation and
 repair"). A work child -- a decorated call's, `child.submit`'s, the skill parser's -- whose round
 ends without a completion that passed gets one host-initiated round asking for the result by the
 submission's id. If that round ends without one too, the submission settles with
@@ -31,5 +31,5 @@ earns its place; one that mostly spends rounds on children that then fail anyway
 
 ## When
 
-After `0003-26` and `0003-28` have run against real models, which is where the stalled calls
+After `0003-27` and `0003-29` have run against real models, which is where the stalled calls
 will come from.

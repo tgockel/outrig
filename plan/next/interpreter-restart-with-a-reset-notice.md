@@ -20,7 +20,7 @@ maintainer deferred it past 0.3.
   interpreter. The dead interpreter's connections are closed, which releases every object they
   held, and the new kernels open their own.
 - Report what was in flight as ended, in events: the running execution with its outcome
-  `unknown`, child kernels and their work handles terminated (`0003-25`), pending escalations
+  `unknown`, child kernels and their work handles terminated (`0003-26`), pending escalations
   cancelled.
 - Put a notice in the next model call: the interpreter was replaced, which names were lost, which
   work was reported terminated, and that nothing was run again. The host keeps no copy of the

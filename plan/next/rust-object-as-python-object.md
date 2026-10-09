@@ -44,9 +44,9 @@ builder.bind("task", Arc::new(TaskService::new(..)));
   answers from the schema, and `runtime.bindings` lists it beside hosted objects.
 - A call carries its arguments by value, as JSON, in a message kind of its own on the interpreter
   pipe. Rust checks them against the schema and calls `call`. No binding process or RPyC is used.
-- The boundary is a hosted object's: `[[policy.rules]]` (`0003-22`) match the binding, the
+- The boundary is a hosted object's: `[[policy.rules]]` (`0003-23`) match the binding, the
   described type, the method and the operation; `evaluate` sends the call to the evaluator
-  (`0003-23`); each call is evented as in `0003-21`; admission and the shutdown report cover it
+  (`0003-24`); each call is evented as in `0003-22`; admission and the shutdown report cover it
   (`plan/phase/0003-python/lifecycle.md`).
 - Calls are awaitable with the same spelling as a hosted object's, so the two read alike
   (`mcp-wrappers.md`). `CallContext` carries the call id, the binding and a cancellation signal,

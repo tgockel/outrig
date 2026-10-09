@@ -13,7 +13,7 @@ library prints are in the log and nowhere else.
 ## Shape
 
 - A binding's `outrig-binding:` lines become an event naming the binding, in the category
-  `0003-21` records hosted calls in; the library's other output becomes an unattributed-output
+  `0003-22` records hosted calls in; the library's other output becomes an unattributed-output
   event as the interpreter's does, so a `print` in a hosted library is recorded as what it is.
 - The supervisor takes the session's `Events` as the interpreter's host does, once `0003-20` gives
   it a session to belong to.

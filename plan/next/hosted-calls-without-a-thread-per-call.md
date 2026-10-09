@@ -2,8 +2,8 @@
 
 ## Context
 
-A hosted object is awaited through a facade over RPyC (`plan/next/a-hosted-object-is-awaited.md`,
-to be numbered; `plan/phase/0003-python/hosted-objects.md`, "Calls are awaited"). `await`
+A hosted object is awaited through a facade over RPyC (`0003-21`;
+`plan/phase/0003-python/hosted-objects.md`, "Calls are awaited"). `await`
 submits a job to the kernel's pool for the binding, a worker thread replays the path's steps as
 RPyC requests through one of the pool's connections and settles the awaiting code through the
 kernel's loop, and the loop keeps turning meanwhile. That meets the first and third acceptance

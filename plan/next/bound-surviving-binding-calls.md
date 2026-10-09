@@ -3,7 +3,7 @@
 ## Context
 
 A hosted call runs in the binding on the thread serving its connection, and RPyC has no cancel
-(`0003-17`; `plan/next/cancel-a-running-hosted-call.md`). When its kernel is released (`0003-25`,
+(`0003-17`; `plan/next/cancel-a-running-hosted-call.md`). When its kernel is released (`0003-26`,
 fork 9) or its connection closes, the caller is told `unknown`, the binding runs the call to
 completion, and nothing counts it afterward: the kernel's pool is gone, `children-max` stops
 counting the child once its kernel is gone, and the releasing agent is charged nothing

@@ -16,8 +16,8 @@ service client: every `ask`, `poll` or `update_records` is two requests on the p
 
 ## Options
 
-- **The facade sends `callattr`.** The container-side stub is now the facade
-  (`plan/next/a-hosted-object-is-awaited.md`): a proxy builds a path of steps, and a worker
+- **The facade sends `callattr`.** The container-side stub is now the facade (`0003-21`): a
+  proxy builds a path of steps, and a worker
   replays them when the path is awaited, `getattr` for an attribute step and `getattr` then
   `call` for a call step, as RPyC's proxies send them. A call step that follows an attribute
   step carries the name and the arguments together, so the worker can send one `callattr` in
