@@ -104,12 +104,13 @@ whether the thing can be used.
   page. `observability.md` designs it, and its governing decision is that nothing is captured richer
   than its category allows -- the model's view, execution diagnostics, and integration audit each
   carry their own rule.
-- Host objects the agent uses as ordinary Python. An operator declares a binding -- a factory
-  from a pure-Python package, run on the host in a process of its own -- and agent code gets the
-  object under a name: a GitPython `Repo` as `repo`, say. When a session has bindings, host
-  directories are mounted at their host paths, so a path means the same thing on both sides. The
-  object acts with the user's authority on the host, which `security.md` states plainly.
-  `hosted-objects.md` designs it.
+- Host objects the agent uses as ordinary Python, awaiting what it reads, calls or iterates on
+  them while its event loop keeps running. An operator declares a binding -- a factory from a
+  pure-Python package, run on the host in a process of its own -- and agent code gets the object
+  under a name: a GitPython `Repo` as `repo`, say. When a session has bindings, host directories
+  are mounted at their host paths, so a path means the same thing on both sides. The object acts
+  with the user's authority on the host, which `security.md` states plainly. `hosted-objects.md`
+  designs it.
 - A policy over what crosses. Every operation on a hosted object is published as events on the
   session's stream, which the CLI writes to `events.jsonl` only when `[events] mode = "record"`.
   The default is allow, published as events; rules can deny an operation or hold it for the user,

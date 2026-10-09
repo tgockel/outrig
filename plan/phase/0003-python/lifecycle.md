@@ -178,9 +178,10 @@ the session.
 **Hosted calls and callbacks** (`0003-21`)
 
 - *Waiting for a free connection* -- in the container, because every connection in its kernel's
-  pool for the binding has a call in flight (`0003-17`). It was never sent, so the host has no
-  record of it and the interpreter reports it. Outcome: woken with the closing error and recorded
-  `cancelled`, with the close as the reason. Invoked: no. Effects: none possible.
+  pool for the binding has a call in flight (`0003-17`). Its job is queued in the pool's executor
+  with no worker thread yet, and the code that awaits it waits on it. It was never sent, so the
+  host has no record of it and the interpreter reports it. Outcome: woken with the closing error
+  and recorded `cancelled`, with the close as the reason. Invoked: no. Effects: none possible.
 - *Queued in the relay, or made after the close* -- not forwarded when the relay stopped, so
   refused in Rust and never seen by its binding. Outcome: `refused`, the reason admission closed;
   the caller gets the closing error. A request Rust's gate holds is cancelled by the gate instead
@@ -204,9 +205,12 @@ the session.
   Invoked: yes. Effects: known only if it returned or raised. A call cut off may have finished its
   effect somewhere the session cannot see, so it is `unknown`, never reported as having failed.
 - *Making a callback* -- the running call has called back into agent code in the container
-  (`hosted-objects.md`). Outcome: the callback is part of a call allowed to finish, so it runs
-  during the drain; the interrupt at terminating ends one still running, and the outer call ends
-  with its binding as above. Invoked: yes, the outer call's target. Effects: as for a running call.
+  (`hosted-objects.md`); the callback runs on the worker thread that holds the call's connection,
+  or on the kernel's loop when it is a coroutine. Outcome: the callback is part of a call allowed
+  to finish, so it runs during the drain; at terminating a coroutine callback still running is
+  cancelled with its kernel's tasks, a plain one on a worker thread is ended by the container
+  stop, and the outer call ends with its binding as above. Invoked: yes, the outer call's target.
+  Effects: as for a running call.
 
 **Pending approvals and evaluations** (`0003-22`, `0003-23`)
 
@@ -423,8 +427,8 @@ interrupting an execution.
   on an asyncio task is one, `h.cancel()` on a child's work item or request another, and closing
   cancels every child's work.
 - **Interrupt an execution.** Raise `CancelledError` or `KeyboardInterrupt` in agent Python,
-  through the interrupter (`runtime-protection.md`). A hosted call blocked in that execution
-  raises in its caller; one not yet invoked is `cancelled`, and one already invoked runs on in
+  through the interrupter (`runtime-protection.md`). A hosted call the execution awaits raises
+  where it is awaited; one not yet invoked is `cancelled`, and one already invoked runs on in
   its binding, its reply recording `returned` or `raised` with the note that the caller was
   interrupted. Terminating interrupts every kernel.
 - **Kill a process.** Send a signal, which a process may handle or ignore unless it is SIGKILL --
@@ -440,11 +444,11 @@ A cancelled wait never cancels work, and none of the five replays anything.
 The agent's code is running a workflow in execution E12, in round R5. The session has one binding,
 `repo`, a GitPython `Repo` -- the phase's example of a hosted library. Earlier in E12 the code
 started a push as a background task,
-`asyncio.create_task(asyncio.to_thread(lambda: repo.remotes.origin.push()))` -- call C40, in the
-binding's process. It also started a child to review a section, work item W3, and now awaits both
-in `asyncio.gather(push, review)`. The child, in its own kernel with its own connection to the
-binding, called `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting for
-an answer. Then the operator stops the session.
+`asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")` -- call C40, in the
+binding's process. It also started a child to review a section, work item W3, and now awaits
+both in `asyncio.gather(push, review)`. The child, in its own kernel with its own connection to
+the binding, awaited `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting
+for an answer. Then the operator stops the session.
 
 ```text
 t0      the owner drops the round it was driving, calls close_admission(), which

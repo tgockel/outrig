@@ -5,7 +5,8 @@
 After `0003-20` a session can declare, approve, install, start and stop a binding, and the agent is
 told that it exists, but agent code cannot reach it: `0003-16` and `0003-17` proved the transport
 and its threading through a relay that exists only in tests. This task puts the relay in `host.rs`,
-binds each binding's name in every kernel, and records every request.
+binds the facade of the facade task (`plan/next/a-hosted-object-is-awaited.md`) under each
+binding's name in every kernel, and records every request.
 
 Today `host.rs` speaks to the interpreter alone. Its reader task parses each line into
 `enum Reply` and hands it to whoever waits for it, what the host sends is built ad hoc with
@@ -42,11 +43,12 @@ drained, then killed and reported.
   host has opened -- today the primary, and later `0003-25`'s children through the same path. Each
   binding has a bounded queue, so a binding that stops reading delays only the calls waiting on it
   (fork 1).
-- **Stubs**: each binding's name bound in every kernel, the primary and every kernel opened later,
-  before `_boot` is taken, so the inventory lists no stub. A stub opens its connection and resolves
-  its root on first use, on its kernel's thread (`0003-17`). Iteration makes one request per item,
-  as RPyC's proxies do, rather than batches through `buffiter`: one request then stands for one
-  item, and a batch size chosen by the request is
+- **Stubs**: the facade of the facade task (`plan/next/a-hosted-object-is-awaited.md`), bound
+  under each binding's name in every kernel, the primary and every kernel opened later, before
+  `_boot` is taken, so the inventory lists no stub. The first `await` opens the connection and
+  fetches the root, on the worker thread. `async for` makes one request per item, `__iter__` then
+  one `__next__` each, as RPyC's proxies do, rather than batches through `buffiter`: one request
+  then stands for one item, and a batch size chosen by the request is
   `plan/next/hosted-reference-and-payload-bounds.md`'s concern. The runtime keeps its own
   reference to each kernel's stubs, apart from the global names the agent sees, so `repo = None`
   or `del repo` changes nothing the runtime uses; `0003-28`'s injection reads the stub from there.
@@ -77,23 +79,24 @@ drained, then killed and reported.
     was killed at shutdown or its process died (fork 3). "Interrupted" is a reason attached to
     `cancelled`, or a note on a later `returned` or `raised`; it is not an outcome of its own.
   - **An interrupt ends the caller's wait; a forwarded call is the binding's to finish.** The
-    interrupt raises in the caller at once and the relay sends the binding a cancel line naming
-    the request. A request the binding has not started -- waiting for the serialize lock in a
-    binding declared `serialize = true` (`0003-17`) -- is dropped and recorded `cancelled`, as is
-    one `0003-22` holds for a decision. One already invoked runs on, since RPyC has no request
-    that stops a call; its reply, when it comes, records `returned` or `raised` with the note
-    that the caller had been interrupted, and `unknown` is recorded only if no reply comes
-    before the binding is killed or dies. A call never sent --
-    woken by an interrupt, or by the close, while it waited for a free connection of its kernel's
-    pool (`0003-17`) -- is recorded `cancelled` from the interpreter's notice of it, since its
-    binding never received it.
+    interrupt raises where the call is awaited, by waking the worker's wait, and the relay sends
+    the binding a cancel line naming the request. A request the binding has not started --
+    waiting for the serialize lock in a binding declared `serialize = true` (`0003-17`) -- is
+    dropped and recorded `cancelled`, as is one `0003-22` holds for a decision. One already
+    invoked runs on, since RPyC has no request that stops a call; its reply, when it comes,
+    records `returned` or `raised` with the note that the caller had been interrupted, and
+    `unknown` is recorded only if no reply comes before the binding is killed or dies. A call
+    never sent -- woken by an interrupt, or by the close, while it waited for a free connection
+    of its kernel's pool (`0003-17`) -- is recorded `cancelled` from the interpreter's notice of
+    it, since its binding never received it.
   - **A request the interception refuses is recorded whatever its kind**, bookkeeping included:
     a receipt and a `refused` outcome naming the check. Bookkeeping that passes the checks is not
     recorded, and an `inspect` answer from which private names were only filtered is not a
     refusal. The caller's error names the refusal and is not a class the hosted library defines,
     so `except` on the library's own classes does not catch it; a refused attribute read raises
-    one that is also an `AttributeError`, so `hasattr` and `getattr` with a default behave as they
-    do on a local object.
+    one that is also an `AttributeError`, so `except AttributeError` at the `await` catches it.
+    `hasattr` and `getattr` with a default cannot see it: a proxy's lookup builds a path and
+    raises nothing until awaited (the facade task, `plan/next/a-hosted-object-is-awaited.md`).
   - The operations form a fixed vocabulary, taken from the inventory, which `0003-22`'s rules match.
   - A preview is built from by-value data only. An object is named by its type and an opaque
     reference id, never by its `repr`, which would run code.
@@ -127,49 +130,51 @@ drained, then killed and reported.
   group is killed, and a call still running is `unknown`, its binding killed at shutdown, in
   `0003-19`'s `ShutdownReport` and in its event. A callback that a draining call makes runs, as
   `lifecycle.md`'s row has it; if this task's callback tests show a reason to refuse it after the
-  close, the row changes with them. A callback still running at terminating is interrupted with its
-  kernel, and the call that made it ends with its binding.
+  close, the row changes with them. A callback still running at terminating is a coroutine
+  cancelled with its kernel or a plain function ended by the container stop, and the call that
+  made it ends with its binding.
 - **`lifecycle.md`'s rows for hosted calls and callbacks**, true of the implementation and tested.
 
 ## Acceptance
 
 - **Every request is recorded, receipt first, through `run-new`** with a mock model and a binding
-  of `0003-16`'s fixture library: `obj.a.b` makes two requests, each with a receipt, a dispatch and
-  an outcome event sharing its id; iterating a hosted sequence makes one request per item the
-  iteration takes, as the inventory classifies them; a method call makes one; and a call that
+  of `0003-16`'s fixture library: `await obj.a.b` makes two requests, each with a receipt, a
+  dispatch and an outcome event sharing its id; `async for` over a hosted sequence makes one
+  request per item the iteration takes, as the inventory classifies them; a method call makes two,
+  `getattr` and `call`, until `plan/next/one-request-per-hosted-method-call.md`; and a call that
   raises the fixture's exception has an outcome that names the type, while the agent's code catches
   it by its own class. A request's receipt and its dispatch are published before its target runs,
   shown by the dispatch event's publication time against the start time the fixture method
   records, both on the host's clock; and a request refused at admission has a receipt and a
   `refused` outcome and no dispatch event.
-- **A callback is recorded under its call.** A fixture method calls a callback that makes a hosted
-  call of its own: the callback's invocation event and the nested call's events carry the outer
-  call's id as their parent.
+- **A callback is recorded under its call.** A fixture method calls a coroutine callback that
+  awaits a hosted call of its own: the callback's invocation event and the nested call's events
+  carry the outer call's id as their parent.
 - **The hand-written-client suite passes in production.** `0003-16`'s tests of a client written by
   hand pass through the relay in `host.rs`.
 - **A refusal by the interception is recorded.** A hand-written client's handler id outside the
   table, `del` with an inflated count, and `inspect` of an object its connection was never handed
   each leave a receipt and a `refused` outcome naming the check, and no dispatch event. Agent
-  code that reads a private attribute gets an error of OutRig's that is also an `AttributeError`,
+  code that awaits a private attribute gets an error of OutRig's that is also an `AttributeError`,
   which `except` on the fixture's exception classes does not catch, and the read is recorded the
   same way.
-- **An interrupt ends the wait, not the binding.** An interrupt during a slow call raises in the
-  agent's code; the call's outcome is recorded `returned` when the binding's reply arrives, with the
-  note that the caller was interrupted; and the next call on that binding returns its own result.
-  The same call with the binding killed before it replies is `unknown`. With the fixture declared
-  `serialize = true`, a call that kernel B made, still waiting for the serialize lock behind kernel
-  A's slow call when B is interrupted, is `cancelled` with the reason interrupted and is never
-  invoked; so is a call interrupted while it waits for a free connection, which never reaches the
-  binding.
+- **An interrupt ends the wait, not the binding.** An interrupt during a slow call raises where the
+  agent's code awaits it; the call's outcome is recorded `returned` when the binding's reply
+  arrives, with the note that the caller was interrupted; and the next call on that binding
+  returns its own result. The same call with the binding killed before it replies is `unknown`.
+  With the fixture declared `serialize = true`, a call that kernel B made, still waiting for the
+  serialize lock behind kernel A's slow call when B is interrupted, is `cancelled` with the reason
+  interrupted and is never invoked; so is a call interrupted while it waits for a free connection,
+  which never reaches the binding.
 - **Shutdown kills what it must.** Shutdown during a slow call reports it `unknown`, its binding
   killed at shutdown, in the report and in its outcome event, and no process remains in the
   binding's group.
 - **A draining call's callback runs.** The session closes while a fixture method sleeps before
   calling a callback: the callback runs during the drain, and the outer call ends `returned`.
-- **A callback that never returns leaves shutdown bounded.** A callback that catches every
-  `KeyboardInterrupt` in a loop, made by a call that is draining at the close: `shutdown` returns
-  within `0003-19`'s stated bound after its deadline, the outer call is `unknown`, and no process
-  remains in the binding's group.
+- **A callback that never returns leaves shutdown bounded.** A coroutine callback that catches
+  every `CancelledError` in a loop, and a plain one that loops on its worker thread, each made by a
+  call that is draining at the close: `shutdown` returns within `0003-19`'s stated bound after its
+  deadline, each outer call is `unknown`, and no process remains in the binding's group.
 - **A stopped binding stops only its callers.** With a binding stopped by `SIGSTOP`, plain Python,
   the user channel and a second binding all work as usual.
 - **A binding process that dies mid-session gives fork 3's result.** With the recommendation, a
@@ -180,9 +185,9 @@ drained, then killed and reported.
 - A stub is bound in a kernel opened after start, and the inventory lists no stub.
 - **A request the owner still holds at the close invokes nothing.** A request after
   `close_admission()` is refused with the documented error and recorded `refused`, admission
-  closed, and a fixture method that writes a file when called leaves no file. A fifth `to_thread`
-  worker on one kernel, waiting for a free connection behind four slow calls at the close, raises
-  the closing error at once, never reaches the binding, and is recorded `cancelled`.
+  closed, and a fixture method that writes a file when called leaves no file. A fifth awaited call
+  on one kernel, waiting for a free connection behind four in flight at the close, raises the
+  closing error at once, never reaches the binding, and is recorded `cancelled`.
 - **A serialize-lock waiter is cancelled when its binding observes the flag.** With the fixture
   declared `serialize = true` and the binding reading, a call from kernel B waiting for the
   serialize lock behind kernel A's 10 s call at the close is `cancelled`, with the close as the
@@ -219,7 +224,8 @@ drained, then killed and reported.
   a local bare repository over `file://`. The bare repository then holds the commit, and the stream
   holds every request the commit and the push made. This task's `## Decisions` lists each place
   found where a proxy behaves unlike the local object -- identity, `isinstance`, `repr`, what
-  iteration costs, exceptions -- with what the agent sees in each.
+  iteration costs, truthiness, `len`, plain `for`, assignment, exceptions -- with what the agent
+  sees in each.
 - `crates/outrig/public-api.txt` is unchanged, or regenerated if the event types `0003-19` made
   public gain fields.
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
@@ -286,6 +292,8 @@ drained, then killed and reported.
   puts into sessions.
 - **Hard: 0003-20.** Bindings that start, stop and are described; and through it, `0003-19`'s
   admission and report, and `0003-19`'s stream.
+- **Hard: the facade task (`plan/next/a-hosted-object-is-awaited.md`, numbered by
+  `/groom-plan`).** The facade this task binds in every kernel.
 
 ## See also
 
@@ -294,7 +302,11 @@ drained, then killed and reported.
   allow, published as events.
 - `plan/phase/0003-python/observability.md` and `plan/phase/0003-python/lifecycle.md` -- the
   integration-audit category, and the rows this task makes true.
+- `plan/next/a-hosted-object-is-awaited.md` -- the facade task: the proxy this task binds, what an
+  `await` resolves, and what raises instead of crossing.
 - `crates/outrig/src/python/host.rs` -- `enum Reply` and `dispatch`, which the relay extends.
 - `plan/next/event-audience-projections.md`, `plan/next/mandatory-audit-sink.md` and
   `plan/next/cancel-a-running-hosted-call.md` -- deferred: fields per audience, a subscriber whose
   failure closes admission, and stopping a call on the host.
+- `plan/next/hosted-calls-without-a-thread-per-call.md` -- deferred: a serving thread per
+  connection in place of a worker per in-flight call.

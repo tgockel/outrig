@@ -117,7 +117,10 @@ A `threading.Thread`
   So a thread those pools start for themselves -- `ThreadPoolExecutor`'s and
   `multiprocessing.pool.ThreadPool`'s, known by its target's module -- begins with an empty
   context, and each item runs in a copy of the context it was submitted from. `run_in_executor`
-  submits to the former, and `asyncio.to_thread` through it.
+  submits to the former, and `asyncio.to_thread` through it. A hosted call's `await` is such an
+  item: the facade submits it to a `ThreadPoolExecutor` of the kernel's pool from the awaiting
+  task, so the worker runs in a copy of that task's context and a callback's output on it is
+  billed to the awaiting execution (`hosted-objects.md`).
 
   A callback runs on whichever thread finishes the work -- a pool's own worker, or a thread a
   process pool started for whoever made it -- so it too runs in a copy of the context it was added
@@ -282,12 +285,13 @@ another kernel (`hosted-objects.md`). RPyC runs an incoming request on whichever
 the connection, so two kernels sharing one could run a callback meant for one kernel on the
 other's thread, billing its output and its state to the wrong agent. Each connection has one call
 in flight at a time and is served by a thread of its own in the binding process, so a callback
-still runs on the thread whose call started it.
+runs on the worker thread whose call started it, in the awaiting kernel's context, and a
+coroutine callback on that kernel's loop.
 
-A kernel blocked in a hosted call blocks only itself (`execution-and-rounds.md`). Interrupting
-that wait does not use the signal path above: the interpreter wakes the waiting connection
-directly, so a blocked hosted call can be interrupted on any kernel, not only the primary
-(`0003-17`). A child wedged in its own Python loop is still contained and unrecoverable, as above.
+A kernel awaiting a hosted call keeps running (`execution-and-rounds.md`). Interrupting the call
+does not use the signal path above: the interpreter wakes the worker's wait directly, so an
+awaited hosted call can be interrupted on any kernel, not only the primary (`0003-17`). A child
+wedged in its own Python loop is still contained and unrecoverable, as above.
 
 ## Open questions
 

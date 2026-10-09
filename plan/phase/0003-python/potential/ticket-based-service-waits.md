@@ -2,12 +2,13 @@
 
 ## Shipped
 
-A hosted call is synchronous and blocks its caller's kernel thread until the host answers
-(`hosted-objects.md`, "Calls are synchronous"). A binding process serves each connection on its
-own thread, and a kernel keeps a pool of connections per binding, up to 4, so one blocked call
-blocks no other call, even from the same kernel. A binding whose library is not thread-safe
-declares `serialize = true` under `[bindings.<name>]` and gets one call at a time. A call that
-should not stop its kernel's event loop runs under `asyncio.to_thread`. `0003-17` proves the
+A hosted call is awaited (`hosted-objects.md`, "Calls are awaited"): the awaiting code suspends,
+a worker thread sends the request through the kernel's pool of connections, and the kernel's
+event loop keeps running. A binding process serves each connection on its own thread, and a
+kernel keeps a pool of connections per binding, up to 4, so a wait of hours holds one worker
+thread and one connection of the caller's pool, not the kernel, and no other call waits on it,
+even from the same kernel. A binding whose library is not thread-safe declares
+`serialize = true` under `[bindings.<name>]` and gets one call at a time. `0003-17` proves the
 arrangement and adds a service-shaped fixture -- a method that blocks for minutes, an `ask ->
 ticket` plus poll pair, and bulk record operations -- and measures RPC count, process memory and
 tail latency across concurrent sessions.
@@ -28,17 +29,23 @@ a library has one.
 
 ## Evaluation
 
-`0003-17`'s numbers for the service-shaped fixture: RPC count per operation, the binding and
-interpreter processes' memory, and tail latency, for representative list, update and question
-operations across concurrent sessions, with a call blocked for minutes present throughout. If
-that call costs only its thread and no other call waits on it, the concurrent-connection design
-covers the wait and tickets are an application's choice. If memory or tail latency rises with
-the number of blocked calls, tickets are the pattern the preamble should teach. The step past
-tickets -- a direct Rust service adapter, with no hosted client and no RPyC -- is
+`0003-17` has reported. Its numbers for the service-shaped fixture -- RPC count per operation,
+the binding and interpreter processes' memory, and tail latency, for representative list, update
+and question operations across concurrent sessions, with a call blocked for minutes present
+throughout -- are in its `## Decisions`: a wait of minutes holds one connection and one thread
+and nothing else, except under `--serialize`, where it holds every call of that binding from
+every kernel of its session. So the concurrent-connection design covers the wait and tickets
+stay an application's choice, and `serialize = true` is the case where they still matter. If a
+session's use shows memory or tail latency rising with the number of waiting calls, beyond the
+one the fixture held, tickets are the pattern the preamble should teach. The step past tickets
+-- a direct Rust service adapter, with no hosted client and no RPyC -- is
 `plan/next/rust-object-as-python-object.md`, and the same numbers decide whether it is worth
 building.
 
 ## When
 
-After `0003-17` reports. A ticket pattern needs no change to OutRig and an embedder can adopt it
-at any time; what this entry decides is whether OutRig recommends it and builds support for it.
+`0003-17` has reported, and the facade over RPyC (`hosted-objects.md`, "Calls are awaited") keeps
+the arrangement it measured, so the question is open only to real-world usage: a session whose
+memory or tail latency rises with the number of waiting calls. A ticket pattern needs no change
+to OutRig and an embedder can adopt it at any time; what this entry decides is whether OutRig
+recommends it and builds support for it.

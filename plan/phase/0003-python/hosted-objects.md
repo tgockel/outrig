@@ -10,10 +10,12 @@ This page replaces `pyro-remote-objects.md`. It is the mechanism: what a binding
 how its packages arrive, why paths need no translating, how requests cross, what crosses, and what
 the agent sees. `boundary-policy.md` decides what is allowed to cross, `security.md` says why the
 host is where it runs and what that grants, and `lifecycle.md` says how it stops. The design was
-settled in the planning round of 2026-09-30. `0003-16` through `0003-18` are spikes that test the
-riskiest parts first -- `0003-16` ran the transport and the interception on the host, with both
-sides started by tests, and its `## Decisions` records what held -- and `0003-20` and `0003-21`
-build the rest.
+settled in the planning round of 2026-09-30, and the round of 2026-10-09 made hosted calls
+awaitable through a facade over the same transport ("Calls are awaited"), after `0003-17` had
+proved the pool it rests on. `0003-16` through `0003-18` are spikes that test the riskiest parts
+first -- `0003-16` ran the transport and the interception on the host, with both sides started by
+tests, and its `## Decisions` records what held -- and `0003-20`, the facade task
+(`plan/next/a-hosted-object-is-awaited.md`), and `0003-21` build the rest.
 
 GitPython is the example throughout, and nothing here is specific to it. No mechanism on this page
 names a library, a type, or a parameter: there are no per-library schemas, classification tables,
@@ -28,8 +30,8 @@ does not have.
   | Rust owner                           |  (1) | interpreter process              |
   |   relays frames, one bounded queue   |<---->|   reader thread routes `rpc`     |
   |   per binding; escalation; events    |      |   frames to their kernel         |
-  +--------------------------------------+      |   kernel `root`:  stub `repo`    |
-         ^                                      |   kernel `child`: stub `repo`    |
+  +--------------------------------------+      |   kernel `root`:  facade `repo`  |
+         ^                                      |   kernel `child`: facade `repo`  |
          | (2)                                  +----------------------------------+
          v
   +--------------------------------------+
@@ -66,7 +68,7 @@ serialize   = true
 - `args`, `kwargs` -- literal values passed to the factory. A path is written in the tagged form
   `{ path = "..." }` and reaches the factory as an absolute host path. A bare string is a string.
 - `serialize` -- `true` when the library is not thread-safe: the binding then runs one call at a
-  time ("Calls are synchronous"). It is `false` when absent. GitPython needs it.
+  time ("Calls are awaited"). It is `false` when absent. GitPython needs it.
 
 The tag exists for the reason path translation was rejected (below): OutRig cannot tell which
 strings are paths, so the operator says. `"."` might be a directory, a branch, or a message.
@@ -235,7 +237,7 @@ shared could run one kernel's callback on the other's thread -- in the wrong nam
 wrong execution slot. RPyC's own documentation recommends a connection per thread for this reason,
 and its thread-binding mode, `bind_threads`, is marked experimental. So no connection is shared
 between kernels (`agent-placement.md`), one call is in flight on a connection at a time, and a
-kernel opens more than one so that a blocked call blocks no other ("Calls are synchronous"). On
+kernel opens more than one so that one awaited call delays no other ("Calls are awaited"). On
 the host, the binding process serves each connection on a thread of its own, which is RPyC's
 ordinary server model, so requests from different connections run in the library at the same time
 unless the binding is declared `serialize = true`. `0003-17` proved the arrangement holds, with
@@ -281,9 +283,10 @@ on a reference the client had supplied, which unpickled bytes the client chose. 
 covers the handler table rather than the attribute check, and the host holds no general reference
 into the container ("What crosses").
 
-**Client-side wrappers are ergonomics only.** Anything installed on the container side -- the stub,
-a patched proxy class -- runs in the process the agent's code runs in, and that code can send raw
-frames past it. `0003-16`'s acceptance attacks the host with a raw client for that reason.
+**Client-side wrappers are ergonomics only.** Anything installed on the container side -- the
+facade, a patched proxy class -- runs in the process the agent's code runs in, and that code can
+send raw frames past it. The facade's rule that nothing crosses without an `await` is ergonomics
+too. `0003-16`'s acceptance attacks the host with a raw client for that reason.
 
 ## What crosses
 
@@ -304,17 +307,21 @@ Arguments, from the container:
   the agent fixes by hand (`0003-16`, fork 3).
 - **A proxy the host handed out** goes back as itself, if it belongs to the kernel whose
   connection the request travels on: the binding keeps one object table per kernel, shared by that
-  kernel's connections ("Calls are synchronous"), and resolves it to the original host object. A
+  kernel's connections ("Calls are awaited"), and resolves it to the original host object. A
   proxy from another binding, or from another kernel, would cross as a reference into the
   container, and is refused. That check runs before the callable rule below: a hosted method is
   callable, and would otherwise cross as a callback.
 - **A callable** becomes an opaque proxy that can only be called. It is valid only during the call
   it was passed to, and is revoked when that call returns. When the host library calls it, it runs
-  in the container, on the thread that made the call, which is blocked waiting for it. Each
-  invocation is a reverse interaction, evented with the id of the call it ran inside. A hosted call
-  made from inside it is an ordinary request and goes through policy (`boundary-policy.md`). What
-  it returns crosses back to the host by the same rules as an argument -- by value, or as the
-  shim's copy -- and any other reference into the container is refused.
+  in the container: a plain function on the worker thread that holds the call's connection, and a
+  coroutine function on the kernel's event loop, scheduled from that worker, which waits for it
+  and meanwhile serves the connection ("Calls are awaited"). Each invocation is a reverse
+  interaction, evented with the id of the call it ran inside. A hosted call made from inside a
+  coroutine callback is an ordinary request, travels on the outer call's connection, and goes
+  through policy (`boundary-policy.md`); a plain function cannot await and reads the proxies it is
+  given with `_sync()`, on the same connection. What it returns crosses back to the host by the
+  same rules as an argument -- by value, or as the shim's copy -- and any other reference into the
+  container is refused.
 - **Anything else** -- a generator, a dataclass instance, any other container object -- is refused
   before it is sent. Accepting it would give the host a reference into the container, and any use
   of that reference would run agent code inside the host library's call; that is how
@@ -323,23 +330,25 @@ Arguments, from the container:
 Results, from the host:
 
 - Values of the by-value types come back by value.
-- Everything else comes back as a proxy, a list or a dict included, so iterating a returned list is
-  a request per item.
+- Everything else comes back as a proxy, a list or a dict included, so `async for` over a returned
+  list is a request per item.
 - A proxy's class is built from the host's listing of the object's members, which holds its public
   names, those on RPyC's safe list, and -- for an object the host can call -- `__call__`. The
   safe list does not include `__call__`, and a call is a request of its own, decided like any
   other; without it no proxy of a hosted method could be called, and listing it only for callable
   objects keeps `callable()` on a proxy truthful.
 - The same host object returned twice on one connection is the same proxy, and on two of a
-  kernel's connections it is two proxies of one object ("Calls are synchronous"); `==` asks the
-  host either way. A library that builds a new object on every access yields a new proxy on every
-  access: GitPython builds a new `HEAD` each time `repo.head` is read, so `repo.head is repo.head`
-  is false. That is the library's behavior, not the transport's.
+  kernel's connections it is two proxies of one object ("Calls are awaited"); `await a.__eq__(b)`
+  asks the host either way, and `is` compares the proxies. A library that builds a new object on
+  every access yields a new proxy on every access: GitPython builds a new `HEAD` each time
+  `repo.head` is awaited, so two awaits of it give two proxies. That is the library's behavior,
+  not the transport's.
 - A method call is two requests, not one. RPyC's proxy fetches the bound method as a proxy of
   its own, calls that, and releases it afterwards; its one-request `callattr` is sent only for
   the special methods Python looks up on the type -- `__iter__`, `__next__`, `__getitem__` -- so
   iterating a returned list costs one request per item and per field read, and a release per
-  proxy. `0003-17` measured both; making an ordinary call one request is
+  proxy. The facade replays its steps as these same operations, so the counts stand. `0003-17`
+  measured both; making an ordinary call one request is
   `plan/next/one-request-per-hosted-method-call.md`.
 
 ## Exceptions
@@ -363,17 +372,20 @@ a token from text.
 
 ## Presentation
 
-Every kernel -- the primary and every child -- gets a local stub per binding, bound under the
-binding's name, and the stub resolves its binding on the kernel's own thread the first time the
-agent uses it. **Building a kernel resolves nothing.** The primary kernel is built before the
-reader thread starts, and every other kernel is built on the reader thread itself, by `_open`.
-Fetching a binding's root is a synchronous request whose reply only the reader thread can deliver,
-so resolving during construction would wait forever in both cases.
+Every kernel -- the primary and every child -- gets a facade per binding, bound under the
+binding's name: a lazy proxy over the binding's root that resolves nothing until it is awaited
+("Calls are awaited"). The first `await` opens the kernel's first connection and fetches the
+root, on the worker thread that runs the await. **Building a kernel resolves nothing.** The
+primary kernel is built before the reader thread starts, and every other kernel is built on the
+reader thread itself, by `_open`; nothing resolves without an `await`, and the reader thread,
+which delivers every reply, never waits for one.
 
 The agent learns its bindings two ways, and neither crosses the boundary:
 
-- **The orientation** lists each binding's name and description, and says that the name is an
-  object on the host while an `import` of the same library is a local copy.
+- **The orientation** lists each binding's name and description, says that the name is an object
+  on the host while an `import` of the same library is a local copy, and says that a hosted
+  object is awaited -- a rule that cannot be learned by looking, since `repo.head.commit.hexsha`
+  reads like a plain attribute chain (`discovery.md`).
 - **`runtime.bindings`** answers from a local manifest. Asking what is bound makes no remote call,
   runs no `repr`, and reads no property.
 
@@ -385,55 +397,96 @@ collision between bindings is an embedding-API binding that repeats a name alrea
 the local name -- `repo = None`, `del repo` -- changes the namespace and nothing else: the binding,
 its process, and its authority are untouched, and `runtime.bindings` still lists it.
 
-**Asking about a proxy is a request.** `help(repo.index)` and `dir(c)` cross the boundary and are
-intercepted, evented, and decided like anything else. So is echoing a proxy as an execution's
-trailing expression, which calls `repr` inside the agent's own execution -- the line
-`execution-and-rounds.md` draws for rendering. Automatic observation never touches a proxy: the
-inventory reports its local class name, which RPyC built when the proxy arrived. `help(git.Repo)`
-on the locally imported class answers without crossing at all.
+**Asking about a proxy is local.** `repr`, `str`, `dir` and `help` answer in the container from
+what the facade knows -- the binding, the path, and for a resolved proxy the host type's name and
+the method names RPyC listed when it built the proxy's class -- and make no request. Echoing a
+proxy as an execution's trailing expression therefore runs no host code, and automatic observation
+never touches one: the inventory reports the facade's type and, for a resolved proxy, the host
+type's name. The host's own answers are explicit and awaited -- `await x.__repr__()`,
+`await x.__str__()`, `await x.__dir__()` -- sent as RPyC's dedicated handlers and recorded under
+those operation names (`boundary-policy.md`). `help(git.Repo)` on the locally imported class
+describes the library without crossing at all.
 
-## Calls are synchronous
+## Calls are awaited
 
-A hosted call is synchronous, as the library's API is. While it runs:
+A hosted object is used by awaiting it. Attribute access, item access and a call build a path and
+cross nothing; `await` resolves the path, one RPyC request per step and two for a method call
+("What crosses"), and settles the awaiting code with the result:
 
-- **Its kernel's thread is blocked, and so is that kernel's event loop.** Nothing else in that
-  kernel runs: its background tasks stall, a message that arrives waits in the queue, and
-  `runtime.wait` cannot raise `MessageAvailable` until the call returns. A synchronous
-  `subprocess.run` costs the same, and the same remedy applies.
-- **Other kernels continue.** The blocked thread waits on a condition variable, which releases the
-  GIL (`0003-16`, `0003-17`). Their calls to the same binding run on the host while this one does,
-  unless the binding is declared `serialize = true`, as below.
+```python
+sha = await repo.head.commit.hexsha        # three `getattr` requests
+info = await repo.remotes.origin.push()    # three `getattr`, a `call`, and a `del` after
+```
+
+While the host works, the kernel's event loop turns: messages are delivered, `runtime.wait` wakes,
+and the kernel's other tasks run. Other kernels are unaffected, as before. A path that is not
+awaited is a path and not a value, and its `repr` says so.
+
+- **What `await` returns.** A result of the by-value types ("What crosses") is the value. Anything
+  else is a resolved proxy bound to the host object, which chains and awaits the same way:
+  `c = await repo.head.commit`, then `await c.hexsha`. Awaiting a resolved proxy returns itself;
+  awaiting a path twice resolves it twice. A tuple comes back as a tuple with proxies inside. A
+  hosted exception is raised where the call is awaited, typed as "Exceptions" says.
+- **A path is awaitable, not a coroutine.** `await` and `asyncio.gather` take it as it is.
+  `asyncio.create_task` takes only a coroutine, so a path scheduled as a named task goes in
+  through `_resolve()`, which returns one:
+  `asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")`. The facade is not
+  a coroutine because a coroutine has `send`, `throw` and `close` as public names, and hosted
+  objects own those (`repo.close()`). `asyncio.wait` and `runtime.wait` take the task, as they
+  take any operation (`messages.md`).
+- **Iteration is `async for`.** One request to start and one per item, as `0003-17` measured, and
+  `[x async for x in proxy]` materializes. `for`, `iter`, `len` and truthiness on a proxy raise
+  `TypeError` naming the awaited spelling -- `async for`, `await x.__len__()`,
+  `await x.__bool__()` -- because a proxy cannot know its length or truth without a round trip and
+  must not make one silently. `in`, `==` and the operators raise the same way, toward
+  `await x.__contains__(y)` and `await a.__eq__(b)`; `hash` is the proxy's identity, so proxies
+  can be dict keys and set members, and `is` compares proxies.
+- **Assignment and deletion are explicit.** `await x._set("name", value)` and
+  `await x._delete("name")` send `setattr` and `delattr`. `x.name = value` and `del x.name` raise
+  with the pointer, since an assignment statement cannot be awaited. The facade's own API lives
+  under single-underscore names -- `_set`, `_delete`, `_resolve`, `_sync`, `_isinstance`,
+  `_netref`, `_binding` -- and the host refuses every private name ("Interception"), so no hosted
+  attribute can collide with them. The facade reserves no public name: `await repo.close()` and
+  `await gen.send(v)` are steps like any other. Dunder names outside the facade's own are steps
+  too, which is how `await x.__len__()` reaches RPyC's safe-list handler.
+- **`hasattr` cannot see the host.** A lookup builds a path and raises nothing, so
+  `hasattr(x, "name")` is always true and `getattr(x, "name", default)` never chooses its
+  default; the facade cannot tell either from an ordinary lookup, so it cannot refuse them the
+  way it refuses `len`. The error arrives at the `await`, and it is an `AttributeError` -- the
+  library's own, or the host's refusal of a private name ("Interception") -- so the spelling is
+  `try: await x.name` / `except AttributeError`.
 - **RPyC's request timeout is off.** Its default is 30 seconds, after which the caller stops waiting
   while the host carries on -- an `unknown` outcome chosen by a constant rather than by anyone. A
   push, a clone, or a call waiting for approval can legitimately take longer.
 
-A long call that should not stop its kernel goes to a worker thread, in plain Python, with the
-whole expression in the worker:
-
-```python
-info = await asyncio.to_thread(lambda: repo.remotes.origin.push())
-```
-
-The loop keeps running, messages arrive, and `runtime.wait` works. The attribute reads are
-requests too, and inside the worker they block nothing else. Given a method the kernel's thread
-looked up, `asyncio.to_thread(repo.remotes.origin.push)`, the worker runs only the call, and the
-three reads cost the loop their round trips.
+**Where a request runs.** Each `await` runs on a worker thread of the pool's own executor, under a
+copy of the awaiting task's context, so the execution, `outrig.runtime` and an invocation id
+resolve on it and its output is attributed (`agent-placement.md`). The worker takes a connection
+from the kernel's pool for the binding, exactly as the `to_thread` workers of the synchronous
+design did, and `0003-17` proved the arrangement.
 
 **A kernel has a pool of connections per binding, up to four.** On one connection, one call is in
 flight at a time: a callback request arrives on the connection and is served by whichever thread
-is reading it, and with one caller waiting that is the thread whose call the callback belongs to.
+is reading it, and with one caller waiting that is the worker whose call the callback belongs to.
 So a call takes a connection with no call in flight, opens another when none is free and fewer
-than four exist, and otherwise waits for one. Two `to_thread` workers from one kernel then run
-their calls at the same time, and a call that blocks for an hour holds its connection and its
-thread, and no other call. An RPyC proxy sends its requests on the connection that produced it,
-and the object ids it names are that connection's; the pool works around both. The binding process
-keeps one object table per kernel, shared by that kernel's connections, so a proxy resolves on any
-of them, and the container side sends a proxy's request on whichever connection its call took
-("What crosses"). The first connection is opened at the kernel's first use of the binding, with
-its root resolved then, on the kernel's own thread ("Presentation"); a later one is opened by the
-thread whose call needs it, which is never the reader thread. A thread waiting for a free
-connection waits where the reader thread can wake it, as a caller waiting for its reply does, and
-a call woken there was never sent. `0003-17` proved the arrangement.
+than four exist, and otherwise waits for one. Two awaited calls from one kernel then run on the
+host at the same time, and a call that waits for an hour holds its connection and its worker, and
+no other call. A fifth awaited call waits in the executor's queue, with no thread, until a worker
+is free, and one woken there was never sent. An RPyC proxy sends its requests on the connection
+that produced it, and the object ids it names are that connection's; the pool works around both.
+The binding process keeps one object table per kernel, shared by that kernel's connections, so a
+proxy resolves on any of them, and the container side sends a proxy's request on whichever
+connection its call took ("What crosses"). Every connection is opened by the worker whose call
+needs it, never by the reader thread, and a worker waiting for a free connection waits where the
+reader thread can wake it, as a worker waiting for its reply does.
+
+**Callbacks run where the call is served.** A plain-function callback runs on the worker thread
+holding the call's connection and reads the proxies it is given with `_sync()`, which resolves on
+that thread and that connection, so nested calls complete with every connection occupied. A
+coroutine callback runs on the kernel's loop, scheduled from the worker, which waits for it and
+meanwhile serves the hosted calls the coroutine awaits, on the same connection; under
+`serialize = true` that is what lets the nested call through the re-entrant turn below, and it is
+what gives the nested call its parent id.
 
 **The binding process serves each connection on a thread of its own.** That is RPyC's ordinary
 server model -- its `ThreadedServer` starts a thread per connection -- so calls from different
@@ -467,33 +520,37 @@ thread-safe. RPyC itself is concurrent across connections, so the serialization 
 choice, not the transport's. The reviewer raised what it costs a service: a hosted method that
 waits for a person -- a `wait_for_answer` that returns when someone answers, hours later -- would
 have held every other call to that binding, from every kernel, for as long as it waited, and
-moving the caller to a worker thread frees the caller's loop and not the binding. The maintainer
-agreed, and the rule became the opt-in above, for the libraries that need it.
+awaiting the call frees the caller's loop and not the binding. The maintainer agreed, and the rule
+became the opt-in above, for the libraries that need it.
 
 Nothing coordinates a binding's writes with the agent's, in either mode. Agent code that writes a
 file while a hosted call writes the same file -- the repository's index, a file in the working tree
 -- is not serialized with that call, and the file holds whatever the two writes leave.
 
-**An interrupt raises in the caller** -- by waking the waiting call, on every kernel the primary
-included, rather than by the primary's SIGINT path, which could raise between a frame's header and
-its body (`0003-17`). A call whose target had been invoked keeps running on the host, because RPyC
-has no request that cancels one. Its reply, when it comes, is not handed to anyone, but it is
-recorded: the call's outcome is `returned` or `raised`, with the note that the caller had been
-interrupted, and the connection stays usable -- though not before that reply has arrived: the
-next call into the pool reads it and drops it, and the connection is free again. A callback the
-library makes after its caller was interrupted is refused the same way, when that next call
-reads it, so a library that calls back then waits for the kernel's next call into the pool
-(`0003-17`). Only a call whose binding is killed or dies before
-replying is `unknown`, in the sense `execution-and-rounds.md` gives it: the host cannot say whether
-it took effect, and nothing retries it. A call not yet invoked -- held for a decision, waiting for
-a free connection, or waiting for the serialize lock -- is `cancelled`, with the
-reason interrupted, and its target never runs (`boundary-policy.md`). Cancelling the
-coroutine that awaits a `to_thread` call cancels a wait, the first of the four cancellations
-`execution-and-rounds.md` distinguishes, and the call goes on.
+**An interrupt raises where the call is awaited** -- by waking the worker's wait through the pool's
+condition variable, on every kernel the primary included, rather than by the primary's SIGINT
+path, which could raise between a frame's header and its body (`0003-17`). A call whose target
+had been invoked keeps running on the host, because RPyC has no request that cancels one. Its
+reply, when it comes, is not handed to anyone, but it is recorded: the call's outcome is
+`returned` or `raised`, with the note that the caller had been interrupted, and the connection
+stays usable -- though not before that reply has arrived: the next call into the pool reads it
+and drops it, and the connection is free again. A callback the library makes after its caller was
+interrupted is refused the same way, when that next call reads it, so a library that calls back
+then waits for the kernel's next call into the pool (`0003-17`). Only a call whose binding is
+killed or dies before replying is `unknown`, in the sense `execution-and-rounds.md` gives it: the
+host cannot say whether it took effect, and nothing retries it. A call not yet invoked -- held for
+a decision, waiting in the executor's queue or for a free connection, or waiting for the serialize
+lock -- is `cancelled`, with the reason interrupted, and its target never runs
+(`boundary-policy.md`). Cancelling the task that awaits a hosted call wakes the worker the same
+way -- a task's cancellation, the second of the four `execution-and-rounds.md` distinguishes --
+and the call goes on, the fourth: an accepted remote operation; `runtime.wait` leaves the task and
+its call running.
 
-Hosted calls that are awaitable without a worker thread need RPyC to deliver a reply to an event
-loop, which it does not do, and are deferred to `plan/next/awaitable-hosted-calls.md`. Cancelling
-a call already invoked is `plan/next/cancel-a-running-hosted-call.md`.
+Awaiting a hosted call costs a worker thread per call in flight, the cost `to_thread` paid in the
+synchronous design; removing it is `plan/next/hosted-calls-without-a-thread-per-call.md`.
+Cancelling a call already invoked is `plan/next/cancel-a-running-hosted-call.md`. A protocol
+without RPyC, which would remove the pool as well, is
+`potential/custom-hosted-object-protocol.md`.
 
 ## Lifetime
 
@@ -521,8 +578,9 @@ result, while the call's outcome event records `returned` or `raised` when the r
 `unknown` only if it never does. From then on no limit counts the call: the kernel's pool, which
 bounded it at four in flight, is gone with the kernel; `children-max` stops counting the child
 once its kernel is gone; and the agent that released the child is charged nothing. A child that
-is spawned, offloads to a worker a call that never returns, and is released, repeated,
-accumulates threads and calls in the binding process for as long as the session lives. The
+is spawned, awaits in a background task a call that never returns, and is released, repeated,
+accumulates threads and calls in the binding process for as long as the session lives: the
+container's worker ends when `close_hosted` wakes it, and the host's thread runs on. The
 maintainer documents this as unbounded for now; bounding it is
 `plan/next/bound-surviving-binding-calls.md`.
 
@@ -595,14 +653,45 @@ server side in Rust, or an FFI layer under a Python class. A Rust service can in
 pure-Python client that is hosted like any library. The trait idea is
 `plan/next/rust-object-as-python-object.md`.
 
+**Rejected: keeping calls synchronous, with `asyncio.to_thread` for long ones.** What this page
+said until the round of 2026-10-09, and what `0003-17` proved. The natural spelling blocked the
+kernel's loop for as long as the host took -- no message delivered, `runtime.wait` deaf,
+background tasks stalled -- which for a push or a human-answered wait is unbounded; the remedy had
+to be taught and was easy to get wrong, since `to_thread(repo.remotes.origin.push)` offloads only
+the call and costs the loop three round trips; and the facade pays the same thread per in-flight
+call `to_thread` did while keeping the pool, the wake and `serialize` unchanged. The facade is the
+stub the relay task was adding anyway.
+
+**Rejected: replacing RPyC with an asyncio-native transport.** The survey of 2026-10-09 found no
+maintained pure-Python library that is asyncio-native and hosts a transparent object graph: every
+transparent-proxy library (RPyC, rpyc-ng, Pyro5, Py4J, `multiprocessing.managers`) is synchronous,
+every asyncio-native one (Callosum, jeepney, dbus-fast, aiorpc, autobahn, pycapnp) is a service or
+schema model, and the three with the right shape are single-author alpha projects. The structural
+reason: attribute syntax cannot be awaited, so `repo.head.commit` is three lookups Python performs
+synchronously, and any proxy library chooses between blocking in `__getattr__` and returning a
+lazy path that is awaited later. The facade is that lazy path over the transport that exists.
+RPyC's own `async_` returns an `AsyncResult` that is not awaitable (upstream
+tomerfiliba-org/rpyc#506, open since 2022) and needs a thread serving the connection to process
+the reply. A protocol of OutRig's own, which would also remove the pool and the thread per call,
+is `potential/custom-hosted-object-protocol.md`.
+
+**Rejected: the reader thread processing replies, so that no thread is started per call.** The
+sketch `plan/next/awaitable-hosted-calls.md` held. Unboxing a reply can issue a nested synchronous
+`inspect` to build a proxy's class (`0003-16`), and a thread that both delivers frames and waits
+for one deadlocks; the reader thread must never wait for a reply (`0003-17`). The facade keeps a
+kernel-side thread per in-flight call; a serving thread per connection instead is
+`plan/next/hosted-calls-without-a-thread-per-call.md`.
+
 ## Open questions
 
 - How a relative tagged path resolves. The config's general rule is the directory of the file that
   declared it; `0003-20` states it for `[bindings]`.
 - What a binding process dying mid-session does. Its calls in flight are `unknown`; whether the
   session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-21`'s.
-- Whether the stub iterates a returned container in batches with RPyC's `buffiter`, which would
-  make one request per batch rather than per item.
+- Whether the facade's `async for` fetches a returned container in batches with RPyC's
+  `buffiter`, which would make one request per batch rather than per item.
+- Whether a plain-function callback may make a hosted call through `_sync()` at all, or only a
+  coroutine callback may, since the plain one cannot await.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of
   two kernels against one binding, and of two sessions against one service, are the first
   evidence.
@@ -642,6 +731,22 @@ pure-Python client that is hosted like any library. The trait idea is
   `smmap` are `py3-none-any` was checked by downloading them for the payload's platform tag.
 - That building a kernel cannot resolve a binding is reasoned from the interpreter's startup order
   and `_open`, not observed.
+- The facade's claims, which the facade task (`plan/next/a-hosted-object-is-awaited.md`) tests:
+  that an interrupt or a cancel reaches a worker's wait, since `Kernel._wake` today finds a wait
+  by the kernel thread's ident and
+  `interruptible` is read from the calling thread's frames, so the facade must register its waits
+  by the awaiting execution and mark them interruptible on its behalf; that a worker runs under a
+  copy of the awaiting task's context, so `outrig.runtime` and an invocation id resolve on it and
+  a callback's output is attributed; that a coroutine callback's nested hosted calls travel on the
+  outer call's connection, served by the worker holding it, since on a new connection they would
+  deadlock under `serialize = true` and lose the parent id; that `isinstance(c, git.Commit)` and
+  `except git.GitCommandError` hold through the facade; that `repr`, `str`, `dir` and `help` make
+  no request, since pydoc probes `__name__`, `__doc__` and `__module__`, which the facade must
+  answer locally; that `_resolve()` satisfies `asyncio.create_task`, that `gather` and `wait_for`
+  take a path as it is, and that `asyncio.wait` and `runtime.wait` take only the task; that a
+  woken worker settles the awaiting future through a loop that may be stopping because its
+  kernel is being released; and that the thread per call costs what `to_thread`'s did against
+  the memory ceiling (`plan/next/one-drain-thread-for-every-execution.md`).
 - What the spikes must confirm before anything is built on this page. A spike that cannot confirm
   its part stops and reports to the maintainer, who decides what follows:
   - `0003-16` -- confirmed: every handler is intercepted, the conformance test fails on a changed

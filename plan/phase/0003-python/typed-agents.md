@@ -443,7 +443,7 @@ async def main(repo, base: str = "origin/main", *paths: str,
                timeout: float | None = 1800.0) -> ReviewOutcome:
     if max_parallel <= 0:
         raise ValueError("max_parallel must be >= 1")   # Semaphore(0) never releases
-    diff = repo.git.diff(base, "--", *paths)          # hosted, intercepted call
+    diff = await repo.git.diff(base, "--", *paths)    # hosted, awaited call
     sections = split_sections(diff)
     if not sections:
         return ReviewOutcome(kind="no-changes", sections=0)
@@ -509,11 +509,10 @@ What it guarantees:
 - **An interruption stops the children.** Cancelling `main` cancels the gather's waiters, which
   cancels no child; the `finally` cancels every handle not yet settled, and each cancelled call
   releases its child.
-- **The hosted call blocks.** `repo.git.diff` is a synchronous hosted call, so it holds this
-  kernel's thread, and with it the agent's event loop, while it runs (`hosted-objects.md`).
-  `await asyncio.to_thread(lambda: repo.git.diff(base, "--", *paths))` keeps the loop turning
-  during a long one. The whole expression goes in the lambda because `repo.git` and `.diff` are
-  hosted attribute lookups too, which passing the bound method would make on this thread.
+- **The hosted call is awaited.** `repo.git.diff(base, "--", *paths)` builds a path and sends
+  nothing; `repo.git` and `.diff` are steps of it, sent with the call when the expression is
+  awaited (`hosted-objects.md`, "Calls are awaited"). The call runs on a worker thread through
+  the kernel's pool of connections, so the agent's event loop keeps turning during a long diff.
 - **Nothing replays.** Aggregation is pure Python, so running `merge` again is safe. Running `main`
   again makes new model calls, and nothing runs it again on its own.
 

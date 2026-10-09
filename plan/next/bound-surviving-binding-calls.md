@@ -7,10 +7,10 @@ A hosted call runs in the binding on the thread serving its connection, and RPyC
 fork 9) or its connection closes, the caller is told `unknown`, the binding runs the call to
 completion, and nothing counts it afterward: the kernel's pool is gone, `children-max` stops
 counting the child once its kernel is gone, and the releasing agent is charged nothing
-(`plan/phase/0003-python/hosted-objects.md`, "Lifetime"). So spawn a child, offload a call that
-never returns, release, repeat: each cycle leaves a thread and a call in the binding, and neither
-`children-max` nor `requests-max` bounds it. The maintainer documents it as unbounded for now and
-notes that it needs addressing later.
+(`plan/phase/0003-python/hosted-objects.md`, "Lifetime"). So spawn a child, await, in a
+background task, a call that never returns, release, repeat: each cycle leaves a thread and a
+call in the binding, and neither `children-max` nor `requests-max` bounds it. The maintainer
+documents it as unbounded for now and notes that it needs addressing later.
 
 ## Candidate bounds, none chosen
 
@@ -25,6 +25,7 @@ notes that it needs addressing later.
 
 ## Acceptance
 
-- The cycle -- spawn, offload a never-returning call, release -- repeated past the chosen bound is
-  refused or ended there, with a documented error and an event; the binding's thread count stays
-  under a stated ceiling; calls from other kernels keep running; a call that returns is uncounted.
+- The cycle -- spawn, await in a background task a call that never returns, release -- repeated
+  past the chosen bound is refused or ended there, with a documented error and an event; the
+  binding's thread count stays under a stated ceiling; calls from other kernels keep running; a
+  call that returns is uncounted.

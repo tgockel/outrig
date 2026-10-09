@@ -157,11 +157,11 @@ agent's history like anything else it ran.
 - **Correlation.** While an invocation runs -- from the call to `invoke`, so the parse call is
   inside it -- the boundary events of the hosted calls made in it and the start events of the
   typed-agent calls it makes carry the invocation's id, through a context variable `invoke` sets
-  around the entry, which tasks the entry starts and `to_thread` workers inherit. It is diagnostic
-  context, not a principal: policy never reads it, and code in the same interpreter can set or
-  clear it (`skills.md`). A skill's helper called directly -- its module imported and the function
-  called, without `invoke` -- produces the boundary events of its hosted calls without the id, and
-  no invocation events.
+  around the entry, which tasks the entry starts, `to_thread` workers and the worker a hosted call
+  runs on inherit. It is diagnostic context, not a principal: policy never reads it, and code in
+  the same interpreter can set or clear it (`skills.md`). A skill's helper called directly -- its
+  module imported and the function called, without `invoke` -- produces the boundary events of its
+  hosted calls without the id, and no invocation events.
 
 ## Acceptance
 
@@ -274,10 +274,10 @@ model makes of a directive is not measured here.
   children carries the sum of their usage and the parser child's, and the main round's total
   includes it once.
 - **Calls made in an invocation carry its id.** The parse call, a hosted call the entry makes, one
-  made from a `to_thread` worker it starts, and an `@outrig.agent` call it makes carry the
-  invocation's id in their events. The same helper called directly, after
-  `import outrig_skills.review_diff.skill`, produces the hosted call's boundary events without an
-  invocation id, and no invocation events.
+  made from a task it starts, one made inside a coroutine callback of a hosted call it makes, and
+  an `@outrig.agent` call it makes carry the invocation's id in their events. The same helper
+  called directly, after `import outrig_skills.review_diff.skill`, produces the hosted call's
+  boundary events without an invocation id, and no invocation events.
 - **The parts compose, end to end**, through `run-new` with a mock model, a mock evaluator and a
   binding of `0003-16`'s fixture library. A `/name` directive is parsed by a child into
   `ReviewDiffParams`, and the entry uses its bound binding; makes three `@outrig.agent` calls,

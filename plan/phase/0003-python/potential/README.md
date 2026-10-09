@@ -35,3 +35,5 @@ Each entry has the same sections: `## Shipped`, `## Alternative`, `## Evaluation
   beyond the per-call turn manifest.
 - `one-shot-nudging.md` -- prompting a work child more than once, or asking what blocks it,
   before its call settles `CompletionRejected`, against one prompted round and then failure.
+- `custom-hosted-object-protocol.md` -- an asyncio-native hosted-object protocol of OutRig's
+  own, with one multiplexed connection and no RPyC, against the awaitable facade over RPyC.

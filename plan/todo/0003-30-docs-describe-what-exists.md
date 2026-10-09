@@ -7,7 +7,9 @@ tasks it documents, and `0003-29` until the round of 2026-10-01 added
 `0003-29-an-agent-class-answers-requests` before it. The finished tasks `0003-01` and `0003-02`
 refer to it by its first number, as the task that documents what `run-new` does, and the queue as
 committed before 2026-10-01 refers to it by the second; in the current queue, `0003-29` is the
-agent-class task.
+agent-class task. A third renumbering, in the planning round of 2026-10-09, inserted the facade
+task (`plan/next/a-hosted-object-is-awaited.md`) before the relay task and shifted `0003-21`
+through `0003-30` by one.
 
 `doc/` is design-first: `.claude/CLAUDE.md` says subsystem pages carry `TODO: Incomplete` until
 their implementation exists. Individual tasks drop their own markers as behavior becomes real,
@@ -80,9 +82,10 @@ MCP now sits, and what a binding lets an agent do on the host.
   `<Skill>Params`, and an agent that understood the text itself calls `invoke(name, params=...)`,
   which makes no model call. Either way the instance is on the invocation's event.
 - **A concepts page on hosted objects and the boundary**: what a binding is, that a hosted object
-  acts with the host user's authority, the same paths on both sides, what crosses and what is
-  refused, the default of allow with every request published as events, rules and escalation,
-  and the evaluator.
+  acts with the host user's authority, the same paths on both sides, that a hosted object is
+  awaited, how iteration, assignment and the host's `repr` are spelled, what raises instead of
+  crossing, what crosses and what is refused, the default of allow with every request published
+  as events, rules and escalation, and the evaluator.
 - **Skills and typed agents in the Python-runtime concepts page**: the two skill roots and the
   shadowing rule, `/name`, `outrig.skills` -- `invoke(name, text)` deriving `<Skill>Params` from
   the entry's signature and having a typed agent call parse the text into it, and

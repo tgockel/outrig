@@ -3,12 +3,12 @@
 ## Context
 
 RPyC 6.0.2's protocol has twenty request handlers (`rpyc/core/consts.py`), and none of them
-cancels a request. So when agent code is interrupted during a hosted call, `0003-17` raises in
-the caller, telling it the call's outcome on the host is unknown, and the binding process keeps
-running the call until it returns; its reply is dropped when it comes, and `0003-21` records the
-call's outcome then as `returned` or `raised` (`plan/phase/0003-python/lifecycle.md`). At
-shutdown a running call is given until the drain deadline, and then the binding's process group
-is killed.
+cancels a request. So when agent code is interrupted during a hosted call, `0003-17` raises
+where the call is awaited, saying the call's outcome on the host is unknown, and the binding
+process keeps running the call until it returns; its reply is dropped when it comes, and
+`0003-21` records the call's outcome then as `returned` or `raised`
+(`plan/phase/0003-python/lifecycle.md`). At shutdown a running call is given until the drain
+deadline, and then the binding's process group is killed.
 
 Between an interrupt and shutdown, a call the user stopped can still act: a push still sending, a
 long subprocess still running. What the agent is told -- outcome unknown -- is true, but nothing

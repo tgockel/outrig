@@ -85,35 +85,34 @@ Killing a **subprocess** is a signal to something with its own opinion about dyi
 **accepted remote operation** may be impossible, and its effect may already have happened. A
 design that says only "cancel" has not said anything.
 
-### A hosted call blocks its kernel
+### A hosted call is awaited
 
-A call on a hosted object (`hosted-objects.md`) is an ordinary synchronous Python call, and it
-holds the calling kernel's thread until the host answers. While it does, that kernel's event loop
-does not turn: messages are not delivered to it, a `runtime.wait` in one of its tasks does not
-wake, and its background tasks stall. Other kernels keep running, because the waiting thread does
-not hold the GIL. A long call that should not stall the loop is written
-`await asyncio.to_thread(lambda: repo.remotes.origin.push())`, which runs the whole expression on
-a worker thread. The attribute lookups are hosted calls too, so a method the kernel's thread looks
-up, `to_thread(repo.remotes.origin.push)`, costs the loop three round trips and offloads only the
-call. A bare `await` of the worker still does not watch the channels, so the pattern for staying
-reachable during a long call is a retained task plus `runtime.wait`:
+A call on a hosted object (`hosted-objects.md`, "Calls are awaited") is awaited. The name bound
+for a binding is a lazy proxy: `repo.remotes.origin.push()` builds a path and makes no round
+trip, and `await` resolves the path on a worker thread through the kernel's pool of connections
+and settles the awaiting code. While the host works, that kernel's event loop keeps turning:
+messages are delivered to it, a `runtime.wait` in one of its tasks wakes, and its background
+tasks run. The attribute lookups are steps of the same path, sent when it is awaited. A bare
+`await` still does not watch the channels, so the pattern for staying reachable during a long
+call keeps its shape, a retained task plus `runtime.wait`, written over the awaitable. A proxy
+is awaitable and not a coroutine, so `create_task` takes its `_resolve()`:
 
 ```python
-push = asyncio.create_task(asyncio.to_thread(lambda: repo.remotes.origin.push()), name="push")
+push = asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")
 done, pending = await runtime.wait({push})
 ```
 
 A kernel keeps a pool of up to four connections per binding, with one call in flight per
 connection, so one call waiting on the host does not, by default, delay the binding's other
-calls: calls from several of its threads run at once, up to four, and a fifth waits for a free
-connection; only a binding declared `serialize = true` runs its calls one after another
+calls: several awaited calls run at once, up to four, and a fifth waits for a free connection;
+only a binding declared `serialize = true` runs its calls one after another
 (`hosted-objects.md`, `0003-17`).
 
-An interrupt reaches a kernel blocked in a hosted call and raises in the caller (`0003-17`). What
-it does to the call depends on where the call is. A call waiting for approval is cancelled and
-never runs later (`boundary-policy.md`). A call already running on the host is the fourth
-cancellation above, made concrete: RPyC has no cancel message, so the host call continues until it
-returns, and its reply is recorded as `returned` or `raised` with the note that the caller was
+An interrupt reaches an awaited hosted call and raises where it is awaited (`0003-17`). What it
+does to the call depends on where the call is. A call waiting for approval is cancelled and never
+runs later (`boundary-policy.md`). A call already running on the host is the fourth cancellation
+above, made concrete: RPyC has no cancel message, so the host call continues until it returns,
+and its reply is recorded as `returned` or `raised` with the note that the caller was
 interrupted.
 
 ## A round

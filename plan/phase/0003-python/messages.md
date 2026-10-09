@@ -240,7 +240,8 @@ comes back in `done` or `pending` as itself; `runtime.wait` watches its `future`
 what `asyncio.wait`, knowing nothing of handles, takes. Prefer `asyncio.create_task(coro,
 name="...")` over `ensure_future`, because `(done, pending)` comes back as sets of tasks and
 `Task.get_name()` is what makes them legible. `Task-7` is a worse answer than `ci_run` in a
-result, a traceback, and the variable inventory alike.
+result, a traceback, and the variable inventory alike. A hosted path is not a coroutine; it goes
+in as `path._resolve()` (`hosted-objects.md`, "Calls are awaited").
 
 Other pages depend on the second property. Because the operation survives under its name and
 the agent's state survives in its namespace, a round can end with nothing important left in the

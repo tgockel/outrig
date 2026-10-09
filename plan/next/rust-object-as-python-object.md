@@ -21,7 +21,9 @@ question operations, made through a hosted Python client across concurrent sessi
 service behind such a client meets its numbers, the second client and the extra process are a
 cost and not a reason to build this. If per-call overhead or the memory of blocked calls
 dominates, this adapter is the step after the ticket pattern
-(`plan/phase/0003-python/potential/ticket-based-service-waits.md`).
+(`plan/phase/0003-python/potential/ticket-based-service-waits.md`). The protocol a Rust service
+could answer directly, with no hosted client and no RPyC, is
+`plan/phase/0003-python/potential/custom-hosted-object-protocol.md`.
 
 ## Shape
 
@@ -46,8 +48,9 @@ builder.bind("task", Arc::new(TaskService::new(..)));
   described type, the method and the operation; `evaluate` sends the call to the evaluator
   (`0003-23`); each call is evented as in `0003-21`; admission and the shutdown report cover it
   (`plan/phase/0003-python/lifecycle.md`).
-- Calls are awaitable, as `mcp-wrappers.md` asks. `CallContext` carries the call id, the binding
-  and a cancellation signal, so unlike an RPyC call this one can be told to stop.
+- Calls are awaitable with the same spelling as a hosted object's, so the two read alike
+  (`mcp-wrappers.md`). `CallContext` carries the call id, the binding and a cancellation signal,
+  so unlike an RPyC call this one can be told to stop.
 
 Open: whether a result may contain further service objects or only values; whether `describe` is
 fixed at start or may change, as an MCP server's tool list can; the error kinds `mcp-wrappers.md`

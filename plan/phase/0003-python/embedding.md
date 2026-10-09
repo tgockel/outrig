@@ -237,8 +237,8 @@ Two consequences follow from that, and both are the embedder's to design around:
 - **Identity comes from the environment, not from arguments.** The binding's environment, which
   the embedder sets, is where the client finds its endpoint and the identity it acts as. A task
   id the agent passes as an argument is data the client may check, not authority it acts on.
-- **Waits are synchronous.** A hosted call blocks its kernel's thread, so a method that waits on a
-  person holds that kernel unless the agent runs it with `asyncio.to_thread`
+- **Waits are awaited.** A hosted call is awaited, so a method that waits on a person holds no
+  kernel; it holds one worker thread and one connection of the kernel's pool for the binding
   (`execution-and-rounds.md`). A binding process serves each connection on its own thread, and a
   kernel keeps a pool of connections per binding (`0003-17`), so such a wait delays no other call.
   Only a binding declared `serialize = true`, because its library is not thread-safe, takes one
@@ -246,13 +246,12 @@ Two consequences follow from that, and both are the embedder's to design around:
   close such a call is a running call: it drains, and if it is still waiting at the deadline it is
   killed with its binding and reported `unknown`. The embedder knows when it closes the session, so
   its service can answer its own pending waits then and let those calls return within the drain.
-  Awaitable hosted calls are `plan/next/awaitable-hosted-calls.md`.
 
-**Why no trait now.** A trait needs a descriptor format -- methods, argument and result schemas,
-and whether each call is awaitable -- and a second way of presenting an object beside hosted
-Python objects, with interception, policy and events built a second time. A pure-Python client
-uses the one path this phase builds. `plan/next/rust-object-as-python-object.md` records the trait,
-and `mcp-wrappers.md` routes MCP servers through it.
+**Why no trait now.** A trait needs a descriptor format -- methods, argument and result schemas --
+and a second way of presenting an object beside hosted Python objects, with interception, policy
+and events built a second time. A pure-Python client uses the one path this phase builds.
+`plan/next/rust-object-as-python-object.md` records the trait, and `mcp-wrappers.md` routes MCP
+servers through it.
 
 ## Not in this phase
 

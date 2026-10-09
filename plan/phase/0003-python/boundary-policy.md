@@ -19,9 +19,12 @@ Three decisions apply throughout:
 
 One semantic operation on a hosted object: reading, writing, or deleting an attribute; a call;
 item access; iteration; or a relevant special method -- a comparison, `repr`, `len`, entering or
-leaving a `with` block. One expression can produce several. `repo.head.commit.tree` is three
-attribute reads, each decided and evented on its own, and `for r in repo.remotes:` is a request to
-start the iteration and one per item.
+leaving a `with` block. One expression can produce several, and its requests are sent when it is
+awaited (`hosted-objects.md`, "Calls are awaited"). `await repo.head.commit.tree` is three
+attribute reads, each decided and evented on its own, and `async for r in repo.remotes:` is a
+request to start the iteration and one per item. `repr`, `str` and `dir` are requests only when
+asked for explicitly, as `await x.__repr__()`, since the container answers them locally
+otherwise.
 
 Bookkeeping is not a semantic operation: fetching a binding's root, counting references, and listing
 the methods a proxy class is built from. Interception still checks it -- a reference count cannot be
@@ -168,10 +171,11 @@ outrig: [7] repo: call push on git.remote.Remote ('main',)
 
 The format is illustrative. The rules around it are not:
 
-- **The call waits until it is answered, interrupted, or the session closes.** While it waits its
-  kernel is blocked, as for any hosted call (`hosted-objects.md`), and other kernels are not.
-  OutRig sets no expiry. A handler that wants a deadline answers deny when its deadline passes,
-  which leaves the deadline to whoever chooses the approvers (`0003-22`).
+- **The call waits until it is answered, interrupted, or the session closes.** While it waits,
+  the awaiting code waits and its kernel's loop keeps turning, as for any hosted call
+  (`hosted-objects.md`), and other kernels are unaffected. OutRig sets no expiry. A handler that
+  wants a deadline answers deny when its deadline passes, which leaves the deadline to whoever
+  chooses the approvers (`0003-22`).
 - **An approval covers one call.** Nothing is reused or cached -- not by member, not by arguments,
   not for a time -- and the next identical call asks again. Reuse with an explicit scope is
   `plan/next/approval-reuse-with-explicit-scope.md`.

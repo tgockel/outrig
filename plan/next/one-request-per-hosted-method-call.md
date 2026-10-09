@@ -16,14 +16,16 @@ service client: every `ask`, `poll` or `update_records` is two requests on the p
 
 ## Options
 
-- **A container-side stub.** The interpreter already builds the proxy's class from the binding's
-  `inspect` answer. A netref subclass whose `__getattribute__` answers a name the `inspect` listed
-  as a method with a local bound callable that sends `callattr` would make an ordinary call one
-  request, with no `del` after. It is ergonomics, not enforcement (`hosted-objects.md`,
-  "Client-side wrappers are ergonomics only"): the binding's `callattr` handler checks the name as
-  `getattr` does. The cost is a class per host type that differs from RPyC's own, and that a
-  name the library adds after `inspect` ran -- an instance attribute that is callable -- would
-  take the two-request path as today.
+- **The facade sends `callattr`.** The container-side stub is now the facade
+  (`plan/next/a-hosted-object-is-awaited.md`): a proxy builds a path of steps, and a worker
+  replays them when the path is awaited, `getattr` for an attribute step and `getattr` then
+  `call` for a call step, as RPyC's proxies send them. A call step that follows an attribute
+  step carries the name and the arguments together, so the worker can send one `callattr` in
+  place of the pair, making a method call one request with no bound-method proxy and no `del`
+  after. It is ergonomics, not enforcement (`hosted-objects.md`, "Client-side wrappers are
+  ergonomics only"): the host's `callattr` handler checks the name as `getattr` does and then
+  the call (`0003-16`). A call that follows no attribute step -- `await stub(...)`, or a call on
+  an item step's result -- is a `call` on its target as today.
 - **Leave it.** Two requests on a local pipe are a few hundred microseconds; the measurements say
   whether the halving matters for a service.
 

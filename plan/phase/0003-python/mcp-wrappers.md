@@ -105,9 +105,10 @@ presented, and they are the part an agent actually experiences.
 
 **Awaitable, and not merely wrapped.** A call waits on something remote. If that blocks the
 agent's event loop it stops channel delivery, which is what lets a user redirect an agent
-mid-wait -- most of what makes long-running work tolerable here. Hosted Python objects accept a
-blocking call and offer `asyncio.to_thread` (`hosted-objects.md`); a Rust-presented object has no
-library forcing that choice on it, so its calls should be awaitable from the start.
+mid-wait -- most of what makes long-running work tolerable here. Hosted Python objects are
+awaited through the facade over RPyC (`hosted-objects.md`, "Calls are awaited"), so a
+Rust-presented object should be awaitable with the same spelling, and the two kinds of object
+read alike.
 
 **Results stay data.** A tool that returns a structured result must arrive as a structure the
 agent can filter in Python, not as prose it has to parse back. This is the whole economic argument

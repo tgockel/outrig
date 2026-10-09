@@ -103,11 +103,17 @@ session mounts has one path on both sides.
 - **The manifest**: each binding's name, description, and the type name of the object its factory
   returned, delivered to the interpreter at start. `runtime.bindings` answers from it in every
   kernel, opened ones included, with no request to any binding.
-- **Orientation**: a line per binding with its name and description, and once for all of them,
-  that the name is an object on the host while an `import` of the same library is a local copy,
-  and that a call blocks its kernel, with the whole expression in a worker --
-  `await asyncio.to_thread(lambda: repo.remotes.origin.push())` -- as the form that does not
-  (`0003-17`). A binding declared `serialize = true` is marked as running one call at a time.
+- **Orientation**: a line per binding with its name and description, plus `Runs one call at a
+  time.` when it is declared `serialize = true`; and once for all of them, that these names are
+  objects in processes on the host while an `import` of the same library gives a local copy that
+  knows nothing of them; that nothing happens on a hosted object until it is awaited --
+  `await repo.head.commit.hexsha` reads a chain, `await repo.remotes.origin.push()` calls,
+  `async for r in repo.remotes:` iterates, and `await x._set("name", value)` and
+  `await x._delete("name")` assign and delete, since an assignment statement cannot be awaited;
+  that `if x:`, `len(x)` and a plain `for` on a hosted object raise and say so; that `repr`, `str`
+  and `dir` answer locally and `help(git.Repo)` describes the library; and that the loop keeps
+  running while the host works, so `runtime.wait` still sees messages, and a hosted object is
+  never put in `asyncio.to_thread`.
 - **`lifecycle.md`'s binding-process row**, true of the implementation and tested: after the drain,
   `SIGTERM`, the grace, `SIGKILL` to the group, and the result in `0003-19`'s `ShutdownReport`. A
   binding whose process already exited is stopped the same way, since what it started can still
@@ -155,7 +161,8 @@ session mounts has one path on both sides.
 - **`runtime.bindings` asks nothing of the binding.** In the primary and in a kernel opened after
   start, it answers with every binding's name and description while the binding process is stopped
   with `SIGSTOP`.
-- The orientation names each binding with its description.
+- The orientation names each binding with its description, and says that a hosted object is
+  awaited.
 - A factory that raises fails start, naming the binding, and leaves no binding process running.
 - e2e: **nothing outlives shutdown.** No process remains in any binding's group, and the report
   says so.

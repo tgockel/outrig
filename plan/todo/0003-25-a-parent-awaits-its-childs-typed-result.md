@@ -487,12 +487,14 @@ including when the session closes.
    to end the same way. A background task left running would go on making hosted calls and
    launching children for an agent that no longer exists, with no one to collect what it does. A
    task that never yields cannot be cancelled on a child's thread, so the thread runs on until the
-   session ends, and the child's status says wedged (fork 7). A hosted call still running in a
-   binding process when the kernel is released cannot be stopped -- RPyC has no cancel, and the
-   release kills no binding (`lifecycle.md`) -- and once the kernel has left the count it is held
-   by neither `children-max` nor `requests-max`, so a program that spawns, offloads a call that
-   never returns, releases and reuses the place can accumulate such calls without bound; the
-   maintainer chose to document that as unbounded for now, and
+   session ends, and the child's status says wedged (fork 7). Cancelling the child's tasks goes
+   with `Kernel.close_hosted`, which wakes the facade's workers so their threads end while the
+   host call runs on. A hosted call still running in a binding process when the kernel is
+   released cannot be stopped -- RPyC has no cancel, and the release kills no binding
+   (`lifecycle.md`) -- and once the kernel has left the count it is held by neither
+   `children-max` nor `requests-max`, so a program that spawns, awaits, in a background task, a
+   call that never returns, releases and reuses the place can accumulate such calls without
+   bound; the maintainer chose to document that as unbounded for now, and
    `plan/next/bound-surviving-binding-calls.md` is the follow-up.
 10. **`request()` or `submit()` when the child has `requests-max` requests unsettled --
     Recommended: refuse, raising `AgentLimitReached` at once with nothing sent.** The count is
@@ -558,7 +560,7 @@ including when the session closes.
 - **Hard: `0003-19`.** The runner is the session's round loop run for a child, and close and
   shutdown are the session's.
 - **Hard: `0003-22`.** Releasing a child cancels its held requests through that task's gate and
-  the handler's signal. Through it, `0003-21`, whose binding stubs in every kernel give a child its
+  the handler's signal. Through it, `0003-21`, whose facades in every kernel give a child its
   parent's bindings, and whose forwarded calls a release lets run on, reporting `unknown` only if
   their binding dies.
 - **Hard: `0003-23`.** The evaluator whose call takes a permit, which the acceptance item on

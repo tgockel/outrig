@@ -75,6 +75,7 @@ becomes a declared dataclass only when it has exactly the declared shape.
 - **In a `to_thread` worker and a `threading.Thread`, `outrig.runtime` is the calling execution's
   runtime**; in `contextvars.Context().run(...)`, outside every execution's context, it raises the
   documented error, not an `AttributeError` and not `None`.
+- Inside a coroutine callback of a hosted call, `outrig.runtime` is the awaiting execution's.
 - **The maintainer's `ReviewResult`, copied from `typed-agents.md` unchanged, declares without
   error**, and its example JSON decodes to the instance the example describes. Its schema text
   carries every `doc()` text verbatim.
