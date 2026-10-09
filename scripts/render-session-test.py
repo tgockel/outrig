@@ -206,10 +206,12 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
             "reserve": 4096,
             "overhead": 1662,
             "max_tokens": 4096,
+            "role_alternation": "relaxed",
         },
         "estimate": estimate,
         "carried": [],
         "evicted": [],
+        "withheld": [],
         "opening": None,
         "adjacent": [],
         "left_out": [],
@@ -645,6 +647,16 @@ class RenderSession(unittest.TestCase):
             for kind, data in ordinary()
         ]
         self.assertIn("left out of turn 0: part 0 of message 1", self.page(events))
+
+    def test_a_call_names_what_it_withheld_so_the_roles_alternate(self) -> None:
+        withheld = {"withheld": [{"turn": 3, "why": "recent"}, {"turn": 5, "why": "promoted"}]}
+        events = [
+            (kind, data | withheld) if kind == "model.call" else (kind, data)
+            for kind, data in ordinary()
+        ]
+        self.assertIn("withheld so the roles alternate: 3 (recent), 5 (promoted)", self.page(events))
+        self.assertNotIn("withheld so the roles alternate", self.page(ordinary()))
+        self.assertIn("role alternation: relaxed", self.page(ordinary()))
 
     def test_an_unknown_type_is_shown_as_it_is(self) -> None:
         html = self.page(ordinary() + [("something.new", {"what": "it says"})])

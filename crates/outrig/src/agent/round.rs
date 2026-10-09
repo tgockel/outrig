@@ -32,6 +32,7 @@ use super::build::RigAgent;
 use super::failover::FailoverModel;
 use super::history::{self, Adjacent, History};
 use super::tool::{self, Interrupts};
+use crate::config::RoleAlternation;
 use crate::events::{self, CallUsage, Event};
 
 /// How a round ended.
@@ -435,21 +436,40 @@ impl RoundHook {
     }
 
     /// What to add to `err`, when a provider refused the latest call and that
-    /// call's view put one role after itself in the conversation: most
-    /// providers take that, and one that requires turns to alternate may not,
-    /// so the refusal may be for it. It says what the conversation held rather
-    /// than what the wire carried, which differs by provider ([`Adjacent`]).
+    /// call's view put one role after itself in the conversation. For a
+    /// provider whose row does not say its turns must alternate, the pair may
+    /// be why, and the row's `role-alternation` is the remedy. For one whose
+    /// row does, the view withheld what it could, and the pair that stands is
+    /// the turn the call answers opening on a reply with nothing kept before
+    /// it that ends on the user's side: its round's opening did not fit, and
+    /// only a larger window mends that. Either says what the conversation held
+    /// rather than what the wire carried, which differs by provider
+    /// ([`Adjacent`]).
     fn refusal_hint(&self, err: &PromptError) -> String {
         let refused = err
             .provider_response_status()
             .is_some_and(|status| matches!(status.as_u16(), 400 | 422));
-        match self.journal().adjacent {
-            Some(adjacent) if refused => format!(
+        let Some(adjacent) = self.journal().adjacent.filter(|_| refused) else {
+            return String::new();
+        };
+        let Budget {
+            model, provider, ..
+        } = &*self.budget;
+        match self.budget.alternation {
+            RoleAlternation::Relaxed => format!(
                 ". The conversation it was sent left turns out, which put {adjacent}; a provider \
                  or gateway that requires the user's and the model's turns to alternate may \
-                 refuse that (see `outrig run-new` in doc/reference/cli.md)"
+                 refuse that. If this one does, set [providers.{provider}].role-alternation = \
+                 \"strict\", and each call is sent a conversation that alternates (see `outrig \
+                 run-new` in doc/reference/cli.md)"
             ),
-            _ => String::new(),
+            RoleAlternation::Strict => format!(
+                ". The conversation it was sent left turns out, which put {adjacent}, and nothing \
+                 kept before the turn this call answers ends on the user's side, so no turn could \
+                 be withheld to clear it: the round's opening did not fit the window. Set \
+                 [models.{model}].context-window to the model's whole window, or lower \
+                 tool-result-max, so that it does (see `outrig run-new` in doc/reference/cli.md)"
+            ),
         }
     }
 }

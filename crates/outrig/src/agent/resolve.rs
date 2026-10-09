@@ -18,6 +18,7 @@ use super::AgentError;
 use super::budget::Budget;
 use crate::config::{
     Agent, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
+    RoleAlternation,
 };
 use crate::error::OutrigError;
 
@@ -88,12 +89,14 @@ pub(crate) enum ResolvedProvider {
         api_key: String,
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
+        role_alternation: RoleAlternation,
     },
     Anthropic {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
+        role_alternation: RoleAlternation,
     },
 }
 
@@ -122,6 +125,19 @@ impl ResolvedProvider {
             | Self::Anthropic {
                 retry_budget_secs, ..
             } => *retry_budget_secs,
+        }
+    }
+
+    /// Whether this provider requires the user's and the model's turns to
+    /// alternate, `Relaxed` when its row does not say.
+    pub(crate) fn role_alternation(&self) -> RoleAlternation {
+        match self {
+            Self::OpenAi {
+                role_alternation, ..
+            }
+            | Self::Anthropic {
+                role_alternation, ..
+            } => *role_alternation,
         }
     }
 }
@@ -403,24 +419,28 @@ fn resolve_candidate(
             api_key,
             request_timeout_secs,
             retry_budget_secs,
+            role_alternation,
             ..
         } => ResolvedProvider::OpenAi {
             base_url: base_url.clone(),
             api_key: api_key.resolve()?,
             request_timeout_secs: *request_timeout_secs,
             retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+            role_alternation: role_alternation.unwrap_or_default(),
         },
         LlmProvider::Anthropic {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
+            role_alternation,
             ..
         } => ResolvedProvider::Anthropic {
             base_url: base_url.clone(),
             api_key: api_key.resolve()?,
             request_timeout_secs: *request_timeout_secs,
             retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+            role_alternation: role_alternation.unwrap_or_default(),
         },
     };
 

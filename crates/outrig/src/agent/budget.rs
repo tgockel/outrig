@@ -25,6 +25,7 @@ use rig::completion::Message;
 use rig::completion::message::{AssistantContent, ReasoningContent};
 
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider};
+use crate::config::RoleAlternation;
 
 /// The window a model is held to when its row names none. Below the window of
 /// every current hosted model this loop is meant for, so a call is rarely
@@ -55,6 +56,8 @@ const TOOL_USE_OVERHEAD: u64 = 512;
 pub(crate) struct Budget {
     /// The candidate's `[models.<name>]` row.
     pub(crate) model: String,
+    /// The `[providers.<name>]` row that model row names.
+    pub(crate) provider: String,
     /// The whole window, in tokens.
     pub(crate) window: u32,
     /// Whether `window` is [`ASSUMED_CONTEXT_WINDOW`] rather than the row's own.
@@ -71,6 +74,10 @@ pub(crate) struct Budget {
     /// The protocol the candidate's provider speaks, which settles what it can
     /// be sent of replies other providers wrote.
     pub(crate) wire: Wire,
+    /// Whether the provider requires the user's and the model's turns to
+    /// alternate, which settles what a call to it can be sent of a
+    /// conversation cut between turns.
+    pub(crate) alternation: RoleAlternation,
 }
 
 /// Which provider's protocol a candidate speaks, for what a call to it can
@@ -107,6 +114,15 @@ impl Wire {
             _ => true,
         }
     }
+
+    /// Whether a call in this protocol is sent any of `message`: a reply none
+    /// of whose parts it takes is left out whole, and anything else goes.
+    pub(crate) fn keeps(self, message: &Message) -> bool {
+        match message {
+            Message::Assistant { content, .. } => content.iter().any(|part| self.takes(part)),
+            _ => true,
+        }
+    }
 }
 
 impl Budget {
@@ -137,6 +153,7 @@ impl Budget {
         };
         let budget = Budget {
             model: candidate.model_name.clone(),
+            provider: candidate.provider_name.clone(),
             window,
             window_assumed,
             reserve,
@@ -146,6 +163,7 @@ impl Budget {
                 ResolvedProvider::OpenAi { .. } => Wire::OpenAi,
                 ResolvedProvider::Anthropic { .. } => Wire::Anthropic,
             },
+            alternation: candidate.provider.role_alternation(),
         };
         if budget.room() < MIN_ROOM {
             return Err(LlmResolveError::WindowTooSmall(budget));
@@ -175,12 +193,24 @@ impl Budget {
     pub(crate) fn with_room(model: &str, room: u64) -> Budget {
         Budget {
             model: model.to_string(),
+            provider: "p".to_string(),
             window: u32::try_from(room).expect("a test's room fits a window"),
             window_assumed: false,
             reserve: 0,
             overhead: 0,
             max_tokens: None,
             wire: Wire::OpenAi,
+            alternation: RoleAlternation::Relaxed,
+        }
+    }
+
+    /// This allowance for a provider that requires the user's and the model's
+    /// turns to alternate.
+    #[cfg(test)]
+    pub(crate) fn strict(self) -> Budget {
+        Budget {
+            alternation: RoleAlternation::Strict,
+            ..self
         }
     }
 }
@@ -219,6 +249,7 @@ pub(crate) fn candidate(model: &str, context_window: Option<u32>) -> ResolvedCan
             api_key: "k".into(),
             request_timeout_secs: None,
             retry_budget_secs: None,
+            role_alternation: RoleAlternation::Relaxed,
         },
         max_tokens: None,
         context_window,

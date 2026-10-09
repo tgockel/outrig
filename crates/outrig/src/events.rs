@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use rig::completion::{Message, ToolDefinition};
 use serde::Serialize;
 
+use crate::config::RoleAlternation;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::line_sink::{self, Labels, LineSink, Loss, Room};
 use crate::python::host::{Background, ExecId};
@@ -484,6 +485,7 @@ pub(crate) struct ModelCall<'a> {
     pub(crate) estimate: u64,
     pub(crate) carried: Vec<Chosen>,
     pub(crate) evicted: Vec<Chosen>,
+    pub(crate) withheld: Vec<Chosen>,
     pub(crate) opening: Option<&'a Message>,
     pub(crate) adjacent: Vec<Repeat>,
     pub(crate) left_out: Vec<LeftOut>,
@@ -507,6 +509,7 @@ pub(crate) struct CallBudget<'a> {
     pub(crate) reserve: u32,
     pub(crate) overhead: u64,
     pub(crate) max_tokens: Option<u32>,
+    pub(crate) role_alternation: RoleAlternation,
 }
 
 /// A turn a call carried or left out, and the reason it was chosen.

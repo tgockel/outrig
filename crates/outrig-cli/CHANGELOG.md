@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
   ignores it.
+- **`[providers.<name>].role-alternation = "strict"`**, for a provider that refuses a request in
+  which one role follows itself, as a Bedrock-backed Claude behind an OpenAI-compatible gateway
+  does. `run-new` then sends it a conversation that alternates, leaving out a turn promoted
+  without the rest of its round and a round that ended on tool results, which the line that
+  opens a round counts and the event log names; without the key, every round failed the same
+  way while the pair stayed in view, and the error now says to set it. `run` ignores it. Fixed
+  in `outrig`; see that crate's changelog. (#472)
 - **`[events] mode = "record"`**, which has `run-new` record what its agent did in
   `<session_dir>/logs/events.jsonl`: each model call and the conversation it was sent, each
   submission and how it ended, each message on the channel, the tokens each round used and the

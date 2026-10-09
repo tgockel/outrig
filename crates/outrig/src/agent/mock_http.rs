@@ -8,7 +8,9 @@
 //!
 //! It speaks Anthropic's Messages API by default and OpenAI's chat completions
 //! through [`Style`], and accepts any request either way. What a provider
-//! would refuse is [`check_wire`]'s to find.
+//! would refuse is [`check_wire`]'s to find -- except as [`start_strict`], a
+//! provider that requires the user's and the model's turns to alternate, which
+//! refuses a request whose roles repeat as a gateway in front of one would.
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -321,6 +323,55 @@ pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
     wire
 }
 
+/// The roles of a request `body`'s `messages` as a gateway in front of a
+/// strict provider sees them: the system prompt apart, and a run of OpenAI
+/// `tool` messages -- one turn's results -- as the one user message it
+/// becomes. Anthropic's wire already carries results in user messages, so its
+/// roles come through as they are.
+fn gateway_roles(body: &Value) -> Vec<&str> {
+    let mut roles: Vec<&str> = body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["role"].as_str())
+        .filter(|role| *role != "system")
+        .collect();
+    roles.dedup_by(|a, b| *a == "tool" && *b == "tool");
+    roles
+        .into_iter()
+        .map(|role| if role == "tool" { "user" } else { role })
+        .collect()
+}
+
+/// How a provider that requires the user's and the model's turns to alternate
+/// refuses `body`, in the words Bedrock's Claude uses: a 400 naming the role
+/// that repeats, or the first message when it is not the user's. `None` when
+/// the request is one it takes.
+pub(super) fn strict_refusal(body: &Value) -> Option<CannedResponse> {
+    let roles = gateway_roles(body);
+    let message = match roles.first() {
+        Some(&first) if first != "user" => {
+            r#"messages: first message must use the "user" role"#.to_string()
+        }
+        _ => {
+            let repeated = roles.windows(2).find(|pair| pair[0] == pair[1])?;
+            format!(
+                r#"messages: roles must alternate between "user" and "assistant", but found multiple "{}" roles in a row"#,
+                repeated[0]
+            )
+        }
+    };
+    Some(CannedResponse::new(
+        400,
+        json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": message,
+            },
+        }),
+    ))
+}
+
 /// Start the mock on an ephemeral loopback port. Returns its address and the
 /// channel on which every request arrives.
 ///
@@ -333,12 +384,37 @@ pub(super) async fn start(
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
+    start_with(script, |_| None).await
+}
+
+/// [`start`], as a provider that requires the user's and the model's turns to
+/// alternate: a request whose roles repeat as a gateway sees them, or that does
+/// not open on the user's, is answered with [`strict_refusal`] rather than from
+/// the script, which it does not advance. The request is recorded either way.
+pub(super) async fn start_strict(
+    script: Vec<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    start_with(script, strict_refusal).await
+}
+
+/// [`start`], refusing each request `refuses` answers for, which the script
+/// does not advance past.
+async fn start_with(
+    script: Vec<CannedResponse>,
+    refuses: fn(&Value) -> Option<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock listener");
     let addr = listener.local_addr().expect("mock local_addr");
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(serve(listener, script, tx));
+    tokio::spawn(serve(listener, script, tx, refuses));
     (addr, rx)
 }
 
@@ -355,6 +431,7 @@ async fn serve(
     listener: TcpListener,
     script: Vec<CannedResponse>,
     tx: mpsc::UnboundedSender<RecordedRequest>,
+    refuses: fn(&Value) -> Option<CannedResponse>,
 ) {
     let mut served = 0usize;
     loop {
@@ -364,13 +441,20 @@ async fn serve(
         let Some(recorded) = read_request(&mut sock).await else {
             continue;
         };
+        let refused = refuses(&recorded.body);
         if tx.send(recorded).is_err() {
             return;
         }
-        let Some(canned) = script.get(served).or(script.last()).cloned() else {
-            return;
+        let canned = match refused {
+            Some(refusal) => refusal,
+            None => {
+                let Some(canned) = script.get(served).or(script.last()).cloned() else {
+                    return;
+                };
+                served += 1;
+                canned
+            }
         };
-        served += 1;
 
         let body = serde_json::to_string(&canned.body).expect("canned body serializes");
         let headers: String = canned

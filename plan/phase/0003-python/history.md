@@ -115,6 +115,14 @@ repair logic and keeping it correct across providers whose role-alternation rule
 by round is coarse enough that one tool-heavy round is most of a budget. A turn is the unit that
 is safe without repair.
 
+For a provider that requires the user's and the model's turns to alternate, the turn stays the
+unit: `[providers.<name>].role-alternation = "strict"` has the view withhold the turns that would
+put one role after itself, rather than cut inside one or synthesize a repair. A promotion that
+would follow the model's own reply is withheld; a round that ended on tool results is withheld
+whole once the next round opens, since each of its turns ends on results; the turn a call
+answers is never withheld, and an earlier round's closing reply yields to it instead. The
+manifest names each turn withheld (#472).
+
 ### The budget
 
 Counting retained rounds is not a budget. A first-and-recent window plus a few promotions can
@@ -301,8 +309,11 @@ new protocol message, and the query vocabulary becomes a surface to design and m
   OpenAI's accepts it; a strict gateway may not. `0003-12` exercised a shortened history against
   both adapters, through rig's own conversions and a mock of each: every cut the view makes keeps
   each call beside its result, and the same-role pairs are where the manifest says. The supported
-  subset is published in `doc/reference/cli.md`, and a refused call that carried a pair says so.
-  No live strict gateway was tried.
+  subset is published in `doc/reference/cli.md`, and a refused call that carried a pair says so
+  and names `role-alternation = "strict"`, which has the view alternate by construction (#472).
+  That pass also opens every view on the user's side, on the belief that a strict gateway
+  requires that too. Both are exercised against a mock that refuses as Bedrock's Claude does; no
+  live strict gateway was tried.
 - `RequestPatch.history` was read from rig 0.40's documentation and from `injection.rs`'s use of
   it, not exercised with a shorter list than rig supplied. `0003-11` sent one on every model
   call, and `0003-12` asserts the result on the wire through both adapters, against mocks. A live

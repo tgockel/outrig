@@ -117,6 +117,47 @@ fn promote(store: &mut Store, ids: &[u64]) {
     store.change(ContextChange::Promote(ids.to_vec()));
 }
 
+/// Commit a round to `store`: it opens on `opening`, makes each of `calls` in
+/// a turn of its own, answered, and closes on `reply` when there is one.
+/// Without one it is cut short, ending on its last result.
+fn round_of_calls(store: &mut Store, opening: &str, calls: &[&str], reply: Option<&str>) {
+    store.begin_round(Message::user(opening));
+    for &id in calls {
+        store.commit(vec![call(id, id), Message::tool_result(id, "ok")]);
+    }
+    if let Some(reply) = reply {
+        store.commit(vec![Message::assistant(reply)]);
+    }
+}
+
+/// The side each of `messages` is on.
+fn roles(messages: &[Message]) -> Vec<Role> {
+    messages.iter().filter_map(Role::of).collect()
+}
+
+/// Whether `messages` alternate between the user's side and the model's.
+fn alternates(messages: &[Message]) -> bool {
+    roles(messages).windows(2).all(|pair| pair[0] != pair[1])
+}
+
+/// The count an opening line states, when the line opens on the count.
+fn stated(opening: &Message) -> usize {
+    text(opening)
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("a count")
+}
+
+/// How many turns the first call of the round `store` has open leaves out,
+/// held to `budget`: all of them, when the opening alone does not fit.
+fn first_call_leaves_out(store: &mut Store, budget: &Budget) -> usize {
+    match store.assemble(budget) {
+        Ok((_, manifest)) => store.turns.len() - manifest.carried.len(),
+        Err(_) => store.turns.len(),
+    }
+}
+
 #[test]
 fn a_turn_begins_at_each_reply() {
     let round = vec![
@@ -477,7 +518,9 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         reserve: 250,
         overhead: 300,
         max_tokens: None,
+        provider: "p".into(),
         wire: crate::agent::budget::Wire::OpenAi,
+        alternation: crate::config::RoleAlternation::Relaxed,
     };
     let err = store.assemble(&budget).expect_err("450 of room");
     assert_eq!(
@@ -574,6 +617,7 @@ fn a_cut_that_puts_one_role_after_itself_is_recorded() {
             role: Role::User
         }]
     );
+    assert!(manifest.withheld.is_empty(), "recorded, not withheld");
     // Round 2's second turn, promoted into a view without its first, follows
     // round 1's closing text with a tool call.
     store.window = Window {
@@ -664,17 +708,13 @@ fn the_opening_counts_exactly_what_its_first_call_leaves_out() {
     }
     let line = |n: usize| format!("{n} {}", "y".repeat(30 * n));
     for room in (0..2_600).step_by(7) {
-        let opening = store.open_round(room, line);
-        let stated: usize = text(&opening)
-            .split(' ')
-            .next()
-            .and_then(|n| n.parse().ok())
-            .expect("a count");
-        let left_out = match store.assemble(&Budget::with_room("m", room)) {
-            Ok((_, manifest)) => store.turns.len() - manifest.carried.len(),
-            Err(_) => store.turns.len(),
-        };
-        assert_eq!(stated, left_out, "room {room}");
+        let budget = Budget::with_room("m", room);
+        let opening = store.open_round(&budget, line);
+        assert_eq!(
+            stated(&opening),
+            first_call_leaves_out(&mut store, &budget),
+            "room {room}"
+        );
     }
 }
 
@@ -800,7 +840,7 @@ async fn the_host_record_and_the_transport_of_a_long_session_are_measured() {
 fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
     use rig::completion::message::Reasoning;
 
-    use super::{LeftOut, as_sent};
+    use super::LeftOut;
     use crate::agent::budget::Wire;
 
     let unsigned = AssistantContent::Reasoning(Reasoning::new("thinking it over"));
@@ -857,12 +897,11 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
             matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| *part == unsigned))
         });
         assert_eq!(unsigned_sent, wire == Wire::OpenAi, "{wire:?}: {sent:#?}");
-        let rebuilt: Vec<Message> = manifest
-            .carried
-            .iter()
-            .flat_map(|&(id, _)| as_sent(id, &store.turns[id].messages, &manifest.left_out))
-            .collect();
-        assert_eq!(rebuilt, sent, "{wire:?}: the record rebuilds the call");
+        assert_eq!(
+            store.reconstruct(&manifest),
+            sent,
+            "{wire:?}: the record rebuilds the call"
+        );
     }
     let kept: Vec<Message> = store
         .turns
@@ -870,4 +909,263 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
         .flat_map(|turn| turn.messages.clone())
         .collect();
     assert_eq!(kept, whole, "the turns keep what each model wrote");
+}
+
+/// For a provider that requires the user's and the model's turns to
+/// alternate, the view withholds what would put one role after itself rather
+/// than recording it. A round cut short goes, turn by turn, once the next
+/// round opens after its results; a turn promoted without the rest of its
+/// round goes when it would follow the model's own reply; a whole promoted
+/// round alternates on its own and stays. The manifest names each turn
+/// withheld, and the record still rebuilds the call.
+#[test]
+fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    // Round 1 (turn 0) closes on text. Round 2 (turns 1 and 2) is cut short
+    // after its second result. Round 3 (turns 3 to 5) and round 4 (turn 6)
+    // close on text.
+    round_of_calls(&mut store, "round 1", &[], Some("done"));
+    round_of_calls(&mut store, "round 2", &["a", "b"], None);
+    round_of_calls(&mut store, "round 3", &["c", "d"], Some("fine"));
+    round_of_calls(&mut store, "round 4", &[], Some("ok"));
+    store.begin_round(Message::user("round 5"));
+    let strict = Budget::with_room("m", ROOMY).strict();
+
+    // Rounds 1 and 4 alternate with the opening on their own.
+    let (sent, manifest) = store.assemble(&strict).expect("room");
+    assert_eq!(manifest.carried, [(0, Why::First), (6, Why::Recent)]);
+    assert!(manifest.withheld.is_empty(), "{manifest:?}");
+    assert!(manifest.adjacent.is_empty(), "{manifest:?}");
+    let alone = [
+        Role::User,
+        Role::Assistant,
+        Role::User,
+        Role::Assistant,
+        Role::User,
+    ];
+    assert_eq!(roles(&sent), alone);
+
+    // Round 2's second turn alone opens on a call right after round 1's reply.
+    promote(&mut store, &[2]);
+    let (sent, manifest) = store.assemble(&strict).expect("room");
+    assert_eq!(manifest.withheld, [(2, Why::Promoted)]);
+    assert_eq!(manifest.carried, [(0, Why::First), (6, Why::Recent)]);
+    assert!(manifest.adjacent.is_empty(), "{manifest:?}");
+    assert_eq!(roles(&sent), alone);
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    // Both of round 2's turns: the first opens on the user's side and the
+    // second follows its results, but round 4 then opens after a result the
+    // model never answered, so the earlier side yields -- both turns.
+    promote(&mut store, &[1]);
+    let (sent, manifest) = store.assemble(&strict).expect("room");
+    assert_eq!(manifest.withheld, [(1, Why::Promoted), (2, Why::Promoted)]);
+    assert_eq!(roles(&sent), alone);
+
+    // A whole promoted round alternates on its own, and stays.
+    store.change(ContextChange::Demote(vec![1, 2]));
+    promote(&mut store, &[3, 4, 5]);
+    let (sent, manifest) = store.assemble(&strict).expect("room");
+    assert!(manifest.withheld.is_empty(), "{manifest:?}");
+    let carried: Vec<usize> = manifest.carried.iter().map(|&(id, _)| id).collect();
+    assert_eq!(carried, [0, 3, 4, 5, 6]);
+    assert!(alternates(&sent), "{:?}", roles(&sent));
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    // The window can hold the round cut short too: round 3 then opens after
+    // round 2's last result, and round 2 goes turn by turn.
+    store.change(ContextChange::Demote(vec![3, 4, 5]));
+    store.window = Window {
+        first: 1,
+        recent: 3,
+    };
+    let (sent, manifest) = store.assemble(&strict).expect("room");
+    assert_eq!(manifest.withheld, [(1, Why::Recent), (2, Why::Recent)]);
+    assert!(manifest.adjacent.is_empty(), "{manifest:?}");
+    assert!(alternates(&sent), "{:?}", roles(&sent));
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    // Relaxed, the same view goes whole, and the pair is recorded instead.
+    let (sent, manifest) = store
+        .assemble(&Budget::with_room("m", ROOMY))
+        .expect("room");
+    assert!(manifest.withheld.is_empty());
+    assert_eq!(
+        manifest.adjacent,
+        [Adjacent {
+            turn: Some(3),
+            role: Role::User
+        }]
+    );
+    assert!(!alternates(&sent));
+}
+
+/// The turn a call answers is never withheld. When the budget leaves out the
+/// turns of its round before it, so that it opens on a call right after an
+/// earlier round's closing reply, what was kept after the nearest results
+/// yields instead, and the call still alternates. When nothing kept ends on
+/// the user's side, the pair stands and is recorded, as a relaxed provider's
+/// would be; and a closing reply that would open the view on the model's side
+/// is withheld, so the latest turn can be sent alone. Those two are the shapes
+/// a strict provider still refuses, and only a larger window mends them.
+#[test]
+fn a_strict_view_never_withholds_the_turn_a_call_answers() {
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    // Round 1: a call and its result (turn 0), then a closing reply (turn 1).
+    // Round 2: a closing reply alone (turn 2). Round 3: its first turn (turn
+    // 3) is too large for the room, and its second (turn 4) is the latest.
+    round_of_calls(&mut store, "round 1", &["a"], Some("done"));
+    round_of_calls(&mut store, "round 2", &[], Some("ok"));
+    round_of_calls(&mut store, "round 3", &["b", "c"], None);
+    let mut store = priced(store, 10);
+    store.turns[3].tokens = 1_000;
+    let strict = Budget::with_room("m", 100).strict();
+
+    // The latest would follow round 2's reply: back to round 1's results.
+    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    assert_eq!(manifest.evicted, [(3, Why::Round)]);
+    assert_eq!(manifest.withheld, [(1, Why::First), (2, Why::Recent)]);
+    assert_eq!(manifest.carried, [(0, Why::First), (4, Why::Latest)]);
+    assert!(manifest.adjacent.is_empty(), "{manifest:?}");
+    assert_eq!(
+        roles(&sent),
+        [
+            Role::User,
+            Role::Assistant,
+            Role::User,
+            Role::Assistant,
+            Role::User
+        ]
+    );
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    // Round 1's results out as well: its closing reply would open the view
+    // on the model's side and is withheld, round 2 alone ends on a reply, and
+    // the pair stands, recorded.
+    store.turns[0].tokens = 1_000;
+    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    assert_eq!(manifest.evicted, [(0, Why::First), (3, Why::Round)]);
+    assert_eq!(manifest.withheld, [(1, Why::First)]);
+    assert_eq!(manifest.carried, [(2, Why::Recent), (4, Why::Latest)]);
+    assert_eq!(
+        manifest.adjacent,
+        [Adjacent {
+            turn: Some(4),
+            role: Role::Assistant
+        }]
+    );
+    assert_eq!(
+        roles(&sent),
+        [Role::User, Role::Assistant, Role::Assistant, Role::User]
+    );
+
+    // Round 2 out too: the latest is sent alone.
+    store.turns[2].tokens = 1_000;
+    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    assert_eq!(manifest.withheld, [(1, Why::First)]);
+    assert_eq!(manifest.carried, [(4, Why::Latest)]);
+    assert!(manifest.adjacent.is_empty(), "{manifest:?}");
+    assert_eq!(roles(&sent), [Role::Assistant, Role::User]);
+}
+
+/// A closing reply the provider cannot take -- reasoning no signature vouches
+/// for, to Anthropic -- leaves its round ending on results, as a call to that
+/// provider is sent it. The seam is judged on what the wire carries, so the
+/// turn before yields; to a provider that takes the reply, nothing does.
+#[test]
+fn an_emptied_reply_leaves_its_round_ending_on_results() {
+    use rig::completion::message::Reasoning;
+
+    use super::LeftOut;
+    use crate::agent::budget::Wire;
+
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    round_of_calls(&mut store, "round 1", &[], Some("done"));
+    round_of_calls(&mut store, "round 2", &["a"], None);
+    store.commit(vec![Message::Assistant {
+        id: None,
+        content: OneOrMany::one(AssistantContent::Reasoning(Reasoning::new("thinking"))),
+    }]);
+    store.begin_round(Message::user("round 3"));
+
+    let anthropic = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", ROOMY).strict()
+    };
+    let (sent, manifest) = store.assemble(&anthropic).expect("room");
+    assert_eq!(manifest.withheld, [(1, Why::Recent)]);
+    assert_eq!(manifest.carried, [(0, Why::First), (2, Why::Recent)]);
+    assert_eq!(
+        manifest.left_out,
+        [LeftOut {
+            turn: 2,
+            message: 0,
+            part: 0
+        }]
+    );
+    assert_eq!(roles(&sent), [Role::User, Role::Assistant, Role::User]);
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    let (sent, manifest) = store
+        .assemble(&Budget::with_room("m", ROOMY).strict())
+        .expect("room");
+    assert!(manifest.withheld.is_empty(), "{manifest:?}");
+    assert!(manifest.left_out.is_empty());
+    assert!(alternates(&sent), "{:?}", roles(&sent));
+}
+
+/// The count an opening states is what its first call leaves out, the turns
+/// withheld so the roles alternate included: a round cut short is counted
+/// whenever it would have fit.
+#[test]
+fn the_opening_counts_what_a_strict_first_call_withholds() {
+    let mut store = rounds_of(
+        Window {
+            first: 1,
+            recent: 2,
+        },
+        3,
+        1,
+    );
+    // A fourth round, cut short, which every opening after it would follow.
+    round_of_calls(&mut store, "round 4", &["a"], None);
+    for (turn, tokens) in store.turns.iter_mut().zip([2_000, 100, 100, 100]) {
+        turn.tokens = tokens;
+    }
+    let line = |n: usize| format!("{n} {}", "y".repeat(30 * n));
+    for room in (0..2_600).step_by(7) {
+        let budget = Budget::with_room("m", room).strict();
+        let opening = store.open_round(&budget, line);
+        assert_eq!(
+            stated(&opening),
+            first_call_leaves_out(&mut store, &budget),
+            "room {room}"
+        );
+    }
+    // With room for everything, the count is round 2, outside the window,
+    // and round 4's turn, withheld.
+    let budget = Budget::with_room("m", ROOMY).strict();
+    let opening = store.open_round(&budget, line);
+    let (sent, manifest) = store.assemble(&budget).expect("room");
+    assert_eq!(stated(&opening), 2);
+    assert_eq!(manifest.withheld, [(3, Why::Recent)]);
+    assert!(alternates(&sent), "{:?}", roles(&sent));
 }

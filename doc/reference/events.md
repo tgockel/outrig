@@ -108,16 +108,21 @@ category says what it may hold.
 - `model.call` -- a model call, as it is made: its manifest.
   - `call`: the agent's calls counted from 0.
   - `round`: its round.
-  - `budget`: what it was held to, in tokens: `model`, `window`, `window_assumed`, `reserve`,
-    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`.
+  - `budget`: what it was held to: `model`; in tokens, `window`, `window_assumed`, `reserve`,
+    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`; and
+    `role_alternation`, `relaxed` or `strict`, as the model's provider row says.
   - `estimate`: the whole request's estimated tokens.
   - `carried`: the turns it sent, oldest first, each as `{turn, why}`; `why` is `latest`,
     `round`, `promoted`, `first`, or `recent`.
   - `evicted`: the turns chosen but left out for size, the same way.
+  - `withheld`: the turns chosen, and fitting, but left out so that the user's and the model's
+    turns alternate, the same way. Empty unless `role_alternation` is `strict`.
   - `opening`: the round's opening message, on a round's first call, before any turn holds it;
     otherwise `null`.
   - `adjacent`: where one role follows itself in what was sent, each as `{turn, role}`; `turn` is
-    `null` where the repeat is the round's opening.
+    `null` where the repeat is the round's opening. For a `"strict"` provider, only where the
+    turn the call answers opens on the model's reply and nothing before it ends on the user's
+    side, which no withholding could clear.
   - `left_out`: the parts of carried turns the call's provider cannot take, which it was not
     sent, each as `{turn, message, part}`, counted from 0 within the turn's `messages` and the
     message's `content`. Today that is reasoning without a signature, left out of a call to an

@@ -351,7 +351,16 @@ pair. OpenAI's carries them as `tool` messages, so a prompt after results is no 
 it accepts two replies in a row. Both adapters are exercised against a mock, not a live
 endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-backed Claude
 behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
-call carried one, the error says where.
+call carried one, the error says where, and what to set: `role-alternation = "strict"` on the
+provider's row (see [`role-alternation`](config.md#style--openai)). With that set, each call is
+sent a conversation that alternates by construction, at the cost of the turns that would not. A
+turn brought back without the rest of its round is left out where it would follow the model's
+own reply, so promote whole rounds on such a provider. A round that ended on results -- the
+tool-call cap, a turn too large to send, Ctrl-C -- is left out whole once the next round opens,
+since each of its turns ends on results. What is left out stays in `runtime.history`, the line
+that opens the round counts it, and the call's manifest names it. One shape is still refused: a
+call whose own round's opening did not fit, so that the turn it answers opens on the model's
+reply with nothing before it that ends on the user's side; only a larger window mends that.
 
 **A failing provider is retried, then left for the next model.** A call that fails in a way that
 may clear -- a rate limit, a 5xx, a dropped connection, a response OutRig cannot use -- is made

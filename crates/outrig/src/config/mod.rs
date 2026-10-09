@@ -753,6 +753,31 @@ impl Config {
     }
 }
 
+/// Whether a provider requires the user's and the model's turns to alternate
+/// in every request: `[providers.<name>].role-alternation`.
+///
+/// A conversation sent in part can put one role after itself. A turn brought
+/// back without the rest of its round opens on the model's reply right after
+/// an earlier round's closing reply, and a round cut short ends on tool
+/// results that the next round's opening follows. Anthropic's API merges such
+/// a pair and OpenAI's accepts it. A provider or gateway that refuses it -- a
+/// Bedrock-backed Claude behind an OpenAI-compatible gateway is one -- is
+/// `Strict`, and `outrig run-new` then sends it a conversation that alternates
+/// by construction, leaving out the turns that would not, which each call's
+/// manifest records. `outrig run` sends whole rounds, and reads the key without
+/// acting on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum RoleAlternation {
+    /// The provider merges or accepts two messages of one role in a row. The
+    /// default.
+    #[default]
+    Relaxed,
+    /// The provider refuses them: every request must alternate.
+    Strict,
+}
+
 /// Optional settings for an OpenAI-compatible provider.
 ///
 /// Non-exhaustive, so a future connection setting is an addition rather than a
@@ -767,6 +792,9 @@ pub struct OpenAiOptions {
     /// Transient-retry budget in seconds. `None` uses the top-level setting,
     /// then [`DEFAULT_RETRY_BUDGET_SECS`].
     pub retry_budget_secs: Option<u64>,
+    /// Whether the provider requires the user's and the model's turns to
+    /// alternate. `None` is [`RoleAlternation::Relaxed`].
+    pub role_alternation: Option<RoleAlternation>,
 }
 
 impl OpenAiOptions {
@@ -788,6 +816,13 @@ impl OpenAiOptions {
         self.retry_budget_secs = Some(secs);
         self
     }
+
+    /// Say whether the provider requires the user's and the model's turns to
+    /// alternate: see [`RoleAlternation`].
+    pub fn with_role_alternation(mut self, alternation: RoleAlternation) -> Self {
+        self.role_alternation = Some(alternation);
+        self
+    }
 }
 
 /// Optional settings for an Anthropic provider.
@@ -804,6 +839,9 @@ pub struct AnthropicOptions {
     /// Transient-retry budget in seconds. `None` uses the top-level setting,
     /// then [`DEFAULT_RETRY_BUDGET_SECS`].
     pub retry_budget_secs: Option<u64>,
+    /// Whether the provider requires the user's and the model's turns to
+    /// alternate. `None` is [`RoleAlternation::Relaxed`].
+    pub role_alternation: Option<RoleAlternation>,
 }
 
 impl AnthropicOptions {
@@ -823,6 +861,13 @@ impl AnthropicOptions {
     /// `secs`, rather than for the top-level budget. `0` disables retries.
     pub fn with_retry_budget_secs(mut self, secs: u64) -> Self {
         self.retry_budget_secs = Some(secs);
+        self
+    }
+
+    /// Say whether the provider requires the user's and the model's turns to
+    /// alternate: see [`RoleAlternation`].
+    pub fn with_role_alternation(mut self, alternation: RoleAlternation) -> Self {
+        self.role_alternation = Some(alternation);
         self
     }
 }
@@ -847,6 +892,8 @@ pub enum LlmProvider {
         request_timeout_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_budget_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_alternation: Option<RoleAlternation>,
     },
     /// Anthropic's native Messages API: `POST {base-url}/v1/messages` with
     /// `x-api-key` auth. Distinct from reaching Claude through an
@@ -860,6 +907,8 @@ pub enum LlmProvider {
         request_timeout_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_budget_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_alternation: Option<RoleAlternation>,
     },
 }
 
@@ -882,6 +931,7 @@ impl LlmProvider {
             api_key,
             request_timeout_secs: options.request_timeout_secs,
             retry_budget_secs: options.retry_budget_secs,
+            role_alternation: options.role_alternation,
         }
     }
 
@@ -898,6 +948,7 @@ impl LlmProvider {
             api_key,
             request_timeout_secs: options.request_timeout_secs,
             retry_budget_secs: options.retry_budget_secs,
+            role_alternation: options.role_alternation,
         }
     }
 }

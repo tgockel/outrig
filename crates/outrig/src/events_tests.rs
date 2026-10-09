@@ -1,3 +1,4 @@
+use crate::config::RoleAlternation;
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
@@ -157,6 +158,7 @@ fn each_event_has_exactly_its_data_fields() {
                     reserve: 32_000,
                     overhead: 900,
                     max_tokens: Some(4096),
+                    role_alternation: RoleAlternation::Relaxed,
                 },
                 estimate: 1_000,
                 carried: vec![Chosen {
@@ -164,6 +166,10 @@ fn each_event_has_exactly_its_data_fields() {
                     why: "first",
                 }],
                 evicted: Vec::new(),
+                withheld: vec![Chosen {
+                    turn: 2,
+                    why: "promoted",
+                }],
                 opening: Some(&opening),
                 adjacent: vec![Repeat {
                     turn: None,
@@ -177,8 +183,8 @@ fn each_event_has_exactly_its_data_fields() {
             }),
             "model.call",
             &[
-                "call", "round", "budget", "estimate", "carried", "evicted", "opening", "adjacent",
-                "left_out",
+                "call", "round", "budget", "estimate", "carried", "evicted", "withheld", "opening",
+                "adjacent", "left_out",
             ],
         ),
         (
@@ -457,12 +463,14 @@ fn each_event_has_exactly_its_data_fields() {
             "model",
             "overhead",
             "reserve",
+            "role_alternation",
             "window",
             "window_assumed"
         ]
     );
     let data = serde_json::to_value(call).expect("encodes");
     assert_eq!(data["carried"], json!([{"turn": 0, "why": "first"}]));
+    assert_eq!(data["withheld"], json!([{"turn": 2, "why": "promoted"}]));
     assert_eq!(data["adjacent"], json!([{"turn": null, "role": "user"}]));
     assert_eq!(
         data["left_out"],

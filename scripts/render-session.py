@@ -518,7 +518,13 @@ class Builder:
         manifest = [
             f"carried: {turn_list(d.get('carried')) or 'nothing'}",
             f"evicted: {turn_list(d.get('evicted')) or 'nothing'}",
+            *(
+                [f"withheld so the roles alternate: {turn_list(w)}"]
+                if (w := d.get("withheld"))
+                else []
+            ),
             f"overhead: {tokens(budget.get('overhead'))} tokens",
+            f"role alternation: {text(budget.get('role_alternation'))}",
         ] + [
             f"left out of turn {text(part.get('turn'))}: part {text(part.get('part'))} of message "
             f"{text(part.get('message'))}, which this model's provider cannot take"

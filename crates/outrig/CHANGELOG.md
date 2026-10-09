@@ -75,7 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recent rounds, then its first, then promotions, then the round's earlier turns -- and the turn
   a call answers never is. When that turn alone does not fit, the call is not made: the round
   ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's
-  refusal of a call whose shortened history put one role after itself says so.
+  refusal of a call whose shortened history put one role after itself says so, and names the
+  provider row's `role-alternation` as the remedy.
 
   Each model call retries a provider's transient failures -- a retryable status, Anthropic's
   `529` included, honoring `Retry-After`, a dropped connection, a response rig cannot use --
@@ -121,6 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
   shape will change without a deprecation while the agent loop is built out.
 
+- **`[providers.<name>].role-alternation`, `"relaxed"` or `"strict"`**, on both provider styles,
+  with `OpenAiOptions::with_role_alternation` and `AnthropicOptions::with_role_alternation`. A
+  `"strict"` provider refuses a request in which one role follows itself, as a Bedrock-backed
+  Claude behind an OpenAI-compatible gateway does, where OpenAI's API accepts it and Anthropic's
+  merges it. `PythonAgent` sends such a provider a conversation that alternates by construction:
+  a turn promoted without the rest of its round is withheld where it would follow the model's
+  own reply, and a round that ended on tool results is withheld whole once the next round opens.
+  Each `model.call` event lists the turns `withheld`. Unset, nothing changes. (#472)
 - **`Model::context_window`, `[models.<name>].context-window` in config**: the model's whole
   context window in tokens, a request and its reply together, as its provider publishes it. It
   configures nothing on the provider's side; `PythonAgent` holds each model call to it. An alias

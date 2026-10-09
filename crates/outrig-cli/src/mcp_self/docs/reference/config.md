@@ -289,6 +289,7 @@ api-key  = "${OLLAMA_API_KEY}"
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.      |
 | `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds. |
+| `role-alternation`     | string       | no       | --      | Strict alternation, see below.   |
 
 `request-timeout-secs` bounds each individual attempt, and defaults high enough not to cut
 off long reasoning completions. It must be between `1` and `3600` seconds; `0` is rejected,
@@ -326,6 +327,22 @@ Two things about the budget that belong here, because they are about the keys:
   response comes back immediately and the budget alone would spend itself on dozens of them.
   `0` still switches that layer off along with everything else.
 
+`role-alternation` says whether the provider requires the user's and the model's turns to
+alternate in every request. Unset, or `"relaxed"`, is a provider that merges or accepts two
+messages of one role in a row, which OpenAI's API and Anthropic's both do. `"strict"` is one that
+refuses them -- a Bedrock-backed Claude behind an OpenAI-compatible gateway is known to -- and
+makes `outrig run-new` send it a conversation that alternates by construction. The conversation
+`run-new` sends is a part of the whole, and a cut can put one role after itself: a turn brought
+back without the rest of its round opens on the model's call right after the model's own reply,
+and a round that ended on tool results is followed by the next round's opening. With `"strict"`,
+the first is left out, and the second is left out whole once the next round opens, since each of
+its turns ends on results. What is left out stays in `runtime.history`, the line that opens a
+round counts it, and the event log names it. When a provider refuses a call that carried such a
+pair, the error says to set this key. It configures nothing on the provider's side, and `run`,
+which sends whole rounds, ignores it. See
+[`outrig run-new`](https://tgockel.github.io/outrig/reference/cli.html#outrig-run-new) for
+what a shortened conversation looks like to a provider.
+
 ### `style = "anthropic"`
 
 Anthropic's native Messages API: requests go to `{base-url}/v1/messages` and authenticate
@@ -347,11 +364,12 @@ api-key  = "${ANTHROPIC_API_KEY}"
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.       |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.         |
 | `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds.    |
+| `role-alternation`     | string       | no       | --      | Strict alternation, see below.      |
 
 `base-url` is the API root, without the `/v1/messages` path -- outrig appends that. A
 trailing `/v1`, `/messages`, or `/v1/messages` is trimmed if you write one anyway, so
-`https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. Timeout
-and transient-retry behavior match `style = "openai"` exactly.
+`https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. Timeout,
+transient-retry, and `role-alternation` behavior match `style = "openai"` exactly.
 
 Anthropic requires an output-token ceiling on every request. outrig knows one for the model
 identifiers it recognizes; any other identifier needs `max-tokens` on the model or the

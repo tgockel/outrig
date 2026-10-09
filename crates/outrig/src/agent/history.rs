@@ -15,7 +15,9 @@
 //! -- nearest the part already left out -- then promotions, oldest first, then
 //! the round's own earlier turns. The latest turn, whose results the call
 //! answers, is never left out; when it cannot fit on its own, the call is not
-//! made ([`TooLarge`]).
+//! made ([`TooLarge`]). For a provider that requires the user's and the model's
+//! turns to alternate, the turns that would put one role after itself are
+//! withheld as well ([`Store::alternate`]).
 //!
 //! Each call's [`Manifest`] records what it carried and why, which is the only
 //! answer to what a model had in front of it: a promotion asks, and the window,
@@ -35,6 +37,7 @@ use serde_json::{Value, json};
 use super::budget::{self, Budget, Wire};
 #[cfg(test)]
 use super::tool::ObserverSlot;
+use crate::config::RoleAlternation;
 use crate::events::{self, Event};
 use crate::python::host::{ContextChange, Interpreter};
 
@@ -105,7 +108,8 @@ impl Role {
 /// such a pair; OpenAI's carries them as `tool` messages, so a prompt after
 /// results is no repeat there, and it accepts two replies in a row. A provider
 /// or gateway that requires turns to alternate -- or turns results back into
-/// user messages -- may refuse the call.
+/// user messages -- may refuse the call, unless its row says it is
+/// [`RoleAlternation::Strict`], when the view withholds what would make a pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Adjacent {
     /// The turn that opens on the role the one before it ended on, or `None`
@@ -151,11 +155,17 @@ pub(crate) struct Manifest {
     pub(crate) carried: Vec<(usize, Why)>,
     /// The turns chosen but not sent because they did not fit, oldest first.
     pub(crate) evicted: Vec<(usize, Why)>,
+    /// The turns chosen and fitting that the call was not sent so that the
+    /// user's and the model's turns alternate, for a provider that requires
+    /// it: see [`Store::alternate`]. Oldest first; empty for any other.
+    pub(crate) withheld: Vec<(usize, Why)>,
     /// The round's opening, when it was the call's prompt: on a round's first
     /// call, before any turn has taken it.
     pub(crate) opening: Option<Message>,
     /// Where one role follows itself in the conversation sent, whether or not
-    /// the wire repeats it.
+    /// the wire repeats it. For a provider that requires turns to alternate,
+    /// only where the turn the call answers opens on a reply and nothing before
+    /// it ends on the user's side, which no withholding could clear.
     pub(crate) adjacent: Vec<Adjacent>,
     /// The parts of the carried turns the call's provider cannot take, which
     /// it was not sent: see [`Wire`]. Oldest first.
@@ -181,6 +191,16 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
             sent.push(original.clone());
             continue;
         };
+        if !wire.keeps(original) {
+            // A reply of nothing the protocol takes made no tool call, so
+            // leaving it out whole leaves no result unanswered.
+            left_out.extend(content.iter().enumerate().map(|(part, _)| LeftOut {
+                turn,
+                message,
+                part,
+            }));
+            continue;
+        }
         if content.iter().all(|part| wire.takes(part)) {
             sent.push(original.clone());
             continue;
@@ -197,8 +217,7 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
                 });
             }
         }
-        // A reply of nothing but what was left out made no tool call, so
-        // leaving it out leaves no result unanswered.
+        // Kept has a part, since the protocol keeps the reply.
         if let Ok(content) = OneOrMany::many(kept) {
             sent.push(Message::Assistant {
                 id: id.clone(),
@@ -207,6 +226,18 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
         }
     }
     sent
+}
+
+/// The roles turn `messages` opens and ends on as a call in `wire` is sent
+/// them -- what [`fit`] would leave, without building it -- or `None` when it
+/// would leave nothing.
+fn ends(wire: Wire, messages: &[Message]) -> Option<(Role, Role)> {
+    let mut roles = messages
+        .iter()
+        .filter(|message| wire.keeps(message))
+        .filter_map(Role::of);
+    let first = roles.next()?;
+    Some((first, roles.next_back().unwrap_or(first)))
 }
 
 /// Turn `turn`'s `messages` as the call `left_out` describes was sent them:
@@ -264,10 +295,12 @@ impl Manifest {
                 reserve: self.budget.reserve,
                 overhead: self.budget.overhead,
                 max_tokens: self.budget.max_tokens,
+                role_alternation: self.budget.alternation,
             },
             estimate: self.estimate,
             carried: chosen(&self.carried),
             evicted: chosen(&self.evicted),
+            withheld: chosen(&self.withheld),
             opening: self.opening.as_ref(),
             adjacent: self
                 .adjacent
@@ -430,7 +463,7 @@ impl History {
     /// fits, so the opening is costed at the longest line it can be -- the one
     /// counting every turn -- both here and when its first call is assembled.
     pub(crate) fn open_round(&self, budget: &Budget, line: impl Fn(usize) -> String) -> Message {
-        self.store().open_round(budget.room(), line)
+        self.store().open_round(budget, line)
     }
 
     /// The number of the round in progress, or of the last one if none is. A
@@ -503,6 +536,7 @@ impl History {
             estimate = manifest.estimate,
             carried = manifest.carried.len(),
             evicted = manifest.evicted.len(),
+            withheld = manifest.withheld.len(),
             "assembled a model call's view"
         );
         Ok((sent, manifest))
@@ -511,14 +545,7 @@ impl History {
     /// The messages `manifest`'s call was sent, its prompt included.
     #[cfg(test)]
     pub(crate) fn reconstruct(&self, manifest: &Manifest) -> Vec<Message> {
-        let store = self.store();
-        let mut messages: Vec<Message> = manifest
-            .carried
-            .iter()
-            .flat_map(|(id, _)| as_sent(*id, &store.turns[*id].messages, &manifest.left_out))
-            .collect();
-        messages.extend(manifest.opening.iter().cloned());
-        messages
+        self.store().reconstruct(manifest)
     }
 
     #[cfg(test)]
@@ -588,19 +615,26 @@ impl Prompt {
     }
 }
 
-/// Which turns a call carries, and which the budget left out, each by id.
+/// Turns by id, each with why it was chosen, oldest first.
+type Chosen = Vec<(usize, Why)>;
+
+/// Which turns a call carries, which the budget left out, and which were
+/// withheld so the roles alternate, each by id.
 struct Selection {
-    carried: Vec<(usize, Why)>,
-    evicted: Vec<(usize, Why)>,
+    carried: Chosen,
+    evicted: Chosen,
+    /// Empty until [`Store::view`] has had its say, and for a provider that
+    /// does not require the roles to alternate.
+    withheld: Chosen,
     /// The estimated tokens of what is carried, the prompt included.
     tokens: u64,
 }
 
 impl Store {
     /// See [`History::open_round`].
-    fn open_round(&mut self, room: u64, line: impl Fn(usize) -> String) -> Message {
+    fn open_round(&mut self, budget: &Budget, line: impl Fn(usize) -> String) -> Message {
         let allowance = budget::tokens([&Message::user(line(self.turns.len()))]);
-        let omitted = self.omitted(room, allowance);
+        let omitted = self.omitted(budget, allowance);
         let opening = Message::user(line(omitted));
         self.begin(opening.clone(), allowance);
         opening
@@ -695,9 +729,10 @@ impl Store {
         let Selection {
             carried,
             evicted,
+            withheld,
             tokens,
         } = self
-            .select(self.start, prompt, budget.room())
+            .view(self.start, prompt, budget)
             .map_err(|estimate| TooLarge {
                 turn: prompt.turn(),
                 round,
@@ -737,21 +772,136 @@ impl Store {
             opening,
             adjacent,
             left_out,
+            withheld,
         };
         self.calls += 1;
         Ok((sent, manifest))
     }
 
     /// How many turns a round starting now, opening on a line of
-    /// `opening_tokens`, would not send on its first call, given `room`.
-    fn omitted(&self, room: u64, opening_tokens: u64) -> usize {
+    /// `opening_tokens`, would not send on its first call, held to `budget`.
+    fn omitted(&self, budget: &Budget, opening_tokens: u64) -> usize {
         let prompt = Prompt::Opening {
             tokens: opening_tokens,
         };
-        match self.select(self.turns.len(), prompt, room) {
+        match self.view(self.turns.len(), prompt, budget) {
             Ok(selection) => self.turns.len() - selection.carried.len(),
             Err(_) => self.turns.len(),
         }
+    }
+
+    /// The messages `manifest`'s call was sent, its prompt included: the turns
+    /// it carried as `left_out` leaves them, then the opening.
+    #[cfg(test)]
+    fn reconstruct(&self, manifest: &Manifest) -> Vec<Message> {
+        manifest
+            .carried
+            .iter()
+            .flat_map(|&(id, _)| as_sent(id, &self.turns[id].messages, &manifest.left_out))
+            .chain(manifest.opening.iter().cloned())
+            .collect()
+    }
+
+    /// What a call of a round beginning at `start` is sent, held to `budget`:
+    /// [`Store::select`]'s choice, less what [`Store::alternate`] withholds
+    /// when the provider requires turns to alternate. `Err` as `select`.
+    fn view(&self, start: usize, prompt: Prompt, budget: &Budget) -> Result<Selection, u64> {
+        let mut selection = self.select(start, prompt, budget.room())?;
+        match budget.alternation {
+            RoleAlternation::Relaxed => {}
+            RoleAlternation::Strict => {
+                let carried = std::mem::take(&mut selection.carried);
+                (selection.carried, selection.withheld) =
+                    self.alternate(carried, prompt, budget.wire);
+                selection.tokens -= selection
+                    .withheld
+                    .iter()
+                    .map(|&(id, _)| self.turns[id].tokens)
+                    .sum::<u64>();
+            }
+        }
+        Ok(selection)
+    }
+
+    /// `carried`, oldest first, split into what a call answering `prompt` is
+    /// sent and what it is not, so that what is sent alternates between the
+    /// user's side and the model's for a provider that requires it
+    /// ([`RoleAlternation::Strict`]). Both oldest first.
+    ///
+    /// Each turn is a fragment that opens on one role and ends on one, as the
+    /// call in `wire` is sent it; a turn [`fit`] leaves nothing of has none and
+    /// stays carried out of the way. The fragments are walked oldest first
+    /// onto a stack of what is kept, which begins as if on a reply so the view
+    /// opens on the user's side. Where a fragment opens on the role the stack
+    /// ends on:
+    ///
+    /// - **After results the model never answered.** Only a round's first turn
+    ///   and the opening open on the user's side, so the stack ends on a round
+    ///   cut short. The earlier side yields: the stack is popped until it ends
+    ///   on a reply. The fragment itself is never dropped, since dropping a
+    ///   round's first turn would lose the user's prompt while the round's
+    ///   later turns stayed.
+    /// - **After a reply.** A promotion or a turn of the window yields and is
+    ///   withheld. A turn of the round in progress, or the latest, is instead
+    ///   sent after the nearest kept fragment that ends on the user's side,
+    ///   withholding what was kept after it; when there is none, the pair
+    ///   stands, and the manifest's `adjacent` records it.
+    ///
+    /// A turn of the round in progress is never popped: one followed by
+    /// another ends on results, so it never ends a reply-after-reply seam, and
+    /// the later side of a user-after-user seam is never of the round in
+    /// progress. Were it reached all the same, the pair would stand.
+    fn alternate(&self, carried: Chosen, prompt: Prompt, wire: Wire) -> (Chosen, Chosen) {
+        // A turn of the round in progress, or the latest, is never withheld.
+        let yields = |at: usize| !matches!(carried[at].1, Why::Latest | Why::Round);
+        // Each kept fragment: its place in `carried`, and the role it ends on.
+        let mut stack: Vec<(usize, Role)> = Vec::new();
+        let mut withheld: Vec<usize> = Vec::new();
+        let ends_on =
+            |stack: &[(usize, Role)]| stack.last().map_or(Role::Assistant, |&(_, last)| last);
+        // Pop the stack while it ends on the user's side and may yield.
+        let unanswered = |stack: &mut Vec<(usize, Role)>, withheld: &mut Vec<usize>| {
+            while let Some(&(top, Role::User)) = stack.last()
+                && yields(top)
+            {
+                stack.pop();
+                withheld.push(top);
+            }
+        };
+        for (at, &(id, _)) in carried.iter().enumerate() {
+            // A turn `fit` leaves nothing of has no roles, and stays carried.
+            let Some((first, last)) = ends(wire, &self.turns[id].messages) else {
+                continue;
+            };
+            match (first, ends_on(&stack)) {
+                (Role::User, Role::User) => unanswered(&mut stack, &mut withheld),
+                (Role::Assistant, Role::Assistant) => {
+                    if yields(at) {
+                        withheld.push(at);
+                        continue;
+                    }
+                    if let Some(cut) = stack.iter().rposition(|&(_, last)| last == Role::User)
+                        && stack[cut + 1..].iter().all(|&(top, _)| yields(top))
+                    {
+                        withheld.extend(stack.drain(cut + 1..).map(|(top, _)| top));
+                    }
+                }
+                _ => {}
+            }
+            stack.push((at, last));
+        }
+        if matches!(prompt, Prompt::Opening { .. }) {
+            unanswered(&mut stack, &mut withheld);
+        }
+        withheld.sort_unstable();
+        let kept = carried
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| withheld.binary_search(at).is_err())
+            .map(|(_, &turn)| turn)
+            .collect();
+        let withheld = withheld.iter().map(|&at| carried[at]).collect();
+        (kept, withheld)
     }
 
     /// Why each turn is chosen for a call of a round that begins at `start`
@@ -825,6 +975,7 @@ impl Store {
         Ok(Selection {
             carried,
             evicted,
+            withheld: Vec::new(),
             tokens: room - left,
         })
     }

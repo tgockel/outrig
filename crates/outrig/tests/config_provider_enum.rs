@@ -7,6 +7,7 @@ use std::path::Path;
 
 use outrig::config::{
     AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, LlmProvider, OpenAiOptions,
+    RoleAlternation,
 };
 use outrig::error::OutrigError;
 
@@ -342,4 +343,103 @@ fn remote_provider_options_populate_remote_variants() {
     // and came out with `request_timeout_secs: None`.
     assert_eq!(OpenAiOptions::new(), OpenAiOptions::default());
     assert_eq!(AnthropicOptions::new(), AnthropicOptions::default());
+}
+
+/// `role-alternation` is optional on both styles and takes its two values; a
+/// row that leaves it out is unset rather than relaxed, so the setting
+/// round-trips only where it was written. A value that is neither names what
+/// was written and a legal value. The builders set it the same way.
+#[test]
+fn role_alternation_parses_on_both_styles() {
+    let cfg = parse(
+        r#"
+[providers.gateway]
+style            = "openai"
+base-url         = "https://gateway.example/v1"
+api-key          = "${GATEWAY_KEY}"
+role-alternation = "strict"
+
+[providers.claude]
+style            = "anthropic"
+base-url         = "https://api.anthropic.com"
+api-key          = "${ANTHROPIC_API_KEY}"
+role-alternation = "relaxed"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+"#,
+    );
+    cfg.validate(None).expect("validates");
+    let alternation = |provider: &LlmProvider| match provider {
+        LlmProvider::OpenAi {
+            role_alternation, ..
+        }
+        | LlmProvider::Anthropic {
+            role_alternation, ..
+        } => *role_alternation,
+        other => panic!("unexpected style: {other:?}"),
+    };
+    assert_eq!(
+        alternation(&cfg.providers["gateway"]),
+        Some(RoleAlternation::Strict)
+    );
+    assert_eq!(
+        alternation(&cfg.providers["claude"]),
+        Some(RoleAlternation::Relaxed)
+    );
+    assert_eq!(alternation(&cfg.providers["openai"]), None);
+
+    let serialized = toml::to_string(&cfg).expect("serializes");
+    assert_eq!(
+        serialized.matches("role-alternation").count(),
+        2,
+        "the key round-trips where it was set and nowhere else, got: {serialized}"
+    );
+    assert!(
+        serialized.contains(r#"role-alternation = "strict""#),
+        "the value round-trips in its documented spelling, got: {serialized}"
+    );
+    let again = Config::load_from_str(&serialized).expect("reserialized parses");
+    assert_eq!(cfg, again);
+
+    let err = Config::load_from_str(
+        r#"
+[providers.gateway]
+style            = "openai"
+base-url         = "https://gateway.example/v1"
+api-key          = "${GATEWAY_KEY}"
+role-alternation = "loose"
+"#,
+    )
+    .expect_err("a value that is neither fails");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("loose") && (msg.contains("strict") || msg.contains("relaxed")),
+        "error should quote the value and name a legal one, got: {msg}"
+    );
+
+    let key = ApiKeyRef::parse("${GATEWAY_KEY}").expect("api-key ref parses");
+    let built = LlmProvider::openai(
+        "https://gateway.example/v1",
+        key,
+        OpenAiOptions::new().with_role_alternation(RoleAlternation::Strict),
+    );
+    assert_eq!(alternation(&built), Some(RoleAlternation::Strict));
+    let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");
+    let built = LlmProvider::anthropic(
+        "https://api.anthropic.com",
+        key,
+        AnthropicOptions::new().with_role_alternation(RoleAlternation::Strict),
+    );
+    assert_eq!(alternation(&built), Some(RoleAlternation::Strict));
+    assert_eq!(
+        alternation(&LlmProvider::anthropic(
+            "https://api.anthropic.com",
+            ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses"),
+            AnthropicOptions::new(),
+        )),
+        None
+    );
 }

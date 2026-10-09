@@ -17,13 +17,14 @@ use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
 use super::history::{LeftOut, Manifest, Why, Window, as_sent};
 use super::mock_http::{
-    self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, submit, text_reply,
+    self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, strict_refusal,
+    submit, text_reply,
 };
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::retry::RetryingHttpClient;
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use super::{AgentError, PythonAgent};
-use crate::config::{Config, LlmProvider};
+use crate::config::{Config, LlmProvider, RoleAlternation};
 use crate::events::{self, Events};
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
@@ -1728,42 +1729,123 @@ async fn every_cut_recorded(
     var: &str,
     events: Events,
 ) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
-    let (mut agent, mut requests) = agent_with(
+    let (agent, requests) = agent_with(
         events,
         style,
         var,
         MODEL,
         "",
-        "max-tokens = 4096\ntool-call-max = 2",
-        vec![
-            // 1: turn 0.
-            style.text("first"),
-            // 2: turns 1 to 3; turn 2 opens on a call, mid-round.
-            style.submit("call_a", "a = 1"),
-            style.submit("call_b", "b = 2"),
-            style.text("second"),
-            // 3: the cap stops it after turn 6's results.
-            style.submit("call_c", "c = 3"),
-            style.submit("call_d", "d = 4"),
-            style.submit("call_e", "e = 5"),
-            // 4: the promoted turn 2 follows turn 0's text.
-            style.submit("call_p", "runtime.context.promote(2)"),
-            style.text("promoted"),
-            // 5: two large turns, of which the budget sends one at a time.
-            style.submit("call_y", "print('y' * 18000)"),
-            style.submit("call_z", "print('z' * 18000)"),
-            style.text("fifth"),
-            // 6: ended while its second call runs.
-            style.batch(&[
-                ("call_g", "g = 1"),
-                ("call_h", "import time\ntime.sleep(2)"),
-                ("call_i", "i = 1"),
-            ]),
-            // 7.
-            style.text("done"),
-        ],
+        EVERY_CUT_AGENT,
+        every_cut_script(style),
     )
     .await;
+    every_cut_driven(agent, requests).await
+}
+
+/// [`every_cut`] against a provider that requires the user's and the model's
+/// turns to alternate -- the mock refusing a request whose roles repeat --
+/// whose row says so.
+async fn every_cut_strict(
+    style: Style,
+    var: &str,
+) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
+    let (agent, requests) = agent_on_a_strict_mock(style, var, true).await;
+    every_cut_driven(agent, requests).await
+}
+
+/// An agent scripted by [`every_cut_script`] over a mock that refuses a
+/// request whose roles repeat, as a strict provider does; its provider's row
+/// says so when `says_so`.
+async fn agent_on_a_strict_mock(
+    style: Style,
+    var: &str,
+    says_so: bool,
+) -> (
+    PythonAgent,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let (addr, requests) = mock_http::start_strict(every_cut_script(style)).await;
+    let mut cfg = config_in(style, addr, var, MODEL, "", EVERY_CUT_AGENT);
+    if says_so {
+        strict(&mut cfg, "claude");
+    }
+    (agent_of(&cfg, var, Events::off()).await, requests)
+}
+
+/// Three rounds on the [`NARROW`] window, then a fourth the provider refuses:
+/// the error that round ends with.
+async fn refused_fourth_round(agent: &mut PythonAgent) -> String {
+    agent.history.set_window(NARROW);
+    for message in ["one", "two", "three"] {
+        round(agent, message).await;
+    }
+    post(agent, "four").await;
+    within(agent.round())
+        .await
+        .expect_err("the provider refused")
+        .to_string()
+}
+
+/// Each of `manifests`, with the store, rebuilds exactly what the matching
+/// request in `recorded` carried, through `style`'s adapter.
+fn each_call_reconstructs(
+    style: Style,
+    agent: &PythonAgent,
+    recorded: &[RecordedRequest],
+    manifests: &[Manifest],
+) {
+    for (n, (request, manifest)) in recorded.iter().zip(manifests).enumerate() {
+        let rebuilt = on_the_wire(style, agent.history.reconstruct(manifest));
+        assert_eq!(
+            rebuilt,
+            conversation(style, request),
+            "{style:?} call {n}: {manifest:#?}"
+        );
+    }
+}
+
+/// The `coding` agent's block for [`every_cut`]: a cap of two tool calls a
+/// round.
+const EVERY_CUT_AGENT: &str = "max-tokens = 4096\ntool-call-max = 2";
+
+/// The replies [`every_cut`] scripts, by round.
+fn every_cut_script(style: Style) -> Vec<CannedResponse> {
+    vec![
+        // 1: turn 0.
+        style.text("first"),
+        // 2: turns 1 to 3; turn 2 opens on a call, mid-round.
+        style.submit("call_a", "a = 1"),
+        style.submit("call_b", "b = 2"),
+        style.text("second"),
+        // 3: the cap stops it after turn 6's results.
+        style.submit("call_c", "c = 3"),
+        style.submit("call_d", "d = 4"),
+        style.submit("call_e", "e = 5"),
+        // 4: the promoted turn 2 follows turn 0's text.
+        style.submit("call_p", "runtime.context.promote(2)"),
+        style.text("promoted"),
+        // 5: two large turns, of which the budget sends one at a time.
+        style.submit("call_y", "print('y' * 18000)"),
+        style.submit("call_z", "print('z' * 18000)"),
+        style.text("fifth"),
+        // 6: ended while its second call runs.
+        style.batch(&[
+            ("call_g", "g = 1"),
+            ("call_h", "import time\ntime.sleep(2)"),
+            ("call_i", "i = 1"),
+        ]),
+        // 7.
+        style.text("done"),
+    ]
+}
+
+/// Drive `agent`, scripted by [`every_cut_script`], through its seven rounds
+/// on the window and the budget that make every cut, and collect what
+/// `requests` saw and each call's manifest.
+async fn every_cut_driven(
+    mut agent: PythonAgent,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
     agent.history.set_window(NARROW);
     // Room for either of round 5's large turns and what else there is, not
     // both: the model's own budget, its window shrunk to leave that room.
@@ -1855,16 +1937,11 @@ async fn each_calls_manifest_reconstructs_what_the_provider_received() {
     for style in Style::ALL {
         let var = format!("OUTRIG_TEST_AGENT_MANIFEST_{}", style.name().to_uppercase());
         let (agent, recorded, manifests) = every_cut(style, &var).await;
-        for (n, (request, manifest)) in recorded.iter().zip(&manifests).enumerate() {
+        for (n, manifest) in manifests.iter().enumerate() {
             assert_eq!(manifest.call, n as u64);
             assert_eq!(manifest.budget, *agent.budget);
-            let rebuilt = on_the_wire(style, agent.history.reconstruct(manifest));
-            assert_eq!(
-                rebuilt,
-                conversation(style, request),
-                "{style:?} call {n}: {manifest:#?}"
-            );
         }
+        each_call_reconstructs(style, &agent, &recorded, &manifests);
     }
 }
 
@@ -1892,21 +1969,113 @@ async fn a_refused_call_that_carried_a_same_role_pair_says_so() {
             ],
         )
         .await;
-        agent.history.set_window(NARROW);
-        for message in ["one", "two", "three"] {
-            round(&mut agent, message).await;
-        }
-        post(&agent, "four").await;
-        let err = within(agent.round())
-            .await
-            .expect_err("the provider refused")
-            .to_string();
+        let err = refused_fourth_round(&mut agent).await;
         assert!(
             err.contains(
                 "The conversation it was sent left turns out, which put two of the model's \
                  replies in a row, where turn 2 begins"
-            ) && err.contains("doc/reference/cli.md"),
+            ) && err.contains(r#"set [providers.claude].role-alternation = "strict""#)
+                && err.contains("doc/reference/cli.md"),
             "{style:?}: {err}"
+        );
+    }
+}
+
+/// A provider that requires the user's and the model's turns to alternate,
+/// whose row says so, is sent every cut the view makes in a form it accepts:
+/// no request repeats a role as a gateway sees them or opens on the model's,
+/// every call keeps each tool call beside its result, the manifest names the
+/// turns withheld for it, and the record rebuilds each call. What it costs: a
+/// turn promoted without the rest of its round is withheld, and a round cut
+/// short goes once the next round opens.
+#[tokio::test]
+async fn a_strict_provider_is_sent_a_conversation_that_alternates_on_both_adapters() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_STRICT_{}", style.name().to_uppercase());
+        let (agent, recorded, manifests) = every_cut_strict(style, &var).await;
+        assert_eq!(
+            recorded.len(),
+            manifests.len(),
+            "{style:?}: a manifest a call, and none refused"
+        );
+        for (n, (request, manifest)) in recorded.iter().zip(&manifests).enumerate() {
+            assert!(
+                strict_refusal(&request.body).is_none(),
+                "{style:?} call {n}: {:#}",
+                request.body
+            );
+            let wire = check_wire(style, &request.body);
+            assert!(wire.unpaired.is_empty(), "{style:?} call {n}: {wire:?}");
+            assert!(
+                manifest.adjacent.is_empty(),
+                "{style:?} call {n}: {manifest:#?}"
+            );
+        }
+        each_call_reconstructs(style, &agent, &recorded, &manifests);
+        // Round 4 opens after the capped round 3's last result, so round 3
+        // goes; its second call would put the promoted turn 2 after turn 0's
+        // reply, so turn 2 goes too.
+        let fourth: Vec<&Manifest> = manifests.iter().filter(|m| m.round == 4).collect();
+        assert_eq!(fourth.len(), 2, "{style:?}");
+        assert_eq!(
+            fourth[0].withheld,
+            [(4, Why::Recent), (5, Why::Recent), (6, Why::Recent)],
+            "{style:?}"
+        );
+        assert_eq!(
+            fourth[1].withheld,
+            [
+                (2, Why::Promoted),
+                (4, Why::Recent),
+                (5, Why::Recent),
+                (6, Why::Recent)
+            ],
+            "{style:?}"
+        );
+        // Round 5's third call: its own first turn is too large, so the
+        // latest would follow round 4's closing reply, which yields instead.
+        let fifth = recorded
+            .iter()
+            .position(|r| count(r, "zzzzzzzzzz") > 0)
+            .expect("round 5's last call");
+        assert_eq!(count(&recorded[fifth], "yyyyyyyyyy"), 0, "{style:?}");
+        assert_eq!(manifests[fifth].evicted, [(9, Why::Round)], "{style:?}");
+        assert!(
+            manifests[fifth].withheld.contains(&(8, Why::Recent)),
+            "{style:?}: {:?}",
+            manifests[fifth].withheld
+        );
+        assert!(
+            count(&recorded[fifth], "call_p") > 0,
+            "{style:?}: the latest follows round 4's results"
+        );
+    }
+}
+
+/// The same provider, whose row does not say so yet, refuses the first call
+/// whose view puts one role after itself -- round 4's opening, after the
+/// capped round 3's results -- and the error says where the pair is and what
+/// to set.
+#[tokio::test]
+async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names_the_key() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_UNSAID_{}", style.name().to_uppercase());
+        let (mut agent, mut requests) = agent_on_a_strict_mock(style, &var, false).await;
+        let err = refused_fourth_round(&mut agent).await;
+        assert!(
+            err.contains("roles must alternate")
+                && err.contains(
+                    "a prompt right after a prompt or tool results the model never answered, \
+                     where the round's opening begins"
+                )
+                && err.contains(r#"set [providers.claude].role-alternation = "strict""#),
+            "{style:?}: {err}"
+        );
+        let recorded = mock_http::drain(&mut requests);
+        assert_eq!(
+            recorded.len(),
+            8,
+            "{style:?}: seven calls answered, the eighth refused"
         );
     }
 }
@@ -2325,6 +2494,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
             api_key: KEY.to_string(),
             request_timeout_secs: None,
             retry_budget_secs: None,
+            role_alternation: RoleAlternation::Relaxed,
         },
         max_tokens,
         context_window: None,
@@ -2999,6 +3169,22 @@ fn retrying(cfg: &mut Config, provider: &str) {
     }
 }
 
+/// Say in `cfg` that its provider `provider` requires the user's and the
+/// model's turns to alternate: `role-alternation = "strict"` on its row.
+fn strict(cfg: &mut Config, provider: &str) {
+    match cfg.providers.get_mut(provider) {
+        Some(
+            LlmProvider::Anthropic {
+                role_alternation, ..
+            }
+            | LlmProvider::OpenAi {
+                role_alternation, ..
+            },
+        ) => *role_alternation = Some(RoleAlternation::Strict),
+        None => panic!("no provider {provider}"),
+    }
+}
+
 /// Two models, `head` and `tail`, and the alias `chain` over both, which the
 /// session runs. Each is given as its provider's style, that provider's
 /// address, and the keys its `[models.<name>]` row carries, and each provider
@@ -3286,6 +3472,116 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
     );
 }
 
+/// A call that moves to a model whose provider requires the user's and the
+/// model's turns to alternate is assembled again for it: the head was sent
+/// the pair, and the model the call moved to is not. The move's own
+/// `model.call` names what was withheld, and the log rebuilds both.
+#[tokio::test]
+async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_STRICT";
+    let (head, mut head_requests) = mock_http::start(vec![
+        text_reply("first"),
+        submit("call_a", "a = 1"),
+        submit("call_b", "b = 2"),
+        text_reply("second"),
+        text_reply("third"),
+        submit("call_p", "runtime.context.promote(2)"),
+        failure(503),
+    ])
+    .await;
+    let (tail, mut tail_requests) =
+        mock_http::start_strict(vec![Style::OpenAi.text("promoted")]).await;
+    let mut cfg = chain_config(
+        vars,
+        (
+            Style::Anthropic,
+            &format!("http://{head}"),
+            "max-tokens = 4096",
+        ),
+        (
+            Style::OpenAi,
+            &format!("http://{tail}"),
+            "max-tokens = 4096",
+        ),
+    );
+    strict(&mut cfg, "second");
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+    agent.history.set_window(NARROW);
+    let alternation: Vec<_> = agent
+        .agent
+        .model
+        .budgets()
+        .map(|budget| (budget.model.as_str(), budget.alternation))
+        .collect();
+    assert_eq!(
+        alternation,
+        [
+            ("head", RoleAlternation::Relaxed),
+            ("tail", RoleAlternation::Strict)
+        ]
+    );
+
+    for (message, reply) in [
+        ("one", "first"),
+        ("two", "second"),
+        ("three", "third"),
+        ("four", "promoted"),
+    ] {
+        assert_eq!(round(&mut agent, message).await, reply);
+    }
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let at_head = mock_http::drain(&mut head_requests);
+    let at_tail = mock_http::drain(&mut tail_requests);
+    assert_eq!((at_head.len(), at_tail.len()), (7, 1));
+    // The same call, as each model was sent it: the head with the promoted
+    // turn 2 right after turn 0's reply, and round 3's opening after turn 2's
+    // result; the tail without turn 2.
+    let (headed, moved) = (&at_head[6], &at_tail[0]);
+    assert_eq!(
+        check_wire(Style::Anthropic, &headed.body).adjacent.len(),
+        2,
+        "{:#}",
+        headed.body
+    );
+    assert!(count(headed, "call_b") > 0);
+    assert_eq!(count(moved, "call_b"), 0, "{:#}", moved.body);
+    assert!(strict_refusal(&moved.body).is_none(), "{:#}", moved.body);
+    assert!(check_wire(Style::OpenAi, &moved.body).unpaired.is_empty());
+
+    let records = events::recorded(dir.path());
+    let kinds = events::kinds(&records);
+    let failover = at(&kinds, "model.failover", 0);
+    let head_call = *events::of_kind(&records[..failover], "model.call")
+        .last()
+        .expect("the head's manifest of the call");
+    let moved_call = &records[at(&kinds, "model.call", failover)]["data"];
+    assert_eq!(head_call["budget"]["model"], "head");
+    assert_eq!(
+        head_call["adjacent"],
+        json!([{"turn": 2, "role": "assistant"}, {"turn": 4, "role": "user"}]),
+        "{head_call:#}"
+    );
+    assert_eq!(head_call["withheld"], json!([]));
+    assert_eq!(moved_call["budget"]["model"], "tail");
+    assert_eq!(moved_call["adjacent"], json!([]), "{moved_call:#}");
+    assert_eq!(
+        moved_call["withheld"],
+        json!([{"turn": 2, "why": "promoted"}]),
+        "{moved_call:#}"
+    );
+    each_call_rebuilds(
+        &records,
+        &[
+            ("head", Style::Anthropic, &at_head),
+            ("tail", Style::OpenAi, &at_tail),
+        ],
+    );
+}
+
 /// The check `0003-12` left for this task: a call that moves to a model with
 /// a smaller window is sent a view assembled for that window, not the head's.
 /// The head's view carried round 1's large turn; the tail's leaves it out, and
@@ -3372,6 +3668,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
             "reserve": 1024,
             "overhead": moved_call["budget"]["overhead"],
             "max_tokens": 1024,
+            "role_alternation": "relaxed",
         })
     );
     // Turn 0 is round 1's opening, the call, and its large result.

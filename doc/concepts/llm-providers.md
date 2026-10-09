@@ -284,6 +284,17 @@ produced nothing but reasoning, usually one cut off at the output-token ceiling,
 assistant message with empty text, so the conversation keeps alternating between user and
 assistant.
 
+A gateway that requires the user's and the model's turns to alternate -- a Bedrock-backed Claude
+behind an OpenAI-compatible gateway is known to -- refuses a request in which one role follows
+itself. `outrig run` never sends one, since whole rounds alternate on their own; the shortened
+conversation `outrig run-new` sends can, and every round then fails the same way until the pair
+leaves it. Set `role-alternation = "strict"` on the provider's row, and `run-new` sends it a
+conversation that alternates by construction, leaving out the turns that would not: a turn
+promoted without the rest of its round, and a round that ended on tool results once the next
+round opens. Promote whole rounds on such a provider. See
+[`role-alternation`](../reference/config.md#style--openai) for the key and
+[`outrig run-new`](../reference/cli.md#outrig-run-new) for what is left out.
+
 ### Local models
 
 A model running on your own machine is reached the same way: serve it with a local server that
@@ -386,8 +397,8 @@ rejects the request and names that limit, whereas a ceiling set too low truncate
 mid-sentence with nothing logged.
 
 Everything else is shared with the other remote styles: `request-timeout-secs`,
-`retry-budget-secs`, tool-call limits, tool-result truncation, conversation history, and
-subagents all behave identically. Turns are non-streaming, as for `openai`.
+`retry-budget-secs`, `role-alternation`, tool-call limits, tool-result truncation, conversation
+history, and subagents all behave identically. Turns are non-streaming, as for `openai`.
 
 ## Transient failures
 
