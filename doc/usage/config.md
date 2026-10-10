@@ -54,6 +54,12 @@ Each provider and each model needs a name of its own. A name already given in th
 for again, after a line saying so, and the suggested name moves on: a second `openai` provider is
 offered `openai-2`, and a second model `fast-2`.
 
+An answer the written config would refuse is asked for again the same way, after a line saying
+why: a `Base URL` that is not an `http://` or `https://` URL, an API key variable that is not a
+variable name, or a `max-tokens` or `context-length` that is not a number. The API key prompt
+takes the name of the variable that holds the key -- `OPENAI_API_KEY`, or `${OPENAI_API_KEY}` as
+it is stored -- never the key itself, and its refusal does not repeat what was typed.
+
 The prompts that follow depend on the style you pick.
 
 `anthropic` asks the same connection questions with its own defaults

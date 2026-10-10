@@ -616,3 +616,101 @@ async fn a_repeated_model_name_is_asked_again() {
         "the taken name must be asked for again:\n{shown}"
     );
 }
+
+/// #347: a `base-url` a load would refuse is asked for again at its prompt,
+/// rather than ending the wizard at its last check with nothing written.
+#[tokio::test]
+async fn a_base_url_that_is_not_http_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // style (openai), name (openai), base-url with a typo'd scheme -- refused,
+    // so asked again -- then a good one, env-var, no extra provider, NO model.
+    let script = b"\n\nhtps://api.example/v1\nhttps://api.example/v1\n\nn\nn\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    assert!(
+        text.contains("base-url = \"https://api.example/v1\""),
+        "missing the second base-url:\n{text}"
+    );
+    assert_eq!(
+        shown
+            .matches("? Base URL [default: https://api.openai.com/v1]: ")
+            .count(),
+        2,
+        "the refused base-url must be asked for again:\n{shown}"
+    );
+}
+
+/// #347: an API key answer that is not an env var name -- the key itself
+/// pasted in, or a name in lower case -- is asked for again, and the `${VAR}`
+/// form the config stores is taken as typed. The pasted key lands nowhere.
+#[tokio::test]
+async fn an_api_key_answer_that_is_not_a_var_name_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // style (openai), name (openai), base-url, then three env-var answers: a
+    // pasted key and a lower-case name, both refused, then `${MY_KEY}`; no
+    // extra provider, NO model.
+    let script = b"\n\n\nsk-not-a-real-key\nopenai_api_key\n${MY_KEY}\nn\nn\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    assert!(
+        text.contains("api-key = \"${MY_KEY}\""),
+        "missing the ${{VAR}} answer as typed:\n{text}"
+    );
+    assert_eq!(
+        shown
+            .matches("? API key environment variable [default: OPENAI_API_KEY]: ")
+            .count(),
+        3,
+        "each refused answer must be asked for again:\n{shown}"
+    );
+    for out in [&text, &shown] {
+        assert!(
+            !out.contains("sk-not-a-real-key"),
+            "the pasted key was repeated:\n{out}"
+        );
+    }
+}
+
+/// #347: a `max-tokens` answer that is not a number is asked for again,
+/// rather than ending the wizard with every earlier answer lost.
+#[tokio::test]
+async fn a_max_tokens_answer_that_is_not_a_number_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // The script of `writes_anthropic_config_with_max_tokens`, answering
+    // max-tokens with `64k` -- refused, so asked again -- and then `32000`.
+    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n64k\n32000\n\n\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    assert!(
+        text.contains("max-tokens = 32000"),
+        "missing the second max-tokens:\n{text}"
+    );
+    assert_eq!(
+        shown
+            .matches("? max-tokens for this model [default: 64000]: ")
+            .count(),
+        2,
+        "the refused max-tokens must be asked for again:\n{shown}"
+    );
+}

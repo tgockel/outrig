@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig config init` asks again for an answer the config would refuse.** An API key variable
+  that was not a variable name -- `openai_api_key`, `${OPENAI_API_KEY}` as the prompt's help
+  suggested, or the key itself pasted in -- a `max-tokens` or `context-length` that was not a
+  number, or a `Base URL` that was not an `http://` or `https://` URL ended the wizard with
+  nothing written, and every earlier answer had to be given again. A pasted key was printed back
+  in the error. Each is now asked for again after a line saying why, and the API key's line never
+  repeats the answer. `${VAR}` is taken as typed, beside the bare name. The `max-tokens` and
+  `context-length` prompts in `outrig init`'s repo phase ask again the same way. (#347)
+
 - **`outrig config init` no longer drops a provider or model whose name repeats.** Each name
   prompt suggested the same default every time -- the style for a provider, `fast` for a model
   -- so a second `openai` provider or a second model left at that default replaced the first,

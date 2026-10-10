@@ -8,7 +8,9 @@
 answer checked against anything else is checked by its caller instead, in a hand-written loop that
 prints the refusal with `eprintln!` and calls `ask_string` again:
 
-- `config_init.rs`: `ask_required`, the GGUF model-file pick, and the default-model pick
+- `config_init.rs`: `ask_required`, the GGUF model-file pick, and the default-model pick;
+  `ask_unused_name`, added for #346; `ask_base_url`, `ask_api_key_env`, and `ask_optional_u32`,
+  added for #347
 - `init/repo.rs`: `ask_agent_model`, `pick_global_model`, and `ask_workspace`'s two loops, added
   for #348
 - `image_setup/add.rs`: `ask_name`, added for #184

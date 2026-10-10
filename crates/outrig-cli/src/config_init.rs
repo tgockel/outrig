@@ -60,10 +60,9 @@ pub async fn run_with(
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
     // With no repo root: a global config serves every repo, so no one root is
-    // the one to check its paths against. One answer the prompts above accept
-    // can fail this: a `base-url` that is not an http:// or https:// URL. It
-    // ends the wizard here with nothing written, rather than with a config the
-    // next load refuses; asking again at the prompt instead is #347.
+    // the one to check its paths against. Nothing the prompts above accept
+    // fails this -- each answer a load would refuse is asked for again where it
+    // was given -- so it keeps the module doc true rather than catching a typo.
     Config::load_from_str(&toml_text)?.validate(None)?;
     write_atomic(path, &toml_text)?;
     Ok(())
@@ -130,7 +129,8 @@ const ANTHROPIC_BASE_URL_FIELD: Field = Field {
 
 const API_KEY_ENV_FIELD: Field = Field {
     name: "API key environment variable",
-    description: "Name of the env var that holds the API key. Stored as ${VAR}.",
+    description: "Name of the env var that holds the API key, such as OPENAI_API_KEY -- \
+                  not the key itself. Stored as ${VAR}; typing it as ${VAR} works too.",
     options: &[],
     doc_link: "doc/reference/config.md",
 };
@@ -315,7 +315,7 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
         let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
         let style = STYLES[style_idx].0;
         let name = ask_unused_name(prompt, &PROVIDER_NAME_FIELD, style, &out, "provider").await?;
-        let provider = prompt_provider_body(prompt, style).await?;
+        let provider = prompt_provider_body(prompt, &name, style).await?;
         out.insert(name, provider);
 
         if !prompt.ask_bool(&ADD_PROVIDER_FIELD, false).await? {
@@ -332,31 +332,29 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
 /// ask the style + connection details.
 pub(crate) async fn prompt_new_provider_for_name(
     prompt: &mut impl PromptSource,
+    name: &str,
 ) -> Result<LlmProvider> {
     let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
     let style = STYLES[style_idx].0;
-    prompt_provider_body(prompt, style).await
+    prompt_provider_body(prompt, name, style).await
 }
 
-async fn prompt_provider_body(prompt: &mut impl PromptSource, style: &str) -> Result<LlmProvider> {
+async fn prompt_provider_body(
+    prompt: &mut impl PromptSource,
+    name: &str,
+    style: &str,
+) -> Result<LlmProvider> {
     match style {
-        "openai" => prompt_openai_provider(prompt).await,
-        "anthropic" => prompt_anthropic_provider(prompt).await,
+        "openai" => prompt_openai_provider(prompt, name).await,
+        "anthropic" => prompt_anthropic_provider(prompt, name).await,
         "mistralrs" => Ok(LlmProvider::Mistralrs {}),
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
 }
 
-async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
-    let base_url = prompt
-        .ask_string(&BASE_URL_FIELD, "https://api.openai.com/v1")
-        .await?;
-    // We capture the env-var name and render it as `${VAR}` -- `ApiKeyRef` only
-    // accepts that form, so feeding a bare name would be rejected at parse time.
-    let env_name = prompt
-        .ask_string(&API_KEY_ENV_FIELD, "OPENAI_API_KEY")
-        .await?;
-    let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
+async fn prompt_openai_provider(prompt: &mut impl PromptSource, name: &str) -> Result<LlmProvider> {
+    let base_url = ask_base_url(prompt, &BASE_URL_FIELD, "https://api.openai.com/v1", name).await?;
+    let api_key = ask_api_key_env(prompt, "OPENAI_API_KEY").await?;
     Ok(LlmProvider::openai(
         base_url,
         api_key,
@@ -364,21 +362,70 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
     ))
 }
 
-async fn prompt_anthropic_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
+async fn prompt_anthropic_provider(
+    prompt: &mut impl PromptSource,
+    name: &str,
+) -> Result<LlmProvider> {
     // The bare official endpoint: rig appends `/v1/messages` itself, and
     // normalizes a `/v1` suffix away if one is typed anyway.
-    let base_url = prompt
-        .ask_string(&ANTHROPIC_BASE_URL_FIELD, "https://api.anthropic.com")
-        .await?;
-    let env_name = prompt
-        .ask_string(&API_KEY_ENV_FIELD, "ANTHROPIC_API_KEY")
-        .await?;
-    let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
+    let base_url = ask_base_url(
+        prompt,
+        &ANTHROPIC_BASE_URL_FIELD,
+        "https://api.anthropic.com",
+        name,
+    )
+    .await?;
+    let api_key = ask_api_key_env(prompt, "ANTHROPIC_API_KEY").await?;
     Ok(LlmProvider::anthropic(
         base_url,
         api_key,
         AnthropicOptions::new(),
     ))
+}
+
+/// Asks `field` for provider `name`'s `base-url` until the rule a load holds it
+/// to accepts the answer, printing the validator's message before each repeat;
+/// that message names the key and never quotes the value, which can carry
+/// credentials. The probe holds an openai provider whatever the style: the rule
+/// is one arm for both remote styles, and the api-key the probe carries, which
+/// the next prompt asks for, is not looked at.
+async fn ask_base_url(
+    prompt: &mut impl PromptSource,
+    field: &Field,
+    default: &str,
+    name: &str,
+) -> Result<String> {
+    let mut probe = Config::default();
+    let api_key = ApiKeyRef::parse("${OPENAI_API_KEY}")?;
+    loop {
+        let answer = prompt.ask_string(field, default).await?;
+        let provider = LlmProvider::openai(answer.clone(), api_key.clone(), OpenAiOptions::new());
+        probe.providers.insert(name.to_string(), provider);
+        match probe.validate(None) {
+            Ok(()) => return Ok(answer),
+            Err(e) => eprintln!("[outrig] {e}"),
+        }
+    }
+}
+
+/// Asks for the name of the env var that holds an API key until the answer is
+/// one, given bare or as the `${VAR}` it is stored as. The refusal never
+/// repeats the answer: the likeliest wrong one is the key itself, pasted in.
+async fn ask_api_key_env(prompt: &mut impl PromptSource, default: &str) -> Result<ApiKeyRef> {
+    loop {
+        let answer = prompt.ask_string(&API_KEY_ENV_FIELD, default).await?;
+        let api_key = ApiKeyRef::parse(&answer)
+            .or_else(|_| ApiKeyRef::parse(&format!("${{{answer}}}")))
+            .ok();
+        if let Some(api_key) = api_key {
+            return Ok(api_key);
+        }
+        eprintln!(
+            "[outrig] that is not an env var name: upper-case letters, digits, and `_`, not \
+             starting with a digit, such as OPENAI_API_KEY. Give the name of the variable that \
+             holds the key, not the key itself."
+        );
+    }
 }
 
 async fn prompt_models(
@@ -446,7 +493,7 @@ pub(crate) async fn prompt_models_loop(
             }
             eprintln!("[outrig] no provider named `{answer}` yet.");
             if prompt.ask_bool(&ADD_NEW_PROVIDER_FIELD, true).await? {
-                let provider = prompt_new_provider_for_name(prompt).await?;
+                let provider = prompt_new_provider_for_name(prompt, &answer).await?;
                 new_providers.insert(answer.clone(), provider);
                 break answer;
             }
@@ -503,23 +550,22 @@ async fn prompt_anthropic_model(
 }
 
 /// Ask for an optional non-negative integer: blank leaves the key unset, and
-/// anything unparseable names `knob` in the error rather than the raw type.
+/// anything unparseable is asked for again after a line naming `knob`.
 async fn ask_optional_u32(
     prompt: &mut impl PromptSource,
     field: &Field,
     default: &str,
     knob: &str,
 ) -> Result<Option<u32>> {
-    blank_to_none(prompt.ask_string(field, default).await?)
-        .map(|s| {
-            s.parse::<u32>().map_err(|_| {
-                OutrigError::Configuration(format!(
-                    "{knob} must be a non-negative integer; got `{s}`"
-                ))
-                .into()
-            })
-        })
-        .transpose()
+    loop {
+        let Some(answer) = blank_to_none(prompt.ask_string(field, default).await?) else {
+            return Ok(None);
+        };
+        match answer.parse::<u32>() {
+            Ok(n) => return Ok(Some(n)),
+            Err(_) => eprintln!("[outrig] {knob} must be a non-negative integer; got `{answer}`"),
+        }
+    }
 }
 
 async fn prompt_mistralrs_model(
