@@ -18,7 +18,7 @@ use super::AgentError;
 use super::budget::Budget;
 use crate::config::{
     Agent, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
-    RoleAlternation,
+    RoleAlternation, Secrets,
 };
 use crate::error::OutrigError;
 
@@ -81,23 +81,52 @@ pub(crate) enum LlmResolveError {
 }
 
 /// Runtime-shaped provider view -- mirrors the config `LlmProvider` enum, but
-/// with the env-var-backed `ApiKeyRef` already resolved to a plain `String`.
+/// with the `ApiKeyRef` already resolved, through the session's [`Secrets`].
 #[derive(Debug)]
 pub(crate) enum ResolvedProvider {
     OpenAi {
         base_url: String,
-        api_key: String,
+        api_key: Redacted,
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
         role_alternation: RoleAlternation,
     },
     Anthropic {
         base_url: String,
-        api_key: String,
+        api_key: Redacted,
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
         role_alternation: RoleAlternation,
     },
+}
+
+/// A secret, which `Debug` does not print: it is the embedder's, and a failed
+/// `expect_err` prints whatever it holds.
+pub(crate) struct Redacted(String);
+
+impl Redacted {
+    /// The secret itself, for the one place it is sent.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Redacted {
+    fn from(secret: String) -> Self {
+        Self(secret)
+    }
+}
+
+impl From<&str> for Redacted {
+    fn from(secret: &str) -> Self {
+        Self(secret.to_string())
+    }
+}
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl ResolvedProvider {
@@ -162,8 +191,8 @@ pub(crate) struct ResolvedCandidate {
 /// Fully-resolved view of one agent: every knob the agent loop needs to
 /// build a Rig client and run a round.
 ///
-/// The api-key is resolved from the env at construction time. The struct
-/// lives in the agent loop, not in session metadata, so it should never get
+/// The api-key is resolved through the session's [`Secrets`] at construction
+/// time. The struct lives in the agent loop, not in session metadata, so it should never get
 /// serialized.
 #[derive(Debug)]
 pub(crate) struct ResolvedAgent {
@@ -200,7 +229,7 @@ impl ResolvedAgent {
 ///
 /// Reads `provider` directly rather than through `Model::source()`, which
 /// panics on an unvalidated row. This must stay total.
-fn selectability(cfg: &Config, model_name: &str) -> Result<(), String> {
+fn selectability(cfg: &Config, model_name: &str, secrets: &dyn Secrets) -> Result<(), String> {
     let not_concrete = || "names neither a provider nor an alias".to_string();
     let model = cfg.models.get(model_name).ok_or_else(not_concrete)?;
     let provider_name = model.provider.as_deref().ok_or_else(not_concrete)?;
@@ -211,9 +240,10 @@ fn selectability(cfg: &Config, model_name: &str) -> Result<(), String> {
         .to_string()
     })?;
     let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) = provider;
-    // Through `resolve` rather than `env::var` so "not set" and "not valid
-    // UTF-8" read exactly as they will when the session resolves.
-    match api_key.resolve() {
+    // Through `resolve_with` rather than asking `secrets` directly, so "not
+    // set" and "not valid UTF-8" read exactly as they will when the session
+    // resolves.
+    match api_key.resolve_with(secrets) {
         Ok(value) if !value.is_empty() => Ok(()),
         Ok(_) => Err(format!(
             "api-key env var {} is set but empty",
@@ -234,11 +264,12 @@ fn selectable<'a>(
     cfg: &Config,
     alias: &str,
     models: &[&'a str],
+    secrets: &dyn Secrets,
 ) -> Result<Vec<&'a str>, AgentError> {
     let mut kept = Vec::new();
     let mut tried = Vec::new();
     for model in models {
-        match selectability(cfg, model) {
+        match selectability(cfg, model, secrets) {
             Ok(()) => kept.push(*model),
             Err(reason) => tried.push((*model, reason)),
         }
@@ -268,8 +299,8 @@ pub(crate) fn render_candidate_reasons(rows: &[(&str, String)]) -> String {
 }
 
 /// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
-/// loop needs. Bails with a descriptive error if a reference is dangling or
-/// the api-key env var is unset.
+/// loop needs, each api-key through `secrets`. Bails with a descriptive error
+/// if a reference is dangling or `secrets` has no key.
 ///
 /// `agent_name` is optional: `None` resolves the *agentless* session, which
 /// behaves as an `[agents.<name>]` block with no keys set. `model_override`
@@ -282,6 +313,7 @@ pub(crate) fn resolve_agent(
     cfg: &Config,
     agent_name: Option<&str>,
     model_override: Option<&str>,
+    secrets: &dyn Secrets,
 ) -> Result<ResolvedAgent, AgentError> {
     // The agentless session resolves against an empty agent rather than a
     // parallel code path, so every fallback below is written once.
@@ -336,7 +368,7 @@ pub(crate) fn resolve_agent(
             // One model is renaming, not choosing. Resolve it exactly as if the
             // user had typed it, so every error keeps its own text and remedy.
             [only] => vec![*only],
-            _ => selectable(cfg, model_name, &models)?,
+            _ => selectable(cfg, model_name, &models, secrets)?,
         }
     } else {
         vec![model_name]
@@ -344,7 +376,7 @@ pub(crate) fn resolve_agent(
 
     let mut candidates = Vec::with_capacity(concrete.len());
     for name in concrete {
-        let candidate = resolve_candidate(cfg, agent, name)?;
+        let candidate = resolve_candidate(cfg, agent, name, secrets)?;
         // The configured values alone: a ceiling at or above the window is a
         // contradiction in the file, whatever a provider would have lowered it
         // to. Checked for each model, since each has its own window.
@@ -389,6 +421,7 @@ fn resolve_candidate(
     cfg: &Config,
     agent: &Agent,
     model_name: &str,
+    secrets: &dyn Secrets,
 ) -> Result<ResolvedCandidate, AgentError> {
     let model = cfg
         .models
@@ -423,7 +456,7 @@ fn resolve_candidate(
             ..
         } => ResolvedProvider::OpenAi {
             base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
+            api_key: api_key.resolve_with(secrets)?.into(),
             request_timeout_secs: *request_timeout_secs,
             retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
             role_alternation: role_alternation.unwrap_or_default(),
@@ -437,7 +470,7 @@ fn resolve_candidate(
             ..
         } => ResolvedProvider::Anthropic {
             base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
+            api_key: api_key.resolve_with(secrets)?.into(),
             request_timeout_secs: *request_timeout_secs,
             retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
             role_alternation: role_alternation.unwrap_or_default(),

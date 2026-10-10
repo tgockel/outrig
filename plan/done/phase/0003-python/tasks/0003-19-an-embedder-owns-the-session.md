@@ -263,3 +263,134 @@ public module, and `run-new` uses that module and nothing else of the loop.
   the terminal rebuilt on the new module.
 - `crates/outrig/tests/public_api_boundary.rs` -- the snapshot rules the new test joins.
 - #471 -- the terminal setting a round's pace, which fork 5 bears on.
+
+## Decisions
+
+- **Fork 1: `outrig::harness`, with the event catalog in `outrig::harness::event` (the
+  maintainer's call).**
+  - "Harness" is the project's own word for the loop and what surrounds it (`doc/README.md`,
+    `harness-components.md`), and it names the whole system rather than the value an owner holds.
+  - "Session" keeps meaning the run: its id, its directory, `session.json`, and `outrig-cli`'s
+    own `session` module. The value held is still `harness::Session`.
+  - `lib.rs` called the `Outrig` facade "a whole managed session"; it now says "container", and
+    lists `harness` beside the facade in the supported tier, stable from the 0.3.0 release.
+- **Fork 2: the builder takes the `LaunchSpec`.**
+  - The builder mints the session id into a spec that names none before anything starts, so the
+    event log's `source` is known and the log can open, and fail the start, before the container.
+  - `harness::container_spec` is `run-new`'s launch policy moved into the library -- no MCP
+    server, no sidecar, the image label ignored, an ensured tag pinned keeping the image's
+    security -- so `run-new` and the shorthand build the same container.
+  - The session does not ensure its image; `run-new` still does, and `embedding.md` keeps the
+    question open.
+- **The shorthand, `Session::start(config, agent, model)`, mounts a workspace only if
+  `[workspace] host-path` declares one.** A library session never mounts its caller's working
+  directory -- or home -- by default; repository-relative paths resolve against the current
+  directory, and logs go under `session-root` or the system's temporary directory as
+  `<root>/<id>/logs`.
+- **Start progress is a builder callback (the maintainer's call).** `Progress::{Started,
+  Finished}` of `Step::{Container, Python}`, so `run-new` keeps its two `ProgressSpan` lines and
+  an embedder can show the same steps.
+- **Fork 3: a round running at the close runs on.** Admission is decided in
+  `Interpreter::submit` under the table lock, so an execution is either live at the close or
+  refused by it; a refused submission's tool result says the session is closing and why, and
+  `exec.refused` records `reason: closed` with a null `holder`. A round asked for after the close
+  is refused with `SessionError::Closed` before the model is called.
+- **Fork 4: the drain is five seconds, `harness::DEFAULT_DRAIN` (the maintainer's call).**
+  `shutdown` still takes the deadline as an argument. After it: cancel and interrupt what is
+  live, one second's grace, stop the container, and wait for the interpreter's exit to be
+  recorded (at most six seconds) so `interpreter.exited` precedes the report. The tests bound a
+  shutdown at the deadline plus fifteen seconds.
+- **Fork 5: events replace `on_submit`.** `run-new` prints each submission from an
+  `exec.submitted` on a subscription of its own, and drains what is waiting before it prints a
+  round's reply, so a submission is never shown after what the model said of it.
+- **Fork 6: `#[non_exhaustive]` on every public history, view and event type**, enum variants
+  included. The id newtypes, `Subject` and `Subscription` have private fields instead. A test in
+  `public_api_boundary.rs` holds every `outrig::harness::event` type to one or the other.
+- **The stream.**
+  - Each subscriber has its own bounded queue (4,096 by default, chosen per subscription). `emit`
+    numbers an event and pushes it to every queue under one lock and never waits; a full queue
+    drops its oldest and counts it, and its reader gets `Received::Missed(n)` before the next.
+  - The builder mints subscriptions (`subscribe`, `subscribe_with_capacity`), so one cannot be
+    attached to two sessions or to none; a failed start ends them.
+  - `close_after` publishes the stream's last event and closes every queue in one step, so
+    `session.state reported` is the last event every subscriber sees.
+  - An emit site whose payload costs something to build (a turn's messages, a history view, a
+    round's calls) builds it in a closure that runs only when the stream has a subscriber.
+  - The catalog is owned and public. rig's types stay out: a turn's messages, and a call's
+    opening, are rig's message JSON as `serde_json::Value`, so keys inside them now come out
+    sorted -- same fields and shape. OutRig has its own `ToolDefinition`, written as rig's was.
+- **The `events.jsonl` writer is one subscriber, and a stalled disk now costs it a counted gap
+  rather than slowing the agent (the task's "keeping `ready()` backpressure for itself").**
+  - This reverses `0003-13`'s choice. Its writer task waits for room in the file before taking
+    the next event, so a disk that stalls leaves events in its subscription, whose overflow is
+    counted and shows in the file as a jump in `id`. Every `ready()` on a session path is gone.
+  - `events_tests.rs`'s stalled-writer test is rewritten as
+    `a_stalled_writer_loses_a_counted_gap_and_close_counts_what_it_lost`; its bound, its
+    integrity check, and its every-loss count stay.
+  - The writer's close and the sink's share one two-second deadline (`LineSink::close_by`), and
+    `LineSink::lose_many` counts a gap at once. What the file lost is the report's `LogLoss`,
+    which replaces the crate-private `EventsUnwritten`.
+  - `run-new` turns the writer on under `[events] mode = "record"`; the mode governs the file,
+    not the stream.
+- **Session states.** One `session.state` kind with a `state` field. A `Lifecycle` cell, whose
+  lock is taken before the interpreter table's, publishes each change and holds the rule that
+  only `reported` follows `closing`. The interpreter's exit closes admission in the host's exit
+  branch, then tells the session through `Interpreter::on_exit` (holding a `Weak`) before any
+  waiter hears, so `interpreter.exited` always precedes `closing`.
+  - `interpreter.exited` carries `expected`: `true` when the session's shutdown asked for the exit
+    (`Interpreter::expect_exit`). A reader -- the renderer among them -- tells a death from a stop
+    by the field rather than by guessing from where the event falls.
+  - One reason type: `ClosedBy::{Owner, InterpreterExited { cause }}` is what the report's
+    `closed_by` and the session record's carry, and `Closed { by }` is the error a refused round
+    or submission returns. The gate, the lifecycle and the report share it.
+- **The report.** `closed_by`, `stopped` (`Outrig::stop` returns every container that failed to
+  stop, not only the primary's), each execution live at the close with `ok`, `error` or
+  `unknown`, and `EventDelivery`: the last id, each subscription's missed count, and the log's
+  loss. `verdict()` reads it as clean, stopped with unknown, or not proven stopped. The
+  `session.report` event carries all but the delivery, which is final only after it.
+  `agent.stopped` is emitted before it, so a recording's last event is now `session.state`
+  `reported`; `run_new_e2e.rs` and the timeline test assert that stricter tail.
+- **Exit statuses.** `/quit`, end of input, and a second Ctrl-C at the prompt (the maintainer's
+  call) close admission, shut down, print the report, and exit 0, 2 or 3 by its verdict. The
+  interpreter's death keeps its documented 1, but 3 when the stop could not be confirmed, which
+  outranks everything. The status is read from the report alone -- its verdict and its
+  `closed_by` -- so how the conversation ended needs no type of its own.
+  `a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running` now expects 2, since it leaves
+  through two Ctrl-Cs with unkillable Python running.
+- **Attempt identity.**
+  - `call_id` and `attempt_id`, new fields beside `model.retry`'s existing `attempt` count and
+    `model.call`'s `call` counter. Both count from 1 per session.
+  - The round's hook reserves the call id so the head's manifest names it; the chain begins the
+    call and names each candidate's settings in a per-chain `CallSlot`, the way `ChainDeadline`
+    reaches the HTTP layer. `send_with_retry` mints an attempt per request sent and records the
+    ones that fail, or are dropped (`cancelled`); `RetryingModel` records each `2xx`, usable or
+    not, since only it learns which.
+  - Round totals come from the ledger of unique attempts rather than rig's `PromptResponse.usage`.
+    A usage the provider did not report is `null`, never zero: rig's all-zero usage maps to
+    `None`, and round totals and `input_tokens_max` are `Option`. Per-field nulls need rig to
+    tell them apart: `plan/next/usage-fields-reported-or-not.md`.
+  - The late-usage path (`Ledger::late_usage`, `model.usage.replaced` / `.refused`) has no
+    producer today: every provider reports usage in the response that ends its attempt, a failed
+    request reports none, and nothing streams. It is crate-private and tested, and one `Book`
+    serves the live session and a replay of the log: `attempt` records one, and `late` replaces a
+    null once or says why it refused, as a `Late` the caller turns into the event.
+  - Each layer reads the ids from the chain's `CallSlot` -- the round's hook takes the attempt
+    that answered from `answered_by()` -- rather than threading them through the answer.
+  - `model.round.failed` and `.dropped` gained `usage` and `attempts`, which partly does
+    `plan/next/every-round-ending-carries-its-usage.md`; that entry says what remains.
+- **Secrets.** `config::Secrets`, `EnvSecrets` with the environment's own errors, and any
+  `Fn(&str) -> Option<String>`; `ApiKeyError::Unresolved` for a resolver with no value.
+  `ResolvedProvider`'s key is a crate-private `Redacted`, whose `Debug` prints `<redacted>`, so the
+  derived `Debug` cannot show it. `SessionBuilder::check()` resolves once and `start()` uses that
+  resolution; setting the resolver again discards it. The agent tests resolve through closures
+  rather than setting environment variables, except where they test the environment itself.
+- **What a round left running** is a new `tasks` request the interpreter answers on the agent's
+  loop, as `inv` is: unfinished tasks other than the executions' own wrappers, told apart by
+  their code object rather than their name, sorted, 50 named and the rest counted. The host
+  waits two seconds; a loop that does not answer reads as `Tasks::CouldNotTell`.
+- **`public_api_boundary.rs` treats an upper-case path root as a type parameter**, as it already
+  did `Self`: the blanket `impl<F> Secrets for F` prints its method as `F::resolve`, and a crate
+  name is never upper-case.
+- **A window remains, documented rather than closed:** for up to the host's five-second exit
+  grace after the interpreter's output closes, `round()` fails with the interpreter's own error
+  rather than `SessionError::Closed`.

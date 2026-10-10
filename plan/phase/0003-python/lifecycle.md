@@ -516,13 +516,15 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 
 ## Open questions
 
-- The default drain deadline -- `0003-19`'s design fork -- and whether anything other than the
-  owner's argument may change it.
+- ~~The default drain deadline.~~ Settled by `0003-19`: five seconds, `harness::DEFAULT_DRAIN`,
+  which `run-new` passes; `shutdown` takes the deadline as its argument, and nothing else changes
+  it.
 - Whether anything but the owner's argument may change the grace between SIGTERM and SIGKILL for
   a binding's group. `0003-18` made it 5 s, counted after the drain deadline rather than against
   it, which `0003-19` and `0003-22` do the counting for.
-- Whether a round still being driven at the close ends at once, or runs on with its submissions
-  refused until the model yields or the owner drops it. `0003-19` settles it.
+- ~~Whether a round still being driven at the close ends at once.~~ Settled by `0003-19`: it runs
+  on, each submission refused with the closing reason as its result, until the model yields or
+  the owner drops it.
 - Whether a callback a draining call makes into the container should be refused after the close
   rather than run. The row above lets it run, as part of a call allowed to finish. Refusing it
   would stop agent code running in a session that is ending, at the cost of failing a call that
@@ -542,6 +544,7 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - The time `shutdown` takes after the deadline was not measured. The container stop is the largest
   known part: about ten seconds today, because the primary's `sleep` is PID 1 and discards
   SIGTERM, so podman waits out its grace (#255).
-- None of the close table has run, and neither has a release. Each row's behavior is acceptance
-  for the task that adds it; a release's is `0003-26`'s, and an instance's release, the finalizer
-  path included, is `0003-30`'s.
+- The rows for executions, the interpreter and the container run, in `0003-19`'s tests; the rest
+  of the close table has not, and neither has a release. Each row's behavior is acceptance for the
+  task that adds it; a release's is `0003-26`'s, and an instance's release, the finalizer path
+  included, is `0003-30`'s.

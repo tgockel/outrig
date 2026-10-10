@@ -17,8 +17,9 @@ field -- submitted source, a traceback, captured output, and a message body each
 a different path -- and then swept: every field of every event type carries a payload that must
 not survive as markup, and every field the page shows must show up escaped, so a field silently
 dropped from the page cannot pass by being absent. The sweep's fixture is checked against the
-event names `crates/outrig/src/events.rs` writes and `doc/reference/events.md` documents, so an
-event added to either fails here until the renderer has been looked at.
+event names the catalog in `crates/outrig/src/harness/event.rs` defines and
+`doc/reference/events.md` documents, so an event added to either fails here until the renderer
+has been looked at.
 
 Standard library only. `uv` is the one thing it needs, and without it the run fails rather than
 skipping.
@@ -39,7 +40,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 RENDERER = SCRIPTS / "render-session.py"
-EVENTS_RS = SCRIPTS.parent / "crates" / "outrig" / "src" / "events.rs"
+CATALOG_RS = SCRIPTS.parent / "crates" / "outrig" / "src" / "harness" / "event.rs"
 EVENTS_MD = SCRIPTS.parent / "doc" / "reference" / "events.md"
 UV = os.environ.get("UV") or shutil.which("uv")
 EVENTS = Path("logs") / "events.jsonl"
@@ -192,6 +193,16 @@ def ordinary(
             },
         ),
         ("agent.stopped", {}),
+        (
+            "session.report",
+            {
+                "closed_by": {"by": "owner"},
+                "stopped": {"state": "proven"},
+                "executions": [],
+                "verdict": "clean",
+            },
+        ),
+        ("session.state", {"state": "reported"}),
     ]
 
 
@@ -256,10 +267,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         "cache_creation_input_tokens": 0,
         "reasoning_tokens": 0,
     }
-    calls = [{"index": 0, "usage": usage}]
+    calls = [{"index": 0, "model": "m", "call_id": 1, "attempt_id": 2, "usage": usage}]
     a = "agent/primary"
     message = {"role": "user", "content": [{"type": "text", "text": "opening"}]}
     return [
+        ("session.state", {"state": "starting"}, None),
         (
             "agent.started",
             {
@@ -306,7 +318,8 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             a,
         ),
         ("exec.submitted", {"execid": 2, "source": "s"}, a),
-        ("exec.refused", {"execid": 3, "holder": 2}, a),
+        ("exec.refused", {"execid": 3, "holder": 2, "reason": "held"}, a),
+        ("exec.refused", {"execid": 5, "holder": None, "reason": "closed"}, a),
         ("message.received", {"message": 1, "channel": "user", "from": "user", "to": a}, a),
         (
             "message.sent",
@@ -402,19 +415,93 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
-        ("model.retry", {"attempt": 1, "delay": 1.0, "error": "e"}, a),
-        ("model.failover", {"from": "m", "to": "n", "error": "e"}, a),
+        (
+            "model.attempt",
+            {
+                "call_id": 1,
+                "attempt_id": 1,
+                "model": "m",
+                "identifier": "i",
+                "max_tokens": 1,
+                "error": "e",
+                "usage": None,
+            },
+            a,
+        ),
+        (
+            "model.retry",
+            {
+                "model": "m",
+                "attempt": 1,
+                "delay": 1.0,
+                "error": "e",
+                "call_id": 1,
+                "attempt_id": 1,
+            },
+            a,
+        ),
+        (
+            "model.failover",
+            {"from": "m", "to": "n", "error": "e", "call_id": 1, "attempt_id": None},
+            a,
+        ),
+        (
+            "model.attempt",
+            {
+                "call_id": 1,
+                "attempt_id": 2,
+                "model": "n",
+                "identifier": "i",
+                "max_tokens": None,
+                "error": None,
+                "usage": usage,
+            },
+            a,
+        ),
         (
             "model.round.completed",
-            {"round": 1, "stopped": "cap", "usage": usage, "calls": calls, "input_tokens_max": 1},
+            {
+                "round": 1,
+                "stopped": "cap",
+                "usage": usage,
+                "calls": calls,
+                "attempts": [1, 2],
+                "input_tokens_max": 1,
+            },
+            a,
+        ),
+        ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
+        (
+            "model.usage.refused",
+            {"call_id": None, "attempt_id": 9, "usage": usage, "reason": "unknown"},
             a,
         ),
         ("round.started", {"round": 2}, a),
-        ("model.round.failed", {"round": 2, "error": "e", "calls": calls}, a),
+        (
+            "model.round.failed",
+            {"round": 2, "error": "e", "calls": calls, "usage": None, "attempts": [3]},
+            a,
+        ),
         ("round.started", {"round": 2}, a),
-        ("model.round.dropped", {"round": 2, "calls": calls}, a),
-        ("interpreter.exited", {"cause": "c"}, None),
+        (
+            "model.round.dropped",
+            {"round": 2, "calls": calls, "usage": usage, "attempts": [4]},
+            a,
+        ),
+        ("session.state", {"state": "closing"}, None),
+        ("interpreter.exited", {"cause": "c", "expected": False}, None),
         ("agent.stopped", {}, a),
+        (
+            "session.report",
+            {
+                "closed_by": {"by": "interpreter_exited", "cause": "c"},
+                "stopped": {"state": "not_proven", "reason": "r"},
+                "executions": [{"execid": 2, "status": "unknown"}],
+                "verdict": "not_proven_stopped",
+            },
+            None,
+        ),
+        ("session.state", {"state": "reported"}, None),
     ]
 
 
@@ -424,6 +511,10 @@ TAGS = r"(turn\.committed\.data\.messages\.\d+|model\.call\.data\.opening)(\..+)
 
 # Where a field is not on the page, and why. Everything else the sweep plants must be found.
 NOT_SHOWN = [
+    # A refusal names the execution that held the interpreter; its reason says only that one did.
+    r"exec\.refused\.data\.reason",
+    # The model that answered each call is named by the attempt that answered it.
+    r"model\.round\.(completed|failed|dropped)\.data\.calls\.\d+\.model",
     # A message's channel and ends are shown from its sending, which a taking or a refusal repeats.
     r"message\.(received|refused)\.data\.(channel|from|to)",
     # The model is shown from agent.started, which names the same one.
@@ -593,14 +684,14 @@ class RenderSession(unittest.TestCase):
 
     def test_the_sweep_covers_every_event_there_is(self) -> None:
         swept = {kind for kind, _, _ in every_event()}
-        written = set(re.findall(r'Event::\w+[^=\n]*=> "([a-z.]+)"', EVENTS_RS.read_text()))
+        written = set(re.findall(r'Payload::\w+[^=\n]*=> "([a-z.]+)"', CATALOG_RS.read_text()))
         documented = {
             name
             for line in EVENTS_MD.read_text().splitlines()
             if (bullet := re.match(r"- ((?:`[a-z.]+`(?:, )?)+) --", line))
             for name in re.findall(r"`([a-z.]+)`", bullet.group(1))
         }
-        self.assertEqual(written, swept, "events.rs writes events the sweep does not plant")
+        self.assertEqual(written, swept, "the catalog has events the sweep does not plant")
         self.assertEqual(documented, swept, "events.md documents events the sweep does not plant")
 
     def test_the_page_allows_no_script(self) -> None:
@@ -666,7 +757,18 @@ class RenderSession(unittest.TestCase):
     def test_a_record_that_stops_short_says_so(self) -> None:
         html = self.page(ordinary()[:5])
         self.assertIn("Round 1 -- unfinished: the record ends inside it", html)
-        self.assertIn("does not end with agent.stopped", html)
+        self.assertIn("does not end with the shutdown report", html)
+
+    def test_only_an_exit_the_shutdown_did_not_ask_for_is_a_health_note(self) -> None:
+        def closed(expected: bool) -> list[tuple[str, dict]]:
+            events = ordinary()
+            at = next(i for i, (kind, _) in enumerate(events) if kind == "agent.stopped")
+            exited = ("interpreter.exited", {"cause": "end of output", "expected": expected})
+            return events[:at] + [("session.state", {"state": "closing"}), exited] + events[at:]
+
+        note = "The interpreter exited while the session ran"
+        self.assertNotIn(note, self.page(closed(True)))
+        self.assertIn(note, self.page(closed(False)))
 
     def test_missing_ids_are_reported(self) -> None:
         self.write(ordinary())
@@ -721,7 +823,7 @@ class RenderSession(unittest.TestCase):
     def test_a_record_without_gaps_is_not_said_to_have_lost_nothing(self) -> None:
         html = self.page(ordinary())
         self.assertNotIn("Nothing missing", html)
-        self.assertIn("spends no id, so it leaves no gap", html)
+        self.assertIn("unless it came\nafter the last one the log wrote, which leaves none", html)
 
     def test_numbers_the_record_could_not_have_written_are_shown_as_they_are(self) -> None:
         self.write(ordinary())
@@ -794,7 +896,8 @@ class RenderSession(unittest.TestCase):
                 },
             }
 
-        events = ordinary()[:-2] + [
+        # Up to the round's end, which is replaced, and the session's own ending, kept.
+        events = ordinary()[:-4] + [
             (
                 "model.round.completed",
                 {
@@ -808,8 +911,7 @@ class RenderSession(unittest.TestCase):
             ("round.started", {"round": 2}),
             ("model.call", model_call(2, 2, estimate=2500)),
             ("model.round.failed", {"round": 2, "error": "e", "calls": [call(0, 2000)]}),
-            ("agent.stopped", {}),
-        ]
+        ] + ordinary()[-3:]
         html = self.page(events)
         tokens = html[html.index('id="tokens"') : html.index('id="timeline"')]
         rows = [

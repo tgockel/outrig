@@ -35,10 +35,9 @@ use rig::completion::message::{AssistantContent, ToolCall, ToolResultContent, Us
 use serde_json::{Value, json};
 
 use super::budget::{self, Budget, Wire};
-#[cfg(test)]
-use super::tool::ObserverSlot;
 use crate::config::RoleAlternation;
-use crate::events::{self, Event};
+use crate::events;
+use crate::harness::event::{self, CallId, Payload};
 use crate::python::host::{ContextChange, Interpreter};
 
 /// Which earlier rounds a model call is sent, besides the turns the agent
@@ -274,22 +273,23 @@ pub(crate) fn as_sent(turn: usize, messages: &[Message], left_out: &[LeftOut]) -
 }
 
 impl Manifest {
-    /// As the event log records it.
-    fn event(&self) -> events::ModelCall<'_> {
+    /// As the event log records it, for model call `call`.
+    fn event(&self, call: CallId) -> event::ModelCall {
         let chosen = |turns: &[(usize, Why)]| {
             turns
                 .iter()
-                .map(|&(turn, why)| events::Chosen {
-                    turn,
-                    why: why.name(),
+                .map(|&(turn, why)| event::Chosen {
+                    turn: turn as u64,
+                    why: why.public(),
                 })
                 .collect()
         };
-        events::ModelCall {
+        event::ModelCall {
             call: self.call,
+            call_id: call,
             round: self.round,
-            budget: events::CallBudget {
-                model: &self.budget.model,
+            budget: event::CallBudget {
+                model: self.budget.model.clone(),
                 window: self.budget.window,
                 window_assumed: self.budget.window_assumed,
                 reserve: self.budget.reserve,
@@ -301,15 +301,15 @@ impl Manifest {
             carried: chosen(&self.carried),
             evicted: chosen(&self.evicted),
             withheld: chosen(&self.withheld),
-            opening: self.opening.as_ref(),
+            opening: self.opening.as_ref().map(rig_json),
             adjacent: self
                 .adjacent
                 .iter()
-                .map(|adjacent| events::Repeat {
-                    turn: adjacent.turn,
+                .map(|adjacent| event::Repeat {
+                    turn: adjacent.turn.map(|turn| turn as u64),
                     role: match adjacent.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
+                        Role::User => event::Role::User,
+                        Role::Assistant => event::Role::Assistant,
                     },
                 })
                 .collect(),
@@ -321,10 +321,10 @@ impl Manifest {
                          turn,
                          message,
                          part,
-                     }| events::LeftOut {
-                        turn,
-                        message,
-                        part,
+                     }| event::LeftOut {
+                        turn: turn as u64,
+                        message: message as u64,
+                        part: part as u64,
                     },
                 )
                 .collect(),
@@ -333,16 +333,22 @@ impl Manifest {
 }
 
 impl Why {
-    /// As the event log names it.
-    fn name(self) -> &'static str {
+    /// As an event names it.
+    fn public(self) -> event::Why {
         match self {
-            Why::Latest => "latest",
-            Why::Round => "round",
-            Why::Promoted => "promoted",
-            Why::First => "first",
-            Why::Recent => "recent",
+            Why::Latest => event::Why::Latest,
+            Why::Round => event::Why::Round,
+            Why::Promoted => event::Why::Promoted,
+            Why::First => event::Why::First,
+            Why::Recent => event::Why::Recent,
         }
     }
+}
+
+/// `message` as rig encodes it, which is how an event carries a message: no
+/// rig type crosses the public surface, and the form can change with rig.
+pub(crate) fn rig_json(message: &Message) -> serde_json::Value {
+    serde_json::to_value(message).expect("rig's messages encode as JSON")
 }
 
 /// A call that was not made, because what it answers would not fit on its own.
@@ -408,6 +414,10 @@ impl fmt::Display for TooLarge {
 /// An error so a failover chain can give it as the reason a candidate it
 /// moved to could not be sent the call.
 impl std::error::Error for TooLarge {}
+
+/// Where a test's observer of each manifest is put, for the store to find.
+#[cfg(test)]
+type ObserverSlot<T> = Arc<Mutex<Option<Box<dyn Fn(&T) + Send + Sync>>>>;
 
 /// The agent's conversation. Cheap to clone; every clone is the one store.
 #[derive(Clone)]
@@ -501,12 +511,14 @@ impl History {
     /// log, in id order.
     fn commit_in(&self, store: &mut Store, messages: Vec<Message>, incomplete: bool) {
         let (id, turn) = store.commit(messages);
-        self.interpreter.events().emit(Event::TurnCommitted {
-            turn: id,
-            round: turn.round,
-            incomplete,
-            messages: &turn.messages,
-        });
+        self.interpreter
+            .events()
+            .emit_with(|| Payload::TurnCommitted {
+                turn: id as u64,
+                round: turn.round,
+                incomplete,
+                messages: turn.messages.iter().map(rig_json).collect(),
+            });
         self.interpreter
             .push_turn(id as u64, mirror(turn.round, &turn.messages, incomplete));
     }
@@ -517,19 +529,23 @@ impl History {
     /// opening on its first call, and on every later one the last message of
     /// the latest turn, which the round has committed by then.
     ///
-    /// `Err` when the prompt's turn cannot fit on its own. The call is not
-    /// made, and nothing is counted.
-    pub(crate) fn assemble(&self, budget: &Budget) -> Result<(Vec<Message>, Manifest), TooLarge> {
+    /// The manifest is recorded under `call`, the model call it is assembled
+    /// for. `Err` when the prompt's turn cannot fit on its own. The call is
+    /// not made, and nothing is counted.
+    pub(crate) fn assemble(
+        &self,
+        budget: &Budget,
+        call: CallId,
+    ) -> Result<(Vec<Message>, Manifest), TooLarge> {
         let (sent, manifest) = self.store().assemble(budget)?;
         // Outside the store's lock: an observer may do anything.
         #[cfg(test)]
         if let Some(observer) = &*lock(&self.manifests) {
             observer(&manifest);
         }
-        let events = self.interpreter.events();
-        if events.is_on() {
-            events.emit(Event::ModelCall(manifest.event()));
-        }
+        self.interpreter
+            .events()
+            .emit_with(|| Payload::ModelCall(manifest.event(call)));
         tracing::debug!(
             call = manifest.call,
             round = manifest.round,

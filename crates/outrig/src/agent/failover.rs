@@ -73,8 +73,9 @@ use serde::{Deserialize, Serialize};
 
 use super::budget::Budget;
 use super::history::{History, TooLarge};
+use super::ledger::CallSlot;
 use super::retry::RetryPolicy;
-use crate::events::{Event, Events};
+use crate::harness::event::{CallId, Payload};
 
 /// One candidate of a chain, behind an object-safe interface.
 ///
@@ -184,16 +185,17 @@ where
 /// [`History`] is the one there is. The trait is what lets the chain's own
 /// tests stand in for the store.
 pub(crate) trait View: Send + Sync {
-    /// The messages a call to a candidate held to `budget` is sent, oldest
-    /// first, ending with the call's prompt -- or why its prompt does not fit.
-    fn view(&self, budget: &Budget) -> Result<Vec<Message>, TooLarge>;
+    /// The messages call `call` to a candidate held to `budget` is sent,
+    /// oldest first, ending with the call's prompt -- or why its prompt does
+    /// not fit.
+    fn view(&self, budget: &Budget, call: CallId) -> Result<Vec<Message>, TooLarge>;
 }
 
 /// Assembled as the round's hook assembles the head's view, and recorded the
 /// same way: a `model.call` manifest naming the candidate's budget.
 impl View for History {
-    fn view(&self, budget: &Budget) -> Result<Vec<Message>, TooLarge> {
-        self.assemble(budget).map(|(sent, _)| sent)
+    fn view(&self, budget: &Budget, call: CallId) -> Result<Vec<Message>, TooLarge> {
+        self.assemble(budget, call).map(|(sent, _)| sent)
     }
 }
 
@@ -202,6 +204,7 @@ impl View for History {
 ///
 /// The round's hook reads it as rig hands the response over, which is how each
 /// call is attributed to the model that answered it rather than to the head.
+/// The request that answered is the chain's [`CallSlot`]'s to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Answered {
     /// The candidate's `[models.<name>]` row.
@@ -242,15 +245,17 @@ pub(crate) struct FailoverModel {
     ///
     /// [`composes_native_output_with_tools`]: Self::composes_native_output_with_tools
     composes: bool,
-    /// Where each move is recorded.
-    events: Events,
+    /// Where the chain's calls and attempts are named, and each move
+    /// recorded.
+    slot: CallSlot,
     /// Where a moved call's view comes from.
     view: Arc<dyn View>,
 }
 
 impl FailoverModel {
-    /// Build a chain over `candidates`, in preference order, recording each
-    /// move in `events` and taking a moved call's view from `view`.
+    /// Build a chain over `candidates`, in preference order, naming its calls
+    /// and recording each move through `slot`, and taking a moved call's view
+    /// from `view`.
     ///
     /// `policy` is the one whose [`chain_deadline`] every candidate below
     /// already holds a handle to; arming it here is what bounds them all.
@@ -259,7 +264,7 @@ impl FailoverModel {
     pub(crate) fn new(
         candidates: Vec<Box<dyn Candidate>>,
         policy: RetryPolicy,
-        events: Events,
+        slot: CallSlot,
         view: Arc<dyn View>,
     ) -> Self {
         // ANDed rather than delegated to candidate one. rig resolves the output
@@ -276,9 +281,14 @@ impl FailoverModel {
             candidates: Arc::new(candidates),
             policy,
             composes,
-            events,
+            slot,
             view,
         }
+    }
+
+    /// Where the chain's calls and attempts are named.
+    pub(crate) fn slot(&self) -> &CallSlot {
+        &self.slot
     }
 
     /// What a call to each candidate may carry, in the chain's order: the
@@ -293,13 +303,15 @@ impl FailoverModel {
     /// what a config typo can silently do; a chain that moves mid-round means
     /// one round can be half one model's work, which is the stronger version of
     /// the same hazard and wants the same mitigation.
-    fn announce(&self, from: &str, to: &str, error: &CompletionError) {
+    fn announce(&self, from: &str, to: &str, error: &CompletionError, call: CallId) {
         let error = error.to_string();
         tracing::warn!("model {from} failed ({error}); trying {to}");
-        self.events.emit(Event::ModelFailover {
-            from,
-            to,
-            error: &error,
+        self.slot.ledger().events().emit(Payload::ModelFailover {
+            from: from.to_string(),
+            to: to.to_string(),
+            error,
+            call_id: call,
+            attempt_id: self.slot.last_attempt(),
         });
     }
 }
@@ -374,6 +386,7 @@ impl CompletionModel for FailoverModel {
         // of these with Python run between them, and each one gets a whole
         // budget to find a working candidate.
         self.policy.chain_deadline.arm(self.policy.budget);
+        let call = self.slot.begin_call();
 
         let mut abandoned: Vec<Abandoned> = Vec::new();
         // Kept while a later candidate may still need it, and moved into the
@@ -393,13 +406,18 @@ impl CompletionModel for FailoverModel {
                 request.clone()
             }
             .expect("taken only for the last candidate");
+            self.slot.candidate(
+                candidate.model_name(),
+                candidate.model_identifier(),
+                candidate.budget().max_tokens,
+            );
             // The head is sent the view the round assembled for it. Any other
             // candidate is sent one assembled for its own window, which may
             // leave out more -- or cannot hold the call's latest turn at all.
             let outcome = if index == 0 {
                 Ok(())
             } else {
-                self.view.view(candidate.budget()).map(|view| {
+                self.view.view(candidate.budget(), call).map(|view| {
                     attempt.chat_history = after_system(&attempt.chat_history, view);
                 })
             };
@@ -432,7 +450,7 @@ impl CompletionModel for FailoverModel {
                 },
             };
             if let Some(next) = self.candidates.get(index + 1) {
-                self.announce(candidate.model_name(), next.model_name(), &error);
+                self.announce(candidate.model_name(), next.model_name(), &error, call);
             }
             abandoned.push(Abandoned {
                 model_name: candidate.model_name().to_string(),
@@ -481,6 +499,7 @@ mod tests {
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
+    use crate::agent::ledger::Ledger;
 
     /// What a call to a test's candidate may carry: a window of no consequence,
     /// and `max_tokens`.
@@ -620,7 +639,7 @@ mod tests {
     }
 
     impl View for Views {
-        fn view(&self, budget: &Budget) -> Result<Vec<Message>, TooLarge> {
+        fn view(&self, budget: &Budget, _call: CallId) -> Result<Vec<Message>, TooLarge> {
             self.asked.lock().expect("asked").push(budget.model.clone());
             if self.too_large_for == Some(budget.model.as_str()) {
                 return Err(TooLarge {
@@ -638,15 +657,15 @@ mod tests {
     }
 
     fn chain(candidates: Vec<Box<dyn Candidate>>) -> FailoverModel {
-        chain_over(candidates, Arc::new(Views::default()), Events::off())
+        chain_over(candidates, Arc::new(Views::default()), CallSlot::default())
     }
 
     fn chain_over(
         candidates: Vec<Box<dyn Candidate>>,
         view: Arc<dyn View>,
-        events: Events,
+        slot: CallSlot,
     ) -> FailoverModel {
-        FailoverModel::new(candidates, RetryPolicy::default(), events, view)
+        FailoverModel::new(candidates, RetryPolicy::default(), slot, view)
     }
 
     /// The text of the `ProviderError` a chain's exhaustion is.
@@ -825,7 +844,7 @@ mod tests {
         chain_over(
             vec![Box::new(first), Box::new(second)],
             Arc::clone(&views) as Arc<dyn View>,
-            Events::off(),
+            CallSlot::default(),
         )
         .completion(request())
         .await
@@ -870,7 +889,7 @@ mod tests {
                 Box::new(Scripted::ok("large")),
             ],
             views,
-            Events::off(),
+            CallSlot::default(),
         )
         .completion(request())
         .await
@@ -888,7 +907,7 @@ mod tests {
                 too_large_for: Some("small"),
                 ..Views::default()
             }),
-            Events::off(),
+            CallSlot::default(),
         )
         .completion(request())
         .await
@@ -913,7 +932,7 @@ mod tests {
                 Box::new(Scripted::failing("anthropic", http_status(503))),
             ],
             Arc::new(Views::default()),
-            events.clone(),
+            CallSlot::new(Ledger::new(events.clone())),
         )
         .completion(request())
         .await
@@ -925,6 +944,12 @@ mod tests {
         assert_eq!(moves.len(), 1, "{moves:#?}");
         assert_eq!(moves[0]["from"], "bedrock");
         assert_eq!(moves[0]["to"], "anthropic");
+        assert_eq!(moves[0]["call_id"], 1, "the call that moved");
+        assert_eq!(
+            moves[0]["attempt_id"],
+            serde_json::Value::Null,
+            "a candidate with no request layer sent nothing this chain recorded"
+        );
         assert!(
             moves[0]["error"]
                 .as_str()

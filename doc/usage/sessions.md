@@ -240,11 +240,11 @@ MCP stderr log. Unlike it, the file is readable by its owner only, because it ho
 typed to the agent and what the agent sent back. Discarding the session removes it with
 everything else.
 
-The session finishes the file before it stops its containers, so every event is *in the file* by
-the time `run-new` exits, on the same terms as `network.jsonl`: not synced to the disk. If the disk
-cannot keep up, the agent waits for it rather than losing events; a part of OutRig that cannot
-wait, such as the one reading the interpreter's replies, queues its events instead, and any the
-file never got are counted in a warning at exit.
+The file is finished as the session stops, so every event it got is *in the file* by the time
+`run-new` exits, on the same terms as `network.jsonl`: not synced to the disk. Nothing the agent
+does waits for it: if the disk cannot keep up, the events it has not taken wait, up to a bound,
+and past that the oldest are dropped, which shows in the file as a jump in the records' ids. Any
+event the file never got is counted in a warning at exit.
 
 ### Reading it in a browser
 

@@ -8,11 +8,20 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::agent::rig_json;
+use crate::harness::event::*;
+use crate::harness::{ClosedBy, ExecutionOutcome, ExecutionStatus, Stopped, Verdict};
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
 
 fn execid(n: u64) -> ExecId {
-    serde_json::from_value(json!(n)).expect("an id")
+    ExecId::new(n)
+}
+
+fn diagnostic(text: impl ToString) -> Payload {
+    Payload::InterpreterDiagnostic {
+        text: text.to_string(),
+    }
 }
 
 fn keys(value: &Value) -> BTreeSet<&str> {
@@ -25,9 +34,12 @@ fn keys(value: &Value) -> BTreeSet<&str> {
 }
 
 async fn opened_as(dir: &Path) -> Events {
-    Events::open(dir, SOURCE.to_string())
+    let mut stream = StreamBuilder::default();
+    stream
+        .record(dir, SOURCE.to_string())
         .await
-        .expect("open the log")
+        .expect("open the log");
+    stream.build()
 }
 
 /// The CloudEvents envelope, exactly: the top level holds the standard context
@@ -38,11 +50,13 @@ async fn opened_as(dir: &Path) -> Events {
 async fn every_record_is_a_cloudevent_with_only_standard_attributes_at_the_top() {
     let dir = tempfile::tempdir().expect("tempdir");
     let events = opened_as(dir.path()).await;
-    events.emit(Event::ExecSubmitted {
+    events.emit(Payload::ExecSubmitted {
         execid: execid(7),
-        source: "print('hi')",
+        source: "print('hi')".to_string(),
     });
-    events.emit(Event::OutputUnattributed { text: "stray" });
+    events.emit(Payload::OutputUnattributed {
+        text: "stray".to_string(),
+    });
     events.close().await.expect("nothing lost");
 
     let records = recorded(dir.path());
@@ -103,13 +117,11 @@ async fn every_record_is_a_cloudevent_with_only_standard_attributes_at_the_top()
 #[test]
 fn each_event_has_exactly_its_data_fields() {
     let opening = Message::user("1 message is waiting");
-    let messages = [opening.clone()];
-    let tools = [ToolDefinition {
+    let tools = vec![ToolDefinition {
         name: "submit_python".to_string(),
         description: "d".to_string(),
         parameters: json!({"type": "object"}),
     }];
-    let background = [];
     let usage = Usage {
         input_tokens: 12,
         output_tokens: 7,
@@ -118,41 +130,46 @@ fn each_event_has_exactly_its_data_fields() {
         cache_creation_input_tokens: 0,
         reasoning_tokens: 0,
     };
+    let (call, attempt) = (CallId::new(1), AttemptId::new(2));
     let calls = || {
         vec![CallUsage {
             index: 0,
             model: "sonnet".into(),
-            usage,
+            call_id: call,
+            attempt_id: attempt,
+            usage: Some(usage),
         }]
     };
     let id = execid(3);
-    let cases: Vec<(Event<'_>, &str, &[&str])> = vec![
+    let text = |s: &str| s.to_string();
+    let cases: Vec<(Payload, &str, &[&str])> = vec![
         (
-            Event::ModelInstructions {
-                model: "sonnet",
-                preamble: "p",
-                tools: &tools,
+            Payload::ModelInstructions {
+                model: text("sonnet"),
+                preamble: text("p"),
+                tools: tools.clone(),
                 max_tokens: Some(4096),
             },
             "model.instructions",
             &["model", "preamble", "tools", "max_tokens"],
         ),
         (
-            Event::TurnCommitted {
+            Payload::TurnCommitted {
                 turn: 0,
                 round: 1,
                 incomplete: false,
-                messages: &messages,
+                messages: vec![rig_json(&opening)],
             },
             "turn.committed",
             &["turn", "round", "incomplete", "messages"],
         ),
         (
-            Event::ModelCall(ModelCall {
+            Payload::ModelCall(ModelCall {
                 call: 0,
+                call_id: call,
                 round: 1,
                 budget: CallBudget {
-                    model: "sonnet",
+                    model: text("sonnet"),
                     window: 128_000,
                     window_assumed: true,
                     reserve: 32_000,
@@ -163,17 +180,17 @@ fn each_event_has_exactly_its_data_fields() {
                 estimate: 1_000,
                 carried: vec![Chosen {
                     turn: 0,
-                    why: "first",
+                    why: Why::First,
                 }],
                 evicted: Vec::new(),
                 withheld: vec![Chosen {
                     turn: 2,
-                    why: "promoted",
+                    why: Why::Promoted,
                 }],
-                opening: Some(&opening),
+                opening: Some(rig_json(&opening)),
                 adjacent: vec![Repeat {
                     turn: None,
-                    role: "user",
+                    role: Role::User,
                 }],
                 left_out: vec![LeftOut {
                     turn: 0,
@@ -183,23 +200,43 @@ fn each_event_has_exactly_its_data_fields() {
             }),
             "model.call",
             &[
-                "call", "round", "budget", "estimate", "carried", "evicted", "withheld", "opening",
-                "adjacent", "left_out",
+                "call", "call_id", "round", "budget", "estimate", "carried", "evicted", "withheld",
+                "opening", "adjacent", "left_out",
             ],
         ),
         (
-            Event::ExecSubmitted {
+            Payload::ExecSubmitted {
                 execid: id,
-                source: "x",
+                source: text("x"),
             },
             "exec.submitted",
             &["execid", "source"],
         ),
         (
-            Event::AgentStarted {
-                model: "sonnet",
-                python: "3.13.15",
-                container: "outrig-x",
+            Payload::SessionState {
+                state: SessionState::RoundRunning,
+            },
+            "session.state",
+            &["state"],
+        ),
+        (
+            Payload::SessionReport {
+                closed_by: ClosedBy::Owner,
+                stopped: Stopped::Proven,
+                executions: vec![ExecutionOutcome {
+                    id,
+                    status: ExecutionStatus::Unknown,
+                }],
+                verdict: Verdict::StoppedWithUnknown,
+            },
+            "session.report",
+            &["closed_by", "stopped", "executions", "verdict"],
+        ),
+        (
+            Payload::AgentStarted {
+                model: text("sonnet"),
+                python: text("3.13.15"),
+                container: text("outrig-x"),
                 tool_call_max: 50,
                 tool_result_max: 262_144,
             },
@@ -212,29 +249,30 @@ fn each_event_has_exactly_its_data_fields() {
                 "tool_result_max",
             ],
         ),
-        (Event::AgentStopped {}, "agent.stopped", &[]),
+        (Payload::AgentStopped {}, "agent.stopped", &[]),
         (
-            Event::RoundStarted { round: 1 },
+            Payload::RoundStarted { round: 1 },
             "round.started",
             &["round"],
         ),
         (
-            Event::ExecRefused {
+            Payload::ExecRefused {
                 execid: id,
-                holder: execid(2),
+                holder: Some(execid(2)),
+                reason: Refusal::Held,
             },
             "exec.refused",
-            &["execid", "holder"],
+            &["execid", "holder", "reason"],
         ),
         (
-            Event::ExecCompleted {
+            Payload::ExecCompleted {
                 execid: id,
-                status: "ok",
-                duration: 0.5,
-                output: "hi\n",
+                status: ExecStatus::Ok,
+                duration: Duration::from_millis(500),
+                output: text("hi\n"),
                 dropped: 0,
                 error: None,
-                background: &background,
+                background: Vec::new(),
             },
             "exec.completed",
             &[
@@ -248,17 +286,17 @@ fn each_event_has_exactly_its_data_fields() {
             ],
         ),
         (
-            Event::MemoryExhausted { execid: id },
+            Payload::MemoryExhausted { execid: id },
             "memory.exhausted",
             &["execid"],
         ),
         (
-            Event::ExecCancelSent { execid: id },
+            Payload::ExecCancelSent { execid: id },
             "exec.cancel.sent",
             &["execid"],
         ),
         (
-            Event::ExecInterruptSent {
+            Payload::ExecInterruptSent {
                 execid: id,
                 runaway: true,
             },
@@ -266,27 +304,27 @@ fn each_event_has_exactly_its_data_fields() {
             &["execid", "runaway"],
         ),
         (
-            Event::ExecProbeFailed {
+            Payload::ExecProbeFailed {
                 execid: id,
-                verdict: "spinning",
+                verdict: ProbeVerdict::Spinning,
             },
             "exec.probe.failed",
             &["execid", "verdict"],
         ),
         (
-            Event::ExecAbandoned {
+            Payload::ExecAbandoned {
                 execid: id,
-                why: "runaway",
+                why: Abandoned::Runaway,
             },
             "exec.abandoned",
             &["execid", "why"],
         ),
         (
-            Event::InventoryObserved {
+            Payload::InventoryObserved {
                 execid: id,
                 names: vec![Held {
-                    name: "x",
-                    kind: "int",
+                    name: text("x"),
+                    type_name: text("int"),
                 }],
                 total: 1,
                 more: 0,
@@ -295,7 +333,7 @@ fn each_event_has_exactly_its_data_fields() {
             &["execid", "names", "total", "more"],
         ),
         (
-            Event::ToolResultTruncated {
+            Payload::ToolResultTruncated {
                 execid: id,
                 size: 2_000,
                 max: 1_024,
@@ -305,105 +343,171 @@ fn each_event_has_exactly_its_data_fields() {
             &["execid", "size", "max", "kept"],
         ),
         (
-            Event::ContextPromoted { turns: &[1, 2] },
+            Payload::ContextPromoted { turns: vec![1, 2] },
             "context.promoted",
             &["turns"],
         ),
         (
-            Event::ContextDemoted { turns: &[1] },
+            Payload::ContextDemoted { turns: vec![1] },
             "context.demoted",
             &["turns"],
         ),
         (
-            Event::OutputUnattributed { text: "t" },
+            Payload::OutputUnattributed { text: text("t") },
             "output.unattributed",
             &["text"],
         ),
         (
-            Event::InterpreterDiagnostic { text: "t" },
+            Payload::InterpreterDiagnostic { text: text("t") },
             "interpreter.diagnostic",
             &["text"],
         ),
         (
-            Event::InterpreterExited { cause: "c" },
+            Payload::InterpreterExited {
+                cause: text("c"),
+                expected: false,
+            },
             "interpreter.exited",
-            &["cause"],
+            &["cause", "expected"],
         ),
         (
-            Event::ModelRoundCompleted {
+            Payload::ModelRoundCompleted {
                 round: 1,
                 stopped: None,
-                usage,
+                usage: Some(usage),
                 calls: calls(),
-                input_tokens_max: 12,
+                attempts: vec![attempt],
+                input_tokens_max: Some(12),
             },
             "model.round.completed",
-            &["round", "stopped", "usage", "calls", "input_tokens_max"],
+            &[
+                "round",
+                "stopped",
+                "usage",
+                "calls",
+                "attempts",
+                "input_tokens_max",
+            ],
         ),
         (
-            Event::ModelRoundFailed {
+            Payload::ModelRoundFailed {
                 round: 1,
-                error: "e",
+                error: text("e"),
                 calls: calls(),
+                usage: None,
+                attempts: vec![attempt],
             },
             "model.round.failed",
-            &["round", "error", "calls"],
+            &["round", "error", "calls", "usage", "attempts"],
         ),
         (
-            Event::ModelRoundDropped {
+            Payload::ModelRoundDropped {
                 round: 1,
                 calls: calls(),
+                usage: None,
+                attempts: vec![attempt],
             },
             "model.round.dropped",
-            &["round", "calls"],
+            &["round", "calls", "usage", "attempts"],
         ),
         (
-            Event::ModelRetry {
-                model: "sonnet",
+            Payload::ModelAttempt(ModelAttempt {
+                call_id: call,
+                attempt_id: attempt,
+                model: text("sonnet"),
+                identifier: text("claude-sonnet-4-6"),
+                max_tokens: Some(4096),
+                error: Some(text("HTTP 429 Too Many Requests")),
+                usage: None,
+            }),
+            "model.attempt",
+            &[
+                "call_id",
+                "attempt_id",
+                "model",
+                "identifier",
+                "max_tokens",
+                "error",
+                "usage",
+            ],
+        ),
+        (
+            Payload::ModelRetry {
+                model: text("sonnet"),
                 attempt: 2,
-                delay: 1.5,
-                error: "429",
+                delay: Duration::from_millis(1_500),
+                error: text("429"),
+                call_id: call,
+                attempt_id: attempt,
             },
             "model.retry",
-            &["model", "attempt", "delay", "error"],
+            &[
+                "model",
+                "attempt",
+                "delay",
+                "error",
+                "call_id",
+                "attempt_id",
+            ],
         ),
         (
-            Event::ModelFailover {
-                from: "a",
-                to: "b",
-                error: "e",
+            Payload::ModelFailover {
+                from: text("a"),
+                to: text("b"),
+                error: text("e"),
+                call_id: call,
+                attempt_id: Some(attempt),
             },
             "model.failover",
-            &["from", "to", "error"],
+            &["from", "to", "error", "call_id", "attempt_id"],
         ),
         (
-            Event::MessageSent {
-                message: id,
-                channel: "user",
-                from: "user",
-                to: "agent/primary",
-                body: "hi",
+            Payload::ModelUsageReplaced {
+                call_id: call,
+                attempt_id: attempt,
+                usage,
+            },
+            "model.usage.replaced",
+            &["call_id", "attempt_id", "usage"],
+        ),
+        (
+            Payload::ModelUsageRefused {
+                call_id: Some(call),
+                attempt_id: attempt,
+                usage,
+                reason: UsageRefusal::Replaced,
+            },
+            "model.usage.refused",
+            &["call_id", "attempt_id", "usage", "reason"],
+        ),
+        (
+            Payload::MessageSent {
+                message: MessageId::new(3),
+                channel: text("user"),
+                from: text("user"),
+                to: text("agent/primary"),
+                body: text("hi"),
             },
             "message.sent",
             &["message", "channel", "from", "to", "body"],
         ),
         (
-            Event::MessageRefused {
-                message: id,
-                channel: "user",
-                from: "user",
-                to: "agent/primary",
-                reason: "full",
+            Payload::MessageRefused {
+                message: MessageId::new(3),
+                channel: text("user"),
+                from: text("user"),
+                to: text("agent/primary"),
+                reason: text("full"),
             },
             "message.refused",
             &["message", "channel", "from", "to", "reason"],
         ),
         (
-            Event::MessageReceived {
-                message: id,
-                channel: "user",
-                from: "user",
-                to: "agent/primary",
+            Payload::MessageReceived {
+                message: MessageId::new(3),
+                channel: text("user"),
+                from: text("user"),
+                to: text("agent/primary"),
             },
             "message.received",
             &["message", "channel", "from", "to"],
@@ -411,10 +515,10 @@ fn each_event_has_exactly_its_data_fields() {
     ];
 
     let mut seen = BTreeSet::new();
-    for (event, kind, fields) in &cases {
-        assert_eq!(event.kind(), *kind);
+    for (payload, kind, fields) in &cases {
+        assert_eq!(payload.kind(), *kind);
         assert!(seen.insert(*kind), "{kind} twice");
-        let data = serde_json::to_value(event).expect("encodes");
+        let data = serde_json::to_value(payload).expect("encodes");
         assert_eq!(
             keys(&data),
             fields.iter().copied().collect::<BTreeSet<_>>(),
@@ -422,18 +526,21 @@ fn each_event_has_exactly_its_data_fields() {
         );
     }
 
-    let nested = |event: &Event<'_>, field: &str| {
-        let data = serde_json::to_value(event).expect("encodes");
+    let nested = |payload: &Payload, field: &str| {
+        let data = serde_json::to_value(payload).expect("encodes");
         keys(&data[field])
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
-    let completed = &cases
-        .iter()
-        .find(|(_, kind, _)| *kind == "model.round.completed")
-        .expect("the round")
-        .0;
+    let case = |kind: &str| {
+        &cases
+            .iter()
+            .find(|(_, case, _)| *case == kind)
+            .expect("the case")
+            .0
+    };
+    let completed = case("model.round.completed");
     assert_eq!(
         nested(completed, "usage"),
         [
@@ -448,14 +555,12 @@ fn each_event_has_exactly_its_data_fields() {
     let data = serde_json::to_value(completed).expect("encodes");
     assert_eq!(
         keys(&data["calls"][0]),
-        BTreeSet::from(["index", "model", "usage"]),
-        "each call names the model that answered it"
+        BTreeSet::from(["index", "model", "call_id", "attempt_id", "usage"]),
+        "each call names the model and the attempt that answered it"
     );
-    let call = &cases
-        .iter()
-        .find(|(_, kind, _)| *kind == "model.call")
-        .expect("the call")
-        .0;
+    let failed = serde_json::to_value(case("model.round.failed")).expect("encodes");
+    assert_eq!(failed["usage"], Value::Null, "null, never zero");
+    let call = case("model.call");
     assert_eq!(
         nested(call, "budget"),
         [
@@ -483,6 +588,30 @@ fn each_event_has_exactly_its_data_fields() {
         serde_json::to_value(&opening).expect("rig encodes it")
     );
     serde_json::from_value::<Message>(data["opening"].clone()).expect("and reads it back");
+    // OutRig's tool definition is written as rig's was.
+    assert_eq!(
+        serde_json::to_value(&tools[0]).expect("encodes"),
+        serde_json::to_value(rig::completion::ToolDefinition {
+            name: "submit_python".to_string(),
+            description: "d".to_string(),
+            parameters: json!({"type": "object"}),
+        })
+        .expect("rig encodes it")
+    );
+    let completed = serde_json::to_value(case("exec.completed")).expect("encodes");
+    assert_eq!(completed["duration"], json!(0.5), "seconds, as a number");
+    let report = serde_json::to_value(case("session.report")).expect("encodes");
+    assert_eq!(
+        report,
+        json!({
+            "closed_by": {"by": "owner"},
+            "stopped": {"state": "proven"},
+            "executions": [{"execid": 3, "status": "unknown"}],
+            "verdict": "stopped_with_unknown",
+        })
+    );
+    let state = serde_json::to_value(case("session.state")).expect("encodes");
+    assert_eq!(state, json!({"state": "round_running"}));
 }
 
 /// The id a record is given is its place in the file, whichever task emitted
@@ -496,10 +625,7 @@ async fn ids_are_the_files_order_whoever_emits() {
             let events = events.clone();
             tokio::spawn(async move {
                 for n in 0..200 {
-                    events.ready().await;
-                    events.emit(Event::InterpreterDiagnostic {
-                        text: &format!("{task}-{n}"),
-                    });
+                    events.emit(diagnostic(format!("{task}-{n}")));
                 }
             })
         })
@@ -529,16 +655,16 @@ async fn ids_are_the_files_order_whoever_emits() {
 async fn a_log_that_holds_a_recording_is_refused_and_kept() {
     let dir = tempfile::tempdir().expect("tempdir");
     let first = opened(dir.path()).await;
-    first.emit(Event::AgentStopped {});
+    first.emit(Payload::AgentStopped {});
     first.close().await.expect("nothing lost");
     released(dir.path()).await;
     let path = dir.path().join(EVENTS_LOG);
     let before = std::fs::read(&path).expect("the first recording");
 
-    let refused = Events::open(dir.path(), TEST_SOURCE.to_string())
+    let refused = StreamBuilder::default()
+        .record(dir.path(), TEST_SOURCE.to_string())
         .await
-        .err()
-        .expect("a second recording is refused")
+        .expect_err("a second recording is refused")
         .to_string();
     assert!(refused.contains("already holds a recording"), "{refused}");
     assert_eq!(
@@ -578,37 +704,47 @@ async fn the_log_is_its_owners_alone() {
     assert_eq!(mode(&path), 0o600, "an earlier file is narrowed");
 }
 
-/// Recording does not change what it records, so nothing that emits waits,
-/// and what a full buffer cannot take is counted rather than lost quietly. A
-/// caller that can wait, waits: a stalled writer holds it up. And a close is
+/// Recording does not change what it records, so nothing that emits waits:
+/// the log's backpressure stops at its own subscription. A writer whose file
+/// has stopped taking anything leaves events waiting there, and those that
+/// overflow it are a counted gap -- the session never waits. A close is
 /// bounded by its deadline, reporting -- as agent events, not network ones --
 /// everything the file did not get.
 #[tokio::test(start_paused = true)]
-async fn a_stalled_writer_holds_up_who_waits_and_close_counts_what_it_lost() {
+async fn a_stalled_writer_loses_a_counted_gap_and_close_counts_what_it_lost() {
     // A writer that never takes anything off its queue.
-    let (records, _queue) = mpsc::channel(QUEUE);
+    let (records, queue) = mpsc::channel(line_sink::QUEUE);
     let sink = LineSink::queuing_to(
         records,
         Some(tokio::spawn(std::future::pending())),
         &EVENT_LABELS,
     );
     let dir = tempfile::tempdir().expect("tempdir");
-    let events = Events::over(sink, dir.path().join(EVENTS_LOG), TEST_SOURCE.to_string());
+    let mut stream = StreamBuilder::default();
+    stream.record_over(sink, dir.path().join(EVENTS_LOG), TEST_SOURCE.to_string());
+    let events = stream.build();
 
-    let emitted = QUEUE + 10;
-    for n in 0..emitted {
-        events.emit(Event::InterpreterDiagnostic {
-            text: &n.to_string(),
-        });
+    // The writer takes events until its file holds all it has room for.
+    for n in 0..line_sink::QUEUE {
+        events.emit(diagnostic(n));
     }
-    assert!(
-        tokio::time::timeout(Duration::from_secs(60), events.ready())
-            .await
-            .is_err(),
-        "a caller that can wait waits for room that is not coming"
-    );
+    while queue.len() < line_sink::QUEUE {
+        tokio::task::yield_now().await;
+    }
+    // Then its subscription fills, and overflows.
+    let over = 10;
+    let started = tokio::time::Instant::now();
+    for n in 0..DEFAULT_CAPACITY + over {
+        events.emit(diagnostic(n));
+    }
     // Emitting still never waits.
-    events.emit(Event::AgentStopped {});
+    events.emit(Payload::AgentStopped {});
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "nothing emitting waited for the writer"
+    );
+    let emitted = line_sink::QUEUE + DEFAULT_CAPACITY + over + 1;
 
     let started = tokio::time::Instant::now();
     let lost = events.close().await.expect_err("nothing was written");
@@ -618,24 +754,23 @@ async fn a_stalled_writer_holds_up_who_waits_and_close_counts_what_it_lost() {
         "bounded by its deadline"
     );
     assert_eq!(
-        lost.records,
-        emitted as u64 + 1,
-        "every one: those the writer held, and those there was no room for"
+        lost.records, emitted as u64,
+        "every one: those the sink held, those its subscription held, and the gap"
     );
     assert!(
         lost.integrity.is_some(),
         "a writer stopped mid-write: {lost}"
     );
-    assert!(lost.first.contains("more than"), "the first lost: {lost}");
+    assert!(lost.first.contains("behind"), "the first lost: {lost}");
     let text = lost.to_string();
     assert!(
-        text.starts_with(&format!("{} agent event(s)", emitted + 1)),
+        text.starts_with(&format!("{emitted} agent event(s)")),
         "{text}"
     );
     assert!(!text.contains("network"), "{text}");
 
     // Closed means closed: nothing after it is recorded, or counted.
-    events.emit(Event::AgentStopped {});
+    events.emit(Payload::AgentStopped {});
     assert!(
         events.close().await.is_ok(),
         "and a second close has nothing to say"
@@ -648,7 +783,7 @@ async fn a_stalled_writer_holds_up_who_waits_and_close_counts_what_it_lost() {
 async fn a_log_dropped_without_a_close_is_finished_anyway() {
     let dir = tempfile::tempdir().expect("tempdir");
     let events = opened(dir.path()).await;
-    events.emit(Event::AgentStopped {});
+    events.emit(Payload::AgentStopped {});
     drop(events);
     let path = dir.path().join(EVENTS_LOG);
     let deadline = tokio::time::Instant::now() + line_sink::SHUTDOWN_GRACE;
@@ -664,7 +799,132 @@ async fn a_log_dropped_without_a_close_is_finished_anyway() {
 async fn off_records_nothing_and_never_waits() {
     let events = Events::off();
     assert!(!events.is_on());
-    events.emit(Event::AgentStopped {});
-    events.ready().await;
+    events.emit(Payload::AgentStopped {});
     events.close().await.expect("nothing to lose");
+    assert_eq!(events.tally(), Tally::default());
+}
+
+/// Every subscriber sees every event, in id order, whichever task published
+/// it, and the log beside them holds the same ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_subscriber_sees_every_event_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut stream = StreamBuilder::default();
+    let mut first = stream.subscribe(DEFAULT_CAPACITY);
+    let mut second = stream.subscribe(DEFAULT_CAPACITY);
+    stream
+        .record(dir.path(), TEST_SOURCE.to_string())
+        .await
+        .expect("open the log");
+    let events = stream.build();
+    let tasks: Vec<_> = (0..8)
+        .map(|task| {
+            let events = events.clone();
+            tokio::spawn(async move {
+                for n in 0..200 {
+                    events.emit(diagnostic(format!("{task}-{n}")));
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.expect("emitted");
+    }
+    events.close().await.expect("nothing lost");
+    for subscription in [&mut first, &mut second] {
+        let mut ids = Vec::new();
+        while let Some(received) = subscription.recv().await {
+            match received {
+                Received::Event(event) => ids.push(event.id),
+                Received::Missed(n) => panic!("missed {n}"),
+            }
+        }
+        assert_eq!(ids, (1..=1600).collect::<Vec<_>>());
+    }
+    let logged: Vec<u64> = recorded(dir.path())
+        .iter()
+        .map(|record| {
+            record["id"]
+                .as_str()
+                .expect("an id")
+                .parse()
+                .expect("decimal")
+        })
+        .collect();
+    assert_eq!(logged, (1..=1600).collect::<Vec<_>>());
+    assert_eq!(
+        events.tally(),
+        Tally {
+            last: 1600,
+            missed: vec![0, 0]
+        }
+    );
+}
+
+/// A subscriber that falls behind loses its oldest events, never slowing the
+/// stream, and is told how many before the next one it gets -- whose id is
+/// that many past the last it saw. What it lost is counted whether it reads or
+/// not.
+#[tokio::test]
+async fn a_subscriber_that_falls_behind_is_told_what_it_missed() {
+    let mut stream = StreamBuilder::default();
+    let mut slow = stream.subscribe(4);
+    let silent = stream.subscribe(2);
+    let events = stream.build();
+    for n in 0..10 {
+        events.emit(diagnostic(n));
+    }
+    assert!(matches!(slow.try_recv(), Ok(Received::Missed(6))));
+    let mut ids = Vec::new();
+    while let Ok(Received::Event(event)) = slow.try_recv() {
+        ids.push(event.id);
+    }
+    assert_eq!(ids, [7, 8, 9, 10]);
+    assert!(matches!(slow.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!((slow.missed(), silent.missed()), (6, 8));
+    assert_eq!(events.tally().missed, [6, 8]);
+
+    events.close().await.expect("nothing to lose");
+    assert!(matches!(slow.try_recv(), Err(TryRecvError::Closed)));
+    assert!(slow.recv().await.is_none());
+}
+
+/// The event that ends the stream is the last every subscriber sees, however
+/// many others are being published at the same moment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_closing_event_is_the_last_of_the_stream() {
+    let mut stream = StreamBuilder::default();
+    let mut subscription = stream.subscribe(100_000);
+    let events = stream.build();
+    let emitting = {
+        let events = events.clone();
+        tokio::spawn(async move {
+            for n in 0..20_000 {
+                events.emit(diagnostic(n));
+            }
+        })
+    };
+    tokio::task::yield_now().await;
+    events
+        .close_after(Payload::AgentStopped {})
+        .await
+        .expect("nothing to lose");
+    emitting.await.expect("emitted");
+    let mut last = None;
+    while let Some(received) = subscription.recv().await {
+        if let Received::Event(event) = received {
+            last = Some(event.kind());
+        }
+    }
+    assert_eq!(last, Some("agent.stopped"));
+}
+
+/// A stream given up before it was built -- a session that failed to start --
+/// ends its subscriptions.
+#[tokio::test]
+async fn an_unbuilt_stream_ends_its_subscriptions() {
+    let mut stream = StreamBuilder::default();
+    let mut subscription = stream.subscribe(4);
+    drop(stream);
+    assert!(subscription.recv().await.is_none());
 }

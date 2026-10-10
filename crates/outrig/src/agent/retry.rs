@@ -57,6 +57,10 @@
 //!
 //! - A library does not print. Each retry is a `tracing` warning, and a
 //!   `model.retry` event in the agent's log ([`Retries`]).
+//! - Each request sent is an attempt of its own, recorded once as a
+//!   `model.attempt` event ([`super::ledger`]): this loop records those that
+//!   fail, and [`RetryingModel`] those that came back `2xx`, since only it
+//!   learns whether the body was usable.
 //! - The predicates the CLI's REPL classifies a failed turn with are not here.
 //!   A round's failure ends the round whatever it was, so nothing reads them;
 //!   [`is_recoverable`] remains, for what a chain says of its exhaustion.
@@ -78,7 +82,9 @@ use rig::http_client::{
 use rig::streaming::StreamingCompletionResponse;
 use rig::wasm_compat::WasmCompatSend;
 
-use crate::events::{Event, Events};
+use super::ledger::CallSlot;
+use crate::events::Events;
+use crate::harness::event::{AttemptId, CallId, Payload};
 
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
 const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -291,8 +297,8 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Where one candidate's retries are recorded: the agent's event log, under
-/// the `[models.<name>]` row being retried.
+/// Where one candidate's attempts and retries are recorded: the chain's
+/// [`CallSlot`], under the `[models.<name>]` row being retried.
 ///
 /// Both layers hold one. The HTTP loop's future is `'static`, so this is
 /// cloned into it, and [`Events::emit`] never waits, so recording from inside
@@ -300,27 +306,39 @@ impl Default for RetryPolicy {
 /// rig's `Default` and `make` paths get.
 #[derive(Clone, Default)]
 pub(crate) struct Retries {
-    events: Events,
+    slot: CallSlot,
     model: Arc<str>,
 }
 
 impl Retries {
-    /// Retries of `model`'s calls, recorded in `events`.
-    pub(crate) fn new(events: Events, model: &str) -> Self {
+    /// Retries of `model`'s calls, recorded through `slot`.
+    pub(crate) fn new(slot: CallSlot, model: &str) -> Self {
         Self {
-            events,
+            slot,
             model: Arc::from(model),
         }
     }
 
-    /// Record that attempt `attempt`, counted from 1, failed with `error`, and
-    /// that the next is `delay` away.
-    fn record(&self, attempt: u32, delay: Duration, error: &str) {
-        self.events.emit(Event::ModelRetry {
-            model: &self.model,
+    fn events(&self) -> &Events {
+        self.slot.ledger().events()
+    }
+
+    /// Record that try `attempt`, counted from 1, of `call` -- the request
+    /// `attempt_id` -- failed with `error`, and that the next is `delay` away.
+    fn record(
+        &self,
+        attempt: u32,
+        delay: Duration,
+        error: &str,
+        (call_id, attempt_id): (CallId, AttemptId),
+    ) {
+        self.events().emit(Payload::ModelRetry {
+            model: self.model.to_string(),
             attempt,
-            delay: delay.as_secs_f64(),
-            error,
+            delay,
+            error: error.to_string(),
+            call_id,
+            attempt_id,
         });
     }
 }
@@ -331,7 +349,7 @@ impl fmt::Debug for Retries {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Retries")
             .field("model", &self.model)
-            .field("recorded", &self.events.is_on())
+            .field("recorded", &self.events().is_on())
             .finish()
     }
 }
@@ -484,7 +502,7 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         // and `None` -- no ceiling sent, provider's default silently in charge
         // -- is the case worth naming loudest.
         let max_tokens = request.max_tokens;
-        let outcome = self.completion_retried(request).await;
+        let outcome = self.completion_retried(request).await.0;
         if let Ok(response) = &outcome {
             report_textless_completion(&self.retries.model, response, max_tokens);
         }
@@ -511,18 +529,37 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
 }
 
 impl<M: CompletionModel> RetryingModel<M> {
+    /// One completion from the inner model, and the attempt it settled, once
+    /// recorded: its usage if rig made a completion of the body, and why not
+    /// if it could not.
+    async fn attempt(
+        &self,
+        request: CompletionRequest,
+    ) -> (
+        Result<CompletionResponse<M::Response>, CompletionError>,
+        Option<(CallId, AttemptId)>,
+    ) {
+        let settling = self.retries.slot.awaiting();
+        let outcome = self.inner.completion(request).await;
+        let ids = settling.settle(&outcome);
+        (outcome, ids)
+    }
+
     /// The retry loop proper. Split out so [`CompletionModel::completion`] can
     /// inspect what came back without the reporting having to live inside the
     /// loop and fire once per attempt.
     async fn completion_retried(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<M::Response>, CompletionError> {
+    ) -> (
+        Result<CompletionResponse<M::Response>, CompletionError>,
+        Option<(CallId, AttemptId)>,
+    ) {
         // rig takes the request by value, so replaying one means holding a copy
         // of the whole conversation for the duration of the call. With retries
         // off there is nothing to replay, so the wrapper costs nothing at all.
         if self.policy.budget.is_zero() {
-            return self.inner.completion(request).await;
+            return self.attempt(request).await;
         }
 
         // `tokio::time::Instant` for the same reason `send_with_retry` uses it:
@@ -531,8 +568,8 @@ impl<M: CompletionModel> RetryingModel<M> {
         let started = tokio::time::Instant::now();
         let mut attempt = 0u32;
         loop {
-            let message = match self.inner.completion(request.clone()).await {
-                Err(CompletionError::ResponseError(message)) => message,
+            let (message, ids) = match self.attempt(request.clone()).await {
+                (Err(CompletionError::ResponseError(message)), ids) => (message, ids),
                 // A success, or a failure this layer cannot fix: one the HTTP
                 // client already retried, or a terminal one -- a bad key's
                 // `401` above all, which no number of tries will fix.
@@ -560,7 +597,7 @@ impl<M: CompletionModel> RetryingModel<M> {
                 })
                 .flatten();
             let Some(delay) = delay else {
-                return Err(CompletionError::ResponseError(message));
+                return (Err(CompletionError::ResponseError(message)), ids);
             };
 
             tracing::warn!(
@@ -570,15 +607,20 @@ impl<M: CompletionModel> RetryingModel<M> {
                 attempt + 2,
                 RESPONSE_RETRY_ATTEMPTS + 1,
             );
-            self.retries.record(
-                attempt + 1,
-                delay,
-                &format!("unusable response ({message})"),
-            );
+            if let Some(ids) = ids {
+                self.retries
+                    .record(attempt + 1, delay, &unusable(&message), ids);
+            }
             tokio::time::sleep(delay).await;
             attempt += 1;
         }
     }
+}
+
+/// Why a `200` rig could not make a completion of failed, as an attempt and
+/// its retry both record it.
+pub(crate) fn unusable(message: &str) -> String {
+    format!("unusable response ({message})")
 }
 
 /// Report a completion that came back with nothing to show for itself.
@@ -672,6 +714,9 @@ where
     // was never right, so the full budget applies for the rest of the request.
     let mut answered = false;
     loop {
+        // An attempt from here: one that is dropped in flight -- its round
+        // dropped -- records itself as cancelled.
+        let pending = retries.slot.sending();
         let sent = client
             .request(method.clone(), url.clone())
             .headers(headers.clone())
@@ -680,7 +725,12 @@ where
             .await;
 
         let (err, retry_after) = match sent {
-            Ok(response) if response.status().is_success() => return into_lazy_response(response),
+            Ok(response) if response.status().is_success() => {
+                if let Some(pending) = pending {
+                    pending.answered();
+                }
+                return into_lazy_response(response);
+            }
             Ok(response) => {
                 answered = true;
                 let status = response.status();
@@ -707,6 +757,7 @@ where
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
                 let err = HttpError::InvalidStatusCodeWithMessage(status, message);
                 if !is_retryable_status(status) {
+                    settle_failed(pending, &err);
                     return Err(err);
                 }
                 (err, retry_after)
@@ -715,7 +766,9 @@ where
             // often it is sent, so it is final at once rather than spending the
             // budget -- and with it a failover chain's -- on replays.
             Err(error) if is_permanent(&error) => {
-                return Err(HttpError::Instance(Box::new(error)));
+                let err = HttpError::Instance(Box::new(error));
+                settle_failed(pending, &err);
+                return Err(err);
             }
             // Read timeouts, connection resets, and the like -- all
             // retry-worthy, and none of them carry a `Retry-After`.
@@ -727,6 +780,8 @@ where
             }
         };
 
+        let label = failure_label(&err);
+        let ids = pending.map(|pending| pending.failed(label.clone()));
         let elapsed = started.elapsed();
         let Some(delay) = next_delay(&policy, attempt, elapsed, answered, retry_after, jitter())
         else {
@@ -735,7 +790,6 @@ where
         // The budget shown is the one actually being spent against, so a
         // connect failure does not count down against a ten-minute bound it
         // will never reach.
-        let label = failure_label(&err);
         tracing::warn!(
             "LLM call to {} failed ({label}); retry in {:.1}s ({}; {}s/{}s spent)",
             retries.model,
@@ -748,10 +802,20 @@ where
             elapsed.as_secs(),
             policy.bound(answered).as_secs(),
         );
-        retries.record(attempt + 1, delay, &label);
+        if let Some(ids) = ids {
+            retries.record(attempt + 1, delay, &label, ids);
+        }
         tokio::time::sleep(delay).await;
         attempt += 1;
     }
+}
+
+/// Record the attempt `pending` as failed with `err`, when it is one.
+fn settle_failed(
+    pending: Option<super::ledger::Pending>,
+    err: &HttpError,
+) -> Option<(CallId, AttemptId)> {
+    pending.map(|pending| pending.failed(failure_label(err)))
 }
 
 /// Repackage a successful `reqwest::Response` as the `http::Response` rig
@@ -975,8 +1039,11 @@ mod tests {
     /// A model that fails the way the bug does, every time, counting the calls
     /// it took. The associated types are the trait's bare minimum: it never
     /// returns a response and never streams.
+    /// A model that answers every request `200` with nothing rig can use, and
+    /// counts them. It stands in for the HTTP layer too: each request it
+    /// answers is one `slot` names.
     #[derive(Clone)]
-    struct AlwaysUnusableModel(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct AlwaysUnusableModel(std::sync::Arc<std::sync::atomic::AtomicUsize>, CallSlot);
 
     impl CompletionModel for AlwaysUnusableModel {
         type Response = ();
@@ -984,7 +1051,7 @@ mod tests {
         type Client = ();
 
         fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-            Self(Default::default())
+            Self(Default::default(), CallSlot::default())
         }
 
         async fn completion(
@@ -992,6 +1059,9 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(sent) = self.1.sending() {
+                sent.answered();
+            }
             Err(CompletionError::ResponseError(
                 "Response contained no message or tool call (empty)".into(),
             ))
@@ -1014,7 +1084,7 @@ mod tests {
     async fn an_endlessly_unusable_response_gives_up_after_a_bounded_number_of_tries() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls)),
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), CallSlot::default()),
             RetryPolicy::default(),
             Retries::default(),
         );
@@ -1038,7 +1108,7 @@ mod tests {
     async fn a_zero_budget_makes_the_first_unusable_response_final() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls)),
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), CallSlot::default()),
             RetryPolicy {
                 budget: Duration::ZERO,
                 ..RetryPolicy::default()
@@ -1062,13 +1132,16 @@ mod tests {
     async fn each_retry_is_recorded() {
         let dir = tempfile::tempdir().expect("a log dir");
         let events = crate::events::opened(dir.path()).await;
+        let slot = CallSlot::new(crate::agent::ledger::Ledger::new(events.clone()));
+        slot.begin_call();
+        slot.candidate("sonnet", "claude-sonnet-4-6", Some(4096));
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::default()),
+            AlwaysUnusableModel(std::sync::Arc::default(), slot.clone()),
             RetryPolicy {
                 base_delay: Duration::from_millis(1),
                 ..RetryPolicy::default()
             },
-            Retries::new(events.clone(), "sonnet"),
+            Retries::new(slot, "sonnet"),
         );
 
         model
@@ -1088,10 +1161,24 @@ mod tests {
                     "delay": floor,
                     "error": "unusable response (Response contained no message or tool call \
                               (empty))",
+                    "call_id": 1,
+                    "attempt_id": attempt,
                 })
             })
             .collect();
         assert_eq!(retries, expected.iter().collect::<Vec<_>>());
+        // Each try was a request of its own, of the one call, and none reported
+        // what it used.
+        let attempts = crate::events::of_kind(&records, "model.attempt");
+        assert_eq!(attempts.len(), 1 + RESPONSE_RETRY_ATTEMPTS as usize);
+        for (n, attempt) in attempts.iter().enumerate() {
+            assert_eq!(attempt["call_id"], 1);
+            assert_eq!(attempt["attempt_id"], n + 1);
+            assert_eq!(attempt["model"], "sonnet");
+            assert_eq!(attempt["identifier"], "claude-sonnet-4-6");
+            assert_eq!(attempt["max_tokens"], 4096);
+            assert_eq!(attempt["usage"], serde_json::Value::Null);
+        }
     }
 
     #[test]

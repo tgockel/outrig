@@ -304,6 +304,11 @@ def usage_of(value: object) -> dict[str, int | float]:
     return {name: num(obj(value).get(name)) or 0 for name, _ in USAGE}
 
 
+def usage_summary(value: object) -> str:
+    usage = usage_of(value)
+    return f"{usage['input_tokens']:,} in, {usage['output_tokens']:,} out"
+
+
 def turn_list(chosen: object) -> str:
     return ", ".join(f"{text(c.get('turn'))} ({text(c.get('why'))})" for c in objs(chosen))
 
@@ -364,8 +369,8 @@ class Builder:
         data = data or {}
         calls = [usage_of(c.get("usage")) for c in objs(data.get("calls"))]
         block.reported = len(calls)
-        # Only a round the model finished carries its own sum; the rest are summed here.
-        if "usage" in data:
+        # A round's own total when it carries one; otherwise its calls', summed here.
+        if data.get("usage") is not None:
             block.usage = usage_of(data.get("usage"))
         else:
             block.usage = {name: sum(c[name] for c in calls) for name, _ in USAGE}
@@ -456,6 +461,25 @@ class Builder:
     def on_agent_stopped(self, d: dict) -> None:
         self.add(self.subject)
 
+    def on_session_state(self, d: dict) -> None:
+        self.add(text(d.get("state")))
+
+    def on_session_report(self, d: dict) -> None:
+        closed, stopped = obj(d.get("closed_by")), obj(d.get("stopped"))
+        self.facts["shutdown"] = text(d.get("verdict"))
+        outcomes = [
+            f"exec {text(e.get('execid'))}: {text(e.get('status'))}"
+            for e in objs(d.get("executions"))
+        ]
+        lines = [
+            f"closed by: {text(closed.get('by'))}",
+            *([f"cause: {text(closed.get('cause'))}"] if "cause" in closed else []),
+            f"stopped: {text(stopped.get('state'))}",
+            *([f"why not: {text(stopped.get('reason'))}"] if "reason" in stopped else []),
+            *(outcomes or ["no execution was running at the close"]),
+        ]
+        self.add(text(d.get("verdict")), parts=[Part("the shutdown report", "\n".join(lines))])
+
     def on_round_started(self, d: dict) -> None:
         self.begin(d.get("round"))
         self.add("")
@@ -477,9 +501,8 @@ class Builder:
     def end_round(self, d: dict, outcome: str, parts: list[Part]) -> None:
         self.within(d.get("round"))
         summary = outcome
-        if "usage" in d:
-            usage = usage_of(d.get("usage"))
-            summary += f" -- {usage['input_tokens']:,} in, {usage['output_tokens']:,} out"
+        if d.get("usage") is not None:
+            summary += f" -- {usage_summary(d.get('usage'))}"
         self.add(summary, parts=parts)
         self.close(outcome, d)
 
@@ -494,8 +517,36 @@ class Builder:
         self.end_round(d, "dropped by a Ctrl-C", [])
 
     def on_model_retry(self, d: dict) -> None:
-        summary = f"attempt {text(d.get('attempt'))} after {seconds(d.get('delay'))}"
+        summary = (
+            f"{text(d.get('model'))}: attempt {text(d.get('attempt'))} again after "
+            f"{seconds(d.get('delay'))}"
+        )
         self.add(summary, parts=[Part("error", text(d.get("error")))])
+
+    def on_model_attempt(self, d: dict) -> None:
+        summary = (
+            f"request {text(d.get('attempt_id'))} of call {text(d.get('call_id'))}: "
+            f"{text(d.get('model'))} ({text(d.get('identifier'))}), max tokens "
+            f"{text(d.get('max_tokens')) or 'none sent'}"
+        )
+        if d.get("usage") is None:
+            summary += " -- no usage reported"
+        else:
+            summary += f" -- {usage_summary(d.get('usage'))}"
+        parts = [Part("error", text(d.get("error")))] if d.get("error") is not None else []
+        self.add(summary, parts=parts)
+
+    def on_model_usage_replaced(self, d: dict) -> None:
+        self.add(
+            f"request {text(d.get('attempt_id'))}'s usage, reported late: "
+            f"{usage_summary(d.get('usage'))}"
+        )
+
+    def on_model_usage_refused(self, d: dict) -> None:
+        self.add(
+            f"a late usage for request {text(d.get('attempt_id'))} refused: "
+            f"{text(d.get('reason'))}"
+        )
 
     def on_model_failover(self, d: dict) -> None:
         summary = f"{text(d.get('from'))} -> {text(d.get('to'))}"
@@ -559,9 +610,16 @@ class Builder:
 
     def on_exec_refused(self, d: dict) -> None:
         x = self.exec(d.get("execid"))
-        holder = self.exec(d.get("holder"))
         x.status = "refused"
         x.submitted = self.here().title
+        if d.get("holder") is None:
+            x.error = (
+                f"Not run: the session was closed to new work ({text(d.get('reason'))}). "
+                "Its source is in the turn that submitted it."
+            )
+            self.add(f"exec {x.id}: the session was closed to new work", href=link(x.anchor))
+            return
+        holder = self.exec(d.get("holder"))
         x.error = (
             f"Not run: exec {holder.id} held the interpreter. "
             "Its source is in the turn that submitted it."
@@ -642,9 +700,11 @@ class Builder:
         self.add("", parts=[Part("text", text(d.get("text")), True)])
 
     def on_interpreter_exited(self, d: dict) -> None:
-        self.health.append(
-            "The interpreter exited while the session ran; the timeline has its cause."
-        )
+        # One the session's shutdown stopped is expected; any other is the interpreter dying.
+        if d.get("expected") is not True:
+            self.health.append(
+                "The interpreter exited while the session ran; the timeline has its cause."
+            )
         self.add("", parts=[Part("cause", text(d.get("cause")), True)])
 
     def on_message_sent(self, d: dict) -> None:
@@ -684,14 +744,16 @@ class Builder:
             shown = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in gaps[:10])
             self.health.append(
                 f"{sum(b - a + 1 for a, b in gaps)} id(s) missing "
-                f"({shown}{', ...' if len(gaps) > 10 else ''}): those events were queued and "
-                "never written."
+                f"({shown}{', ...' if len(gaps) > 10 else ''}): those events were published and "
+                "never written -- the log fell behind or could not write them, and the shutdown "
+                "report counted them."
             )
         types = [text(r.get("type")) for r in records]
-        if types[-1] != PREFIX + "agent.stopped":
+        last = obj(records[-1].get("data"))
+        if types[-1] != PREFIX + "session.state" or last.get("state") != "reported":
             self.health.append(
-                "The record does not end with agent.stopped: the session is still running, or "
-                "it ended without shutting its agent down."
+                "The record does not end with the shutdown report: the session is still "
+                "running, or it ended without being shut down."
             )
         if (started := types.count(PREFIX + "agent.started")) > 1:
             self.health.append(f"The record holds {started} agent starts: logs were joined.")
@@ -1110,11 +1172,12 @@ nav a { margin-right: 1rem; }
 {% endfor %}
 </ul>
 {% else %}
-<p>No gaps in its ids, no skipped lines, and the agent shut down.</p>
+<p>No gaps in its ids, no skipped lines, and the session shut down.</p>
 {% endif %}
-<p>That is what this page can check. An event OutRig had no room to queue is counted rather than
-written, and spends no id, so it leaves no gap: <code>outrig run-new</code> reports any such loss
-in a warning as the session ends, and nothing in the record says so.</p>
+<p>That is what this page can check. Every event the session published has an id, so one the log
+did not get -- because it fell behind, or could not write it -- shows as a gap, unless it came
+after the last one the log wrote, which leaves none. <code>outrig run-new</code> counts every such
+loss in a warning as the session ends.</p>
 
 <h2 id="tokens">Tokens</h2>
 <p>What each round used, as its provider reported it. A round's total adds up every call it made,

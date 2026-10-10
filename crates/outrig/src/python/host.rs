@@ -79,12 +79,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::container::{Container, ExecOptions};
 use crate::error::OutrigError;
-use crate::events::{Event, Events, PRIMARY_SUBJECT};
+use crate::events::{Events, PRIMARY_SUBJECT};
+use crate::harness::event::{self, ExecStatus, Payload, Refusal};
+use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
 use super::payload::PAYLOAD_MOUNT;
 
@@ -151,6 +153,29 @@ pub(crate) struct ExecId(u64);
 impl fmt::Display for ExecId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl ExecId {
+    /// As an event names an execution.
+    pub(crate) fn public(self) -> event::ExecId {
+        event::ExecId::new(self.0)
+    }
+
+    /// As an event names a message, which is posted under a request's id.
+    pub(crate) fn message(self) -> event::MessageId {
+        event::MessageId::new(self.0)
+    }
+}
+
+impl Background {
+    /// As an event carries it.
+    pub(crate) fn public(&self) -> event::Background {
+        event::Background {
+            id: self.id.public(),
+            output: self.output.clone(),
+            dropped: self.dropped,
+        }
     }
 }
 
@@ -245,6 +270,18 @@ pub(crate) enum InterpreterError {
     /// A message the channel did not take. Nothing was queued.
     #[error("not delivered: {0}")]
     Refused(String),
+    /// The session was closed to new work. Nothing was sent.
+    #[error(transparent)]
+    Closed(#[from] Closed),
+}
+
+/// The background tasks still running in the agent's kernel, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct Tasks {
+    /// The first of them, sorted.
+    pub(crate) names: Vec<String>,
+    /// How many there are past those named.
+    pub(crate) more: usize,
 }
 
 /// A handle on a session's interpreter, addressing its primary agent. Cheap
@@ -295,6 +332,28 @@ struct Table {
     /// Where what crosses the protocol is recorded, for what is recorded
     /// under this lock.
     events: Events,
+    /// The session's close, once admission has closed.
+    closing: Option<Closing>,
+    /// What to tell once the interpreter has exited.
+    on_exit: Option<ExitHook>,
+    /// Set once the interpreter has exited and everything it left is settled.
+    gone: watch::Sender<bool>,
+    /// Set once the session has started stopping the interpreter, so its exit
+    /// is recorded as expected.
+    stopping: bool,
+}
+
+/// What an exit is told.
+type ExitHook = Arc<dyn Fn() + Send + Sync>;
+
+/// A session's admission, closed: why, and each execution that was running
+/// when it closed, with how it ended once it has.
+struct Closing {
+    by: ClosedBy,
+    /// Each execution running at the close, and how it ended once it has.
+    live: Vec<(ExecId, Option<ExecutionStatus>)>,
+    /// True once every live execution has ended.
+    drained: watch::Sender<bool>,
 }
 
 /// What a change to the agent's context is handed to.
@@ -324,6 +383,7 @@ enum Query {
     /// A posted message: how many then waited, or why it was refused.
     Post(oneshot::Sender<Result<usize, String>>),
     Pending(oneshot::Sender<Channels>),
+    Tasks(oneshot::Sender<Tasks>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -361,6 +421,11 @@ enum Reply {
     Pending {
         id: ExecId,
         channels: Channels,
+    },
+    Tasks {
+        id: ExecId,
+        #[serde(flatten)]
+        tasks: Tasks,
     },
     /// A message the agent sent, which nothing asked for.
     #[serde(rename = "send")]
@@ -525,19 +590,35 @@ impl Interpreter {
         let mut table = lock(&self.table);
         table.open()?;
         let id = table.next_id();
+        // Decided under the lock the slot is claimed under, so an execution is
+        // either running at the close or refused by it, never both.
+        if let Some(closing) = &table.closing {
+            let by = closing.by.clone();
+            table.events.emit(Payload::ExecRefused {
+                execid: id.public(),
+                holder: None,
+                reason: Refusal::Closed,
+            });
+            return Err(Closed::from(by).into());
+        }
         let queued = match &table.slot {
             Some(slot) => {
                 let holder = slot.id;
-                table.events.emit(Event::ExecRefused { execid: id, holder });
+                table.events.emit(Payload::ExecRefused {
+                    execid: id.public(),
+                    holder: Some(holder.public()),
+                    reason: Refusal::Held,
+                });
                 let _ = waiter.send(Outcome::Refused { holder });
                 false
             }
             None => {
                 // Recorded before it is sent, so nothing the execution does
                 // can be recorded ahead of it.
-                table
-                    .events
-                    .emit(Event::ExecSubmitted { execid: id, source });
+                table.events.emit_with(|| Payload::ExecSubmitted {
+                    execid: id.public(),
+                    source: source.to_string(),
+                });
                 // Queued under the lock, so the wire order is the order the
                 // slot was claimed in.
                 self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}))?;
@@ -605,12 +686,12 @@ impl Interpreter {
             json!({"t": "msg", "channel": channel, "body": body}),
             Query::Post,
             |table, id| {
-                table.events.emit(Event::MessageSent {
-                    message: id,
-                    channel,
-                    from: USER_END,
-                    to: PRIMARY_SUBJECT,
-                    body,
+                table.events.emit_with(|| Payload::MessageSent {
+                    message: id.message(),
+                    channel: channel.to_string(),
+                    from: USER_END.to_string(),
+                    to: PRIMARY_SUBJECT.to_string(),
+                    body: body.to_string(),
                 });
             },
         )?;
@@ -626,6 +707,55 @@ impl Interpreter {
     /// delivered. A message posted before this is asked is counted.
     pub(crate) async fn pending(&self) -> Result<Channels, InterpreterError> {
         self.query("pending", Query::Pending).await
+    }
+
+    /// The tasks still running on the agent's event loop, other than the
+    /// runtime's own. Answered on that loop, so it waits for as long as the
+    /// loop is not turning.
+    pub(crate) async fn tasks(&self) -> Result<Tasks, InterpreterError> {
+        self.query("tasks", Query::Tasks).await
+    }
+
+    /// The session's admission, without a way to send: what decides whether a
+    /// submission runs, and what was running when it closed.
+    pub(crate) fn gate(&self) -> Gate {
+        Gate {
+            table: Arc::clone(&self.table),
+        }
+    }
+
+    /// Call `exited` once the interpreter has exited, before anything waiting
+    /// on it hears. Replaces any earlier hook.
+    pub(crate) fn on_exit(&self, exited: impl Fn() + Send + Sync + 'static) {
+        lock(&self.table).on_exit = Some(Arc::new(exited));
+    }
+
+    /// Close the interpreter's stdin, which is its signal to exit, whatever
+    /// else still holds a handle on it. Nothing more can be sent.
+    pub(crate) fn hang_up(&self) {
+        let mut table = lock(&self.table);
+        table.stopping = true;
+        if table.ended.is_none() {
+            table.ended = Some("the host closed its input".into());
+        }
+        // The writer's sign to stop: every line it is given otherwise ends
+        // with a newline.
+        let _ = self.lines.send(String::new());
+    }
+
+    /// Wait until the interpreter has exited and everything it left was
+    /// settled.
+    pub(crate) fn gone(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut gone = lock(&self.table).gone.subscribe();
+        async move {
+            let _ = gone.wait_for(|gone| *gone).await;
+        }
+    }
+
+    /// The session is about to stop the interpreter: its exit, when it
+    /// comes, is the session's doing rather than a death.
+    pub(crate) fn expect_exit(&self) {
+        lock(&self.table).stopping = true;
     }
 
     /// Where the messages the agent sends to the user arrive, in the order
@@ -648,11 +778,11 @@ impl Interpreter {
     /// on `channel`, which makes room for the agent to send another.
     fn received(&self, channel: &str, message: ExecId) {
         let mut table = lock(&self.table);
-        table.events.emit(Event::MessageReceived {
-            message,
-            channel,
-            from: PRIMARY_SUBJECT,
-            to: USER_END,
+        table.events.emit(Payload::MessageReceived {
+            message: message.message(),
+            channel: channel.to_string(),
+            from: PRIMARY_SUBJECT.to_string(),
+            to: USER_END.to_string(),
         });
         if table.open().is_ok() {
             acknowledge(&mut table, &self.lines, channel);
@@ -702,7 +832,9 @@ impl Interpreter {
         self.stop(
             id,
             json!({"t": "cancel", "agent": PRIMARY, "id": id}),
-            Event::ExecCancelSent { execid: id },
+            Payload::ExecCancelSent {
+                execid: id.public(),
+            },
         );
     }
 
@@ -720,8 +852,8 @@ impl Interpreter {
         self.stop(
             id,
             json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}),
-            Event::ExecInterruptSent {
-                execid: id,
+            Payload::ExecInterruptSent {
+                execid: id.public(),
                 runaway,
             },
         );
@@ -730,7 +862,7 @@ impl Interpreter {
     /// Send `message` if `id` still holds the slot, recording `sent` if it
     /// was. One that no longer does has replied, and there is nothing left to
     /// stop.
-    fn stop(&self, id: ExecId, message: Value, sent: Event<'_>) {
+    fn stop(&self, id: ExecId, message: Value, sent: Payload) {
         let table = lock(&self.table);
         if table.open().is_ok() && table.slot.as_ref().is_some_and(|slot| slot.id == id) {
             table.events.emit(sent);
@@ -790,6 +922,53 @@ impl Interpreter {
     }
 }
 
+/// A session's admission, from [`Interpreter::gate`]. Holds no way to send,
+/// so keeping one does not keep the interpreter's input open.
+#[derive(Clone)]
+pub(crate) struct Gate {
+    table: Arc<Mutex<Table>>,
+}
+
+impl Gate {
+    /// Close admission, `by` what closed it: every submission from now on is
+    /// refused.
+    /// Returns at once; whether this was the close.
+    pub(crate) fn close(&self, by: ClosedBy) -> bool {
+        lock(&self.table).close(by)
+    }
+
+    /// Why admission closed, once it has.
+    pub(crate) fn closed(&self) -> Option<ClosedBy> {
+        lock(&self.table)
+            .closing
+            .as_ref()
+            .map(|closing| closing.by.clone())
+    }
+
+    /// Wait until every execution live at the close has ended -- at once, if
+    /// none was or admission is open.
+    pub(crate) fn drained(&self) -> impl Future<Output = ()> + Send + 'static {
+        let drained = lock(&self.table)
+            .closing
+            .as_ref()
+            .map(|closing| closing.drained.subscribe());
+        async move {
+            if let Some(mut drained) = drained {
+                let _ = drained.wait_for(|drained| *drained).await;
+            }
+        }
+    }
+
+    /// Each execution live at the close, and how it ended if it has.
+    pub(crate) fn live_at_close(&self) -> Vec<(ExecId, Option<ExecutionStatus>)> {
+        lock(&self.table)
+            .closing
+            .as_ref()
+            .map(|closing| closing.live.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// The messages the agent sends the user, from [`Interpreter::subscribe`].
 pub(crate) struct Sent {
     receiver: mpsc::UnboundedReceiver<(ExecId, String)>,
@@ -801,10 +980,7 @@ impl Sent {
     /// the interpreter has exited and every one has been received.
     /// Cancel-safe.
     ///
-    /// Waits for room in the event log first: holding the user's side back is
-    /// what holds the agent back, by the window its sends run ahead in.
     pub(crate) async fn recv(&mut self) -> Option<String> {
-        self.interpreter.events().ready().await;
         let (id, body) = self.receiver.recv().await?;
         self.interpreter.received(USER, id);
         Some(body)
@@ -913,22 +1089,52 @@ impl Table {
     fn record_ended(
         &self,
         slot: &Slot,
-        status: &'static str,
+        status: ExecStatus,
         report: &Report,
         error: Option<&str>,
         raised: Option<&str>,
     ) {
-        self.events.emit(Event::ExecCompleted {
-            execid: slot.id,
+        self.events.emit_with(|| Payload::ExecCompleted {
+            execid: slot.id.public(),
             status,
-            duration: slot.submitted.elapsed().as_secs_f64(),
-            output: &report.output,
+            duration: slot.submitted.elapsed(),
+            output: report.output.clone(),
             dropped: report.dropped,
-            error,
-            background: &report.background,
+            error: error.map(str::to_string),
+            background: report.background.iter().map(Background::public).collect(),
         });
         if raised == Some("MemoryError") {
-            self.events.emit(Event::MemoryExhausted { execid: slot.id });
+            self.events.emit(Payload::MemoryExhausted {
+                execid: slot.id.public(),
+            });
+        }
+    }
+
+    /// Close admission, `by` what closed it, recording the execution holding the slot
+    /// as live at the close. Whether this was the close: only the first one
+    /// is.
+    fn close(&mut self, by: ClosedBy) -> bool {
+        if self.closing.is_some() {
+            return false;
+        }
+        let live: Vec<_> = self.slot.iter().map(|slot| (slot.id, None)).collect();
+        let drained = watch::channel(live.is_empty()).0;
+        self.closing = Some(Closing { by, live, drained });
+        true
+    }
+
+    /// Record that `id` ended as `end`, if it was live at the close.
+    fn ended_live(&mut self, id: ExecId, end: ExecutionStatus) {
+        let Some(closing) = &mut self.closing else {
+            return;
+        };
+        for (live, ended) in &mut closing.live {
+            if *live == id && ended.is_none() {
+                *ended = Some(end);
+            }
+        }
+        if closing.live.iter().all(|(_, ended)| ended.is_some()) {
+            closing.drained.send_replace(true);
         }
     }
 
@@ -943,9 +1149,9 @@ impl Table {
             return;
         };
         let (status, error) = match &result.status {
-            Status::Ok => ("ok", None),
-            Status::Error { error } => ("error", Some(error.as_str())),
-            Status::Refused { .. } => ("refused", None),
+            Status::Ok => (ExecStatus::Ok, None),
+            Status::Error { error } => (ExecStatus::Error, Some(error.as_str())),
+            Status::Refused { .. } => (ExecStatus::Refused, None),
         };
         self.record_ended(
             &slot,
@@ -953,6 +1159,16 @@ impl Table {
             &result.report,
             error,
             result.raised.as_deref(),
+        );
+        self.ended_live(
+            slot.id,
+            match status {
+                ExecStatus::Ok => ExecutionStatus::Ok,
+                ExecStatus::Error => ExecutionStatus::Error,
+                // Refused by the interpreter, disagreeing about the slot: it
+                // never ran, as far as anyone can say.
+                _ => ExecutionStatus::Unknown,
+            },
         );
         let outcome = match result.status {
             Status::Ok => Outcome::Ok(result.report),
@@ -1035,6 +1251,10 @@ async fn write_requests<W: AsyncWrite + Unpin>(
     table: Arc<Mutex<Table>>,
 ) {
     while let Some(line) = queued.recv().await {
+        // [`Interpreter::hang_up`]'s sign: close its input now.
+        if line.is_empty() {
+            break;
+        }
         let written = async {
             requests.write_all(line.as_bytes()).await?;
             requests.flush().await
@@ -1092,17 +1312,40 @@ async fn read_replies<R, E>(
         table.outbox = None;
     }
     let cause: Arc<str> = ended.await.into();
-    let mut table = lock(&table);
-    table.ended = Some(Arc::clone(&cause));
-    // Recorded before anyone waiting hears of it, so whoever does finds it
-    // recorded.
-    let slot = table.slot.take();
-    if let Some(slot) = &slot {
-        table.record_ended(slot, "lost", &Report::default(), None, None);
+    // Recorded, and admission closed, before anyone waiting hears of it, so
+    // whoever does finds both done.
+    let (slot, exited) = {
+        let mut table = lock(&table);
+        table.ended = Some(Arc::clone(&cause));
+        // A session's death is a close: what was running is live at it, and
+        // nothing more is admitted.
+        table.close(ClosedBy::InterpreterExited {
+            cause: cause.to_string(),
+        });
+        let slot = table.slot.take();
+        if let Some(slot) = &slot {
+            table.record_ended(slot, ExecStatus::Lost, &Report::default(), None, None);
+        }
+        // Whatever was live at an earlier close and had not ended is over now,
+        // however it ended.
+        if let Some(closing) = &mut table.closing {
+            for (_, ended) in &mut closing.live {
+                ended.get_or_insert(ExecutionStatus::Unknown);
+            }
+            closing.drained.send_replace(true);
+        }
+        table.events.emit(Payload::InterpreterExited {
+            cause: cause.to_string(),
+            expected: table.stopping,
+        });
+        (slot, table.on_exit.clone())
+    };
+    // Outside the lock, as a context change is handed over: whoever it is may
+    // ask the interpreter something.
+    if let Some(exited) = exited {
+        exited();
     }
-    table
-        .events
-        .emit(Event::InterpreterExited { cause: &cause });
+    let mut table = lock(&table);
     if let Some(slot) = slot {
         // An exit is not a reply, so a caller no longer waiting gets no `Late`.
         let _ = slot
@@ -1111,6 +1354,7 @@ async fn read_replies<R, E>(
     }
     // Dropping the waiters fails each query with the cause just recorded.
     table.queries.clear();
+    table.gone.send_replace(true);
 }
 
 fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, line: &[u8]) {
@@ -1149,12 +1393,12 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
                         (None, None) => Err("the interpreter answered without saying".to_string()),
                     };
                     if let Err(reason) = &answer {
-                        table.events.emit(Event::MessageRefused {
-                            message: id,
-                            channel: USER,
-                            from: USER_END,
-                            to: PRIMARY_SUBJECT,
-                            reason,
+                        table.events.emit(Payload::MessageRefused {
+                            message: id.message(),
+                            channel: USER.to_string(),
+                            from: USER_END.to_string(),
+                            to: PRIMARY_SUBJECT.to_string(),
+                            reason: reason.clone(),
                         });
                     }
                     let _ = waiter.send(answer);
@@ -1168,15 +1412,21 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
             }
             _ => tracing::warn!("ignored pending counts {id}, which nothing asked for"),
         },
+        Reply::Tasks { id, tasks } => match lock(table).queries.remove(&id) {
+            Some(Query::Tasks(waiter)) => {
+                let _ = waiter.send(tasks);
+            }
+            _ => tracing::warn!("ignored task listing {id}, which nothing asked for"),
+        },
         Reply::Sent { channel, body } => {
             let mut table = lock(table);
             let id = table.next_id();
-            table.events.emit(Event::MessageSent {
-                message: id,
-                channel: &channel,
-                from: PRIMARY_SUBJECT,
-                to: USER_END,
-                body: &body,
+            table.events.emit_with(|| Payload::MessageSent {
+                message: id.message(),
+                channel: channel.clone(),
+                from: PRIMARY_SUBJECT.to_string(),
+                to: USER_END.to_string(),
+                body: body.clone(),
             });
             let held = channel == USER
                 && table
@@ -1184,12 +1434,12 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
                     .as_ref()
                     .is_some_and(|outbox| outbox.send((id, body)).is_ok());
             if !held {
-                table.events.emit(Event::MessageRefused {
-                    message: id,
-                    channel: &channel,
-                    from: PRIMARY_SUBJECT,
-                    to: USER_END,
-                    reason: "nothing on the host reads this channel",
+                table.events.emit(Payload::MessageRefused {
+                    message: id.message(),
+                    channel: channel.clone(),
+                    from: PRIMARY_SUBJECT.to_string(),
+                    to: USER_END.to_string(),
+                    reason: "nothing on the host reads this channel".to_string(),
                 });
                 tracing::warn!(
                     "dropped a message the agent sent on {channel:?}: nothing on the host reads it"
@@ -1204,11 +1454,11 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
         Reply::Promote { turns } => context_changed(table, ContextChange::Promote(turns)),
         Reply::Demote { turns } => context_changed(table, ContextChange::Demote(turns)),
         Reply::Took { channel, message } => {
-            lock(table).events.emit(Event::MessageReceived {
-                message,
-                channel: &channel,
-                from: USER_END,
-                to: PRIMARY_SUBJECT,
+            lock(table).events.emit(Payload::MessageReceived {
+                message: message.message(),
+                channel,
+                from: USER_END.to_string(),
+                to: PRIMARY_SUBJECT.to_string(),
             });
         }
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
@@ -1226,8 +1476,12 @@ fn context_changed(table: &Mutex<Table>, change: ContextChange) {
     let changed = {
         let table = lock(table);
         table.events.emit(match &change {
-            ContextChange::Promote(turns) => Event::ContextPromoted { turns },
-            ContextChange::Demote(turns) => Event::ContextDemoted { turns },
+            ContextChange::Promote(turns) => Payload::ContextPromoted {
+                turns: turns.clone(),
+            },
+            ContextChange::Demote(turns) => Payload::ContextDemoted {
+                turns: turns.clone(),
+            },
         });
         table.on_context.clone()
     };
@@ -1258,13 +1512,13 @@ async fn drain_stderr<R: AsyncRead + Unpin>(
         match text.strip_prefix(DIAGNOSTIC) {
             Some(diagnostic) => {
                 tracing::warn!("{text}");
-                events.emit(Event::InterpreterDiagnostic {
-                    text: diagnostic.trim_start(),
+                events.emit(Payload::InterpreterDiagnostic {
+                    text: diagnostic.trim_start().to_string(),
                 });
             }
             None => {
                 tracing::debug!("python: {text}");
-                events.emit(Event::OutputUnattributed { text: &text });
+                events.emit_with(|| Payload::OutputUnattributed { text: text.clone() });
             }
         }
         let mut tail = lock(&tail);

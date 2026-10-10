@@ -20,9 +20,9 @@ use super::AgentError;
 use super::budget::Budget;
 use super::failover::{Candidate, FailoverModel, ModelCandidate};
 use super::history::History;
+use super::ledger::{CallSlot, Ledger};
 use super::resolve::{LlmResolveError, ResolvedAgent, ResolvedCandidate, ResolvedProvider};
 use super::retry::{self, Retries, RetryPolicy, RetryingHttpClient, RetryingModel};
-use crate::events::Events;
 
 /// Default per-request HTTP timeout for remote providers when
 /// `request-timeout-secs` is unset. Generous enough not to truncate long
@@ -45,9 +45,9 @@ pub(crate) const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 32_768;
 pub(crate) type RigAgent = Agent<FailoverModel>;
 
 /// Build the agent for `resolved`, with `preamble` as its system prompt and
-/// `tools` as its whole tool list, recording to `history`'s events and taking
-/// a moved call's view from `history`. Every call carries `overhead` besides
-/// the conversation. Does no I/O.
+/// `tools` as its whole tool list, recording its calls and attempts in
+/// `ledger` and taking a moved call's view from `history`. Every call carries
+/// `overhead` besides the conversation. Does no I/O.
 ///
 /// Each candidate's [`Budget`] is settled and checked here, since its reserve
 /// is the ceiling building settles: one whose window leaves a round too little
@@ -58,6 +58,7 @@ pub(crate) fn build_agent(
     preamble: &str,
     tools: Vec<Box<dyn ToolDyn>>,
     history: &History,
+    ledger: &Ledger,
     overhead: u64,
 ) -> Result<RigAgent, AgentError> {
     // One policy for the whole chain, so its `chain_deadline` is the same
@@ -70,11 +71,11 @@ pub(crate) fn build_agent(
     // answer, and the head of a preference order is the defensible one -- it
     // is the endpoint the user said to use.
     let policy = retry_policy(resolved.head().provider.retry_budget_secs());
-    let events = history.events();
+    let slot = CallSlot::new(ledger.clone());
     let candidates = resolved
         .candidates
         .iter()
-        .map(|candidate| build_candidate(candidate, &policy, events, overhead))
+        .map(|candidate| build_candidate(candidate, &policy, &slot, overhead))
         .collect::<Result<Vec<_>, _>>()?;
     if let [head, rest @ ..] = &resolved.candidates[..]
         && !rest.is_empty()
@@ -90,12 +91,7 @@ pub(crate) fn build_agent(
         );
     }
 
-    let chain = FailoverModel::new(
-        candidates,
-        policy,
-        events.clone(),
-        Arc::new(history.clone()),
-    );
+    let chain = FailoverModel::new(candidates, policy, slot, Arc::new(history.clone()));
     // No `max_tokens` here: the chain sets each attempt's to its candidate's.
     let mut builder = AgentBuilder::new(chain).preamble(preamble);
     if let Some(temperature) = resolved.temperature {
@@ -113,17 +109,17 @@ pub(crate) fn build_agent(
 fn build_candidate(
     candidate: &ResolvedCandidate,
     policy: &RetryPolicy,
-    events: &Events,
+    slot: &CallSlot,
     overhead: u64,
 ) -> Result<Box<dyn Candidate>, AgentError> {
-    let retries = Retries::new(events.clone(), &candidate.model_name);
+    let retries = Retries::new(slot.clone(), &candidate.model_name);
     let http = remote_http_client(candidate.provider.request_timeout_secs(), policy, &retries)?;
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url, api_key, ..
         } => {
             let client = openai::CompletionsClient::builder()
-                .api_key(api_key.to_string())
+                .api_key(api_key.expose())
                 .base_url(base_url)
                 .http_client(http)
                 .build()
@@ -146,7 +142,7 @@ fn build_candidate(
             // native content blocks. It also normalizes a trailing `/v1` or
             // `/messages` off the configured base URL.
             let client = anthropic::Client::builder()
-                .api_key(api_key.to_string())
+                .api_key(api_key.expose())
                 .base_url(base_url)
                 .http_client(http)
                 .build()

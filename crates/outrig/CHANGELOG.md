@@ -9,23 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`PythonAgent`, an agent that acts by writing Python.** `PythonAgent::start` takes a launched
-  `Outrig`, resolves a model from the `Config` as `outrig run` does, and starts a Python
-  interpreter in the session's primary container. `PythonAgent::round` drives one round. The
-  model's only tool submits source to that interpreter, so names it binds persist from round to
-  round. Errors are boxed `std::error::Error`s. A round that fails after running Python keeps what
-  it ran in the conversation, because nothing is rolled back, and its error says to send another
-  message rather than repeat one. So does a round whose future is dropped, such as by a Ctrl-C,
+- **`harness`, an agent session that acts by writing Python.** A `SessionBuilder` takes
+  everything a session needs from outside before it starts: the `Config`, the agent and model, the
+  container as a `LaunchSpec`, a `Secrets` resolver for the keys its model calls need, event
+  subscriptions, whether to record `events.jsonl`, and a progress callback. `start` resolves the
+  model, as `outrig run` does, launches the container, starts a Python interpreter in it, and
+  returns the `Session`; `Session::start` does the same from a `Config` alone, with every
+  default. `Session::round` drives one round, and returns a `RoundOutcome`: whether a round ran,
+  the reply, why a limit stopped it, the reasoning of a turn that held only that, and the tasks its
+  code left running, by name. The model's only tool submits source to that interpreter, so names
+  it binds persist from round to round. Errors are a `SessionError` whose text is OutRig's own: no
+  type of rig's crosses the surface. A round that fails after running Python keeps what it ran in
+  the conversation, because nothing is rolled back, and its error says to send another message
+  rather than repeat one. So does a round whose future is dropped, such as by a Ctrl-C,
   at the moment it is dropped -- including the calls of an unfinished batch that had returned.
   Every other call in that batch is answered with a note that it had not returned or had not
   started, since a provider refuses a call without its result.
 
   The user reaches the agent through its `user` channel, not through the prompt.
-  `PythonAgent::user_channel` returns a `UserChannel`, whose `send` queues text for the agent and
+  `Session::user_channel` returns a `UserChannel`, whose `send` queues text for the agent and
   whose `receive` yields what the agent's code sends back -- including from a task still running
   after its round ended. `round` takes no prompt: it tells the model how many messages wait,
-  never what they say, and returns `None` without calling the model when nothing new has
-  arrived. A message arriving mid-round is announced at the head of the next tool result, and one
+  never what they say, and returns `RoundOutcome::NothingNew` without calling the model when
+  nothing new has arrived. A message arriving mid-round is announced at the head of the next tool result, and one
   a failed round announced is announced again. In the interpreter, `runtime.channels["user"]`
   offers `receive()`, which returns a `Delivery` with `.body`, `.sender`, and `.received_at`;
   `send(text)`; and `pending()`. A channel's contract is checked against the serializable subset
@@ -95,16 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the workspace, `pip install` adds pure-Python packages and nothing compiled loads, and
   `help(runtime)` describes the rest. The agent's configured `preamble` follows it.
 
-  `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
-  fail before pulling an image. `model`, `python_version`, and `container_name` report what a
-  started agent runs on. `on_submit` registers an observer that sees each submission's source as
-  the interpreter accepts it.
+  `SessionBuilder::check` runs `start`'s model resolution, keys included, without starting
+  anything, so a caller can fail before pulling an image. `model`, `python_version`,
+  `container_name`, and `id` report what a started session runs on.
 
-  `PythonAgent::interrupter` returns a function another task can call while a round runs -- what
+  `Session::interrupter` returns a function another task can call while a round runs -- what
   Ctrl-C does. The first call cancels the Python the round is waiting on, and interrupts it too if
   its event loop has stopped turning; the model reads how it ended and the round goes on, with the
   turn's later calls not run. A second call stops waiting for it. With no call waiting on Python
-  it returns `None` and does nothing. `PythonAgent::stop_held`, between rounds, stops Python left
+  it returns `None` and does nothing. `Session::stop_held`, between rounds, stops Python left
   holding the interpreter with nothing waiting on it -- after a second call, or a dropped round --
   with a cancel and an interrupt, and says so; how it ended reaches the model with the next call.
   Separately, code that keeps its event loop from turning while a CPU stays busy is taken for a
@@ -119,27 +124,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one agent's. Every program the Python starts inherits it, and since the hard limit is left as it
   was, one that needs more can raise its own.
 
-  **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
-  shape will change without a deprecation while the agent loop is built out.
+  **Stopping.** `Session::close_admission` -- or a `Closer`, which another task holds while a
+  round runs -- closes the session to new work at once: a later round is refused with
+  `SessionError::Closed`, and a round already running runs on, each submission it makes refused
+  with the reason as its result, which the model reads. The interpreter exiting closes it too.
+  `Session::shutdown(deadline)` lets what is running finish until the deadline
+  (`DEFAULT_DRAIN`, five seconds, is what `outrig run-new` passes), interrupts what is left, and
+  stops the container, then returns a `ShutdownReport`: what closed the session, whether
+  everything is proven stopped, how each execution running at the close ended -- `ok`, `error`,
+  or `unknown` -- and how its events were delivered, with a `verdict`. Nothing in it waits on a
+  subscriber.
+
+  **Events.** Each subscription, made on the builder, receives the session's events as values, in
+  order, numbered from 1 (`harness::event`); one that falls behind loses its oldest and is told how
+  many, and never slows the session. Their payloads are the event log's, field for field, and the
+  session's own state -- starting, idle, round running, executing, closing, reported -- is among
+  them. Every model call has a `CallId` and every request sent for it an `AttemptId`; each request
+  is recorded once as `model.attempt`, failed ones with a `null` usage, and a round's total is the
+  sum over its attempts. The history and event types are `#[non_exhaustive]`, so a later field or
+  kind is not a break.
+
+  **Keys.** `config::Secrets` resolves a session's `${VAR}` keys: `EnvSecrets` reads the process
+  environment, as before, and any `Fn(&str) -> Option<String>` is one, so sessions in one process
+  can each use their own key without touching the environment. `ApiKeyRef::resolve_with` resolves
+  through one, and `ApiKeyError::Unresolved` is a resolver that had no value.
+
+  The API may change on the `version/0.3.x` line until the 0.3.0 release fixes it.
 
 - **`[providers.<name>].role-alternation`, `"relaxed"` or `"strict"`**, on both provider styles,
   with `OpenAiOptions::with_role_alternation` and `AnthropicOptions::with_role_alternation`. A
   `"strict"` provider refuses a request in which one role follows itself, as a Bedrock-backed
   Claude behind an OpenAI-compatible gateway does, where OpenAI's API accepts it and Anthropic's
-  merges it. `PythonAgent` sends such a provider a conversation that alternates by construction:
+  merges it. A harness session sends such a provider a conversation that alternates by
+  construction:
   a turn promoted without the rest of its round is withheld where it would follow the model's
   own reply, and a round that ended on tool results is withheld whole once the next round opens.
   Each `model.call` event lists the turns `withheld`. Unset, nothing changes. (#472)
 - **`Model::context_window`, `[models.<name>].context-window` in config**: the model's whole
   context window in tokens, a request and its reply together, as its provider publishes it. It
-  configures nothing on the provider's side; `PythonAgent` holds each model call to it. An alias
+  configures nothing on the provider's side; a harness session holds each model call to it. An
+  alias
   row refuses it like `max-tokens`, and a `max-tokens` at or above it is refused when an agent is
   resolved. `outrig run` ignores it.
 
-- **An agent event log: `[events] mode = "record"`, `EventsConfig`, `EventsMode`, and
-  `PythonAgent::shutdown`.** With the mode on, `PythonAgent::start` writes what its agent does to
-  `events.jsonl` in the launched session's log directory, created readable by its owner only. A
-  log that already holds a recording fails the start instead, so no two events share an identity.
+- **An agent event log: `[events] mode = "record"`, `EventsConfig`, and `EventsMode`.** With the
+  mode on, `outrig run-new` has its session write what its agent does to `events.jsonl` in the
+  session's log directory (`SessionBuilder::record_events`), created readable by its owner only.
+  A log that already holds a recording fails the start instead, so no two events share an
+  identity.
   Each line is a CloudEvents 1.0 event whose `data` is OutRig's: each model call's manifest and
   the turns it carried, in rig's message JSON, so the file alone rebuilds what every call sent;
   each submission and how it ended; each message on the `user` channel, with its body; what each
@@ -147,13 +179,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry, and each move to another of an alias's models; and what the host did -- interrupts,
   cancels, failed liveness checks, executions it stopped waiting for, `MemoryError`s, and output
   no execution wrote. `doc/reference/events.md` is the schema, with the rule each event is
-  recorded under. `PythonAgent::shutdown` finishes the file, waiting at most two seconds, and
-  returns how many events it lost and why as its error; an agent dropped without it finishes the
-  file in the background. A writer that falls behind holds up the model loop and the Python
-  tool, and never the parts that cannot wait, which queue their events, up to 4,096, and count
-  what does not fit.
-  The mode merges like `[network].mode`, and `outrig run` ignores it. Event types and the writer
-  are private: the config key and `shutdown` are the whole new surface.
+  recorded under. The file is one subscriber of the session's events, and nothing in the session
+  waits for it: a writer that falls behind leaves events waiting in its subscription, up to
+  4,096, and loses the oldest past that, which shows as a jump in the file's ids. The session's
+  shutdown finishes the file, waiting at most two seconds, and its report says how many events
+  the file lost and why; a session dropped without it finishes the file in the background.
+  The mode merges like `[network].mode`, and `outrig run` ignores it.
 
 - **`LaunchSpec::with_session_id` names the session.** The primary is named `outrig-<id>` and
   labeled `org.outrig.session=<id>`, a sidecar `outrig-<id>-<name>` with the same label, the event
