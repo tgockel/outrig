@@ -17,9 +17,7 @@
 
 use std::future::Future;
 
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines, Stdin,
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin};
 
 use super::editor::EditorSource;
 use crate::error::Result;
@@ -60,14 +58,23 @@ pub(crate) trait LineSource {
 /// Line-at-a-time reads over an async stream: piped stdin, and every test.
 /// The terminal, if there is one, stays in canonical mode -- this is what the
 /// REPL did before rustyline.
+///
+/// Lines are decoded lossily: a byte sequence that is not UTF-8 becomes
+/// U+FFFD and the line is still sent, rather than failing the read and with it
+/// the session.
 pub(crate) struct StreamSource<RD> {
-    lines: Lines<RD>,
+    stdin: RD,
+    /// The line being read. A field rather than a local because `read_until`
+    /// is cancel safe only over a buffer that outlives the call: an interrupt
+    /// mid-line keeps the bytes already read, as `Lines::next_line` did.
+    pending: Vec<u8>,
 }
 
 impl<RD: AsyncBufRead + Unpin> StreamSource<RD> {
     pub(crate) fn new(stdin: RD) -> Self {
         Self {
-            lines: stdin.lines(),
+            stdin,
+            pending: Vec::new(),
         }
     }
 }
@@ -86,11 +93,24 @@ impl<RD: AsyncBufRead + Unpin> LineSource for StreamSource<RD> {
         out.write_all(prompt.as_bytes()).await?;
         out.flush().await?;
 
+        // Split on the raw byte: 0x0A never occurs inside a multi-byte UTF-8
+        // sequence, so no character straddles two lines.
         let event = tokio::select! {
-            line = self.lines.next_line() => match line? {
-                Some(line) => LineEvent::Line(line),
-                None => LineEvent::Eof,
-            },
+            read = self.stdin.read_until(b'\n', &mut self.pending) => {
+                read?;
+                // Empty, not `read == 0`: a cancelled read may have left the
+                // start of an unterminated last line behind.
+                if self.pending.is_empty() {
+                    LineEvent::Eof
+                } else {
+                    // The terminator stays on: the loop trims line endings
+                    // for every source.
+                    let line = std::mem::take(&mut self.pending);
+                    LineEvent::Line(String::from_utf8(line).unwrap_or_else(|e| {
+                        String::from_utf8_lossy(e.as_bytes()).into_owned()
+                    }))
+                }
+            }
             _ = interrupt => LineEvent::Interrupted,
         };
 
@@ -139,5 +159,41 @@ pub(crate) fn auto() -> AutoSource {
     match EditorSource::try_new() {
         Some(editor) => AutoSource::Editor(editor),
         None => AutoSource::Stream(StreamSource::new(BufReader::new(tokio::io::stdin()))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::duplex;
+
+    use super::*;
+
+    /// An interrupt mid-line must not lose what was already read: the reader
+    /// has consumed those bytes from the stream, so a buffer that died with the
+    /// cancelled call would hand the next read only the line's tail.
+    #[tokio::test]
+    async fn an_interrupt_mid_line_keeps_the_bytes_already_read() {
+        let (mut stdin_w, stdin_r) = duplex(64);
+        let mut source = StreamSource::new(BufReader::new(stdin_r));
+        let mut out = Vec::new();
+
+        stdin_w.write_all(b"hel").await.unwrap();
+        // Pending on its first poll, so the read is polled -- and takes `hel`
+        // -- before the interrupt fires.
+        let event = source
+            .read_line("> ", &mut out, tokio::task::yield_now())
+            .await
+            .expect("read");
+        assert!(matches!(event, LineEvent::Interrupted));
+
+        stdin_w.write_all(b"lo\n").await.unwrap();
+        let event = source
+            .read_line("> ", &mut out, std::future::pending::<()>())
+            .await
+            .expect("read");
+        match event {
+            LineEvent::Line(line) => assert_eq!(line, "hello\n"),
+            _ => panic!("expected a line"),
+        }
     }
 }

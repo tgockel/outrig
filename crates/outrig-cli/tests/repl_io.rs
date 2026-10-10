@@ -193,6 +193,51 @@ async fn empty_line_is_ignored() {
     assert_eq!(stdout_buf, b"got:hello\n");
 }
 
+/// A line that is not valid UTF-8 is sent with U+FFFD in place of each bad
+/// sequence, and the lines after it still run (#344). It used to fail the read
+/// and end the session -- in `outrig run < prompts.txt`, at the first Latin-1
+/// byte. The last line is unterminated as well as invalid.
+#[tokio::test]
+async fn a_line_that_is_not_utf8_is_decoded_lossily() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w
+        .write_all(b"caf\xe9 au lait\nnext\n\xff")
+        .await
+        .unwrap();
+    drop(stdin_w);
+    let (stdout_w, mut stdout_r) = duplex(BUF);
+    let (stderr_w, _stderr_r) = duplex(BUF);
+
+    let on_prompt = |s: String| async move { OutrigResult::Ok(format!("got:{s}")) };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        &[],
+        on_prompt,
+        no_commands(),
+    );
+
+    let read_out = async {
+        let mut buf = Vec::new();
+        stdout_r.read_to_end(&mut buf).await.unwrap();
+        buf
+    };
+
+    let (run_res, stdout_buf) = timeout(TEST_TIMEOUT, async { tokio::join!(run, read_out) })
+        .await
+        .expect("test must not hang");
+    run_res.expect("an invalid line must not end the session");
+
+    assert_eq!(
+        String::from_utf8(stdout_buf).expect("stdout utf-8"),
+        "got:caf\u{FFFD} au lait\ngot:next\ngot:\u{FFFD}\n",
+    );
+}
+
 #[tokio::test]
 async fn empty_prompt_reply_produces_no_stdout() {
     let (mut stdin_w, stdin_r) = duplex(BUF);

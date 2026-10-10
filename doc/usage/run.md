@@ -417,6 +417,10 @@ than the one you are typing at (`outrig run < /dev/pts/7`), or `TERM` is `dumb`,
 `emacs`, the prompt falls back to reading one line at a time with no editing and no recall, which
 is what keeps scripted use (`echo "..." | outrig run`) working unchanged.
 
+Input is read as UTF-8. A line with bytes that are not UTF-8 -- a Latin-1 `é` in a prompts file,
+an `Alt` key that sets the eighth bit -- is still sent, with U+FFFD (`�`) in place of each bad
+sequence, and a paste that contains one is still a single prompt.
+
 `RUST_LOG=debug` and `OUTRIG_LOG=debug` do not record what you type. The editor's own debug
 output names every keystroke, so it stays at `warn` unless the filter mentions `rustyline`.
 

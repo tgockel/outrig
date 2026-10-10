@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A line of input that is not valid UTF-8 no longer ends `outrig run`.** One byte that was
+  not UTF-8 failed the read with `error: stream did not contain valid UTF-8`, exit 1, and the
+  containers were torn down, so `outrig run < prompts.txt` with a single Latin-1 byte never ran
+  the prompts after it. The line is now sent with U+FFFD in place of each bad sequence, and the
+  session goes on. See
+  [Line editing and history](../../doc/usage/run.md#line-editing-and-history). (#344)
+
 - **`outrig config init` asks again for an answer the config would refuse.** An API key variable
   that was not a variable name -- `openai_api_key`, `${OPENAI_API_KEY}` as the prompt's help
   suggested, or the key itself pasted in -- a `max-tokens` or `context-length` that was not a
