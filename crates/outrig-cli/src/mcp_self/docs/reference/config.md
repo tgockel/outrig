@@ -16,7 +16,8 @@ outrig reads two TOML files:
 Both files use the same schema. Names declared in either are visible everywhere; if a name
 appears in both files, the **repo entry wins**. Outrig keys are **kebab-case**; only inner-map
 keys whose values map to environment variables (Dockerfile build-args, MCP `env` blocks) keep
-their as-written form. Unknown keys are an error -- outrig validates with `deny_unknown_fields`.
+their as-written form. A key outrig does not know is ignored with a warning rather than refused;
+see [What a load sets aside](#what-a-load-sets-aside).
 
 ## Top level
 
@@ -399,11 +400,11 @@ style = "mistralrs"
 |---------|--------|----------|---------|-------------------------------------|
 | `style` | string | yes      | --      | Must be `"mistralrs"` for this row. |
 
-`base-url`, `api-key`, and any other key are rejected on `style = "mistralrs"`: the table
-above is the whole of it, and an unknown key here is an error exactly as it is anywhere else
-in this schema. The model-specific fields (`model-id`, `model-path`, `model-file`, `revision`,
-`context-length`, `device`) live on `[models.<name>]` -- see the
-[mistralrs models](#mistralrs-models) subsection.
+`base-url`, `api-key`, and any other key are unknown on `style = "mistralrs"`: the table above
+is the whole of it, and a key outside it is [set aside with a warning](#what-a-load-sets-aside)
+exactly as it is anywhere else in this schema. The model-specific fields (`model-id`,
+`model-path`, `model-file`, `revision`, `context-length`, `device`) live on `[models.<name>]` --
+see the [mistralrs models](#mistralrs-models) subsection.
 
 #### Always parses, even without `--features local-llm`
 
@@ -521,9 +522,9 @@ to rebuild.
 
 Two spelling notes. `alias = "opus-5"` and `alias = ["opus-5"]` are the same config; a
 round-trip through OutRig rewrites the first as the second, the same way `model-file`
-behaves. And because `[models.<name>]` rejects unknown fields, a config using `alias` is
-rejected outright by an OutRig older than this feature rather than degrading -- worth
-knowing before putting one in a shared repo config.
+behaves. And an OutRig older than this feature refused every key it did not know, so it
+rejects a config using `alias` outright rather than degrading -- worth knowing before putting
+one in a shared repo config.
 
 ### Remote-provider models
 
@@ -554,9 +555,9 @@ identifier = "gpt-4o"
 decide -- which is fine for OpenAI-compatible endpoints, and is what the next section is
 about for Anthropic.
 
-Note the spelling. In config it is `max-tokens`, like every other key; `max_tokens` is
-rejected as an unknown field. The underscored form is what the provider API calls it, so it
-is what appears in a raw error coming back from one.
+Note the spelling. In config it is `max-tokens`, like every other key; `max_tokens` is an
+unknown key, ignored with a warning. The underscored form is what the provider API calls it, so
+it is what appears in a raw error coming back from one.
 
 #### anthropic models
 
@@ -1012,9 +1013,10 @@ image, or declare any other MCP command that should run inside the container.
   whose tools run builds or test suites; `initialize` and `tools/list` are not affected -- they
   have a fixed 120-second bound each.
 
-Any other key in a full-form entry is an error, as it is in every other table. That matters
-more here than elsewhere: an entry whose `command` is misspelled has none, so beside `sidecar`
-or `image` it would otherwise be an entrypoint-stdio server.
+Any other key in a full-form entry is [set aside with a warning](#what-a-load-sets-aside), as
+it is in every other table. Read that warning before the session goes on: an entry whose
+`command` is misspelled has none, so beside `sidecar` or `image` it runs as an entrypoint-stdio
+server. In an `org.outrig.mcp` label or an `image.toml` `[mcp]` table the key is still an error.
 
 Notes:
 
@@ -1383,6 +1385,39 @@ build-args = { NODE_VERSION = "20" }
   tests = { command = ["test-mcp"], call-timeout-secs = 1800 }
 ```
 
+## What a load sets aside
+
+Every outrig on a machine reads the same global config, so a file written for a newer outrig
+should not stop an older one. A load sets aside what it cannot use, prints a warning on stderr
+for each thing it set aside, and goes on:
+
+```text
+[outrig] warning: /home/you/.outrig/config.toml:5: unknown key `events`, ignored
+```
+
+- **An unknown key** is ignored, in the global config, the repo config, or a `--config` file:
+  a typo, or a key a newer outrig reads. An unknown table is one warning, not one per key in it.
+- **A value outrig cannot read, in the global config**, is dropped with the smallest entry that
+  holds it: a wrong type, an unknown variant such as a newer provider `style`, or a missing
+  required key. That is the key itself, or one table of a `[[...]]` array; a bad element of any
+  other array drops the whole key, so no argv runs short an argument. When what is left of a
+  table cannot stand alone -- a provider without its `style` -- the table goes too, with a
+  warning of its own. In a repo config or a `--config` file the same value is an error.
+
+Validation then runs on what is left, so an entry something else needed is still an error --
+printed after the warning that explains it. A misspelled `provider` is warned about, and then
+its model is refused for having no provider. Some things are never set aside:
+
+- anything in `[network]`, `[images.<name>.security]`, or `[sidecars.<sc>.security]`, where
+  leaving a key out could give a container more access than the file asks for;
+- a TOML syntax error, which leaves nothing to read;
+- a table header with an unquoted `.` in a name, such as `[models.opus-4.7]`, which is refused
+  with a hint to quote it: `[models."opus-4.7"]`.
+
+`outrig mcp self`'s `validate_config` tool returns the same warnings beside its errors. An
+`org.outrig.mcp` image label and an `image.toml`, which no config load reads, still refuse an
+unknown key.
+
 ## Validation rules
 
 `outrig run` and `outrig mcp` use the full validation path. `outrig build` validates every
@@ -1518,7 +1553,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.
 - Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.
-- Unknown keys at any level are rejected.
+- An unknown key, at any level, is ignored with a warning rather than rejected, except in
+  `[network]` and the `security` tables; see [What a load sets aside](#what-a-load-sets-aside).
 
 ## See also
 

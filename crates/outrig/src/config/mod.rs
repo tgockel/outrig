@@ -3,6 +3,7 @@
 mod api_key;
 mod env_ref;
 mod env_value;
+mod lenient;
 mod merge;
 mod validate;
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef};
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
+pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
 pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
@@ -31,41 +33,6 @@ pub(crate) use validate::{
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
-
-/// True when the parse error is an "unknown field" complaint and its span
-/// lands on a `[<dotted.path>]` header whose path has an unquoted `.`. That's
-/// the shape that makes TOML treat a name like `opus-4.7` as nested keys
-/// (`opus-4` table with field `7`) and is the cue to suggest quoting.
-/// Restricting to unknown-field errors avoids hinting on legitimate dotted
-/// headers like `[providers.openai]` whose values fail validation.
-fn error_lands_on_unquoted_dotted_header(err: &toml::de::Error, input: &str) -> bool {
-    if !err.message().contains("unknown field") {
-        return false;
-    }
-    let Some(span) = err.span() else {
-        return false;
-    };
-    let line_start = input[..span.start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = input[span.start..]
-        .find('\n')
-        .map_or(input.len(), |i| span.start + i);
-    let line = input[line_start..line_end].trim();
-    let Some(rest) = line.strip_prefix('[') else {
-        return false;
-    };
-    let Some(end) = rest.find(']') else {
-        return false;
-    };
-    let mut in_quote = false;
-    for c in rest[..end].chars() {
-        match c {
-            '"' => in_quote = !in_quote,
-            '.' if !in_quote => return true,
-            _ => {}
-        }
-    }
-    false
-}
 
 pub const DEFAULT_TOOL_CALL_MAX: u32 = 50;
 pub const TOOL_CALL_MAX_LIMIT: u32 = 2000;
@@ -363,17 +330,28 @@ pub struct Config {
     pub images: BTreeMap<String, ImageConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sidecars: BTreeMap<String, SidecarConfig>,
+
+    /// What the load set aside instead of failing on. See
+    /// [`warnings`](Self::warnings).
+    #[serde(skip)]
+    warnings: Vec<ConfigWarning>,
 }
 
 impl Config {
+    /// Parse `s` as a config file. A key no table has is dropped and recorded
+    /// in [`warnings`](Self::warnings); any other problem fails the parse.
+    /// `toml::from_str::<Config>` stays strict and fails on the key as well.
     pub fn load_from_str(s: &str) -> Result<Self> {
-        match toml::from_str(s) {
-            Ok(cfg) => Ok(cfg),
-            Err(e) if error_lands_on_unquoted_dotted_header(&e, s) => {
-                Err(OutrigError::ConfigDottedKey { source: e })
-            }
-            Err(e) => Err(e.into()),
-        }
+        lenient::parse(s, None, false)
+    }
+
+    /// What the load that produced this config set aside instead of failing
+    /// on, in file order: each key no table has, and, from the global config
+    /// alone, each value that did not deserialize. `[network]` and the
+    /// `security` tables set nothing aside. [`merge`] keeps both sides',
+    /// global first. Empty for a config built in code.
+    pub fn warnings(&self) -> &[ConfigWarning] {
+        &self.warnings
     }
 
     /// Read repo + (optional) global config files, merge with repo precedence,
@@ -381,7 +359,7 @@ impl Config {
     /// file is read from `<repo_root>/.agents/outrig/config.toml`; a missing
     /// one loads as empty.
     pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate(Some(repo_root))?;
         Ok(merged)
     }
@@ -394,7 +372,7 @@ impl Config {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
         Ok(merged)
     }
@@ -403,7 +381,7 @@ impl Config {
     /// sections, so this preserves image and general validation while skipping
     /// agent/model/provider cross-reference checks.
     pub fn load_for_build(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate_for_build(Some(repo_root))?;
         Ok(merged)
     }
@@ -424,7 +402,7 @@ impl Config {
         repo_root: &Path,
         global_path: Option<&Path>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate(Some(repo_root))?;
         Ok(merged)
     }
@@ -438,7 +416,7 @@ impl Config {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
         Ok(merged)
     }
@@ -450,7 +428,7 @@ impl Config {
         repo_root: &Path,
         global_path: Option<&Path>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate_for_build(Some(repo_root))?;
         Ok(merged)
     }
@@ -459,7 +437,7 @@ impl Config {
     /// `outrig run`/`outrig mcp` may run in a directory with no
     /// `.agents/outrig/config.toml`, falling back to the global config (and
     /// built-in defaults). Mirrors the global-file handling in
-    /// [`load_unvalidated`](Self::load_unvalidated).
+    /// [`load_global`](Self::load_global).
     fn read_repo(repo_root: &Path) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
         let repo_text = match fs::read_to_string(&repo_path) {
@@ -488,8 +466,14 @@ impl Config {
         Ok(repo_cfg)
     }
 
+    /// Parse the file `src` names, setting aside what [`load_from_str`]
+    /// does -- and, for the global config, a value that does not deserialize
+    /// -- with each warning naming the file, then stamp it.
+    ///
+    /// [`load_from_str`]: Self::load_from_str
     fn parse_stamped(text: &str, src: &ConfigSource) -> Result<Self> {
-        let mut cfg = Self::load_from_str(text)?;
+        let global = matches!(src, ConfigSource::Global { .. });
+        let mut cfg = lenient::parse(text, Some(&src.config_path()), global)?;
         cfg.stamp_source(src);
         Ok(cfg)
     }
@@ -503,6 +487,13 @@ impl Config {
     /// its `default-model` may name a model the repo declares. This is the read
     /// for a caller that wants a machine-level key and has no repo -- `outrig
     /// ls` finding the session root from any directory.
+    ///
+    /// Read leniently, because every outrig on the machine reads this one
+    /// file: a key no table has, and a value that does not deserialize, are
+    /// dropped and recorded in [`warnings`](Self::warnings) rather than
+    /// failing the load -- except in `[network]` and the `security` tables,
+    /// where leaving a key out would give a container more than the file
+    /// allows. A TOML syntax error still fails it.
     pub fn load_global(path: &Path) -> Result<Self> {
         let (path, text) = read_resolved(path)?;
         match text {
@@ -517,8 +508,30 @@ impl Config {
         }
     }
 
+    /// [`load`](Self::load) up to the validation: both files read, each held
+    /// to its own rules, and merged, but the merged config not validated.
+    ///
+    /// For a caller that reports [`warnings`](Self::warnings) before
+    /// validating. A key set aside can be why a rule then fails -- a misspelled
+    /// `provider` leaves its model with none -- and the warning naming it is
+    /// what makes that error make sense. Follow it with
+    /// [`validate`](Self::validate), [`validate_for_run`](Self::validate_for_run),
+    /// or [`validate_for_build`](Self::validate_for_build), as the matching
+    /// `load` would.
+    pub fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        Self::merge_over_global(Self::read_repo(repo_root)?, global_path)
+    }
+
+    /// [`load_unvalidated`](Self::load_unvalidated), with the repo config read
+    /// from `repo_cfg` as [`load_file`](Self::load_file) reads it. No repo
+    /// root: nothing is resolved against one until the validation that
+    /// follows.
+    pub fn load_file_unvalidated(repo_cfg: &Path, global_path: Option<&Path>) -> Result<Self> {
+        Self::merge_over_global(Self::read_repo_file(repo_cfg)?, global_path)
+    }
+
     /// Merge `repo_cfg` over the global config at `global_path`, unvalidated.
-    fn load_unvalidated(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
+    fn merge_over_global(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
         let global_cfg = match global_path {
             Some(g) => Self::load_global(g)?,
             None => Self::default(),
@@ -814,9 +827,10 @@ impl Config {
         Ok(())
     }
 
-    /// `--model` stands in for the model of the agent the run selects, and
-    /// only that one.
-    fn validate_for_run(
+    /// [`validate`](Self::validate) as [`load_for_run`](Self::load_for_run)
+    /// applies it: `--model` stands in for the model of the agent the run
+    /// selects, and only that one.
+    pub fn validate_for_run(
         &self,
         repo_root: Option<&Path>,
         agent_flag: Option<&str>,
@@ -834,7 +848,10 @@ impl Config {
         Ok(())
     }
 
-    fn validate_for_build(&self, repo_root: Option<&Path>) -> Result<()> {
+    /// [`validate`](Self::validate) as [`load_for_build`](Self::load_for_build)
+    /// applies it: the image and general rules, without the
+    /// agent/model/provider cross-references a build does not use.
+    pub fn validate_for_build(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate_with_options(
             self,
             repo_root,
@@ -961,9 +978,10 @@ pub enum LlmProvider {
     /// Braced and empty rather than a unit variant, and deliberately without
     /// `#[non_exhaustive]`. `deny_unknown_fields` has no field set to check a
     /// unit variant against, so `style = "mistralrs"` used to accept and
-    /// discard any key at all -- the one place this schema's "unknown keys are
-    /// an error" rule did not hold. An empty field set is one serde *can*
-    /// check. `#[non_exhaustive]` would stop the variant being constructed
+    /// discard any key at all, without a word -- the one place every table's
+    /// refusal of an unknown key did not hold, and so the one place a config
+    /// load could not name the key it set aside. An empty field set is one
+    /// serde *can* check. `#[non_exhaustive]` would stop the variant being constructed
     /// outside this crate, which no other spelling of this fix requires.
     Mistralrs {},
 }

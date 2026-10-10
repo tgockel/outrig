@@ -109,8 +109,9 @@ impl Kind {
             }
             Self::ValidateConfig => {
                 "Parse and validate a config.toml fragment containing \
-                 [images.<name>] entries, returning parse and validation errors. \
-                 Run it on any config you write before telling the user it is ready."
+                 [images.<name>] entries, returning parse and validation errors, \
+                 and a warning for each key outrig would ignore. Run it on any \
+                 config you write before telling the user it is ready."
             }
             Self::ValidateImageToml => {
                 "Parse and validate the complete contents of a standalone \
@@ -325,11 +326,30 @@ mod tests {
     #[tokio::test]
     async fn validate_config_reports_a_bad_fragment() {
         let out = tool(Kind::ValidateConfig)
-            .call(json!({ "toml": "[images.x]\nbogus-key = 1\n" }).to_string())
+            .call(json!({ "toml": "[images.x]\ndockerfile = 5\n" }).to_string())
             .await
             .expect("validation runs");
         let parsed: Value = serde_json::from_str(&out).expect("json");
         assert_eq!(parsed["valid"], json!(false), "{out}");
+    }
+
+    /// An unknown key is what `outrig run` warns about and ignores: a warning
+    /// naming it, on a fragment that is otherwise valid.
+    #[tokio::test]
+    async fn validate_config_warns_about_an_unknown_key() {
+        let toml = "[images.x]\nimage-name = \"debian\"\nbogus-key = 1\n";
+        let out = tool(Kind::ValidateConfig)
+            .call(json!({ "toml": toml }).to_string())
+            .await
+            .expect("validation runs");
+        let parsed: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(parsed["valid"], json!(true), "{out}");
+        assert_eq!(
+            parsed["warnings"][0]["code"],
+            json!("unknown_config_key"),
+            "{out}"
+        );
+        assert_eq!(parsed["warnings"][0]["line"], json!(3), "{out}");
     }
 
     #[tokio::test]

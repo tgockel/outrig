@@ -1,11 +1,11 @@
-//! Integration tests for the config schema: round-trip parsing, unknown-key
-//! rejection, and MCP shape parity.
+//! Integration tests for the config schema: round-trip parsing, unknown keys
+//! set aside with a warning, and MCP shape parity.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use outrig::config::{
-    CapabilityProfile, Config, EnvValue, LlmProvider, McpServerSpec, MountAccess,
+    CapabilityProfile, Config, ConfigWarningKind, EnvValue, LlmProvider, McpServerSpec, MountAccess,
 };
 use outrig::error::OutrigError;
 
@@ -22,21 +22,174 @@ mod config_schema {
         assert_eq!(parsed, again);
     }
 
+    /// The `(key, line)` of each warning, in order, for a compact assertion.
+    fn warned(cfg: &Config) -> Vec<(&str, usize)> {
+        cfg.warnings().iter().map(|w| (w.key(), w.line())).collect()
+    }
+
+    /// An unknown key is dropped with a warning naming it, and the rest of the
+    /// file loads. The type itself still refuses it: only the loader is lenient.
     #[test]
-    fn unknown_top_level_key_rejected() {
+    fn unknown_top_level_key_is_a_warning() {
         let bad = r#"
 default-agent = "coding"
 oops          = "this key is not in the schema"
 "#;
-        let err = Config::load_from_str(bad).unwrap_err();
-        let OutrigError::Config(toml_err) = err else {
-            panic!("expected OutrigError::Config, got: {err:?}");
-        };
-        let msg = toml_err.to_string();
-        assert!(
-            msg.contains("oops"),
-            "error message should point at the offending key, got: {msg}",
+        let cfg = Config::load_from_str(bad).expect("an unknown key does not fail the load");
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+        assert_eq!(warned(&cfg), [("oops", 3)]);
+        let warning = &cfg.warnings()[0];
+        assert_eq!(*warning.kind(), ConfigWarningKind::UnknownKey);
+        assert_eq!(warning.file(), None);
+        assert_eq!(warning.to_string(), "line 3: unknown key `oops`, ignored");
+
+        let err = toml::from_str::<Config>(bad).expect_err("the type is still strict");
+        assert!(err.to_string().contains("oops"), "got: {err}");
+    }
+
+    /// The keys a 0.3 config carries, each in a different kind of table: a
+    /// whole table at the root, a key on a derived table, and a key on the
+    /// internally tagged `LlmProvider`, whose error lands on the provider's
+    /// header rather than the key. A table is one warning, not one per key in
+    /// it, and the warnings come in file order.
+    #[test]
+    fn a_newer_outrigs_keys_are_warnings() {
+        let cfg = Config::load_from_str(
+            r#"
+[events]
+mode = "record"
+
+[providers.p]
+style            = "openai"
+base-url         = "https://example.com/v1"
+api-key          = "${KEY}"
+role-alternation = "strict"
+
+[models."opus-4.8"]
+provider       = "p"
+identifier     = "opus"
+context-window = 32000
+"#,
+        )
+        .expect("a newer outrig's config loads");
+        assert_eq!(
+            warned(&cfg),
+            [
+                ("events", 2),
+                ("providers.p.role-alternation", 9),
+                ("models.\"opus-4.8\".context-window", 14),
+            ],
         );
+        let LlmProvider::OpenAi { base_url, .. } = &cfg.providers["p"] else {
+            panic!("expected the OpenAi variant, got {:?}", cfg.providers["p"]);
+        };
+        assert_eq!(base_url, "https://example.com/v1");
+        assert_eq!(cfg.models["opus-4.8"].identifier.as_deref(), Some("opus"));
+    }
+
+    /// Two unknown keys in one provider: the second error lands on the same
+    /// header as the first, and is answered by name all the same.
+    #[test]
+    fn every_unknown_key_in_a_provider_is_warned() {
+        let cfg = Config::load_from_str(
+            r#"
+[providers.p]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${KEY}"
+alpha    = 1
+beta     = 2
+"#,
+        )
+        .expect("loads");
+        assert_eq!(
+            warned(&cfg),
+            [("providers.p.alpha", 6), ("providers.p.beta", 7)]
+        );
+    }
+
+    /// An element of an array of tables is named by its index, and only its
+    /// own unknown key goes: the mount keeps its default access.
+    #[test]
+    fn an_unknown_key_in_an_array_of_tables_is_indexed() {
+        let cfg = Config::load_from_str(
+            r#"
+[[workspace.mounts]]
+host-path      = "/a"
+container-path = "/a"
+
+[[workspace.mounts]]
+host-path      = "/b"
+container-path = "/b"
+acess          = "read-write"
+"#,
+        )
+        .expect("loads");
+        assert_eq!(warned(&cfg), [("workspace.mounts[1].acess", 9)]);
+        assert_eq!(cfg.workspace.mounts.len(), 2);
+        assert_eq!(cfg.workspace.mounts[1].access(), MountAccess::ReadOnly);
+    }
+
+    /// A section this build does not know, opened by a dotted header, is an
+    /// unknown key like any other -- not a misquoted name, which needs a name
+    /// before the dot.
+    #[test]
+    fn an_unknown_section_under_a_dotted_header_is_a_warning() {
+        let cfg = Config::load_from_str(
+            r#"
+[events.sinks]
+file = "events.jsonl"
+"#,
+        )
+        .expect("loads");
+        assert_eq!(warned(&cfg), [("events", 2)]);
+    }
+
+    /// `[network]` and the `security` tables set nothing aside: what they leave
+    /// out a container gets, so an unknown key there still fails the load.
+    #[test]
+    fn strict_tables_keep_failing_on_an_unknown_key() {
+        for (key, toml) in [
+            (
+                "mod",
+                r#"
+[network]
+mod = "filter"
+"#,
+            ),
+            (
+                "cap-dorp",
+                r#"
+[images.c]
+dockerfile = "D"
+context    = "ctx"
+
+[images.c.security]
+cap-dorp = ["ALL"]
+"#,
+            ),
+            (
+                "cap-dorp",
+                r#"
+[sidecars.s]
+image = "mcp-tools"
+
+[sidecars.s.security]
+cap-dorp = ["ALL"]
+"#,
+            ),
+        ] {
+            let err = Config::load_from_str(toml).expect_err("a strict table refuses the key");
+            let OutrigError::Config(toml_err) = &err else {
+                panic!("expected OutrigError::Config, got: {err:?}");
+            };
+            assert!(
+                toml_err
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`")),
+                "got: {toml_err}",
+            );
+        }
     }
 
     #[test]
@@ -500,11 +653,12 @@ default = "ask"
         );
     }
 
-    /// One typo per table shape. Each used to parse: the `enviroment` entry
-    /// started with no env, and a `comand` beside `sidecar` or `image` turned
-    /// an exec-stdio entry into entrypoint-stdio.
+    /// One typo per table shape. Each used to parse without a word: the
+    /// `enviroment` entry started with no env, and a `comand` beside `sidecar`
+    /// or `image` turned an exec-stdio entry into entrypoint-stdio. The type
+    /// refuses each by name, and a config file's load reports each by name.
     #[test]
-    fn mcp_table_unknown_fields_are_rejected_by_name() {
+    fn mcp_table_unknown_fields_are_named() {
         let cases = [
             (
                 "enviroment",
@@ -534,14 +688,21 @@ context    = "ctx"
 {entry}
 "#
             );
-            let err = Config::load_from_str(&bad).unwrap_err();
-            let OutrigError::Config(toml_err) = err else {
-                panic!("expected OutrigError::Config for {entry}, got: {err:?}");
-            };
-            let msg = toml_err.to_string();
+            let err = toml::from_str::<Config>(&bad).unwrap_err();
+            let msg = err.to_string();
             assert!(
                 msg.contains(&format!("unknown field `{key}`")),
                 "error should name `{key}` in {entry}, got: {msg}",
+            );
+
+            let cfg = Config::load_from_str(&bad).expect("a config file's load sets it aside");
+            let server = entry.split_whitespace().next().expect("server name");
+            assert_eq!(
+                cfg.warnings()
+                    .iter()
+                    .map(|w| w.key().to_owned())
+                    .collect::<Vec<_>>(),
+                [format!("images.c.mcp.{server}.{key}")],
             );
         }
     }

@@ -284,6 +284,15 @@ mod tests {
         }
     }
 
+    /// The load sets aside a key it does not know rather than failing on it,
+    /// so a stale key here would no longer stop the parse above. Nothing in the
+    /// built-in config may be set aside.
+    #[test]
+    fn the_built_in_config_has_no_key_a_load_sets_aside() {
+        let cfg = Config::load_from_str(DEFAULT_TOML).expect("parses");
+        assert_eq!(cfg.warnings(), []);
+    }
+
     /// `outrig`'s `tests/mcp_placement_parity.rs` proves the public API can
     /// build *this* config, which is what makes "entrypoint-stdio in a named
     /// sidecar is reachable" a claim about something outrig ships rather than

@@ -98,7 +98,8 @@ impl SelfServer {
             tool::<ValidateConfigArgs>(
                 VALIDATE_CONFIG,
                 "Validate Config",
-                "Parse and validate a TOML fragment containing [images.<name>] entries.",
+                "Parse and validate a TOML fragment containing [images.<name>] entries; \
+                 a key outrig would ignore comes back as a warning.",
             ),
             tool::<ValidateConfigArgs>(
                 VALIDATE_IMAGE_TOML,

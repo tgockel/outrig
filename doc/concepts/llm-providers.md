@@ -466,8 +466,10 @@ on stderr. No tool-call line means no tool calling.
 
 ## API keys are env-var-only
 
-`api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses to load any
-other value -- a literal key, a missing `${...}` wrapper, anything. This guarantees:
+`api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses any other
+value -- a literal key, a missing `${...}` wrapper, anything. A repo config holding one fails to
+load; in the global config the provider holding one is left out, with a warning that names the
+provider but not the value. Either way the value is never sent. This guarantees:
 
 - No config file holds key material, so none of them can leak it.
 - Keys never end up in `outrig logs` output, in tracing diagnostics, or in session metadata on

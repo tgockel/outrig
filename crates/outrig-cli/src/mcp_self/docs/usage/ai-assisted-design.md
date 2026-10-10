@@ -84,7 +84,7 @@ The server exposes these tools:
 | `list_base_images`            | Base-image suggestions, explicitly non-exhaustive.         |
 | `list_mcp_server_suggestions` | MCP server suggestions and shell guidance.                 |
 | `validate_dockerfile`         | Advisory warnings about OutRig Dockerfile conventions.     |
-| `validate_config`             | TOML parse and config validation results for image blocks. |
+| `validate_config`             | Errors and unknown-key warnings for config image blocks.   |
 | `validate_image_toml`         | TOML validation for standalone image projects.             |
 
 The suggestion tools are not a registry. The AI can pick any base image, package set, or MCP

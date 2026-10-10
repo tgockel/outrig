@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Config::warnings` reports what a config load set aside rather than failing on.** Each
+  `ConfigWarning` names the file (`None` from `load_from_str`), the 1-based line, the key as a
+  dotted TOML path such as `models."opus-4.8".context-window` or `workspace.mounts[1].acess`, and
+  a `ConfigWarningKind`: `UnknownKey`, or `InvalidValue { reason }` for a value the global config
+  could not read. `Display` is one line, ``<file>:<line>: unknown key `events`, ignored``, and
+  `merge` keeps both sides' warnings, global first. `Config::load_unvalidated` and
+  `load_file_unvalidated` stop where `load` and `load_file` would validate, and
+  `validate_for_run` and `validate_for_build` are now public, so a caller can show the warnings
+  before a validation error they explain: a misspelled `provider` is set aside, and its model is
+  then refused for having none. (#507)
+
 - **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
   It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
   (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
@@ -44,6 +55,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the background. Nothing is reported, and the name is free to `attach` again. It is for code
   that cannot await, such as a destructor unwinding an attach that was never committed. `detach`
   is still the form that confirms the undo. (#345)
+
+### Changed
+
+- **A key a config file does not know is set aside with a warning instead of failing the load.**
+  `load_from_str` and every `Config::load*` drop the key, record it in `Config::warnings`, and
+  read the rest, so a config written for a newer outrig loads -- the 0.3 line's `[events]`, a
+  model's `context-window`, a provider's `role-alternation`. The global config, which every
+  outrig on a machine reads, also sets aside a value that does not deserialize -- a wrong type,
+  an unknown `style`, a missing required key -- with the smallest entry holding it; a repo or
+  `--config` file still fails on one. Nothing in `[network]` or a `security` table is ever set
+  aside, since leaving a key out there can give a container more than the file allows, and a
+  TOML syntax error and an unquoted dotted name such as `[models.opus-4.7]` still fail. A dropped
+  value's warning never quotes an `api-key`. Only the loader changed: every config type is still
+  `deny_unknown_fields`, so the JSON schema, an `org.outrig.mcp` label, a standalone
+  `image.toml`, and a bare `toml::from_str::<Config>` still refuse the key. The quoting hint
+  `ConfigDottedKey` carries now needs the unknown key to follow an unquoted `.` in a header, so
+  an unknown key in a `[providers.<name>]` table, whose error lands on the whole header, and a
+  `[section.sub]` header for a section this build does not know no longer draw it. (#507)
 
 ### Fixed
 
@@ -108,8 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatches on type -- an array is `Short`, a table `Full` -- so a stray key fails with
   ``unknown field `comand`, expected one of ...`` at that key's span. A bare untagged
   `deny_unknown_fields` would only have said no variant matched. This holds wherever a spec is
-  parsed: either config file, an `org.outrig.mcp` label (`EmbeddedImageConfigError::Json`), and
-  a standalone `image.toml`'s `[mcp]`. The derived JSON schema's table branch now carries
+  deserialized, an `org.outrig.mcp` label (`EmbeddedImageConfigError::Json`) and a standalone
+  `image.toml`'s `[mcp]` included; a config file's load sets the key aside with a warning naming
+  it instead (#507). The derived JSON schema's table branch now carries
   `additionalProperties: false`. Serialization is unchanged. (#340)
 
 - **A `tools/list` whose pages never end fails at once instead of paging until its deadline.**
