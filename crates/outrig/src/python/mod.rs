@@ -9,8 +9,8 @@
 //! spinning.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly: the
-//! agent loop in `crate::agent` drives it, and `PythonAgent` is how the binary
-//! reaches that.
+//! agent loop in `crate::agent` drives it, and `crate::harness` is how the
+//! binary, and any other owner, reaches that.
 
 pub(crate) mod host;
 pub(crate) mod install;

@@ -81,6 +81,8 @@ OUTPUT_MAX = 16 * 1024  # bytes of one execution's own output
 BG_MAX = 2 * 1024  # bytes of other executions' output held for the next result, tail kept
 REPR_MAX = 1000  # one echoed value, or one inventory entry
 INVENTORY_MAX = 200  # global names listed in one inventory
+TASKS_MAX = 50  # running tasks named in one listing
+TASK_NAME_MAX = 200  # characters of one task's name
 HELP_MAX = 8 * 1024  # characters of one `help()` answer
 DRAIN_TIMEOUT = 5.0  # seconds a result waits for its pipe to reach the end of the body's output
 
@@ -3528,6 +3530,26 @@ class Kernel:
             }
         )
 
+    def tasks(self, request_id):
+        """Name the tasks still running on this loop, other than the executions' own wrappers:
+        what an agent's code left running, which a round ending does not stop. Always answered.
+
+        Excluded by their code rather than their name, which agent code can give a task of its
+        own. Read on the loop, the only thread `asyncio.all_tasks` may be asked on.
+        """
+        names, more = [], 0
+        try:
+            running = sorted(
+                str.__str__(task.get_name())
+                for task in asyncio.all_tasks(self.loop)
+                if not task.done() and getattr(task.get_coro(), "cr_code", None) is not _WRAPPER
+            )
+            more = max(len(running) - TASKS_MAX, 0)
+            names = [name[:TASK_NAME_MAX] for name in running[:TASKS_MAX]]
+        except Exception as e:
+            _diag(f"agent {self.agent!r}: listing its tasks failed: {e!r}")
+        _send({"t": "tasks", "agent": self.agent, "id": request_id, "names": names, "more": more})
+
 
 # ---------------------------------------------------------------------------- interrupts
 
@@ -3735,6 +3757,11 @@ def _inventory(kernel, request_id, message):
     )
 
 
+def _tasks(kernel, request_id, _message):
+    """Name the tasks running on the agent's loop, on that loop."""
+    kernel.loop.call_soon_threadsafe(kernel.tasks, request_id)
+
+
 def _observe(kernel, _request_id, _message):
     """Say from now on when the agent's code takes a message from one of its channels.
 
@@ -3794,8 +3821,8 @@ def _rpc_notice(agent, binding, number, reason):
         _diag(f"connection {number} to {binding!r} closed, but saying so failed: no memory")
 
 
-# What each message addressed to an agent does, with the id it carries. `inv` is answered on the
-# agent's loop; the rest are handled here, on the reader thread.
+# What each message addressed to an agent does, with the id it carries. `inv` and `tasks` are
+# answered on the agent's loop; the rest are handled here, on the reader thread.
 _ROUTES = {
     "exec": _exec,
     "msg": _msg,
@@ -3804,6 +3831,7 @@ _ROUTES = {
     "turn": _turn,
     "observe": _observe,
     "inv": _inventory,
+    "tasks": _tasks,
     "rpc": _rpc,
     "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
     "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),

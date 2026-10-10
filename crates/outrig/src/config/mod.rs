@@ -15,7 +15,7 @@ use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub use api_key::{ApiKeyError, ApiKeyRef};
+pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use merge::merge;
 pub use validate::{
@@ -1789,6 +1789,11 @@ impl NetworkConfig {
 
 /// Whether `outrig run-new` records what its agent did, in
 /// `<session_dir>/logs/events.jsonl`.
+///
+/// The mode governs the file, not the session's events: a program running a
+/// session through [`crate::harness`] receives them through its own
+/// subscriptions whatever this says, and records them only if it asks
+/// ([`SessionBuilder::record_events`](crate::harness::SessionBuilder::record_events)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]

@@ -6,6 +6,7 @@ use serde_json::json;
 use super::{Adjacent, History, Prompt, Role, Store, TooLarge, Why, Window, split_turns};
 use crate::agent::budget::{Budget, candidate};
 use crate::agent::tool;
+use crate::harness::event::CallId;
 use crate::python::host::ContextChange;
 use crate::python::testing::{Fake, round_trip};
 
@@ -319,7 +320,7 @@ fn a_turn_is_mirrored_as_its_prompt_text_and_calls() {
 /// The replies and openings a call is sent, in order, its prompt last.
 fn sent(history: &History) -> Vec<String> {
     let (sent, _) = history
-        .assemble(&Budget::with_room("m", ROOMY))
+        .assemble(&Budget::with_room("m", ROOMY), CallId::new(1))
         .expect("room for everything");
     sent.iter().map(text).collect()
 }
@@ -751,7 +752,7 @@ async fn a_manifest_rebuilds_the_call_it_describes() {
     for round in 1..=3 {
         history.begin_round(Message::user(format!("r{round}")));
         let (sent, manifest) = history
-            .assemble(&Budget::with_room("m", ROOMY))
+            .assemble(&Budget::with_room("m", ROOMY), CallId::new(1))
             .expect("room");
         assert_eq!(sent.last(), Some(&Message::user(format!("r{round}"))));
         assert_eq!(history.reconstruct(&manifest), sent, "a round's first call");
@@ -760,7 +761,7 @@ async fn a_manifest_rebuilds_the_call_it_describes() {
             false,
         );
         let (sent, manifest) = history
-            .assemble(&Budget::with_room("m", ROOMY))
+            .assemble(&Budget::with_room("m", ROOMY), CallId::new(1))
             .expect("room");
         assert_eq!(sent.last(), Some(&Message::tool_result("a", "one")));
         assert_eq!(history.reconstruct(&manifest), sent, "a later call");

@@ -288,6 +288,14 @@ stay bound from one message to the next. The interpreter is a static build OutRi
 read-only, so the image needs no Python of its own. Each submission's source is printed on stderr
 as it starts running.
 
+**A reply is not the work being done.** A round ends when the model yields, and Python it started
+can still be running. So a round closes on a line after the model's reply that names what its code
+left running -- `(still running: ci_run)`, by each task's name, as `asyncio.create_task(...,
+name="ci_run")` gave it -- and says why a limit stopped it, when one did: `(round ended: ...)`. A
+round that yielded with nothing left running closes on no such line. A turn that held only the
+model's reasoning, which usually means it was cut off at its output ceiling, is reported as that,
+with the reasoning, rather than as silence.
+
 **What the agent's Python can import.** The standard library, and modules in the workspace, which
 come after the standard library on `sys.path`. `pip install`, run from the agent's code, adds
 pure-Python packages: `pip` there is the interpreter's own, not the image's, and it installs into
@@ -401,8 +409,24 @@ its record is written once the interpreter is up, under the name of the containe
 
 The only slash commands are `/help` and `/quit`, and a blank line is ignored. A failed round is
 reported and the session carries on; the messages it had not read are still waiting, so a line
-typed next is announced with them. If the interpreter exits -- Python that calls `os._exit`, say
--- nothing typed could reach the agent any more, and the session ends with exit status 1.
+typed next is announced with them.
+
+**Leaving.** `/quit`, the end of input, and a second Ctrl-C at the prompt each close the session
+to new work, then stop it: Python still running is given five seconds to finish, is interrupted,
+and the container is stopped, which ends whatever an interrupt could not. A round running at
+`/quit` is dropped; one still running when input ends is let finish first. `run-new` then prints
+what the stop found -- whether everything stopped, and how each execution that was running ended,
+`ok`, `error`, or `unknown` for one cut off -- and exits with the status it decides:
+
+| Status | What the stop found                                                                |
+|--------|------------------------------------------------------------------------------------|
+| 0      | Everything stopped, and every outcome is known.                                    |
+| 2      | Everything stopped, and some Python was cut off: what it did may or may not stand. |
+| 3      | Something could not be confirmed stopped, and may still be running.                |
+
+If the interpreter exits -- Python that calls `os._exit`, say -- nothing typed could reach the
+agent any more, and the session ends, through the same report, with exit status 1, or 3 if the
+stop could not be confirmed.
 
 Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
 cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping
@@ -431,9 +455,10 @@ itself, and one that needs more can raise its own with `ulimit -d unlimited`. Py
 
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each
-message on the channel, and the tokens each round used (see [Event log](events.md)). At exit the
-file is finished before the container stops, and a warning says how many events it could not
-take, if any.
+message on the channel, the tokens each request used, and the session's own state, ending with
+what its stop found (see [Event log](events.md)). The agent never waits for the file. At exit the
+file is finished as the session reports, and a warning says how many events it could not take,
+if any.
 
 `run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
 `--max-tool-result-bytes`, nor a flag for `[events]`. The config keys behind the last two,

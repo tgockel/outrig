@@ -29,7 +29,19 @@ pub(super) const SIGNATURE: &str = "signed-by-the-mock";
 #[derive(Debug)]
 pub(super) struct RecordedRequest {
     pub(super) path: String,
+    /// Each header as sent, its name lowercased.
+    pub(super) headers: Vec<(String, String)>,
     pub(super) body: Value,
+}
+
+impl RecordedRequest {
+    /// The value of the header `name`, matched without regard to case.
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 /// One canned response.
@@ -502,11 +514,14 @@ async fn read_request(sock: &mut TcpStream) -> Option<RecordedRequest> {
     let path = request_line.next()?.to_string();
 
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+            if name == "content-length" {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value.to_string()));
         }
     }
 
@@ -519,5 +534,9 @@ async fn read_request(sock: &mut TcpStream) -> Option<RecordedRequest> {
     }
     let body = serde_json::from_slice(&total[header_end..]).unwrap_or(Value::Null);
 
-    Some(RecordedRequest { path, body })
+    Some(RecordedRequest {
+        path,
+        headers,
+        body,
+    })
 }

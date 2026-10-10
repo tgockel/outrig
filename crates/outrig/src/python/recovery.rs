@@ -65,7 +65,7 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, sleep_until, timeout};
 
 use super::host::{ExecId, Execution, Interpreter, InterpreterError, Inventory, Outcome};
-use crate::events::{Event, Held};
+use crate::harness::event::{Abandoned, Held, Payload, ProbeVerdict};
 
 /// The share of a CPU the loop's thread must have used across a probe that
 /// went unanswered for the loop to count as spinning.
@@ -158,13 +158,14 @@ pub(crate) enum Verdict {
 }
 
 impl Verdict {
-    /// As the event log names it.
-    fn name(self) -> &'static str {
+    /// As the event log records a check that found the loop not turning, or
+    /// `None` for one that found it turning.
+    fn failed(self) -> Option<ProbeVerdict> {
         match self {
-            Verdict::Turning => "turning",
-            Verdict::Blocked => "blocked",
-            Verdict::Spinning => "spinning",
-            Verdict::Starved => "starved",
+            Verdict::Turning => None,
+            Verdict::Blocked => Some(ProbeVerdict::Blocked),
+            Verdict::Spinning => Some(ProbeVerdict::Spinning),
+            Verdict::Starved => Some(ProbeVerdict::Starved),
         }
     }
 }
@@ -417,11 +418,11 @@ fn give_up(
     why: GaveUp,
 ) -> Outcome {
     waited.gave_up = Some(why);
-    interpreter.events().emit(Event::ExecAbandoned {
-        execid: execution.id(),
+    interpreter.events().emit(Payload::ExecAbandoned {
+        execid: execution.id().public(),
         why: match why {
-            GaveUp::User => "user",
-            GaveUp::Runaway => "runaway",
+            GaveUp::User => Abandoned::User,
+            GaveUp::Runaway => Abandoned::Runaway,
         },
     });
     execution.stop_waiting()
@@ -429,10 +430,10 @@ fn give_up(
 
 /// Record a check of `id`'s loop that found it not turning.
 fn probe_failed(interpreter: &Interpreter, id: ExecId, verdict: Verdict) {
-    if verdict != Verdict::Turning {
-        interpreter.events().emit(Event::ExecProbeFailed {
-            execid: id,
-            verdict: verdict.name(),
+    if let Some(verdict) = verdict.failed() {
+        interpreter.events().emit(Payload::ExecProbeFailed {
+            execid: id.public(),
+            verdict,
         });
     }
 }
@@ -501,20 +502,21 @@ async fn check<'a>(
 
 /// Record what a probe found the agent's namespace holding while `id` ran.
 fn observed(interpreter: &Interpreter, id: ExecId, inventory: &Inventory) {
-    let events = interpreter.events();
-    if !events.is_on() {
-        return;
-    }
-    events.emit(Event::InventoryObserved {
-        execid: id,
-        names: inventory
-            .globals
-            .iter()
-            .map(|(name, kind)| Held { name, kind })
-            .collect(),
-        total: inventory.total,
-        more: inventory.more,
-    });
+    interpreter
+        .events()
+        .emit_with(|| Payload::InventoryObserved {
+            execid: id.public(),
+            names: inventory
+                .globals
+                .iter()
+                .map(|(name, kind)| Held {
+                    name: name.clone(),
+                    type_name: kind.clone(),
+                })
+                .collect(),
+            total: inventory.total as u64,
+            more: inventory.more as u64,
+        });
 }
 
 #[cfg(test)]

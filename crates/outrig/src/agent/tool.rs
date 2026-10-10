@@ -26,8 +26,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::channel::Announcer;
-use crate::events::Event;
-use crate::python::host::{ExecId, Interpreter, Late, Outcome, Report, Unknown};
+use crate::harness::ClosedBy;
+use crate::harness::event::{Payload, SessionState};
+use crate::harness::lifecycle::Lifecycle;
+use crate::python::host::{ExecId, Interpreter, InterpreterError, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Timings, Verdict, Waited};
 
 /// What the model calls the tool.
@@ -51,12 +53,6 @@ fn parse_args(args: &str) -> Result<Args, ToolError> {
     let args = if args.trim().is_empty() { "{}" } else { args };
     serde_json::from_str(args).map_err(ToolError::JsonError)
 }
-
-/// Where an observer of `T` is put for whoever tells it to find: by default,
-/// the tool telling of each submission's source as it goes to run. The tool is
-/// handed to rig when the agent is built, before any observer exists, so the
-/// two share this rather than the observer being passed in.
-pub(crate) type ObserverSlot<T = str> = Arc<Mutex<Option<Box<dyn Fn(&T) + Send + Sync>>>>;
 
 /// Where the user's interrupt goes: the execution a call is waiting on, and
 /// the turn that call belongs to. Shared by the tool, the round's hook, and
@@ -88,7 +84,7 @@ impl Interrupts {
 
     /// Stop the execution left holding `interpreter`'s slot with nothing
     /// waiting for it, and say so as a sentence for the user; `None` if there
-    /// is none. What [`PythonAgent::stop_held`](crate::PythonAgent::stop_held)
+    /// is none. What [`Session::stop_held`](crate::harness::Session::stop_held)
     /// does, phrased beside what a press says.
     pub(crate) fn stop_held(&self, interpreter: &Interpreter) -> Option<String> {
         let holder = recovery::stop_abandoned(interpreter)?;
@@ -118,8 +114,9 @@ pub(crate) struct SubmitPython {
     /// room to report. `take_late` hands each out once, so they are held here
     /// and lead the next result rather than being lost.
     unreported: Mutex<Vec<Late>>,
-    on_submit: ObserverSlot,
     interrupts: Interrupts,
+    /// The session's state, which a submission moves to executing and back.
+    lifecycle: Arc<Lifecycle>,
     /// What the model has been told of what waits on the agent's channels.
     announcer: Announcer,
 }
@@ -129,20 +126,16 @@ impl SubmitPython {
         interpreter: Interpreter,
         result_max_bytes: usize,
         announcer: Announcer,
+        lifecycle: Arc<Lifecycle>,
     ) -> Self {
         Self {
             interpreter,
             result_max_bytes,
             unreported: Mutex::new(Vec::new()),
-            on_submit: ObserverSlot::default(),
             interrupts: Interrupts::default(),
+            lifecycle,
             announcer,
         }
-    }
-
-    /// The slot this tool reads its observer from.
-    pub(crate) fn observer_slot(&self) -> ObserverSlot {
-        Arc::clone(&self.on_submit)
     }
 
     /// Where presses reach this tool's calls.
@@ -214,29 +207,24 @@ impl ToolDyn for SubmitPython {
         Box::pin(async move {
             let Args { source } = parse_args(&args)?;
             let events = self.interpreter.events();
-            // Where a writer that has fallen behind holds the agent up: before
-            // anything runs, rather than once it has.
-            events.ready().await;
-            // Nothing was sent, so this one is a failure of the tool rather than
-            // an outcome of the code.
-            let execution = self
-                .interpreter
-                .submit(&source)
-                .map_err(|e| ToolError::ToolCallError(e.into()))?;
+            let execution = match self.interpreter.submit(&source) {
+                Ok(execution) => execution,
+                // Refused at the close: the model reads why, and that nothing
+                // more will run, and can say so in its reply.
+                Err(InterpreterError::Closed(closed)) => return Ok(refused(closed.by())),
+                // Nothing was sent, so this one is a failure of the tool rather
+                // than an outcome of the code.
+                Err(e) => return Err(ToolError::ToolCallError(e.into())),
+            };
             let id = execution.id();
             tracing::debug!(execution = %id, "submitted");
-            // Only source that went to run: a refusal is the model's to read,
-            // not something to show as running. Interrupts reach it from
-            // before it is shown, since that is what a person interrupts.
+            // Only source that went to run is executing: a refusal is the
+            // model's to read. Interrupts reach it from the start, since that
+            // is what a person interrupts.
             let queued = execution.queued();
             let waiting = queued.then(|| self.interrupts.presses.waiting_on(id));
-            if queued
-                && let Some(observer) = &*self
-                    .on_submit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-            {
-                observer(&source);
+            if queued {
+                self.lifecycle.set(SessionState::Executing);
             }
             let settled = recovery::settle(
                 &self.interpreter,
@@ -245,6 +233,9 @@ impl ToolDyn for SubmitPython {
                 &Timings::default(),
             )
             .await;
+            if queued {
+                self.lifecycle.set(SessionState::RoundRunning);
+            }
             // From what was done rather than from the press, which may have
             // lost the race to the outcome and done nothing.
             if settled.waited.user_stopped {
@@ -279,11 +270,11 @@ impl ToolDyn for SubmitPython {
             );
             *unreported = rest;
             if let Some(Cut { size, max, kept }) = cut {
-                events.emit(Event::ToolResultTruncated {
-                    execid: id,
-                    size,
-                    max,
-                    kept,
+                events.emit(Payload::ToolResultTruncated {
+                    execid: id.public(),
+                    size: size as u64,
+                    max: max as u64,
+                    kept: kept as u64,
                 });
             }
             Ok(if announcement.is_empty() {
@@ -293,6 +284,15 @@ impl ToolDyn for SubmitPython {
             })
         })
     }
+}
+
+/// What a submission refused at the session's close reads as: nothing from it
+/// ran, nothing more will, and why.
+fn refused(by: &ClosedBy) -> String {
+    format!(
+        "[outrig] not run: this session is closing -- {by} -- so no code runs from here on. \
+         Nothing from this call ran. Finish your reply without submitting more."
+    )
 }
 
 /// An outcome a call holds between its code reporting and its result being

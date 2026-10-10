@@ -262,11 +262,11 @@ already committed. The first two still hold for the CLI's file. The third does n
 designs a public session API (`embedding.md`), and an embedder driving a session from Rust needs
 its events as values, not as a file to read back.
 
-So **event subscription becomes public through the session API**, and is fixed with the rest of it
-at the 0.3.0 release. The event types stay crate-private until `0003-19` makes subscription public;
-`0003-13` built the file writer and the event types without publishing either, and no
-in-memory stream: its `emit` numbers each event and queues it to the file's sink. `0003-19` adds
-the stream in front of that sink and makes subscription public. For the file, the revisit
+So **event subscription is public through the session API** (`outrig::harness::event`), and is
+fixed with the rest of it at the 0.3.0 release. `0003-13` built the file writer and the event
+types without publishing either, and no in-memory stream: its `emit` numbered each event and
+queued it to the file's sink. `0003-19` put the stream in front of that sink, made the file one
+subscriber of it, and made subscription public. For the file, the revisit
 `harness-components.md` asked for -- whether the library loop needs a session record of its own --
 still concludes no, because `NetworkInterceptor::new(log_dir, ..)` already shows the shape. **The
 caller supplies a directory; the library owns the writer and the schema.** Session directories and
@@ -428,14 +428,13 @@ for it, which `history.md` records.
 - Whether every event carries a causal parent -- which model turn produced which execution -- or
   whether ordering alone is enough. Hosted requests carry one, because a callback names the call it
   ran under (`0003-22`); for the rest, ordering is enough to read and not enough to query.
-- How far a subscriber may fall behind before it loses events, and whether an embedder may choose
-  that per subscriber.
+- ~~How far a subscriber may fall behind before it loses events.~~ Settled by `0003-19`: 4,096
+  events by default, chosen per subscription when it is made.
 
 ## Unverified
 
-- The stream's promise that a stalled subscriber never delays a round is `0003-19`'s acceptance
-  and has not run. Its numbering has: `0003-13` assigns an event's id under one lock as it queues
-  the event, so the id is the event's place in the file.
+- ~~The stream's promise that a stalled subscriber never delays a round.~~ Run by `0003-19`'s
+  tests, a round and a shutdown each against a subscription that never reads.
 - The cost of emitting inter-agent messages was not measured. It is the one addition co-hosting
   forces, and a chatty pair of agents is the case to measure before assuming it is free.
 - The CloudEvents attribute names, their required/optional split, and the lower-case-alphanumeric

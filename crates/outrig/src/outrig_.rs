@@ -677,7 +677,7 @@ impl LaunchSpec {
 
 /// The id the session's containers carry: the spec's, checked, or one minted
 /// in the shape `outrig run` uses.
-fn resolve_session_id(spec: &LaunchSpec) -> Result<String> {
+pub(crate) fn resolve_session_id(spec: &LaunchSpec) -> Result<String> {
     match &spec.session_id {
         Some(id) => {
             check_session_id(id)?;
@@ -1280,12 +1280,6 @@ impl Outrig {
         &self.container
     }
 
-    /// The directory the session's logs go to -- `network.jsonl`, each
-    /// server's stderr, and the agent loop's `events.jsonl`.
-    pub(crate) fn log_dir(&self) -> &Path {
-        &self.log_dir
-    }
-
     /// Dispatch an MCP `tools/call` to the named server. `server` must
     /// match a key in the effective MCP map; `tool` is the
     /// un-namespaced tool name as it appeared in [`Outrig::tools`].
@@ -1304,6 +1298,22 @@ impl Outrig {
     /// server or sidecar can't strand the rest; the primary `stop` error, if
     /// any, propagates.
     pub async fn shutdown(self) -> Result<()> {
+        self.stop_all().await.0
+    }
+
+    /// [`Outrig::shutdown`], saying why each container that may not have
+    /// stopped -- the primary, a sidecar, one an earlier failure left -- was
+    /// not confirmed stopped. Empty when every one was.
+    pub(crate) async fn stop(self) -> Vec<String> {
+        let (primary, mut failed) = self.stop_all().await;
+        if let Err(e) = primary {
+            failed.push(format!("the primary container: {e}"));
+        }
+        failed
+    }
+
+    /// The primary's stop, and why each other container's failed.
+    async fn stop_all(self) -> (Result<()>, Vec<String>) {
         let Self {
             abandoned,
             sidecars,
@@ -1336,6 +1346,7 @@ impl Outrig {
         {
             tracing::warn!(target: "outrig::outrig", "network shutdown: {e}");
         }
+        let mut failed = Vec::new();
         // Cleanup-only containers first: they are the ones already known not
         // to have stopped, and this is the orderly retry they were kept for.
         for abandoned in abandoned {
@@ -1344,6 +1355,7 @@ impl Outrig {
                     target: "outrig::outrig",
                     "abandoned sidecar stop failed: {e}"
                 );
+                failed.push(format!("an abandoned sidecar: {e}"));
             }
         }
         for (name, sidecar) in sidecars {
@@ -1352,9 +1364,10 @@ impl Outrig {
                     target: "outrig::outrig",
                     "sidecar {name:?} stop failed: {e}"
                 );
+                failed.push(format!("sidecar {name:?}: {e}"));
             }
         }
-        container.stop(SHUTDOWN_GRACE).await
+        (container.stop(SHUTDOWN_GRACE).await, failed)
     }
 }
 

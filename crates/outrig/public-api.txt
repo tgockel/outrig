@@ -14,6 +14,8 @@ pub outrig::config::ApiKeyError::NotPresent
 pub outrig::config::ApiKeyError::NotPresent::var: alloc::string::String
 pub outrig::config::ApiKeyError::NotUnicode
 pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
+pub outrig::config::ApiKeyError::Unresolved
+pub outrig::config::ApiKeyError::Unresolved::var: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::BuildImageNameError
 pub outrig::config::BuildImageNameError::Empty
 pub outrig::config::BuildImageNameError::InvalidCharacter
@@ -416,6 +418,7 @@ pub struct outrig::config::ApiKeyRef(_)
 impl outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::parse(&str) -> outrig::error::Result<Self>
 pub fn outrig::config::ApiKeyRef::resolve(&self) -> outrig::error::Result<alloc::string::String>
+pub fn outrig::config::ApiKeyRef::resolve_with(&self, &impl outrig::config::Secrets + ?core::marker::Sized) -> outrig::error::Result<alloc::string::String>
 pub fn outrig::config::ApiKeyRef::var_name(&self) -> &str
 impl serde_core::ser::Serialize for outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
@@ -464,6 +467,9 @@ impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::contain
 pub fn outrig::container::ContainerCapabilities::from(&outrig::config::ContainerSecurity) -> Self
 impl core::default::Default for outrig::config::ContainerSecurity
 pub fn outrig::config::ContainerSecurity::default() -> Self
+pub struct outrig::config::EnvSecrets
+impl outrig::config::Secrets for outrig::config::EnvSecrets
+pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 #[non_exhaustive] pub struct outrig::config::EventsConfig
 impl outrig::config::EventsConfig
 pub fn outrig::config::EventsConfig::mode(&self) -> outrig::config::EventsMode
@@ -589,6 +595,12 @@ pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
 pub const outrig::config::TOOL_RESULT_MAX_CEILING_BYTES: u32
 pub const outrig::config::TOOL_RESULT_MAX_FLOOR_BYTES: u32
+pub trait outrig::config::Secrets: core::marker::Send + core::marker::Sync
+pub fn outrig::config::Secrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+impl outrig::config::Secrets for outrig::config::EnvSecrets
+pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
+pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 pub fn outrig::config::check_build_image_name(&str) -> core::result::Result<(), outrig::config::BuildImageNameError>
 pub fn outrig::config::merge(outrig::config::Config, outrig::config::Config) -> outrig::config::Config
 pub mod outrig::container
@@ -913,6 +925,415 @@ impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::
 pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 pub fn outrig::error::superseded_by_a_confirmed_stop(outrig::error::OutrigError, &str) -> outrig::error::OutrigError
 pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
+pub mod outrig::harness
+pub mod outrig::harness::event
+#[non_exhaustive] pub enum outrig::harness::event::Abandoned
+pub outrig::harness::event::Abandoned::Runaway
+pub outrig::harness::event::Abandoned::User
+#[non_exhaustive] pub enum outrig::harness::event::ExecStatus
+pub outrig::harness::event::ExecStatus::Error
+pub outrig::harness::event::ExecStatus::Lost
+pub outrig::harness::event::ExecStatus::Ok
+pub outrig::harness::event::ExecStatus::Refused
+#[non_exhaustive] pub enum outrig::harness::event::Payload
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentStarted
+pub outrig::harness::event::Payload::AgentStarted::container: alloc::string::String
+pub outrig::harness::event::Payload::AgentStarted::model: alloc::string::String
+pub outrig::harness::event::Payload::AgentStarted::python: alloc::string::String
+pub outrig::harness::event::Payload::AgentStarted::tool_call_max: u64
+pub outrig::harness::event::Payload::AgentStarted::tool_result_max: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentStopped
+#[non_exhaustive] pub outrig::harness::event::Payload::ContextDemoted
+pub outrig::harness::event::Payload::ContextDemoted::turns: alloc::vec::Vec<u64>
+#[non_exhaustive] pub outrig::harness::event::Payload::ContextPromoted
+pub outrig::harness::event::Payload::ContextPromoted::turns: alloc::vec::Vec<u64>
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecAbandoned
+pub outrig::harness::event::Payload::ExecAbandoned::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecAbandoned::why: outrig::harness::event::Abandoned
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecCancelSent
+pub outrig::harness::event::Payload::ExecCancelSent::execid: outrig::harness::event::ExecId
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecCompleted
+pub outrig::harness::event::Payload::ExecCompleted::background: alloc::vec::Vec<outrig::harness::event::Background>
+pub outrig::harness::event::Payload::ExecCompleted::dropped: u64
+pub outrig::harness::event::Payload::ExecCompleted::duration: core::time::Duration
+pub outrig::harness::event::Payload::ExecCompleted::error: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ExecCompleted::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecCompleted::output: alloc::string::String
+pub outrig::harness::event::Payload::ExecCompleted::status: outrig::harness::event::ExecStatus
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecInterruptSent
+pub outrig::harness::event::Payload::ExecInterruptSent::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecInterruptSent::runaway: bool
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecProbeFailed
+pub outrig::harness::event::Payload::ExecProbeFailed::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecProbeFailed::verdict: outrig::harness::event::ProbeVerdict
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecRefused
+pub outrig::harness::event::Payload::ExecRefused::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecRefused::holder: core::option::Option<outrig::harness::event::ExecId>
+pub outrig::harness::event::Payload::ExecRefused::reason: outrig::harness::event::Refusal
+#[non_exhaustive] pub outrig::harness::event::Payload::ExecSubmitted
+pub outrig::harness::event::Payload::ExecSubmitted::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ExecSubmitted::source: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::InterpreterDiagnostic
+pub outrig::harness::event::Payload::InterpreterDiagnostic::text: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::InterpreterExited
+pub outrig::harness::event::Payload::InterpreterExited::cause: alloc::string::String
+pub outrig::harness::event::Payload::InterpreterExited::expected: bool
+#[non_exhaustive] pub outrig::harness::event::Payload::InventoryObserved
+pub outrig::harness::event::Payload::InventoryObserved::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::InventoryObserved::more: u64
+pub outrig::harness::event::Payload::InventoryObserved::names: alloc::vec::Vec<outrig::harness::event::Held>
+pub outrig::harness::event::Payload::InventoryObserved::total: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::MemoryExhausted
+pub outrig::harness::event::Payload::MemoryExhausted::execid: outrig::harness::event::ExecId
+#[non_exhaustive] pub outrig::harness::event::Payload::MessageReceived
+pub outrig::harness::event::Payload::MessageReceived::channel: alloc::string::String
+pub outrig::harness::event::Payload::MessageReceived::from: alloc::string::String
+pub outrig::harness::event::Payload::MessageReceived::message: outrig::harness::event::MessageId
+pub outrig::harness::event::Payload::MessageReceived::to: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::MessageRefused
+pub outrig::harness::event::Payload::MessageRefused::channel: alloc::string::String
+pub outrig::harness::event::Payload::MessageRefused::from: alloc::string::String
+pub outrig::harness::event::Payload::MessageRefused::message: outrig::harness::event::MessageId
+pub outrig::harness::event::Payload::MessageRefused::reason: alloc::string::String
+pub outrig::harness::event::Payload::MessageRefused::to: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::MessageSent
+pub outrig::harness::event::Payload::MessageSent::body: alloc::string::String
+pub outrig::harness::event::Payload::MessageSent::channel: alloc::string::String
+pub outrig::harness::event::Payload::MessageSent::from: alloc::string::String
+pub outrig::harness::event::Payload::MessageSent::message: outrig::harness::event::MessageId
+pub outrig::harness::event::Payload::MessageSent::to: alloc::string::String
+pub outrig::harness::event::Payload::ModelAttempt(outrig::harness::event::ModelAttempt)
+pub outrig::harness::event::Payload::ModelCall(outrig::harness::event::ModelCall)
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelFailover
+pub outrig::harness::event::Payload::ModelFailover::attempt_id: core::option::Option<outrig::harness::event::AttemptId>
+pub outrig::harness::event::Payload::ModelFailover::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::Payload::ModelFailover::error: alloc::string::String
+pub outrig::harness::event::Payload::ModelFailover::from: alloc::string::String
+pub outrig::harness::event::Payload::ModelFailover::to: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelInstructions
+pub outrig::harness::event::Payload::ModelInstructions::max_tokens: core::option::Option<u32>
+pub outrig::harness::event::Payload::ModelInstructions::model: alloc::string::String
+pub outrig::harness::event::Payload::ModelInstructions::preamble: alloc::string::String
+pub outrig::harness::event::Payload::ModelInstructions::tools: alloc::vec::Vec<outrig::harness::event::ToolDefinition>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelRetry
+pub outrig::harness::event::Payload::ModelRetry::attempt: u32
+pub outrig::harness::event::Payload::ModelRetry::attempt_id: outrig::harness::event::AttemptId
+pub outrig::harness::event::Payload::ModelRetry::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::Payload::ModelRetry::delay: core::time::Duration
+pub outrig::harness::event::Payload::ModelRetry::error: alloc::string::String
+pub outrig::harness::event::Payload::ModelRetry::model: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelRoundCompleted
+pub outrig::harness::event::Payload::ModelRoundCompleted::attempts: alloc::vec::Vec<outrig::harness::event::AttemptId>
+pub outrig::harness::event::Payload::ModelRoundCompleted::calls: alloc::vec::Vec<outrig::harness::event::CallUsage>
+pub outrig::harness::event::Payload::ModelRoundCompleted::input_tokens_max: core::option::Option<u64>
+pub outrig::harness::event::Payload::ModelRoundCompleted::round: u32
+pub outrig::harness::event::Payload::ModelRoundCompleted::stopped: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::ModelRoundCompleted::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelRoundDropped
+pub outrig::harness::event::Payload::ModelRoundDropped::attempts: alloc::vec::Vec<outrig::harness::event::AttemptId>
+pub outrig::harness::event::Payload::ModelRoundDropped::calls: alloc::vec::Vec<outrig::harness::event::CallUsage>
+pub outrig::harness::event::Payload::ModelRoundDropped::round: u32
+pub outrig::harness::event::Payload::ModelRoundDropped::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelRoundFailed
+pub outrig::harness::event::Payload::ModelRoundFailed::attempts: alloc::vec::Vec<outrig::harness::event::AttemptId>
+pub outrig::harness::event::Payload::ModelRoundFailed::calls: alloc::vec::Vec<outrig::harness::event::CallUsage>
+pub outrig::harness::event::Payload::ModelRoundFailed::error: alloc::string::String
+pub outrig::harness::event::Payload::ModelRoundFailed::round: u32
+pub outrig::harness::event::Payload::ModelRoundFailed::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelUsageRefused
+pub outrig::harness::event::Payload::ModelUsageRefused::attempt_id: outrig::harness::event::AttemptId
+pub outrig::harness::event::Payload::ModelUsageRefused::call_id: core::option::Option<outrig::harness::event::CallId>
+pub outrig::harness::event::Payload::ModelUsageRefused::reason: outrig::harness::event::UsageRefusal
+pub outrig::harness::event::Payload::ModelUsageRefused::usage: outrig::harness::event::Usage
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelUsageReplaced
+pub outrig::harness::event::Payload::ModelUsageReplaced::attempt_id: outrig::harness::event::AttemptId
+pub outrig::harness::event::Payload::ModelUsageReplaced::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::Payload::ModelUsageReplaced::usage: outrig::harness::event::Usage
+#[non_exhaustive] pub outrig::harness::event::Payload::OutputUnattributed
+pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
+pub outrig::harness::event::Payload::RoundStarted::round: u32
+#[non_exhaustive] pub outrig::harness::event::Payload::SessionReport
+pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
+pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
+pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
+pub outrig::harness::event::Payload::SessionReport::verdict: outrig::harness::Verdict
+#[non_exhaustive] pub outrig::harness::event::Payload::SessionState
+pub outrig::harness::event::Payload::SessionState::state: outrig::harness::event::SessionState
+#[non_exhaustive] pub outrig::harness::event::Payload::ToolResultTruncated
+pub outrig::harness::event::Payload::ToolResultTruncated::execid: outrig::harness::event::ExecId
+pub outrig::harness::event::Payload::ToolResultTruncated::kept: u64
+pub outrig::harness::event::Payload::ToolResultTruncated::max: u64
+pub outrig::harness::event::Payload::ToolResultTruncated::size: u64
+#[non_exhaustive] pub outrig::harness::event::Payload::TurnCommitted
+pub outrig::harness::event::Payload::TurnCommitted::incomplete: bool
+pub outrig::harness::event::Payload::TurnCommitted::messages: alloc::vec::Vec<serde_json::value::Value>
+pub outrig::harness::event::Payload::TurnCommitted::round: u32
+pub outrig::harness::event::Payload::TurnCommitted::turn: u64
+impl outrig::harness::event::Payload
+pub fn outrig::harness::event::Payload::kind(&self) -> &'static str
+#[non_exhaustive] pub enum outrig::harness::event::ProbeVerdict
+pub outrig::harness::event::ProbeVerdict::Blocked
+pub outrig::harness::event::ProbeVerdict::Spinning
+pub outrig::harness::event::ProbeVerdict::Starved
+#[non_exhaustive] pub enum outrig::harness::event::Received
+pub outrig::harness::event::Received::Event(alloc::sync::Arc<outrig::harness::event::Event>)
+pub outrig::harness::event::Received::Missed(u64)
+#[non_exhaustive] pub enum outrig::harness::event::Refusal
+pub outrig::harness::event::Refusal::Closed
+pub outrig::harness::event::Refusal::Held
+#[non_exhaustive] pub enum outrig::harness::event::Role
+pub outrig::harness::event::Role::Assistant
+pub outrig::harness::event::Role::User
+#[non_exhaustive] pub enum outrig::harness::event::SessionState
+pub outrig::harness::event::SessionState::Closing
+pub outrig::harness::event::SessionState::Executing
+pub outrig::harness::event::SessionState::Idle
+pub outrig::harness::event::SessionState::Reported
+pub outrig::harness::event::SessionState::RoundRunning
+pub outrig::harness::event::SessionState::Starting
+#[non_exhaustive] pub enum outrig::harness::event::TryRecvError
+pub outrig::harness::event::TryRecvError::Closed
+pub outrig::harness::event::TryRecvError::Empty
+#[non_exhaustive] pub enum outrig::harness::event::UsageRefusal
+pub outrig::harness::event::UsageRefusal::Replaced
+pub outrig::harness::event::UsageRefusal::Reported
+pub outrig::harness::event::UsageRefusal::Unknown
+#[non_exhaustive] pub enum outrig::harness::event::Why
+pub outrig::harness::event::Why::First
+pub outrig::harness::event::Why::Latest
+pub outrig::harness::event::Why::Promoted
+pub outrig::harness::event::Why::Recent
+pub outrig::harness::event::Why::Round
+pub struct outrig::harness::event::AttemptId(_)
+impl outrig::harness::event::AttemptId
+pub fn outrig::harness::event::AttemptId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::AttemptId
+pub fn outrig::harness::event::AttemptId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::Background
+pub outrig::harness::event::Background::dropped: u64
+pub outrig::harness::event::Background::id: outrig::harness::event::ExecId
+pub outrig::harness::event::Background::output: alloc::string::String
+#[non_exhaustive] pub struct outrig::harness::event::CallBudget
+pub outrig::harness::event::CallBudget::max_tokens: core::option::Option<u32>
+pub outrig::harness::event::CallBudget::model: alloc::string::String
+pub outrig::harness::event::CallBudget::overhead: u64
+pub outrig::harness::event::CallBudget::reserve: u32
+pub outrig::harness::event::CallBudget::role_alternation: outrig::config::RoleAlternation
+pub outrig::harness::event::CallBudget::window: u32
+pub outrig::harness::event::CallBudget::window_assumed: bool
+pub struct outrig::harness::event::CallId(_)
+impl outrig::harness::event::CallId
+pub fn outrig::harness::event::CallId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::CallId
+pub fn outrig::harness::event::CallId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::CallUsage
+pub outrig::harness::event::CallUsage::attempt_id: outrig::harness::event::AttemptId
+pub outrig::harness::event::CallUsage::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::CallUsage::index: u64
+pub outrig::harness::event::CallUsage::model: alloc::string::String
+pub outrig::harness::event::CallUsage::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub struct outrig::harness::event::Chosen
+pub outrig::harness::event::Chosen::turn: u64
+pub outrig::harness::event::Chosen::why: outrig::harness::event::Why
+#[non_exhaustive] pub struct outrig::harness::event::Event
+pub outrig::harness::event::Event::id: u64
+pub outrig::harness::event::Event::payload: outrig::harness::event::Payload
+pub outrig::harness::event::Event::subject: core::option::Option<outrig::harness::event::Subject>
+pub outrig::harness::event::Event::time: std::time::SystemTime
+impl outrig::harness::event::Event
+pub fn outrig::harness::event::Event::kind(&self) -> &'static str
+pub struct outrig::harness::event::ExecId(_)
+impl outrig::harness::event::ExecId
+pub fn outrig::harness::event::ExecId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::ExecId
+pub fn outrig::harness::event::ExecId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::Held
+pub outrig::harness::event::Held::name: alloc::string::String
+pub outrig::harness::event::Held::type_name: alloc::string::String
+#[non_exhaustive] pub struct outrig::harness::event::LeftOut
+pub outrig::harness::event::LeftOut::message: u64
+pub outrig::harness::event::LeftOut::part: u64
+pub outrig::harness::event::LeftOut::turn: u64
+pub struct outrig::harness::event::MessageId(_)
+impl outrig::harness::event::MessageId
+pub fn outrig::harness::event::MessageId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::MessageId
+pub fn outrig::harness::event::MessageId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::ModelAttempt
+pub outrig::harness::event::ModelAttempt::attempt_id: outrig::harness::event::AttemptId
+pub outrig::harness::event::ModelAttempt::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::ModelAttempt::error: core::option::Option<alloc::string::String>
+pub outrig::harness::event::ModelAttempt::identifier: alloc::string::String
+pub outrig::harness::event::ModelAttempt::max_tokens: core::option::Option<u32>
+pub outrig::harness::event::ModelAttempt::model: alloc::string::String
+pub outrig::harness::event::ModelAttempt::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub struct outrig::harness::event::ModelCall
+pub outrig::harness::event::ModelCall::adjacent: alloc::vec::Vec<outrig::harness::event::Repeat>
+pub outrig::harness::event::ModelCall::budget: outrig::harness::event::CallBudget
+pub outrig::harness::event::ModelCall::call: u64
+pub outrig::harness::event::ModelCall::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::ModelCall::carried: alloc::vec::Vec<outrig::harness::event::Chosen>
+pub outrig::harness::event::ModelCall::estimate: u64
+pub outrig::harness::event::ModelCall::evicted: alloc::vec::Vec<outrig::harness::event::Chosen>
+pub outrig::harness::event::ModelCall::left_out: alloc::vec::Vec<outrig::harness::event::LeftOut>
+pub outrig::harness::event::ModelCall::opening: core::option::Option<serde_json::value::Value>
+pub outrig::harness::event::ModelCall::round: u32
+pub outrig::harness::event::ModelCall::withheld: alloc::vec::Vec<outrig::harness::event::Chosen>
+#[non_exhaustive] pub struct outrig::harness::event::Repeat
+pub outrig::harness::event::Repeat::role: outrig::harness::event::Role
+pub outrig::harness::event::Repeat::turn: core::option::Option<u64>
+pub struct outrig::harness::event::Subject(_)
+impl outrig::harness::event::Subject
+pub fn outrig::harness::event::Subject::as_str(&self) -> &str
+impl core::fmt::Display for outrig::harness::event::Subject
+pub fn outrig::harness::event::Subject::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct outrig::harness::event::Subscription
+impl outrig::harness::event::Subscription
+pub fn outrig::harness::event::Subscription::capacity(&self) -> usize
+pub fn outrig::harness::event::Subscription::missed(&self) -> u64
+pub async fn outrig::harness::event::Subscription::recv(&mut self) -> core::option::Option<outrig::harness::event::Received>
+pub fn outrig::harness::event::Subscription::try_recv(&mut self) -> core::result::Result<outrig::harness::event::Received, outrig::harness::event::TryRecvError>
+impl core::fmt::Debug for outrig::harness::event::Subscription
+pub fn outrig::harness::event::Subscription::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::ToolDefinition
+pub outrig::harness::event::ToolDefinition::description: alloc::string::String
+pub outrig::harness::event::ToolDefinition::name: alloc::string::String
+pub outrig::harness::event::ToolDefinition::parameters: serde_json::value::Value
+#[non_exhaustive] pub struct outrig::harness::event::Usage
+pub outrig::harness::event::Usage::cache_creation_input_tokens: u64
+pub outrig::harness::event::Usage::cached_input_tokens: u64
+pub outrig::harness::event::Usage::input_tokens: u64
+pub outrig::harness::event::Usage::output_tokens: u64
+pub outrig::harness::event::Usage::reasoning_tokens: u64
+pub outrig::harness::event::Usage::total_tokens: u64
+impl core::iter::traits::accum::Sum for outrig::harness::event::Usage
+pub fn outrig::harness::event::Usage::sum<I: core::iter::traits::iterator::Iterator<Item = outrig::harness::event::Usage>>(I) -> outrig::harness::event::Usage
+pub const outrig::harness::event::DEFAULT_CAPACITY: usize
+#[non_exhaustive] pub enum outrig::harness::ClosedBy
+#[non_exhaustive] pub outrig::harness::ClosedBy::InterpreterExited
+pub outrig::harness::ClosedBy::InterpreterExited::cause: alloc::string::String
+pub outrig::harness::ClosedBy::Owner
+impl core::convert::From<outrig::harness::ClosedBy> for outrig::harness::Closed
+pub fn outrig::harness::Closed::from(outrig::harness::ClosedBy) -> Self
+impl core::fmt::Display for outrig::harness::ClosedBy
+pub fn outrig::harness::ClosedBy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum outrig::harness::ExecutionStatus
+pub outrig::harness::ExecutionStatus::Error
+pub outrig::harness::ExecutionStatus::Ok
+pub outrig::harness::ExecutionStatus::Unknown
+#[non_exhaustive] pub enum outrig::harness::Progress
+pub outrig::harness::Progress::Finished(outrig::harness::Step)
+pub outrig::harness::Progress::Started(outrig::harness::Step)
+#[non_exhaustive] pub enum outrig::harness::RoundOutcome
+pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
+pub outrig::harness::RoundOutcome::NothingNew
+#[non_exhaustive] pub enum outrig::harness::SessionError
+pub outrig::harness::SessionError::Closed(outrig::harness::Closed)
+pub outrig::harness::SessionError::Resolve(outrig::harness::Failure)
+pub outrig::harness::SessionError::Round(outrig::harness::Failure)
+pub outrig::harness::SessionError::Start(outrig::harness::Failure)
+#[non_exhaustive] pub enum outrig::harness::Step
+pub outrig::harness::Step::Container
+pub outrig::harness::Step::Python
+#[non_exhaustive] pub enum outrig::harness::Stopped
+#[non_exhaustive] pub outrig::harness::Stopped::NotProven
+pub outrig::harness::Stopped::NotProven::reason: alloc::string::String
+pub outrig::harness::Stopped::Proven
+#[non_exhaustive] pub enum outrig::harness::Tasks
+pub outrig::harness::Tasks::CouldNotTell
+#[non_exhaustive] pub outrig::harness::Tasks::Listed
+pub outrig::harness::Tasks::Listed::more: usize
+pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub enum outrig::harness::Verdict
+pub outrig::harness::Verdict::Clean
+pub outrig::harness::Verdict::NotProvenStopped
+pub outrig::harness::Verdict::StoppedWithUnknown
+pub struct outrig::harness::Closed
+impl outrig::harness::Closed
+pub fn outrig::harness::Closed::by(&self) -> &outrig::harness::ClosedBy
+impl core::convert::From<outrig::harness::ClosedBy> for outrig::harness::Closed
+pub fn outrig::harness::Closed::from(outrig::harness::ClosedBy) -> Self
+pub struct outrig::harness::Closer(_)
+impl outrig::harness::Closer
+pub fn outrig::harness::Closer::close_admission(&self)
+#[non_exhaustive] pub struct outrig::harness::ContainerSpec
+pub outrig::harness::ContainerSpec::left_out: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::ContainerSpec::spec: outrig::LaunchSpec
+pub struct outrig::harness::EnvSecrets
+impl outrig::config::Secrets for outrig::config::EnvSecrets
+pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+#[non_exhaustive] pub struct outrig::harness::EventDelivery
+pub outrig::harness::EventDelivery::last_sequence: u64
+pub outrig::harness::EventDelivery::log: core::option::Option<outrig::harness::LogLoss>
+pub outrig::harness::EventDelivery::missed: alloc::vec::Vec<u64>
+#[non_exhaustive] pub struct outrig::harness::ExecutionOutcome
+pub outrig::harness::ExecutionOutcome::id: outrig::harness::event::ExecId
+pub outrig::harness::ExecutionOutcome::status: outrig::harness::ExecutionStatus
+pub struct outrig::harness::Failure(_)
+impl outrig::harness::Failure
+pub fn outrig::harness::Failure::ran_python(&self) -> bool
+#[non_exhaustive] pub struct outrig::harness::LogLoss
+pub outrig::harness::LogLoss::first: alloc::string::String
+pub outrig::harness::LogLoss::integrity: core::option::Option<alloc::string::String>
+pub outrig::harness::LogLoss::path: std::path::PathBuf
+pub outrig::harness::LogLoss::records: u64
+impl core::fmt::Display for outrig::harness::LogLoss
+pub fn outrig::harness::LogLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::RoundEnd
+pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::String>
+pub outrig::harness::RoundEnd::reply: alloc::string::String
+pub outrig::harness::RoundEnd::still_running: outrig::harness::StillRunning
+pub outrig::harness::RoundEnd::stopped: core::option::Option<alloc::string::String>
+pub struct outrig::harness::Session
+impl outrig::harness::Session
+pub fn outrig::harness::Session::close_admission(&self)
+pub fn outrig::harness::Session::closer(&self) -> outrig::harness::Closer
+pub fn outrig::harness::Session::container_name(&self) -> &str
+pub fn outrig::harness::Session::id(&self) -> &str
+pub fn outrig::harness::Session::interrupter(&self) -> impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static
+pub fn outrig::harness::Session::model(&self) -> &str
+pub fn outrig::harness::Session::python_version(&self) -> &str
+pub async fn outrig::harness::Session::round(&mut self) -> core::result::Result<outrig::harness::RoundOutcome, outrig::harness::SessionError>
+pub async fn outrig::harness::Session::shutdown(self, core::time::Duration) -> outrig::harness::ShutdownReport
+pub async fn outrig::harness::Session::start(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
+pub fn outrig::harness::Session::stop_held(&self) -> core::option::Option<alloc::string::String>
+pub fn outrig::harness::Session::user_channel(&self) -> outrig::harness::UserChannel
+pub struct outrig::harness::SessionBuilder
+impl outrig::harness::SessionBuilder
+pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
+pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
+pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
+pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function::FnMut(outrig::harness::Progress) + core::marker::Send + 'static) -> Self
+pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
+pub fn outrig::harness::SessionBuilder::secrets(self, impl outrig::config::Secrets + 'static) -> Self
+pub async fn outrig::harness::SessionBuilder::start(self) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
+pub fn outrig::harness::SessionBuilder::subscribe(&mut self) -> outrig::harness::event::Subscription
+pub fn outrig::harness::SessionBuilder::subscribe_with_capacity(&mut self, usize) -> outrig::harness::event::Subscription
+#[non_exhaustive] pub struct outrig::harness::ShutdownReport
+pub outrig::harness::ShutdownReport::closed_by: outrig::harness::ClosedBy
+pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
+pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
+pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped
+impl outrig::harness::ShutdownReport
+pub fn outrig::harness::ShutdownReport::verdict(&self) -> outrig::harness::Verdict
+#[non_exhaustive] pub struct outrig::harness::StillRunning
+pub outrig::harness::StillRunning::tasks: outrig::harness::Tasks
+impl outrig::harness::StillRunning
+pub fn outrig::harness::StillRunning::is_empty(&self) -> bool
+pub struct outrig::harness::UserChannel
+impl outrig::harness::UserChannel
+pub async fn outrig::harness::UserChannel::receive(&self) -> core::option::Option<alloc::string::String>
+pub fn outrig::harness::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn outrig::harness::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
+pub const outrig::harness::DEFAULT_DRAIN: core::time::Duration
+pub trait outrig::harness::Secrets: core::marker::Send + core::marker::Sync
+pub fn outrig::harness::Secrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+impl outrig::config::Secrets for outrig::config::EnvSecrets
+pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
+pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+pub async fn outrig::harness::container_spec(&outrig::config::Config, &str, core::option::Option<&outrig::image::ImageTag>, &std::path::Path, std::path::PathBuf) -> core::result::Result<outrig::harness::ContainerSpec, outrig::error::OutrigError>
 pub mod outrig::image
 #[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
 pub outrig::image::ImageBuildOutcome::cache_hit: bool
@@ -1236,19 +1657,6 @@ pub async fn outrig::Outrig::exec_stdio(&self, &[alloc::string::String], &outrig
 pub async fn outrig::Outrig::launch(&outrig::LaunchSpec) -> outrig::error::Result<Self>
 pub async fn outrig::Outrig::shutdown(self) -> outrig::error::Result<()>
 pub fn outrig::Outrig::tools(&self) -> &[outrig::ToolHandle]
-pub struct outrig::PythonAgent
-impl outrig::PythonAgent
-pub fn outrig::PythonAgent::check(&outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
-pub fn outrig::PythonAgent::container_name(&self) -> &str
-pub fn outrig::PythonAgent::interrupter(&self) -> impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static
-pub fn outrig::PythonAgent::model(&self) -> &str
-pub fn outrig::PythonAgent::on_submit(&mut self, impl core::ops::function::Fn(&str) + core::marker::Send + core::marker::Sync + 'static)
-pub fn outrig::PythonAgent::python_version(&self) -> &str
-pub async fn outrig::PythonAgent::round(&mut self) -> core::result::Result<core::option::Option<alloc::string::String>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
-pub async fn outrig::PythonAgent::shutdown(self) -> core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
-pub async fn outrig::PythonAgent::start(&outrig::Outrig, &outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::PythonAgent, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
-pub fn outrig::PythonAgent::stop_held(&self) -> core::option::Option<alloc::string::String>
-pub fn outrig::PythonAgent::user_channel(&self) -> outrig::UserChannel
 #[non_exhaustive] pub struct outrig::SecuritySpec
 pub outrig::SecuritySpec::capabilities: outrig::CapabilitySpec
 pub outrig::SecuritySpec::devices: alloc::vec::Vec<alloc::string::String>
@@ -1290,11 +1698,6 @@ pub struct outrig::Transcript
 impl outrig::Transcript
 pub async fn outrig::Transcript::create(&std::path::Path, bool) -> outrig::error::Result<Self>
 pub async fn outrig::Transcript::line(&self, &'static str, &str) -> std::io::error::Result<()>
-pub struct outrig::UserChannel
-impl outrig::UserChannel
-pub async fn outrig::UserChannel::receive(&self) -> core::option::Option<alloc::string::String>
-pub fn outrig::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
-pub fn outrig::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
 #[non_exhaustive] pub struct outrig::WorkspaceSpec
 pub outrig::WorkspaceSpec::container: std::path::PathBuf
 pub outrig::WorkspaceSpec::host: std::path::PathBuf

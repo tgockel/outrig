@@ -375,6 +375,23 @@ async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
         "{stderr}"
     );
     assert!(stderr.contains("[outrig] python 3."), "{stderr}");
+    // Each step of the start, as it began and as it ended.
+    let at = |line: &str| {
+        stderr
+            .find(line)
+            .unwrap_or_else(|| panic!("no {line:?}: {stderr}"))
+    };
+    assert!(
+        at("[outrig] starting container") < at("[outrig] container ready")
+            && at("[outrig] container ready") < at("[outrig] starting python")
+            && at("[outrig] starting python") < at("[outrig] python ready"),
+        "{stderr}"
+    );
+    // End of input leaves through the report, and nothing was cut off.
+    assert!(
+        stderr.contains("[outrig] session closed: stopped, every outcome known"),
+        "{stderr}"
+    );
     // What the person watched run.
     assert!(
         stderr.contains("[outrig] python:\n    import os\n    x = 41"),
@@ -537,9 +554,24 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
         .lines()
         .map(|line| serde_json::from_str(line).expect("a whole record"))
         .collect();
+    // The agent stopped, then the session reported, and its last state is
+    // that it has.
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["type"].as_str().expect("a type"))
+        .collect();
     assert_eq!(
-        events.last().map(|e| e["type"].clone()),
-        Some(json!("org.outrig.agent.stopped")),
+        kinds[kinds.len() - 3..],
+        [
+            "org.outrig.agent.stopped",
+            "org.outrig.session.report",
+            "org.outrig.session.state"
+        ],
+        "{text}"
+    );
+    assert_eq!(
+        events.last().map(|e| e["data"].clone()),
+        Some(json!({"state": "reported"})),
         "{text}"
     );
     // Under the session's own id, the one `session.json` and `outrig ls` show.
@@ -652,6 +684,17 @@ async fn the_session_ends_when_the_interpreter_exits() {
     );
     assert!(
         stderr.contains("[outrig] the Python interpreter exited; the session is over"),
+        "{stderr}"
+    );
+    // The report says so, and that the execution it took with it is unknown.
+    assert!(
+        stderr.contains("[outrig]   closed because the Python interpreter exited"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("[outrig]   execution ") && line.ends_with(": unknown")),
         "{stderr}"
     );
 }
@@ -904,7 +947,19 @@ async fn a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     ctrl_c(&session.pid);
     let (status, stdout, stderr) = session.exit(false).await;
-    assert!(status.success(), "{status}: {stderr}");
+    // Leaving cut the unkillable code off, and the status and the report say
+    // so.
+    assert_eq!(status.code(), Some(2), "{status}: {stderr}");
+    assert!(
+        stderr.contains("[outrig] session closed: stopped, but some Python was cut off"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("[outrig]   execution ") && line.ends_with(": unknown")),
+        "{stderr}"
+    );
     assert_eq!(
         stdout, "",
         "the agent sent nothing; its commentary is on stderr"
@@ -922,4 +977,108 @@ async fn a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running() {
     let next = tool_result(&recorded[3], "toolu_next");
     assert!(next.contains("CancelledError"), "{next}");
     assert!(next.contains("[this call]\nagain\n"), "{next}");
+}
+
+/// The one session dir under `sessions`, and its record.
+fn the_record(sessions: &Path) -> Value {
+    let dir = std::fs::read_dir(sessions)
+        .expect("the session root")
+        .next()
+        .expect("one session")
+        .expect("an entry")
+        .path();
+    serde_json::from_str(&std::fs::read_to_string(dir.join("session.json")).expect("a record"))
+        .expect("the record parses")
+}
+
+/// `/quit` with nothing running leaves through the report, which reads
+/// stopped with every outcome known, and exits 0. A round that left nothing
+/// running closes on no line about it.
+#[tokio::test]
+async fn quit_with_nothing_running_exits_0_and_reports_a_clean_stop() {
+    let (addr, _requests) =
+        start_mock_http(vec![submit("toolu_1", "x = 1"), text_reply("set")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("set x").await;
+    wait_for(&session.stderr, "set", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("(still running"), "{stderr}");
+    assert!(
+        stderr.contains("[outrig] session closed: stopped, every outcome known"),
+        "{stderr}"
+    );
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 0, "{record:#}");
+    let container = record["container_name"].as_str().expect("a name");
+    assert!(podman_names(&format!("name={container}")).is_empty());
+}
+
+/// A round whose code leaves a task running says so as it closes, so a prompt
+/// that returns is not taken for work done.
+#[tokio::test]
+async fn a_round_that_leaves_a_task_running_says_so() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_ci",
+            "ci = asyncio.create_task(asyncio.sleep(60), name='ci_run')",
+        ),
+        text_reply("started ci"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("start ci").await;
+    wait_for(&session.stderr, "(still running: ci_run)", TEST_TIMEOUT).await;
+    let (status, _, stderr) = session.exit(true).await;
+    // A task is not an execution: leaving cuts no execution off.
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let reply = stderr.find("started ci").expect("the reply");
+    let closing = stderr.find("(still running: ci_run)").expect("the line");
+    assert!(reply < closing, "the line closes the round: {stderr}");
+}
+
+/// `/quit` while an execution catches every interrupt: the session stops
+/// anyway, and leaving says the code was cut off -- in the report, naming the
+/// execution unknown, and in the exit status, 2.
+#[tokio::test]
+async fn quit_while_an_execution_ignores_interrupts_exits_2() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_hold",
+            "import time\nopen('holding', 'w').close()\nwhile True:\n    try:\n        \
+             time.sleep(0.1)\n    except BaseException:\n        pass",
+        ),
+        text_reply("never"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("hold").await;
+    wait_for_file(&repo.path().join("holding"), TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("[outrig] session closed: stopped, but some Python was cut off"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("[outrig]   execution ") && line.ends_with(": unknown")),
+        "{stderr}"
+    );
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 2, "{record:#}");
+    let container = record["container_name"].as_str().expect("a name");
+    assert!(podman_names(&format!("name={container}")).is_empty());
 }

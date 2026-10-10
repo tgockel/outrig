@@ -1,29 +1,29 @@
 //! `outrig run-new`: an interactive session whose agent acts by writing Python.
 //!
-//! The loop lives in `outrig` ([`PythonAgent`]); this module and `converse`
-//! are the terminal around it. It shares none of `run`'s session setup,
-//! because only [`Outrig::launch`] mounts the interpreter's payload -- so the
-//! session is launched through the library facade, and `run`'s code is left
+//! The loop lives in `outrig`, and this module and `converse` are the terminal
+//! around it: the session is started, driven, watched and stopped through
+//! [`outrig::harness`] and nothing else of the loop, as any other owner of one
+//! would. It shares none of `run`'s session setup, and `run`'s code is left
 //! exactly as it was. Nor does it share `run`'s REPL, which reads a line only
 //! between rounds: here what the user types reaches the agent's `user`
 //! channel while a round runs, too.
 //!
-//! **No MCP server and no sidecar starts.** The model's one tool submits
-//! Python, so nothing could call them. A primary-placed server would also run
-//! in the interpreter's container as the same user, holding whatever secrets
-//! its `env` resolved -- readable from Python wherever `/proc` allows it. Not
-//! handing the model a tool does not put a credential out of reach; not
-//! starting the server does.
+//! **No MCP server and no sidecar starts**: see
+//! [`harness::container_spec`], which describes the container.
 //!
 //! The session is recorded like any other, in the order that keeps
 //! `session.json` honest: the record is written once the interpreter is up,
-//! carrying the container name [`PythonAgent`] reports, so a live record
-//! always has a container behind it. The container is `outrig-<sid>`, labeled
-//! `org.outrig.session=<sid>`, as `run`'s is: the session id reaches
-//! [`Outrig::launch`] through its `LaunchSpec`, and `discard` and `clean` read
-//! the name back to tell a live session from a finished one. Until the record
-//! is written, the session directory is held by a lock instead, so nothing
-//! else starts a session in it meanwhile.
+//! carrying the container name the session reports, so a live record always
+//! has a container behind it. The container is `outrig-<sid>`, labeled
+//! `org.outrig.session=<sid>`, as `run`'s is: the session id reaches the
+//! launch through its `LaunchSpec`, and `discard` and `clean` read the name
+//! back to tell a live session from a finished one. Until the record is
+//! written, the session directory is held by a lock instead, so nothing else
+//! starts a session in it meanwhile.
+//!
+//! It leaves through the session's report: `/quit`, end of input, or a second
+//! Ctrl-C at the prompt close the session to new work, stop it, print what the
+//! report found, and exit with the status the report decides.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -31,14 +31,18 @@ use std::time::SystemTime;
 
 use clap::Parser;
 use nix::fcntl::{Flock, FlockArg};
-use outrig::config::{Config, ImageConfig};
+use outrig::config::{Config, EnvSecrets, EventsMode, ImageConfig};
 use outrig::error::IoPathExt;
+use outrig::harness::{
+    self, DEFAULT_DRAIN, ExecutionStatus, Progress, SessionBuilder, ShutdownReport, Step,
+    Stopped, Verdict,
+};
 use outrig::image::{self, ImageTag};
-use outrig::{EmbeddedMcpPolicy, LaunchSpec, Outrig, PythonAgent};
+use outrig::LaunchSpec;
 
 use crate::builtin_image;
 use crate::cli::session_setup::ProgressSpan;
-use crate::error::{CliError, OutrigError, Result};
+use crate::error::{OutrigError, Result};
 use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
 use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
@@ -92,11 +96,20 @@ pub async fn execute(
         refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
     }
 
+    // What the session needs from outside, given before it starts: the
+    // terminal sees each submission through a subscription of its own, and
+    // the event log is a second one when the user asked for it.
+    let agent_name = args.agent.clone().or_else(|| cfg.default_agent.clone());
+    let mut builder = SessionBuilder::new(cfg.clone(), agent_name.as_deref(), args.model.as_deref())
+        .secrets(EnvSecrets)
+        .progress(progress_lines());
+    if matches!(cfg.events.mode(), EventsMode::Record) {
+        builder = builder.record_events();
+    }
+    let mut shown = builder.subscribe();
     // Before anything is pulled or started, so a config that names no usable
     // model costs nothing.
-    let agent_name = args.agent.clone().or_else(|| cfg.default_agent.clone());
-    PythonAgent::check(&cfg, agent_name.as_deref(), args.model.as_deref())
-        .map_err(CliError::PythonAgent)?;
+    builder.check()?;
 
     let (image_cfg_name, builtin_default) =
         image_config_name(&mut cfg, args.image.as_deref(), agent_name.as_deref())?;
@@ -131,14 +144,13 @@ pub async fn execute(
         link_target: None,
     };
     let started = start(Start {
+        builder,
         cfg: &cfg,
         image_cfg_name: &image_cfg_name,
         image_cfg,
         repo_root: &repo_root,
         log_dir,
-        agent_name: agent_name.as_deref(),
-        model: args.model.as_deref(),
-        session: &mut session,
+        record: &mut session,
     })
     .await;
 
@@ -146,13 +158,16 @@ pub async fn execute(
     // session that failed to start is recorded too, and at once finalized, so
     // it is never a live record without a container.
     if let Err(e) = store.create(&sid, args.session_dir.as_deref(), &mut session) {
-        if let Ok((outrig, agent)) = started {
-            shut_down(outrig, agent).await;
+        if let Ok(running) = started {
+            let report = running.shutdown(DEFAULT_DRAIN).await;
+            if report.verdict() != Verdict::Clean {
+                print_report(&report);
+            }
         }
         return Err(e.into());
     }
-    let (outrig, mut agent) = match started {
-        Ok(started) => started,
+    let mut running = match started {
+        Ok(running) => running,
         Err(e) => {
             let _ = store.finalize(&sid, SystemTime::now(), 1);
             return Err(e);
@@ -167,22 +182,149 @@ pub async fn execute(
                 builtin_default
             ),
             image_tag: &session.image_tag,
-            model: agent.model(),
-            python_version: agent.python_version(),
-            container_name: agent.container_name(),
+            model: running.model(),
+            python_version: running.python_version(),
+            container_name: running.container_name(),
             session_id: sid.as_str(),
         })
     );
-    agent.on_submit(|source| eprint!("{}", render_submission(source)));
 
-    let outcome = converse::converse(&mut agent).await;
+    let conversed = converse::converse(&mut running, &mut shown).await;
 
-    shut_down(outrig, agent).await;
+    // Said first, since stopping can take a few seconds and a Ctrl-C there
+    // does nothing.
+    eprintln!("[outrig] closing the session");
+    let report = running.shutdown(DEFAULT_DRAIN).await;
+    let summary = summarize(&report);
+    eprint!("{}", render_report(&summary));
+    let outcome = conversed.map(|()| exit_status(&summary));
     let exit = outcome.as_ref().copied().unwrap_or(1);
     if let Err(e) = store.finalize(&sid, SystemTime::now(), exit) {
         tracing::warn!(target: "outrig::cli::run_new", "finalizing session {sid}: {e}");
     }
     outcome
+}
+
+/// The exit status a session's report decides: 0 for a clean stop, 2 for a
+/// stop that cut some Python off, 3 for one not proven stopped -- which
+/// outranks everything, since something may still be running. A session the
+/// interpreter's exit closed keeps its documented 1.
+fn exit_status(summary: &Summary) -> i32 {
+    match summary.verdict {
+        Verdict::NotProvenStopped => 3,
+        _ if summary.closed.is_some() => 1,
+        Verdict::StoppedWithUnknown => 2,
+        Verdict::Clean => 0,
+        // A verdict this build does not know is not one it can call clean.
+        _ => 3,
+    }
+}
+
+/// The report, on stderr.
+fn print_report(report: &ShutdownReport) {
+    eprint!("{}", render_report(&summarize(report)));
+}
+
+/// What the terminal says of a report.
+#[derive(Debug)]
+struct Summary {
+    verdict: Verdict,
+    /// What closed the session, when it was not its owner: the interpreter
+    /// exiting.
+    closed: Option<String>,
+    /// Why it is not proven stopped, when it is not.
+    not_stopped: Option<String>,
+    executions: Vec<(u64, ExecutionStatus)>,
+    last_sequence: u64,
+    /// What the terminal's own subscription missed.
+    missed: u64,
+    /// What the event log did not get.
+    log: Option<String>,
+}
+
+fn summarize(report: &ShutdownReport) -> Summary {
+    Summary {
+        verdict: report.verdict(),
+        closed: match &report.closed_by {
+            harness::ClosedBy::Owner => None,
+            by => Some(by.to_string()),
+        },
+        not_stopped: match &report.stopped {
+            Stopped::NotProven { reason, .. } => Some(reason.clone()),
+            _ => None,
+        },
+        executions: report
+            .executions
+            .iter()
+            .map(|execution| (execution.id.get(), execution.status))
+            .collect(),
+        last_sequence: report.events.last_sequence,
+        missed: report.events.missed.first().copied().unwrap_or(0),
+        log: report.events.log.as_ref().map(ToString::to_string),
+    }
+}
+
+/// The report, on stderr: whether the session is stopped, how each execution
+/// running at the close ended, and anything its events lost.
+fn render_report(summary: &Summary) -> String {
+    let mut text = String::from(match summary.verdict {
+        Verdict::Clean => "[outrig] session closed: stopped, every outcome known\n",
+        Verdict::StoppedWithUnknown => {
+            "[outrig] session closed: stopped, but some Python was cut off -- what it did may or \
+             may not have happened\n"
+        }
+        _ => "[outrig] session closed: NOT proven stopped -- something it started may still be \
+              running\n",
+    });
+    if let Some(by) = &summary.closed {
+        text.push_str(&format!("[outrig]   closed because {by}\n"));
+    }
+    if let Some(reason) = &summary.not_stopped {
+        text.push_str(&format!("[outrig]   not proven stopped: {reason}\n"));
+    }
+    for (id, status) in &summary.executions {
+        let status = match status {
+            ExecutionStatus::Ok => "ok",
+            ExecutionStatus::Error => "error",
+            _ => "unknown",
+        };
+        text.push_str(&format!("[outrig]   execution {id}: {status}\n"));
+    }
+    if summary.missed > 0 {
+        text.push_str(&format!(
+            "[outrig]   events: {} published; {} were not shown here\n",
+            summary.last_sequence, summary.missed
+        ));
+    }
+    if let Some(log) = &summary.log {
+        text.push_str(&format!("[outrig] warning: {log}\n"));
+    }
+    text
+}
+
+/// The two lines the start prints for each of its steps, as each begins and
+/// ends.
+fn progress_lines() -> impl FnMut(Progress) + Send + 'static {
+    let mut span = None;
+    move |progress| match progress {
+        Progress::Started(step) => {
+            span = Some(ProgressSpan::start(match step {
+                Step::Container => "starting container",
+                Step::Python => "starting python",
+                _ => "starting",
+            }));
+        }
+        Progress::Finished(step) => {
+            if let Some(span) = span.take() {
+                span.done(match step {
+                    Step::Container => "container ready",
+                    Step::Python => "python ready",
+                    _ => "ready",
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The image-config the session runs: `--image`, the agent's, `default-image`,
@@ -285,29 +427,27 @@ fn reserve_session_dir(
 }
 
 struct Start<'a> {
+    builder: SessionBuilder,
     cfg: &'a Config,
     image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
     repo_root: &'a Path,
     log_dir: PathBuf,
-    agent_name: Option<&'a str>,
-    model: Option<&'a str>,
     /// Filled in with the image tag and the container name as each is learned.
-    session: &'a mut Session,
+    record: &'a mut Session,
 }
 
-/// Ensure the image, launch the session, and start the agent's interpreter in
-/// it. On failure nothing is left running.
-async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
+/// Ensure the image, then start the session in it. On failure nothing is left
+/// running.
+async fn start(args: Start<'_>) -> Result<harness::Session> {
     let Start {
+        builder,
         cfg,
         image_cfg_name,
         image_cfg,
         repo_root,
         log_dir,
-        agent_name,
-        model,
-        session,
+        record,
     } = args;
 
     // Ensured here, under the image-config's name as `run` and `build` do,
@@ -323,10 +463,10 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
         image.tag,
         if image.cache_hit { "cache hit" } else { "built" }
     ));
-    session.image_tag = image.tag.to_string();
+    record.image_tag = image.tag.to_string();
 
     let (spec, skipped) =
-        launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &session.id).await?;
+        launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &record.id).await?;
     if !skipped.is_empty() {
         eprintln!(
             "[outrig] run-new starts no MCP servers; not started: {}",
@@ -334,22 +474,9 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
         );
     }
 
-    let span = ProgressSpan::start("starting container");
-    let outrig = Outrig::launch(&spec).await?;
-    span.done("container ready");
-
-    let span = ProgressSpan::start("starting python");
-    match PythonAgent::start(&outrig, cfg, agent_name, model).await {
-        Ok(agent) => {
-            span.done("python ready");
-            session.container_name = agent.container_name().to_string();
-            Ok((outrig, agent))
-        }
-        Err(e) => {
-            stop_containers(outrig).await;
-            Err(CliError::PythonAgent(e))
-        }
-    }
+    let session = builder.container(spec).start().await?;
+    record.container_name = session.container_name().to_string();
+    Ok(session)
 }
 
 /// The launch for `image_cfg_name`, running the already-ensured `tag`, with no
@@ -359,11 +486,7 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
 ///
 /// The image-config is replaced by one naming `tag`, keeping only its
 /// security, so the image that runs is the one the session records and
-/// `launch` has nothing to build. That also drops its MCP servers. Sidecars go
-/// before lowering rather than after: lowering builds or pulls every sidecar
-/// image it plans, for containers that would never start. Servers an image
-/// declares in its own `org.outrig.mcp` label are only known at launch, so the
-/// policy that ignores the label is what keeps those out.
+/// `launch` has nothing to build.
 async fn launch_spec(
     cfg: &Config,
     image_cfg_name: &str,
@@ -372,38 +495,12 @@ async fn launch_spec(
     log_dir: PathBuf,
     sid: &SessionId,
 ) -> Result<(LaunchSpec, Vec<String>)> {
-    let mut pinned = cfg.clone();
-    pinned.sidecars.clear();
-    let mut skipped = Vec::new();
-    if let Some(image) = pinned.images.get_mut(image_cfg_name) {
-        skipped = image.mcp.keys().cloned().collect();
-        let security = std::mem::take(&mut image.security);
-        *image = ImageConfig::from_image_name(tag.as_str());
-        image.security = security;
-    }
-    let spec = LaunchSpec::from_config(&pinned, image_cfg_name, repo_root, log_dir)
-        .await?
-        .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore)
-        .with_session_id(sid.as_str());
-    Ok((spec, skipped))
-}
-
-/// End the session: the agent first, so its event log is finished while the
-/// containers it describes still run, then the containers. Each failure is
-/// said and the rest still runs, since by now there is nothing left to return
-/// an error to.
-async fn shut_down(outrig: Outrig, agent: PythonAgent) {
-    if let Err(e) = agent.shutdown().await {
-        eprintln!("[outrig] warning: {e}");
-    }
-    stop_containers(outrig).await;
-}
-
-/// Shut the session's containers down, saying so if that fails.
-async fn stop_containers(outrig: Outrig) {
-    if let Err(e) = outrig.shutdown().await {
-        eprintln!("[outrig] warning: shutting the session down: {e}");
-    }
+    let container =
+        harness::container_spec(cfg, image_cfg_name, Some(tag), repo_root, log_dir).await?;
+    Ok((
+        container.spec.with_session_id(sid.as_str()),
+        container.left_out,
+    ))
 }
 
 struct Banner<'a> {
@@ -431,21 +528,10 @@ fn render_banner(banner: &Banner<'_>) -> String {
     )
 }
 
-/// What the terminal shows of a submission: its source, indented under a
-/// heading, on stderr with everything else that is not the model's reply.
-fn render_submission(source: &str) -> String {
-    let mut text = String::from("[outrig] python:\n");
-    for line in source.trim_end().lines() {
-        text.push_str("    ");
-        text.push_str(line);
-        text.push('\n');
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use outrig::EmbeddedMcpPolicy;
 
     /// A config whose image carries a primary server holding a secret and a
     /// sidecar-hosted server, the two ways an MCP server could start.
@@ -512,12 +598,71 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         );
     }
 
+    /// A summary of a report that `verdict` reads as, and nothing else.
+    fn summary(verdict: Verdict) -> Summary {
+        Summary {
+            verdict,
+            closed: None,
+            not_stopped: None,
+            executions: Vec::new(),
+            last_sequence: 0,
+            missed: 0,
+            log: None,
+        }
+    }
+
+    /// What a stop found decides the status, and one not proven stopped
+    /// outranks everything. A report that reads not proven stopped cannot be
+    /// had from podman on demand, so this is where 3 is forced.
     #[test]
-    fn a_submission_is_shown_indented_under_its_heading() {
+    fn the_report_decides_the_exit_status() {
+        assert_eq!(exit_status(&summary(Verdict::Clean)), 0);
+        assert_eq!(exit_status(&summary(Verdict::StoppedWithUnknown)), 2);
+        assert_eq!(exit_status(&summary(Verdict::NotProvenStopped)), 3);
+        let died = |verdict| Summary {
+            closed: Some("the Python interpreter exited (exit status: 1)".to_string()),
+            ..summary(verdict)
+        };
+        assert_eq!(exit_status(&died(Verdict::Clean)), 1);
+        assert_eq!(exit_status(&died(Verdict::StoppedWithUnknown)), 1);
+        assert_eq!(exit_status(&died(Verdict::NotProvenStopped)), 3);
+    }
+
+    /// What the terminal says of each kind of report.
+    #[test]
+    fn the_report_says_what_stopped_and_what_was_cut_off() {
         assert_eq!(
-            render_submission("x = 41\nprint(x)\n"),
-            "[outrig] python:\n    x = 41\n    print(x)\n"
+            render_report(&Summary {
+                last_sequence: 40,
+                ..summary(Verdict::Clean)
+            }),
+            "[outrig] session closed: stopped, every outcome known\n"
         );
+
+        let cut = render_report(&Summary {
+            executions: vec![(7, ExecutionStatus::Unknown), (9, ExecutionStatus::Ok)],
+            last_sequence: 80,
+            missed: 3,
+            ..summary(Verdict::StoppedWithUnknown)
+        });
+        assert!(cut.starts_with("[outrig] session closed: stopped, but some Python was cut off"));
+        assert!(cut.contains("[outrig]   execution 7: unknown\n"), "{cut}");
+        assert!(cut.contains("[outrig]   execution 9: ok\n"), "{cut}");
+        assert!(cut.contains("80 published; 3 were not shown here"), "{cut}");
+
+        let stuck = render_report(&Summary {
+            closed: Some("the Python interpreter exited (exit status: 1)".to_string()),
+            not_stopped: Some("the primary container: timed out".to_string()),
+            log: Some("2 agent event(s) could not be written".to_string()),
+            ..summary(Verdict::NotProvenStopped)
+        });
+        assert!(stuck.starts_with("[outrig] session closed: NOT proven stopped"), "{stuck}");
+        assert!(
+            stuck.contains("closed because the Python interpreter exited (exit status: 1)"),
+            "{stuck}"
+        );
+        assert!(stuck.contains("not proven stopped: the primary container: timed out"));
+        assert!(stuck.contains("[outrig] warning: 2 agent event(s)"), "{stuck}");
     }
 
     /// What a person needs before typing: the model, and that Python is ready

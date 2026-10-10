@@ -124,6 +124,19 @@ fn path_roots_are_first_segments_only() {
     );
 }
 
+/// Whether `root` names a type rather than a crate: `Self`, or a blanket
+/// impl's parameter, whose methods the snapshot prints as `F::method`. A crate
+/// name is lower-case, so an upper-case first letter is never one.
+fn is_type_parameter(root: &str) -> bool {
+    root.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+#[test]
+fn a_type_parameter_is_not_a_crate() {
+    assert!(is_type_parameter("Self") && is_type_parameter("F"));
+    assert!(!is_type_parameter("rig_core") && !is_type_parameter("outrig"));
+}
+
 #[test]
 fn the_public_surface_names_only_the_public_crates() {
     let leaked: Vec<String> = snapshot_items()
@@ -131,7 +144,7 @@ fn the_public_surface_names_only_the_public_crates() {
         .filter(|line| {
             path_roots(line)
                 .iter()
-                .any(|root| *root != "Self" && !PUBLIC_CRATES.contains(root))
+                .any(|root| !is_type_parameter(root) && !PUBLIC_CRATES.contains(root))
         })
         .collect();
     assert!(
@@ -139,5 +152,66 @@ fn the_public_surface_names_only_the_public_crates() {
         "a crate outside PUBLIC_CRATES reached the public surface, so a release of it \
          would be an outrig major:\n  {}",
         leaked.join("\n  ")
+    );
+}
+
+/// The session API is the public way into the agent loop, and the provisional
+/// entry point it replaced is gone: `outrig::harness` and its session are in
+/// the snapshot, and no `PythonAgent` or crate-root `UserChannel` is.
+#[test]
+fn the_harness_is_public_and_python_agent_is_gone() {
+    let items = snapshot_items();
+    for want in [
+        "pub mod outrig::harness",
+        "pub mod outrig::harness::event",
+        "pub struct outrig::harness::Session",
+        "pub struct outrig::harness::SessionBuilder",
+        "pub struct outrig::harness::ShutdownReport",
+        "pub struct outrig::harness::event::Subscription",
+    ] {
+        assert!(
+            items.iter().any(|line| line.ends_with(want)),
+            "the snapshot has no `{want}`"
+        );
+    }
+    let stale: Vec<&String> = items
+        .iter()
+        .filter(|line| line.contains("PythonAgent") || line.contains("outrig::UserChannel"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "the replaced entry point is still public: {stale:#?}"
+    );
+}
+
+/// Every history, view and event type the harness publishes takes a field or a
+/// variant without a break: `#[non_exhaustive]`, so an embedder reads them and
+/// constructs none. The exceptions have private fields, which is the same
+/// promise: an id, an agent's name, and a subscription.
+#[test]
+fn every_harness_event_type_grows_without_a_break() {
+    const PRIVATE_FIELDS: &[&str] = &[
+        "outrig::harness::event::AttemptId",
+        "outrig::harness::event::CallId",
+        "outrig::harness::event::ExecId",
+        "outrig::harness::event::MessageId",
+        "outrig::harness::event::Subject",
+        "outrig::harness::event::Subscription",
+    ];
+    let open: Vec<String> = snapshot_items()
+        .into_iter()
+        .filter(|line| {
+            (line.starts_with("pub struct outrig::harness::event::")
+                || line.starts_with("pub enum outrig::harness::event::"))
+                && !PRIVATE_FIELDS.iter().any(|name| {
+                    line.split_whitespace()
+                        .nth(2)
+                        .is_some_and(|item| item.trim_end_matches("(_)") == *name)
+                })
+        })
+        .collect();
+    assert!(
+        open.is_empty(),
+        "a harness event type a later field or variant would break: {open:#?}"
     );
 }

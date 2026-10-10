@@ -1,41 +1,42 @@
-//! The agent event log: what a session's agents did, one record per line of
-//! `<log_dir>/events.jsonl`.
+//! The session's event stream: what its agents did, and what was done to
+//! them, numbered as it happens and handed to every subscriber.
 //!
-//! One stream rather than a file per subject, because an agent's timeline is a
-//! causal chain -- a model call produced this code, which printed this, which
-//! sent this message -- and recovering that order by joining files on their
-//! timestamps fails exactly when it is needed. Every record is numbered and
-//! queued in one step, so the file's order is the order they happened in.
+//! The catalog is public, in [`crate::harness::event`]; this is the part that
+//! publishes it. [`Events::emit`] numbers an event and hands it to each
+//! subscriber's queue under one lock, so every subscriber sees the same order,
+//! and it never waits: a queue that is full drops its oldest event and counts
+//! it, for its reader to be told. Nothing a subscriber does -- a stalled disk
+//! under the event log, an embedder that stops reading -- can hold up a round,
+//! an execution, or a shutdown.
 //!
-//! The envelope is CloudEvents 1.0 and the payloads are OutRig's. The top
-//! level carries the standard context attributes and nothing else, because
-//! CloudEvents attribute names are lower-case letters and digits only:
-//! everything OutRig-specific is inside `data`. `doc/reference/events.md` is
-//! the schema.
+//! `<log_dir>/events.jsonl` is written by one such subscriber
+//! ([`StreamBuilder::record`]). The envelope is CloudEvents 1.0 and the
+//! payloads are OutRig's. The top level carries the standard context
+//! attributes and nothing else, because CloudEvents attribute names are
+//! lower-case letters and digits only: everything OutRig-specific is inside
+//! `data`. `doc/reference/events.md` is the schema.
 //!
-//! # Recording is not allowed to change what it records
+//! # The log's backpressure is its own
 //!
-//! The file is written by a [`LineSink`], and [`Events::emit`] never waits on
-//! it: the places that emit include the task reading the interpreter's
-//! replies, whose stalling would make healthy Python look stuck to the
-//! liveness check, and the path a Ctrl-C takes. Where waiting is harmless --
-//! the model loop and the Python tool -- [`Events::ready`] waits for the
-//! writer to catch up first, which is how a stalled disk slows the agent down
-//! rather than losing its record. The queue holds four times what `ready`
-//! waits for, and an event that finds even that full is the sink's to count
-//! lost, which [`Events::close`] reports with everything else the file did not
-//! get.
+//! The writer takes an event from its subscription only once the file has
+//! room for it, so a disk that falls behind leaves events waiting in that
+//! subscription, whose overflow is a counted gap -- never in the session. A
+//! gap shows in the file as a jump in `id`, and [`Events::close`] reports it
+//! with everything else the file did not get.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rig::completion::{Message, ToolDefinition};
 use serde::Serialize;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
-use crate::config::RoleAlternation;
 use crate::error::{IoPathExt, OutrigError, Result};
-use crate::line_sink::{self, Labels, LineSink, Loss, Room};
-use crate::python::host::{Background, ExecId};
+use crate::harness::LogLoss;
+use crate::harness::event::{Event, Payload, Received, Subject, Subscription, TryRecvError};
+use crate::line_sink::{self, Labels, LineSink, Loss};
 
 /// The log's name under the session's log directory.
 pub(crate) const EVENTS_LOG: &str = "events.jsonl";
@@ -44,15 +45,11 @@ pub(crate) const EVENTS_LOG: &str = "events.jsonl";
 /// have printed, which is a different sensitivity from a connection log.
 const MODE: u32 = 0o600;
 
-/// How many events may wait for the writer before one that cannot wait is
-/// lost. [`Events::ready`] waits at a quarter of this.
-const QUEUE: usize = 4 * line_sink::QUEUE;
-
 /// The type prefix: the reverse-DNS name OutRig's labels already use.
 const TYPE_PREFIX: &str = "org.outrig.";
 
-/// The `subject` of an event that belongs to an agent: the protocol's id for
-/// the one agent a session runs.
+/// The protocol's id for the one agent a session runs: the `subject` of an
+/// event that belongs to it, and the end a message to or from it names.
 pub(crate) const PRIMARY_SUBJECT: &str = "agent/primary";
 
 static EVENT_LABELS: Labels = Labels {
@@ -62,53 +59,369 @@ static EVENT_LABELS: Labels = Labels {
     error: |args| tracing::error!(target: "outrig::events", "{args}"),
 };
 
-/// Where an agent's events go. Cheap to clone; every clone emits into the one
-/// log. [`Events::off`] emits nowhere, and is what a session that did not ask
-/// for the log holds.
+/// Where a session's events go. Cheap to clone; every clone publishes into
+/// the one stream. [`Events::off`] publishes nowhere, and is what a session
+/// with no subscriber holds.
 #[derive(Clone, Default)]
 pub(crate) struct Events {
-    handle: Option<Arc<Handle>>,
+    stream: Option<Arc<Stream>>,
 }
 
-struct Handle {
-    path: PathBuf,
-    /// The session, as a CloudEvents `source`.
-    source: String,
-    /// How far behind the writer is, without a sender to keep it open.
-    room: Room<()>,
-    writer: Mutex<Writer>,
+struct Stream {
+    /// What numbering and handing out share: the one lock `emit` takes.
+    published: Mutex<Published>,
+    /// The embedder's subscriptions, in the order they were made, then the
+    /// log's.
+    queues: Box<[Arc<Queue>]>,
+    /// How many of `queues` are the embedder's.
+    subscribers: usize,
+    /// The log's writer, until a close takes it.
+    file: Mutex<Option<FileWriter>>,
 }
 
-/// What numbering and queueing share, under one lock.
-struct Writer {
+struct Published {
     /// The id the last event was given. Ids start at 1.
     last: u64,
-    /// The sink, until [`Events::close`] takes it. This is its only sender,
-    /// so the last handle dropping lets the writer finish on its own.
-    sink: Option<LineSink<()>>,
+    /// Set once the stream has ended: nothing more is numbered.
+    closed: bool,
+}
+
+/// How a session's stream was delivered, as far as it had got.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    /// The id of the last event published.
+    pub(crate) last: u64,
+    /// How many events each of the embedder's subscriptions lost, in the order
+    /// they were made.
+    pub(crate) missed: Vec<u64>,
 }
 
 impl Events {
-    /// No log: every emit is dropped, and nothing waits.
+    /// No subscriber: every emit is dropped.
     pub(crate) fn off() -> Self {
         Self::default()
     }
 
-    /// Whether events go anywhere.
+    /// Whether events go anywhere. Fixed when the stream is built, so a caller
+    /// can skip building an event nobody will receive.
     pub(crate) fn is_on(&self) -> bool {
-        self.handle.is_some()
+        self.stream.is_some()
     }
 
-    /// Open `<log_dir>/events.jsonl` for the session `source` names.
+    /// Publish `payload`, now. Never waits: a subscriber with no room loses its
+    /// oldest event instead, and one emitted after the stream ended is
+    /// dropped, there being nobody left to hand it to.
+    pub(crate) fn emit(&self, payload: Payload) {
+        if let Some(stream) = &self.stream {
+            stream.publish(payload, false);
+        }
+    }
+
+    /// [`Events::emit`] the payload `build` makes, building it only when
+    /// someone subscribes: for one that copies what it carries.
+    pub(crate) fn emit_with(&self, build: impl FnOnce() -> Payload) {
+        if let Some(stream) = &self.stream {
+            stream.publish(build(), false);
+        }
+    }
+
+    /// Publish `last` as the stream's final event, and end it there, in one
+    /// step: an event emitted concurrently lands before it or not at all.
+    /// Then finish the log -- see [`Events::close`].
+    pub(crate) async fn close_after(&self, last: Payload) -> std::result::Result<(), LogLoss> {
+        match &self.stream {
+            Some(stream) => {
+                stream.publish(last, true);
+                stream.finish().await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// End the stream, and wait until the log holds every event it was given
+    /// -- at most [`line_sink::SHUTDOWN_GRACE`]. What it does not hold by then
+    /// is reported, counted, rather than waited for. A subscription keeps what
+    /// it holds, and reads to the end of it. A session ends its stream with
+    /// [`Events::close_after`] instead.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) -> std::result::Result<(), LogLoss> {
+        match &self.stream {
+            Some(stream) => {
+                stream.end();
+                stream.finish().await
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// How far the stream has got, and what each of the embedder's
+    /// subscriptions has lost. Final once the stream has ended.
+    pub(crate) fn tally(&self) -> Tally {
+        let Some(stream) = &self.stream else {
+            return Tally::default();
+        };
+        Tally {
+            last: lock(&stream.published).last,
+            missed: stream.queues[..stream.subscribers]
+                .iter()
+                .map(|queue| queue.missed())
+                .collect(),
+        }
+    }
+}
+
+impl Stream {
+    /// Number `payload` and hand it to every queue; with `last`, end the stream
+    /// behind it.
+    fn publish(&self, payload: Payload, last: bool) {
+        // Built before the lock every emitter shares, and given its place
+        // under it.
+        let subject = payload.subject();
+        let mut event = Arc::new(Event {
+            id: 0,
+            time: UNIX_EPOCH,
+            subject,
+            payload,
+        });
+        let mut evicted = Vec::new();
+        {
+            let mut published = lock(&self.published);
+            if published.closed {
+                tracing::debug!(
+                    target: "outrig::events",
+                    "not published, the stream having ended: {}",
+                    event.kind()
+                );
+                return;
+            }
+            published.last += 1;
+            let fresh = Arc::get_mut(&mut event).expect("nothing else holds it yet");
+            fresh.id = published.last;
+            fresh.time = SystemTime::now();
+            for queue in &self.queues {
+                evicted.extend(queue.push(&event));
+            }
+            if last {
+                self.end_locked(&mut published);
+            }
+        }
+        // Freed outside the lock: an evicted turn can be large.
+        drop(evicted);
+    }
+
+    /// End the stream: nothing more is numbered, and every queue is closed.
+    #[cfg(test)]
+    fn end(&self) {
+        self.end_locked(&mut lock(&self.published));
+    }
+
+    fn end_locked(&self, published: &mut Published) {
+        published.closed = true;
+        self.queues.iter().for_each(|queue| queue.close());
+    }
+
+    /// Finish the log, once; a second call has nothing to report.
+    async fn finish(&self) -> std::result::Result<(), LogLoss> {
+        let file = lock(&self.file).take();
+        match file {
+            Some(file) => file.close().await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// A stream dropped without a close still ends every subscription, and lets
+/// the log's writer finish in the background.
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.queues.iter().for_each(|queue| queue.close());
+    }
+}
+
+/// One subscriber's queue: the events it has not taken, oldest first, and
+/// what it lost.
+pub(crate) struct Queue {
+    capacity: usize,
+    buffer: Mutex<Buffer>,
+    /// Woken by each event pushed, and by the close.
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct Buffer {
+    events: VecDeque<Arc<Event>>,
+    /// Dropped since the reader last took anything, and not yet told.
+    unreported: u64,
+    /// Dropped in all.
+    missed: u64,
+    closed: bool,
+}
+
+impl Queue {
+    fn new(capacity: usize) -> Arc<Self> {
+        assert!(capacity > 0, "a subscription holds at least one event");
+        Arc::new(Self {
+            capacity,
+            buffer: Mutex::new(Buffer::default()),
+            ready: Notify::new(),
+        })
+    }
+
+    /// Hold `event` for the reader, dropping the oldest held if there is no
+    /// room; that one is handed back, for the caller to free. Never waits.
+    fn push(&self, event: &Arc<Event>) -> Option<Arc<Event>> {
+        let mut buffer = lock(&self.buffer);
+        if buffer.closed {
+            return None;
+        }
+        let evicted = if buffer.events.len() == self.capacity {
+            buffer.unreported += 1;
+            buffer.missed += 1;
+            buffer.events.pop_front()
+        } else {
+            None
+        };
+        buffer.events.push_back(Arc::clone(event));
+        drop(buffer);
+        // One reader, so a permit stored for it is never lost.
+        self.ready.notify_one();
+        evicted
+    }
+
+    fn close(&self) {
+        lock(&self.buffer).closed = true;
+        self.ready.notify_one();
+    }
+
+    /// What the reader is owed next: what it lost, before the event after
+    /// it; then the oldest event held.
+    pub(crate) fn next(&self) -> std::result::Result<Received, TryRecvError> {
+        let mut buffer = lock(&self.buffer);
+        if buffer.unreported > 0 {
+            return Ok(Received::Missed(std::mem::take(&mut buffer.unreported)));
+        }
+        match buffer.events.pop_front() {
+            Some(event) => Ok(Received::Event(event)),
+            None if buffer.closed => Err(TryRecvError::Closed),
+            None => Err(TryRecvError::Empty),
+        }
+    }
+
+    /// [`Queue::next`], waiting for it; `None` once closed and empty. Only
+    /// `next` takes anything, so dropping this takes nothing.
+    pub(crate) async fn recv(&self) -> Option<Received> {
+        loop {
+            match self.next() {
+                Ok(received) => return Some(received),
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) => self.ready.notified().await,
+            }
+        }
+    }
+
+    pub(crate) fn missed(&self) -> u64 {
+        lock(&self.buffer).missed
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Give up on what is held: how many were dropped and not yet told, and
+    /// how many were held and not taken.
+    fn abandon(&self) -> (u64, u64) {
+        let mut buffer = lock(&self.buffer);
+        buffer.closed = true;
+        let unread = buffer.events.len() as u64;
+        buffer.events.clear();
+        (std::mem::take(&mut buffer.unreported), unread)
+    }
+}
+
+/// What a session's stream will be: its subscriptions and its log, made before
+/// the first event so each sees every one.
+#[derive(Default)]
+pub(crate) struct StreamBuilder {
+    queues: Vec<Arc<Queue>>,
+    file: Option<FileWriter>,
+}
+
+impl StreamBuilder {
+    /// A subscription holding at most `capacity` events for its reader.
+    pub(crate) fn subscribe(&mut self, capacity: usize) -> Subscription {
+        let queue = Queue::new(capacity);
+        self.queues.push(Arc::clone(&queue));
+        Subscription::new(queue)
+    }
+
+    /// Record the stream in `<log_dir>/events.jsonl` for the session `source`
+    /// names.
     ///
     /// A log that already holds a recording is refused, and left as it is.
     /// Its events carry this `source` with ids from 1, as a second recording's
-    /// would -- an agent started again on the same session -- and a reader
+    /// would -- a session started again in the same directory -- and a reader
     /// that takes `source` and `id` as an event's identity, as CloudEvents
     /// says to, would drop the second's as repeats.
-    pub(crate) async fn open(log_dir: &Path, source: String) -> Result<Self> {
+    pub(crate) async fn record(&mut self, log_dir: &Path, source: String) -> Result<()> {
+        self.file = Some(FileWriter::open(log_dir, source).await?);
+        Ok(())
+    }
+
+    /// Record into `sink`, which writes `path`.
+    #[cfg(test)]
+    pub(crate) fn record_over(&mut self, sink: LineSink<()>, path: PathBuf, source: String) {
+        self.file = Some(FileWriter::over(sink, path, source));
+    }
+
+    /// The stream, or [`Events::off`] when nothing subscribed.
+    pub(crate) fn build(mut self) -> Events {
+        let mut queues = std::mem::take(&mut self.queues);
+        let subscribers = queues.len();
+        let file = self.file.take();
+        if let Some(file) = &file {
+            queues.push(Arc::clone(&file.queue));
+        }
+        if queues.is_empty() {
+            return Events::off();
+        }
+        Events {
+            stream: Some(Arc::new(Stream {
+                published: Mutex::new(Published {
+                    last: 0,
+                    closed: false,
+                }),
+                queues: queues.into_boxed_slice(),
+                subscribers,
+                file: Mutex::new(file),
+            })),
+        }
+    }
+}
+
+/// A builder dropped unbuilt -- a session that failed to start -- ends its
+/// subscriptions, and lets go of its log.
+impl Drop for StreamBuilder {
+    fn drop(&mut self) {
+        self.queues.iter().for_each(|queue| queue.close());
+        if let Some(file) = &self.file {
+            file.queue.close();
+        }
+    }
+}
+
+/// `events.jsonl`'s writer: a subscription of its own, and the task that
+/// takes from it into the file.
+struct FileWriter {
+    path: PathBuf,
+    queue: Arc<Queue>,
+    sink: LineSink<()>,
+    task: JoinHandle<()>,
+}
+
+impl FileWriter {
+    async fn open(log_dir: &Path, source: String) -> Result<Self> {
         let path = log_dir.join(EVENTS_LOG);
-        let sink = LineSink::open(&path, Some(MODE), QUEUE, &EVENT_LABELS).await?;
+        let sink = LineSink::open(&path, Some(MODE), line_sink::QUEUE, &EVENT_LABELS).await?;
         // Read under the claim the sink holds, so nothing appends in between.
         // Dropping the sink on the error lets its writer end and the claim go.
         let held = tokio::fs::metadata(&path)
@@ -126,89 +439,59 @@ impl Events {
         Ok(Self::over(sink, path, source))
     }
 
-    /// Emit into `sink`, which writes `path`.
+    /// Write what a fresh subscription receives into `sink`, which writes
+    /// `path`.
     fn over(sink: LineSink<()>, path: PathBuf, source: String) -> Self {
+        let queue = Queue::new(crate::harness::event::DEFAULT_CAPACITY);
+        let task = tokio::spawn(write_events(
+            Subscription::new(Arc::clone(&queue)),
+            sink.clone(),
+            source,
+        ));
         Self {
-            handle: Some(Arc::new(Handle {
-                path,
-                source,
-                room: sink.room(),
-                writer: Mutex::new(Writer {
-                    last: 0,
-                    sink: Some(sink),
-                }),
-            })),
+            path,
+            queue,
+            sink,
+            task,
         }
     }
 
-    /// Wait until the writer has caught up to within a quarter of its queue.
-    /// Called where pausing is harmless, ahead of what will emit, so a writer
-    /// that has fallen behind holds up the agent rather than losing its
-    /// record.
-    pub(crate) async fn ready(&self) {
-        if let Some(handle) = &self.handle {
-            handle.room.below(line_sink::QUEUE as u64).await;
+    /// Wait for the writer to take what its subscription holds and the file
+    /// to hold it, all within one [`line_sink::SHUTDOWN_GRACE`], and report
+    /// everything the file did not get: what the subscription lost, what was
+    /// left unread, what failed to write, and what the sink still held.
+    async fn close(mut self) -> std::result::Result<(), LogLoss> {
+        let deadline = tokio::time::Instant::now() + line_sink::SHUTDOWN_GRACE;
+        self.queue.close();
+        if tokio::time::timeout_at(deadline, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
         }
-    }
-
-    /// Record `event`, now. Never waits: an event there is no room for is
-    /// counted lost instead, and one emitted after [`Events::close`] is
-    /// dropped, there being no file to report it to.
-    pub(crate) fn emit(&self, event: Event<'_>) {
-        let Some(handle) = &self.handle else {
-            return;
-        };
-        // Encoded before the lock every emitter shares.
-        let data = serde_json::to_vec(&event);
-        let mut writer = lock(&handle.writer);
-        let Writer { last, sink } = &mut *writer;
-        let Some(sink) = sink else {
-            tracing::debug!(
-                target: "outrig::events",
-                "not recorded, the log having closed: {}",
-                event.kind()
-            );
-            return;
-        };
-        let line = match data {
-            Ok(data) => envelope(*last + 1, &handle.source, &event, &data),
-            Err(e) => {
-                let why = format!("encoding {} failed: {e}", event.kind());
-                tracing::warn!(target: "outrig::events", "{why}");
-                sink.lose(&(), std::io::Error::other(why));
-                return;
-            }
-        };
-        // Numbered and queued under one lock, so an event's id is its place
-        // in the file; an id is spent only on an event that was queued.
-        if sink.try_enqueue((), line, || {
-            format!("more than {QUEUE} events were waiting for the agent event writer")
-        }) {
-            *last += 1;
-        }
-    }
-
-    /// Stop taking events, and wait until the file holds every one it was
-    /// given -- at most [`line_sink::SHUTDOWN_GRACE`]. What it does not hold by
-    /// then is reported, counted, rather than waited for.
-    pub(crate) async fn close(&self) -> std::result::Result<(), EventsUnwritten> {
-        let Some(handle) = &self.handle else {
-            return Ok(());
-        };
-        let Some(mut sink) = lock(&handle.writer).sink.take() else {
-            return Ok(());
-        };
+        let (unreported, unread) = self.queue.abandon();
+        self.sink.lose_many(&(), unreported, behind());
+        self.sink.lose_many(
+            &(),
+            unread,
+            std::io::Error::other(format!(
+                "the agent event writer did not take them within {:?}, so they were never \
+                 written",
+                line_sink::SHUTDOWN_GRACE
+            )),
+        );
         // A writer that had to be stopped holding nothing lost nothing, so
         // only what the sink counted is reported.
-        let _ = sink.close().await;
-        match sink.take_loss(&()) {
+        let _ = self.sink.close_by(deadline).await;
+        match self.sink.take_loss(&()) {
             None => Ok(()),
             Some(Loss {
                 records,
                 source,
                 integrity,
-            }) => Err(EventsUnwritten {
-                path: handle.path.clone(),
+            }) => Err(LogLoss {
+                path: self.path,
                 records,
                 first: source.to_string(),
                 integrity: integrity.map(|why| why.to_string()),
@@ -217,369 +500,77 @@ impl Events {
     }
 }
 
-/// One record: the CloudEvents context attributes, then `data`.
-fn envelope(id: u64, source: &str, event: &Event<'_>, data: &[u8]) -> Vec<u8> {
+/// Why events the writer's subscription dropped were lost.
+fn behind() -> std::io::Error {
+    std::io::Error::other(format!(
+        "the agent event writer fell more than {} events behind the session",
+        crate::harness::event::DEFAULT_CAPACITY
+    ))
+}
+
+/// Take each event from `events` into `sink` as one line, once the file has
+/// room for it -- the writer's own backpressure, which stops at its
+/// subscription.
+async fn write_events(mut events: Subscription, sink: LineSink<()>, source: String) {
+    let room = sink.room();
+    loop {
+        room.below(line_sink::QUEUE as u64).await;
+        // No await between taking an event and queueing it, so a writer
+        // stopped at either await loses nothing it does not count.
+        match events.recv().await {
+            None => return,
+            Some(Received::Missed(lost)) => sink.lose_many(&(), lost, behind()),
+            Some(Received::Event(event)) => match envelope(&event, &source) {
+                Ok(line) => {
+                    sink.try_enqueue((), line, || {
+                        format!(
+                            "more than {} events were waiting for the agent event writer",
+                            line_sink::QUEUE
+                        )
+                    });
+                }
+                Err(e) => {
+                    let why = format!("encoding {} failed: {e}", event.kind());
+                    tracing::warn!(target: "outrig::events", "{why}");
+                    sink.lose(&(), std::io::Error::other(why));
+                }
+            },
+        }
+    }
+}
+
+/// One record: the CloudEvents context attributes, then `data`, on a line.
+fn envelope(event: &Event, source: &str) -> serde_json::Result<Vec<u8>> {
     #[derive(Serialize)]
-    struct Context<'a> {
+    struct Record<'a> {
         specversion: &'static str,
         id: String,
         source: &'a str,
         #[serde(rename = "type")]
         kind: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        subject: Option<&'static str>,
+        subject: Option<&'a str>,
         time: String,
         datacontenttype: &'static str,
+        data: &'a Payload,
     }
-    let context = Context {
+    let time = jiff::Timestamp::try_from(event.time).unwrap_or_else(|_| jiff::Timestamp::now());
+    let mut line = serde_json::to_vec(&Record {
         specversion: "1.0",
-        id: id.to_string(),
+        id: event.id.to_string(),
         source,
         kind: format!("{TYPE_PREFIX}{}", event.kind()),
-        subject: event.subject(),
-        time: jiff::Timestamp::now()
-            .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string(),
+        subject: event.subject.as_ref().map(Subject::as_str),
+        time: time.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
         datacontenttype: "application/json",
-    };
-    let mut line = serde_json::to_vec(&context).expect("the context attributes are plain strings");
-    // `}` replaced by `data` and a closing brace: the payload was encoded once,
-    // ahead of the lock this runs under.
-    line.pop();
-    line.reserve(data.len() + 10);
-    line.extend_from_slice(b",\"data\":");
-    line.extend_from_slice(data);
-    line.extend_from_slice(b"}\n");
-    line
+        data: &event.payload,
+    })?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Events the log could not keep: how many, why the first was lost, and --
-/// when the writer could not prove its rollback -- why the file may hold a
-/// partial record.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{records} agent event(s) could not be written to {}; the first was lost because: {first}{}",
-    path.display(),
-    match integrity {
-        Some(why) => format!(
-            "\n  and the log may hold a partial record that could not be removed: {why}"
-        ),
-        None => String::new(),
-    }
-)]
-pub(crate) struct EventsUnwritten {
-    pub(crate) path: PathBuf,
-    pub(crate) records: u64,
-    /// Why the first was lost.
-    pub(crate) first: String,
-    pub(crate) integrity: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// The catalog. Each event's `data` is the variant's fields, as they are
-// named here; `doc/reference/events.md` says what each means and which of
-// the three categories it belongs to.
-
-/// Something an agent did, or something done to it.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-pub(crate) enum Event<'a> {
-    // Model view: what a model call was presented, or produced.
-    ModelInstructions {
-        model: &'a str,
-        preamble: &'a str,
-        tools: &'a [ToolDefinition],
-        max_tokens: Option<u32>,
-    },
-    TurnCommitted {
-        turn: usize,
-        round: u32,
-        incomplete: bool,
-        messages: &'a [Message],
-    },
-    ModelCall(ModelCall<'a>),
-    ExecSubmitted {
-        execid: ExecId,
-        source: &'a str,
-    },
-
-    // Execution diagnostics: the runtime's own state.
-    AgentStarted {
-        model: &'a str,
-        python: &'a str,
-        container: &'a str,
-        tool_call_max: usize,
-        tool_result_max: usize,
-    },
-    AgentStopped {},
-    RoundStarted {
-        round: u32,
-    },
-    ExecRefused {
-        execid: ExecId,
-        holder: ExecId,
-    },
-    ExecCompleted {
-        execid: ExecId,
-        status: &'static str,
-        duration: f64,
-        output: &'a str,
-        dropped: u64,
-        error: Option<&'a str>,
-        background: &'a [Background],
-    },
-    MemoryExhausted {
-        execid: ExecId,
-    },
-    ExecCancelSent {
-        execid: ExecId,
-    },
-    ExecInterruptSent {
-        execid: ExecId,
-        runaway: bool,
-    },
-    ExecProbeFailed {
-        execid: ExecId,
-        verdict: &'static str,
-    },
-    ExecAbandoned {
-        execid: ExecId,
-        why: &'static str,
-    },
-    InventoryObserved {
-        execid: ExecId,
-        names: Vec<Held<'a>>,
-        total: usize,
-        more: usize,
-    },
-    ToolResultTruncated {
-        execid: ExecId,
-        size: usize,
-        max: usize,
-        kept: usize,
-    },
-    ContextPromoted {
-        turns: &'a [u64],
-    },
-    ContextDemoted {
-        turns: &'a [u64],
-    },
-    OutputUnattributed {
-        text: &'a str,
-    },
-    InterpreterDiagnostic {
-        text: &'a str,
-    },
-    InterpreterExited {
-        cause: &'a str,
-    },
-
-    // Integration audit: what crossed to a provider, or across a channel.
-    ModelRoundCompleted {
-        round: u32,
-        stopped: Option<&'a str>,
-        usage: Usage,
-        calls: Vec<CallUsage>,
-        input_tokens_max: u64,
-    },
-    ModelRoundFailed {
-        round: u32,
-        error: &'a str,
-        calls: Vec<CallUsage>,
-    },
-    ModelRoundDropped {
-        round: u32,
-        calls: Vec<CallUsage>,
-    },
-    ModelRetry {
-        model: &'a str,
-        attempt: u32,
-        delay: f64,
-        error: &'a str,
-    },
-    ModelFailover {
-        from: &'a str,
-        to: &'a str,
-        error: &'a str,
-    },
-    MessageSent {
-        message: ExecId,
-        channel: &'a str,
-        from: &'a str,
-        to: &'a str,
-        body: &'a str,
-    },
-    MessageRefused {
-        message: ExecId,
-        channel: &'a str,
-        from: &'a str,
-        to: &'a str,
-        reason: &'a str,
-    },
-    MessageReceived {
-        message: ExecId,
-        channel: &'a str,
-        from: &'a str,
-        to: &'a str,
-    },
-}
-
-impl Event<'_> {
-    /// The event's type, after `org.outrig.`.
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Event::ModelInstructions { .. } => "model.instructions",
-            Event::TurnCommitted { .. } => "turn.committed",
-            Event::ModelCall(_) => "model.call",
-            Event::ExecSubmitted { .. } => "exec.submitted",
-            Event::AgentStarted { .. } => "agent.started",
-            Event::AgentStopped {} => "agent.stopped",
-            Event::RoundStarted { .. } => "round.started",
-            Event::ExecRefused { .. } => "exec.refused",
-            Event::ExecCompleted { .. } => "exec.completed",
-            Event::MemoryExhausted { .. } => "memory.exhausted",
-            Event::ExecCancelSent { .. } => "exec.cancel.sent",
-            Event::ExecInterruptSent { .. } => "exec.interrupt.sent",
-            Event::ExecProbeFailed { .. } => "exec.probe.failed",
-            Event::ExecAbandoned { .. } => "exec.abandoned",
-            Event::InventoryObserved { .. } => "inventory.observed",
-            Event::ToolResultTruncated { .. } => "tool.result.truncated",
-            Event::ContextPromoted { .. } => "context.promoted",
-            Event::ContextDemoted { .. } => "context.demoted",
-            Event::OutputUnattributed { .. } => "output.unattributed",
-            Event::InterpreterDiagnostic { .. } => "interpreter.diagnostic",
-            Event::InterpreterExited { .. } => "interpreter.exited",
-            Event::ModelRoundCompleted { .. } => "model.round.completed",
-            Event::ModelRoundFailed { .. } => "model.round.failed",
-            Event::ModelRoundDropped { .. } => "model.round.dropped",
-            Event::ModelRetry { .. } => "model.retry",
-            Event::ModelFailover { .. } => "model.failover",
-            Event::MessageSent { .. } => "message.sent",
-            Event::MessageRefused { .. } => "message.refused",
-            Event::MessageReceived { .. } => "message.received",
-        }
-    }
-
-    /// The agent the event belongs to, or `None` for one that belongs to the
-    /// interpreter every agent shares.
-    fn subject(&self) -> Option<&'static str> {
-        match self {
-            Event::OutputUnattributed { .. }
-            | Event::InterpreterDiagnostic { .. }
-            | Event::InterpreterExited { .. } => None,
-            _ => Some(PRIMARY_SUBJECT),
-        }
-    }
-}
-
-/// One model call's manifest: what it was sent of the conversation, and why.
-#[derive(Debug, Serialize)]
-pub(crate) struct ModelCall<'a> {
-    pub(crate) call: u64,
-    pub(crate) round: u32,
-    pub(crate) budget: CallBudget<'a>,
-    pub(crate) estimate: u64,
-    pub(crate) carried: Vec<Chosen>,
-    pub(crate) evicted: Vec<Chosen>,
-    pub(crate) withheld: Vec<Chosen>,
-    pub(crate) opening: Option<&'a Message>,
-    pub(crate) adjacent: Vec<Repeat>,
-    pub(crate) left_out: Vec<LeftOut>,
-}
-
-/// A part of a carried turn a call was not sent, by its place: the turn, the
-/// message within it, and the part within that.
-#[derive(Debug, Serialize)]
-pub(crate) struct LeftOut {
-    pub(crate) turn: usize,
-    pub(crate) message: usize,
-    pub(crate) part: usize,
-}
-
-/// What a call was held to, in tokens.
-#[derive(Debug, Serialize)]
-pub(crate) struct CallBudget<'a> {
-    pub(crate) model: &'a str,
-    pub(crate) window: u32,
-    pub(crate) window_assumed: bool,
-    pub(crate) reserve: u32,
-    pub(crate) overhead: u64,
-    pub(crate) max_tokens: Option<u32>,
-    pub(crate) role_alternation: RoleAlternation,
-}
-
-/// A turn a call carried or left out, and the reason it was chosen.
-#[derive(Debug, Serialize)]
-pub(crate) struct Chosen {
-    pub(crate) turn: usize,
-    pub(crate) why: &'static str,
-}
-
-/// Where one role follows itself in what a call was sent.
-#[derive(Debug, Serialize)]
-pub(crate) struct Repeat {
-    pub(crate) turn: Option<usize>,
-    pub(crate) role: &'static str,
-}
-
-/// A name the agent's namespace holds, and its value's type.
-#[derive(Debug, Serialize)]
-pub(crate) struct Held<'a> {
-    pub(crate) name: &'a str,
-    #[serde(rename = "type")]
-    pub(crate) kind: &'a str,
-}
-
-/// Tokens, as the provider reported them. Zeros mean it reported none.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct Usage {
-    pub(crate) input_tokens: u64,
-    pub(crate) output_tokens: u64,
-    pub(crate) total_tokens: u64,
-    pub(crate) cached_input_tokens: u64,
-    pub(crate) cache_creation_input_tokens: u64,
-    pub(crate) reasoning_tokens: u64,
-}
-
-/// A round's tokens are its calls' added up.
-impl std::iter::Sum for Usage {
-    fn sum<I: Iterator<Item = Usage>>(calls: I) -> Usage {
-        calls.fold(Usage::default(), |sum, call| Usage {
-            input_tokens: sum.input_tokens + call.input_tokens,
-            output_tokens: sum.output_tokens + call.output_tokens,
-            total_tokens: sum.total_tokens + call.total_tokens,
-            cached_input_tokens: sum.cached_input_tokens + call.cached_input_tokens,
-            cache_creation_input_tokens: sum.cache_creation_input_tokens
-                + call.cache_creation_input_tokens,
-            reasoning_tokens: sum.reasoning_tokens + call.reasoning_tokens,
-        })
-    }
-}
-
-impl From<rig::completion::Usage> for Usage {
-    fn from(usage: rig::completion::Usage) -> Self {
-        Self {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-        }
-    }
-}
-
-/// One model call's tokens, by its place in the round, and the model that
-/// answered it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CallUsage {
-    pub(crate) index: usize,
-    pub(crate) model: String,
-    pub(crate) usage: Usage,
 }
 
 #[cfg(test)]
@@ -601,11 +592,14 @@ mod testing {
     /// The `source` of a test's log.
     pub(crate) const TEST_SOURCE: &str = "/outrig/session/test";
 
-    /// A log in `dir`, as `PythonAgent::start` opens one.
+    /// A stream recording to a log in `dir`, as a session opens one.
     pub(crate) async fn opened(dir: &Path) -> Events {
-        Events::open(dir, TEST_SOURCE.to_string())
+        let mut stream = super::StreamBuilder::default();
+        stream
+            .record(dir, TEST_SOURCE.to_string())
             .await
-            .expect("open the log")
+            .expect("open the log");
+        stream.build()
     }
 
     /// Wait until nothing holds the lock on `log_dir`'s closed log, for a test
