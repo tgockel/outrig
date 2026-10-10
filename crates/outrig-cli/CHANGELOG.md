@@ -60,6 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A panic a task survives no longer removes the session's containers.** outrig's panic hook
+  removed every container the process had started on any panic -- including one in a subagent
+  round, an MCP connection, or the sidecar watcher, which `outrig run` and `outrig mcp` carry on
+  from -- so the session would have gone on against containers that were gone. Only a panic
+  that ends outrig sweeps them now. No panic that reaches this is known; the path is closed
+  rather than a crash fixed. (#349)
+
 - **A line of input that is not valid UTF-8 no longer ends `outrig run`.** One byte that was
   not UTF-8 failed the read with `error: stream did not contain valid UTF-8`, exit 1, and the
   containers were torn down, so `outrig run < prompts.txt` with a single Latin-1 byte never ran

@@ -836,7 +836,8 @@ pub struct ToolHandle {
 /// attached. Construct via [`Outrig::launch`]; grow via
 /// [`Outrig::add_sidecar`]; clean up via [`Outrig::shutdown`]. Dropping
 /// without `shutdown` still removes every container via a detached
-/// `podman rm -f` (plus the panic-hook sweeper if the host installed it).
+/// `podman rm -f` (plus the panic sweep, if the host runs under
+/// [`crate::container::with_panic_sweep`]).
 pub struct Outrig {
     /// Containers this session still owns for cleanup only.
     ///

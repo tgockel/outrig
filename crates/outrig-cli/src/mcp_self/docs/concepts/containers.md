@@ -439,13 +439,15 @@ so `outrig clean` sweeps a library session's strays the same way.)
 
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
 after the primary and stop before it, and the same four cleanup layers -- explicit stop, the
-name guard, Drop, and the panic-hook sweep -- cover every container. In addition, sessions with
-sidecars run a `podman events` watcher on the primary: if the primary dies out from under
-outrig (manual `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an
-error. It reaps by `org.outrig.instance`, a per-container label whose value is unique to the
-session, rather than by container name -- a sidecar dies at the same moment the primary does
-and `--rm` frees its name on the spot, so a removal that resolved a name a moment later could
-reach whatever had taken it.
+name guard, Drop, and the panic sweep -- cover every container. The panic sweep acts only on a
+panic that ends outrig, never on one the session carries on from, such as a subagent round or an
+MCP connection whose task panicked. In addition, sessions with sidecars run a `podman events`
+watcher on the primary: if the primary dies out from under outrig (manual `podman kill`, OOM),
+the watcher reaps all sidecars and ends the session with an error. It reaps by
+`org.outrig.instance`, a per-container label whose value is unique to the session, rather than
+by container name -- a sidecar dies at the same moment the primary does and `--rm` frees its
+name on the spot, so a removal that resolved a name a moment later could reach whatever had
+taken it.
 A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
 sweeps stopped, record-less containers carrying `org.outrig.session`; see
 [Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
@@ -468,7 +470,7 @@ create that collided made nothing carrying it, and a cleanup still in flight can
 container you have since started under the same name. Labels are part of the creation request,
 so there is no instant in which the container exists without the mark that identifies it.
 
-**Every layer uses that selector**, not just the start guard. The panic-hook sweep used to hold
+**Every layer uses that selector**, not just the start guard. The panic sweep used to hold
 container *names* and remove by them, so a panic arriving while a start had collided would
 delete the container that already held the name -- one outrig never created. It now replays
 each outstanding attempt's label-scoped removal instead, and it tracks those attempts

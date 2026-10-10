@@ -152,21 +152,24 @@ pub fn run() -> ExitCode {
     init_tracing(cli.verbose);
     raise_descriptor_limit();
 
+    // The hook is the panic sweep only in an abort build; in this one, the
+    // sweep is a panic leaving everything below.
     outrig::container::install_panic_hook();
-
-    tracing::debug!("outrig starting");
-    match dispatch(&cli) {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
-        Err(e) => {
-            // A signal announced itself as it landed, and the terminal it
-            // would be reported to may be gone.
-            if !matches!(e, CliError::Interrupted(_)) {
-                eprintln!("error: {e}");
+    outrig::container::with_panic_sweep(|| {
+        tracing::debug!("outrig starting");
+        match dispatch(&cli) {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(e) => {
+                // A signal announced itself as it landed, and the terminal it
+                // would be reported to may be gone.
+                if !matches!(e, CliError::Interrupted(_)) {
+                    eprintln!("error: {e}");
+                }
+                ExitCode::from(e.exit_code().clamp(0, 255) as u8)
             }
-            ExitCode::from(e.exit_code().clamp(0, 255) as u8)
         }
-    }
+    })
 }
 
 /// Drive a session command, then shut its runtime down without waiting on

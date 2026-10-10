@@ -104,7 +104,7 @@ get, a `plan/next/` entry.
 - Post-fork use of `std::net::*::bind` is a residual async-signal-safety risk in `nsfork`.
 - The panic-hook sweep removing by requested name is **no longer buffered** -- `0002-55` fixed it,
   and what that task could not reach is refiled as
-  `plan/next/panic-hook-sweep-is-never-driven-by-a-panic.md`,
+  `plan/next/panic-sweep-is-never-driven-end-to-end.md`,
   `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and #272.
 - The four-site `[security]` lowering (`plan/next/launch-spec-security-lowering.md`) is the same
   silent-drop class as `0002-41` and stays buffered: `0002-41` fixed a block that was not lowered

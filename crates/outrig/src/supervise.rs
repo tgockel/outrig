@@ -8,8 +8,8 @@
 //!
 //! Two properties come from being an ordinary OS process rather than a task:
 //!
-//! - It needs no tokio runtime, so it is callable from `Drop` and from a
-//!   panic hook -- the two places that have no runtime to lean on.
+//! - It needs no tokio runtime, so it is callable from `Drop` and from the
+//!   panic sweep -- the two places that have no runtime to lean on.
 //! - It runs to completion even if outrig's runtime is torn down, or outrig
 //!   itself exits, immediately afterwards. A spawned task would be cancelled
 //!   by either.
@@ -160,7 +160,7 @@ const REAP_BATCH: usize = 64;
 /// Run `cmd` as a detached cleanup process and take responsibility for
 /// reaping it.
 ///
-/// Synchronous and runtime-free: safe from `Drop` and from a panic hook. The
+/// Synchronous and runtime-free: safe from `Drop` and from the panic sweep. The
 /// exit status is unavailable by construction -- nobody is left to receive it
 /// -- so this is for obligations whose failure has nowhere to go. A caller
 /// that can await and wants the status should run the command through

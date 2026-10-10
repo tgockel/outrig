@@ -879,6 +879,7 @@ pub const outrig::container::PRIMARY_VIEW_NS_MOUNT: &str
 pub fn outrig::container::force_remove_detached(&str)
 pub fn outrig::container::install_panic_hook()
 pub fn outrig::container::sidecar_container_name(&str, &str) -> alloc::string::String
+pub fn outrig::container::with_panic_sweep<T>(impl core::ops::function::FnOnce() -> T) -> T
 pub mod outrig::error
 #[non_exhaustive] pub enum outrig::error::McpFailureKind
 pub outrig::error::McpFailureKind::Canceled

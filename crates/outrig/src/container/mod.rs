@@ -11,9 +11,10 @@
 //! 3. [`Drop`] -- best-effort detached `podman rm -f` if a `Container`
 //!    falls out of scope without `stop` being called (e.g. a future was
 //!    cancelled, an `?` propagated past the handle).
-//! 4. [`install_panic_hook`] -- last-resort replay of every outstanding
-//!    attempt's removal when the process is unwinding from a panic and `Drop`
-//!    cannot run.
+//! 4. The panic sweep -- last-resort replay of every outstanding attempt's
+//!    removal when a panic is ending the process: [`with_panic_sweep`] once
+//!    the panic has unwound out of `main`'s body, or [`install_panic_hook`] at
+//!    the panic site in a `panic = "abort"` build, where `Drop` never runs.
 //!
 //! All four select the container by the per-attempt `org.outrig.attempt` label
 //! rather than by the name that was asked for. A name is a request and podman
@@ -1368,7 +1369,7 @@ impl Drop for Container {
 /// between the name being chosen and a [`Container`] existing to own it.
 ///
 /// [`Drop`] for `Container` cannot cover that window -- there is no
-/// `Container` yet -- and the panic hook only fires on a panic, so a cancelled
+/// `Container` yet -- and the panic sweep only runs on a panic, so a cancelled
 /// or failed create used to leave the name in `TRACKED` forever and, if podman
 /// had already made the container, the container running with nothing that
 /// would remove it.
@@ -1418,7 +1419,7 @@ struct NameGuard {
 
 impl NameGuard {
     /// Reserve `name`, registering the obligation this attempt now owes so the
-    /// panic hook can discharge it too.
+    /// panic sweep can discharge it too.
     ///
     /// The guard keeps no copy of `name`. It is recorded against the token for
     /// [`is_tracked`] and diagnostics, and the guard cannot reach it -- so
@@ -1460,7 +1461,7 @@ impl Drop for NameGuard {
         }
         // Detached first, discharged second, never the reverse: a panic landing
         // between the two has to find the obligation still registered, so the
-        // hook re-issues a removal rather than finding nothing owed.
+        // sweep re-issues a removal rather than finding nothing owed.
         removal_by_attempt(&self.attempt).detach();
         discharge(&self.attempt);
     }
@@ -1885,21 +1886,23 @@ fn append_bind_mount(
 /// Every removal the panic sweep would issue right now, one per outstanding
 /// obligation and each scoped to the attempt that owes it.
 ///
-/// Separate from the hook for two reasons, the second of which is the one that
-/// was a defect. It lets the sweep be asserted on without a process panic. And
-/// it builds the commands under the lock and spawns them outside it: the hook
-/// used to `Command::spawn` -- and, through [`crate::supervise`], possibly start
-/// a thread -- while still holding the registry, from a panicking thread.
+/// Separate from the sweep for two reasons, the second of which is the one
+/// that was a defect. It lets the sweep be asserted on without a process
+/// panic. And it builds the commands under the lock and spawns them outside
+/// it: the hook used to `Command::spawn` -- and, through [`crate::supervise`],
+/// possibly start a thread -- while still holding the registry, from a
+/// panicking thread.
 ///
-/// `try_lock` rather than `lock`, because a hook runs at the panic site before
-/// unwinding: a thread that panics while holding the registry would re-lock a
-/// non-reentrant mutex on itself and hang there, and a forked child
-/// ([`crate::nsfork`]) inherits a lock held by a thread it does not have. A
-/// sweep that gives up is a leak; one that deadlocks is a process that never
-/// reports the panic at all.
+/// `try_lock` rather than `lock`, for both of the sweep's triggers. The hook
+/// runs at the panic site before unwinding, so a thread that panics while
+/// holding the registry would re-lock a non-reentrant mutex on itself and hang
+/// there. [`with_panic_sweep`] runs once the unwind has let go of anything this
+/// thread held, but a forked child ([`crate::nsfork`]) can reach either, and it
+/// inherits a lock held by a thread it does not have. A sweep that gives up is
+/// a leak; one that deadlocks is a process that never finishes dying.
 ///
 /// A registry that will not come free is left alone. Giving up costs a sweep;
-/// waiting would cost the panic report itself.
+/// waiting would cost the panic report, or the exit, itself.
 fn pending_removals() -> Vec<Removal> {
     match TRACKED.try_lock() {
         Ok(guard) => removals_for(&guard),
@@ -1910,7 +1913,7 @@ fn pending_removals() -> Vec<Removal> {
 
 /// The removals `tracked` owes. Pure, and separate from acquiring the lock, so
 /// a caller that can afford to wait for the registry does not have to inherit
-/// the hook's refusal to.
+/// the sweep's refusal to.
 fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
     tracked
         .keys()
@@ -1918,21 +1921,113 @@ fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
         .collect()
 }
 
-/// Install a process-wide panic hook that replays every outstanding attempt's
-/// label-scoped removal before delegating to the previous hook. Idempotent --
-/// safe to call from multiple `main`s or test setups.
+/// The panic sweep: detach every removal still owed. What both of its
+/// triggers run.
+fn sweep() {
+    for removal in pending_removals() {
+        removal.detach();
+    }
+}
+
+/// Run `f`, and if a panic unwinds out of it, replay every outstanding
+/// attempt's label-scoped removal before letting the panic carry on.
+///
+/// This is the panic sweep for an ordinary, unwinding build, and it belongs
+/// around `main`'s body. It sweeps for a panic that is ending the process and
+/// for no other, which only a frame this far out can tell.
+///
+/// The panic site cannot. The sweep used to run from a panic hook, which runs
+/// where the panic is raised, before anything has had the chance to catch it
+/// -- so a panic tokio's task harness would contain, in a subagent round, an
+/// MCP service, or a watcher, removed every container of a session that then
+/// carried on without them (#349). No test made at the panic site fixes that.
+/// A `current_thread` runtime polls its tasks on the thread that drives it, so
+/// "the main thread" includes them; and "outside any task" misses a task's
+/// panic that its caller re-raises with [`std::panic::resume_unwind`], which
+/// ends the process without calling a hook at all.
+///
+/// A panic that has left `f` is one nothing inside `f` caught, and by the time
+/// it arrives the unwind has dropped everything `f` owned: every [`Container`]
+/// on the way out and, if `f` held the runtime, every task's future with it.
+/// Each of those has already detached its own removal and discharged its
+/// obligation. What the sweep finds is what `Drop` could not reach -- a handle
+/// another thread owns, or one that was leaked.
+///
+/// The panic is resumed rather than raised again, so the hook does not run a
+/// second time and the report and exit status are the ones the panic already
+/// had. The sweep runs after the catch, not from a guard's `Drop` during the
+/// unwind, so a fault inside it is an ordinary panic rather than an abort.
+///
+/// # Where to put it
+///
+/// Around the outermost frame that can panic: `main`'s body, after
+/// [`install_panic_hook`]. Anything further out that catches a panic makes the
+/// sweep wrong, because it would remove the containers of a process that goes
+/// on.
+///
+/// # What it does not cover
+///
+/// A panic that does not unwind -- every panic in a `panic = "abort"` build,
+/// which [`install_panic_hook`] covers instead, and a panic in a destructor
+/// while another is unwinding, which nothing can.
+///
+/// # Example
+///
+/// ```no_run
+/// fn main() -> std::process::ExitCode {
+///     outrig::container::install_panic_hook();
+///     outrig::container::with_panic_sweep(|| {
+///         // Start containers and run the session.
+///         std::process::ExitCode::SUCCESS
+///     })
+/// }
+/// ```
+pub fn with_panic_sweep<T>(f: impl FnOnce() -> T) -> T {
+    on_unwind(f, sweep)
+}
+
+/// [`with_panic_sweep`] with the sweep supplied, so a test can watch for it
+/// without spawning `podman`.
+fn on_unwind<T>(f: impl FnOnce() -> T, sweep: impl FnOnce()) -> T {
+    // Unwind safety is about state a panic left half-updated being observed
+    // afterwards, and nothing observes it: the payload goes straight back to
+    // unwinding.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            sweep();
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+/// In a `panic = "abort"` build, install a process-wide panic hook that
+/// replays every outstanding attempt's label-scoped removal before delegating
+/// to the previous hook. In an unwinding build, install nothing:
+/// [`with_panic_sweep`] is the sweep there. Idempotent -- safe to call from
+/// multiple `main`s.
+///
+/// The build decides because it is the one thing that settles, at the panic
+/// site, whether a panic ends the process. Under `abort` every panic does and
+/// no destructor runs after it, so a hook is the only layer left that can act,
+/// and it is never wrong to. Under `unwind` a hook cannot know, and acting
+/// anyway is what removed the containers of a session that survived a task's
+/// panic (#349).
 ///
 /// Not to be installed from a test. It is process-wide and `OnceLock`-guarded,
-/// so one test installing it makes every *other* failing test in that binary
-/// sweep obligations it does not own.
+/// so in an abort build one test installing it makes every *other* failing
+/// test in that binary sweep obligations it does not own.
 pub fn install_panic_hook() {
+    // `cfg!` rather than `#[cfg]`, so the hook is still compiled and linted in
+    // the unwinding builds that never install it.
+    if !cfg!(panic = "abort") {
+        return;
+    }
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            for removal in pending_removals() {
-                removal.detach();
-            }
+            sweep();
             prev(info);
         }));
     });
@@ -2330,12 +2425,12 @@ mod tests {
     /// Every removal the panic sweep would issue right now, as
     /// `(argv, reissue)`.
     fn swept() -> Vec<(Vec<String>, Reissue)> {
-        // Through the blocking lock, not the hook's `try_lock`. A test that
+        // Through the blocking lock, not the sweep's `try_lock`. A test that
         // used `pending_removals` would read "another test is holding the
         // registry" as "nothing is owed" and fail at random in a parallel
-        // binary; the hook declines to wait because a panic hook must not, and
-        // a test has no such constraint. What is under test is the mapping,
-        // and `removals_for` is exactly that half.
+        // binary; the sweep declines to wait because a dying process must not,
+        // and a test has no such constraint. What is under test is the
+        // mapping, and `removals_for` is exactly that half.
         removals_for(&tracked())
             .into_iter()
             .map(|removal| (argv(removal.cmd), removal.reissue))
@@ -2522,6 +2617,101 @@ mod tests {
                 "a borrowed container must never be swept: {argv:?}"
             );
         }
+    }
+
+    /// Run `f` under the panic sweep's trigger, with a sweep that only records
+    /// that it ran: whether it did, and what `f` returned or unwound with.
+    fn under_the_sweep<T>(f: impl FnOnce() -> T) -> (bool, std::thread::Result<T>) {
+        let fired = std::cell::Cell::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_unwind(f, || fired.set(true))
+        }));
+        (fired.get(), outcome)
+    }
+
+    /// The runtime shape of the CLI's: tasks are polled on the thread that
+    /// drives the session.
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime builds")
+    }
+
+    /// A task that panics, as a subagent round, an MCP service, or a model
+    /// load can. Spawned onto the runtime the caller is inside.
+    fn panicking_task(message: &'static str) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { panic!("{message}") })
+    }
+
+    /// A panic nothing inside the closure caught is ending the process, so it
+    /// is swept -- and still reaches whatever is further out, intact.
+    #[test]
+    fn a_panic_that_leaves_the_closure_sweeps_and_keeps_unwinding() {
+        let (fired, outcome) = under_the_sweep::<()>(|| panic!("the session is over"));
+
+        assert!(
+            fired,
+            "a panic out of `main`'s body is the one to sweep for"
+        );
+        let payload = outcome.expect_err("the panic must carry on past the sweep");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the session is over"),
+            "the panic must arrive as it was raised"
+        );
+    }
+
+    /// #349. A panic tokio's task harness contains is one the session goes on
+    /// from, so it must not take the session's containers with it -- even on a
+    /// `current_thread` runtime, where it is raised on the very thread that
+    /// drives the session. The hook this replaced swept here.
+    #[test]
+    fn a_panic_a_task_catches_sweeps_nothing() {
+        let (fired, outcome) = under_the_sweep(|| {
+            current_thread_runtime()
+                .block_on(async { panicking_task("a subagent round failed").await })
+        });
+
+        assert!(!fired, "a task's panic is not the process's");
+        let joined = outcome.expect("the closure returned");
+        assert!(joined.expect_err("the task panicked").is_panic());
+    }
+
+    /// A task's panic its caller hands on with `resume_unwind`, as the CLI's
+    /// model registry does, ends the process without calling a panic hook a
+    /// second time. That is why the sweep is not decided at the panic site: a
+    /// hook that let the task's panic go -- rightly -- would never have seen
+    /// this one.
+    #[test]
+    fn a_task_panic_its_caller_re_raises_sweeps() {
+        let (fired, outcome) = under_the_sweep(|| {
+            current_thread_runtime().block_on(async {
+                if let Err(e) = panicking_task("a model load failed").await {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+            })
+        });
+
+        assert!(fired, "a re-raised panic that leaves the closure is fatal");
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn a_panic_caught_inside_the_closure_sweeps_nothing() {
+        let (fired, outcome) = under_the_sweep(|| {
+            std::panic::catch_unwind::<_, ()>(|| panic!("recovered from")).is_err()
+        });
+
+        assert!(!fired, "a panic the closure recovered from is not fatal");
+        assert_eq!(outcome.ok(), Some(true));
+    }
+
+    #[test]
+    fn a_closure_that_returns_sweeps_nothing_and_hands_back_its_value() {
+        let (fired, outcome) = under_the_sweep(|| 42);
+
+        assert!(!fired);
+        assert_eq!(outcome.ok(), Some(42));
     }
 
     #[test]

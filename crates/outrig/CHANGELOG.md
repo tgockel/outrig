@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`container::with_panic_sweep` sweeps for a panic that ends the process, and for no other.**
+  It runs a closure -- `main`'s body -- and, if a panic unwinds out of it, detaches the
+  label-scoped removal of every attempt still owed before the panic carries on. By then the
+  unwind has dropped every `Container` the closure held, so the sweep finds only what `Drop`
+  could not reach. A panic caught anywhere inside, including by a tokio task's `JoinHandle`, is
+  not swept. (#349)
+
 - **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
   It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
   (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
@@ -46,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still the form that confirms the undo. (#345)
 
 ### Fixed
+
+- **A panic a tokio task survives no longer removes every container the process owns.**
+  `install_panic_hook` swept every outstanding obligation on every panic, from the panic site,
+  where a hook cannot tell a panic the process dies of from one a task's `JoinHandle` contains --
+  so a panic in one task would have force-removed the containers of a session that went on
+  without them. It now sweeps only in a `panic = "abort"` build, where every panic is fatal and
+  no destructor runs; in an unwinding build it installs nothing. A caller that installed it also
+  wraps `main`'s body in `with_panic_sweep`. (#349)
 
 - **`Config::validate` refuses a provider `base-url` that is not an `http://` or `https://`
   URL.** The key took any string, so a typo'd scheme such as `htps://` loaded, and every request
