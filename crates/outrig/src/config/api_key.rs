@@ -1,6 +1,7 @@
 //! `${VAR}`-only API-key references. Validated at config-load time, resolved
-//! from `std::env` at use time. Literal keys are refused unconditionally so
-//! they cannot land in committed config files.
+//! at use time -- from `std::env`, or from whatever [`Secrets`] a session was
+//! given. Literal keys are refused unconditionally so they cannot land in
+//! committed config files.
 
 use std::env::VarError;
 
@@ -26,6 +27,54 @@ pub enum ApiKeyError {
 
     #[error("api-key env var {var} value is not valid UTF-8")]
     NotUnicode { var: String },
+
+    /// A session's [`Secrets`] had no value for it.
+    #[error("api-key ${{{var}}} has no value in this session's secrets")]
+    Unresolved { var: String },
+}
+
+/// Where a session's `${VAR}` secrets come from: called while its model is
+/// resolved, before anything starts, with each variable its model calls need
+/// -- today each candidate provider's `api-key` -- and possibly more than once
+/// for one name.
+///
+/// The process environment is one table for every session and thread in the
+/// process, so an embedder running sessions that need different keys gives
+/// each its own resolver and changes no environment at all. A key is read
+/// once, at start, and held for the session's life: a rotated key takes a new
+/// session.
+pub trait Secrets: Send + Sync {
+    fn resolve(&self, var: &str) -> std::result::Result<String, ApiKeyError>;
+}
+
+/// The process environment, with the errors reading it always gave. What
+/// `outrig run-new` resolves through.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvSecrets;
+
+impl Secrets for EnvSecrets {
+    fn resolve(&self, var: &str) -> std::result::Result<String, ApiKeyError> {
+        std::env::var(var).map_err(|err| {
+            let var = var.to_string();
+            match err {
+                VarError::NotPresent => ApiKeyError::NotPresent { var },
+                VarError::NotUnicode(_) => ApiKeyError::NotUnicode { var },
+            }
+        })
+    }
+}
+
+/// A function from a variable's name to its value; `None` is
+/// [`ApiKeyError::Unresolved`].
+impl<F> Secrets for F
+where
+    F: Fn(&str) -> Option<String> + Send + Sync,
+{
+    fn resolve(&self, var: &str) -> std::result::Result<String, ApiKeyError> {
+        self(var).ok_or_else(|| ApiKeyError::Unresolved {
+            var: var.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,15 +88,14 @@ impl ApiKeyRef {
         Ok(Self(var.to_string()))
     }
 
+    /// The key, read from the process environment.
     pub fn resolve(&self) -> Result<String> {
-        std::env::var(&self.0).map_err(|err| {
-            let var = self.0.clone();
-            match err {
-                VarError::NotPresent => ApiKeyError::NotPresent { var },
-                VarError::NotUnicode(_) => ApiKeyError::NotUnicode { var },
-            }
-            .into()
-        })
+        self.resolve_with(&EnvSecrets)
+    }
+
+    /// The key, as `secrets` gives it.
+    pub fn resolve_with(&self, secrets: &(impl Secrets + ?Sized)) -> Result<String> {
+        Ok(secrets.resolve(&self.0)?)
     }
 
     pub fn var_name(&self) -> &str {

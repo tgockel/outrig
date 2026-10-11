@@ -98,12 +98,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**The owner's API**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-19` | An embedder owns the session, and `run-new` is one                 |
-
 **Host objects and the boundary**
 
 | Task      | What it settles                                                    |

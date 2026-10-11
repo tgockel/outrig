@@ -2,11 +2,13 @@
 //!
 //! # Supported surface
 //!
-//! The facade above is one of two supported tiers. `config`, `container`,
-//! `error`, `image`, `mcp_proxy`, and `network` are the other: a caller that
-//! wants the pieces rather than a whole managed session drives them directly,
-//! and downstream crates do. Both tiers are a SemVer commitment; every other
-//! module is private, reaching this root only through the re-exports below.
+//! The facade above, [`Outrig`], and [`harness`], the agent session built on
+//! it, are one supported tier. `config`, `container`, `error`, `image`,
+//! `mcp_proxy`, and `network` are the other: a caller that wants the pieces
+//! rather than a whole managed container drives them directly, and downstream
+//! crates do. Both tiers are a SemVer commitment -- `harness` from the 0.3.0
+//! release, before which it may still change -- and every other module is
+//! private, reaching this root only through the re-exports below.
 
 // `network` and `nsfork` below are declared unconditionally and call `setns`
 // and `CLONE_NEW*`, which libc declares only under `linux_like` -- so an Apple
@@ -36,6 +38,7 @@ pub mod container;
 mod engine_env;
 pub mod error;
 mod events;
+pub mod harness;
 pub mod image;
 mod line_sink;
 mod mcp;
@@ -50,7 +53,6 @@ mod repo;
 mod supervise;
 mod tool_name;
 
-pub use agent::{PythonAgent, UserChannel};
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,

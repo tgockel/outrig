@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use rig::tool::{ToolDyn, ToolError};
 use serde_json::json;
 
+use super::AgentError;
 use super::budget::{ASSUMED_CONTEXT_WINDOW, Budget, DEFAULT_REPLY_RESERVE};
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
@@ -23,12 +24,15 @@ use super::mock_http::{
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::retry::RetryingHttpClient;
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
-use super::{AgentError, PythonAgent};
-use crate::config::{Config, LlmProvider, RoleAlternation};
-use crate::events::{self, Events};
+use crate::config::{Config, EnvSecrets, LlmProvider, RoleAlternation};
+use crate::events::{self, Events, StreamBuilder};
+use crate::harness::event::{DEFAULT_CAPACITY, Payload, Received, Subscription};
+use crate::harness::{
+    DEFAULT_DRAIN, RoundEnd, RoundOutcome, Session, SessionBuilder, SessionError, ShutdownReport,
+};
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
-use crate::python::testing::{ok, slot_freed, start_on_host, start_on_host_with, within};
+use crate::python::testing::{ok, slot_freed, start_on_host, within};
 
 const KEY: &str = "sk-ant-mock-key";
 
@@ -107,7 +111,7 @@ async fn agent_over(
     agent_keys: &str,
     script: Vec<CannedResponse>,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     agent_in(Style::Anthropic, var, identifier, "", agent_keys, script).await
@@ -123,7 +127,7 @@ async fn agent_in(
     agent_keys: &str,
     script: Vec<CannedResponse>,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     agent_with(
@@ -148,7 +152,7 @@ async fn agent_with(
     agent_keys: &str,
     script: Vec<CannedResponse>,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     let (addr, requests) = mock_http::start(script).await;
@@ -156,36 +160,116 @@ async fn agent_with(
     (agent_of(&cfg, var, events).await, requests)
 }
 
+/// A resolver holding the one key `var` names.
+fn keyed(var: &str) -> impl Fn(&str) -> Option<String> + Send + Sync + 'static {
+    let var = var.to_string();
+    move |name: &str| (name == var).then(|| KEY.to_string())
+}
+
 /// `cfg`'s `coding` agent over a host-run interpreter recording to `events`,
-/// with the api-key variable `var` set.
-async fn agent_of(cfg: &Config, var: &str, events: Events) -> PythonAgent {
-    let interpreter = start_on_host_with(events).await;
-    with_key(var, || {
-        PythonAgent::with_interpreter(interpreter, cfg, Some("coding"), None)
-    })
-    .unwrap_or_else(|e| panic!("{e}"))
+/// with the key `var` names.
+async fn agent_of(cfg: &Config, var: &str, events: Events) -> Session {
+    host_session(cfg, Some("coding"), None, events)
+        .secrets(keyed(var))
+        .start_on_host()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A session of `agent` over `cfg`, `model` overriding, publishing to
+/// `events`, to start on the host.
+fn host_session(
+    cfg: &Config,
+    agent: Option<&str>,
+    model: Option<&str>,
+    events: Events,
+) -> SessionBuilder {
+    SessionBuilder::new(cfg.clone(), agent, model).events(events)
+}
+
+/// A stream recording into `dir` when one is given, and a subscription to it.
+async fn watched(dir: Option<&std::path::Path>) -> (Events, Subscription) {
+    let mut stream = StreamBuilder::default();
+    let subscription = stream.subscribe(DEFAULT_CAPACITY);
+    if let Some(dir) = dir {
+        stream
+            .record(dir, events::TEST_SOURCE.to_string())
+            .await
+            .expect("open the log");
+    }
+    (stream.build(), subscription)
+}
+
+/// The source of the next submission `events` publishes as it starts to run.
+async fn next_submission(events: &mut Subscription) -> String {
+    loop {
+        match events.recv().await.expect("the session is running") {
+            Received::Event(event) => {
+                if let Payload::ExecSubmitted { source, .. } = &event.payload {
+                    return source.clone();
+                }
+            }
+            Received::Missed(missed) => panic!("missed {missed} events"),
+        }
+    }
+}
+
+/// The sources of every submission `events` has published so far.
+fn submissions(events: &mut Subscription) -> Vec<String> {
+    let mut sources = Vec::new();
+    while let Ok(received) = events.try_recv() {
+        if let Received::Event(event) = received
+            && let Payload::ExecSubmitted { source, .. } = &event.payload
+        {
+            sources.push(source.clone());
+        }
+    }
+    sources
+}
+
+/// Stop `agent`'s session, its log holding everything it was given.
+async fn shut_down(agent: Session) -> ShutdownReport {
+    let report = within(agent.shutdown(DEFAULT_DRAIN)).await;
+    if let Some(lost) = &report.events.log {
+        panic!("{lost}");
+    }
+    report
 }
 
 /// Send `message` on the agent's user channel, as a person typing it does.
-async fn post(agent: &PythonAgent, message: &str) {
+async fn post(agent: &Session, message: &str) {
     within(agent.user_channel().send(message))
         .await
         .unwrap_or_else(|e| panic!("the message was not delivered: {e}"));
 }
 
-/// Send `message`, then run the round it starts.
-async fn round(agent: &mut PythonAgent, message: &str) -> String {
+/// Send `message`, then run the round it starts, to its end.
+async fn round_end(agent: &mut Session, message: &str) -> RoundEnd {
     post(agent, message).await;
-    within(agent.round())
+    match within(agent.round())
         .await
         .unwrap_or_else(|e| panic!("the round failed: {e}"))
-        .expect("a message was waiting, so a round ran")
+    {
+        RoundOutcome::Ended(end) => end,
+        RoundOutcome::NothingNew => panic!("a message was waiting, so a round ran"),
+    }
+}
+
+/// [`round_end`], read as the text a round once returned: the reply, and why
+/// a limit stopped it after it.
+async fn round(agent: &mut Session, message: &str) -> String {
+    let end = round_end(agent, message).await;
+    match &end.stopped {
+        None => end.reply,
+        Some(reason) if end.reply.trim().is_empty() => format!("(round ended: {reason})"),
+        Some(reason) => format!("{}\n(round ended: {reason})", end.reply),
+    }
 }
 
 /// Send `message`, then run the round it starts until `reached`, and drop it
 /// there, as Ctrl-C at the REPL does. `biased` polls `reached` first, so a
 /// round that could return in the same poll is dropped all the same.
-async fn dropped_round(agent: &mut PythonAgent, message: &str, reached: impl Future) {
+async fn dropped_round(agent: &mut Session, message: &str, reached: impl Future) {
     post(agent, message).await;
     tokio::select! {
         biased;
@@ -195,15 +279,14 @@ async fn dropped_round(agent: &mut PythonAgent, message: &str, reached: impl Fut
 }
 
 /// Send `message`, then drop the round it starts once its second call's
-/// source goes to run -- by when the first call has returned.
-async fn dropped_inside_the_second(agent: &mut PythonAgent, message: &str) {
-    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    agent.on_submit(move |source| {
-        let _ = started.send(source.to_string());
-    });
+/// source goes to run -- by when the first call has returned. `events` is the
+/// session's.
+async fn dropped_inside_the_second(agent: &mut Session, events: &mut Subscription, message: &str) {
+    // Only this round's count: those of rounds before it were shown already.
+    submissions(events);
     let inside_the_second = async {
-        starts.recv().await.expect("the first call");
-        starts.recv().await.expect("the second call");
+        next_submission(events).await;
+        next_submission(events).await;
     };
     dropped_round(agent, message, inside_the_second).await;
 }
@@ -535,7 +618,7 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
     };
     dropped_round(&mut agent, "set x", second_call).await;
     assert_eq!(
-        agent.history.len(),
+        agent.agent.history.len(),
         1,
         "what the round ran is kept as it is dropped, not a round later"
     );
@@ -563,14 +646,18 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
         ("toolu_b", "import time\ntime.sleep(30)"),
         ("toolu_c", "print('c ran')"),
     ]);
-    let (mut agent, mut requests) = agent_over(
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, mut requests) = agent_with(
+        events,
+        Style::Anthropic,
         "OUTRIG_TEST_AGENT_DROPPED_BATCH",
         MODEL,
+        "",
         "max-tokens = 4096",
         vec![batch, text_reply("carried on")],
     )
     .await;
-    dropped_inside_the_second(&mut agent, "run three").await;
+    dropped_inside_the_second(&mut agent, &mut submitted, "run three").await;
 
     assert_eq!(round(&mut agent, "continue").await, "carried on");
     let recorded = mock_http::drain(&mut requests);
@@ -589,12 +676,16 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
 }
 
 /// A submission the interpreter refuses, because code a dropped round left
-/// running still holds its slot, is not shown as running: it never ran.
+/// running still holds its slot, is not published as running: it never ran.
 #[tokio::test]
-async fn the_observer_is_not_told_of_a_refused_submission() {
-    let (mut agent, _requests) = agent_over(
+async fn a_refused_submission_is_not_published_as_running() {
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, _requests) = agent_with(
+        events,
+        Style::Anthropic,
         "OUTRIG_TEST_AGENT_OBSERVER_REFUSED",
         MODEL,
+        "",
         "max-tokens = 4096",
         vec![
             submit("toolu_slow", "import time\ntime.sleep(30)"),
@@ -603,30 +694,29 @@ async fn the_observer_is_not_told_of_a_refused_submission() {
         ],
     )
     .await;
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&seen);
-    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    agent.on_submit(move |source| {
-        sink.lock().expect("unpoisoned").push(source.to_string());
-        let _ = started.send(());
-    });
 
-    dropped_round(&mut agent, "sleep", starts.recv()).await;
+    let mut seen = Vec::new();
+    dropped_round(&mut agent, "sleep", async {
+        seen.push(next_submission(&mut submitted).await);
+    })
+    .await;
     assert_eq!(round(&mut agent, "go on").await, "refused");
 
-    assert_eq!(
-        *seen.lock().expect("unpoisoned"),
-        ["import time\ntime.sleep(30)"]
-    );
+    seen.extend(submissions(&mut submitted));
+    assert_eq!(seen, ["import time\ntime.sleep(30)"]);
 }
 
-/// The observer is told each submission's source, and not a call the cap
-/// refuses, since that one does not run.
+/// Each submission's source is published as it goes to run, and not a call
+/// the cap refuses, since that one does not run.
 #[tokio::test]
-async fn the_observer_is_told_each_source_that_runs() {
-    let (mut agent, _requests) = agent_over(
+async fn each_source_that_runs_is_published() {
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, _requests) = agent_with(
+        events,
+        Style::Anthropic,
         "OUTRIG_TEST_AGENT_OBSERVER",
         MODEL,
+        "",
         "max-tokens = 4096\ntool-call-max = 2",
         vec![
             submit("toolu_a", "x = 1"),
@@ -635,13 +725,10 @@ async fn the_observer_is_told_each_source_that_runs() {
         ],
     )
     .await;
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&seen);
-    agent.on_submit(move |source| sink.lock().expect("unpoisoned").push(source.to_string()));
 
     round(&mut agent, "go").await;
 
-    assert_eq!(*seen.lock().expect("unpoisoned"), ["x = 1", "print(x)"]);
+    assert_eq!(submissions(&mut submitted), ["x = 1", "print(x)"]);
 }
 
 /// The model is oriented before the agent's own preamble, and an agentless
@@ -673,11 +760,11 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
     let var = "OUTRIG_TEST_AGENT_ORIENTATION_AGENTLESS";
     let cfg = config(addr, var, MODEL, "max-tokens = 4096");
-    let interpreter = start_on_host().await;
-    let mut agentless = with_key(var, || {
-        PythonAgent::with_interpreter(interpreter, &cfg, None, None)
-    })
-    .unwrap_or_else(|e| panic!("{e}"));
+    let mut agentless = host_session(&cfg, None, None, Events::off())
+        .secrets(keyed(var))
+        .start_on_host()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     round(&mut agentless, "hello").await;
     let system = system_prompt(&mock_http::drain(&mut requests)[0]);
     assert!(
@@ -799,19 +886,17 @@ async fn receiving_consumes_and_an_announcement_does_not() {
 
     assert_eq!(round(&mut agent, "first").await, "not now");
     assert!(
-        within(agent.round())
-            .await
-            .expect("no model call to fail")
-            .is_none(),
+        matches!(
+            within(agent.round()).await.expect("no model call to fail"),
+            RoundOutcome::NothingNew
+        ),
         "nothing new arrived, so no round runs"
     );
     assert_eq!(round(&mut agent, "second").await, "read both");
-    assert!(
-        within(agent.round())
-            .await
-            .expect("no model call to fail")
-            .is_none()
-    );
+    assert!(matches!(
+        within(agent.round()).await.expect("no model call to fail"),
+        RoundOutcome::NothingNew
+    ));
 
     let recorded = mock_http::drain(&mut requests);
     assert_eq!(recorded.len(), 3, "{recorded:#?}");
@@ -851,7 +936,10 @@ async fn messages_and_replies_keep_their_order() {
     }
 
     let reply = within(agent.round()).await.expect("the round ran");
-    assert_eq!(reply.as_deref(), Some("echoed"));
+    assert!(
+        matches!(&reply, RoundOutcome::Ended(end) if end.reply == "echoed"),
+        "{reply:?}"
+    );
     for want in ["ONE", "TWO", "THREE"] {
         assert_eq!(within(user.receive()).await.as_deref(), Some(want));
     }
@@ -943,10 +1031,10 @@ async fn a_message_arriving_mid_round_is_announced_in_the_next_result() {
     let (reply, ()) = tokio::join!(round(&mut agent, "go"), within(meanwhile));
     assert_eq!(reply, "told");
     assert!(
-        within(agent.round())
-            .await
-            .expect("no model call to fail")
-            .is_none(),
+        matches!(
+            within(agent.round()).await.expect("no model call to fail"),
+            RoundOutcome::NothingNew
+        ),
         "the model was told in the result"
     );
 
@@ -1002,10 +1090,10 @@ async fn a_message_ends_a_wait_and_the_round_goes_on() {
     let (reply, ()) = tokio::join!(round(&mut agent, "wait for it"), within(meanwhile));
     assert_eq!(reply, "redirected");
     assert!(
-        within(agent.round())
-            .await
-            .expect("no model call to fail")
-            .is_none(),
+        matches!(
+            within(agent.round()).await.expect("no model call to fail"),
+            RoundOutcome::NothingNew
+        ),
         "the model was told in the result, so no round follows"
     );
 
@@ -1047,7 +1135,10 @@ async fn an_announcement_the_model_never_read_is_made_again() {
     let reply = within(agent.round())
         .await
         .expect("the second call answers");
-    assert_eq!(reply.as_deref(), Some("ok"));
+    assert!(
+        matches!(&reply, RoundOutcome::Ended(end) if end.reply == "ok"),
+        "{reply:?}"
+    );
 
     let recorded = mock_http::drain(&mut requests);
     assert_eq!(recorded.len(), 2, "{recorded:#?}");
@@ -1125,12 +1216,12 @@ async fn three_narrow_rounds(
     var: &str,
     script: Vec<CannedResponse>,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
     Vec<RecordedRequest>,
 ) {
     let (mut agent, mut requests) = agent_over(var, MODEL, "max-tokens = 4096", script).await;
-    agent.history.set_window(NARROW);
+    agent.agent.history.set_window(NARROW);
     for message in ["one", "two", "three"] {
         round(&mut agent, message).await;
     }
@@ -1291,20 +1382,28 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
         ],
     )
     .await;
-    agent.history.set_window(NARROW);
+    agent.agent.history.set_window(NARROW);
     round(&mut agent, "one").await;
     round(&mut agent, "two").await;
     assert_eq!(
         round(&mut agent, "capped").await,
         "(round ended: tool-call iteration max (1) reached)"
     );
-    assert_eq!(agent.history.len(), 4, "the capped round's two turns, once");
+    assert_eq!(
+        agent.agent.history.len(),
+        4,
+        "the capped round's two turns, once"
+    );
 
     post(&agent, "fails").await;
     within(agent.round())
         .await
         .expect_err("the second model call failed");
-    assert_eq!(agent.history.len(), 5, "the failed round's finished turn");
+    assert_eq!(
+        agent.agent.history.len(),
+        5,
+        "the failed round's finished turn"
+    );
 
     mock_http::drain(&mut requests);
     let second_call = async {
@@ -1312,10 +1411,14 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
         requests.recv().await.expect("the second model call");
     };
     dropped_round(&mut agent, "dropped", second_call).await;
-    assert_eq!(agent.history.len(), 6, "the dropped round's finished turn");
+    assert_eq!(
+        agent.agent.history.len(),
+        6,
+        "the dropped round's finished turn"
+    );
 
     round(&mut agent, "done?").await;
-    assert_eq!(agent.history.len(), 7);
+    assert_eq!(agent.agent.history.len(), 7);
     let last = mock_http::drain(&mut requests)
         .pop()
         .expect("the last round's request");
@@ -1387,9 +1490,13 @@ async fn the_default_window_leaves_out_the_third_round_of_ten() {
 /// it, not the round.
 #[tokio::test]
 async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
-    let (mut agent, mut requests) = agent_over(
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, mut requests) = agent_with(
+        events,
+        Style::Anthropic,
         "OUTRIG_TEST_AGENT_INTERRUPTED",
         MODEL,
+        "",
         "max-tokens = 4096",
         vec![
             submit("toolu_first", "x = 1\nprint('first')"),
@@ -1402,12 +1509,8 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
         ],
     )
     .await;
-    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    agent.on_submit(move |source| {
-        let _ = started.send(source.to_string());
-    });
     assert_eq!(round(&mut agent, "set x").await, "set");
-    starts.recv().await.expect("the first round's call");
+    next_submission(&mut submitted).await;
     mock_http::drain(&mut requests);
 
     dropped_round(
@@ -1416,7 +1519,12 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
         requests.recv(),
     )
     .await;
-    dropped_round(&mut agent, "interrupted while Python runs", starts.recv()).await;
+    dropped_round(
+        &mut agent,
+        "interrupted while Python runs",
+        next_submission(&mut submitted),
+    )
+    .await;
 
     assert_eq!(round(&mut agent, "still there?").await, "carried on");
     let last = mock_http::drain(&mut requests)
@@ -1425,7 +1533,7 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
     assert_eq!(
         tool_result(&last, "toolu_first"),
         "first\n",
-        "run-new's loop (`PythonAgent::round`) lost the conversation to an interrupted round"
+        "run-new's loop (`Session::round`) lost the conversation to an interrupted round"
     );
     assert!(
         tool_result(&last, "toolu_slow").contains("had not returned when the round ended"),
@@ -1439,10 +1547,11 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
 // ---------------------------------------------------------------------------- the budget
 
 /// Every manifest `agent`'s model calls are assembled with, from now on.
-fn manifests(agent: &PythonAgent) -> Arc<Mutex<Vec<Manifest>>> {
+fn manifests(agent: &Session) -> Arc<Mutex<Vec<Manifest>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
     agent
+        .agent
         .history
         .on_manifest(move |manifest| record.lock().expect("manifests").push(manifest.clone()));
     seen
@@ -1451,14 +1560,6 @@ fn manifests(agent: &PythonAgent) -> Arc<Mutex<Vec<Manifest>>> {
 /// How many times `needle` appears in the messages `request` carried.
 fn count(request: &RecordedRequest, needle: &str) -> usize {
     request.body["messages"].to_string().matches(needle).count()
-}
-
-/// Every source the agent's interpreter accepted, in order, from now on.
-fn sources(agent: &mut PythonAgent) -> Arc<Mutex<Vec<String>>> {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let record = Arc::clone(&seen);
-    agent.on_submit(move |source| record.lock().expect("sources").push(source.to_string()));
-    seen
 }
 
 /// The failure this task exists to remove: a turn too large for the model's
@@ -1494,7 +1595,7 @@ async fn a_turn_too_large_for_the_window_ends_its_round_and_later_rounds_go_on()
     ] {
         assert!(reply.contains(needle), "{needle:?} in {reply}");
     }
-    assert_eq!(agent.history.len(), 1, "the turn is kept");
+    assert_eq!(agent.agent.history.len(), 1, "the turn is kept");
     assert_eq!(
         mock_http::drain(&mut requests).len(),
         1,
@@ -1619,9 +1720,13 @@ async fn the_turn_in_flight_is_promotable_once_it_commits() {
 /// next round's own.
 #[tokio::test]
 async fn a_round_ended_mid_batch_keeps_an_incomplete_turn_and_runs_nothing_again() {
-    let (mut agent, mut requests) = agent_over(
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, mut requests) = agent_with(
+        events,
+        Style::Anthropic,
         "OUTRIG_TEST_AGENT_INCOMPLETE",
         MODEL,
+        "",
         "max-tokens = 4096",
         vec![
             Style::Anthropic.batch(&[
@@ -1637,8 +1742,7 @@ async fn a_round_ended_mid_batch_keeps_an_incomplete_turn_and_runs_nothing_again
         ],
     )
     .await;
-    dropped_inside_the_second(&mut agent, "run three").await;
-    let sources = sources(&mut agent);
+    dropped_inside_the_second(&mut agent, &mut submitted, "run three").await;
 
     // The second call keeps the interpreter until it finishes, which the next
     // round's submission waits out by being refused; so look once it is done.
@@ -1652,7 +1756,7 @@ async fn a_round_ended_mid_batch_keeps_an_incomplete_turn_and_runs_nothing_again
     let look = tool_result(&last, "toolu_look");
     assert!(look.contains("[this call]\n[(0, True)]\n"), "{look}");
     assert_eq!(
-        *sources.lock().expect("sources"),
+        submissions(&mut submitted),
         ["print([(t.id, t.incomplete) for t in runtime.history.turns])"],
         "nothing of the ended round ran again"
     );
@@ -1719,16 +1823,17 @@ fn conversation(style: Style, request: &RecordedRequest) -> Vec<serde_json::Valu
 /// promotion brings back without the rest of its round, a round cut short by
 /// the cap followed by the next opening, the budget dropping this round's
 /// earlier turn, and a round ended mid-batch leaving an incomplete turn.
-async fn every_cut(style: Style, var: &str) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
-    every_cut_recorded(style, var, Events::off()).await
+async fn every_cut(style: Style, var: &str) -> (Session, Vec<RecordedRequest>, Vec<Manifest>) {
+    every_cut_recorded(style, var, None).await
 }
 
-/// [`every_cut`], recording to `events`.
+/// [`every_cut`], recording in `dir` when one is given.
 async fn every_cut_recorded(
     style: Style,
     var: &str,
-    events: Events,
-) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
+    dir: Option<&std::path::Path>,
+) -> (Session, Vec<RecordedRequest>, Vec<Manifest>) {
+    let (events, submitted) = watched(dir).await;
     let (agent, requests) = agent_with(
         events,
         style,
@@ -1739,7 +1844,7 @@ async fn every_cut_recorded(
         every_cut_script(style),
     )
     .await;
-    every_cut_driven(agent, requests).await
+    every_cut_driven(agent, requests, submitted).await
 }
 
 /// [`every_cut`] against a provider that requires the user's and the model's
@@ -1748,9 +1853,10 @@ async fn every_cut_recorded(
 async fn every_cut_strict(
     style: Style,
     var: &str,
-) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
-    let (agent, requests) = agent_on_a_strict_mock(style, var, true).await;
-    every_cut_driven(agent, requests).await
+) -> (Session, Vec<RecordedRequest>, Vec<Manifest>) {
+    let (events, submitted) = watched(None).await;
+    let (agent, requests) = agent_on_a_strict_mock(style, var, true, events).await;
+    every_cut_driven(agent, requests, submitted).await
 }
 
 /// An agent scripted by [`every_cut_script`] over a mock that refuses a
@@ -1760,8 +1866,9 @@ async fn agent_on_a_strict_mock(
     style: Style,
     var: &str,
     says_so: bool,
+    events: Events,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     let (addr, requests) = mock_http::start_strict(every_cut_script(style)).await;
@@ -1769,13 +1876,13 @@ async fn agent_on_a_strict_mock(
     if says_so {
         strict(&mut cfg, "claude");
     }
-    (agent_of(&cfg, var, Events::off()).await, requests)
+    (agent_of(&cfg, var, events).await, requests)
 }
 
 /// Three rounds on the [`NARROW`] window, then a fourth the provider refuses:
 /// the error that round ends with.
-async fn refused_fourth_round(agent: &mut PythonAgent) -> String {
-    agent.history.set_window(NARROW);
+async fn refused_fourth_round(agent: &mut Session) -> String {
+    agent.agent.history.set_window(NARROW);
     for message in ["one", "two", "three"] {
         round(agent, message).await;
     }
@@ -1790,12 +1897,12 @@ async fn refused_fourth_round(agent: &mut PythonAgent) -> String {
 /// request in `recorded` carried, through `style`'s adapter.
 fn each_call_reconstructs(
     style: Style,
-    agent: &PythonAgent,
+    agent: &Session,
     recorded: &[RecordedRequest],
     manifests: &[Manifest],
 ) {
     for (n, (request, manifest)) in recorded.iter().zip(manifests).enumerate() {
-        let rebuilt = on_the_wire(style, agent.history.reconstruct(manifest));
+        let rebuilt = on_the_wire(style, agent.agent.history.reconstruct(manifest));
         assert_eq!(
             rebuilt,
             conversation(style, request),
@@ -1843,20 +1950,21 @@ fn every_cut_script(style: Style) -> Vec<CannedResponse> {
 /// on the window and the budget that make every cut, and collect what
 /// `requests` saw and each call's manifest.
 async fn every_cut_driven(
-    mut agent: PythonAgent,
+    mut agent: Session,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
-) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
-    agent.history.set_window(NARROW);
+    mut submitted: Subscription,
+) -> (Session, Vec<RecordedRequest>, Vec<Manifest>) {
+    agent.agent.history.set_window(NARROW);
     // Room for either of round 5's large turns and what else there is, not
     // both: the model's own budget, its window shrunk to leave that room.
-    let real = (*agent.budget).clone();
+    let real = (*agent.agent.budget).clone();
     let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
-    agent.budget = Arc::new(Budget { window, ..real });
+    agent.agent.budget = Arc::new(Budget { window, ..real });
     let seen = manifests(&agent);
     for message in ["one", "two", "three", "four", "five"] {
         round(&mut agent, message).await;
     }
-    dropped_inside_the_second(&mut agent, "six").await;
+    dropped_inside_the_second(&mut agent, &mut submitted, "six").await;
     round(&mut agent, "seven").await;
     let recorded = mock_http::drain(&mut requests);
     let seen = seen.lock().expect("manifests").clone();
@@ -1939,7 +2047,7 @@ async fn each_calls_manifest_reconstructs_what_the_provider_received() {
         let (agent, recorded, manifests) = every_cut(style, &var).await;
         for (n, manifest) in manifests.iter().enumerate() {
             assert_eq!(manifest.call, n as u64);
-            assert_eq!(manifest.budget, *agent.budget);
+            assert_eq!(manifest.budget, *agent.agent.budget);
         }
         each_call_reconstructs(style, &agent, &recorded, &manifests);
     }
@@ -2060,7 +2168,8 @@ async fn a_strict_provider_is_sent_a_conversation_that_alternates_on_both_adapte
 async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names_the_key() {
     for style in Style::ALL {
         let var = format!("OUTRIG_TEST_AGENT_UNSAID_{}", style.name().to_uppercase());
-        let (mut agent, mut requests) = agent_on_a_strict_mock(style, &var, false).await;
+        let (mut agent, mut requests) =
+            agent_on_a_strict_mock(style, &var, false, Events::off()).await;
         let err = refused_fourth_round(&mut agent).await;
         assert!(
             err.contains("roles must alternate")
@@ -2100,7 +2209,7 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
             vec![text_reply("ok")],
         )
         .await;
-        let budget = &agent.budget;
+        let budget = &agent.agent.budget;
         assert_eq!(
             (
                 budget.model.as_str(),
@@ -2113,7 +2222,10 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
         let seen = manifests(&agent);
         round(&mut agent, "go").await;
         let manifest = seen.lock().expect("manifests")[0].clone();
-        assert_eq!(manifest.budget, *agent.budget, "the call was held to it");
+        assert_eq!(
+            manifest.budget, *agent.agent.budget,
+            "the call was held to it"
+        );
     }
 }
 
@@ -2139,7 +2251,7 @@ async fn no_context_window_assumes_one_whatever_the_identifier() {
             vec![style.text("ok")],
         )
         .await;
-        let budget = &agent.budget;
+        let budget = &agent.agent.budget;
         assert_eq!(
             (budget.window, budget.window_assumed, budget.reserve),
             (ASSUMED_CONTEXT_WINDOW, true, reserve),
@@ -2163,7 +2275,9 @@ async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
         "context-window = 4096",
         "max-tokens = 4096",
     );
-    let err = with_key(VAR, || PythonAgent::check(&cfg, Some("coding"), None))
+    let err = SessionBuilder::new(cfg, Some("coding"), None)
+        .secrets(keyed(VAR))
+        .check()
         .expect_err("the reply fills the window")
         .to_string();
     assert!(
@@ -2181,15 +2295,16 @@ async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
         "context-window = 3000",
         "max-tokens = 1000",
     );
-    with_key(VAR, || PythonAgent::check(&cfg, Some("coding"), None))
+    let session = SessionBuilder::new(cfg, Some("coding"), None).secrets(keyed(VAR));
+    session
+        .check()
         .expect("nothing in the file is contradictory");
-    let interpreter = start_on_host().await;
-    let err = with_key(VAR, || {
-        PythonAgent::with_interpreter(interpreter, &cfg, Some("coding"), None)
-    })
-    .err()
-    .expect("no room for a round")
-    .to_string();
+    let err = session
+        .start_on_host()
+        .await
+        .err()
+        .expect("no room for a round")
+        .to_string();
     assert!(
         err.starts_with("model \"sonnet\": a 3000-token context window leaves about ")
             && err.contains("1000 reserved for the reply"),
@@ -2201,7 +2316,12 @@ async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
 
 /// The tool alone, over `interpreter`, at the smallest ceiling config allows.
 fn tool_over(interpreter: crate::python::host::Interpreter) -> SubmitPython {
-    SubmitPython::new(interpreter.clone(), 1024, Announcer::new(interpreter))
+    SubmitPython::new(
+        interpreter.clone(),
+        1024,
+        Announcer::new(interpreter),
+        crate::harness::lifecycle::Lifecycle::starting(Events::off()),
+    )
 }
 
 /// Arguments the schema does not allow are the model's mistake to fix, so
@@ -2491,7 +2611,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
         provider_name: "claude".to_string(),
         provider: ResolvedProvider::Anthropic {
             base_url: "http://127.0.0.1:1".to_string(),
-            api_key: KEY.to_string(),
+            api_key: KEY.into(),
             request_timeout_secs: None,
             retry_budget_secs: None,
             role_alternation: RoleAlternation::Relaxed,
@@ -2546,7 +2666,7 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
     ] {
         let (mut agent, mut requests) =
             agent_over(var, identifier, keys, vec![text_reply("ok")]).await;
-        let head = agent.agent.model.budgets().next().expect("a head");
+        let head = agent.agent.agent.model.budgets().next().expect("a head");
         assert_eq!(head.max_tokens, Some(expected), "{identifier}");
         round(&mut agent, "hi").await;
         let recorded = mock_http::drain(&mut requests);
@@ -2600,11 +2720,23 @@ fn with_both_keys<T>(vars: &str, f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// A resolver holding both keys `vars` names, as [`with_both_keys`] sets them.
+fn both_keys(vars: &str) -> impl Fn(&str) -> Option<String> + Send + Sync + 'static {
+    let names = [format!("{vars}_FIRST"), format!("{vars}_SECOND")];
+    move |name: &str| {
+        names
+            .iter()
+            .any(|known| known == name)
+            .then(|| KEY.to_string())
+    }
+}
+
 #[test]
 fn an_agentless_session_takes_the_default_model_and_the_default_limits() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_AGENTLESS";
     let cfg = two_provider_config(vars, "");
-    let resolved = with_both_keys(vars, || resolve_agent(&cfg, None, None)).expect("resolves");
+    let resolved =
+        with_both_keys(vars, || resolve_agent(&cfg, None, None, &EnvSecrets)).expect("resolves");
     assert_eq!(resolved.head().model_name, "head");
     assert_eq!(resolved.preamble, None);
     assert_eq!(
@@ -2617,8 +2749,10 @@ fn an_agentless_session_takes_the_default_model_and_the_default_limits() {
 fn a_model_override_wins_over_the_agent_and_the_default() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_OVERRIDE";
     let cfg = two_provider_config(vars, "model = \"head\"");
-    let resolved = with_both_keys(vars, || resolve_agent(&cfg, Some("coding"), Some("tail")))
-        .expect("resolves");
+    let resolved = with_both_keys(vars, || {
+        resolve_agent(&cfg, Some("coding"), Some("tail"), &EnvSecrets)
+    })
+    .expect("resolves");
     assert_eq!(resolved.head().model_identifier, "gpt-tail");
     assert!(matches!(
         resolved.head().provider,
@@ -2630,8 +2764,10 @@ fn a_model_override_wins_over_the_agent_and_the_default() {
 fn an_unknown_agent_names_the_ones_that_exist() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_UNKNOWN";
     let cfg = two_provider_config(vars, "");
-    let err = with_both_keys(vars, || resolve_agent(&cfg, Some("nope"), None))
-        .expect_err("an unknown agent does not resolve");
+    let err = with_both_keys(vars, || {
+        resolve_agent(&cfg, Some("nope"), None, &EnvSecrets)
+    })
+    .expect_err("an unknown agent does not resolve");
     assert!(
         matches!(
             &err,
@@ -2648,17 +2784,20 @@ fn an_unknown_agent_names_the_ones_that_exist() {
 async fn check_agrees_with_start() {
     let vars = "OUTRIG_TEST_AGENT_CHECK";
     let cfg = two_provider_config(vars, "");
-    with_both_keys(vars, || PythonAgent::check(&cfg, Some("coding"), None))
+    SessionBuilder::new(cfg.clone(), Some("coding"), None)
+        .secrets(both_keys(vars))
+        .check()
         .unwrap_or_else(|e| panic!("{e}"));
 
-    let checked = PythonAgent::check(&cfg, Some("coding"), Some("head"))
-        .expect_err("the key is unset")
+    // Read from the environment, where the key is unset.
+    let unset = SessionBuilder::new(cfg, Some("coding"), Some("head")).secrets(EnvSecrets);
+    let checked = unset.check().expect_err("the key is unset").to_string();
+    let started = unset
+        .start_on_host()
+        .await
+        .err()
+        .expect("the key is unset")
         .to_string();
-    let started =
-        PythonAgent::with_interpreter(start_on_host().await, &cfg, Some("coding"), Some("head"))
-            .err()
-            .expect("the key is unset")
-            .to_string();
     assert_eq!(checked, started);
     assert!(checked.contains(&format!("{vars}_FIRST")), "{checked}");
 }
@@ -2680,14 +2819,19 @@ fn names(resolved: &super::resolve::ResolvedAgent) -> Vec<&str> {
 fn an_alias_resolves_to_each_reachable_model_in_order() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_ALIAS";
     let cfg = two_provider_config(vars, "");
-    let both = with_both_keys(vars, || resolve_agent(&cfg, None, Some("chain"))).expect("resolves");
+    let both = with_both_keys(vars, || {
+        resolve_agent(&cfg, None, Some("chain"), &EnvSecrets)
+    })
+    .expect("resolves");
     assert_eq!(names(&both), ["head", "tail"]);
 
     let second = format!("{vars}_SECOND");
-    let tail_only = with_key(&second, || resolve_agent(&cfg, None, Some("chain")));
+    let tail_only = with_key(&second, || {
+        resolve_agent(&cfg, None, Some("chain"), &EnvSecrets)
+    });
     assert_eq!(names(&tail_only.expect("resolves")), ["tail"]);
 
-    let err = resolve_agent(&cfg, None, Some("chain")).expect_err("no key is set");
+    let err = resolve_agent(&cfg, None, Some("chain"), &EnvSecrets).expect_err("no key is set");
     let rendered = err.to_string();
     assert!(
         rendered.contains("no usable model for alias \"chain\"")
@@ -2744,15 +2888,28 @@ async fn a_recorded_session_is_the_agents_timeline() {
         Some("got hello"),
         "the agent's reply"
     );
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     // Read at once: what shutdown returned after is in the file.
     let records = events::recorded(dir.path());
     let kinds = events::kinds(&records);
-    assert_eq!(kinds.first().map(String::as_str), Some("agent.started"));
-    assert_eq!(kinds.last().map(String::as_str), Some("agent.stopped"));
+    // The session's own states bracket the agent's: starting first, and the
+    // report's last; the agent starts before anything else, and stops before
+    // the report.
+    assert_eq!(kinds.first().map(String::as_str), Some("session.state"));
+    assert_eq!(records[0]["data"], json!({"state": "starting"}));
+    assert_eq!(
+        kinds.iter().find(|kind| !kind.starts_with("session.")),
+        Some(&"agent.started".to_string())
+    );
+    assert_eq!(
+        kinds[kinds.len() - 3..],
+        ["agent.stopped", "session.report", "session.state"]
+    );
+    assert_eq!(
+        records.last().expect("a record")["data"],
+        json!({"state": "reported"})
+    );
     for (n, record) in records.iter().enumerate() {
         assert_eq!(record["id"], (n + 1).to_string(), "{record}");
         assert_eq!(record["specversion"], "1.0");
@@ -2765,20 +2922,26 @@ async fn a_recorded_session_is_the_agents_timeline() {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "data",
-                "datacontenttype",
-                "id",
-                "source",
-                "specversion",
-                "subject",
-                "time",
-                "type",
-            ],
-            "{record}"
-        );
+        // Only an event about the session, or the interpreter every agent
+        // shares, names no agent.
+        let kind = &kinds[n];
+        let shared = kind.starts_with("session.")
+            || kind.starts_with("interpreter.")
+            || kind == "output.unattributed";
+        let mut expected = vec![
+            "data",
+            "datacontenttype",
+            "id",
+            "source",
+            "specversion",
+            "subject",
+            "time",
+            "type",
+        ];
+        if shared {
+            expected.retain(|key| *key != "subject");
+        }
+        assert_eq!(keys, expected, "{record}");
     }
 
     let instructions = events::of_kind(&records, "model.instructions");
@@ -2865,9 +3028,7 @@ async fn token_usage_is_what_the_provider_reported() {
     )
     .await;
     round(&mut agent, "count").await;
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let records = events::recorded(dir.path());
     let ended = events::of_kind(&records, "model.round.completed");
@@ -2888,9 +3049,22 @@ async fn token_usage_is_what_the_provider_reported() {
             "stopped": null,
             "usage": usage(400, 30, 480, 50),
             "calls": [
-                {"index": 0, "model": "sonnet", "usage": usage(100, 10, 160, 50)},
-                {"index": 1, "model": "sonnet", "usage": usage(300, 20, 320, 0)},
+                {
+                    "index": 0,
+                    "model": "sonnet",
+                    "call_id": 1,
+                    "attempt_id": 1,
+                    "usage": usage(100, 10, 160, 50),
+                },
+                {
+                    "index": 1,
+                    "model": "sonnet",
+                    "call_id": 2,
+                    "attempt_id": 2,
+                    "usage": usage(300, 20, 320, 0),
+                },
             ],
+            "attempts": [1, 2],
             "input_tokens_max": 300,
         })
     );
@@ -2977,11 +3151,8 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
             "OUTRIG_TEST_AGENT_EVENTS_REBUILD_{}",
             style.name().to_uppercase()
         );
-        let (agent, recorded, _) =
-            every_cut_recorded(style, &var, events::opened(dir.path()).await).await;
-        within(agent.shutdown())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        let (agent, recorded, _) = every_cut_recorded(style, &var, Some(dir.path())).await;
+        shut_down(agent).await;
 
         let records = events::recorded(dir.path());
         let mut turns: Vec<Vec<rig::completion::Message>> = Vec::new();
@@ -3029,49 +3200,48 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
     }
 }
 
-/// With the mode off, there is no log: not an empty one, no file at all, and
-/// nothing a whole session does writes one.
+/// Unless the session is asked to record, there is no log: not an empty one,
+/// no file at all, and nothing a whole session does writes one. Asked to, it
+/// records under its own id, and a second recording in one log is refused.
 #[tokio::test]
 async fn with_events_off_no_log_is_written() {
     let dir = tempfile::tempdir().expect("a log dir");
-    let off = Config::load_from_str("").expect("an empty config");
-    let events = super::events_for(&off, dir.path(), "test")
-        .await
-        .expect("off opens nothing");
-    assert!(!events.is_on());
-    let (mut agent, _requests) = agent_with(
-        events,
-        Style::Anthropic,
-        "OUTRIG_TEST_AGENT_EVENTS_OFF",
-        MODEL,
-        "",
-        "max-tokens = 4096",
-        vec![submit("toolu_1", "print(1)"), text_reply("done")],
-    )
-    .await;
-    round(&mut agent, "go").await;
-    within(agent.shutdown())
+    let var = "OUTRIG_TEST_AGENT_EVENTS_OFF";
+    let (addr, _requests) =
+        mock_http::start(vec![submit("toolu_1", "print(1)"), text_reply("done")]).await;
+    let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    let session = || {
+        SessionBuilder::new(cfg.clone(), Some("coding"), None)
+            .secrets(keyed(var))
+            .log_in(dir.path())
+    };
+    let mut agent = session()
+        .start_on_host()
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+    round(&mut agent, "go").await;
+    shut_down(agent).await;
     assert_eq!(
         std::fs::read_dir(dir.path()).expect("list").count(),
         0,
         "nothing in the log directory"
     );
 
-    let on = Config::load_from_str("[events]\nmode = \"record\"\n").expect("parses");
-    let events = super::events_for(&on, dir.path(), "20260921T103000-a1b2")
+    let agent = session()
+        .record_events()
+        .start_on_host()
         .await
-        .expect("record opens the log");
-    events.emit(crate::events::Event::AgentStopped {});
-    events.close().await.expect("nothing lost");
+        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
     let records = events::recorded(dir.path());
-    assert_eq!(records[0]["source"], "/outrig/session/20260921T103000-a1b2");
+    assert_eq!(records[0]["source"], events::TEST_SOURCE);
     events::released(dir.path()).await;
 
-    // An agent started again on the session would repeat those events'
-    // `source` and ids, so its start is refused instead.
-    let again = super::events_for(&on, dir.path(), "20260921T103000-a1b2")
+    // A session started again on the log would repeat those events' `source`
+    // and ids, so its start is refused instead.
+    let again = session()
+        .record_events()
+        .start_on_host()
         .await
         .err()
         .expect("a second recording in one log")
@@ -3084,8 +3254,9 @@ async fn with_events_off_no_log_is_written() {
 #[tokio::test]
 async fn failed_dropped_and_truncated_are_recorded() {
     let dir = tempfile::tempdir().expect("a log dir");
+    let (events, mut submitted) = watched(Some(dir.path())).await;
     let (mut agent, _requests) = agent_with(
-        events::opened(dir.path()).await,
+        events,
         Style::Anthropic,
         "OUTRIG_TEST_AGENT_EVENTS_ENDINGS",
         MODEL,
@@ -3103,14 +3274,9 @@ async fn failed_dropped_and_truncated_are_recorded() {
     post(&agent, "fail").await;
     within(agent.round()).await.expect_err("the call failed");
     assert_eq!(round(&mut agent, "big").await, "cut");
-    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    agent.on_submit(move |_| {
-        let _ = started.send(());
-    });
-    dropped_round(&mut agent, "slow", starts.recv()).await;
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    submissions(&mut submitted);
+    dropped_round(&mut agent, "slow", next_submission(&mut submitted)).await;
+    shut_down(agent).await;
 
     let records = events::recorded(dir.path());
     let failed = events::of_kind(&records, "model.round.failed");
@@ -3145,7 +3311,7 @@ async fn retrying_agent(
     events: Events,
     script: Vec<CannedResponse>,
 ) -> (
-    PythonAgent,
+    Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     let (addr, requests) = mock_http::start(script).await;
@@ -3231,12 +3397,12 @@ alias = ["head", "tail"]
 
 /// An agent over `cfg`'s chain and a host-run interpreter, recording to
 /// `events`.
-async fn chained_agent(vars: &str, events: Events, cfg: &Config) -> PythonAgent {
-    let interpreter = start_on_host_with(events).await;
-    with_both_keys(vars, || {
-        PythonAgent::with_interpreter(interpreter, cfg, None, None)
-    })
-    .unwrap_or_else(|e| panic!("{e}"))
+async fn chained_agent(vars: &str, events: Events, cfg: &Config) -> Session {
+    host_session(cfg, None, None, events)
+        .secrets(both_keys(vars))
+        .start_on_host()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A rate-limited call waits as long as the provider asks, is made again, and
@@ -3255,9 +3421,7 @@ async fn a_rate_limited_call_is_retried_and_the_retry_recorded() {
     let started = std::time::Instant::now();
     assert_eq!(round(&mut agent, "hi").await, "ok");
     let waited = started.elapsed();
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     assert!(
         waited >= std::time::Duration::from_millis(950),
@@ -3277,6 +3441,8 @@ async fn a_rate_limited_call_is_retried_and_the_retry_recorded() {
             "attempt": 1,
             "delay": 1.0,
             "error": "HTTP 429 Too Many Requests",
+            "call_id": 1,
+            "attempt_id": 1,
         })]
     );
     assert_eq!(
@@ -3292,9 +3458,10 @@ async fn a_rate_limited_call_is_retried_and_the_retry_recorded() {
 #[tokio::test]
 async fn an_unusable_response_is_retried_without_running_python_again() {
     let dir = tempfile::tempdir().expect("a log dir");
+    let (events, mut submitted) = watched(Some(dir.path())).await;
     let (mut agent, mut requests) = retrying_agent(
         "OUTRIG_TEST_AGENT_RETRY_UNUSABLE",
-        events::opened(dir.path()).await,
+        events,
         vec![
             submit("toolu_1", "print('ran')"),
             mock_http::unusable(),
@@ -3302,14 +3469,11 @@ async fn an_unusable_response_is_retried_without_running_python_again() {
         ],
     )
     .await;
-    let ran = sources(&mut agent);
 
     assert_eq!(round(&mut agent, "run it").await, "done");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
-    assert_eq!(*ran.lock().expect("sources"), ["print('ran')"]);
+    assert_eq!(submissions(&mut submitted), ["print('ran')"]);
     let recorded = mock_http::drain(&mut requests);
     assert_eq!(
         recorded.len(),
@@ -3354,9 +3518,7 @@ async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering
     );
 
     assert_eq!(round(&mut agent, "hi").await, "from the tail");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     assert_eq!(mock_http::drain(&mut requests).len(), 1);
     let records = events::recorded(dir.path());
@@ -3396,15 +3558,13 @@ async fn python_run_before_a_move_is_not_run_again() {
         (Style::Anthropic, &format!("http://{tail}"), ""),
     );
     let dir = tempfile::tempdir().expect("a log dir");
-    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
-    let ran = sources(&mut agent);
+    let (events, mut submitted) = watched(Some(dir.path())).await;
+    let mut agent = chained_agent(vars, events, &cfg).await;
 
     assert_eq!(round(&mut agent, "run it").await, "finished on the tail");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
-    assert_eq!(*ran.lock().expect("sources"), ["print('ran')"]);
+    assert_eq!(submissions(&mut submitted), ["print('ran')"]);
     assert_eq!(mock_http::drain(&mut head_requests).len(), 2);
     let moved = mock_http::drain(&mut tail_requests);
     assert_eq!(moved.len(), 1);
@@ -3441,8 +3601,8 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
         (Style::Anthropic, &format!("http://{head}"), ""),
         (Style::Anthropic, &format!("http://{tail}"), ""),
     );
-    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
-    let ran = sources(&mut agent);
+    let (events, mut submitted) = watched(None).await;
+    let mut agent = chained_agent(vars, events, &cfg).await;
 
     post(&agent, "set x").await;
     let err = within(agent.round())
@@ -3462,7 +3622,7 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
     );
 
     assert_eq!(round(&mut agent, "continue").await, "carried on");
-    assert_eq!(*ran.lock().expect("sources"), ["x = 41\nprint('ran')"]);
+    assert_eq!(submissions(&mut submitted), ["x = 41\nprint('ran')"]);
     let recorded = mock_http::drain(&mut head_requests);
     assert_eq!(recorded.len(), 3, "{recorded:#?}");
     assert_eq!(
@@ -3507,8 +3667,9 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     strict(&mut cfg, "second");
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
-    agent.history.set_window(NARROW);
+    agent.agent.history.set_window(NARROW);
     let alternation: Vec<_> = agent
+        .agent
         .agent
         .model
         .budgets()
@@ -3530,9 +3691,7 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     ] {
         assert_eq!(round(&mut agent, message).await, reply);
     }
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let at_head = mock_http::drain(&mut head_requests);
     let at_tail = mock_http::drain(&mut tail_requests);
@@ -3615,6 +3774,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
     let ceilings: Vec<_> = agent
         .agent
+        .agent
         .model
         .budgets()
         .map(|budget| (budget.model.as_str(), budget.max_tokens))
@@ -3623,9 +3783,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
 
     assert_eq!(round(&mut agent, "make a large result").await, "first");
     assert_eq!(round(&mut agent, "and then?").await, "second");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let at_head = mock_http::drain(&mut head_requests);
     let at_tail = mock_http::drain(&mut tail_requests);
@@ -3756,9 +3914,7 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
 
     assert_eq!(round(&mut agent, "run it").await, "finished on Anthropic");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let moved = mock_http::drain(&mut tail_requests);
     assert_eq!(moved.len(), 1);
@@ -3813,9 +3969,7 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
 
     assert_eq!(round(&mut agent, "run it").await, "finished on the head");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let headed = mock_http::drain(&mut head_requests);
     let moved = mock_http::drain(&mut tail_requests);
@@ -3865,9 +4019,7 @@ async fn a_redirect_loop_moves_on_without_retrying() {
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
 
     assert_eq!(round(&mut agent, "hi").await, "from the tail");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     let followed = mock_http::drain(&mut head_requests).len();
     assert!(
@@ -3903,9 +4055,7 @@ async fn an_overloaded_model_is_retried_rather_than_left() {
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
 
     assert_eq!(round(&mut agent, "hi").await, "from the head");
-    within(agent.shutdown())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    shut_down(agent).await;
 
     assert_eq!(mock_http::drain(&mut head_requests).len(), 2);
     assert!(mock_http::drain(&mut tail_requests).is_empty());
@@ -4063,7 +4213,7 @@ impl Running {
 /// Run `prompt` as a round, pressing Ctrl-C `presses` times once `running`
 /// exists, and return the round's reply with what each press said.
 async fn round_pressed(
-    agent: &mut PythonAgent,
+    agent: &mut Session,
     prompt: &str,
     running: &Running,
     presses: usize,
@@ -4248,7 +4398,7 @@ async fn ctrl_c_twice_stops_waiting_and_a_stop_at_the_prompt_ends_it() {
         .stop_held()
         .expect("an execution was left holding the interpreter");
     assert!(said.starts_with("stopping execution"), "{said}");
-    slot_freed(&agent.interpreter).await;
+    slot_freed(agent.interpreter()).await;
     assert_eq!(agent.stop_held(), None);
     assert_eq!(round(&mut agent, "once more").await, "ran");
 
@@ -4287,7 +4437,7 @@ async fn a_stop_breaks_the_blocking_call_a_dropped_round_left_running() {
         .stop_held()
         .expect("an execution was left holding the interpreter");
     assert!(said.starts_with("stopping execution"), "{said}");
-    slot_freed(&agent.interpreter).await;
+    slot_freed(agent.interpreter()).await;
 
     assert_eq!(round(&mut agent, "again").await, "ran");
     let recorded = mock_http::drain(&mut requests);
@@ -4297,31 +4447,693 @@ async fn a_stop_breaks_the_blocking_call_a_dropped_round_left_running() {
     assert!(next.contains("[this call]\n2\n"), "{next}");
 }
 
+// ---------------------------------------------------------------------------- the session
+
+/// Every `session.state` `events` has published, in order, until its stream
+/// ends.
+async fn states(events: &mut Subscription) -> Vec<String> {
+    let mut states = Vec::new();
+    while let Some(received) = within(events.recv()).await {
+        if let Received::Event(event) = received
+            && let Payload::SessionState { state, .. } = &event.payload
+        {
+            states.push(
+                serde_json::to_value(state)
+                    .expect("a state encodes")
+                    .as_str()
+                    .expect("as its name")
+                    .to_string(),
+            );
+        }
+    }
+    states
+}
+
+/// A subscriber that stops reading never holds a round up: a round fills
+/// its subscription past what it holds, and runs to its end all the same.
+/// When it reads again, it is told how many events it lost, and the next one
+/// it gets is that many past the last it saw.
+#[tokio::test]
+async fn a_stalled_subscriber_never_delays_a_round() {
+    let mut stream = StreamBuilder::default();
+    let mut stalled = stream.subscribe(1);
+    let (mut agent, _requests) = agent_with(
+        stream.build(),
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_STALLED_SUBSCRIBER",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_1", "print('one')"),
+            submit("toolu_2", "print('two')"),
+            text_reply("done"),
+        ],
+    )
+    .await;
+
+    // `round` bounds it: a round that waited on its subscriber would not end.
+    assert_eq!(round(&mut agent, "go").await, "done");
+
+    let Ok(Received::Missed(missed)) = stalled.try_recv() else {
+        panic!("a subscriber that fell behind is told so first");
+    };
+    assert!(missed > 0);
+    let Ok(Received::Event(next)) = stalled.try_recv() else {
+        panic!("and then gets the event after the gap");
+    };
+    assert_eq!(next.id, missed + 1, "every id it did not see is counted");
+    assert_eq!(stalled.missed(), missed);
+    shut_down(agent).await;
+}
+
+/// One model call, retried once and then moved to the next model, is one
+/// call of three attempts: each request sent is recorded once, failed ones
+/// included, with what it was sent with -- the model, its identifier, its
+/// ceiling -- and a usage that is null where the provider reported none, and
+/// what it reported where it did.
+#[tokio::test]
+async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
+    let vars = "OUTRIG_TEST_AGENT_ATTEMPTS";
+    let (head, mut head_requests) =
+        mock_http::start(vec![failure(429).header("Retry-After", 0), failure(401)]).await;
+    let (tail, mut tail_requests) = mock_http::start(vec![
+        text_reply("moved").usage(json!({"input_tokens": 40, "output_tokens": 5})),
+    ])
+    .await;
+    let mut cfg = chain_config(
+        vars,
+        (
+            Style::Anthropic,
+            &format!("http://{head}"),
+            "max-tokens = 1024",
+        ),
+        (
+            Style::Anthropic,
+            &format!("http://{tail}"),
+            "max-tokens = 2048",
+        ),
+    );
+    retrying(&mut cfg, "first");
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+    assert_eq!(round(&mut agent, "go").await, "moved");
+    shut_down(agent).await;
+
+    let records = events::recorded(dir.path());
+    let attempts = events::of_kind(&records, "model.attempt");
+    let usage = |input: u64, output: u64| {
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "total_tokens": input + output,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0,
+        })
+    };
+    assert_eq!(
+        attempts,
+        [
+            &json!({
+                "call_id": 1,
+                "attempt_id": 1,
+                "model": "head",
+                "identifier": MODEL,
+                "max_tokens": 1024,
+                "error": "HTTP 429 Too Many Requests",
+                "usage": null,
+            }),
+            &json!({
+                "call_id": 1,
+                "attempt_id": 2,
+                "model": "head",
+                "identifier": MODEL,
+                "max_tokens": 1024,
+                "error": "HTTP 401 Unauthorized",
+                "usage": null,
+            }),
+            &json!({
+                "call_id": 1,
+                "attempt_id": 3,
+                "model": "tail",
+                "identifier": MODEL,
+                "max_tokens": 2048,
+                "error": null,
+                "usage": usage(40, 5),
+            }),
+        ]
+    );
+    // The settings each attempt names are the ones its request carried.
+    let sent: Vec<_> = mock_http::drain(&mut head_requests)
+        .into_iter()
+        .chain(mock_http::drain(&mut tail_requests))
+        .map(|request| {
+            (
+                request.body["model"].clone(),
+                request.body["max_tokens"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (json!(MODEL), json!(1024)),
+            (json!(MODEL), json!(1024)),
+            (json!(MODEL), json!(2048)),
+        ]
+    );
+
+    let retry = events::of_kind(&records, "model.retry");
+    assert_eq!(
+        (&retry[0]["call_id"], &retry[0]["attempt_id"]),
+        (&json!(1), &json!(1))
+    );
+    let moved = events::of_kind(&records, "model.failover");
+    assert_eq!(
+        (&moved[0]["call_id"], &moved[0]["attempt_id"]),
+        (&json!(1), &json!(2))
+    );
+    let ended = events::of_kind(&records, "model.round.completed");
+    assert_eq!(ended[0]["attempts"], json!([1, 2, 3]));
+    assert_eq!(ended[0]["calls"][0]["call_id"], 1);
+    assert_eq!(ended[0]["calls"][0]["attempt_id"], 3);
+    assert_eq!(ended[0]["usage"], usage(40, 5), "the one that answered");
+}
+
+/// A session's spend is its unique attempts': totalled from the session's own
+/// book and from the attempts' events in its log, the two agree. A round's
+/// total is inclusive of the calls beneath it, so adding the two counts every
+/// attempt twice.
+#[tokio::test]
+async fn session_usage_is_the_unique_attempts_and_a_round_total_is_inclusive() {
+    let var = "OUTRIG_TEST_AGENT_UNIQUE_ATTEMPTS";
+    let dir = tempfile::tempdir().expect("a log dir");
+    // Held, not dropped: the mock stops serving once nothing reads what it
+    // records.
+    let (addr, _requests) = mock_http::start(vec![
+        submit("toolu_1", "x = 1").usage(json!({"input_tokens": 100, "output_tokens": 10})),
+        text_reply("set").usage(json!({"input_tokens": 200, "output_tokens": 20})),
+        failure(503).header("Retry-After", 0),
+        text_reply("again").usage(json!({"input_tokens": 300, "output_tokens": 30})),
+    ])
+    .await;
+    let mut cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    retrying(&mut cfg, "claude");
+    let mut agent = agent_of(&cfg, var, events::opened(dir.path()).await).await;
+    round(&mut agent, "set x").await;
+    round(&mut agent, "again").await;
+    let live = agent.agent.ledger().session_total();
+    shut_down(agent).await;
+
+    let records = events::recorded(dir.path());
+    let replayed = super::ledger::replay(&records).session_total();
+    let total = |usage: &serde_json::Value| usage["total_tokens"].as_u64().unwrap_or(0);
+    let from_attempts: u64 = events::of_kind(&records, "model.attempt")
+        .iter()
+        .map(|attempt| total(&attempt["usage"]))
+        .sum();
+    let from_rounds: u64 = events::of_kind(&records, "model.round.completed")
+        .iter()
+        .map(|round| total(&round["usage"]))
+        .sum();
+    assert_eq!(live.map(|usage| usage.total_tokens), Some(660));
+    assert_eq!(live, replayed);
+    assert_eq!(from_attempts, 660);
+    assert_eq!(from_rounds, 660, "each round's total is its attempts'");
+
+    let first = events::of_kind(&records, "model.round.completed")[0];
+    let beneath: u64 = first["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|call| total(&call["usage"]))
+        .sum();
+    assert_eq!(total(&first["usage"]), beneath, "inclusive of its calls");
+    assert_eq!(
+        total(&first["usage"]) + beneath,
+        2 * total(&first["usage"]),
+        "adding the two counts each attempt twice"
+    );
+    let failed: Vec<_> = events::of_kind(&records, "model.attempt")
+        .into_iter()
+        .filter(|attempt| attempt["error"].is_string())
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed[0]["usage"],
+        serde_json::Value::Null,
+        "null, never zero"
+    );
+}
+
+/// A usage record arriving after its attempt's event replaces that attempt's
+/// null usage once: the round's total changes once, to it. A second record
+/// for the attempt is refused, and both are told apart in the log, each naming
+/// the attempt. Rebuilt from the log alone, through the fold the session used,
+/// the total is the one the session reached -- not what applying the refused
+/// record would give -- and another session's attempt of the same id is
+/// touched by neither record.
+#[tokio::test]
+async fn a_late_usage_record_replaces_a_null_once_and_a_replay_agrees() {
+    use crate::harness::event::{AttemptId, Usage};
+
+    let var = "OUTRIG_TEST_AGENT_LATE_USAGE";
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (addr, _requests) = mock_http::start(vec![failure(500)]).await;
+    let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    let mut agent = agent_of(&cfg, var, events::opened(dir.path()).await).await;
+    post(&agent, "fail").await;
+    within(agent.round()).await.expect_err("the call failed");
+    let attempt = AttemptId::new(1);
+    let ledger = agent.agent.ledger().clone();
+    assert_eq!(ledger.total(&[attempt]), None, "null, never zero");
+
+    assert!(matches!(
+        ledger.late_usage(attempt, Usage::total(7)),
+        super::ledger::Late::Replaced { .. }
+    ));
+    assert_eq!(ledger.total(&[attempt]), Some(Usage::total(7)));
+    assert!(matches!(
+        ledger.late_usage(attempt, Usage::total(9)),
+        super::ledger::Late::Refused { .. }
+    ));
+    assert_eq!(ledger.total(&[attempt]), Some(Usage::total(7)), "once");
+
+    // A second session in the process, with an attempt of the same id.
+    let other_dir = tempfile::tempdir().expect("a log dir");
+    let other_var = "OUTRIG_TEST_AGENT_LATE_USAGE_OTHER";
+    let (other_addr, _other_requests) = mock_http::start(vec![
+        failure(503).header("Retry-After", 0),
+        text_reply("ok").usage(json!({"input_tokens": 12, "output_tokens": 7})),
+    ])
+    .await;
+    let mut other_cfg = config(other_addr, other_var, MODEL, "max-tokens = 4096");
+    retrying(&mut other_cfg, "claude");
+    let mut other = agent_of(
+        &other_cfg,
+        other_var,
+        events::opened(other_dir.path()).await,
+    )
+    .await;
+    round(&mut other, "go").await;
+    let other_ledger = other.agent.ledger().clone();
+    assert_eq!(
+        other_ledger.usage_of(attempt),
+        None,
+        "its own attempt 1 failed"
+    );
+    assert_eq!(
+        other_ledger.session_total().map(|usage| usage.total_tokens),
+        Some(19)
+    );
+    shut_down(agent).await;
+    shut_down(other).await;
+
+    let records = events::recorded(dir.path());
+    let replaced = events::of_kind(&records, "model.usage.replaced");
+    let refused = events::of_kind(&records, "model.usage.refused");
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(replaced[0]["attempt_id"], 1);
+    assert_eq!(replaced[0]["usage"]["total_tokens"], 7);
+    assert_eq!(refused[0]["attempt_id"], 1);
+    assert_eq!(refused[0]["usage"]["total_tokens"], 9);
+    assert_eq!(refused[0]["reason"], "replaced");
+    let failed = events::of_kind(&records, "model.round.failed");
+    assert_eq!(failed[0]["attempts"], json!([1]));
+    assert_eq!(failed[0]["usage"], serde_json::Value::Null);
+
+    let book = super::ledger::replay(&records);
+    assert_eq!(
+        book.total(&[attempt]).map(|usage| usage.total_tokens),
+        Some(7),
+        "the replay agrees with the session"
+    );
+    // A reconstruction that let the last record win would read 9.
+    let last_wins = records
+        .iter()
+        .filter(|record| {
+            record["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("org.outrig.model.usage."))
+        })
+        .filter_map(|record| record["data"]["usage"]["total_tokens"].as_u64())
+        .next_back();
+    assert_eq!(last_wins, Some(9));
+
+    let other_records = events::recorded(other_dir.path());
+    assert!(
+        events::of_kind(&other_records, "model.usage.replaced").is_empty()
+            && events::of_kind(&other_records, "model.usage.refused").is_empty(),
+        "the other session's log has no record of either"
+    );
+    assert_eq!(
+        super::ledger::replay(&other_records)
+            .session_total()
+            .map(|usage| usage.total_tokens),
+        Some(19)
+    );
+}
+
+/// What the session is doing is in its events: one round, in which the model
+/// runs one execution, and a shutdown, publish these states in this order --
+/// closing as admission closes, and reported once the report exists, with
+/// nothing between.
+#[tokio::test]
+async fn a_session_publishes_its_states_in_order() {
+    let (events, mut watched) = watched(None).await;
+    let (mut agent, _requests) = agent_with(
+        events,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_STATES",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![submit("toolu_1", "x = 1"), text_reply("set")],
+    )
+    .await;
+    assert_eq!(round(&mut agent, "set x").await, "set");
+    let report = shut_down(agent).await;
+
+    assert_eq!(
+        states(&mut watched).await,
+        [
+            "starting",
+            "idle",
+            "round_running",
+            "executing",
+            "round_running",
+            "idle",
+            "closing",
+            "reported",
+        ]
+    );
+    assert_eq!(report.verdict(), crate::harness::Verdict::Clean);
+    assert!(report.executions.is_empty(), "nothing ran at the close");
+}
+
+/// Agent code that ends the interpreter ends the session: the exit is an
+/// event and not a state, after which the session is closing; a later round
+/// is refused for it; and the shutdown report names the execution that was
+/// running as unknown, with reported last.
+#[tokio::test]
+async fn the_interpreter_exiting_is_an_event_then_a_close() {
+    let (events, mut watched) = watched(None).await;
+    let (mut agent, _requests) = agent_with(
+        events,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_EXIT",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_exit", "import os\nos._exit(1)"),
+            text_reply("it is gone"),
+        ],
+    )
+    .await;
+    round(&mut agent, "exit").await;
+    post_unchecked(&agent, "again").await;
+    let refused = within(agent.round()).await.expect_err("the session closed");
+    let SessionError::Closed(closed) = &refused else {
+        panic!("{refused}");
+    };
+    assert!(
+        matches!(
+            closed.by(),
+            crate::harness::ClosedBy::InterpreterExited { .. }
+        ),
+        "{refused}"
+    );
+    let report = shut_down(agent).await;
+    assert_eq!(report.executions.len(), 1, "{report:?}");
+    assert_eq!(
+        report.executions[0].status,
+        crate::harness::ExecutionStatus::Unknown
+    );
+
+    let mut kinds = Vec::new();
+    while let Some(received) = within(watched.recv()).await {
+        if let Received::Event(event) = received {
+            let state = match &event.payload {
+                Payload::SessionState { state, .. } => Some(*state),
+                _ => None,
+            };
+            kinds.push((event.kind(), state));
+        }
+    }
+    let at = |kind: &str| {
+        kinds
+            .iter()
+            .position(|(k, _)| *k == kind)
+            .unwrap_or_else(|| panic!("no {kind}: {kinds:?}"))
+    };
+    let closing = kinds
+        .iter()
+        .position(|(_, state)| *state == Some(crate::harness::event::SessionState::Closing))
+        .expect("closing");
+    assert!(at("exec.completed") < at("interpreter.exited"), "{kinds:?}");
+    assert!(at("interpreter.exited") < closing, "{kinds:?}");
+    let after: Vec<_> = kinds[closing + 1..]
+        .iter()
+        .filter_map(|(_, state)| *state)
+        .collect();
+    assert_eq!(
+        after,
+        [crate::harness::event::SessionState::Reported],
+        "no state between closing and reported"
+    );
+}
+
+/// Send `message`, whether or not the agent's channel takes it.
+async fn post_unchecked(agent: &Session, message: &str) {
+    let _ = within(agent.user_channel().send(message)).await;
+}
+
+/// Two sessions in one process, each resolving the same `${VAR}` through a
+/// resolver of its own: each one's model calls carry its own key, and the
+/// process environment is never touched.
+#[tokio::test]
+async fn each_session_sends_its_own_key() {
+    let var = "OUTRIG_TEST_AGENT_OWN_KEY";
+    assert!(std::env::var_os(var).is_none());
+    let start = |key: &'static str| async move {
+        let (addr, requests) = mock_http::start(vec![text_reply("hi")]).await;
+        let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+        let session = host_session(&cfg, Some("coding"), None, Events::off())
+            .secrets(move |name: &str| (name == var).then(|| key.to_string()))
+            .start_on_host()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        (session, requests)
+    };
+    let (mut first, mut first_requests) = start("sk-ant-session-a").await;
+    let (mut second, mut second_requests) = start("sk-ant-session-b").await;
+    let (a, b) = tokio::join!(round(&mut first, "hi"), round(&mut second, "hi"));
+    assert_eq!((a.as_str(), b.as_str()), ("hi", "hi"));
+    for (requests, key) in [
+        (&mut first_requests, "sk-ant-session-a"),
+        (&mut second_requests, "sk-ant-session-b"),
+    ] {
+        let recorded = mock_http::drain(requests);
+        assert!(!recorded.is_empty());
+        for request in recorded {
+            assert_eq!(request.header("x-api-key"), Some(key));
+        }
+    }
+    shut_down(first).await;
+    shut_down(second).await;
+}
+
+/// A turn whose final message held only reasoning -- cut off at its ceiling,
+/// typically -- ends in an outcome that says so and carries the reasoning,
+/// rather than reading as a model that chose to say nothing.
+#[tokio::test]
+async fn a_reasoning_only_round_says_so_and_carries_the_reasoning() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_REASONING_ONLY",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            mock_http::message(
+                json!([{
+                    "type": "thinking",
+                    "thinking": "weighing it",
+                    "signature": mock_http::SIGNATURE,
+                }]),
+                "max_tokens",
+            ),
+            text_reply("ok"),
+        ],
+    )
+    .await;
+    let end = round_end(&mut agent, "think").await;
+    assert!(end.reply.trim().is_empty(), "{end:?}");
+    assert_eq!(end.stopped, None);
+    assert_eq!(end.reasoning.as_deref(), Some("weighing it"));
+
+    let end = round_end(&mut agent, "now say it").await;
+    assert_eq!((end.reply.as_str(), end.reasoning), ("ok", None));
+}
+
+/// A round ending is the model yielding, not the work being done: one whose
+/// code left a task running names it, and one that left nothing names
+/// nothing.
+#[tokio::test]
+async fn a_round_that_leaves_a_task_running_names_it() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_STILL_RUNNING",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_1", "x = 1"),
+            text_reply("set"),
+            submit(
+                "toolu_2",
+                "ci = asyncio.create_task(asyncio.sleep(60), name='ci_run')",
+            ),
+            text_reply("started"),
+        ],
+    )
+    .await;
+    let end = round_end(&mut agent, "set x").await;
+    assert!(end.still_running.is_empty(), "{end:?}");
+    let end = round_end(&mut agent, "start ci").await;
+    assert_eq!(
+        end.still_running.tasks,
+        crate::harness::Tasks::Listed {
+            names: vec!["ci_run".to_string()],
+            more: 0
+        }
+    );
+}
+
+/// Closing admission takes effect at once, from another task, while a round
+/// runs: the round runs on, and its next submission is refused with the
+/// reason as its result, which the model reads. A round asked for after is
+/// refused, and the report has the execution that was running end `ok`.
+#[tokio::test]
+async fn after_the_close_round_refuses_and_a_running_round_reads_why() {
+    let dir = tempfile::tempdir().expect("a dir");
+    let release = dir.path().join("release");
+    let (events, mut watched) = watched(None).await;
+    let (mut agent, mut requests) = agent_with(
+        events,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_CLOSE",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_a",
+                &format!(
+                    "import os\nwhile not os.path.exists({release:?}):\n    \
+                     await asyncio.sleep(0.05)\nprint('a done')",
+                    release = release.to_str().expect("a path")
+                ),
+            ),
+            submit("toolu_b", "print('b')"),
+            text_reply("closing"),
+        ],
+    )
+    .await;
+    let closer = agent.closer();
+    let (end, ()) = tokio::join!(round_end(&mut agent, "go"), async {
+        next_submission(&mut watched).await;
+        closer.close_admission();
+        std::fs::write(&release, "").expect("release a");
+    });
+    assert_eq!(end.reply, "closing");
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(tool_result(&recorded[1], "toolu_a"), "a done\n");
+    let refused = tool_result(&recorded[2], "toolu_b");
+    assert!(
+        refused.contains("not run: this session is closing")
+            && refused.contains("its owner closed admission"),
+        "{refused}"
+    );
+
+    post_unchecked(&agent, "more").await;
+    let err = within(agent.round()).await.expect_err("closed");
+    assert!(
+        matches!(err, SessionError::Closed(_)),
+        "a documented error: {err}"
+    );
+    assert!(err.to_string().contains("closed to new work"), "{err}");
+    let report = shut_down(agent).await;
+    assert_eq!(report.executions.len(), 1);
+    assert_eq!(
+        report.executions[0].status,
+        crate::harness::ExecutionStatus::Ok
+    );
+
+    let mut refusals = Vec::new();
+    while let Some(received) = within(watched.recv()).await {
+        if let Received::Event(event) = received
+            && let Payload::ExecRefused { holder, reason, .. } = &event.payload
+        {
+            refusals.push((*holder, *reason));
+        }
+    }
+    assert_eq!(
+        refusals,
+        [(None, crate::harness::event::Refusal::Closed)],
+        "the refusal is recorded, naming no holder"
+    );
+}
+
 #[cfg(feature = "e2e")]
 mod e2e {
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::LaunchSpec;
     use crate::container::ExecOptions;
+    use crate::harness::{ExecutionStatus, Stopped, Verdict};
     use crate::python::testing::{ALPINE, pull};
-    use crate::{LaunchSpec, Outrig};
 
-    /// The public entry end to end: `start` finds the payload in a launched
-    /// session's primary and starts the interpreter there, and what the
-    /// model's source reads is the container's filesystem, not the host's.
-    /// Recorded, the session's log directory holds what it did, under the
-    /// session its containers are named for, readable by its owner alone.
+    /// How long past its deadline a shutdown may take: an interrupt's grace,
+    /// the container's stop, the interpreter's exit, and the log's finish,
+    /// with room for a loaded machine.
+    const PAST_THE_DEADLINE: Duration = Duration::from_secs(15);
+
+    /// A session of the `coding` agent over `cfg`, in an Alpine container
+    /// whose logs go to `logs`, with the key `var` names.
+    fn in_a_container(cfg: &Config, var: &str, logs: &std::path::Path) -> SessionBuilder {
+        SessionBuilder::new(cfg.clone(), Some("coding"), None)
+            .secrets(keyed(var))
+            .container(LaunchSpec::from_image(
+                ALPINE,
+                BTreeMap::new(),
+                logs.to_path_buf(),
+            ))
+    }
+
+    /// Whether the container named `name` is gone.
+    async fn gone(name: &str) -> bool {
+        let listed = tokio::process::Command::new("podman")
+            .args(["ps", "-a", "--format", "{{.Names}}", "--filter"])
+            .arg(format!("name=^{name}$"))
+            .output()
+            .await
+            .expect("podman ps runs");
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty()
+    }
+
+    /// The public entry end to end: the session launches its container,
+    /// starts the interpreter there, and what the model's source reads is the
+    /// container's filesystem, not the host's. Recorded, the session's log
+    /// directory holds what it did, under the session its containers are named
+    /// for, readable by its owner alone.
     #[tokio::test]
     async fn a_round_runs_its_source_in_the_session_container() {
         pull(ALPINE).await;
         let session = tempfile::tempdir().expect("a session dir");
-        let outrig = Outrig::launch(&LaunchSpec::from_image(
-            ALPINE,
-            BTreeMap::new(),
-            session.path().join("logs"),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+        let logs = session.path().join("logs");
 
         let (addr, mut requests) = mock_http::start(vec![
             submit(
@@ -4342,19 +5154,21 @@ mod e2e {
             "[events]\nmode = \"record\"",
             "max-tokens = 4096",
         );
-        unsafe { std::env::set_var(var, KEY) };
-        let started = within(PythonAgent::start(&outrig, &cfg, Some("coding"), None)).await;
-        unsafe { std::env::remove_var(var) };
-        let mut agent = started.unwrap_or_else(|e| panic!("{e}"));
+        let mut agent = within(in_a_container(&cfg, var, &logs).record_events().start())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             agent.container_name().starts_with("outrig-"),
             "{}",
             agent.container_name()
         );
+        assert_eq!(agent.container_name(), format!("outrig-{}", agent.id()));
 
         assert_eq!(round(&mut agent, "which alpine?").await, "read it");
 
-        let release = outrig
+        let release = agent
+            .outrig()
+            .expect("a container")
             .exec_capture(
                 &["cat".to_string(), "/etc/alpine-release".to_string()],
                 &ExecOptions::new(),
@@ -4368,15 +5182,13 @@ mod e2e {
         );
 
         let container = agent.container_name().to_string();
-        let suffix = outrig.primary().session_suffix().to_string();
-        within(agent.shutdown())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        outrig.shutdown().await.expect("the session shuts down");
+        let id = agent.id().to_string();
+        let report = within(agent.shutdown(DEFAULT_DRAIN)).await;
+        assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+        assert!(gone(&container).await, "the container is stopped");
 
-        let logs = session.path().join("logs");
         let records = events::recorded(&logs);
-        assert_eq!(records[0]["source"], format!("/outrig/session/{suffix}"));
+        assert_eq!(records[0]["source"], format!("/outrig/session/{id}"));
         assert_eq!(
             events::of_kind(&records, "agent.started")[0]["container"],
             json!(container)
@@ -4388,5 +5200,166 @@ mod e2e {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Start a session in a container whose model submits `source` once,
+    /// drive its round until the source is running, and drop the round there.
+    /// The session, its subscription, and the mock's recorder.
+    async fn running(
+        var: &str,
+        logs: &std::path::Path,
+        source: &str,
+        capacity: Option<usize>,
+    ) -> (
+        Session,
+        Subscription,
+        tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+    ) {
+        pull(ALPINE).await;
+        let (addr, requests) =
+            mock_http::start(vec![submit("toolu_run", source), text_reply("done")]).await;
+        let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+        let mut builder = in_a_container(&cfg, var, logs);
+        let mut watched = builder.subscribe();
+        let _stalled = capacity.map(|capacity| builder.subscribe_with_capacity(capacity));
+        let mut agent = within(builder.start())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        dropped_round(&mut agent, "run it", next_submission(&mut watched)).await;
+        (agent, watched, requests)
+    }
+
+    /// Code that catches every interrupt cannot keep a session from stopping:
+    /// shutdown interrupts it once the deadline has passed, stops the
+    /// container, which ends it, and returns a bounded time after the
+    /// deadline, reporting the execution unknown and the session stopped.
+    #[tokio::test]
+    async fn shutdown_cuts_off_code_that_catches_every_interrupt() {
+        let logs = tempfile::tempdir().expect("a log dir");
+        let (agent, _watched, _requests) = running(
+            "OUTRIG_TEST_AGENT_E2E_STUBBORN",
+            logs.path(),
+            "import time\nwhile True:\n    try:\n        time.sleep(0.1)\n    except BaseException:\n        pass",
+            None,
+        )
+        .await;
+        let container = agent.container_name().to_string();
+        let deadline = Duration::from_secs(2);
+        let started = Instant::now();
+        let report = agent.shutdown(deadline).await;
+        let took = started.elapsed();
+        assert!(took < deadline + PAST_THE_DEADLINE, "{took:?}");
+        assert!(
+            took >= deadline,
+            "the drain waited out its deadline: {took:?}"
+        );
+        assert_eq!(report.executions.len(), 1, "{report:?}");
+        assert_eq!(report.executions[0].status, ExecutionStatus::Unknown);
+        assert_eq!(report.stopped, Stopped::Proven);
+        assert_eq!(report.verdict(), Verdict::StoppedWithUnknown);
+        assert!(gone(&container).await, "the container is stopped");
+    }
+
+    /// An execution that finishes within the drain is reported as it ended:
+    /// `ok` for one that returns, `error` for one that raises.
+    #[tokio::test]
+    async fn the_report_says_ok_or_error_for_each_execution() {
+        for (source, status) in [
+            ("await asyncio.sleep(1)", ExecutionStatus::Ok),
+            (
+                "await asyncio.sleep(1)\nraise ValueError('late')",
+                ExecutionStatus::Error,
+            ),
+        ] {
+            let logs = tempfile::tempdir().expect("a log dir");
+            let (agent, _watched, _requests) =
+                running("OUTRIG_TEST_AGENT_E2E_DRAINED", logs.path(), source, None).await;
+            let deadline = Duration::from_secs(10);
+            let started = Instant::now();
+            let report = agent.shutdown(deadline).await;
+            assert!(
+                started.elapsed() < deadline,
+                "it did not wait out the drain: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(report.executions.len(), 1, "{report:?}");
+            assert_eq!(report.executions[0].status, status, "{source}");
+            assert_eq!(report.verdict(), Verdict::Clean);
+        }
+    }
+
+    /// A subscriber that takes nothing while more events are published than
+    /// it holds does not hold shutdown back, and the report counts what it
+    /// missed.
+    #[tokio::test]
+    async fn a_stalled_subscriber_does_not_hold_shutdown_back() {
+        let logs = tempfile::tempdir().expect("a log dir");
+        let (agent, _watched, _requests) = running(
+            "OUTRIG_TEST_AGENT_E2E_STALLED",
+            logs.path(),
+            "print('ran')",
+            Some(2),
+        )
+        .await;
+        let deadline = Duration::from_secs(2);
+        let started = Instant::now();
+        let report = agent.shutdown(deadline).await;
+        assert!(
+            started.elapsed() < deadline + PAST_THE_DEADLINE,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.events.missed.len(), 2, "two subscriptions");
+        assert!(
+            report.events.missed[1] > 0,
+            "the stalled one missed some: {report:?}"
+        );
+        assert!(report.events.last_sequence > 2);
+    }
+
+    /// A `Config` built in code starts a session with the one call alone:
+    /// keys from the environment, the container from the config's image, and
+    /// no other input.
+    #[tokio::test]
+    async fn a_config_built_in_code_starts_with_one_call() {
+        use crate::config::{AnthropicOptions, ApiKeyRef, ImageConfig, LlmProvider, Model};
+
+        pull(ALPINE).await;
+        let sessions = tempfile::tempdir().expect("a session root");
+        let (addr, _requests) = mock_http::start(vec![text_reply("built in code")]).await;
+        let var = "OUTRIG_TEST_AGENT_E2E_IN_CODE";
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "claude".to_string(),
+            LlmProvider::anthropic(
+                format!("http://{addr}"),
+                ApiKeyRef::parse(&format!("${{{var}}}")).expect("a reference"),
+                AnthropicOptions::new(),
+            ),
+        );
+        let mut model = Model::new("claude");
+        model.identifier = Some(MODEL.to_string());
+        model.max_tokens = Some(4096);
+        cfg.models.insert("sonnet".to_string(), model);
+        cfg.default_model = Some("sonnet".to_string());
+        cfg.images
+            .insert("alpine".to_string(), ImageConfig::from_image_name(ALPINE));
+        cfg.default_image = Some("alpine".to_string());
+        cfg.session_root = Some(sessions.path().to_path_buf());
+
+        // SAFETY: edition 2024 marks `env::set_var` unsafe because of
+        // multi-thread races; the variable is this test's alone.
+        unsafe { std::env::set_var(var, KEY) };
+        let started = within(Session::start(cfg, None, None)).await;
+        unsafe { std::env::remove_var(var) };
+        let mut session = started.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(round(&mut session, "hi").await, "built in code");
+        let id = session.id().to_string();
+        let report = within(session.shutdown(DEFAULT_DRAIN)).await;
+        assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+        assert!(
+            sessions.path().join(id).join("logs").is_dir(),
+            "its logs under the session root"
+        );
     }
 }

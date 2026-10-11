@@ -41,10 +41,10 @@ pub enum CliError {
     #[error("agent prompt failed: {0}")]
     Prompt(rig::completion::PromptError),
 
-    /// A failure from `outrig`'s Python agent, which renders its own errors
-    /// and hands them over boxed.
+    /// A failure from an `outrig` harness session, which renders its own
+    /// errors.
     #[error(transparent)]
-    PythonAgent(Box<dyn std::error::Error + Send + Sync>),
+    Session(#[from] outrig::harness::SessionError),
 
     /// Rig refused to build the request because no output-token ceiling was
     /// set. Its own wording names `max_tokens`, which is the field on the wire

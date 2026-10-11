@@ -1,5 +1,9 @@
 # Every way a round ends carries the same usage fields
 
+> **Partly done by `0003-19`.** `model.round.failed` and `model.round.dropped` now carry `usage`
+> (the sum over the round's attempts, `null` when none reported any) and `attempts`, the requests
+> the round sent. `input_tokens_max` on those two, and a round sequence beside the number, remain.
+
 ## Context
 
 `model.round.completed` carries `usage`, the round's summed tokens, and `input_tokens_max`.

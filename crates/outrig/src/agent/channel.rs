@@ -116,9 +116,8 @@ fn announcement(channels: &Channels) -> Option<String> {
 
 /// The user's end of an agent's `user` channel: what the user sends goes to
 /// the agent's `runtime.channels["user"]`, and what the agent sends there
-/// comes out here.
-///
-/// **Provisional**, as [`PythonAgent`](super::PythonAgent) is.
+/// comes out here. [`Session::user_channel`](crate::harness::Session::user_channel)
+/// hands it out.
 ///
 /// Clones share one channel. A message the agent sends reaches one
 /// [`UserChannel::receive`], whichever clone it is called on.
@@ -147,8 +146,9 @@ impl UserChannel {
     /// interpreter once it has exited -- and how many messages then waited
     /// unread, this one included.
     ///
-    /// Sending does not start a round: [`PythonAgent::round`](super::PythonAgent::round) does,
-    /// and tells the model what waits.
+    /// Sending does not start a round:
+    /// [`Session::round`](crate::harness::Session::round) does, and tells the
+    /// model what waits.
     pub fn send(
         &self,
         text: &str,
@@ -165,8 +165,8 @@ impl UserChannel {
     /// The agent runs at most 16 messages ahead of this: past that, its code
     /// waits in `send` until one is received. So a caller should receive while
     /// a round runs -- one that receives only once
-    /// [`PythonAgent::round`](super::PythonAgent::round) returns can leave that
-    /// round's code waiting on it.
+    /// [`Session::round`](crate::harness::Session::round) returns can leave
+    /// that round's code waiting on it.
     pub async fn receive(&self) -> Option<String> {
         self.sent.lock().await.recv().await
     }

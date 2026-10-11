@@ -338,6 +338,14 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
     /// either way, since a writer that will not stop is a reason to report
     /// rather than a reason to skip collecting what it already recorded.
     pub(crate) async fn close(&mut self) -> Option<OutrigError> {
+        self.close_by(tokio::time::Instant::now() + SHUTDOWN_GRACE)
+            .await
+    }
+
+    /// [`close`](Self::close), waiting for the writer only until `deadline`:
+    /// for a caller whose own wait has already spent part of the grace. One
+    /// already past stops the writer at once.
+    pub(crate) async fn close_by(&mut self, deadline: tokio::time::Instant) -> Option<OutrigError> {
         let writer = self.writer.lock().ok().and_then(|mut w| w.take())?;
         // Every other handle is gone by now, or about to be. Taking the
         // sender ends the writer's loop once its queue is empty; a record
@@ -350,7 +358,7 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
         // sweep that was supposed to be the last word on both.
         let mut writer = writer;
         let what = self.labels.what;
-        let stopped = match tokio::time::timeout(SHUTDOWN_GRACE, &mut writer).await {
+        let stopped = match tokio::time::timeout_at(deadline, &mut writer).await {
             Ok(Ok(())) => return None,
             // It ended on its own, badly. Whatever it was holding is as lost
             // as if it had been stopped, so the same accounting runs.
@@ -460,7 +468,15 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
     /// Count one of `who`'s records lost before it reached the writer, for
     /// `why`.
     pub(crate) fn lose(&self, who: &K, why: io::Error) {
-        Self::remember_unwritten(&self.unwritten, who, why);
+        self.lose_many(who, 1, why);
+    }
+
+    /// Count `records` of `who`'s records lost before they reached the writer,
+    /// for `why`. `why` is kept only if they are the first `who` lost.
+    pub(crate) fn lose_many(&self, who: &K, records: u64, why: io::Error) {
+        if records > 0 {
+            Self::remember_unwritten(&self.unwritten, who, records, why);
+        }
     }
 
     /// [`enqueue`](Self::enqueue), then wait for the writer to have dealt with
@@ -542,13 +558,18 @@ impl<K: Ord + Clone + Send + 'static> LineSink<K> {
         }
     }
 
-    fn remember_unwritten(unwritten: &Mutex<BTreeMap<K, Loss>>, who: &K, error: io::Error) {
+    fn remember_unwritten(
+        unwritten: &Mutex<BTreeMap<K, Loss>>,
+        who: &K,
+        records: u64,
+        error: io::Error,
+    ) {
         if let Ok(mut unwritten) = unwritten.lock() {
             unwritten
                 .entry(who.clone())
-                .and_modify(|loss| loss.records = loss.records.saturating_add(1))
+                .and_modify(|loss| loss.records = loss.records.saturating_add(records))
                 .or_insert_with(|| Loss {
-                    records: 1,
+                    records,
                     source: error,
                     integrity: None,
                 });
@@ -608,7 +629,7 @@ async fn write_lines<K: Ord + Clone + Send + 'static>(
         };
 
         if let Some(why) = &poisoned {
-            LineSink::remember_unwritten(&unwritten, &who, io::Error::other(why.clone()));
+            LineSink::remember_unwritten(&unwritten, &who, 1, io::Error::other(why.clone()));
             LineSink::leave_pending(&pending, &who);
             freed.notify_waiters();
             let _ = done.send(());
@@ -653,7 +674,7 @@ async fn write_lines<K: Ord + Clone + Send + 'static>(
                 },
             };
             (labels.warn)(format_args!("{what} write failed: {e}"));
-            LineSink::remember_unwritten(&unwritten, &who, e);
+            LineSink::remember_unwritten(&unwritten, &who, 1, e);
             if let Some(why) = recovery {
                 (labels.error)(format_args!(
                     "the {what} log may hold a partial record and cannot be recovered ({why}); \

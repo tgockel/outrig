@@ -25,6 +25,7 @@ use super::testing::{
     Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, start_on_host_with, within,
 };
 use crate::events::{Events, kinds, of_kind, opened, recorded};
+use crate::harness::{ClosedBy, ExecutionStatus};
 
 /// The message of the startup error `started` must be.
 fn startup_error(started: Result<Interpreter, InterpreterError>) -> String {
@@ -690,7 +691,7 @@ async fn an_interpreter_that_exits_is_recorded_with_what_it_was_running() {
     assert_eq!(of_kind(&records, "exec.completed")[0]["status"], "lost");
     assert_eq!(
         *of_kind(&records, "interpreter.exited")[0],
-        json!({"cause": HUNG_UP})
+        json!({"cause": HUNG_UP, "expected": false})
     );
     assert!(
         records[2].get("subject").is_none(),
@@ -914,4 +915,124 @@ mod e2e {
             .await
             .expect("the container stops");
     }
+}
+
+/// Closing admission is decided where the slot is claimed: an execution
+/// running at the close is live at it, and drains when its result arrives,
+/// recorded as it ended; every submission after it is refused, sending
+/// nothing. A second close changes nothing.
+#[tokio::test]
+async fn a_close_refuses_what_follows_and_drains_what_runs() {
+    let interpreter = start_on_host().await;
+    let gate = interpreter.gate();
+    let mut running = interpreter
+        .submit("await asyncio.sleep(0.3)\nprint('drained')")
+        .expect("submitted");
+    let id = running.id();
+
+    assert!(gate.close(ClosedBy::Owner));
+    assert!(!gate.close(ClosedBy::Owner), "once");
+    assert_eq!(gate.closed(), Some(ClosedBy::Owner));
+    assert_eq!(gate.live_at_close(), [(id, None)]);
+    assert!(matches!(
+        interpreter.submit("print('late')"),
+        Err(InterpreterError::Closed(closed)) if *closed.by() == ClosedBy::Owner
+    ));
+
+    within(gate.drained()).await;
+    assert_eq!(within(running.outcome()).await, ok("drained\n"));
+    assert_eq!(gate.live_at_close(), [(id, Some(ExecutionStatus::Ok))]);
+}
+
+/// An interpreter that exits closes admission itself, and what was running is
+/// over, however it ended: the hook is told before its caller hears, and the
+/// exit is recorded as unexpected.
+#[tokio::test]
+async fn an_exit_closes_admission_and_tells_the_hook_first() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let interpreter = start_on_host_with(opened(dir.path()).await).await;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&told);
+    let gate = interpreter.gate();
+    interpreter.on_exit(move || {
+        seen.lock().expect("unpoisoned").push(gate.closed());
+    });
+    let mut exiting = interpreter.submit("import os\nos._exit(1)").expect("sent");
+    let id = exiting.id();
+    let outcome = within(exiting.outcome()).await;
+    assert!(matches!(outcome, Outcome::Unknown(Unknown::Exited { .. })));
+    let told = told.lock().expect("unpoisoned").clone();
+    assert!(
+        matches!(told[..], [Some(ClosedBy::InterpreterExited { .. })]),
+        "admission had closed by then: {told:?}"
+    );
+    assert_eq!(
+        interpreter.gate().live_at_close(),
+        [(id, Some(ExecutionStatus::Unknown))]
+    );
+    within(interpreter.gone()).await;
+    // An exit is still `Gone` to a submission, as it always was.
+    gone(interpreter.submit("print(1)"));
+    let events = interpreter.events().clone();
+    drop(interpreter);
+    events.close().await.expect("nothing lost");
+    let exited = of_kind(&recorded(dir.path()), "interpreter.exited")
+        .first()
+        .copied()
+        .cloned()
+        .expect("recorded");
+    assert_eq!(exited["expected"], false, "{exited}");
+}
+
+/// An interpreter the session stops is recorded as stopped on purpose, not as
+/// having died.
+#[tokio::test]
+async fn an_exit_the_session_asked_for_is_expected() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let interpreter = start_on_host_with(opened(dir.path()).await).await;
+    interpreter.hang_up();
+    within(interpreter.gone()).await;
+    let events = interpreter.events().clone();
+    drop(interpreter);
+    events.close().await.expect("nothing lost");
+    let exited = of_kind(&recorded(dir.path()), "interpreter.exited")
+        .first()
+        .copied()
+        .cloned()
+        .expect("recorded");
+    assert_eq!(exited["expected"], true, "{exited}");
+}
+
+/// What a round leaves running is named by the task: the executions' own
+/// wrappers are not listed, whatever a task is called, and past the bound the
+/// rest are counted.
+#[tokio::test]
+async fn the_tasks_left_running_are_listed_by_name() {
+    let interpreter = start_on_host().await;
+    assert_eq!(
+        within(interpreter.tasks()).await.expect("answered").names,
+        Vec::<String>::new()
+    );
+    run(
+        &interpreter,
+        "never = asyncio.Event()\n\
+         lookalike = asyncio.create_task(never.wait(), name='execution-9')\n\
+         many = [asyncio.create_task(never.wait(), name=f'w{n:02}') for n in range(60)]",
+    )
+    .await;
+    let tasks = within(interpreter.tasks()).await.expect("answered");
+    assert_eq!(tasks.names.len(), 50);
+    assert_eq!(tasks.more, 11, "61 running, 50 named");
+    assert_eq!(
+        tasks.names[0], "execution-9",
+        "named as agent code named it"
+    );
+    // The listing is asked while an execution is suspended: its wrapper is
+    // not among what it names.
+    let mut suspended = interpreter
+        .submit("await asyncio.sleep(0.5)")
+        .expect("submitted");
+    let during = within(interpreter.tasks()).await.expect("answered");
+    assert_eq!((during.names.len(), during.more), (50, 11));
+    within(suspended.outcome()).await;
 }

@@ -11,7 +11,8 @@ point, `PythonAgent` with its `UserChannel`. This supersedes the earlier rule, i
 `crate-split-tradeoffs.md`, that the loop has one entry point and that it is not an interface.
 That rule was waiting for evidence about what a consumer needs, and two things changed: the first
 milestone produced the evidence, and an embedder now needs to drive the same loop from Rust rather
-than keep a second loop of its own. `0003-19` builds it.
+than keep a second loop of its own. `0003-19` builds it, as `outrig::harness`, with the event
+catalog in `outrig::harness::event`; that task's `## Decisions` records the shape.
 
 ## Stable at 0.3.0, not before
 
@@ -298,7 +299,8 @@ thread that reads the environment, and every process started meanwhile inherits 
 
 ## Open questions
 
-- The module's public name and its type names -- `0003-19`'s design fork.
+- ~~The module's public name and its type names.~~ Settled by `0003-19`: `outrig::harness`, a
+  `SessionBuilder` that starts a `Session`, and the events in `outrig::harness::event`.
 - Whether starting a session ensures its image. `run-new` does that itself today, before
   `Outrig::launch`, because `launch` neither pulls nor builds under the image-config's name
   (#456). If this API is all `run-new` uses, either the session takes that step or the API

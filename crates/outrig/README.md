@@ -1,14 +1,18 @@
 # outrig
 
 Run an LLM agent's tools inside a [podman](https://podman.io/)-managed container. This is the
-library crate: it acquires a container image, starts the container, connects the MCP servers
-running inside it, and hands you a typed surface for listing and calling their tools. The agent
-loop, LLM providers, and the `outrig` command-line tool live in the companion
-[`outrig-cli`](https://crates.io/crates/outrig-cli) crate — depend on this crate when you want to
-embed container-isolated MCP tools in your own program and stay free of the LLM-side dependency
-graph.
+library crate. It does two things:
 
-The curated entry point is [`Outrig::launch`].
+- **Containers and their tools.** It acquires a container image, starts the container, connects
+  the MCP servers running inside it, and hands you a typed surface for listing and calling their
+  tools. The entry point is [`Outrig::launch`].
+- **An agent that acts by writing Python** ([`harness`]). A session holds a container, a Python
+  interpreter in it, and an agent whose one tool runs Python there. Your program starts it,
+  drives its rounds, watches its events, and stops it with a report that says whether everything
+  it started has stopped. `outrig run-new` is built on it and nothing else of the loop.
+
+The `outrig` command-line tool lives in the companion
+[`outrig-cli`](https://crates.io/crates/outrig-cli) crate.
 
 Every session's container gets OutRig's own static CPython, mounted read-only at
 `/outrig/python`, so the image needs no Python of its own. The interpreter is part of the build:
@@ -71,6 +75,34 @@ to be authoritative can opt out:
 # use std::collections::BTreeMap;
 let spec = LaunchSpec::from_image("my-image:latest", BTreeMap::new(), "/tmp/outrig-logs".into())
     .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+```
+
+## Running an agent
+
+```rust,no_run
+# async fn example(config: outrig::config::Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use outrig::harness::{DEFAULT_DRAIN, RoundOutcome, SessionBuilder, Verdict};
+
+// Everything the session needs from outside, given before it starts: here, each `${VAR}` its
+// model's key names is read from this program's own store rather than the environment.
+let mut builder = SessionBuilder::new(config, Some("coding"), None)
+    .secrets(|var: &str| (var == "ANTHROPIC_API_KEY").then(|| "sk-...".to_string()));
+let mut events = builder.subscribe();
+let mut session = builder.start().await?;
+
+// The user reaches the agent through its channel; a round runs on what waits there.
+session.user_channel().send("summarize the README").await?;
+if let RoundOutcome::Ended(end) = session.round().await? {
+    println!("{}", end.reply);
+}
+
+// Stop it: nothing new is admitted, what runs gets a few seconds, then the container stops.
+session.close_admission();
+let report = session.shutdown(DEFAULT_DRAIN).await;
+assert_eq!(report.verdict(), Verdict::Clean);
+# let _ = events.try_recv();
+# Ok(())
+# }
 ```
 
 ## Documentation

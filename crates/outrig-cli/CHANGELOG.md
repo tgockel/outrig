@@ -18,8 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the agent's Python waits in `runtime.wait` ends that wait, not the work it was waiting on,
   and the model reads it in the same round. stdout
   carries only what the agent sends on the channel, a send from code that outlived its round
-  included; the model's own text goes to stderr. If the interpreter exits, the session ends with
-  status 1. It starts no MCP server and no sidecar, since the model could not
+  included; the model's own text goes to stderr. A round closes on a line naming the tasks its
+  code left running, `(still running: ci_run)`, beside why a limit stopped it, so a returned prompt
+  is not taken for work done, and a turn that held only reasoning shows the reasoning. `/quit`,
+  the end of input, and a second Ctrl-C at the prompt close the session to new work, give Python
+  still running five seconds, stop the container, print what the stop found, and exit 0 when
+  everything stopped with every outcome known, 2 when some Python was cut off, and 3 when the stop
+  could not be confirmed. If the interpreter exits, the session ends with status 1, or 3 if its
+  stop could not be confirmed. It starts no MCP server and no sidecar, since the model could not
   call them and a server in the primary container would sit beside the interpreter as the same
   user, holding its resolved secrets. Its session is recorded like `run`'s, in a container named
   `outrig-<sid>` and labeled `org.outrig.session=<sid>`, so `outrig clean` finds one an abrupt
@@ -55,9 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[events] mode = "record"`**, which has `run-new` record what its agent did in
   `<session_dir>/logs/events.jsonl`: each model call and the conversation it was sent, each
   submission and how it ended, each message on the channel, the tokens each round used and the
-  model that answered each call, and each retry and failover. The
-  file is readable by its owner only, and finished before the container stops; a warning at exit
-  counts any events it could not take. Off by default, with no flag yet, and `run` ignores it.
+  model that answered each call, each request sent and each retry and failover, and the
+  session's own state, ending with what its stop found. The file is readable by its owner only,
+  and the agent never waits for it; a warning at exit counts any events it could not take, and
+  each shows as a jump in the file's ids. Off by default, with no flag yet, and `run` ignores it.
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py
   <session>` renders a recording to one HTML page, written beside it as `report.html`; it takes
   a session id as `outrig logs` does, or a session directory.

@@ -31,17 +31,22 @@ use super::budget::Budget;
 use super::build::RigAgent;
 use super::failover::FailoverModel;
 use super::history::{self, Adjacent, History};
+use super::ledger::CallSlot;
 use super::tool::{self, Interrupts};
 use crate::config::RoleAlternation;
-use crate::events::{self, CallUsage, Event};
+use crate::harness::event::{AttemptId, CallUsage, Payload, Usage};
 
 /// How a round ended.
-pub(crate) struct RoundEnd {
+pub(crate) struct Finished {
     /// The model's closing text.
     pub(crate) reply: String,
     /// Why the round was cut short, when it was. `None` means the model
     /// finished on its own.
     pub(crate) stopped: Option<String>,
+    /// The final message's reasoning, when it held no text: a round the model
+    /// spent thinking -- often cut off at its output ceiling -- is not
+    /// reported as one that said nothing.
+    pub(crate) reasoning: Option<String>,
 }
 
 /// Run one round of `agent` that `opening` opens, committing its turns to
@@ -73,12 +78,15 @@ pub(crate) async fn round(
     budget: &Arc<Budget>,
     tool_call_max: usize,
     interrupts: &Interrupts,
-) -> Result<RoundEnd, AgentError> {
+) -> Result<Finished, AgentError> {
+    let slot = agent.model.slot().clone();
+    slot.open_round();
     let hook = RoundHook::new(
         tool_call_max,
         interrupts.clone(),
         history.clone(),
         Arc::clone(budget),
+        slot,
     );
     // rig's own budget is a backstop set above the hook's, so the hook -- with
     // its message the model can read -- is the limiter that fires first. As of
@@ -98,13 +106,11 @@ pub(crate) async fn round(
         .add_hook(hook)
         .extended_details()
         .await;
-    // Waited for while the round can still be dropped and keep what it ran:
-    // from the next line on, nothing may wait.
-    unfinished.hook.history.events().ready().await;
+    // From the next line on, nothing may wait.
     unfinished.armed = false;
     let hook = &unfinished.hook;
 
-    let (ended, usage) = match result {
+    let ended = match result {
         Ok(response) => {
             hook.flush(
                 &response
@@ -114,18 +120,46 @@ pub(crate) async fn round(
             // A hook stop normally surfaces as an error, but reading the reason
             // back unconditionally means a stop can never be lost to a path
             // that ends the run cleanly instead.
-            let end = RoundEnd {
+            Ok(Finished {
+                reasoning: is_blank(&response.output)
+                    .then(|| recover_non_text(&response.content))
+                    .flatten(),
                 reply: response.output,
                 stopped: hook.stop_reason(),
-            };
-            (Ok(end), Some(response.usage))
+            })
         }
-        // Only a run that succeeded has rig's total; any other is summed from
-        // its calls.
-        Err(err) => (stopped_short(err, hook), None),
+        Err(err) => stopped_short(err, hook),
     };
-    hook.record_end(&ended, hook.calls_so_far(), usage);
+    // The round's total is its attempts', rather than rig's: rig cannot see
+    // a usage recorded after the run, nor the attempts that failed.
+    hook.record_end(&ended);
     ended
+}
+
+/// Whether `reply` says nothing a person could read.
+fn is_blank(reply: &str) -> bool {
+    reply.trim().is_empty()
+}
+
+/// The reasoning in `content`, the final message of a round whose text was
+/// blank, joined into one block; `None` when there is none worth showing.
+///
+/// rig's `output` is the final message's text parts concatenated, so a turn
+/// the model spent thinking -- cut off at its output ceiling, typically --
+/// arrives as nothing, though it produced, and was billed for, reasoning.
+fn recover_non_text(content: &OneOrMany<AssistantContent>) -> Option<String> {
+    let recovered = content
+        .iter()
+        .filter_map(|part| match part {
+            AssistantContent::Reasoning(reasoning) => {
+                let text = reasoning.display_text();
+                (!is_blank(&text)).then_some(text)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!is_blank(&recovered)).then_some(recovered)
 }
 
 /// Keeps what a round was running when its future is dropped. rig works on a
@@ -142,13 +176,15 @@ impl Drop for KeptIfDropped {
     fn drop(&mut self) {
         if self.armed {
             self.hook.keep_what_ran();
-            let events = self.hook.history.events();
-            if events.is_on() {
-                events.emit(Event::ModelRoundDropped {
+            self.hook.history.events().emit_with(|| {
+                let (usage, attempts) = self.hook.spent();
+                Payload::ModelRoundDropped {
                     round: self.hook.round,
                     calls: self.hook.calls_so_far(),
-                });
-            }
+                    usage,
+                    attempts,
+                }
+            });
         }
     }
 }
@@ -169,7 +205,7 @@ impl Drop for KeptIfDropped {
 /// [`RoundHook::keep_what_ran`]. Dropping it would leave the interpreter
 /// holding what the calls did and the conversation saying they never ran,
 /// which is how a resent prompt runs a `git push` twice.
-fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<RoundEnd, AgentError> {
+fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentError> {
     let (reason, chat_history) = match (err, hook.stop_reason()) {
         (PromptError::PromptCancelled { chat_history, .. }, Some(ours)) => (ours, chat_history),
         (
@@ -190,9 +226,10 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<RoundEnd, AgentEr
         }
     };
     hook.flush(&chat_history);
-    Ok(RoundEnd {
+    Ok(Finished {
         reply: String::new(),
         stopped: Some(reason),
+        reasoning: None,
     })
 }
 
@@ -238,6 +275,8 @@ struct RoundHook {
     budget: Arc<Budget>,
     /// The round's number in the conversation.
     round: u32,
+    /// Where the round's calls are named and its attempts recorded.
+    slot: CallSlot,
 }
 
 /// The round as far as it has got: how much of it is in the store, and the
@@ -289,7 +328,13 @@ impl Journal {
 }
 
 impl RoundHook {
-    fn new(max: usize, interrupts: Interrupts, history: History, budget: Arc<Budget>) -> Self {
+    fn new(
+        max: usize,
+        interrupts: Interrupts,
+        history: History,
+        budget: Arc<Budget>,
+        slot: CallSlot,
+    ) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::default(),
@@ -305,6 +350,7 @@ impl RoundHook {
             round: history.round(),
             history,
             budget,
+            slot,
         }
     }
 
@@ -313,43 +359,37 @@ impl RoundHook {
         self.journal().calls.clone()
     }
 
-    /// Record how the round ended, with what each of `calls` used and, when the
-    /// provider's account of the whole run is to hand, `usage`.
-    fn record_end(
-        &self,
-        ended: &Result<RoundEnd, AgentError>,
-        calls: Vec<CallUsage>,
-        usage: Option<rig::completion::Usage>,
-    ) {
-        let events = self.history.events();
-        if !events.is_on() {
-            return;
-        }
-        let usage = usage.map_or_else(
-            || calls.iter().map(|call| call.usage).sum(),
-            events::Usage::from,
-        );
-        let input_tokens_max = calls
-            .iter()
-            .map(|call| call.usage.input_tokens)
-            .max()
-            .unwrap_or(0);
-        let error;
-        events.emit(match ended {
-            Ok(RoundEnd { stopped, .. }) => Event::ModelRoundCompleted {
-                round: self.round,
-                stopped: stopped.as_deref(),
-                usage,
-                calls,
-                input_tokens_max,
-            },
-            Err(failed) => {
-                error = failed.to_string();
-                Event::ModelRoundFailed {
+    /// What the round's attempts used, each counted once, and the attempts.
+    fn spent(&self) -> (Option<Usage>, Vec<AttemptId>) {
+        let attempts = self.slot.round_attempts();
+        (self.slot.ledger().total(&attempts), attempts)
+    }
+
+    /// Record how the round ended: each call it made, and what its attempts
+    /// used.
+    fn record_end(&self, ended: &Result<Finished, AgentError>) {
+        self.history.events().emit_with(|| {
+            let calls = self.calls_so_far();
+            let (usage, attempts) = self.spent();
+            match ended {
+                Ok(Finished { stopped, .. }) => Payload::ModelRoundCompleted {
                     round: self.round,
-                    error: &error,
+                    stopped: stopped.clone(),
+                    usage,
+                    input_tokens_max: calls
+                        .iter()
+                        .filter_map(|call| call.usage.map(|usage| usage.input_tokens))
+                        .max(),
                     calls,
-                }
+                    attempts,
+                },
+                Err(failed) => Payload::ModelRoundFailed {
+                    round: self.round,
+                    error: failed.to_string(),
+                    calls,
+                    usage,
+                    attempts,
+                },
             }
         });
     }
@@ -498,18 +538,15 @@ impl AgentHook<FailoverModel> for RoundHook {
                 history: round,
                 ..
             } => {
-                // Before the journal's lock, which an await cannot be held
-                // across: the turn committed below and the call's manifest
-                // are both recorded.
-                self.history.events().ready().await;
                 self.interrupts.clear_turn();
+                let call = self.slot.reserve_call();
                 // What rig holds is whole turns by now, since a call is made
                 // only once the last one's tool calls have returned. Once they
                 // are committed, the store holds everything this call answers.
                 let mut journal = self.journal();
                 journal.commit(round.iter().chain([prompt]), &self.history);
                 journal.latest = Latest::default();
-                match self.history.assemble(&self.budget) {
+                match self.history.assemble(&self.budget, call) {
                     Ok((mut sent, manifest)) => {
                         // rig sends the prompt itself, after the history.
                         let last = sent.pop();
@@ -533,11 +570,16 @@ impl AgentHook<FailoverModel> for RoundHook {
                 journal.latest.reply = Some(response.choice.clone());
                 // rig counts its turns from one; the event log counts calls
                 // from zero.
-                journal.calls.push(CallUsage {
-                    index: ctx.turn().saturating_sub(1),
-                    model: response.raw_response.model.clone(),
-                    usage: response.usage.into(),
-                });
+                // The chain has just recorded the request that answered.
+                if let Some((call, attempt)) = self.slot.answered_by() {
+                    journal.calls.push(CallUsage {
+                        index: ctx.turn().saturating_sub(1) as u64,
+                        model: response.raw_response.model.clone(),
+                        call_id: call,
+                        attempt_id: attempt,
+                        usage: self.slot.ledger().usage_of(attempt),
+                    });
+                }
                 Flow::cont()
             }
             StepEvent::ToolCall {
