@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::{Notify, watch};
 
@@ -32,9 +32,10 @@ pub enum Outcome {
 /// ceiling.
 ///
 /// Shared because two places say it: [`Snapshot::read`], for a round that ends
-/// having published nothing, and `set_result` itself, which publishes this
-/// verbatim once it stops asking the subagent to retry. Near-duplicate wordings
-/// would drift, and the parent cannot tell which path it came down anyway.
+/// having published nothing, and [`SubagentShared::give_up`], which publishes
+/// this verbatim once `set_result` stops asking the subagent to retry.
+/// Near-duplicate wordings would drift, and the parent cannot tell which path
+/// it came down anyway.
 pub const TRUNCATED_REPORT: &str = "\
     subagent hit its output token limit while writing its report, so nothing \
     was recorded. Re-ask it for a narrower or shorter report, or raise \
@@ -53,6 +54,16 @@ pub enum SilentCause {
     /// The agent loop was cut short -- the tool-call budget, or a hook that
     /// stopped it. Carries the reason the loop gave.
     EndedEarly(String),
+}
+
+/// How a round gave up on a report that kept being cut off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaveUp {
+    /// The round had not reported, so the parent was told its report did not
+    /// fit.
+    Told,
+    /// The round had reported already, and that report stands.
+    KeptReport,
 }
 
 /// Whether the subagent is working.
@@ -140,16 +151,15 @@ pub struct SubagentShared {
     /// `set_result` can stop asking for a retry that keeps failing the same
     /// way.
     truncated_attempts: AtomicU32,
-    /// Whether this round already gave up on the subagent's report and told
-    /// the parent so.
+    /// How this round gave up on the subagent's report, once it has.
     ///
     /// A latch, not a counter, and cleared only by [`Self::begin_round`]. It has
-    /// to survive the `publish` that giving up performs: without it that
+    /// to survive the `publish` that giving up can perform: without it that
     /// publish reset the tally, so the very next truncated call counted as a
     /// first attempt and the whole three-strike cycle began again -- the loop
     /// slowed to a third of its old rate rather than stopped, re-warning and
     /// re-publishing every three calls.
-    gave_up: AtomicBool,
+    gave_up: Mutex<Option<GaveUp>>,
     /// Every prompt the parent has sent that no round has taken up yet, and
     /// whether the round in flight can still take one. See
     /// [`crate::subagent::injection`].
@@ -204,7 +214,7 @@ impl SubagentShared {
             tx,
             round_start_version: Mutex::new(0),
             truncated_attempts: AtomicU32::new(0),
-            gave_up: AtomicBool::new(false),
+            gave_up: Mutex::new(None),
             // Closed until the first round begins, so a send that races the
             // launch queues behind its first prompt instead of steering a
             // round that has not seen its assignment yet.
@@ -249,18 +259,31 @@ impl SubagentShared {
         self.truncated_attempts.store(0, Ordering::SeqCst);
     }
 
-    /// Whether this round has already given up on reporting.
-    pub fn has_given_up(&self) -> bool {
-        self.gave_up.load(Ordering::SeqCst)
+    /// How this round gave up on reporting, if it has.
+    pub fn gave_up(&self) -> Option<GaveUp> {
+        *self.lock_gave_up()
     }
 
-    /// Give up on the subagent's report and tell the parent why, once.
+    /// Give up on the subagent's report, and return how the round gave up.
     ///
-    /// Returns whether this call was the one that gave up, so the caller can
-    /// publish and warn exactly once no matter how many more truncated calls
-    /// arrive behind it.
-    pub fn give_up(&self) -> bool {
-        !self.gave_up.swap(true, Ordering::SeqCst)
+    /// The first call decides, and tells the parent why the report did not
+    /// arrive -- unless the round has reported already. The inbox keeps only
+    /// the latest, so publishing would replace a report that fit with news that
+    /// a later one did not (#350). Unlike a failed round, this one goes on, so
+    /// a parent that sent a message after the report needs no publish either:
+    /// [`Self::end_round`] counts no publish from before it, and the cut-off
+    /// reaches that parent as the round's silent cause. Every later call
+    /// returns what the first decided.
+    pub fn give_up(&self) -> GaveUp {
+        let mut gave_up = self.lock_gave_up();
+        *gave_up.get_or_insert_with(|| {
+            if self.published_this_round() {
+                GaveUp::KeptReport
+            } else {
+                self.publish(Outcome::Error(TRUNCATED_REPORT.to_string()));
+                GaveUp::Told
+            }
+        })
     }
 
     /// Record that a report was cut off part-way, and return how many
@@ -297,7 +320,7 @@ impl SubagentShared {
             .lock()
             .expect("round-version mutex poisoned") = version;
         self.truncated_attempts.store(0, Ordering::SeqCst);
-        self.gave_up.store(false, Ordering::SeqCst);
+        *self.lock_gave_up() = None;
         let mut prompts = self.lock_prompts();
         prompts.open = true;
         prompts.steered_at = None;
@@ -444,6 +467,10 @@ impl SubagentShared {
 
     fn lock_prompts(&self) -> std::sync::MutexGuard<'_, Prompts> {
         self.prompts.lock().expect("prompts mutex poisoned")
+    }
+
+    fn lock_gave_up(&self) -> std::sync::MutexGuard<'_, Option<GaveUp>> {
+        self.gave_up.lock().expect("gave-up mutex poisoned")
     }
 }
 
@@ -668,16 +695,47 @@ mod tests {
     fn giving_up_latches_once_per_round() {
         let shared = SubagentShared::new();
         shared.begin_round();
-        assert!(!shared.has_given_up());
-        assert!(shared.give_up(), "the first caller gives up");
-        assert!(!shared.give_up(), "later callers do not publish again");
-        assert!(shared.has_given_up());
+        assert_eq!(shared.gave_up(), None);
+        assert_eq!(shared.give_up(), GaveUp::Told, "the first caller gives up");
+        assert_eq!(shared.give_up(), GaveUp::Told);
+        assert_eq!(
+            shared.snapshot().version,
+            1,
+            "later callers do not publish again"
+        );
+        assert_eq!(shared.gave_up(), Some(GaveUp::Told));
 
         shared.end_round();
         shared.begin_round();
-        assert!(
-            !shared.has_given_up(),
+        assert_eq!(
+            shared.gave_up(),
+            None,
             "new work from the parent deserves a fresh attempt"
+        );
+    }
+
+    /// #350: a round that reported keeps its report when it gives up on a
+    /// later one. A parent that steered after the report gets it first, and
+    /// the cut-off once the round ends, since the report is no answer to the
+    /// steer.
+    #[test]
+    fn giving_up_after_a_report_keeps_it() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.publish(Outcome::Result("report".into()));
+        shared.accept("expand on it".into());
+        shared.note_truncated_attempt();
+        assert_eq!(shared.give_up(), GaveUp::KeptReport);
+        assert_eq!(shared.snapshot().version, 1, "nothing is published over it");
+        let _ = shared.deliver_injections();
+        let _ = shared.close_injections(true);
+        shared.end_round();
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.read(0), Some(Outcome::Result("report".into())));
+        assert_eq!(
+            snapshot.read(1),
+            Some(Outcome::Error(TRUNCATED_REPORT.to_string()))
         );
     }
 

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::llm::TurnUndo;
 use crate::rig_tool::truncate_for_llm;
-use crate::subagent::state::{Outcome, SubagentShared, TRUNCATED_REPORT};
+use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
 use crate::subagent::{Read, SubagentRegistry};
 
 /// Wraps a failure as the model-visible tool error.
@@ -546,7 +546,8 @@ const SHORTEN_THE_REPORT: &str = "\
     quoting at length. If it genuinely cannot be shortened, say so via \
     `status: \"error\"` with a short `body`.";
 
-/// What every truncated call gets once the round has given up.
+/// What every truncated call gets once the round has given up and told the
+/// parent so.
 ///
 /// Deliberately a *failure* rather than a success. Returning `Ok` here read as
 /// "call handled" to the repeat breaker in [`crate::llm::RepeatTracker`], which
@@ -557,6 +558,21 @@ const ALREADY_REPORTED: &str = "\
     nothing further was recorded. The agent that launched you has already been \
     told that your reply is being cut off at its output-token limit, so this \
     report cannot be delivered. Stop calling outrig__set_result.";
+
+/// [`ALREADY_REPORTED`], for a round that gave up after it had reported: that
+/// report stands, and the agent that launched it was told nothing (#350).
+const REPORT_STANDS: &str = "\
+    nothing further was recorded. This report is being cut off at your \
+    output-token limit, so it cannot be delivered; the agent that launched you \
+    keeps the report you recorded earlier. Stop calling outrig__set_result.";
+
+/// What a truncated call gets once the round has given up, by how it did.
+fn refusal(how: GaveUp) -> &'static str {
+    match how {
+        GaveUp::Told => ALREADY_REPORTED,
+        GaveUp::KeptReport => REPORT_STANDS,
+    }
+}
 
 /// The last ask. Retrying the report is off the table by now, so this asks for
 /// the one thing that still fits: a short error the parent can act on.
@@ -686,8 +702,8 @@ impl ToolDyn for SetResultTool {
                 // Checked before the attempt count, and latched rather than
                 // derived from it, so that everything below happens exactly
                 // once per round however many truncated calls keep arriving.
-                if self.shared.has_given_up() {
-                    return fail(ALREADY_REPORTED);
+                if let Some(how) = self.shared.gave_up() {
+                    return fail(refusal(how));
                 }
                 return match attempt {
                     1 => {
@@ -699,14 +715,9 @@ impl ToolDyn for SetResultTool {
                     // what makes this converge: `end_round` sees a round that
                     // published, and a parent blocked in `get_result` wakes now
                     // with the cause instead of once the tool-call budget has
-                    // drained into the same failing call.
-                    _ => {
-                        if self.shared.give_up() {
-                            self.shared
-                                .publish(Outcome::Error(TRUNCATED_REPORT.to_string()));
-                        }
-                        fail(ALREADY_REPORTED)
-                    }
+                    // drained into the same failing call. A round that reported
+                    // already keeps its report instead (#350).
+                    _ => fail(refusal(self.shared.give_up())),
                 };
             }
             let args: SetResultArgs = parse_args(&args)?;
@@ -755,6 +766,7 @@ pub fn parent_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagent::state::TRUNCATED_REPORT;
 
     /// The built-ins must look exactly like MCP tools to the model, which
     /// means going through the same `<server>__<tool>` sanitizer.
@@ -1141,6 +1153,38 @@ mod tests {
             Some(Outcome::Result("the short version".to_string())),
             "the report that fit must survive the later truncation"
         );
+    }
+
+    /// #350: the restored budget runs out too. Giving up then published the
+    /// cut-off over the report that fit, so the parent was told nothing was
+    /// recorded when something was. The report stands, and the subagent is
+    /// told so rather than that its parent was told of the cut-off.
+    #[tokio::test]
+    async fn giving_up_on_a_revision_keeps_the_report_that_fit() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the short version"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        truncated_call(&tool).await.expect_err("first attempt");
+        truncated_call(&tool).await.expect_err("second attempt");
+        for call in 3..=4 {
+            let err = truncated_call(&tool)
+                .await
+                .expect_err("past the budget, every call is refused");
+            assert!(
+                err.to_string()
+                    .contains("keeps the report you recorded earlier"),
+                "call {call}: {err}"
+            );
+        }
+
+        let snapshot = shared.snapshot();
+        assert_eq!(
+            snapshot.outcome,
+            Some(Outcome::Result("the short version".to_string()))
+        );
+        assert_eq!(snapshot.version, 1, "nothing is published over it");
     }
 
     /// `required` keeps `body` present but not meaningful; an empty report

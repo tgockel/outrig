@@ -42,7 +42,7 @@ use tokio::task::JoinHandle;
 
 use crate::llm::{ResolvedAgent, TurnStop};
 use crate::session_tool::SessionTool;
-use state::{Outcome, SubagentShared};
+use state::{GaveUp, Outcome, SubagentShared};
 
 /// Longest subagent name accepted. Names are handles the model types back, so
 /// they stay short enough to be cheap to repeat.
@@ -1012,6 +1012,15 @@ async fn run_rounds(
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
         log.record_reply(&reply).await;
+        if shared.gave_up() == Some(GaveUp::KeptReport) {
+            // The give-up goes beside the report rather than over it (#350), as
+            // a failure after reporting does.
+            let note = "a later report was cut off at the output-token limit; the earlier one \
+                        was kept";
+            eprintln!("[outrig]   [{name}] {note}");
+            log.record_outcome("report cut off after reporting", note)
+                .await;
+        }
         if let Some(reason) = &failure {
             if shared.published_this_round() && !shared.steered_since_publish() {
                 // A round that reported keeps its report. The inbox keeps only
@@ -1817,6 +1826,13 @@ mod tests {
                 .map(|arguments| (name.as_str(), arguments.as_str()))
                 .collect();
             self.call_tools(&calls);
+        }
+
+        /// Answer with an `outrig__set_result` call cut off before its `body`,
+        /// the way the output-token ceiling leaves one.
+        fn set_result_cut_off(self) {
+            let name = crate::builtin_tool::name_of("set_result");
+            self.call_tools(&[(&name, r#"{"status":"result"}"#)]);
         }
 
         /// Answer with an `outrig__get_result` call for `name`, so another
@@ -2831,7 +2847,25 @@ mod tests {
 
         provider.next_call().await.set_result("the findings");
         provider.next_call().await.fail(status);
-        tokio::time::timeout(WAIT_TIMEOUT, until_idle(&registry, "probe"))
+        assert_report_kept_beside(
+            "round failed after reporting",
+            &registry,
+            &mut provider,
+            &log_dir,
+        )
+        .await;
+    }
+
+    /// Once `probe`'s round is idle: the parent reads the report it made, and
+    /// its transcript notes `what` beside the report, which it records as the
+    /// round's outcome.
+    async fn assert_report_kept_beside(
+        what: &str,
+        registry: &SubagentRegistry,
+        provider: &mut ScriptedProvider,
+        log_dir: &tempfile::TempDir,
+    ) {
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(registry, "probe"))
             .await
             .expect("the round went idle");
         assert_eq!(
@@ -2841,14 +2875,14 @@ mod tests {
         );
 
         // The next round records its prompt before its first model call, so
-        // by now the failed round's transcript entry is written.
-        let call = follow_up(&registry, &mut provider).await;
+        // by now the round's transcript entry is written.
+        let call = follow_up(registry, provider).await;
         let transcript = tokio::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
             .await
             .expect("transcript exists");
         assert!(
-            transcript.contains("\n--- round failed after reporting ---\n"),
-            "the failure is noted: {transcript}"
+            transcript.contains(&format!("\n--- {what} ---\n")),
+            "{what} is noted: {transcript}"
         );
         assert!(
             transcript.contains("\n--- result ---\nthe findings\n"),
@@ -2926,6 +2960,61 @@ mod tests {
             Ok(Outcome::Error(
                 "subagent stopped without calling outrig__set_result".to_string()
             ))
+        );
+    }
+
+    /// #350: a round whose report fit gives up on a later one that will not.
+    /// Giving up published the cut-off over the report, so a parent that read
+    /// once the round was over was told nothing was recorded, and the
+    /// transcript recorded the give-up as the round's outcome. The report
+    /// stands, and the give-up is noted beside it.
+    #[tokio::test]
+    async fn a_report_that_fit_outlasts_the_give_up_on_its_revision() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe(&provider, 8).await;
+
+        provider.next_call().await.set_result("the findings");
+        for _ in 0..3 {
+            provider.next_call().await.set_result_cut_off();
+        }
+        provider.next_call().await.reply("done");
+        assert_report_kept_beside(
+            "report cut off after reporting",
+            &registry,
+            &mut provider,
+            &log_dir,
+        )
+        .await;
+    }
+
+    /// The case #350 was found in: the parent follows up on the report without
+    /// reading it, and the revision that would answer it will not fit. The
+    /// parent was told only that nothing was recorded. It now reads the
+    /// report, then that the follow-up's did not fit.
+    #[tokio::test]
+    async fn a_follow_up_whose_report_will_not_fit_leaves_the_report_to_read() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+
+        provider.next_call().await.set_result("the findings");
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.set_result_cut_off();
+        for _ in 0..2 {
+            provider.next_call().await.set_result_cut_off();
+        }
+        provider.next_call().await.reply("done");
+
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string()))
+        );
+        let outcome = tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+            .await
+            .expect("the parent is told, rather than left waiting");
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Error(state::TRUNCATED_REPORT.to_string()))
         );
     }
 

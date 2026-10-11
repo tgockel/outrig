@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent's report outlasts a revision that does not fit.** When a subagent reported with
+  `outrig__set_result` and later in the round tried a longer report that was cut off at the
+  output-token ceiling three times, outrig gave up on it by publishing `subagent hit its output
+  token limit while writing its report, so nothing was recorded` over the report that fit. A
+  parent that read after that was told nothing was recorded, and the report was gone from the
+  inbox and from the transcript's outcome. The report now stands, and the give-up is noted beside
+  it, on stderr and in the subagent's transcript. A parent that sent a message after the report
+  reads the report if it had not, then, once the round ends, that the answer did not fit. (#350)
+
 - **A panic a task survives no longer removes the session's containers.** outrig's panic hook
   removed every container the process had started on any panic -- including one in a subagent
   round, an MCP connection, or the sidecar watcher, which `outrig run` and `outrig mcp` carry on

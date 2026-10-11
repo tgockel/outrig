@@ -149,10 +149,16 @@ on the subagent's behalf, so a parent blocked in `outrig__get_result` wakes with
 immediately instead of once the subagent's whole tool-call budget has drained into one call that
 could not succeed.
 
-Having given up, the round stays given up: it publishes and warns once, and every later truncated
-call gets the same refusal. That refusal is a tool *failure*, not a success, so identical repeats
-keep accumulating against the breaker below -- which is what ends the round if the subagent will
-not take the hint.
+Unless the round has reported already: a report that fit stands, and a later one that will not
+fit does not replace it. The subagent is told its earlier report stands instead, and the give-up
+is noted on stderr and in the subagent's transcript. If the parent sent a message after the
+report, the report is no answer to it, so the parent reads the report if it had not, then, once
+the round ends, that the subagent's report did not fit.
+
+Having given up, the round stays given up: it publishes, or keeps the report, and warns once, and
+every later truncated call gets the same refusal. That refusal is a tool *failure*, not a success,
+so identical repeats keep accumulating against the breaker below -- which is what ends the round if
+the subagent will not take the hint.
 
 The durable fix is a bigger ceiling. `max-tokens` is unset by default, which leaves the limit to
 the provider, and that default can be much lower than expected behind a gateway. The first
