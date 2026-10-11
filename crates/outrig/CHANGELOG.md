@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image rebuilds when a build context gains an empty directory or has a directory's
+  permissions changed.** For a context in a git repo, the cache key came from git's file
+  listing, which names no empty directory and carries no directory's mode, though `COPY .`
+  copies both. Adding an empty directory, or running `chmod` on one, left the key alone, and
+  `outrig build` and `outrig run` reported a cache hit on an image that lacked the directory or
+  had its old mode. The key now also covers every directory in the context that no ignore rule
+  excludes, empty ones and the context itself included, by path and permission bits. A
+  directory `.gitignore` excludes still does not count, empty or not. One the build user cannot
+  open, or cannot reach through a directory it cannot search, is left unread rather than failing
+  the key. Every build image whose context is in a git repo gets a new key, so each rebuilds
+  once after upgrading. (#217)
+
 - **A raw image ref that is not local no longer reads as a problem with `--image`.**
   `ensure_local_image` hard-wired `--image` and "did not match any `[images.<name>]`" into the
   error for every ref it refused, so a `[sidecars.<sc>]` or inline `image` that was never pulled

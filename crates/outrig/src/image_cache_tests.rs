@@ -361,6 +361,173 @@ async fn path_and_mode_are_part_of_the_key() {
     assert_ne!(executable, renamed, "a rename must change the key");
 }
 
+/// A committed context for `COPY . /app`, with a tracked directory `conf` and
+/// whatever else `files` adds.
+fn copy_all_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let mut all = vec![
+        ("Dockerfile", "FROM scratch\nCOPY . /app\n"),
+        ("conf/app.conf", "x\n"),
+    ];
+    all.extend_from_slice(files);
+    let ctx = make_ctx(&all);
+    git_init(ctx.path());
+    ctx
+}
+
+/// Flip the group-execute bit of `dir`, leaving its owner's access alone.
+fn chmod_directory(dir: &Path) {
+    let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode ^ 0o010)).unwrap();
+}
+
+/// git tracks files, so it lists no empty directory, yet `COPY .` copies one.
+#[tokio::test]
+async fn an_empty_directory_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::create_dir(ctx.path().join("cache")).unwrap();
+    assert_not_ignored(ctx.path(), "cache");
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory must change the key"
+    );
+
+    // `untracked/` is one entry to `ls-files --directory`, which says nothing
+    // of what is inside.
+    let untracked = ctx.path().join("untracked");
+    std::fs::create_dir(&untracked).unwrap();
+    std::fs::write(untracked.join("a.txt"), "a\n").unwrap();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::create_dir(untracked.join("empty")).unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory inside an untracked directory must change the key"
+    );
+}
+
+/// `COPY` keeps a directory's permission bits, which no git listing carries.
+#[tokio::test]
+async fn chmod_on_a_directory_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    std::fs::create_dir(ctx.path().join("empty")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+
+    // A directory of tracked files, an empty one, and the context itself.
+    for rel in ["conf", "empty", ""] {
+        let dir = ctx.path().join(rel);
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        chmod_directory(&dir);
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "chmod on {rel:?} must change the key"
+        );
+    }
+}
+
+/// Where the rules exclude every file, the whole tree counts, and `COPY .`
+/// still keeps the context directory's own mode.
+#[tokio::test]
+async fn chmod_on_an_ignored_context_changes_the_key() {
+    let repo = make_ctx(&[
+        (".gitignore", "private/\n"),
+        ("private/ctx/Dockerfile", "FROM scratch\nCOPY . /app\n"),
+    ]);
+    git_init(repo.path());
+    assert_ignored(repo.path(), "private/ctx/Dockerfile");
+    let ctx = repo.path().join("private/ctx");
+    let dockerfile = ctx.join("Dockerfile");
+    let args = BTreeMap::new();
+
+    let before = key(&dockerfile, &args, &ctx).await;
+    chmod_directory(&ctx);
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, &ctx).await,
+        "chmod on an ignored context directory must change the key"
+    );
+}
+
+/// Ignore rules keep build output out of the key, directories included.
+#[tokio::test]
+async fn an_ignored_directory_does_not_count() {
+    let ctx = copy_all_ctx(&[(".gitignore", "build/\ncache/\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::create_dir(ctx.path().join("cache")).unwrap();
+    std::fs::create_dir_all(ctx.path().join("build/sub")).unwrap();
+    std::fs::write(ctx.path().join("build/sub/out.o"), "artifact").unwrap();
+    assert_ignored(ctx.path(), "cache");
+    assert_ignored(ctx.path(), "build/sub");
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an ignored directory, empty or not, must not change the key"
+    );
+
+    chmod_directory(&ctx.path().join("cache"));
+    chmod_directory(&ctx.path().join("build/sub"));
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "chmod on an ignored directory must not change the key"
+    );
+}
+
+/// A nested repository is walked by its own pass, under its own rules; the
+/// outer one leaves it alone.
+#[tokio::test]
+async fn an_empty_directory_in_a_nested_repository_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    let lib = ctx.path().join("vendor/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("lib.txt"), "v1").unwrap();
+    git_init(&lib);
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::create_dir(lib.join("cache")).unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory inside a nested repository must change the key"
+    );
+}
+
+/// git warns about a directory it cannot look into and carries on, and so must
+/// the key: a root-owned volume in a context does not stop a build that worked.
+/// Mode 0o000 cannot be opened; 0o644 can be listed, but nothing in it can be
+/// reached, a subdirectory included.
+#[tokio::test]
+async fn an_inaccessible_directory_does_not_fail_the_key() {
+    for mode in [0o000, 0o644] {
+        let ctx = copy_all_ctx(&[]);
+        let locked = ctx.path().join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
+        if std::fs::symlink_metadata(locked.join("sub")).is_ok() {
+            eprintln!("skipping: permissions are not enforced for this user");
+            return;
+        }
+
+        let dockerfile = ctx.path().join("Dockerfile");
+        let result = CacheKey::compute(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+
+        // So the tempdir can clean up, whatever the result.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap_or_else(|err| panic!("mode {mode:o} must not fail the key: {err}"));
+    }
+}
+
 #[tokio::test]
 async fn subdirectory_context_hashes_its_own_files() {
     let repo = make_ctx(&[

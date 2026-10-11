@@ -364,10 +364,11 @@ outrig tags built images as `<image-config-name>:<hash>`, where the name is the 
 block key and the hash is a content-addressed cache key combining the contents of the
 `Dockerfile`, the `build-args`, the OutRig labels derived from `[images.<name>.mcp]`, and the
 build context. When the context is in a git repo, that means every file in it that `.gitignore`
-does not exclude, committed or not, by path, permission bits, and content. If `.gitignore`
-matches the context directory, or every file in it, committed or not, then every file counts: the
-rules say nothing about which of them the build uses. Outside a git repo, it is a tarball hash of
-the whole directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
+does not exclude, committed or not, by path, permission bits, and content, and every directory it
+does not exclude, empty ones included, by path and permission bits. If `.gitignore` matches the
+context directory, or every file in it, committed or not, then every file counts: the rules say
+nothing about which of them the build uses. Outside a git repo, it is a tarball hash of the whole
+directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
 podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a

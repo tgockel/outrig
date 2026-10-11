@@ -1260,12 +1260,14 @@ async fn is_worktree_root(dir: &Path) -> Result<bool> {
 }
 
 /// Hash every file in a git-hosted `ctx` that no ignore rule excludes, tracked
-/// or not, each by its context-relative path, `st_mode`, and content.
+/// or not, each by its context-relative path, `st_mode`, and content, and every
+/// directory no rule excludes, empty ones included, by path and `st_mode`.
 ///
 /// buildah is handed the whole directory, so that is the set a `COPY` can
 /// reach, less what `.gitignore` excludes: build output (`target/`,
 /// `node_modules/`) stays out so it cannot bust the cache. The mode carries
-/// both the file type and the permission bits `COPY` preserves.
+/// both the file type and the permission bits `COPY` preserves. Directories
+/// come from [`context_dirs`], not git's listing.
 ///
 /// Where the rules exclude every file -- the context sits under an ignored
 /// directory, as `.agents/` kept out of version control would, or every file
@@ -1305,14 +1307,41 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
     .await
     .expect("context hashing task panicked")?;
 
-    // Nothing left, or only what a rule excludes: the whole tree counts.
+    // Nothing left, or only what a rule excludes: the whole tree counts, and
+    // so does its own mode, which `TreeHasher::dir` leaves to a parent.
     if entries
         .iter()
         .all(|(rel, ..)| excluded.binary_search(rel).is_ok())
     {
-        hasher.update(hash_whole_tree(ctx, dir).await?.as_bytes());
+        let root = tokio::fs::symlink_metadata(&tree)
+            .await
+            .path_ctx("stat", &tree)?;
+        update_record(hasher, b"", root.mode(), &hash_whole_tree(ctx, dir).await?);
         return Ok(());
     }
+
+    // Asked only here: from a directory below an ignored one, which the
+    // whole-tree case above covers, git exits 128.
+    let ignored = ls_files(
+        &tree,
+        &["--others", "--ignored", "--exclude-standard", "--directory"],
+    )
+    .await?;
+    // A nested repository is walked by its own call, under its own rules.
+    let skip: HashSet<Vec<u8>> = ignored
+        .iter()
+        .filter_map(|rel| rel.strip_suffix(b"/"))
+        .chain(
+            entries
+                .iter()
+                .filter(|(.., entry)| matches!(entry, ContextEntry::Dir))
+                .map(|(rel, ..)| rel.strip_suffix(b"/").unwrap_or(rel)),
+        )
+        .map(<[u8]>::to_vec)
+        .collect();
+    let dirs = tokio::task::spawn_blocking(move || context_dirs(&tree, &skip))
+        .await
+        .expect("context hashing task panicked")?;
 
     for (rel, mode, entry) in entries {
         let digest = match entry {
@@ -1334,14 +1363,93 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
                 }
             }
         };
-        // Everything after the NUL-terminated path is fixed-width, so two
-        // different listings cannot feed the same stream.
-        hasher.update(&rel);
-        hasher.update(b"\0");
-        hasher.update(&mode.to_le_bytes());
-        hasher.update(digest.as_bytes());
+        update_record(hasher, &rel, mode, &digest);
+    }
+    for (rel, mode) in dirs {
+        update_record(hasher, &rel, mode, &NO_CONTENT);
     }
     Ok(())
+}
+
+/// One entry of the context stream. Everything after the NUL-terminated path is
+/// fixed-width, so two different listings cannot feed the same stream.
+fn update_record(hasher: &mut blake3::Hasher, rel: &[u8], mode: u32, digest: &blake3::Hash) {
+    hasher.update(rel);
+    hasher.update(b"\0");
+    hasher.update(&mode.to_le_bytes());
+    hasher.update(digest.as_bytes());
+}
+
+/// The digest of an entry with no content to read: a directory, FIFO, socket,
+/// or device.
+const NO_CONTENT: blake3::Hash = blake3::Hash::from_bytes([0; 32]);
+
+/// Every directory under `tree`, itself included, that no ignore rule
+/// excludes, as its path relative to `tree` (empty for `tree`) and its
+/// `st_mode`. Empty ones count: buildah copies them, and git, which tracks
+/// files, lists neither them nor any directory's mode.
+///
+/// `skip` holds the paths, relative to `tree`, that are not walked: directories
+/// the rules exclude, and those a nested repository or submodule owns. `.git`
+/// and symlinks are not walked either.
+fn context_dirs(tree: &Path, skip: &HashSet<Vec<u8>>) -> Result<Vec<(Vec<u8>, u32)>> {
+    let mut dirs = Vec::new();
+    // Next to visit last, so names come out sorted.
+    let mut pending = vec![Vec::new()];
+    while let Some(rel) = pending.pop() {
+        let path = tree.join(OsStr::from_bytes(&rel));
+        // A directory under one the build user cannot search has no mode to
+        // read; its parent's record is all of it that shows.
+        let Some(meta) = unless_denied(std::fs::symlink_metadata(&path), "stat", &path)? else {
+            continue;
+        };
+        dirs.push((rel.clone(), meta.mode()));
+
+        // Keyed but not opened, as `git ls-files` does.
+        let Some(entries) = unless_denied(std::fs::read_dir(&path), "read", &path)? else {
+            continue;
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            let entry = entry.path_ctx("read", &path)?;
+            let Some(file_type) = unless_denied(entry.file_type(), "stat", &path)? else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let mut child = rel.clone();
+            if !child.is_empty() {
+                child.push(b'/');
+            }
+            child.extend_from_slice(name.as_bytes());
+            if !skip.contains(&child) {
+                children.push(child);
+            }
+        }
+        children.sort_unstable();
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(dirs)
+}
+
+/// `None` for what the build user may not look at. git warns and carries on
+/// there, and a root-owned volume in a context must not fail a build that
+/// worked.
+fn unless_denied<T>(
+    result: std::io::Result<T>,
+    op: &'static str,
+    path: &Path,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(None),
+        Err(err) => Err(err).path_ctx(op, path),
+    }
 }
 
 /// What `git ls-files -z <flags> .` lists in `tree`, sorted and deduplicated.
@@ -1445,7 +1553,7 @@ impl<'a> TreeHasher<'a> {
         } else if file_type.is_dir() {
             self.dir(rel)
         } else {
-            Ok(blake3::Hash::from_bytes([0; 32]))
+            Ok(NO_CONTENT)
         }
     }
 
@@ -1466,10 +1574,8 @@ impl<'a> TreeHasher<'a> {
             let rel = rel.join(&name);
             let path = self.ctx.join(&rel);
             let meta = std::fs::symlink_metadata(&path).path_ctx("stat", &path)?;
-            hasher.update(name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(&meta.mode().to_le_bytes());
-            hasher.update(self.entry(&rel, &meta)?.as_bytes());
+            let digest = self.entry(&rel, &meta)?;
+            update_record(&mut hasher, name.as_bytes(), meta.mode(), &digest);
         }
         Ok(hasher.finalize())
     }
