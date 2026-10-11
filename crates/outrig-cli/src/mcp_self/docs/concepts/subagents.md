@@ -32,6 +32,10 @@ Because it borrows the parent's MCP connections, launching one starts no contain
 server. That keeps the [MCP trust model](mcp-trust-model.md) invariant intact: a subagent can only
 reach tools the operator already granted the session.
 
+The tools are the session's as they stand at launch. A sidecar started with `/sidecar add` joins
+them for every subagent launched after it, at any depth. A subagent already running keeps the
+tools it was launched with; release it and launch it again to give it the new ones.
+
 ## The tools
 
 ```

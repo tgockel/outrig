@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent launched after `/sidecar add` has the sidecar's tools.** `/sidecar add` gave its
+  tools to the primary agent alone: every subagent launched afterwards, at any depth, ran with the
+  tools the session started with, so one asked to use the new server reported it could not while
+  `/tools` listed it. A launch now takes the session's tools as they stand, sidecar tools
+  included. A subagent already running keeps the tools it was launched with; release it and
+  launch it again to give it the new ones. See
+  [Subagents](../../doc/concepts/subagents.md). (#351)
+
 - **A subagent's report outlasts a revision that does not fit.** When a subagent reported with
   `outrig__set_result` and later in the round tried a longer report that was cut off at the
   output-token ceiling three times, outrig gave up on it by publishing `subagent hit its output

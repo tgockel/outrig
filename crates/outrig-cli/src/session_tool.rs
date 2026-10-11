@@ -17,7 +17,7 @@
 //! `ToolDyn` already exposes `name()` and `description()`, so the banner and
 //! `/tools` render straight off the trait and need no separate metadata.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rig::tool::{ToolCallExtensions, ToolDyn, ToolError, ToolExecutionResult};
 use rig::wasm_compat::WasmBoxedFuture;
@@ -76,6 +76,37 @@ impl ToolDyn for SessionTool {
         extensions: &'a ToolCallExtensions,
     ) -> WasmBoxedFuture<'a, ToolExecutionResult> {
         self.0.call_structured(args, extensions)
+    }
+}
+
+/// A tool list several holders share and one of them grows: the session's MCP
+/// tools, which the primary agent extends when `/sidecar add` connects a
+/// sidecar and which every subagent registry launches from, nested ones
+/// included. A reader takes a [`snapshot`](Self::snapshot) and keeps it, so a
+/// tool added afterwards reaches the next reader rather than that one.
+///
+/// A `Mutex` rather than a `RefCell` because subagents launch from rounds
+/// running on spawned tasks. The lock is never held across an await.
+#[derive(Clone, Default)]
+pub struct SharedTools(Arc<Mutex<Vec<SessionTool>>>);
+
+impl SharedTools {
+    pub fn new(tools: Vec<SessionTool>) -> Self {
+        Self(Arc::new(Mutex::new(tools)))
+    }
+
+    /// The list as it stands now.
+    pub fn snapshot(&self) -> Vec<SessionTool> {
+        self.lock().clone()
+    }
+
+    /// Append `tools`; every snapshot taken from here on carries them.
+    pub fn extend(&self, tools: impl IntoIterator<Item = SessionTool>) {
+        self.lock().extend(tools);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SessionTool>> {
+        self.0.lock().expect("shared tool list poisoned")
     }
 }
 

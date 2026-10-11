@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::{CliError, Result};
-use crate::session_tool::{self, SessionTool};
+use crate::session_tool::{self, SessionTool, SharedTools};
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
 
 /// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
@@ -1943,11 +1943,16 @@ impl RigAgent {
 
 /// A [`RigAgent`] plus the recipe to rebuild it when `/sidecar add` grows
 /// the tool list mid-session. The rig agent's toolset is frozen at build
-/// time, so [`RebuildingAgent::extend_tools`] only marks the agent stale;
+/// time, so [`RebuildingAgent::extend_mcp_tools`] only marks the agent stale;
 /// the next [`RebuildingAgent::run_turn`] rebuilds over the full list
 /// (a remote arm builds a fresh HTTP client, so the first turn after a
 /// rebuild re-handshakes rather than reusing the pooled connection; mistralrs
 /// model loads are registry-cached).
+///
+/// What it adds also joins the session's [`SharedTools`], which subagents
+/// launch from: growing the primary is the only way the session gains a tool,
+/// so no later launch misses one. Only MCP tools go that way -- the `outrig__`
+/// launch tools hold a subagent registry, which holds that list.
 ///
 /// Interior mutability (`RefCell`/`Cell`) because the wrapper is shared by
 /// `&` between the REPL's prompt path and its `/sidecar` command; the
@@ -1959,6 +1964,8 @@ pub struct RebuildingAgent {
     #[cfg(feature = "local-llm")]
     registry: Arc<LlmRegistry>,
     tools: RefCell<Vec<SessionTool>>,
+    /// The session's MCP tools, without the built-ins `tools` also holds.
+    mcp_tools: SharedTools,
     dirty: Cell<bool>,
     // The agent rides in an inner `Rc` so a turn clones it out and never
     // holds the `RefCell` borrow across the run_turn await (a rebuild in a
@@ -1972,6 +1979,7 @@ impl RebuildingAgent {
     pub fn new(
         agent: RigAgent,
         tools: Vec<SessionTool>,
+        mcp_tools: SharedTools,
         resolved: ResolvedAgent,
         cache_root: PathBuf,
         #[cfg(feature = "local-llm")] registry: Arc<LlmRegistry>,
@@ -1982,14 +1990,17 @@ impl RebuildingAgent {
             #[cfg(feature = "local-llm")]
             registry,
             tools: RefCell::new(tools),
+            mcp_tools,
             dirty: Cell::new(false),
             agent: RefCell::new(Rc::new(agent)),
         }
     }
 
-    /// Append tool adapters and mark the agent stale; the next
-    /// [`RebuildingAgent::run_turn`] rebuilds over the extended list.
-    pub fn extend_tools(&self, new: Vec<SessionTool>) {
+    /// Append MCP tool adapters, here and to the shared list, and mark the
+    /// agent stale; the next [`RebuildingAgent::run_turn`] rebuilds over the
+    /// extended list.
+    pub fn extend_mcp_tools(&self, new: Vec<SessionTool>) {
+        self.mcp_tools.extend(new.iter().cloned());
         self.tools.borrow_mut().extend(new);
         self.dirty.set(true);
     }
@@ -3900,6 +3911,45 @@ mod tests {
     #[test]
     fn model_display_is_the_bare_name_for_a_direct_model() {
         assert_eq!(test_resolved_for_display().model_display(), "opus-5");
+    }
+
+    /// Tools `/sidecar add` gives the primary join the shared MCP list too,
+    /// which is what a subagent launched afterwards is built from (#351).
+    #[tokio::test]
+    async fn extended_tools_join_the_shared_mcp_list() {
+        let resolved = crate::subagent::fixtures::test_resolved(1);
+        #[cfg(feature = "local-llm")]
+        let registry = Arc::new(LlmRegistry::new());
+        let built = build_agent(
+            &resolved,
+            Vec::new(),
+            Path::new("."),
+            #[cfg(feature = "local-llm")]
+            &registry,
+        )
+        .await
+        .expect("openai agent builds without I/O");
+        let mcp_tools = SharedTools::default();
+        let agent = RebuildingAgent::new(
+            built,
+            Vec::new(),
+            mcp_tools.clone(),
+            resolved,
+            PathBuf::from("."),
+            #[cfg(feature = "local-llm")]
+            registry,
+        );
+
+        // Stand-ins for a sidecar's MCP adapters, which need a live client.
+        let added = crate::self_tool::self_tools();
+        let names = |tools: &[SessionTool]| -> Vec<String> {
+            tools.iter().map(rig::tool::ToolDyn::name).collect()
+        };
+        let expected = names(&added);
+        agent.extend_mcp_tools(added);
+
+        assert_eq!(names(&mcp_tools.snapshot()), expected);
+        assert_eq!(names(&agent.tools()), expected);
     }
 
     /// The display helper only reads the first candidate's name and

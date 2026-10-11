@@ -41,7 +41,7 @@ use outrig::config::Config;
 use tokio::task::JoinHandle;
 
 use crate::llm::{ResolvedAgent, TurnStop};
-use crate::session_tool::SessionTool;
+use crate::session_tool::{SessionTool, SharedTools};
 use state::{GaveUp, Outcome, SubagentShared};
 
 /// Longest subagent name accepted. Names are handles the model types back, so
@@ -72,8 +72,10 @@ pub struct SubagentContext {
     /// cloned per nesting level, and because a grandchild must re-resolve
     /// against the same config the session did.
     pub cfg: Arc<Config>,
-    /// The session's MCP-backed tools. Cloning shares the live connections.
-    pub mcp_tools: Vec<SessionTool>,
+    /// The session's MCP-backed tools, the list the primary agent grows when
+    /// `/sidecar add` connects a sidecar. Cloning the context shares it, so a
+    /// nested registry sees a sidecar added after the registry was made.
+    pub mcp_tools: SharedTools,
     pub cache_root: PathBuf,
     /// The base a re-resolution joins a relative `model-path` to -- the same
     /// one the session resolved against, kept for the same reason `cfg` is.
@@ -820,12 +822,13 @@ fn resolve_launch_model(
 ///
 /// The `resolved` handed in is whatever [`resolve_launch_model`] decided, so a
 /// launch that named a model arrives here already re-resolved; only the
-/// preamble is replaced. The tool list is always the session's MCP tools plus
-/// this subagent's own `outrig__set_result`. When the subagent's depth is under
-/// `subagent_depth_max`, it also gets its own [`SubagentRegistry`] and the
-/// parent-side launch tools, so it can launch children of its own; at the max
-/// depth those are withheld and the returned registry is `None`. Recursion is
-/// bounded by that depth check rather than impossible by construction.
+/// preamble is replaced. The tool list is always the session's MCP tools as
+/// they stand at launch plus this subagent's own `outrig__set_result`. When
+/// the subagent's depth is under `subagent_depth_max`, it also gets its own
+/// [`SubagentRegistry`] and the parent-side launch tools, so it can launch
+/// children of its own; at the max depth those are withheld and the returned
+/// registry is `None`. Recursion is bounded by that depth check rather than
+/// impossible by construction.
 async fn build_subagent_agent(
     ctx: &SubagentContext,
     resolved: &ResolvedAgent,
@@ -838,7 +841,7 @@ async fn build_subagent_agent(
     // preamble is `Some` even when the session that launched it has none.
     resolved.preamble = Some(compose_preamble(preamble.as_deref()));
 
-    let mut tools = ctx.mcp_tools.clone();
+    let mut tools = ctx.mcp_tools.snapshot();
     // The agent name is the parent's -- a subagent has no `[agents.<name>]` table
     // of its own -- but the ceiling has to be *this* subagent's, which a launch
     // that named a model resolved from that model. Reporting the parent's would
@@ -1296,7 +1299,7 @@ pub(crate) mod fixtures {
         let registry = SubagentRegistry::new(SubagentContext {
             resolved: test_resolved(subagent_depth_max),
             cfg: Arc::new(cfg),
-            mcp_tools: Vec::new(),
+            mcp_tools: SharedTools::default(),
             cache_root: PathBuf::from("."),
             repo_root: PathBuf::from("."),
             log_dir: log_dir.path().to_path_buf(),
@@ -1365,6 +1368,15 @@ mod tests {
             blocking: None,
         })];
         (live, tools)
+    }
+
+    /// A stand-in for one MCP tool, for a test that only needs it listed.
+    fn named_tool(name: &'static str) -> SessionTool {
+        SessionTool::new(CountedTool {
+            name,
+            live: Arc::new(AtomicUsize::new(1)),
+            blocking: None,
+        })
     }
 
     /// How many copies of a [`CountedTool`] are still alive. Zero means every
@@ -1770,6 +1782,20 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        /// The names of the MCP tools the request offers the model: every one
+        /// outside the reserved `outrig__` namespace.
+        fn mcp_tool_names(&self) -> Vec<&str> {
+            self.body["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .filter(|name| {
+                    name.split_once("__").map(|(server, _)| server) != Some(outrig::RESERVED_SERVER)
+                })
+                .collect()
+        }
+
         /// How many times `text` appears in the request, history included.
         fn mentions(&self, text: &str) -> usize {
             self.body.to_string().matches(text).count()
@@ -1885,7 +1911,7 @@ mod tests {
         tools: Vec<SessionTool>,
     ) -> (SubagentRegistry, tempfile::TempDir) {
         let (mut registry, log_dir) = test_registry();
-        registry.ctx.mcp_tools = tools;
+        registry.ctx.mcp_tools = SharedTools::new(tools);
         registry.ctx.resolved = provider.resolved();
         registry.ctx.resolved.tool_call_max = tool_call_max;
         registry
@@ -3205,7 +3231,7 @@ mod tests {
     async fn shutdown_releases_the_tool_clones_subagents_hold() {
         let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry();
-        registry.ctx.mcp_tools = tools;
+        registry.ctx.mcp_tools = SharedTools::new(tools);
 
         registry
             .launch("audit", None, None, "work".to_string())
@@ -3285,7 +3311,7 @@ mod tests {
     async fn shutdown_reaps_nested_subagents_and_releases_their_tool_clones() {
         let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry_at(2, 3);
-        registry.ctx.mcp_tools = tools;
+        registry.ctx.mcp_tools = SharedTools::new(tools);
 
         let child = launch_nested(&registry).await;
         registry.shutdown().await;
@@ -3309,7 +3335,7 @@ mod tests {
     async fn full_idle_tree_shuts_down_within_the_grace() {
         let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry();
-        registry.ctx.mcp_tools = tools;
+        registry.ctx.mcp_tools = SharedTools::new(tools);
         // What this measures is the join, on a real clock, after every round
         // has gone idle -- so the rounds themselves have to fail at once. The
         // fixture's default budget is realistic on purpose, which here would
@@ -3339,7 +3365,7 @@ mod tests {
         let server = serve_completions(axum::routing::post(mock_tool_call)).await;
         let mut probe = BlockingTools::new();
         let (mut registry, _log_dir) = test_registry();
-        registry.ctx.mcp_tools = probe.take_tools();
+        registry.ctx.mcp_tools = SharedTools::new(probe.take_tools());
         registry.ctx.resolved = test_resolved_at(
             &server.base_url,
             None,
@@ -3387,7 +3413,7 @@ mod tests {
     async fn shutdown_reaps_released_trees() {
         let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry_at(2, 3);
-        registry.ctx.mcp_tools = tools;
+        registry.ctx.mcp_tools = SharedTools::new(tools);
 
         let child = launch_nested(&registry).await;
         registry.release(&["mid".to_string()]).expect("release");
@@ -3477,6 +3503,45 @@ mod tests {
             1,
             "launching should sweep records whose tasks are already reaped"
         );
+    }
+
+    /// A sidecar's tools join the session's list after a subagent is already
+    /// live, and every launch from then on carries them (#351): one at the top
+    /// level, and one through the registry the live subagent was handed before
+    /// the add. The live one keeps the tools it was launched with.
+    #[tokio::test]
+    async fn a_launch_after_the_tools_grow_carries_the_new_ones() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) =
+            launch_probe_with(&provider, 4, vec![named_tool("fs__read_file")]).await;
+        let call = provider.next_call().await;
+        assert_eq!(call.mcp_tool_names(), ["fs__read_file"]);
+        // A reply with no tool call ends the round, so no later call of
+        // `probe`'s is in the queue ahead of the launches below.
+        call.reply("done");
+
+        registry.ctx.mcp_tools.extend([named_tool("search__query")]);
+        let grown = ["fs__read_file", "search__query"];
+
+        registry
+            .launch("after", None, None, "work".to_string())
+            .await
+            .expect("launch");
+        let call = provider.next_call().await;
+        assert_eq!(call.mcp_tool_names(), grown);
+        call.reply("done");
+
+        child_registry(&registry, "probe")
+            .launch("deep", None, None, "work".to_string())
+            .await
+            .expect("grandchild launch");
+        let call = provider.next_call().await;
+        assert_eq!(
+            call.mcp_tool_names(),
+            grown,
+            "a registry made before the add shares the grown list"
+        );
+        call.reply("done");
     }
 
     /// The default path: no model named means the context's resolution is used

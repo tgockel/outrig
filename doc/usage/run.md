@@ -458,8 +458,10 @@ A sidecar declared with `start = "manual"` (see
 -- its image label is merged and its servers are reserved names -- but its container does not
 start and its tools are absent. `/sidecar add <name>` starts it mid-session: the container
 comes up with session labels, network policy attaches (in audit and filter modes), its MCP
-servers connect, and the new tools become available to the agent **on the next turn**. Unknown
-names and already-running sidecars are errors, and there is no `/sidecar stop` in v0.
+servers connect, and the new tools become available to the agent **on the next turn**. Subagents
+launched from then on get them too; one already running keeps the tools it was launched with
+(see [Concepts -> Subagents](../concepts/subagents.md)). Unknown names and already-running
+sidecars are errors, and there is no `/sidecar stop` in v0.
 
 ```
 > /sidecar list

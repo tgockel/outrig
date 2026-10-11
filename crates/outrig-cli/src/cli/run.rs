@@ -35,7 +35,7 @@ use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
 use crate::self_tool;
-use crate::session_tool::{self, SessionTool};
+use crate::session_tool::{self, SessionTool, SharedTools};
 use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
 use outrig::config::{
@@ -302,14 +302,13 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     #[cfg(feature = "local-llm")]
     let registry = Arc::new(llm::LlmRegistry::new());
 
-    // Subagents borrow the session's MCP tools as they stand now. A sidecar
-    // added later grows the *primary* agent's tool list via `extend_tools`,
-    // but not this snapshot, so subagents launched afterwards still see the
-    // startup set.
+    // Shared by the primary and every subagent registry, so a sidecar added
+    // later reaches the launches after it; see `SharedTools`.
+    let mcp_tools = SharedTools::new(all_tools.clone());
     let subagents = Arc::new(SubagentRegistry::new(SubagentContext {
         resolved: resolved.clone(),
         cfg: cfg.clone(),
-        mcp_tools: all_tools.clone(),
+        mcp_tools: mcp_tools.clone(),
         cache_root: cache_root.to_path_buf(),
         repo_root: repo_root.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
@@ -366,6 +365,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     let agent = llm::RebuildingAgent::new(
         agent,
         agent_tools,
+        mcp_tools,
         resolved,
         cache_root.to_path_buf(),
         #[cfg(feature = "local-llm")]
@@ -919,7 +919,7 @@ async fn try_sidecar_add(
             watcher.register_sidecar(sidecar);
         }
     }
-    state.agent.extend_tools(new_adapters);
+    state.agent.extend_mcp_tools(new_adapters);
 
     let mut text = format!(
         "[outrig] sidecar {name} started: {container_name}\n\
@@ -1623,6 +1623,7 @@ mod tests {
                     agent: llm::RebuildingAgent::new(
                         rig_agent,
                         Vec::new(),
+                        SharedTools::default(),
                         resolved,
                         PathBuf::from("."),
                         #[cfg(feature = "local-llm")]
