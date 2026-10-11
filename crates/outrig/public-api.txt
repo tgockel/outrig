@@ -765,6 +765,8 @@ pub outrig::container::sidecar::SidecarPlan::security: outrig::config::Container
 pub outrig::container::sidecar::SidecarPlan::start: outrig::config::SidecarStart
 pub outrig::container::sidecar::SidecarPlan::view: outrig::config::SidecarView
 pub outrig::container::sidecar::SidecarPlan::workspace: outrig::config::SidecarWorkspaceAccess
+impl outrig::container::sidecar::SidecarPlan
+pub fn outrig::container::sidecar::SidecarPlan::image_declared_by(&self) -> alloc::string::String
 pub fn outrig::container::sidecar::build_primary_view_argv(&[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &str, &str, &str, core::option::Option<(u32, u32)>) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::container::sidecar::entrypoint_args<'a>(&'a outrig::config::McpServerSpec, &'a outrig::container::sidecar::SidecarPlan) -> &'a [alloc::string::String]
 pub fn outrig::container::sidecar::entrypoint_create_args(outrig::config::SidecarView, &[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &std::path::Path, core::option::Option<(u32, u32)>) -> alloc::vec::Vec<alloc::string::String>
@@ -1012,6 +1014,7 @@ pub async fn outrig::image::compute_tag(&outrig::config::ImageConfig, &std::path
 pub async fn outrig::image::compute_tag_for(&str, &outrig::config::ImageConfig, &std::path::Path) -> outrig::error::Result<outrig::image::ImageTag>
 pub async fn outrig::image::ensure_image(&outrig::config::ImageConfig, &std::path::Path, bool) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::ensure_local_image(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
+pub async fn outrig::image::ensure_local_image_requested_by(&str, &outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::ensure_tagged_image_for(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::ensure_tagged_image_for_with_output(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool, core::option::Option<&outrig::Transcript>, outrig::image::BuildOutput) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
 pub async fn outrig::image::probe_cached(&outrig::image::ImageTag) -> outrig::error::Result<bool>

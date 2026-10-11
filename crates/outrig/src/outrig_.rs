@@ -627,7 +627,9 @@ impl LaunchSpec {
         let plan = sidecar::plan_from_config(config, cfg);
         let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root);
         for sidecar in &mut sidecars {
-            sidecar.image = resolve_sidecar_image_tag(config, repo_root, &sidecar.image).await?;
+            let declared_by = plan.sidecars[&sidecar.name].image_declared_by();
+            sidecar.image =
+                resolve_sidecar_image_tag(config, repo_root, &sidecar.image, &declared_by).await?;
         }
 
         Ok(Self {
@@ -791,12 +793,13 @@ fn carry_call_timeout(server: SidecarServerSpec, declared: &McpServerSpec) -> Si
 /// Resolve a sidecar image ref like `--image`: a sibling `[images.<name>]`
 /// config builds/pulls through the content-hash cache; an unmatched name is a
 /// raw podman ref that must already be present locally (no pull). Returns the
-/// resolved tag used verbatim as [`SidecarSpec::image`]. Mirrors the CLI's
-/// `ensure_sidecar_image`.
+/// resolved tag used verbatim as [`SidecarSpec::image`]; `declared_by` is what
+/// a missing raw ref's error points at. Mirrors the CLI's `ensure_sidecar_image`.
 async fn resolve_sidecar_image_tag(
     config: &Config,
     repo_root: &Path,
     image_ref: &str,
+    declared_by: &str,
 ) -> Result<String> {
     match config.images.get(image_ref) {
         Some(image_cfg) => {
@@ -807,7 +810,7 @@ async fn resolve_sidecar_image_tag(
         }
         None => {
             let tag = ImageTag::new(image_ref);
-            image::ensure_local_image(&tag, None).await?;
+            image::ensure_local_image_requested_by(declared_by, &tag, None).await?;
             Ok(tag.into_string())
         }
     }

@@ -144,7 +144,7 @@ async fn the_built_in_is_reachable_by_name_from_run() {
     .await;
 
     assert!(
-        !stderr.contains("did not match any [images.<name>]"),
+        !stderr.contains("is not an [images.<name>]"),
         "`outrig run --image outrig-default` must resolve the built-in, not fall \
          through to the raw-local-ref rule: {stderr}"
     );

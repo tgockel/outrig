@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sidecar whose raw image ref is not local is refused by name, with the fix.** A
+  `[sidecars.<sc>] image` -- or an inline `image` on an MCP entry -- that is not an
+  `[images.<name>]` and was never pulled failed with `--image "<ref>" did not match any
+  [images.<name>]`, a flag the run never took. The error now names where the ref was written,
+  `image "<ref>" (from [sidecars.tools]) is not an [images.<name>] ...`, and says to
+  `podman pull <ref>` it first, since outrig never pulls a raw ref. `outrig run --image` reads the
+  same way, `(from --image)`. See [Sidecar containers](../../doc/concepts/containers.md#sidecar-containers). (#355)
+
 - **A subagent launched after `/sidecar add` has the sidecar's tools.** `/sidecar add` gave its
   tools to the primary agent alone: every subagent launched afterwards, at any depth, ran with the
   tools the session started with, so one asked to use the new server reported it could not while

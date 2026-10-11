@@ -563,6 +563,11 @@ async fn warn_on_failure_serves_reduced_toolset() {
         stderr.contains("warning: sidecar broken"),
         "stderr should carry the sidecar warning: {stderr}"
     );
+    assert!(
+        stderr.contains("(from [sidecars.broken]) is not an [images.<name>]")
+            && !stderr.contains("--image"),
+        "the warning should name the declaring block, not a flag: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -605,8 +610,15 @@ async fn abort_on_failure_fails_fast_without_leftovers() {
         "abort on-failure must fail the session: {stderr}"
     );
     assert!(
-        stderr.contains("no-such-image-outrig-e2e"),
-        "stderr should name the failing image: {stderr}"
+        stderr.contains(
+            "image \"no-such-image-outrig-e2e:1\" (from [sidecars.broken]) is not an \
+             [images.<name>]"
+        ),
+        "stderr should name the failing image and the block that declared it: {stderr}"
+    );
+    assert!(
+        stderr.contains("`podman pull no-such-image-outrig-e2e:1`") && !stderr.contains("--image"),
+        "stderr should say how to fix it, without blaming a flag nobody passed: {stderr}"
     );
 
     // The primary was started (its progress line names it) and must be gone.

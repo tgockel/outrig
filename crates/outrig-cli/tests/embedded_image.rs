@@ -343,12 +343,16 @@ async fn missing_raw_image_ref_is_local_only() {
         "missing raw image unexpectedly succeeded; stderr:\n{stderr}",
     );
     assert!(
-        stderr.contains("did not match any [images.<name>]")
-            && stderr.contains("local podman image"),
+        stderr.contains(&format!(
+            "image {image_ref:?} (from --image) is not an [images.<name>]"
+        )) && stderr.contains("not in podman's local image store"),
         "stderr lacked local-only raw image error: {stderr}",
     );
+    // The error advises a pull; what must not happen is one running, which
+    // `-v` would echo as a `$ podman pull` line.
     assert!(
-        !stderr.contains("podman pull"),
+        stderr.contains(&format!("run `podman pull {image_ref}`"))
+            && !stderr.contains("$ podman pull"),
         "raw local fallback must not pull missing images: {stderr}",
     );
 }

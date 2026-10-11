@@ -378,10 +378,30 @@ async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) ->
 
 /// Ensure `tag` exists in Podman's local image store without pulling it.
 ///
-/// This is used for raw CLI image references: once a value failed to match an
+/// This is used for raw image references: once a value failed to match an
 /// `[images.<name>]` config block, OutRig should behave like `podman run` with
-/// `--pull=never` and accept only already-local images.
+/// `--pull=never` and accept only already-local images. A miss does not say
+/// who asked for the ref; [`ensure_local_image_requested_by`] does.
 pub async fn ensure_local_image(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_local_image_with_requester(None, tag, transcript).await
+}
+
+/// [`ensure_local_image`] whose miss names `requester` -- where the ref was
+/// written, such as `--image` or `[sidecars.tools]` -- so the error points at
+/// the setting to look at rather than at one the user may never have used.
+pub async fn ensure_local_image_requested_by(
+    requester: &str,
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_local_image_with_requester(Some(requester), tag, transcript).await
+}
+
+async fn ensure_local_image_with_requester(
+    requester: Option<&str>,
     tag: &ImageTag,
     transcript: Option<&Transcript>,
 ) -> Result<ImageBuildOutcome> {
@@ -392,11 +412,27 @@ pub async fn ensure_local_image(
             cache_hit: true,
         });
     }
-    Err(OutrigError::Configuration(format!(
-        "--image {:?} did not match any [images.<name>] and local podman image {:?} was not found",
-        tag.as_str(),
-        tag.as_str()
+    Err(OutrigError::Configuration(local_image_missing(
+        requester, tag,
     )))
+}
+
+/// The miss message: what was asked for and by whom, why it was refused, and
+/// the command that fixes it. A raw ref is never pulled (see
+/// [`ensure_local_image`]), so the fix is the user's to run -- and is meant to
+/// be pasted, so the ref is rendered as the one literal argument it is rather
+/// than interpolated: a config accepts any nonblank ref, `$(...)` included.
+fn local_image_missing(requester: Option<&str>, tag: &ImageTag) -> String {
+    let image = tag.as_str();
+    let from = requester
+        .map(|requester| format!(" (from {requester})"))
+        .unwrap_or_default();
+    let pull = Cmd::new("podman").arg("pull").arg(image).render();
+    format!(
+        "image {image:?}{from} is not an [images.<name>] and is not in podman's local image \
+         store; outrig does not pull a raw image ref, so run `{pull}` (or build and tag it) \
+         first"
+    )
 }
 
 /// Pull an image by ref via `podman pull`. Stderr is streamed to
@@ -1600,6 +1636,56 @@ mod tests {
 
     use super::*;
     use crate::config::EnvValue;
+
+    /// The issue #355 shape: a sidecar's raw ref that is not local was blamed
+    /// on `--image`, and the error never named the command that fixes it.
+    #[test]
+    fn a_missing_local_image_names_its_requester_and_the_pull() {
+        let tag = ImageTag::new("ghcr.io/example/mcp-tools:1");
+
+        let message = local_image_missing(Some("[sidecars.tools]"), &tag);
+        assert!(
+            message.starts_with(
+                "image \"ghcr.io/example/mcp-tools:1\" (from [sidecars.tools]) is not an \
+                 [images.<name>]"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("`podman pull ghcr.io/example/mcp-tools:1`"),
+            "{message}"
+        );
+        assert!(!message.contains("--image"), "{message}");
+
+        let anonymous = local_image_missing(None, &tag);
+        assert!(!anonymous.contains("(from"), "{anonymous}");
+        assert!(anonymous.contains("`podman pull "), "{anonymous}");
+    }
+
+    /// The pull advice is copied into a shell, and a ref is any nonblank
+    /// string: one with a command substitution or an apostrophe must stay a
+    /// single quoted argument, not code.
+    #[test]
+    fn the_pull_advice_keeps_a_hostile_ref_one_literal_argument() {
+        let substitution =
+            local_image_missing(None, &ImageTag::new("missing$(printf marker >&2):1"));
+        assert!(
+            substitution.contains("`podman pull 'missing$(printf marker >&2):1'`"),
+            "{substitution}"
+        );
+
+        let apostrophe = local_image_missing(None, &ImageTag::new("it's:1"));
+        assert!(
+            apostrophe.contains("`podman pull 'it'\\''s:1'`"),
+            "{apostrophe}"
+        );
+
+        let plain = local_image_missing(None, &ImageTag::new("ghcr.io/example/mcp-tools:1"));
+        assert!(
+            plain.contains("`podman pull ghcr.io/example/mcp-tools:1`"),
+            "a ref of safe bytes stays bare: {plain}"
+        );
+    }
 
     /// The issue #324 shape: a token in a build-arg must not be on buildah's
     /// command line, where `ps` reads it, nor in anything a failure prints.

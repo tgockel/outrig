@@ -93,6 +93,17 @@ pub struct SidecarPlan {
 }
 
 impl SidecarPlan {
+    /// Where this sidecar's `image` was written, for an error to point at: its
+    /// `[sidecars.<name>]` block, or the MCP server whose inline `image` key
+    /// implied it.
+    pub fn image_declared_by(&self) -> String {
+        if self.anonymous {
+            format!("the inline image of MCP server {:?}", self.name)
+        } else {
+            format!("[sidecars.{}]", self.name)
+        }
+    }
+
     /// The all-defaults plan an inline `image` key implies. `view` rides the
     /// declaring entry (the one-liner `image = ..., view = "primary"` form);
     /// everything else takes defaults.
@@ -543,6 +554,33 @@ grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
         assert_eq!(grep.workspace, SidecarWorkspaceAccess::None);
         assert_eq!(grep.on_failure, SidecarOnFailure::Abort);
         assert_eq!(grep.start, SidecarStart::Auto);
+    }
+
+    #[test]
+    fn image_declared_by_points_at_the_block_or_the_inline_entry() {
+        let plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[sidecars.tools]
+image = "mcp-tools"
+
+[images.x.mcp]
+fs   = { command = ["mcp-fs"], sidecar = "tools" }
+grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+"#,
+        );
+
+        assert_eq!(
+            plan.sidecars["tools"].image_declared_by(),
+            "[sidecars.tools]"
+        );
+        assert_eq!(
+            plan.sidecars["grep"].image_declared_by(),
+            "the inline image of MCP server \"grep\""
+        );
     }
 
     #[test]

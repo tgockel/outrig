@@ -419,7 +419,10 @@ access         = "read-write"        # "read-only" (default) | "read-write"
 
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
 (Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
-must be present locally. An optional `[sidecars.<sc>.security]` block reuses the
+must be present locally -- outrig never pulls one. A ref that is not local is refused with
+`image "<ref>" (from [sidecars.<sc>]) is not an [images.<name>] ...` and the `podman pull <ref>`
+to run first; an inline `image` on an MCP entry reads `(from the inline image of MCP server
+"<name>")`. An optional `[sidecars.<sc>.security]` block reuses the
 whole security surface of the primary -- capability keys, `no-new-privileges`, `devices`, and
 `unmask` alike -- and each sidecar's block stands on its own, so opting one out of
 `no-new-privileges` leaves the others hardened. `start = "manual"` declares a sidecar that does

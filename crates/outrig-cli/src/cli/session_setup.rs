@@ -623,7 +623,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         // one, already mirrors to stderr and is left to do it.
         let ensure = async {
             if raw_local_image {
-                image::ensure_local_image(&image_tag, transcript.as_ref()).await
+                image::ensure_local_image_requested_by("--image", &image_tag, transcript.as_ref())
+                    .await
             } else {
                 image::ensure_tagged_image_for_with_output(
                     &image_cfg_name,
@@ -806,7 +807,14 @@ pub(crate) async fn launch_declared_sidecar(
     sc: &SidecarPlan,
     abandoned: &mut Vec<Container>,
 ) -> Result<Container> {
-    let tag = ensure_sidecar_image(ctx.cfg, ctx.repo_root, &sc.image, ctx.transcript).await?;
+    let tag = ensure_sidecar_image(
+        ctx.cfg,
+        ctx.repo_root,
+        &sc.image,
+        &sc.image_declared_by(),
+        ctx.transcript,
+    )
+    .await?;
     start_one_sidecar(
         ctx,
         &tag,
@@ -943,18 +951,23 @@ async fn resolve_sidecar_images(
 ) -> HashMap<String, ImageResolution> {
     // Distinct images, each flagged for a label read iff some sidecar using
     // it honors labels (an image only anonymous or entrypoint hosts use is
-    // never inspected).
-    let mut images: BTreeMap<&str, bool> = BTreeMap::new();
+    // never inspected), and carrying where every sidecar using it wrote it:
+    // one ensure serves them all, so a miss names them all.
+    let mut images: BTreeMap<&str, (bool, Vec<String>)> = BTreeMap::new();
     for sc in plan.sidecars.values() {
-        *images.entry(sc.image.as_str()).or_default() |= plan.sidecar_honors_labels(sc);
+        let (read_labels, declared_by) = images.entry(sc.image.as_str()).or_default();
+        *read_labels |= plan.sidecar_honors_labels(sc);
+        declared_by.push(sc.image_declared_by());
     }
 
     let one_ensure_at_a_time = tokio::sync::Mutex::new(());
     let one_ensure_at_a_time = &one_ensure_at_a_time;
-    futures_util::future::join_all(images.into_iter().map(|(image, read_labels)| async move {
+    futures_util::future::join_all(images.into_iter().map(|(image, wanted)| async move {
+        let (read_labels, declared_by) = wanted;
         let ensured = {
             let _turn = one_ensure_at_a_time.lock().await;
-            ensure_sidecar_image(cfg, repo_root, image, transcript).await
+            ensure_sidecar_image(cfg, repo_root, image, &declared_by.join(" and "), transcript)
+                .await
         };
         let resolution = match ensured {
             Ok(tag) => {
@@ -1189,16 +1202,21 @@ fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliErr
 /// Reports a progress pair like the primary's, and shows a cache miss's build
 /// as it runs for the same reason: without them a sidecar that needs building
 /// is a silent pause between `container user ready` and whatever comes next.
+/// `declared_by` is where the sidecars using `image_name` wrote it
+/// ([`SidecarPlan::image_declared_by`]), which a raw ref that is not local
+/// names in its error.
 async fn ensure_sidecar_image(
     cfg: &Config,
     repo_root: &Path,
     image_name: &str,
+    declared_by: &str,
     transcript: Option<&Transcript>,
 ) -> Result<ImageTag> {
     let span = ProgressSpan::start(format!("ensuring sidecar image {image_name}"));
     let (image_cfg, raw_local) = resolve_image_config(cfg, image_name, true)?;
     let outcome = if raw_local {
-        image::ensure_local_image(&ImageTag::new(image_name), transcript).await?
+        image::ensure_local_image_requested_by(declared_by, &ImageTag::new(image_name), transcript)
+            .await?
     } else {
         let tag = image::compute_tag_for(image_name, &image_cfg, repo_root).await?;
         image::ensure_tagged_image_for_with_output(

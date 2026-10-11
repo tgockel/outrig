@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`image::ensure_local_image_requested_by` names who asked for a ref that is not local.** It is
+  `ensure_local_image` with a `requester` -- `--image`, `[sidecars.tools]` -- that a miss names
+  as `image "<ref>" (from <requester>)`. `SidecarPlan::image_declared_by` supplies the phrase for
+  a sidecar: its `[sidecars.<name>]` block, or the MCP server whose inline `image` key implied
+  it. `ensure_local_image` keeps its signature and leaves the parenthetical out. (#355)
+
 - **`container::with_panic_sweep` sweeps for a panic that ends the process, and for no other.**
   It runs a closure -- `main`'s body -- and, if a panic unwinds out of it, detaches the
   label-scoped removal of every attempt still owed before the panic carries on. By then the
@@ -53,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still the form that confirms the undo. (#345)
 
 ### Fixed
+
+- **A raw image ref that is not local no longer reads as a problem with `--image`.**
+  `ensure_local_image` hard-wired `--image` and "did not match any `[images.<name>]`" into the
+  error for every ref it refused, so a `[sidecars.<sc>]` or inline `image` that was never pulled
+  was reported as a flag nobody passed, and the pull that fixes it went unmentioned. The error is
+  now `image "<ref>" is not an [images.<name>] and is not in podman's local image store; outrig
+  does not pull a raw image ref, so run `podman pull <ref>` (or build and tag it) first`, and
+  `LaunchSpec::from_config` adds `(from [sidecars.<sc>])` -- or the inline entry's MCP server --
+  after the ref. The `podman pull` is written to be pasted, so a ref with a character a shell
+  would act on is single-quoted. (#355)
 
 - **A connection made straight to the interceptor's listener is no longer dialed from the host.**
   The redirect leaves loopback alone, so a process in the container that connected to the

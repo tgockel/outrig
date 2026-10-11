@@ -607,12 +607,16 @@ The MCP server binary isn't in the image. Install it in the Dockerfile.
 
 ```
 $ outrig run --image outrig-standard:53e082e721df8ecc
-error: --image "outrig-standard:53e082e721df8ecc" did not match any [images.<name>]
-       and local podman image "outrig-standard:53e082e721df8ecc" was not found
+error: configuration: image "outrig-standard:53e082e721df8ecc" (from --image) is not an
+       [images.<name>] and is not in podman's local image store; outrig does not pull a raw
+       image ref, so run `podman pull outrig-standard:53e082e721df8ecc` (or build and tag it)
+       first
 ```
 
 An explicit `--image` ref that is not an image-config is local-only. Build, tag,
-or pull it with Podman first, then rerun the command.
+or pull it with Podman first, then rerun the command. A sidecar's `image` that is
+not an image-config is refused the same way, with `(from [sidecars.<name>])` in
+place of `(from --image)`.
 
 ```
 $ outrig run
