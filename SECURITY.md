@@ -40,6 +40,9 @@ Issues that bear on **host integrity** are in scope, for example:
   configured to, including through a podman default OutRig leaves in place, such as
   `--http-proxy`.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
+- The network interceptor dialing, from the host's network namespace, an address that means
+  something only inside the container's -- its loopback, or the interceptor's own listener --
+  so that a container reaches a host service the policy never named.
 - A name the container merely asserts -- a TLS `ClientHello` SNI or an HTTP `Host:` header --
   satisfying a hostname `allow` entry. A hostname rule grants only against a destination the
   interceptor itself resolved to that name.

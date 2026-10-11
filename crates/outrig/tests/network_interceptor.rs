@@ -1599,3 +1599,104 @@ async fn a_datagram_the_redirects_do_not_carry_is_dropped_under_a_deny_default()
         .await
         .expect("stop container");
 }
+
+/// The port the interceptor's TCP listener has, read from the redirect it
+/// installed in the container's namespace.
+fn listener_port(pid: u32) -> u16 {
+    let table = outrig_table_name(pid).expect("the redirect table");
+    let rules = nft_in_netns(pid, &["list", "table", "inet", &table]);
+    String::from_utf8_lossy(&rules.stdout)
+        .lines()
+        .find_map(|line| {
+            let (_, port) = line.split_once("meta l4proto tcp redirect to :")?;
+            port.trim().parse().ok()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no TCP redirect in {table}: {}",
+                String::from_utf8_lossy(&rules.stdout)
+            )
+        })
+}
+
+/// The redirect leaves loopback alone, so a process in the container that
+/// connects to the listener itself -- its port is in `/proc/net/tcp`, and in
+/// the redirect -- is not redirected, and the destination the interceptor
+/// reads for it is the listener's own address. Dialed from the host's
+/// namespace, that is whatever the host has on the same port. It must be
+/// refused and recorded instead, in audit mode, where policy would allow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_made_straight_to_the_listener_is_refused_not_dialed_by_the_host() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+    let port = listener_port(container_root_pid(&container));
+
+    // The host's own service on that port, in the host's namespace. The port
+    // was chosen by the kernel in the container's, so nothing made it free
+    // here; a host that happens to use it cannot run this.
+    let host_service = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .unwrap_or_else(|e| panic!("the host already has something on 127.0.0.1:{port}: {e}"));
+    host_service
+        .set_nonblocking(true)
+        .expect("nonblocking host service");
+
+    // Its outcome is the interceptor's to settle: the connection is closed,
+    // and curl says so.
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &[],
+        &format!("http://127.0.0.1:{port}/"),
+    ));
+
+    // Before the records: a connection that was carried instead is held open
+    // by the service that never answers it, so no record of it is written
+    // until teardown, and waiting for one would hide this.
+    match host_service.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the host was made to dial its own 127.0.0.1:{port}: {other:?}"),
+    }
+
+    let to_port =
+        |record: &&Value| record.get("id.resp_p").and_then(Value::as_u64) == Some(port as u64);
+    let records = read_audit_records_until(&log_dir, |records| {
+        records.iter().filter(to_port).count() > 0
+    })
+    .await;
+    let to_listener: Vec<&Value> = records.iter().filter(to_port).collect();
+    assert_eq!(to_listener.len(), 1, "{records:#?}");
+    let record = to_listener[0];
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("deny"),
+        "{record:#?}"
+    );
+    assert_eq!(
+        record.get("outrig.rule").and_then(Value::as_str),
+        Some("not-redirected"),
+        "{record:#?}"
+    );
+    assert_eq!(
+        record.get("id.resp_h").and_then(Value::as_str),
+        Some("127.0.0.1")
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}

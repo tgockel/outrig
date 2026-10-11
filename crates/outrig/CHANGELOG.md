@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A connection made straight to the interceptor's listener is no longer dialed from the host.**
+  The redirect leaves loopback alone, so a process in the container that connected to the
+  listener's own port -- which `/proc/net/tcp` gives it -- was never redirected, and the
+  destination the interceptor read for it was the listener's own address. Policy admitted it
+  wherever it admits loopback, audit mode included, and the interceptor dialed it from the host's
+  network namespace: whatever the host had on `127.0.0.1` at that port answered. On a bridge
+  network the host reaches, a connection to the container's own address looped the same way, the
+  host's dial arriving at the listener as another connection to be dialed. A connection that
+  reaches the listener without the redirect, or whose destination is in loopback, is now closed
+  as it is accepted and recorded with `outrig.action = "deny"` and
+  `outrig.rule = "not-redirected"`, in audit mode as in filter. A connection redirected to
+  another host that happens to use the listener's port is carried as before. (#352)
+
 - **A panic a tokio task survives no longer removes every container the process owns.**
   `install_panic_hook` swept every outstanding obligation on every panic, from the panic site,
   where a hook cannot tell a panic the process dies of from one a task's `JoinHandle` contains --

@@ -162,8 +162,11 @@ does not hold up the container's other lookups. TCP connections are carried up t
 container, in either mode: each holds two of outrig's open files, and the limit keeps one container
 from taking all of them. A connection past it is closed as soon as it is accepted and recorded with
 `outrig.action = "deny"` and `outrig.rule = "connection-limit"`. For the same reason `outrig`
-raises its own soft open-file limit to the hard limit when it starts. If either mode is requested
-and setup fails, the session fails before MCP servers launch.
+raises its own soft open-file limit to the hard limit when it starts. A connection that reaches
+the interceptor's own listener without having been redirected to it, such as a process in the
+container connecting straight to the listener's port, is closed as soon as it is accepted and
+recorded with `outrig.action = "deny"` and `outrig.rule = "not-redirected"`, in either mode. If
+either mode is requested and setup fails, the session fails before MCP servers launch.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback

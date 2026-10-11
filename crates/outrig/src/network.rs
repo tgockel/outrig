@@ -96,6 +96,10 @@ const TCP_CONNECTIONS: usize = 256;
 /// under. Policy rules are labelled `default`, `allow[N]` and `deny[N]`, so it
 /// cannot be read as one of them.
 const CONNECTION_LIMIT_RULE: &str = "connection-limit";
+/// The `outrig.rule` a connection no redirect carried to the listener is
+/// recorded under; see [`not_redirected`]. Labelled like
+/// [`CONNECTION_LIMIT_RULE`], and for the same reason.
+const UNREDIRECTED_RULE: &str = "not-redirected";
 /// How long a listener waits before trying again after a failure that is not
 /// about one connection -- out of descriptors, buffers, memory. Connections
 /// finishing is what frees those, which takes time, and trying again at once
@@ -2098,8 +2102,8 @@ fn zeek_uid() -> String {
 ///
 /// Returns an error when the listener stopped taking connections before it
 /// was asked to; see [`after_listener_failure`].
-async fn tcp_accept_loop(
-    listener: TcpListener,
+async fn tcp_accept_loop<L: Accept>(
+    listener: L,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
@@ -2141,11 +2145,20 @@ async fn tcp_accept_loop(
 
 /// Where the accept loop takes its connections from.
 ///
-/// A seam for one reason: the failures the loop has to survive -- out of
+/// A seam for two reasons. The failures the loop has to survive -- out of
 /// descriptors, out of memory -- cannot be had from a real listener without
-/// starving every other test in the process of the same thing.
+/// starving every other test in the process of the same thing. And what a
+/// redirect displaced cannot be had from one without a redirect: a test that
+/// connects straight to a listener has been handed no destination but the
+/// listener's own, which the loop refuses.
 trait Accept: Send + Sync {
     fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+
+    /// The destination the redirect displaced on a connection this took, asked
+    /// of the family `peer` connected over.
+    fn original_dst(&self, stream: &TcpStream, peer: SocketAddr) -> io::Result<SocketAddr> {
+        original_dst(stream, peer)
+    }
 }
 
 impl Accept for TcpListener {
@@ -2155,7 +2168,8 @@ impl Accept for TcpListener {
 }
 
 /// The accepting half, with its carrier passed in. Carries at most
-/// [`TCP_CONNECTIONS`] at once, refusing the rest.
+/// [`TCP_CONNECTIONS`] at once, refusing the rest, and refuses every connection
+/// that was [`not_redirected`] before it counts toward them.
 ///
 /// Split out for one reason: the claim that finished connections are taken
 /// back out of the set as they complete is only observable in the set itself,
@@ -2190,21 +2204,35 @@ async fn accept_into<L: Accept>(
         };
         // The listener takes both families, so an IPv4 client arrives
         // v4-mapped. It is looked up and recorded as the IPv4 connection it is.
-        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        let dst = match original_dst(&stream, peer) {
+        let peer = canonical(peer);
+        let dst = match listener.original_dst(&stream, peer) {
             Ok(dst) => dst,
             Err(e) => {
                 tracing::warn!(target: "outrig::network", "SO_ORIGINAL_DST failed: {e}");
                 continue;
             }
         };
+        let local = match stream.local_addr() {
+            Ok(local) => local,
+            Err(e) => {
+                tracing::warn!(target: "outrig::network", "local address unreadable: {e}");
+                continue;
+            }
+        };
+        // Ahead of the limit: a flood of these is not a flood of connections
+        // the attachment is carrying, and must not be recorded as one.
+        if not_redirected(dst, local) {
+            drop(stream);
+            record_refused(audit, bindings, peer, dst, UNREDIRECTED_RULE, cancel).await;
+            continue;
+        }
         // Reaped here, as each connection arrives, rather than before the
         // accept: it can have waited a long time, and a connection that
         // finished meanwhile is not one this is still carrying.
         reap_finished(conns);
         if conns.len() >= TCP_CONNECTIONS {
             drop(stream);
-            record_refused(audit, bindings, peer, dst, cancel).await;
+            record_refused(audit, bindings, peer, dst, CONNECTION_LIMIT_RULE, cancel).await;
             continue;
         }
         // The connection carries a clone of `live` for as long as it runs, so
@@ -2221,6 +2249,44 @@ async fn accept_into<L: Accept>(
             drop(held);
         });
     }
+}
+
+/// Whether a connection reached the listener without the redirect, given the
+/// destination `SO_ORIGINAL_DST` reported for it and the listener-side address
+/// it arrived on.
+///
+/// Both are compared as the IPv4 or IPv6 address they are: the listener takes
+/// both families on one socket, so an IPv4 connection's `local` is v4-mapped,
+/// while the lookup reports `dst` in the family the connection came over.
+///
+/// Such a connection has nothing to bridge. The proxy dials its destination
+/// from the host's network namespace, and what the lookup reports for a flow
+/// nothing redirected is the address the client connected to -- the
+/// listener's own, which the host then reaches as whatever it has on that
+/// port: a container that read the port from `/proc/net/tcp` and connected to
+/// `127.0.0.1` on it got the host's loopback service there, and one dialing
+/// its own bridge address got the host's dial back into this listener, again
+/// and again.
+///
+/// - `dst == local` is every such connection. It is also the second hop of
+///   that bridge loop, which arrives from the host rather than the container,
+///   and a host on the bridge that dials the container's address on this port.
+/// - A loopback `dst` is none that a redirect carried: the nat chain returns
+///   ahead of loopback, so a redirected flow never has one, and an address
+///   that means the container's own loopback means the host's when the host
+///   dials it.
+///
+/// Not the listener's port alone. A connection to some other host that
+/// happens to use it is redirected and entitled to be carried, and every
+/// connection that reached the listener by itself already has `dst == local`.
+fn not_redirected(dst: SocketAddr, local: SocketAddr) -> bool {
+    let (dst, local) = (canonical(dst), canonical(local));
+    dst == local || dst.ip().is_loopback()
+}
+
+/// `addr` as the IPv4 address it is when it is v4-mapped.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// What one failed `accept` or receive says about the socket that returned it.
@@ -2295,9 +2361,10 @@ async fn after_listener_failure(
     }
 }
 
-/// Records a connection refused because its attachment already carries
-/// [`TCP_CONNECTIONS`]: denied by [`CONNECTION_LIMIT_RULE`], nothing read,
-/// nothing moved.
+/// Records a connection refused before it was read from: denied by `rule` --
+/// [`CONNECTION_LIMIT_RULE`] when its attachment already carries
+/// [`TCP_CONNECTIONS`], [`UNREDIRECTED_RULE`] when no redirect brought it --
+/// with nothing read and nothing moved.
 ///
 /// Queued rather than waited out. The accept loop is the one doing this, and
 /// waiting for the write would hold it out of `accept` -- and deaf to its
@@ -2309,6 +2376,7 @@ async fn record_refused(
     bindings: &Bindings,
     orig: SocketAddr,
     dst: SocketAddr,
+    rule: &str,
     cancel: &CancellationToken,
 ) {
     let record = AuditRecord::new(
@@ -2326,7 +2394,7 @@ async fn record_refused(
             bytes_rx: 0,
             decision: PolicyDecision {
                 action: NetworkAction::Deny,
-                rule: CONNECTION_LIMIT_RULE.to_string(),
+                rule: rule.to_string(),
             },
         },
     );
@@ -5895,10 +5963,7 @@ mod tests {
         Arc::new(compiled(NetworkPolicy::allow_all()))
     }
 
-    /// Denies everything. `SO_ORIGINAL_DST` on a connection nothing redirected
-    /// reports the accepting listener's own address, so an allowed connection
-    /// through a loop bound to that listener is bridged straight back into it
-    /// -- each one accepted, bridged, and accepted again.
+    /// Denies everything, so a connection a test carries is never dialed.
     fn deny_all_policy() -> Arc<CompiledNetworkPolicy> {
         Arc::new(compiled(
             NetworkPolicy::builder()
@@ -6577,6 +6642,7 @@ mod tests {
         let audit = audit_sink(dir.path()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let listener = Redirected::elsewhere(listener);
         let cancel = CancellationToken::new();
         let conn_cancel = cancel.child_token();
         // Held here rather than by the loop, which is the whole reason the
@@ -6677,20 +6743,9 @@ mod tests {
     #[tokio::test]
     async fn the_accept_loop_waits_for_the_connections_it_started() {
         const HELD: usize = 4;
-        let dir = tempfile::tempdir().expect("tempdir");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("listener addr");
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(tcp_accept_loop(
-            listener,
-            audit_sink(dir.path()).await,
-            empty_bindings(),
-            allow_all_policy(),
-            None,
-            cancel.clone(),
-            mpsc::channel(1).0,
-        ));
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected::elsewhere(listener)).await;
 
         // Silent clients, so every connection parks in the sniff read and is
         // still live -- and still unrecorded -- when the cancel lands. The
@@ -6777,9 +6832,43 @@ mod tests {
         }
     }
 
+    /// Somewhere a redirect could have been headed: not loopback, not the
+    /// listener, and never dialed, because every test that carries a
+    /// connection to it either denies it or cuts it in the sniff.
+    const ELSEWHERE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443);
+
+    /// A listener the redirect sends connections to: every one it takes was
+    /// headed for `dst` before the redirect displaced it. What a real listener
+    /// reports for a connection made straight to it is its own address, which
+    /// the loop refuses, so a test about what the loop does with a connection
+    /// it carries has to say where the connection was going.
+    struct Redirected {
+        listener: TcpListener,
+        dst: SocketAddr,
+    }
+
+    impl Redirected {
+        fn elsewhere(listener: TcpListener) -> Self {
+            Self {
+                listener,
+                dst: ELSEWHERE,
+            }
+        }
+    }
+
+    impl Accept for Redirected {
+        fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+            self.listener.accept()
+        }
+
+        fn original_dst(&self, _: &TcpStream, _: SocketAddr) -> io::Result<SocketAddr> {
+            Ok(self.dst)
+        }
+    }
+
     /// The accept loop over `listener`, carrying `conns`, until `cancel` or
     /// the listener ends it. Under [`deny_all_policy`], so a connection it
-    /// accepts is never bridged back into the listener it came from.
+    /// accepts is never dialed.
     async fn run_accept_loop(
         listener: &impl Accept,
         audit: &AuditSink,
@@ -6983,11 +7072,11 @@ mod tests {
     /// connections again.
     #[tokio::test]
     async fn a_connection_past_the_limit_is_refused_and_recorded() {
-        require_original_dst().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let audit = audit_sink(dir.path()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let listener = Redirected::elsewhere(listener);
         let cancel = CancellationToken::new();
         let conn_cancel = cancel.child_token();
 
@@ -7267,22 +7356,11 @@ mod tests {
     /// peer, and is recorded by the address it actually connected from.
     #[tokio::test]
     async fn the_accept_loop_records_an_ipv4_client_by_its_ipv4_address() {
-        let dir = tempfile::tempdir().expect("tempdir");
         let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
         listener.set_nonblocking(true).expect("nonblocking");
         let listener = TcpListener::from_std(listener).expect("tokio listener");
         let port = listener.local_addr().expect("listener addr").port();
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(tcp_accept_loop(
-            listener,
-            audit_sink(dir.path()).await,
-            empty_bindings(),
-            allow_all_policy(),
-            None,
-            cancel.clone(),
-            mpsc::channel(1).0,
-        ));
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected::elsewhere(listener)).await;
 
         // Silent, so it parks in the sniff read and nothing is forwarded.
         let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
@@ -7334,6 +7412,196 @@ mod tests {
             !matches!(dst, Ok(SocketAddr::V4(_))),
             "the IPv6 connection from {peer} was given an IPv4 destination: {dst:?}"
         );
+    }
+
+    /// The accept loop over `listener` under [`allow_all_policy`] -- audit
+    /// mode, where nothing but the loop's own refusals can stop a connection --
+    /// as a task of its own, with the directory its audit log goes to.
+    async fn spawn_allow_all_loop<L: Accept + 'static>(
+        listener: L,
+    ) -> (tempfile::TempDir, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            None,
+            cancel.clone(),
+            mpsc::channel(1).0,
+        ));
+        (dir, cancel, tasks)
+    }
+
+    /// Connects to `target` under [`spawn_allow_all_loop`] and returns the one
+    /// record the loop wrote for it, having checked that the connection was
+    /// closed at once rather than left in the sniff.
+    ///
+    /// The loop is cancelled only after that record is in, so a connection it
+    /// had carried instead -- or dialed back into itself -- writes its own as
+    /// it is cut, and the count of one fails.
+    async fn refused_connection<L: Accept + 'static>(
+        listener: L,
+        target: SocketAddr,
+    ) -> serde_json::Value {
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(listener).await;
+
+        let mut client = TcpStream::connect(target).await.expect("connect");
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf))
+            .await
+            .expect("a refused connection is closed at once, not left open");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        await_audit_records(dir.path(), 1).await;
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+        only_audit_record(dir.path())
+    }
+
+    /// A connection made straight to the listener, the way a container
+    /// process that read its port from `/proc/net/tcp` makes one. The redirect
+    /// leaves loopback alone, so nothing displaced the destination, and what
+    /// `SO_ORIGINAL_DST` reports is the listener's own address -- which the
+    /// host would dial as whatever it has on that port.
+    ///
+    /// Against the socket the attachment really binds. The destination is the
+    /// kernel's own answer, or with `stand_in` said outright: the address the
+    /// client dials, which is what the kernel would report.
+    async fn dial_the_listener_directly(to: IpAddr, stand_in: bool) {
+        let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let target = SocketAddr::new(to, port);
+
+        let record = if stand_in {
+            let dst = target;
+            refused_connection(Redirected { listener, dst }, target).await
+        } else {
+            refused_connection(listener, target).await
+        };
+
+        assert_eq!(record["outrig.rule"], UNREDIRECTED_RULE, "{record:#}");
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["id.resp_h"], to.to_string());
+        assert_eq!(record["id.resp_p"], port);
+        assert_eq!(record["orig_bytes"], 0);
+        assert_eq!(record["resp_bytes"], 0);
+    }
+
+    /// With the kernel's own `SO_ORIGINAL_DST`, which is what makes the
+    /// destination the listener's own address in the first place.
+    #[tokio::test]
+    async fn a_direct_connection_to_the_listener_is_refused_not_dialed() {
+        require_original_dst().await;
+        dial_the_listener_directly(Ipv4Addr::LOCALHOST.into(), false).await;
+    }
+
+    /// Each family's client of the dual-stack listener, with the destination
+    /// said outright, so it holds on a host with no conntrack to give one --
+    /// the kernel tracks IPv6 flows only in a namespace something has asked it
+    /// to, and a test process's need not have. What it does not isolate is the
+    /// v4-mapped comparison, which the loopback half would settle here on its
+    /// own: that is the truth table's.
+    #[tokio::test]
+    async fn a_direct_connection_to_the_listener_is_refused_over_either_family() {
+        dial_the_listener_directly(Ipv4Addr::LOCALHOST.into(), true).await;
+        if kernel_has_ipv6() {
+            dial_the_listener_directly(Ipv6Addr::LOCALHOST.into(), true).await;
+        }
+    }
+
+    /// A destination in loopback is never one a redirect carried, whatever it
+    /// is equal to, because the redirect returns ahead of loopback. Only a
+    /// stand-in can say a connection was headed there: a real flow that was
+    /// would have reached the listener by itself, with its own address.
+    #[tokio::test]
+    async fn a_loopback_destination_is_refused_whatever_it_arrived_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let headed_for: SocketAddr = "127.0.0.1:9".parse().expect("address");
+        assert_ne!(headed_for, addr);
+
+        let record = refused_connection(
+            Redirected {
+                listener,
+                dst: headed_for,
+            },
+            addr,
+        )
+        .await;
+
+        assert_eq!(record["outrig.rule"], UNREDIRECTED_RULE, "{record:#}");
+        assert_eq!(record["id.resp_h"], "127.0.0.1");
+        assert_eq!(record["id.resp_p"], 9);
+    }
+
+    /// A connection the redirect did carry here, to another host that uses the
+    /// port the listener happens to have, is carried.
+    #[tokio::test]
+    async fn a_redirected_connection_to_another_host_on_the_listeners_port_is_carried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dst = SocketAddr::new(ELSEWHERE.ip(), addr.port());
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected { listener, dst }).await;
+
+        // Silent, so it parks in the sniff read and nothing is dialed.
+        let _client = TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(SNIFF_TIMEOUT / 5).await;
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow", "{record:#}");
+        assert_ne!(record["outrig.rule"], UNREDIRECTED_RULE);
+        assert_eq!(record["id.resp_h"], dst.ip().to_string());
+        assert_eq!(record["id.resp_p"], dst.port());
+    }
+
+    /// What `not_redirected` takes as a connection no redirect carried, and
+    /// what it leaves to policy.
+    #[test]
+    fn a_connection_is_not_redirected_when_it_is_headed_where_it_arrived_or_into_loopback() {
+        for (dst, local) in [
+            // Straight to the listener, over each family.
+            ("127.0.0.1:40000", "127.0.0.1:40000"),
+            ("[::1]:40000", "[::1]:40000"),
+            // The same, as the dual-stack listener reports an IPv4 client's
+            // end of it.
+            ("127.0.0.1:40000", "[::ffff:127.0.0.1]:40000"),
+            ("10.88.0.2:40000", "[::ffff:10.88.0.2]:40000"),
+            // The host dialing the container's address on the listener's
+            // port: the second hop of the bridge loop.
+            ("10.88.0.2:40000", "10.88.0.2:40000"),
+            ("[fd00::2]:40000", "[fd00::2]:40000"),
+            // Loopback that is not the listener's address.
+            ("127.0.0.1:9", "127.0.0.1:40000"),
+            ("127.0.0.2:40000", "127.0.0.1:40000"),
+            ("[::1]:9", "[::1]:40000"),
+            ("127.0.0.1:40000", "[::1]:40000"),
+            ("[::ffff:127.0.0.1]:9", "127.0.0.1:40000"),
+        ] {
+            assert!(not_redirected(addr(dst), addr(local)), "{dst} on {local}");
+        }
+
+        for (dst, local) in [
+            ("93.184.216.34:443", "127.0.0.1:40000"),
+            ("[2001:db8::1]:443", "[::1]:40000"),
+            ("93.184.216.34:443", "[::ffff:127.0.0.1]:40000"),
+            // The listener's port, on a host that is not the listener.
+            ("93.184.216.34:40000", "127.0.0.1:40000"),
+            ("[2001:db8::1]:40000", "[::1]:40000"),
+            // The container's own address, redirected here: it is the host's
+            // dial back that is refused, on its arrival.
+            ("10.88.0.2:40000", "127.0.0.1:40000"),
+        ] {
+            assert!(!not_redirected(addr(dst), addr(local)), "{dst} on {local}");
+        }
     }
 
     #[test]

@@ -196,7 +196,12 @@ metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule
 `outrig.host` is one the interceptor validated for that address and `asserted` when the
 container merely claimed it -- only a resolved name can have granted a hostname allow rule. A
 connection refused because its container already had 256 open through the interceptor is recorded
-with `outrig.action` `deny` and `outrig.rule` `connection-limit`.
+with `outrig.action` `deny` and `outrig.rule` `connection-limit`. One that reached the
+interceptor's own listener without being redirected there -- a process in the container
+connecting straight to the listener's port, which the redirect leaves alone because it is on
+loopback -- is closed on arrival and recorded with `outrig.action` `deny` and `outrig.rule`
+`not-redirected`. Its only destination is the listener itself, which the interceptor would
+otherwise dial from the host's network namespace.
 
 Interception ends with the session, and ending it is the exact inverse of starting it. Every
 connection still open through the interceptor is cut, and each one is recorded before teardown
