@@ -43,7 +43,7 @@ pub async fn run_with(
     hf: &mut impl HfTreeFetcher,
 ) -> Result<()> {
     // Phase 1: global config.
-    let global_path = global_config_path(global_override);
+    let global_path = global_config_path(global_override)?;
     if global_path.exists() {
         eprintln!(
             "[outrig] using existing global config at {}",

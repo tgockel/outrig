@@ -17,8 +17,8 @@ use crate::hf::HfTreeFetcher;
 use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{
-    find_repo_root_from, repo_config_path, report_config_warnings, resolve_global_config,
-    write_atomic,
+    find_repo_root_from, load_global_or_empty, repo_config_path, report_config_warnings,
+    resolve_global_config, write_atomic,
 };
 use outrig::config::{Agent, Config, ImageConfig, LlmProvider, Model, Workspace, merge};
 
@@ -45,7 +45,7 @@ pub async fn ensure(
         "[outrig] no repo config at {} -- let's create one.",
         cfg_path.display()
     );
-    let name = write_repo_config(repo_root, global_path, None, prompt, hf).await?;
+    let name = write_repo_config(repo_root, Some(global_path), None, prompt, hf).await?;
     Ok(Some(name))
 }
 
@@ -61,7 +61,9 @@ pub async fn ensure(
 /// Returns the resolved repo root paired with `name`, or, when that is
 /// `None` and the bootstrap ran, the name it asked for.
 /// `global_override` is `--global-config`, which only the bootstrap reads: one
-/// that names nothing is refused before the bootstrap asks anything.
+/// that names nothing is refused before the bootstrap asks anything. With no
+/// flag and no default location, the bootstrap reads no global config, as it
+/// does when the default file is missing.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_override: Option<&Path>,
@@ -86,7 +88,7 @@ pub async fn resolve_or_bootstrap(
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
-            let name = write_repo_config(cwd, &global_path, name, prompt, hf).await?;
+            let name = write_repo_config(cwd, global_path.as_deref(), name, prompt, hf).await?;
             Ok((cwd.to_path_buf(), Some(name)))
         }
         Err(other) => Err(other.into()),
@@ -102,7 +104,7 @@ pub async fn resolve_or_bootstrap(
 /// Returns the name written.
 async fn write_repo_config(
     repo_root: &Path,
-    global_path: &Path,
+    global_path: Option<&Path>,
     image_name: Option<String>,
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
@@ -157,10 +159,11 @@ async fn write_repo_config(
         modelless_agent.as_deref(),
     )
     .map_err(|e| {
+        let merged_with = global_path.unwrap_or(Path::new("no global config"));
         OutrigError::Configuration(format!(
             "not writing {}: merged with {}, it would not load: {e}",
             cfg_path.display(),
-            global_path.display()
+            merged_with.display()
         ))
     })?;
     write_atomic(&cfg_path, &toml_text)?;
@@ -216,12 +219,13 @@ struct GlobalSummary {
     default_model: Option<String>,
 }
 
-/// Best-effort load of the global config. A missing file yields an empty
-/// summary (the user will be prompted to run `outrig config init`); what the
-/// load sets aside is reported as it would be for `outrig run`, and an error
-/// propagates so a corrupt config surfaces immediately.
-fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
-    let cfg = Config::load_global(global_path)?;
+/// Best-effort load of the global config. A missing file, or no global config
+/// at all, yields an empty summary (the user will be prompted to run `outrig
+/// config init`); what the load sets aside is reported as it would be for
+/// `outrig run`, and an error propagates so a corrupt config surfaces
+/// immediately.
+fn load_global_summary(global_path: Option<&Path>) -> Result<GlobalSummary> {
+    let cfg = load_global_or_empty(global_path)?;
     report_config_warnings(&cfg);
     // Only rows a validated load would accept. `load_global` parses without
     // validating, and since `provider` became optional a broken row survives
@@ -431,11 +435,11 @@ fn render(
 
 /// Whether the next load would take `text`, asked before it is written: the
 /// steps [`Config::load`] takes -- parse, the repo-file rules, merge over the
-/// global config at `global_path`, validate against `repo_root` -- run on the
-/// rendered text. Unlike a load, nothing is stamped with its source, and
-/// nothing needs to be: an unstamped `host-path` resolves against
-/// `repo_root` as a repo-stamped one does, and the wizard writes no image or
-/// mount paths.
+/// global config at `global_path` (an empty one with none), validate against
+/// `repo_root` -- run on the rendered text. Unlike a load, nothing is stamped
+/// with its source, and nothing needs to be: an unstamped `host-path` resolves
+/// against `repo_root` as a repo-stamped one does, and the wizard writes no
+/// image or mount paths.
 ///
 /// Two things are knowingly unresolved here, and the check takes them as
 /// settled. `pending_image` is the image the `image add` after this writes,
@@ -449,13 +453,13 @@ fn render(
 fn check_loads(
     text: &str,
     repo_root: &Path,
-    global_path: &Path,
+    global_path: Option<&Path>,
     pending_image: &str,
     modelless_agent: Option<&str>,
 ) -> outrig::error::Result<()> {
     let repo = Config::load_from_str(text)?;
     repo.validate_as_repo()?;
-    let mut merged = merge(Config::load_global(global_path)?, repo);
+    let mut merged = merge(load_global_or_empty(global_path)?, repo);
     merged.images.insert(
         pending_image.to_string(),
         ImageConfig::from_image_name(pending_image),
@@ -567,7 +571,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, body).expect("write");
-        load_global_summary(&path).expect("parses")
+        load_global_summary(Some(&path)).expect("parses")
     }
 
     /// `load_global_summary` parses without validating, so every model rule has

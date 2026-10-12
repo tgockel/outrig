@@ -101,7 +101,7 @@ async fn build_default_image_then_cache_hits() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -117,7 +117,7 @@ async fn build_default_image_then_cache_hits() {
     let started = Instant::now();
     let exit2 = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -153,7 +153,7 @@ async fn build_stamps_repo_mcp_labels() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -197,7 +197,7 @@ async fn build_all_iterates_every_container() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -234,7 +234,7 @@ async fn build_all_short_circuits_on_first_failure() {
     };
     let result = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await;
@@ -270,7 +270,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     };
     build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -286,7 +286,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     };
     build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &no_cache_args,
     )
     .await

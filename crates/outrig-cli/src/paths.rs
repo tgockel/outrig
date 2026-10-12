@@ -164,7 +164,9 @@ impl RepoConfig {
             .unwrap_or_else(|| repo_config_path(&self.root))
     }
 
-    pub(crate) fn load(&self, global: &Path) -> Result<Config> {
+    /// `global` is the global config as [`resolve_global_config`] found it:
+    /// `None` is a run without one, which is what a missing file amounts to.
+    pub(crate) fn load(&self, global: Option<&Path>) -> Result<Config> {
         let cfg = self.load_unvalidated(global)?;
         cfg.validate(Some(&self.root))?;
         Ok(cfg)
@@ -172,7 +174,7 @@ impl RepoConfig {
 
     pub(crate) fn load_for_run(
         &self,
-        global: &Path,
+        global: Option<&Path>,
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Config> {
@@ -181,7 +183,7 @@ impl RepoConfig {
         Ok(cfg)
     }
 
-    pub(crate) fn load_for_build(&self, global: &Path) -> Result<Config> {
+    pub(crate) fn load_for_build(&self, global: Option<&Path>) -> Result<Config> {
         let cfg = self.load_unvalidated(global)?;
         cfg.validate_for_build(Some(&self.root))?;
         Ok(cfg)
@@ -190,10 +192,10 @@ impl RepoConfig {
     /// Both files read and merged, with whatever either set aside reported
     /// before the caller validates: a key set aside can be why a rule then
     /// fails, and its warning is what explains that error.
-    fn load_unvalidated(&self, global: &Path) -> Result<Config> {
+    fn load_unvalidated(&self, global: Option<&Path>) -> Result<Config> {
         let cfg = match &self.file {
-            Some(file) => Config::load_file_unvalidated(file, Some(global)),
-            None => Config::load_unvalidated(&self.root, Some(global)),
+            Some(file) => Config::load_file_unvalidated(file, global),
+            None => Config::load_unvalidated(&self.root, global),
         }?;
         report_config_warnings(&cfg);
         Ok(cfg)
@@ -344,13 +346,17 @@ pub(crate) fn default_session_root() -> PathBuf {
 }
 
 /// Where the global config is, unchecked: `init` and `config init` write it
-/// there. A command that reads it goes through [`resolve_global_config`].
-pub(crate) fn global_config_path(override_path: Option<&Path>) -> PathBuf {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let home = BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_default();
-    global_config_path_with(override_path, xdg.as_deref(), &home)
+/// there, so with nowhere to put it they stop. A command that reads it goes
+/// through [`resolve_global_config`].
+pub(crate) fn global_config_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    locate_global_config(override_path).ok_or_else(|| {
+        OutrigError::Configuration(
+            "nowhere to put the global config: there is no absolute XDG_CONFIG_HOME and no \
+             absolute home directory\n\
+             help: pass --global-config <path>, or set HOME to an absolute path"
+                .to_string(),
+        )
+    })
 }
 
 /// [`global_config_path`] for a command that reads the file. `--global-config`
@@ -359,7 +365,11 @@ pub(crate) fn global_config_path(override_path: Option<&Path>) -> PathBuf {
 /// does exist is left to the read, which reports a directory or a file it
 /// cannot open, and reads `/dev/null` as empty. Call it where the file is about
 /// to be read: a command that never reads it never checks the flag.
-pub(crate) fn resolve_global_config(override_path: Option<&Path>) -> Result<PathBuf> {
+///
+/// `None` is no global config at all: with no flag, no absolute
+/// `XDG_CONFIG_HOME`, and no absolute home directory there is no default
+/// location, and the command runs as it does when the default file is missing.
+pub(crate) fn resolve_global_config(override_path: Option<&Path>) -> Result<Option<PathBuf>> {
     if let Some(path) = override_path
         && matches!(path.try_exists(), Ok(false))
     {
@@ -368,21 +378,47 @@ pub(crate) fn resolve_global_config(override_path: Option<&Path>) -> Result<Path
             path.display()
         )));
     }
-    Ok(global_config_path(override_path))
+    Ok(locate_global_config(override_path))
 }
 
+/// The global config at `path` alone, as [`Config::load_global`] reads it, or
+/// an empty one when there is no global config.
+pub(crate) fn load_global_or_empty(path: Option<&Path>) -> Result<Config> {
+    path.map_or_else(|| Ok(Config::default()), Config::load_global)
+}
+
+/// What [`global_config_path`] and [`resolve_global_config`] share: where the
+/// global config is -- the flag, else what the environment names -- or `None`
+/// when nothing names a place.
+fn locate_global_config(override_path: Option<&Path>) -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    global_config_path_with(override_path, xdg.as_deref(), home.as_deref())
+}
+
+/// [`locate_global_config`] over explicit values: `--global-config`, else
+/// `<xdg_config_home>/outrig/config.toml`, else `<home>/.outrig/config.toml`.
+///
+/// The flag is taken as given, a relative one included, as `--config` is. An
+/// `XDG_CONFIG_HOME` or home that is not absolute is no location: joined onto
+/// the working directory, it would make the global config -- the file that may
+/// declare what a repo config may not, such as a provider's `api-key` --
+/// whichever file the directory holds. The XDG Base Directory Specification has
+/// an implementation ignore a relative `XDG_CONFIG_HOME` and read an empty one
+/// as unset.
 fn global_config_path_with(
     override_path: Option<&Path>,
     xdg_config_home: Option<&Path>,
-    home: &Path,
-) -> PathBuf {
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     if let Some(p) = override_path {
-        return p.to_path_buf();
+        return Some(p.to_path_buf());
     }
-    if let Some(xdg) = xdg_config_home {
-        return xdg.join(GLOBAL_XDG_DIR).join(GLOBAL_CONFIG_FILE);
+    if let Some(xdg) = xdg_config_home.filter(|p| p.is_absolute()) {
+        return Some(xdg.join(GLOBAL_XDG_DIR).join(GLOBAL_CONFIG_FILE));
     }
-    home.join(GLOBAL_HOME_DIR).join(GLOBAL_CONFIG_FILE)
+    home.filter(|p| p.is_absolute())
+        .map(|home| home.join(GLOBAL_HOME_DIR).join(GLOBAL_CONFIG_FILE))
 }
 
 #[cfg(test)]
@@ -710,7 +746,7 @@ mod tests {
     fn global_config_path_xdg_overrides_home_default() {
         let xdg = Path::new("/xdg/conf");
         let home = Path::new("/home/alice");
-        let p = global_config_path_with(None, Some(xdg), home);
+        let p = global_config_path_with(None, Some(xdg), Some(home)).unwrap();
         assert_eq!(p, Path::new("/xdg/conf/outrig/config.toml"));
     }
 
@@ -719,15 +755,67 @@ mod tests {
         let flag = Path::new("/explicit/global.toml");
         let xdg = Path::new("/xdg/conf");
         let home = Path::new("/home/alice");
-        let p = global_config_path_with(Some(flag), Some(xdg), home);
+        let p = global_config_path_with(Some(flag), Some(xdg), Some(home)).unwrap();
         assert_eq!(p, flag);
     }
 
     #[test]
     fn global_config_path_home_default_when_xdg_unset() {
         let home = Path::new("/home/alice");
-        let p = global_config_path_with(None, None, home);
+        let p = global_config_path_with(None, None, Some(home)).unwrap();
         assert_eq!(p, Path::new("/home/alice/.outrig/config.toml"));
+    }
+
+    /// #368: an `XDG_CONFIG_HOME` that is empty or relative is unset, so the
+    /// global config is the home default and not a file under the working
+    /// directory, as the XDG Base Directory Specification says.
+    #[test]
+    fn global_config_path_ignores_an_xdg_config_home_that_is_not_absolute() {
+        let home = Path::new("/home/alice");
+        for xdg in ["", "conf", "./conf", "~/.config"] {
+            let p = global_config_path_with(None, Some(Path::new(xdg)), Some(home));
+            assert_eq!(
+                p.as_deref(),
+                Some(Path::new("/home/alice/.outrig/config.toml")),
+                "XDG_CONFIG_HOME={xdg:?}",
+            );
+        }
+    }
+
+    /// #368: a home that is missing, empty, or relative names no place, and
+    /// with no absolute `XDG_CONFIG_HOME` either there is no location -- not
+    /// one resolved against the working directory. An absolute
+    /// `XDG_CONFIG_HOME` needs no home, and the flag needs neither.
+    #[test]
+    fn global_config_path_needs_an_absolute_xdg_config_home_or_home() {
+        let flag = Path::new("global.toml");
+        for home in [None, Some(Path::new("")), Some(Path::new("alice"))] {
+            for xdg in [None, Some(Path::new("")), Some(Path::new("conf"))] {
+                assert_eq!(
+                    global_config_path_with(None, xdg, home),
+                    None,
+                    "XDG_CONFIG_HOME={xdg:?}, home={home:?}",
+                );
+            }
+            let p = global_config_path_with(None, Some(Path::new("/xdg")), home);
+            assert_eq!(p.as_deref(), Some(Path::new("/xdg/outrig/config.toml")));
+            let p = global_config_path_with(Some(flag), None, home);
+            assert_eq!(p.as_deref(), Some(flag));
+        }
+    }
+
+    /// With no global config there is nothing to read, and what comes back is
+    /// an empty config, as it is for a file that is not there.
+    #[test]
+    fn no_global_config_loads_as_an_empty_one() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("config.toml");
+
+        assert_eq!(load_global_or_empty(None).unwrap(), Config::default());
+        assert_eq!(
+            load_global_or_empty(Some(&missing)).unwrap(),
+            Config::default()
+        );
     }
 
     /// #342: `--global-config` names a file outright, so one that is not there
@@ -764,11 +852,14 @@ mod tests {
             tmp.path().to_path_buf(),
             PathBuf::from("/dev/null"),
         ] {
-            assert_eq!(resolve_global_config(Some(&present)).unwrap(), present);
+            assert_eq!(
+                resolve_global_config(Some(&present)).unwrap(),
+                Some(present)
+            );
         }
         assert_eq!(
             resolve_global_config(None).unwrap(),
-            global_config_path(None)
+            global_config_path(None).ok()
         );
     }
 }

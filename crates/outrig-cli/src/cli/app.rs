@@ -196,7 +196,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 runtime,
                 run::execute(
                     &repo_config,
-                    &global_config,
+                    global_config.as_deref(),
                     cli.session_root.as_deref(),
                     args,
                     cli.verbose,
@@ -215,7 +215,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 runtime,
                 mcp::execute(
                     &repo_config,
-                    &global_config,
+                    global_config.as_deref(),
                     cli.session_root.as_deref(),
                     args,
                     cli.verbose,
@@ -225,7 +225,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, true)?;
-            runtime.block_on(build::execute(&repo_config, &global_config, args))
+            runtime.block_on(build::execute(&repo_config, global_config.as_deref(), args))
         }
         Cmd::Config(args) => match &args.cmd {
             ConfigCmd::Init { force } => {
@@ -390,14 +390,14 @@ fn session_cmd_ctx(cli: &Cli) -> Result<(Option<&Path>, tokio::runtime::Runtime)
 }
 
 /// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the
-/// resolved global config, and a current-thread tokio runtime. With
-/// `require_config` (build), errors if no repo config can be located;
-/// otherwise (run/mcp) a missing config falls back to the current directory
-/// as repo root, merged over the global config.
+/// resolved global config (`None` with nowhere to look for one), and a
+/// current-thread tokio runtime. With `require_config` (build), errors if no
+/// repo config can be located; otherwise (run/mcp) a missing config falls back
+/// to the current directory as repo root, merged over the global config.
 fn repo_cmd_ctx(
     cli: &Cli,
     require_config: bool,
-) -> Result<(RepoConfig, PathBuf, tokio::runtime::Runtime)> {
+) -> Result<(RepoConfig, Option<PathBuf>, tokio::runtime::Runtime)> {
     let cwd = crate::paths::current_dir()?;
     let repo_config = if require_config {
         resolve_repo_config(cli.config.as_deref(), &cwd)?

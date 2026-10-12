@@ -24,9 +24,10 @@ use outrig::config::{AnthropicOptions, ApiKeyRef, Config, LlmProvider, Model, Op
 /// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
 /// delegate to `run_with`. `global_override` plumbs the top-level
 /// `--global-config` flag into the same resolver [`global_config_path`]
-/// uses elsewhere.
+/// uses elsewhere; with no flag and no home to put the file in, that is an
+/// error.
 pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
-    let path = global_config_path(global_override);
+    let path = global_config_path(global_override)?;
     eprintln!("[outrig] writing global config to {}", path.display());
     let mut prompt = prompt::auto();
     let mut hf = hf::auto();

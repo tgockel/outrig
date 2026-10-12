@@ -74,6 +74,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An empty or relative `XDG_CONFIG_HOME` no longer moves the global config into the working
+  directory.** The variable was used as written, so `XDG_CONFIG_HOME= outrig run` read
+  `./outrig/config.toml` as the global config and `XDG_CONFIG_HOME=conf` read
+  `./conf/outrig/config.toml`. Provider keys, `session-root`, and the `[network]` policy then
+  changed with the directory outrig was started in, and a checked-out repo holding such a file
+  could declare what only the global config may: a provider with an `api-key` and a `base-url`
+  of its choosing, which a repo config is refused. Both values are now ignored, as the XDG Base
+  Directory Specification says, and the global config is `~/.outrig/config.toml`. A home
+  directory that is missing or not absolute is ignored the same way; with no other location
+  there is no default global config, where there used to be `<cwd>/.outrig/config.toml`.
+  `outrig run`, `mcp`, `build`, `image add`, and the session commands then go on without one,
+  and `outrig init` and `outrig config init`, which have nowhere to write it, stop and ask for
+  `--global-config`. See [Global flags](../../doc/reference/cli.md#global-flags). (#368)
+
 - **That a dynamically linked `view = "primary"` payload cannot re-execute itself is now
   documented.** It runs through the sidecar's own loader, so its `/proc/self/exe` is the loader
   and its `argv[0]` is a graft path the kernel cannot run by name. A server that starts a copy of

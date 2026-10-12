@@ -7,8 +7,8 @@
 ## `outrig config init`
 
 `outrig config init` walks you through the global config at `~/.outrig/config.toml` (or
-`<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set) -- the user/machine-level
-providers and models that any outrig repo can reuse.
+`<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set to an absolute path) -- the
+user/machine-level providers and models that any outrig repo can reuse.
 
 It's the first phase of [`outrig init`](init.md), which runs `config init` automatically when
 no global config is present.

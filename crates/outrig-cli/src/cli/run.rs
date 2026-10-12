@@ -104,7 +104,7 @@ pub struct RunArgs {
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
     repo: &RepoConfig,
-    global_cfg_path: &Path,
+    global_cfg_path: Option<&Path>,
     session_root_flag: Option<&Path>,
     args: &RunArgs,
     verbose: u8,

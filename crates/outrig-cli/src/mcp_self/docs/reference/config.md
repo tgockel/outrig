@@ -3,7 +3,7 @@
 outrig reads two TOML files:
 
 - **Global config** -- user/machine-level. Default location: `~/.outrig/config.toml` (or
-  `<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set). Holds
+  `<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set to an absolute path). Holds
   `[providers.<name>]` and (typically) `[models.<name>]` since those reference API keys and
   model identifiers that belong to the user, not to any one repo.
 - **Repo config** at `.agents/outrig/config.toml` -- repository-level, committed to source

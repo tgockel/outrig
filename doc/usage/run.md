@@ -129,8 +129,8 @@ $ outrig run --image my-tool:latest --volume "$PWD/data:/data:rw"
 
 With no repo config found and no `--config`, outrig uses the current directory as the workspace
 root (mounted at `/workspace`) and reads the agent, model, and provider from the global config
-(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). You need not pass
-`--image`: with nothing else naming one, the session falls through to
+(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml` when that is an absolute
+path). You need not pass `--image`: with nothing else naming one, the session falls through to
 [the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
 unknown ref is used as a local Podman image and is never pulled. The current directory can't be
 your home directory or one above it, unless a config declares `[workspace] host-path`; see

@@ -48,8 +48,14 @@ config-less run. Which repo the command then runs against depends on where the f
   file sits never decides which directory is mounted as the workspace.
 
 `--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
-when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --
-note this is `~/.outrig/`, not `~/.config/outrig/`).
+when `XDG_CONFIG_HOME` is set to an absolute path, then `~/.outrig/config.toml` (the
+outrig-specific fallback -- note this is `~/.outrig/`, not `~/.config/outrig/`). As the XDG Base
+Directory Specification says, an empty `XDG_CONFIG_HOME` counts as unset and a relative one is
+ignored, so the global config is never looked for under the current directory. A home directory
+that is not absolute is ignored the same way. With no absolute `XDG_CONFIG_HOME` and no absolute
+home directory there is no default location: a command that reads the global config runs without
+one, and `outrig init` and `outrig config init`, which would have nowhere to write it, stop and
+ask for `--global-config`.
 
 Only the default may be missing: a machine with no global config runs on the repo config alone. A
 path the flag names has to exist wherever outrig reads the global config, and one that does not
@@ -392,7 +398,7 @@ Environment variables used by `outrig mcp`:
 | `OUTRIG_LOG`      | Preferred `tracing-subscriber` filter.                          |
 | `RUST_LOG`        | Fallback tracing filter when `OUTRIG_LOG` is unset.             |
 | `XDG_DATA_HOME`   | Default base for `session-root` if not set in global config.    |
-| `XDG_CONFIG_HOME` | Global config is checked before `~/.outrig/config.toml`.        |
+| `XDG_CONFIG_HOME` | Absolute only: global config is checked before `~/.outrig/`.    |
 
 See [Usage -> outrig mcp](../usage/mcp.md) for client configuration and stdio details.
 
@@ -546,7 +552,8 @@ there; the run is reported in full, and the container is named on stderr.
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.
 - `XDG_DATA_HOME`: default base for `session-root` if not set in the global config.
-- `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
+- `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`, when it is
+  an absolute path. An empty or relative value is ignored.
 
 These are read on the host. None of them, nor any other host variable such as `HTTPS_PROXY`,
 reaches a container unless an MCP server's `env` or `--env` names it; see

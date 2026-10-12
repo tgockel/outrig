@@ -111,7 +111,8 @@ fn cache_status(raw_local_image: bool, outcome: &ImageBuildOutcome) -> &'static 
 /// is the caller's stack frame.
 pub struct SessionSetupArgs<'a> {
     pub repo: &'a RepoConfig,
-    pub global_cfg_path: &'a Path,
+    /// The global config, `None` when there is no default location for one.
+    pub global_cfg_path: Option<&'a Path>,
     pub session_root_flag: Option<&'a Path>,
     pub image_flag: Option<&'a str>,
     /// Existing session id or podman container name to attach to instead of

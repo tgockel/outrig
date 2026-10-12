@@ -117,7 +117,7 @@ impl McpArgs {
 /// Run one `outrig mcp` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
     repo: &RepoConfig,
-    global_cfg_path: &Path,
+    global_cfg_path: Option<&Path>,
     session_root_flag: Option<&Path>,
     args: &McpArgs,
     verbose: u8,
