@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **That a dynamically linked `view = "primary"` payload cannot re-execute itself is now
+  documented.** It runs through the sidecar's own loader, so its `/proc/self/exe` is the loader
+  and its `argv[0]` is a graft path the kernel cannot run by name. A server that starts a copy of
+  itself -- Node `child_process.fork()`, Python `multiprocessing` or `subprocess` with
+  `sys.executable`, Go `os.Executable()`, Rust `current_exe()` -- fails, and obliquely: `ENOENT`
+  for a file that is there. A static payload can still execute the literal path `/proc/self/exe`;
+  its `argv[0]` and the path `current_exe()` reads back do not work. Behavior is unchanged, since
+  the primary's rootfs is where the kernel looks for the loader and the view cannot move it; a
+  server that needs more belongs in a sidecar with `workspace`, not `view = "primary"`.
+  See [Primary filesystem view](../../doc/concepts/mcp-servers.md#primary-filesystem-view).
+  (#358)
+
 - **A base image's unreadable `org.outrig.mcp` label no longer fails `outrig build` and `outrig run`
   naming a tag that is gone.** An image-config whose Dockerfile inherits an `org.outrig.mcp` label
   outrig cannot decode -- invalid JSON, a placement key, `args`, an invalid name, an empty

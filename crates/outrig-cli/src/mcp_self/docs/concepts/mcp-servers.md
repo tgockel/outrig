@@ -203,6 +203,31 @@ which is what a program asking about itself intends. Programs that read it are m
 than they look: rustup's `cargo` shim resolves its own toolchain that way. The trade is that
 the primary's process list is not visible through the view -- it is a filesystem view.
 
+**A dynamic payload cannot re-execute itself.** The kernel looks for a binary's loader
+(its `PT_INTERP`) in the process's own root, which after the join is the *primary's* rootfs --
+where the sidecar's loader is absent or is a different one. So the launcher does not exec a
+dynamically linked payload directly; it runs the sidecar's loader explicitly, as
+`/mnt/lib/ld-musl-x86_64.so.1 --library-path /mnt/lib:... /mnt/usr/local/bin/node ...`. The
+payload then gets wrong answers to the questions a self-re-exec asks: `/proc/self/exe` names the
+*loader*, so executing it runs a loader with no program, and `argv[0]` is the server's path under
+the graft -- a file that exists but that the kernel cannot run by name, because it goes looking
+for the loader in the primary. Failures are oblique. Python's
+`subprocess.run([sys.executable, ...])`, and so `multiprocessing`'s `spawn` and `forkserver`, get
+`ENOENT` for a file that is plainly there; Node's `child_process.fork()` runs `process.execPath`,
+which is the loader, and the loader tries to load the script as a program; a Go `os.Executable()`
+or Rust `current_exe()` re-exec fails the same way.
+
+A static payload has no loader and is exec'd from an open file, so executing `/proc/self/exe`
+itself -- the idiom of container runtimes -- does re-run it. What fails are the paths: none of the
+sidecar's rootfs is grafted for it, so `argv[0]` names a file the view does not have (`ENOENT`),
+and what `/proc/self/exe` reads back as -- which is what `os.Executable()` and `current_exe()`
+hand over -- is `/`, which cannot be executed.
+
+A server that does its work in one process -- the quickstart's filesystem server -- is unaffected.
+One that starts copies of itself cannot take `view = "primary"` unless it is a static binary that
+executes the literal path `/proc/self/exe`; run it as an entrypoint sidecar in its own image,
+with the project mounted through `workspace` instead.
+
 A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
 the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in
 that same pre-join instant and for the same reason: the program is one of the sidecar's own

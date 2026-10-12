@@ -61,6 +61,25 @@
 //! itself -- a `DT_NEEDED` library that is an absolute symlink escapes by the
 //! identical mechanism, as does musl's `/etc/ld-musl-<arch>.path`; see #268.
 //!
+//! **A dynamic payload cannot re-execute itself, which is a limit of this
+//! design and not a bug in it (#358).** The kernel resolves a binary's
+//! `PT_INTERP` against the process's root, which after the setns is the
+//! primary's, so a dynamic payload can only run by naming the sidecar's loader
+//! explicitly. That makes the kernel's `exe` link the loader and leaves
+//! `argv[0]` a graft path whose own `PT_INTERP` the kernel will resolve in the
+//! primary: a payload that execs either one (Node `fork()`, Python
+//! `sys.executable`, Rust `current_exe()`) fails. A static payload has no loader
+//! to name and is exec'd from the open file, so executing the literal path
+//! `/proc/self/exe` re-runs it; the *paths* fail, since none of the sidecar's
+//! rootfs is grafted for it -- `argv[0]` is a path the view lacks, and the exe
+//! link reads back as `/`, which `current_exe()` then hands over. Nothing here
+//! can close the dynamic case: the root has to stay the primary's, and putting
+//! the sidecar's loader where the kernel looks either needs a mount point the
+//! primary may not have or replaces the loader the primary's own binaries use.
+//! `doc/concepts/mcp-servers.md` carries the user-facing version as "A dynamic
+//! payload cannot re-execute itself"; changing the exec strategy means changing
+//! that paragraph with it.
+//!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
 //! Linux musl target; it is not part of the normal `cargo build`. The logic it
 //! relies on lives in `elf.rs`, `path_search.rs` and `canon.rs`, pulled in
@@ -565,7 +584,9 @@ fn main() {
             // Run through the sidecar's own loader, now under the graft point,
             // at the paths resolved before the setns. Every one of these is
             // symlink-free already, so prefixing the graft is the last thing
-            // that happens to them.
+            // that happens to them. This is also why the payload's `exe` link is
+            // the loader and its `argv[0]` is `progpath` -- see #358 in the
+            // module docs.
             let g = graft.to_string_lossy();
             let loader = format!("{g}{}", dynamic.loader);
             let progpath = format!("{g}{}", dynamic.program);
