@@ -69,6 +69,19 @@ impl CannedResponse {
         self
     }
 
+    /// The body it is sent with.
+    pub(super) fn body(&self) -> &Value {
+        &self.body
+    }
+
+    /// The same response, reporting no `usage` at all.
+    pub(super) fn without_usage(mut self) -> Self {
+        if let Some(body) = self.body.as_object_mut() {
+            body.remove("usage");
+        }
+        self
+    }
+
     /// The same reply, with the model's reasoning `text` before the rest: as
     /// OpenAI-compatible providers send it, a `reasoning_content` beside the
     /// message, or as Anthropic does, a thinking block signed [`SIGNATURE`].
@@ -160,6 +173,14 @@ impl Style {
         match self {
             Style::Anthropic => text_reply(text),
             Style::OpenAi => chat(json!({"role": "assistant", "content": text}), "stop"),
+        }
+    }
+
+    /// A `200 OK` rig cannot make a completion of: no content at all.
+    pub(super) fn unusable(self) -> CannedResponse {
+        match self {
+            Style::Anthropic => unusable(),
+            Style::OpenAi => chat(json!({"role": "assistant", "content": ""}), "length"),
         }
     }
 

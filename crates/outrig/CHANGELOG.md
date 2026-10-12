@@ -140,9 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   many, and never slows the session. Their payloads are the event log's, field for field, and the
   session's own state -- starting, idle, round running, executing, closing, reported -- is among
   them. Every model call has a `CallId` and every request sent for it an `AttemptId`; each request
-  is recorded once as `model.attempt`, failed ones with a `null` usage, and a round's total is the
-  sum over its attempts. The history and event types are `#[non_exhaustive]`, so a later field or
-  kind is not a break.
+  is recorded once as `model.attempt`, and a round's total is the sum over its attempts. One that
+  failed before an answer carries a `null` usage. A `200` that cannot be made a completion of --
+  an Anthropic message with no content, an OpenAI reply with no choices -- is billed all the same,
+  so its attempt carries the usage its body reported beside its error, and every total counts it.
+  The history and event types are `#[non_exhaustive]`, so a later field or kind is not a break.
 
   **Keys.** `config::Secrets` resolves a session's `${VAR}` keys: `EnvSecrets` reads the process
   environment, as before, and any `Fn(&str) -> Option<String>` is one, so sessions in one process

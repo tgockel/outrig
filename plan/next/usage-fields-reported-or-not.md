@@ -11,9 +11,11 @@ each field is still a number: rig 0.40's `Usage` fills a field the provider left
 
 ## Shape
 
-- Read each field from the provider's own usage object rather than rig's, below the erasure in
-  `ModelCandidate::completion`, where the raw response is still in hand, and carry `Option<u64>`
-  per field on `harness::event::Usage`.
+- Read each field from the provider's own usage object rather than rig's, and carry `Option<u64>`
+  per field on `harness::event::Usage`. The body is in hand at the HTTP layer, where #523 keeps it
+  on the in-flight attempt (`AnsweredBody`, read by `retry::body_usage` for a response rig could
+  not use). That reader maps through rig's zero-filling `token_usage()` as well, so it takes the
+  same change, and the completed path can read the same stashed body in place of rig's usage.
 - Or wait for rig to say which fields a provider reported, and map them then.
 - Either way the public `Usage` changes its field types, so do it before the 0.3.0 release fixes
   the surface, or add the per-field form beside the existing one.

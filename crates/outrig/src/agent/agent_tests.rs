@@ -3360,10 +3360,36 @@ async fn retrying_agent(
     Session,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
+    retrying_agent_in(Style::Anthropic, var, events, script).await
+}
+
+/// [`retrying_agent`] against a provider of `style`.
+async fn retrying_agent_in(
+    style: Style,
+    var: &str,
+    events: Events,
+    script: Vec<CannedResponse>,
+) -> (
+    Session,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
     let (addr, requests) = mock_http::start(script).await;
-    let mut cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    let mut cfg = config_in(style, addr, var, MODEL, "", "max-tokens = 4096");
     retrying(&mut cfg, "claude");
     (agent_of(&cfg, var, events).await, requests)
+}
+
+/// A usage as a `model.attempt` or round record carries it, for a provider
+/// that reported input and output tokens and nothing else.
+fn usage_json(input: u64, output: u64) -> serde_json::Value {
+    json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": input + output,
+        "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "reasoning_tokens": 0,
+    })
 }
 
 /// Turn retries on for `cfg`'s provider `provider`: thirty seconds of them.
@@ -3540,6 +3566,73 @@ async fn an_unusable_response_is_retried_without_running_python_again() {
             .is_some_and(|error| error.starts_with("unusable response")),
         "{}",
         retries[0]
+    );
+
+    // The provider billed the unusable response all the same, so its attempt
+    // carries what the body said beside the error, and every total counts it.
+    let attempts = events::of_kind(&records, "model.attempt");
+    assert_eq!(attempts.len(), 3, "{attempts:#?}");
+    assert_eq!(attempts[1]["attempt_id"], 2);
+    assert!(
+        attempts[1]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("unusable response")),
+        "{}",
+        attempts[1]
+    );
+    assert_eq!(attempts[1]["usage"], usage_json(12, 7));
+    let ended = events::of_kind(&records, "model.round.completed");
+    assert_eq!(ended[0]["usage"], usage_json(36, 21), "all three responses");
+    assert_eq!(
+        super::ledger::replay(&records)
+            .session_total()
+            .map(|usage| usage.total_tokens),
+        Some(57),
+        "the session's total counts what the round's does"
+    );
+}
+
+/// An unusable response is counted from OpenAI's usage object too, and one
+/// whose body reported no usage is `null` rather than zero: unknown stays
+/// unknown, and the totals count only the attempts that said.
+#[tokio::test]
+async fn an_unusable_openai_response_is_counted_unless_its_body_reported_no_usage() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, _requests) = retrying_agent_in(
+        Style::OpenAi,
+        "OUTRIG_TEST_AGENT_UNUSABLE_OPENAI_USAGE",
+        events::opened(dir.path()).await,
+        vec![
+            Style::OpenAi.unusable(),
+            Style::OpenAi.unusable().without_usage(),
+            Style::OpenAi.text("done"),
+        ],
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "go").await, "done");
+    shut_down(agent).await;
+
+    let records = events::recorded(dir.path());
+    let attempts = events::of_kind(&records, "model.attempt");
+    let errored: Vec<_> = attempts
+        .iter()
+        .map(|attempt| attempt["error"].is_string())
+        .collect();
+    assert_eq!(errored, [true, true, false], "{attempts:#?}");
+    let usages: Vec<_> = attempts.iter().map(|attempt| &attempt["usage"]).collect();
+    assert_eq!(
+        usages,
+        [&usage_json(12, 7), &json!(null), &usage_json(12, 7)],
+        "null, not zeros, for the body that reported none"
+    );
+    let ended = events::of_kind(&records, "model.round.completed");
+    assert_eq!(ended[0]["usage"], usage_json(24, 14));
+    assert_eq!(
+        super::ledger::replay(&records)
+            .session_total()
+            .map(|usage| usage.total_tokens),
+        Some(38)
     );
 }
 
@@ -4588,16 +4681,6 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
 
     let records = events::recorded(dir.path());
     let attempts = events::of_kind(&records, "model.attempt");
-    let usage = |input: u64, output: u64| {
-        json!({
-            "input_tokens": input,
-            "output_tokens": output,
-            "total_tokens": input + output,
-            "cached_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "reasoning_tokens": 0,
-        })
-    };
     assert_eq!(
         attempts,
         [
@@ -4626,7 +4709,7 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
                 "identifier": MODEL,
                 "max_tokens": 2048,
                 "error": null,
-                "usage": usage(40, 5),
+                "usage": usage_json(40, 5),
             }),
         ]
     );
@@ -4664,7 +4747,11 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
     assert_eq!(ended[0]["attempts"], json!([1, 2, 3]));
     assert_eq!(ended[0]["calls"][0]["call_id"], 1);
     assert_eq!(ended[0]["calls"][0]["attempt_id"], 3);
-    assert_eq!(ended[0]["usage"], usage(40, 5), "the one that answered");
+    assert_eq!(
+        ended[0]["usage"],
+        usage_json(40, 5),
+        "the one that answered"
+    );
 }
 
 /// A session's spend is its unique attempts': totalled from the session's own

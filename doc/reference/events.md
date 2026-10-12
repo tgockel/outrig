@@ -233,7 +233,10 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
     on the wire; `max_tokens`: the reply ceiling it carried, or `null`.
   - `error`: why it failed -- an HTTP status, a connection error, an unusable response, or
     `cancelled` for one whose round was dropped -- or `null` when it answered.
-  - `usage`: what the provider reported it used, or `null`.
+  - `usage`: what the provider reported it used, or `null`. A request that failed before a
+    response came back reports none. An unusable response -- a `200` OutRig could not make a
+    completion of -- carries the usage its body reported beside its `error`, because the provider
+    bills it; it is `null` when the body reported none.
 - `model.round.completed` -- the model yielded control: it finished a round, or OutRig stopped
   it. Not a claim that the round's work succeeded.
   - `round`, and `stopped`: why OutRig ended it, such as the tool-call cap, or `null`.

@@ -4,7 +4,11 @@
 //! request actually sent for it -- a retry, a move to the next model of a
 //! chain -- an [`AttemptId`] of its own. Each attempt is recorded once, as a
 //! `model.attempt` event, failed ones included, with what the provider said it
-//! used or `null` when it said nothing.
+//! used or `null` when it said nothing. A `200` rig could not make a
+//! completion of is billed all the same, so its usage is read from the body
+//! ([`body_usage`]) rather than from the completion there is none of.
+//!
+//! [`body_usage`]: super::retry::body_usage
 //!
 //! Every total is derived from those attempts, never stored: a round's is the
 //! sum over the attempts it made, the session's over all of them. A usage
@@ -19,8 +23,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use bytes::Bytes;
 use rig::completion::{CompletionError, CompletionResponse};
 
 use crate::events::Events;
@@ -185,8 +190,8 @@ impl Ledger {
     /// attempt's, under its own id, never a correction of this one.
     ///
     /// Nothing calls this yet: every provider this loop speaks reports usage
-    /// in the response that ends its attempt, a failed request reports none,
-    /// and nothing streams. A streamed reply's closing usage, or a provider's
+    /// in the response that ends its attempt, a request that failed before a
+    /// response reports none, and nothing streams. A streamed reply's closing usage, or a provider's
     /// billing callback, is what would.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn late_usage(&self, attempt: AttemptId, usage: Usage) -> Late {
@@ -300,9 +305,21 @@ struct InFlight {
     call: CallId,
     settings: Arc<Settings>,
     /// The attempt a `2xx` answered, until the model layer settles it.
-    answered: Option<AttemptId>,
+    answered: Option<AnsweredAttempt>,
     /// The latest attempt the current candidate was sent.
     last: Option<AttemptId>,
+}
+
+/// A `2xx` the model layer has yet to settle.
+struct AnsweredAttempt {
+    attempt: AttemptId,
+    /// The body that came with it, set once the HTTP layer has read it: what
+    /// [`body_usage`] is read from when rig can make nothing of it. The bytes
+    /// rig is reading, held a second time; where rig turns them into a `Vec`
+    /// that costs a copy, paid on every call for the failures it serves.
+    ///
+    /// [`body_usage`]: super::retry::body_usage
+    body: Arc<OnceLock<Bytes>>,
 }
 
 /// What a request was sent with: its candidate's row, the identifier it named,
@@ -465,14 +482,34 @@ impl Pending {
     }
 
     /// A `2xx` came back: the model layer, which learns whether its body was
-    /// usable, records it.
-    pub(crate) fn answered(mut self) {
+    /// usable, records it. The HTTP layer reports the body through what this
+    /// returns, once it has read it.
+    pub(crate) fn answered(mut self) -> AnsweredBody {
         self.done = true;
+        let body = Arc::new(OnceLock::new());
         if let Some(call) = &mut self.slot.state().call
             && call.call == self.call
         {
-            call.answered = Some(self.attempt);
+            call.answered = Some(AnsweredAttempt {
+                attempt: self.attempt,
+                body: Arc::clone(&body),
+            });
         }
+        AnsweredBody(body)
+    }
+}
+
+/// The HTTP layer's hold on the body of the `2xx` an attempt got, to report it
+/// once it is read. One per attempt, so a report that arrives after its attempt
+/// settled lands where nothing reads it, never on the next attempt's.
+pub(crate) struct AnsweredBody(Arc<OnceLock<Bytes>>);
+
+impl AnsweredBody {
+    /// The body of the response arrived.
+    pub(crate) fn arrived(&self, body: &Bytes) {
+        // A response has one body, so the cell is empty; were it not, the
+        // first is the one rig read.
+        let _ = self.0.set(body.clone());
     }
 }
 
@@ -498,28 +535,37 @@ pub(crate) struct Settling {
 
 impl Settling {
     /// Record the answered attempt as `outcome` says: its usage when rig made a
-    /// completion of it, and why not otherwise. The ids, or `None` when no
-    /// request was answered -- a failure the HTTP layer already recorded.
+    /// completion of it, and why not otherwise -- with the usage its body
+    /// reported, which the provider billed whether or not rig could use it.
+    /// The ids, or `None` when no request was answered -- a failure the HTTP
+    /// layer already recorded.
     pub(crate) fn settle<R>(
         mut self,
         outcome: &Result<CompletionResponse<R>, CompletionError>,
     ) -> Option<(CallId, AttemptId)> {
         self.done = true;
-        let (call, attempt, settings) = {
+        let (call, answered, settings) = {
             let mut state = self.slot.state();
             let in_flight = state.call.as_mut()?;
-            let attempt = in_flight.answered.take()?;
-            (in_flight.call, attempt, Arc::clone(&in_flight.settings))
+            let answered = in_flight.answered.take()?;
+            (in_flight.call, answered, Arc::clone(&in_flight.settings))
+        };
+        let from_body = || {
+            answered
+                .body
+                .get()
+                .and_then(|body| super::retry::body_usage(body))
         };
         let (error, usage) = match outcome {
             Ok(response) => (None, reported(response.usage)),
             Err(CompletionError::ResponseError(message)) => {
-                (Some(super::retry::unusable(message)), None)
+                (Some(super::retry::unusable(message)), from_body())
             }
-            Err(error) => (Some(error.to_string()), None),
+            Err(error) => (Some(error.to_string()), from_body()),
         };
-        self.slot.record(call, attempt, &settings, error, usage);
-        Some((call, attempt))
+        self.slot
+            .record(call, answered.attempt, &settings, error, usage);
+        Some((call, answered.attempt))
     }
 }
 
@@ -531,8 +577,8 @@ impl Drop for Settling {
         let answered = {
             let mut state = self.slot.state();
             state.call.as_mut().and_then(|call| {
-                let attempt = call.answered.take()?;
-                Some((call.call, attempt, Arc::clone(&call.settings)))
+                let answered = call.answered.take()?;
+                Some((call.call, answered.attempt, Arc::clone(&call.settings)))
             })
         };
         if let Some((call, attempt, settings)) = answered {
@@ -550,6 +596,7 @@ impl Drop for Settling {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::mock_http::MODEL;
 
     fn usage(total: u64) -> Usage {
         Usage::total(total)
@@ -610,6 +657,106 @@ mod tests {
         let mut some = rig::completion::Usage::new();
         some.output_tokens = 3;
         assert_eq!(reported(some).map(|usage| usage.output_tokens), Some(3));
+    }
+
+    /// What a provider that reported input and output tokens and nothing else
+    /// used.
+    fn plain(input: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            ..Usage::default()
+        }
+    }
+
+    fn bytes(body: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&body).expect("serializes"))
+    }
+
+    /// A slot with a call in flight, and the attempt it was just sent.
+    fn sent() -> (CallSlot, Pending) {
+        let slot = CallSlot::new(Ledger::default());
+        slot.begin_call();
+        slot.candidate("sonnet", MODEL, Some(4096));
+        let pending = slot.sending().expect("a call is in flight");
+        (slot, pending)
+    }
+
+    fn unusable_outcome() -> Result<CompletionResponse<()>, CompletionError> {
+        Err(CompletionError::ResponseError("empty".into()))
+    }
+
+    #[test]
+    fn an_answered_attempt_rig_could_not_use_records_its_bodys_usage() {
+        let (slot, pending) = sent();
+        pending.answered().arrived(&bytes(serde_json::json!({
+            "usage": { "input_tokens": 12, "output_tokens": 7 },
+        })));
+
+        let (_, attempt) = slot
+            .awaiting()
+            .settle(&unusable_outcome())
+            .expect("an answered attempt");
+        assert_eq!(slot.ledger().usage_of(attempt), Some(plain(12, 7)));
+        assert_eq!(slot.round_attempts(), [attempt]);
+    }
+
+    #[test]
+    fn an_error_that_is_not_an_unusable_response_keeps_the_usage_too() {
+        let (slot, pending) = sent();
+        pending.answered().arrived(&bytes(serde_json::json!({
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+        })));
+        let outcome: Result<CompletionResponse<()>, _> = Err(CompletionError::ProviderError(
+            "a body it could not read".into(),
+        ));
+
+        let (_, attempt) = slot.awaiting().settle(&outcome).expect("answered");
+        assert_eq!(slot.ledger().usage_of(attempt), Some(plain(5, 2)));
+    }
+
+    #[test]
+    fn an_attempt_whose_body_was_never_read_or_reported_nothing_is_null() {
+        let (slot, pending) = sent();
+        let _unread = pending.answered();
+        let (_, unread) = slot
+            .awaiting()
+            .settle(&unusable_outcome())
+            .expect("answered");
+        assert_eq!(slot.ledger().usage_of(unread), None, "never read");
+
+        let pending = slot.sending().expect("the retry");
+        pending
+            .answered()
+            .arrived(&bytes(serde_json::json!({ "content": [] })));
+        let (_, empty) = slot
+            .awaiting()
+            .settle(&unusable_outcome())
+            .expect("answered");
+        assert_eq!(slot.ledger().usage_of(empty), None, "no usage in it");
+        assert_eq!(slot.ledger().total(&[unread, empty]), None, "not zero");
+    }
+
+    #[test]
+    fn a_completion_keeps_the_usage_rig_gave_it_over_its_bodys() {
+        let (slot, pending) = sent();
+        pending.answered().arrived(&bytes(serde_json::json!({
+            "usage": { "input_tokens": 100, "output_tokens": 100 },
+        })));
+        let mut given = rig::completion::Usage::new();
+        given.input_tokens = 1;
+        given.output_tokens = 2;
+        given.total_tokens = 3;
+        let outcome: Result<CompletionResponse<()>, CompletionError> = Ok(CompletionResponse {
+            choice: rig::OneOrMany::one(rig::completion::AssistantContent::text("hi")),
+            usage: given,
+            raw_response: (),
+            message_id: None,
+        });
+
+        let (_, attempt) = slot.awaiting().settle(&outcome).expect("answered");
+        assert_eq!(slot.ledger().usage_of(attempt), Some(plain(1, 2)));
     }
 
     #[test]

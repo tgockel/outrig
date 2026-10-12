@@ -74,17 +74,21 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::RngExt;
 use reqwest::StatusCode;
-use rig::completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse};
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
+};
 use rig::http_client::{
     Error as HttpError, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request,
     Response, StreamingResponse, Uri,
 };
+use rig::providers::{anthropic, openai};
 use rig::streaming::StreamingCompletionResponse;
 use rig::wasm_compat::WasmCompatSend;
+use serde::Deserialize;
 
-use super::ledger::CallSlot;
+use super::ledger::{AnsweredBody, CallSlot, Pending, reported};
 use crate::events::Events;
-use crate::harness::event::{AttemptId, CallId, Payload};
+use crate::harness::event::{AttemptId, CallId, Payload, Usage};
 
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
 const BASE_DELAY: Duration = Duration::from_secs(1);
@@ -530,8 +534,8 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
 
 impl<M: CompletionModel> RetryingModel<M> {
     /// One completion from the inner model, and the attempt it settled, once
-    /// recorded: its usage if rig made a completion of the body, and why not
-    /// if it could not.
+    /// recorded: with the usage rig gave its completion, or -- when rig could
+    /// make none -- the usage the body reported, and why not.
     async fn attempt(
         &self,
         request: CompletionRequest,
@@ -621,6 +625,38 @@ impl<M: CompletionModel> RetryingModel<M> {
 /// its retry both record it.
 pub(crate) fn unusable(message: &str) -> String {
     format!("unusable response ({message})")
+}
+
+/// What a `200`'s body says it used, for a body rig made no completion of and
+/// so took no usage from: `None` when it carries no `usage`, or one of neither
+/// provider's shape.
+///
+/// Both dialects are tried, as in [`provider_finish_reason`], and each is read
+/// as rig reads its own, through [`GetTokenUsage`], so a count means here what
+/// it means for a response rig could use -- Anthropic's total includes its
+/// cached input, for one.
+///
+/// OpenAI's is tried first. Its usage needs `prompt_tokens` and
+/// `total_tokens`, which no Anthropic usage carries, while a gateway speaking
+/// OpenAI's protocol may report `input_tokens` and `output_tokens` as well --
+/// and its body is OpenAI's to read, as rig reads it when it can use it.
+///
+/// Only the failure path calls it, so the body of a response rig could use is
+/// never parsed twice.
+pub(crate) fn body_usage(body: &[u8]) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        usage: Option<serde_json::Value>,
+    }
+    let envelope: Envelope = serde_json::from_slice(body).ok()?;
+    let usage = envelope.usage?;
+    let usage = openai::completion::Usage::deserialize(&usage)
+        .map(|usage| usage.token_usage())
+        .or_else(|_| {
+            anthropic::completion::Usage::deserialize(&usage).map(|usage| usage.token_usage())
+        })
+        .ok()?;
+    reported(usage)
 }
 
 /// Report a completion that came back with nothing to show for itself.
@@ -726,10 +762,7 @@ where
 
         let (err, retry_after) = match sent {
             Ok(response) if response.status().is_success() => {
-                if let Some(pending) = pending {
-                    pending.answered();
-                }
-                return into_lazy_response(response);
+                return into_lazy_response(response, pending.map(Pending::answered));
             }
             Ok(response) => {
                 answered = true;
@@ -811,10 +844,7 @@ where
 }
 
 /// Record the attempt `pending` as failed with `err`, when it is one.
-fn settle_failed(
-    pending: Option<super::ledger::Pending>,
-    err: &HttpError,
-) -> Option<(CallId, AttemptId)> {
+fn settle_failed(pending: Option<Pending>, err: &HttpError) -> Option<(CallId, AttemptId)> {
     pending.map(|pending| pending.failed(failure_label(err)))
 }
 
@@ -823,8 +853,14 @@ fn settle_failed(
 /// reqwest::Client` -- keep in sync with rig-core 0.40
 /// `src/http_client/mod.rs:155-215`. rig exposes no public converter for this,
 /// so it is a copy by necessity rather than by choice.
+///
+/// `answered` is told the body once it is read: this future is the last place
+/// it is in hand before rig turns it into a completion or, when it cannot, an
+/// error that is only a string. It is how a response rig cannot use still has
+/// its usage counted.
 fn into_lazy_response<U>(
     response: reqwest::Response,
+    answered: Option<AnsweredBody>,
 ) -> rig::http_client::Result<Response<LazyBody<U>>>
 where
     U: From<Bytes> + WasmCompatSend + 'static,
@@ -833,11 +869,14 @@ where
     if let Some(hs) = res.headers_mut() {
         *hs = response.headers().clone();
     }
-    let body: LazyBody<U> = Box::pin(async {
+    let body: LazyBody<U> = Box::pin(async move {
         let bytes = response
             .bytes()
             .await
             .map_err(|e| HttpError::Instance(e.into()))?;
+        if let Some(answered) = &answered {
+            answered.arrived(&bytes);
+        }
         Ok(U::from(bytes))
     });
     res.body(body).map_err(HttpError::Protocol)
@@ -1178,6 +1217,91 @@ mod tests {
             assert_eq!(attempt["identifier"], "claude-sonnet-4-6");
             assert_eq!(attempt["max_tokens"], 4096);
             assert_eq!(attempt["usage"], serde_json::Value::Null);
+        }
+    }
+
+    fn usage_in(body: serde_json::Value) -> Option<Usage> {
+        body_usage(&serde_json::to_vec(&body).expect("serializes"))
+    }
+
+    #[test]
+    fn a_body_without_a_usage_it_can_read_reports_none() {
+        for body in [
+            serde_json::json!({ "content": [] }),
+            serde_json::json!({ "usage": null }),
+            serde_json::json!({ "usage": "a lot" }),
+            serde_json::json!({ "usage": { "tokens": 5 } }),
+            serde_json::json!({ "usage": { "input_tokens": 0, "output_tokens": 0 } }),
+        ] {
+            assert_eq!(usage_in(body.clone()), None, "{body}");
+        }
+        assert_eq!(body_usage(b"<html>bad gateway</html>"), None);
+        assert_eq!(body_usage(b""), None);
+    }
+
+    /// A gateway speaking OpenAI's protocol that also reports Anthropic's
+    /// names is read as OpenAI, which is how rig reads its usable replies.
+    #[test]
+    fn a_usage_in_both_providers_names_is_openais() {
+        let both = serde_json::json!({
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+            },
+        });
+        assert_eq!(
+            usage_in(both).map(|usage| (usage.input_tokens, usage.total_tokens)),
+            Some((10, 14))
+        );
+    }
+
+    /// A body is read the way rig reads a response it can use: were the two to
+    /// disagree, an attempt's usage would depend on whether its reply happened
+    /// to be usable.
+    #[test]
+    fn a_body_reads_as_rig_reads_a_response_it_can_use() {
+        use crate::agent::mock_http::Style;
+
+        let fixtures = [
+            (
+                Style::Anthropic,
+                serde_json::json!({
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "cache_read_input_tokens": 5,
+                    "cache_creation_input_tokens": 3,
+                }),
+            ),
+            (
+                Style::OpenAi,
+                serde_json::json!({
+                    "prompt_tokens": 12,
+                    "completion_tokens": 7,
+                    "total_tokens": 19,
+                    "prompt_tokens_details": { "cached_tokens": 4 },
+                    "completion_tokens_details": { "reasoning_tokens": 2 },
+                }),
+            ),
+        ];
+        for (style, usage) in fixtures {
+            let body = style.text("hi").usage(usage).body().clone();
+            let rigs = match style {
+                Style::Anthropic => {
+                    let parsed: anthropic::completion::CompletionResponse =
+                        serde_json::from_value(body.clone()).expect("rig parses it");
+                    CompletionResponse::try_from(parsed).expect("usable").usage
+                }
+                Style::OpenAi => {
+                    let parsed: openai::completion::CompletionResponse =
+                        serde_json::from_value(body.clone()).expect("rig parses it");
+                    CompletionResponse::try_from(parsed).expect("usable").usage
+                }
+            };
+            assert!(reported(rigs).is_some(), "{style:?}");
+            assert_eq!(usage_in(body), reported(rigs), "{style:?}");
         }
     }
 
