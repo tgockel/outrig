@@ -89,6 +89,40 @@ async fn try_capture_returns_output_on_nonzero_exit() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// A child of `try_capture` must not read the caller's stdin (#359).
+///
+/// The property is about this process's fd 0, which every other test shares,
+/// so the body runs again as a child whose stdin is a pipe it controls.
+#[tokio::test(flavor = "current_thread")]
+async fn try_capture_leaves_the_callers_stdin_alone() {
+    const CHILD: &str = "OUTRIG_TEST_TRY_CAPTURE_STDIN";
+
+    if std::env::var_os(CHILD).is_some() {
+        let out = super::try_capture(Cmd::new("/bin/cat"))
+            .await
+            .expect("cat runs");
+        assert_eq!(out.stdout, b"", "cat read what this process still owed");
+        return;
+    }
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    std::io::Write::write_all(&mut writer, b"owed\n").expect("fill the pipe");
+    drop(writer);
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .arg("try_capture_leaves_the_callers_stdin_alone")
+        .env(CHILD, "1")
+        .stdin(reader)
+        .output()
+        .expect("run the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the child holding the pipe failed ({:?}): {stdout}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn logged_capture_tees_command_and_output_to_transcript() {
     // `run_capture_logged` reaches the same two callsites

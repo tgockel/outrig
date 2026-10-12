@@ -1283,7 +1283,9 @@ impl Outrig {
 
     /// [`Outrig::exec_stdio`], driven to completion: stdout and stderr are
     /// drained concurrently and returned with the exit status. A non-zero
-    /// exit is data on the returned [`Output`], not an error.
+    /// exit is data on the returned [`Output`], not an error. Its stdin is
+    /// empty -- it reads end-of-file at once -- so a command that needs input
+    /// goes through [`Outrig::exec_stdio`].
     pub async fn exec_capture(&self, argv: &[String], options: &ExecOptions) -> Result<Output> {
         self.container.exec_capture(argv, options).await
     }

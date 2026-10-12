@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`exec_capture` no longer reads the embedder's stdin.** It ran `podman exec -i` with outrig's
+  own stdin inherited, and the client forwards what it reads into the container, so a library
+  embedder that read its own stdin -- a REPL, an MCP-over-stdio server -- lost bytes to the
+  command for as long as the capture ran. A command that read stdin, `cat` for one, waited on the
+  embedder's instead of finding it empty. The command's stdin is now empty, on
+  `Outrig::exec_capture` and `Container::exec_capture` alike: it reads end-of-file at once.
+  `exec_stdio` is the form that takes input. (#359)
+
 - **A repo-built image whose inherited `org.outrig.mcp` label cannot be decoded fails naming its
   image-config, and says how to replace the label.** The build merges the label it inherits --
   from the base image, or a `LABEL` in the Dockerfile -- with `[images.<name>.mcp]` before it

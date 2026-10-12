@@ -385,17 +385,6 @@ impl StdioSpec {
         }
     }
 
-    /// [`Self::captured`] but with the parent's stdin. `try_capture` was built
-    /// on `Command::output()`, which (unlike `std`'s) does not redirect stdin,
-    /// so its children have always inherited it. Preserved deliberately:
-    /// `Container::exec_capture` is public and runs through this.
-    fn captured_inheriting_stdin() -> Self {
-        Self {
-            stdin: Stdio::inherit(),
-            ..Self::captured()
-        }
-    }
-
     /// stdin closed, stdout inherited, stderr piped for line forwarding.
     fn streamed() -> Self {
         Self {
@@ -823,8 +812,13 @@ impl Tee {
 /// caller (e.g. `git rev-parse --git-dir` for "is this a git repo?",
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
+///
+/// The child's stdin is `/dev/null`. This is what `Container::exec_capture`
+/// runs through, and its `podman exec -i` client forwards whatever it reads: a
+/// stdin inherited from the caller would be consumed out from under an
+/// embedder that reads its own.
 pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
-    let mut child = cmd.spawn_owned(StdioSpec::captured_inheriting_stdin(), Termination::Kill)?;
+    let mut child = cmd.spawn_owned(StdioSpec::captured(), Termination::Kill)?;
     let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
     let stderr_task = Drain::spawn(capture_all(child.take_stderr()));
 

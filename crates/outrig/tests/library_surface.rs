@@ -900,6 +900,14 @@ async fn exec_capture_runs_a_command_in_the_primary() {
         .expect("a failing command still ran");
     assert_eq!(failed.status.code(), Some(3));
 
+    // The command's stdin is empty: one that reads it gets end-of-file.
+    let read_stdin = outrig
+        .exec_capture(&["cat".into()], &ExecOptions::new())
+        .await
+        .expect("a command reading stdin still ran");
+    assert!(read_stdin.status.success(), "exit: {:?}", read_stdin.status);
+    assert_eq!(String::from_utf8_lossy(&read_stdin.stdout), "");
+
     // The streaming form hands back the child with all three pipes open.
     let mut child = outrig
         .exec_stdio(

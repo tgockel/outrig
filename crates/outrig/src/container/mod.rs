@@ -1171,6 +1171,9 @@ impl Container {
     /// ran, and what it made of its arguments is the caller's to judge. A
     /// working directory the container does not have lands here too: podman
     /// exits non-zero and names the path on stderr.
+    ///
+    /// Its stdin is empty -- it reads end-of-file at once -- so a command that
+    /// needs input goes through [`Self::exec_stdio`].
     pub async fn exec_capture(&self, cmd: &[String], options: &ExecOptions) -> Result<Output> {
         process::try_capture(self.build_exec_argv(cmd, options)).await
     }
