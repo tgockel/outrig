@@ -154,7 +154,16 @@ pub enum OutrigError {
         source: EnvValueError,
     },
 
-    #[error("image {image:?} embedded config: {source}")]
+    // Raised by the build merge, a runtime read of a raw or sidecar image, and
+    // `image inspect`, so the `help:` cannot assume the reader owns the
+    // image's Dockerfile.
+    #[error(
+        "image {image:?} embedded config: {source}\n\
+         help: the label is part of the image, set by a `LABEL` in its Dockerfile or inherited \
+         from its base image; replace it with `LABEL org.outrig.mcp='{{}}'` (an empty table \
+         declares no servers) in the Dockerfile that builds the image, or in one built `FROM` \
+         it, or correct its value"
+    )]
     #[non_exhaustive]
     EmbeddedImageConfigParse {
         image: String,

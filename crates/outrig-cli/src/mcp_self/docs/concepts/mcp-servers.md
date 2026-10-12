@@ -288,8 +288,22 @@ repo that wants to delegate completely to the image can omit
 
 The `org.outrig.mcp` label is not required; this allows a shared image
 to be used with different configurations via `config.toml`. Malformed JSON,
-invalid server names, and empty command arrays are startup errors because they
-mean the image metadata is broken.
+invalid server names, and empty command arrays are errors because they
+mean the image metadata is broken: a startup error for an image outrig did not build, and a
+build error for a repo-built image, whose build reads the label it inherited before it merges
+`[images.<name>.mcp]` into it.
+
+That build error names the image-config (`image "coding" embedded config: ...`) and ends with
+the way past it. The label comes from a `LABEL` in the image's Dockerfile or from its base image,
+so replace it in the Dockerfile, after the `FROM`:
+
+```dockerfile
+FROM registry.example.com/shared/tools:3
+LABEL org.outrig.mcp='{}'
+```
+
+An empty table declares no servers, so the build keeps only what `[images.<name>.mcp]` adds.
+Set a corrected value instead to keep the servers the base image meant to declare.
 
 To inspect what will actually start, run:
 

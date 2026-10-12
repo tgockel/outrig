@@ -781,9 +781,16 @@ mod tests {
     fn merged_mcp_config_labels_reject_malformed_inherited_label() {
         let inherited = BTreeMap::from([(LABEL_MCP.to_string(), r#"{"fs": ["#.to_string())]);
 
-        let err = merged_mcp_config_to_labels("img", &inherited, &BTreeMap::new()).unwrap_err();
+        let err = merged_mcp_config_to_labels("coding", &inherited, &BTreeMap::new()).unwrap_err();
 
         assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+        // The error is framed by the caller's name and says how to replace the label.
+        let message = err.to_string();
+        assert!(
+            message.starts_with("image \"coding\" embedded config:"),
+            "{message}"
+        );
+        assert!(message.contains("LABEL org.outrig.mcp='{}'"), "{message}");
     }
 
     #[test]

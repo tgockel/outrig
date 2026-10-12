@@ -492,7 +492,7 @@ pub async fn build_image_for(
     no_cache: bool,
 ) -> Result<()> {
     let build_args = resolve_build_args(image, cfg)?;
-    build_image_with_build_args(cfg, repo_root, tag, no_cache, &build_args).await
+    build_image_with_build_args(image, cfg, repo_root, tag, no_cache, &build_args).await
 }
 
 /// Run `build` against a temporary tag, and own that tag whatever happens to
@@ -517,6 +517,7 @@ where
 }
 
 async fn build_image_with_build_args(
+    image: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
@@ -530,12 +531,14 @@ async fn build_image_with_build_args(
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, None).await
+        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, None).await
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_image_logged_with_build_args(
+    image: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
@@ -553,7 +556,7 @@ async fn build_image_logged_with_build_args(
             output,
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, transcript).await
+        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, transcript).await
     })
     .await
 }
@@ -605,7 +608,7 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            build_image_with_build_args(cfg, repo_root, &tag, no_cache, &build_args).await?;
+            build_image_with_build_args(image, cfg, repo_root, &tag, no_cache, &build_args).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,
@@ -685,6 +688,7 @@ pub async fn ensure_tagged_image_for_with_output(
                 });
             }
             build_image_logged_with_build_args(
+                image,
                 cfg,
                 repo_root,
                 tag,
@@ -1050,14 +1054,22 @@ fn temp_nonce() -> u128 {
     u128::from_be_bytes(buf)
 }
 
+/// Merge `source_tag`'s own `org.outrig.mcp` label with `config_mcp` and commit
+/// the result as `final_tag`.
+///
+/// `image` is the image-config's name, and it -- not `source_tag` -- is what a
+/// label that will not decode is reported against. `source_tag` is this
+/// build's temporary tag, which [`into_temp_tag`] removes before the caller
+/// sees the error.
 async fn stamp_repo_image_labels(
+    image: &str,
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     config_mcp: &BTreeMap<String, McpServerSpec>,
     transcript: Option<&Transcript>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
-    let labels = merged_mcp_config_to_labels(source_tag.as_str(), &inherited, config_mcp)?;
+    let labels = merged_mcp_config_to_labels(image, &inherited, config_mcp)?;
     commit_image_with_labels(source_tag, final_tag, &labels, transcript).await
 }
 

@@ -60,6 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo-built image whose inherited `org.outrig.mcp` label cannot be decoded fails naming its
+  image-config, and says how to replace the label.** The build merges the label it inherits --
+  from the base image, or a `LABEL` in the Dockerfile -- with `[images.<name>.mcp]` before it
+  commits the final tag, so a label that is invalid JSON, or carries a placement key, `args`, a
+  reserved or invalid name, or an empty command, fails the build after buildah has succeeded.
+  The error named the temporary `outrig-tmp-...` tag the label was read from, which is removed
+  before the error is returned, and offered no way forward; the one
+  (`LABEL org.outrig.mcp='{}'` in the Dockerfile) was not discoverable from it. It now reads
+  `image "<image-config>" embedded config: ...` (`"<image>"` through `ensure_image`, which has no
+  name) and ends with a `help:` line giving that override. The build still fails, and
+  `OutrigError::EmbeddedImageConfigParse` is still the error; its `help:` line also ends the
+  message where the variant is raised for a runtime read or `image inspect`. (#356)
+
 - **An image rebuilds when a build context gains an empty directory or has a directory's
   permissions changed.** For a context in a git repo, the cache key came from git's file
   listing, which names no empty directory and carries no directory's mode, though `COPY .`

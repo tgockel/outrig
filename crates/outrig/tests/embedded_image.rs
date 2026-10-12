@@ -249,6 +249,42 @@ async fn malformed_mcp_label_fails_ensure_image() {
         .await
         .expect_err("malformed org.outrig.mcp label should fail ensure_image");
     assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+    assert_names_the_image_and_the_override(&err, "<image>");
+}
+
+#[tokio::test]
+async fn malformed_mcp_label_error_names_the_image_config() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    // The session path builds through `ensure_tagged_image_for`, a separate
+    // builder from `ensure_image`'s, and is the one that knows the
+    // image-config by name.
+    let ctx = malformed_label_context();
+    let cfg = common::fixture_build_config();
+    let tag = image::compute_tag_for("coding", &cfg, ctx.path())
+        .await
+        .expect("compute tag");
+
+    let err = image::ensure_tagged_image_for("coding", &cfg, ctx.path(), &tag, false, None)
+        .await
+        .expect_err("malformed org.outrig.mcp label should fail the build");
+    assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+    assert_names_the_image_and_the_override(&err, "coding");
+}
+
+/// The build-time failure names the image-config, not the temporary tag it
+/// read the label from, and says how to replace the label.
+fn assert_names_the_image_and_the_override(err: &OutrigError, image: &str) {
+    let message = err.to_string();
+    assert!(
+        message.starts_with(&format!("image {image:?} embedded config:")),
+        "{message}"
+    );
+    assert!(!message.contains("outrig-tmp-"), "{message}");
+    assert!(
+        message.contains("LABEL org.outrig.mcp='{}'"),
+        "the message should say how to override the label: {message}"
+    );
 }
 
 #[tokio::test]

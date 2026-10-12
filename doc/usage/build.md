@@ -54,6 +54,9 @@ outrig build [--image <name>]
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.
+     A label it cannot decode fails the build here, before anything is committed, with an error
+     naming the image-config; see
+     [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
      The temporary tag is then removed, whether or not the build succeeded. If buildah refuses
      the removal, outrig warns and reissues it in the background rather than leaving the tag
      behind; the build's own result stands either way.

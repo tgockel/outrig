@@ -60,6 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A base image's unreadable `org.outrig.mcp` label no longer fails `outrig build` and `outrig run`
+  naming a tag that is gone.** An image-config whose Dockerfile inherits an `org.outrig.mcp` label
+  outrig cannot decode -- invalid JSON, a placement key, `args`, an invalid name, an empty
+  command -- fails after buildah has built it, and the error named a temporary
+  `<name>:outrig-tmp-...` tag that is removed before the message is printed. It now reads
+  `image "coding" embedded config: ...` and ends with a `help:` line: put
+  `LABEL org.outrig.mcp='{}'` after the Dockerfile's `FROM` to replace the label with an empty
+  one, or set a corrected value. The build still fails; only what it says changed. See
+  [MCP servers](../../doc/concepts/mcp-servers.md#embedding-mcp-config-in-the-image). (#356)
+
 - **A sidecar whose raw image ref is not local is refused by name, with the fix.** A
   `[sidecars.<sc>] image` -- or an inline `image` on an MCP entry -- that is not an
   `[images.<name>]` and was never pulled failed with `--image "<ref>" did not match any
