@@ -17,11 +17,11 @@ proxies, and OutRig puts no credential in it. A **binding process** runs one hos
 host, with the same static CPython and whatever environment the binding was given. Unqualified
 "the interpreter" means the agent interpreter.
 
-None of this is built yet. `0003-18` is a spike that proves binding processes and their supervision,
-and `0003-20` builds them, with the declarations, the approval of repo-declared ones, and same-path
-mounts; `0003-22` builds the interception and its events, and `0003-23` the policy. `SECURITY.md`'s
-"Known boundaries" gains its entry with `0003-20`: a binding acts with the host user's authority,
-and the default -- allow, published as events -- runs every call and publishes it.
+`0003-18` proved binding processes and their supervision, and `0003-20` built them into the
+session, with the declarations, the approval of repo-declared ones, and same-path mounts;
+`0003-22` builds the interception and its events, and `0003-23` the policy. `SECURITY.md`'s
+"Known boundaries" carries the entry `0003-20` added: a binding acts with the host user's
+authority, and the default -- allow, published as events -- runs every call and publishes it.
 
 Until then, OutRig starts nothing that holds a credential from its config where the agent can
 reach it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
@@ -151,8 +151,9 @@ earlier session -- would choose what the host runs at the next start.
 So a repo-declared binding starts only after the operator approves that exact declaration. OutRig
 prompts once and remembers the approval by the declaration's digest; any edit changes the digest
 and prompts again. Bindings from the global config or the embedding API need no approval, because
-they come from the operator or the embedder directly. `0003-20` builds it, and decides what happens
-when nobody can be prompted.
+they come from the operator or the embedder directly. `0003-20` built it: when nobody can be
+prompted -- no terminal, or an embedder with no approver -- the binding does not start, the session
+runs without it, and a `binding.refused` event says which and how to approve it.
 
 The same reasoning gives the policy rule: a repo's `[policy]` may only add restrictions
 (`boundary-policy.md`), as a repo's `[network]` may not widen the operator's egress policy
@@ -211,12 +212,12 @@ that assumption and no more:
 
 ## Open questions
 
-- Whether the CLI should remove the variables its own config references -- provider keys above all
-  -- from the environment a binding inherits. It would narrow what a library that runs programs can
-  print, and would not touch the ssh-agent, the credential helpers, or the files under the user's
-  home directory. `0003-20` carries it as a design fork.
-- What happens to a repo-declared binding when nobody can be prompted: a non-interactive session,
-  or an embedder that loads a repo config. `0003-20` decides.
+- Settled by `0003-20`: a binding that inherits the owner's environment inherits it without the
+  variables the config names through `${VAR}` -- provider keys, image build arguments, MCP server
+  environments. It narrows what a library that runs programs can print, and does not touch the
+  ssh-agent, the credential helpers, or the files under the user's home directory.
+- Settled by `0003-20`: a repo-declared binding nobody can be prompted about does not start, and
+  the session runs without it.
 
 ## What this does not change
 

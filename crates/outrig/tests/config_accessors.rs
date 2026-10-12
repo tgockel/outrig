@@ -22,7 +22,7 @@ fn mount_accessors_read_and_write_every_replaced_field() {
     let mut mount = MountConfig::new("data", "/data", MountAccess::ReadOnly);
 
     assert_eq!(mount.host_path(), Path::new("data"));
-    assert_eq!(mount.container_path(), Path::new("/data"));
+    assert_eq!(mount.declared_container_path(), Some(Path::new("/data")));
     assert_eq!(mount.access(), MountAccess::ReadOnly);
 
     mount.set_host_path("cache");
@@ -30,7 +30,7 @@ fn mount_accessors_read_and_write_every_replaced_field() {
     mount.set_access(MountAccess::ReadWrite);
 
     assert_eq!(mount.host_path(), Path::new("cache"));
-    assert_eq!(mount.container_path(), Path::new("/cache"));
+    assert_eq!(mount.declared_container_path(), Some(Path::new("/cache")));
     assert_eq!(mount.access(), MountAccess::ReadWrite);
     assert_eq!(
         mount.resolved_host_path(Path::new("/repo")),

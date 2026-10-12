@@ -2,15 +2,18 @@
 
 Started on the host by the Rust owner with the payload's `python3 -I -c <this program>` and three
 arguments -- the vendored RPyC's directory, the binding's package directory, and the factory as
-`module:callable` -- it imports the factory, calls it once, and serves the object it returned as the
-root of every connection. A fourth argument, `--serialize`, is for a library that is not
+`module:callable` -- it reads the factory's arguments from its first line of input, imports the
+factory, calls it once with them, and serves the object it returned as the root of every
+connection. The arguments arrive on stdin rather than the command line, which any user on the host
+can read. A fourth argument, `--serialize`, is for a library that is not
 thread-safe: the binding then runs one request at a time across all its connections, in the order
 they arrived, except that a callback's nested request runs at once on the thread whose turn it is,
 and that `ping` and `close` never wait.
 
 Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by agent and
-connection, split into bounded parts (`rpc` lines), both ways; a `ready` line once the factory has
-returned; `event` lines, which `0003-21` fills with a request's events; `decision` lines, each a
+connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `factory`
+line holding the factory's `args` and `kwargs`; a `ready` line once the factory has returned, naming
+the type of what it returned, or a `failed` line naming what it raised; `event` lines, which `0003-21` fills with a request's events; `decision` lines, each a
 request held on its serving thread until the owner's answer arrives under the same id, which
 `0003-22` asks for; and `control` lines from the owner, which `0003-21` gives a meaning. Everything
 else it writes goes to stderr, where the owner logs it.
@@ -1290,8 +1293,8 @@ def _handle(connections, line):
         connections.notice(agent, cid, reason)
 
 
-def _read(connections):
-    with os.fdopen(_PROTO_IN, "rb") as stream:
+def _read(connections, stream):
+    with stream:
         while True:
             line = stream.readline()
             if not line:
@@ -1335,16 +1338,44 @@ def main():
     import rpyc
 
     Binding = connection_class(rpyc)
+    stream = os.fdopen(_PROTO_IN, "rb")
+    args, kwargs = _arguments(stream.readline())
     module, _, name = factory.partition(":")
     try:
-        root_object = getattr(importlib.import_module(module), name)()
+        root_object = getattr(importlib.import_module(module), name)(*args, **kwargs)
     except BaseException as e:
         _diag(f"the factory {factory!r} failed: {''.join(traceback.format_exception(e))}")
+        error = "".join(traceback.format_exception_only(e)).strip()
+        _send({"t": "failed", "error": error[:FAILED_MAX]})
         os._exit(1)
+    kind = type(root_object)
     connections = Connections(Binding, root_object)
-    _send({"t": "ready"})
-    _read(connections)
+    _send({"t": "ready", "type": f"{kind.__module__}.{kind.__qualname__}"})
+    _read(connections, stream)
     _die("the owner closed the protocol")
+
+
+# Characters of a raising factory's one-line rendering sent to the owner; the whole traceback is
+# on stderr.
+FAILED_MAX = 4096
+
+
+def _arguments(line):
+    """The factory's `args` and `kwargs` from the owner's first line, or end the process saying
+    why there are none: the factory never runs on arguments this program did not understand."""
+    if not line:
+        _die("the owner closed the protocol before sending the factory's arguments")
+    try:
+        message = json.loads(line)
+        args, kwargs = message["args"], message["kwargs"]
+        if message.get("t") != "factory" or not isinstance(args, list) or not isinstance(
+            kwargs, dict
+        ):
+            raise ValueError("not a factory line")
+    except (ValueError, KeyError, TypeError) as e:
+        _diag(f"the first line was not the factory's arguments ({e}): {line[:200]!r}")
+        os._exit(2)
+    return args, kwargs
 
 
 if __name__ == "__main__":

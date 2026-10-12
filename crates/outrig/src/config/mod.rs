@@ -1,6 +1,7 @@
 //! Config schema, parsing, merge, and validation.
 
 mod api_key;
+mod binding;
 mod env_ref;
 mod env_value;
 mod merge;
@@ -16,6 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
+pub use binding::{Binding, FactoryValue};
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use merge::merge;
 pub use validate::{
@@ -23,7 +25,7 @@ pub use validate::{
 };
 pub(crate) use validate::{
     check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
-    is_valid_mcp_server_name, mcp_command_is_empty,
+    is_valid_mcp_server_name, mcp_command_is_empty, validate_binding,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
@@ -208,6 +210,24 @@ fn source_base_dir<'a>(source: Option<&'a ConfigSource>, repo_root: &'a Path) ->
     source.map_or(repo_root, ConfigSource::base_dir)
 }
 
+/// `path` resolved as [`resolve_against`] and [`source_base_dir`] would, with
+/// `.` and `..` resolved, where that can be known: always with a repository
+/// root, and without one only for a path from a config file, an absolute
+/// path, or one under `~`. Validation without a root uses this to check what
+/// it can and skip the rest.
+fn known_path(
+    source: Option<&ConfigSource>,
+    path: &Path,
+    repo_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let resolved = match (source, repo_root) {
+        (Some(source), _) => resolve_against(source.base_dir(), path),
+        (None, Some(root)) => resolve_against(root, path),
+        (None, None) => resolve_against(Path::new(""), path),
+    };
+    resolved.is_absolute().then(|| lexical(&resolved))
+}
+
 /// A config file named by path, made absolute, and the outcome of reading it.
 /// Resolve before reading, and read through the resolved path: a
 /// `--global-config` or `--config` path may be relative, and would otherwise
@@ -237,6 +257,25 @@ pub(crate) fn resolve_against(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// `path` with `.` and `..` resolved textually, as a container runtime resolves
+/// a mount's destination: the host filesystem has nothing to say about a path
+/// in the container, and `..` at the root stays at the root. What two config
+/// paths are compared by, since [`resolve_against`] keeps `..` -- a host path
+/// it gives is what podman mounts, symlinks and all.
+pub(crate) fn lexical(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    resolved
 }
 
 /// The invoking user's home directory: `HOME`, or the passwd entry's when
@@ -314,6 +353,11 @@ pub struct Config {
     pub images: BTreeMap<String, ImageConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sidecars: BTreeMap<String, SidecarConfig>,
+
+    /// Objects a session hosts for its agent, each in a process of its own on the host. See
+    /// [`Binding`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, Binding>,
 }
 
 impl Config {
@@ -467,13 +511,19 @@ impl Config {
     /// before the merge: `extend` and the mount concatenation move whole
     /// entries, and nothing afterwards can tell the two files apart.
     ///
-    /// Only images, mounts, and `[workspace].host-path` are stamped -- the
-    /// last of those only when the file declared it, since the built-in `.`
-    /// belongs to no file. Providers, models, and agents have no path
-    /// fields, so a base directory would buy them nothing.
+    /// Only images, mounts, bindings, and `[workspace].host-path` are stamped
+    /// -- the last of those only when the file declared it, since the built-in
+    /// `.` belongs to no file. Providers, models, and agents have no path
+    /// fields, so a base directory would buy them nothing. A binding's paths
+    /// resolve against the repository root whichever file declared it; its
+    /// source says whether a repository declared it, which decides whether it
+    /// needs the operator's approval.
     fn stamp_source(&mut self, src: &ConfigSource) {
         for image in self.images.values_mut() {
             image.set_config_source(src.clone());
+        }
+        for binding in self.bindings.values_mut() {
+            binding.set_config_source(src.clone());
         }
         self.workspace.set_config_source(src.clone());
         // Every mount, wherever it lives -- one expression, so a future
@@ -486,6 +536,29 @@ impl Config {
         for mount in mounts {
             mount.set_config_source(src.clone());
         }
+    }
+
+    /// Every variable this config names through `${VAR}`: each provider's
+    /// `api-key`, and each image's `build-args` and MCP server `env`. These
+    /// are OutRig's own secrets, so a binding that inherits the owner's
+    /// environment inherits it without them.
+    pub(crate) fn env_refs(&self) -> BTreeSet<String> {
+        let keys = self.providers.values().map(|provider| {
+            let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) =
+                provider;
+            api_key.var_name().to_string()
+        });
+        let values = self.images.values().flat_map(|image| {
+            image
+                .build_args
+                .values()
+                .chain(image.mcp.values().flat_map(|server| server.env().values()))
+        });
+        let refs = values.filter_map(|value| match value {
+            EnvValue::EnvRef(var) => Some(var.clone()),
+            _ => None,
+        });
+        keys.chain(refs).collect()
     }
 
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
@@ -1265,6 +1338,12 @@ impl Workspace {
         )
     }
 
+    /// [`resolved_host_path`](Self::resolved_host_path), with `.` and `..`
+    /// resolved, where [`known_path`] can say.
+    pub(crate) fn known_host_path(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
+        known_path(self.source.as_ref(), self.host_path(), repo_root)
+    }
+
     /// The file to name in a diagnostic about `host-path`, or `None` when no
     /// file declared it: the built-in `.`, or a value from [`Workspace::new`]
     /// or [`set_host_path`](Self::set_host_path). Deliberately not defaulted
@@ -1280,16 +1359,22 @@ impl Workspace {
 /// [`ConfigSource`] it is resolved against: a value replaced without clearing
 /// that pairing would be resolved against the directory of a file it never came
 /// from, and a mount may be read-write. Read them with
-/// [`host_path`](Self::host_path) / [`container_path`](Self::container_path) /
+/// [`host_path`](Self::host_path) /
+/// [`declared_container_path`](Self::declared_container_path) /
 /// [`access`](Self::access); write them with the setters, which keep the
 /// pairing honest. The other two carry no provenance and are private only so
 /// that one syntax reads the whole struct.
+///
+/// An undeclared `container-path` is the resolved host path: the directory
+/// appears in the container where it is on the host, which is what a session
+/// with a binding requires of every mount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct MountConfig {
     host_path: PathBuf,
-    container_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    container_path: Option<PathBuf>,
     #[serde(default)]
     access: MountAccess,
     /// Set at load time, never deserialized. See [`ConfigSource`].
@@ -1307,7 +1392,7 @@ impl MountConfig {
     ) -> Self {
         Self {
             host_path: host_path.into(),
-            container_path: container_path.into(),
+            container_path: Some(container_path.into()),
             access,
             source: None,
         }
@@ -1319,9 +1404,36 @@ impl MountConfig {
         &self.host_path
     }
 
-    /// The absolute in-container mount point.
-    pub fn container_path(&self) -> &Path {
-        &self.container_path
+    /// `container-path` exactly as declared, or `None` when the config was
+    /// silent and the mount appears at its host path.
+    pub fn declared_container_path(&self) -> Option<&Path> {
+        self.container_path.as_deref()
+    }
+
+    /// The in-container mount point: the declared `container-path`, or else
+    /// [`resolved_host_path`](Self::resolved_host_path) with `.` and `..`
+    /// resolved.
+    pub fn resolved_container_path(&self, repo_root: &Path) -> PathBuf {
+        match &self.container_path {
+            Some(path) => path.clone(),
+            None => lexical(&self.resolved_host_path(repo_root)),
+        }
+    }
+
+    /// [`resolved_container_path`](Self::resolved_container_path) where it can
+    /// be known: declared, or defaulted from a host path [`known_path`] can
+    /// resolve.
+    pub(crate) fn known_container_path(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
+        match &self.container_path {
+            Some(path) => Some(path.clone()),
+            None => self.known_host_path(repo_root),
+        }
+    }
+
+    /// [`resolved_host_path`](Self::resolved_host_path), with `.` and `..`
+    /// resolved, where [`known_path`] can say.
+    pub(crate) fn known_host_path(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
+        known_path(self.source.as_ref(), self.host_path(), repo_root)
     }
 
     /// Whether the container may write through this mount.
@@ -1343,7 +1455,7 @@ impl MountConfig {
     /// Declare `container-path`. Carries no provenance -- a container path is
     /// absolute and resolves against nothing.
     pub fn set_container_path(&mut self, container_path: impl Into<PathBuf>) {
-        self.container_path = container_path.into();
+        self.container_path = Some(container_path.into());
     }
 
     /// Declare `access`.

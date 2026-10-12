@@ -9,7 +9,10 @@ library crate. It does two things:
 - **An agent that acts by writing Python** ([`harness`]). A session holds a container, a Python
   interpreter in it, and an agent whose one tool runs Python there. Your program starts it,
   drives its rounds, watches its events, and stops it with a report that says whether everything
-  it started has stopped. `outrig run-new` is built on it and nothing else of the loop.
+  it started has stopped. A session can host bindings -- objects a process on the host holds for
+  the agent, such as a GitPython `Repo` -- each started before the interpreter and stopped with
+  the session, and one a repository's config declares only once its operator approves it.
+  `outrig run-new` is built on it and nothing else of the loop.
 
 The `outrig` command-line tool lives in the companion
 [`outrig-cli`](https://crates.io/crates/outrig-cli) crate.
@@ -23,7 +26,7 @@ the build warns and every launch fails with a message saying so. The same build 
 embeds the pinned RPyC wheel that carries hosted-object requests between the interpreter and a
 binding's process; `OUTRIG_RPYC_WHEEL` names a local copy of it for a build with no network.
 OutRig reserves `/outrig` inside the container, so neither the workspace nor a mount may be
-placed there.
+placed there; a session's bindings mount their packages read-only under `/outrig/bindings`.
 
 ## Example
 

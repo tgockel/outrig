@@ -6,7 +6,8 @@ use super::Config;
 
 /// Merge `global` and `repo`, with `repo` winning on every collision.
 ///
-/// - For each map (`providers`, `models`, `agents`, `images`, `sidecars`):
+/// - For each map (`providers`, `models`, `agents`, `images`, `sidecars`,
+///   `bindings`):
 ///   repo entries replace global entries with the same key. Entries unique to
 ///   either side are preserved as-is. A repo image-config can therefore name a
 ///   sidecar the user declared globally.
@@ -49,6 +50,11 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut sidecars = global.sidecars;
     sidecars.extend(repo.sidecars);
 
+    // A repo binding replacing a global one keeps the repo's source, so it
+    // still needs the operator's approval.
+    let mut bindings = global.bindings;
+    bindings.extend(repo.bindings);
+
     let mut workspace = repo.workspace;
     workspace.inherit_missing_primary_fields(&global.workspace);
     let mut mounts = global.workspace.mounts;
@@ -79,5 +85,6 @@ pub fn merge(global: Config, repo: Config) -> Config {
         workspace,
         images,
         sidecars,
+        bindings,
     }
 }

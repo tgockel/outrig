@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 /// The identifier every canned response names. Recognized by rig, with a
 /// published ceiling of 64 000.
-pub(super) const MODEL: &str = "claude-sonnet-4-6";
+pub(crate) const MODEL: &str = "claude-sonnet-4-6";
 
 /// The signature on the thinking an Anthropic canned response carries.
 pub(super) const SIGNATURE: &str = "signed-by-the-mock";

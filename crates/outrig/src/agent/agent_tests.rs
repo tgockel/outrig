@@ -775,9 +775,55 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
 }
 
 #[test]
+fn the_orientation_names_each_binding_and_says_a_hosted_object_is_awaited() {
+    use crate::harness::bindings::Brief;
+    let brief = |name: &str, description: &str, serialize| Brief {
+        name: name.to_string(),
+        description: description.to_string(),
+        type_name: "m.T".to_string(),
+        serialize,
+    };
+    let text = super::orientation::preamble(
+        None,
+        &[
+            brief("repo", "The project's Git repository.", true),
+            brief("tasks", "The task tracker.", false),
+        ],
+        Some("You write Python."),
+        Window::DEFAULT,
+    );
+    assert!(
+        text.contains("\n- `repo`: The project's Git repository. Runs one call at a time.\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n- `tasks`: The task tracker.\n"), "{text}");
+    assert!(
+        text.contains("Importing the same library here gives a local copy"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Nothing happens on a hosted object until it is awaited: `await repo.a.b`"),
+        "{text}"
+    );
+    for rule in [
+        "`await repo._set(\"name\", value)`",
+        "`if repo:`, `len(repo)` and a plain `for` over one raise",
+        "`runtime.wait` still sees messages",
+        "never put a hosted object in `asyncio.to_thread`",
+    ] {
+        assert!(text.contains(rule), "{rule}: {text}");
+    }
+    assert!(text.ends_with("\n\nYou write Python."), "{text}");
+
+    let without = super::orientation::preamble(None, &[], None, Window::DEFAULT);
+    assert!(!without.contains("hosted"), "{without}");
+}
+
+#[test]
 fn the_orientation_names_the_workspace_when_there_is_one() {
     let text = super::orientation::preamble(
         Some(std::path::Path::new("/workspace")),
+        &[],
         None,
         Window::DEFAULT,
     );

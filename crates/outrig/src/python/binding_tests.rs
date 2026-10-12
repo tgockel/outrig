@@ -2851,3 +2851,91 @@ mod measurements {
         two_sessions_are_two_clients(true);
     }
 }
+
+/// `runtime.bindings` answers in every kernel, one opened after the session started included,
+/// from what the host declared at the start: the binding is stopped, and it still answers.
+#[test]
+fn runtime_bindings_answers_in_a_kernel_opened_later_without_asking_the_binding() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let fixture = crate::harness::bindings::Brief {
+        name: "fx".into(),
+        description: "The fixture.".into(),
+        type_name: "outrig_fixture.Root".into(),
+        serialize: false,
+    };
+    relay.send(super::host::bindings_message(
+        &[fixture],
+        [fixture_dir().to_string_lossy().into_owned()],
+    ));
+    let pid = nix::unistd::Pid::from_raw(relay.binding_pid("fx") as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).expect("stop the binding");
+    relay.open("b");
+    let ask = "print({n: (b.description, b.type) for n, b in runtime.bindings.items()})";
+    let primary = relay.output(1, ask);
+    let later = relay.output_in("b", 1, ask);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGCONT).expect("continue it");
+    assert_eq!(primary, "{'fx': ('The fixture.', 'outrig_fixture.Root')}\n");
+    assert_eq!(later, primary);
+}
+
+/// `serialize` in a declaration reaches the binding through the session's own lowering of it:
+/// two kernels' calls never overlap on the host under `serialize = true`, and overlap under
+/// `serialize = false` and with the key absent.
+#[test]
+fn serialize_reaches_the_binding_from_its_declaration() {
+    use crate::harness::bindings::{Programs, gather, lower};
+    for (line, serialized) in [
+        ("serialize = true", true),
+        ("serialize = false", false),
+        ("", false),
+    ] {
+        let cfg = crate::config::Config::load_from_str(&format!(
+            "[bindings.fx]\ndescription = \"d\"\nfactory = {FACTORY:?}\n{line}\n"
+        ))
+        .expect("the declaration parses");
+        let declared = gather(&cfg, &[]).expect("a valid binding");
+        let programs = Programs {
+            python: python().to_path_buf(),
+            rpyc_dir: rpyc_dir().to_path_buf(),
+        };
+        let here = std::env::current_dir().expect("a working directory");
+        let spec =
+            lower(&declared[0], fixture_dir(), &programs, &here, &here, None).expect("lowered");
+        let mut relay = Relay::start();
+        relay.bind_spec("fx", spec);
+        relay.open("b");
+        relay.output(1, &with_root("root.public"));
+        relay.output_in("b", 1, &with_root_in("b", "root.public"));
+        let (started, release) = (Flag::new(), Flag::new());
+        relay.submit_in(
+            "primary",
+            2,
+            &with_root(&format!(
+                "print(root.record(0, 'a', started={}, until={}))",
+                started.py(),
+                release.py()
+            )),
+        );
+        started.wait();
+        let before = relay.stats.between("b", "fx").to_binding.lines();
+        relay.submit_in("b", 2, &with_root_in("b", "print(root.record(0, 'b'))"));
+        frame_reached_binding(&relay, "b", before);
+        if !serialized {
+            // Not serialized, `b`'s call runs to its end while `a`'s still waits.
+            assert_eq!(
+                relay.result_from("b", 2, TIMEOUT)["output"],
+                "b\n",
+                "{line}"
+            );
+        }
+        release.raise();
+        assert_eq!(relay.result_from("primary", 2, TIMEOUT)["output"], "a\n");
+        if serialized {
+            assert_eq!(relay.result_from("b", 2, TIMEOUT)["output"], "b\n");
+        }
+        let recorded = intervals(&mut relay, "primary", 3);
+        let (a, b) = (interval(&recorded, "a"), interval(&recorded, "b"));
+        assert_eq!(a.overlaps(b), !serialized, "{line:?}: {recorded:?}");
+    }
+}

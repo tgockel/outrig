@@ -18,7 +18,7 @@
 
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::statvfs::{FsFlags, statvfs};
@@ -33,6 +33,13 @@ pub(crate) const OUTRIG_ROOT: &str = "/outrig";
 
 /// Where the payload is bound, read-only, inside the primary container.
 pub(crate) const PAYLOAD_MOUNT: &str = "/outrig/python";
+
+/// Where each binding's package directory is bound, read-only, inside the
+/// primary container, as `<BINDINGS_MOUNT>/<hash>`: under OutRig's own root
+/// rather than at its host path, which under `~/.cache` would leave the
+/// directories podman makes for the mount point root-owned in the container
+/// user's home.
+pub(crate) const BINDINGS_MOUNT: &str = "/outrig/bindings";
 
 /// The pinned archive, as `build.rs` verified it; empty when that build could
 /// not fetch it.
@@ -92,6 +99,11 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The payload's `python3` on the host, as a binding process runs it.
+pub(crate) async fn host_python() -> Result<PathBuf> {
+    Ok(host_dir().await?.join("bin/python3"))
+}
+
 /// The vendored RPyC's directory on the host, holding the `rpyc` package,
 /// unpacked from the embedded wheel the first time it is asked for. Binding
 /// processes import from it, and `0003-21` mounts it read-only in the
@@ -115,7 +127,12 @@ pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
 /// The user's cache directory, or a configuration error naming `what` could
 /// not be placed.
 pub(super) fn cache_dir(what: &str) -> Result<PathBuf> {
-    cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")).ok_or_else(|| {
+    xdg_root(
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+        ".cache",
+    )
+    .ok_or_else(|| {
         OutrigError::Configuration(format!(
             "cannot place the {what}: neither an absolute XDG_CACHE_HOME nor HOME is set"
         ))
@@ -137,7 +154,7 @@ pub(crate) async fn mount() -> Result<ContainerMount> {
 /// over. Compared by components after resolving `.` and `..` as the runtime
 /// will, so `/outrigger` passes and `/tmp/../outrig/python` does not.
 pub(crate) fn reject_reserved(destination: &Path) -> Result<()> {
-    if lexical(destination).starts_with(OUTRIG_ROOT) {
+    if crate::config::lexical(destination).starts_with(OUTRIG_ROOT) {
         return Err(OutrigError::Configuration(format!(
             "container path {} is under {OUTRIG_ROOT}, which OutRig reserves for the \
              Python payload it mounts at {PAYLOAD_MOUNT}",
@@ -145,23 +162,6 @@ pub(crate) fn reject_reserved(destination: &Path) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// `path` with `.` and `..` resolved textually. A container destination names
-/// a path in the container, so the host filesystem has nothing to say about
-/// it; `..` at the root stays at the root.
-fn lexical(path: &Path) -> PathBuf {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::CurDir => {}
-            other => resolved.push(other),
-        }
-    }
-    resolved
 }
 
 /// Refuse a payload directory on a filesystem mounted `noexec`. A bind mount
@@ -234,16 +234,20 @@ fn wheel_not_embedded() -> OutrigError {
     ))
 }
 
-/// The cache directory: `XDG_CACHE_HOME` when it is absolute, as the XDG spec
-/// requires, otherwise `$HOME/.cache`. `build.rs`'s `download_cache` applies
-/// the same rule.
-fn cache_root(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    xdg_cache_home
-        .map(PathBuf::from)
+/// An XDG base directory: `xdg`, the value of its variable, when it is
+/// absolute, as the XDG spec requires, otherwise `$HOME/<under_home>` -- the
+/// cache directory is `xdg_root(XDG_CACHE_HOME, HOME, ".cache")`, and
+/// `build.rs`'s `download_cache` applies the same rule.
+pub(crate) fn xdg_root(
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+    under_home: &str,
+) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
             home.filter(|home| !home.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
+                .map(|home| PathBuf::from(home).join(under_home))
         })
 }
 
@@ -386,7 +390,7 @@ mod tests {
     #[test]
     fn an_absolute_xdg_cache_home_wins() {
         assert_eq!(
-            cache_root(os("/xdg"), os("/home/u")),
+            xdg_root(os("/xdg"), os("/home/u"), ".cache"),
             Some(PathBuf::from("/xdg"))
         );
     }
@@ -395,16 +399,16 @@ mod tests {
     fn a_relative_or_empty_xdg_cache_home_falls_back_to_home() {
         for xdg in [os("relative/cache"), os(""), None] {
             assert_eq!(
-                cache_root(xdg, os("/home/u")),
-                Some(PathBuf::from("/home/u/.cache"))
+                xdg_root(xdg, os("/home/u"), ".local/state"),
+                Some(PathBuf::from("/home/u/.local/state"))
             );
         }
     }
 
     #[test]
     fn no_usable_variable_is_no_cache_root() {
-        assert_eq!(cache_root(os("relative"), None), None);
-        assert_eq!(cache_root(None, os("")), None);
+        assert_eq!(xdg_root(os("relative"), None, ".cache"), None);
+        assert_eq!(xdg_root(None, os(""), ".cache"), None);
     }
 
     #[test]

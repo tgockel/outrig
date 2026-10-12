@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py
   <session>` renders a recording to one HTML page, written beside it as `report.html`; it takes
   a session id as `outrig logs` does, or a session directory.
+- **`run-new` hosts `[bindings.<name>]`.** Each declared binding's packages are installed and
+  its process started on the host before the agent's interpreter (`installing binding packages`,
+  `starting bindings`), the agent is told its name and description, and it is stopped with
+  everything it started as the session closes. A binding the repository's config declares is
+  shown whole, with a `[y/N]` question, before anything is installed; a yes is remembered for
+  that exact declaration in that repository, and an edit asks again. With no terminal on stdin,
+  `run-new` says which binding it skipped and how to approve it, and the session runs without
+  it. A `[[workspace.mounts]]` entry may now leave `container-path` unset, to mount the
+  directory at its host path.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

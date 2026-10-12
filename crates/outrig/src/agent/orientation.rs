@@ -16,19 +16,29 @@
 //! conversation: an agent that cannot see the middle of it would not know to
 //! look for it. The rest is in docstrings: the orientation names
 //! `help(runtime)` and `runtime.python`, and those say the details.
+//!
+//! A session's bindings are here too, each by name and description: names an
+//! agent cannot learn by looking, and any round may need one. So is the one
+//! rule about them that looking cannot teach -- a hosted object is awaited --
+//! since `repo.head.commit.hexsha` reads like a plain attribute chain
+//! (`plan/phase/0003-python/discovery.md`).
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::history::Window;
+use crate::harness::bindings::Brief;
 
 /// The orientation, then `configured` after a blank line when there is one.
 ///
 /// `workspace` is where the interpreter's working directory is: the primary's
 /// `-w`, which is its workspace mount. Without one there is nothing true to
-/// say about it, so the line is left out. `window` is what each model call is
-/// sent of the conversation.
+/// say about it, so the line is left out. `bindings` are the session's, in its
+/// order; with none, nothing is said of them. `window` is what each model call
+/// is sent of the conversation.
 pub(crate) fn preamble(
     workspace: Option<&Path>,
+    bindings: &[Brief],
     configured: Option<&str>,
     window: Window,
 ) -> String {
@@ -75,10 +85,49 @@ pub(crate) fn preamble(
          through `subprocess`. `help(x)` describes anything, and `help(runtime)` describes what \
          OutRig gives you.",
     );
+    if !bindings.is_empty() {
+        text.push_str(&hosted(bindings));
+    }
     if let Some(configured) = configured {
         text.push_str("\n\n");
         text.push_str(configured);
     }
+    text
+}
+
+/// What the agent is told of the session's bindings, of which there is at
+/// least one: each by name and description, and how a hosted object is used,
+/// with the first one's name standing in for any of them.
+fn hosted(bindings: &[Brief]) -> String {
+    let example = &bindings[0].name;
+    let mut text = String::from(
+        "\n\nThese names are objects held by processes on the host, outside this container, \
+         with the user's own authority there. Importing the same library here gives a local copy \
+         that knows nothing of them.\n",
+    );
+    for binding in bindings {
+        let _ = write!(
+            text,
+            "\n- `{}`: {}",
+            binding.name,
+            binding.description.trim()
+        );
+        if binding.serialize {
+            text.push_str(" Runs one call at a time.");
+        }
+    }
+    let _ = write!(
+        text,
+        "\n\nNothing happens on a hosted object until it is awaited: `await {example}.a.b` reads \
+         a chain of attributes, `await {example}.f(x)` calls a method, `async for item in \
+         {example}.items:` iterates, and `await {example}._set(\"name\", value)` and `await \
+         {example}._delete(\"name\")` assign and delete, since an assignment cannot be awaited. \
+         `if {example}:`, `len({example})` and a plain `for` over one raise, and say what to \
+         write instead. `repr`, `str` and `dir` answer here without asking the host, and \
+         `help()` on the imported library's own classes describes it. Your event loop keeps \
+         running while the host works, so `runtime.wait` still sees messages; never put a \
+         hosted object in `asyncio.to_thread`. `runtime.bindings` lists them."
+    );
     text
 }
 

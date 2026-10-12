@@ -46,6 +46,7 @@ use crate::error::{OutrigError, Result};
 use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
 use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
+mod approve;
 mod converse;
 
 #[derive(Debug, Parser)]
@@ -102,6 +103,8 @@ pub async fn execute(
     let agent_name = args.agent.clone().or_else(|| cfg.default_agent.clone());
     let mut builder = SessionBuilder::new(cfg.clone(), agent_name.as_deref(), args.model.as_deref())
         .secrets(EnvSecrets)
+        .repo_root(&repo_root)
+        .approver(approve::TerminalApprover)
         .progress(progress_lines());
     if matches!(cfg.events.mode(), EventsMode::Record) {
         builder = builder.record_events();
@@ -309,6 +312,8 @@ fn progress_lines() -> impl FnMut(Progress) + Send + 'static {
     move |progress| match progress {
         Progress::Started(step) => {
             span = Some(ProgressSpan::start(match step {
+                Step::Packages => "installing binding packages",
+                Step::Bindings => "starting bindings",
                 Step::Container => "starting container",
                 Step::Python => "starting python",
                 _ => "starting",
@@ -317,6 +322,8 @@ fn progress_lines() -> impl FnMut(Progress) + Send + 'static {
         Progress::Finished(step) => {
             if let Some(span) = span.take() {
                 span.done(match step {
+                    Step::Packages => "binding packages installed",
+                    Step::Bindings => "bindings started",
                     Step::Container => "container ready",
                     Step::Python => "python ready",
                     _ => "ready",

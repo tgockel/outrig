@@ -15,14 +15,13 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nix::errno::Errno;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
 use nix::unistd::Pid;
 use serde_json::json;
 
 use super::relay::{Bind, Relay, TIMEOUT, fixture_dir, rpyc_dir};
 use super::supervisor::{self, Probe, STOP_GRACE, Spec, group_members};
-use super::testing::{Flag, capture, eventually, py, python};
+use super::testing::{Flag, capture, eventually, group_gone, py, python, wait_group_gone};
 
 const FACTORY: &str = "outrig_fixture:make";
 const ROLE: &str = "OUTRIG_TEST_OWNER_ROLE";
@@ -39,35 +38,17 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn spec<'a>(factory: &'a str, env: Option<&'a [(OsString, OsString)]>) -> Spec<'a> {
     Spec {
+        name: "fx",
         python: python(),
         rpyc_dir: rpyc_dir(),
         packages: fixture_dir(),
         factory,
+        args: serde_json::json!([]),
+        kwargs: serde_json::json!({}),
         serialize: false,
         cwd: None,
         env,
         probe: None,
-    }
-}
-
-/// Whether no process is left in `pgid`'s group: `ESRCH`, and nothing else.
-fn group_gone(pgid: Pid) -> bool {
-    kill(Pid::from_raw(-pgid.as_raw()), None) == Err(Errno::ESRCH)
-}
-
-/// Wait up to `within` for the group to be gone, failing with what is left in it.
-fn wait_group_gone(pgid: Pid, within: Duration) {
-    let deadline = Instant::now() + within;
-    while !group_gone(pgid) {
-        assert!(
-            Instant::now() < deadline,
-            "group {pgid} still holds {:?} after {within:?}",
-            group_members(pgid)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

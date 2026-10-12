@@ -453,6 +453,16 @@ Python tries to allocate fails as well. Programs it starts inherit the same ceil
 itself, and one that needs more can raise its own with `ulimit -d unlimited`. Python that calls
 `os._exit` still ends the session.
 
+**Bindings.** Each [`[bindings.<name>]`](config.md#bindingsname) the config declares is an
+object a process on the host holds for the agent: `run-new` installs its packages, starts its
+process before the interpreter -- `starting bindings`, `bindings started` -- and stops it, with
+everything it started, as the session closes. One the repository's config declares is shown
+whole before anything is installed, with a `[y/N]` question; a yes is remembered for that exact
+declaration in that repository, and an edit asks again. With no terminal on stdin -- a script,
+CI -- `run-new` says which binding it skipped and how to approve it, and the session runs without
+it. The agent is told each binding's name and description; calling one from its Python is not
+built yet.
+
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each
 message on the channel, the tokens each request used, and the session's own state, ending with

@@ -1879,13 +1879,13 @@ access         = "read-write"
         assert_eq!(merged.workspace.container_path(), Path::new("/workspace"));
         assert_eq!(merged.workspace.mounts.len(), 2);
         assert_eq!(
-            merged.workspace.mounts[0].container_path(),
-            Path::new("/resources/global-docs"),
+            merged.workspace.mounts[0].declared_container_path(),
+            Some(Path::new("/resources/global-docs")),
         );
         assert_eq!(merged.workspace.mounts[0].access(), MountAccess::ReadOnly);
         assert_eq!(
-            merged.workspace.mounts[1].container_path(),
-            Path::new("/resources/repo-cache"),
+            merged.workspace.mounts[1].declared_container_path(),
+            Some(Path::new("/resources/repo-cache")),
         );
         assert_eq!(merged.workspace.mounts[1].access(), MountAccess::ReadWrite);
     }
@@ -4306,8 +4306,8 @@ container-path = "/abs"
         cfg.workspace.mounts[0].set_access(MountAccess::ReadWrite);
 
         assert_eq!(
-            cfg.workspace.mounts[0].container_path(),
-            Path::new("/elsewhere")
+            cfg.workspace.mounts[0].declared_container_path(),
+            Some(Path::new("/elsewhere"))
         );
         assert_eq!(cfg.workspace.mounts[0].access(), MountAccess::ReadWrite);
         assert_eq!(
@@ -4630,5 +4630,260 @@ preamble = "hi"
             cfg.images.is_empty(),
             "the planted repo config stays unread"
         );
+    }
+}
+
+/// `[bindings.<name>]`: how a declaration parses, what validation refuses, how a repository's
+/// replaces the global config's, and the same-paths rule a binding puts on every mount.
+mod binding_config {
+    use super::*;
+    use outrig::config::{Binding, FactoryValue};
+
+    const REPO: &str = r#"
+[bindings.repo]
+description = "The project's Git repository."
+requires    = ["GitPython==3.2.0"]
+factory     = "git:Repo"
+args        = [{ path = "." }, "branch", 3, 1.5, true, ["a", { path = "~/x" }]]
+kwargs      = { odbt = { kind = "db" }, at = { path = "/abs" } }
+serialize   = true
+"#;
+
+    fn binding(toml: &str) -> Binding {
+        parse(toml)
+            .bindings
+            .into_values()
+            .next()
+            .expect("one binding")
+    }
+
+    fn parse_err(toml: &str) -> String {
+        Config::load_from_str(toml)
+            .expect_err("refused when parsed")
+            .to_string()
+    }
+
+    #[test]
+    fn a_declaration_parses_every_field_and_tags_its_paths() {
+        let repo = binding(REPO);
+        assert_eq!(repo.description, "The project's Git repository.");
+        assert_eq!(repo.requires, ["GitPython==3.2.0"]);
+        assert_eq!(repo.factory, "git:Repo");
+        assert!(repo.serialize);
+        assert_eq!(
+            repo.args,
+            [
+                FactoryValue::path("."),
+                FactoryValue::String("branch".into()),
+                FactoryValue::Integer(3),
+                FactoryValue::Float(1.5),
+                FactoryValue::Boolean(true),
+                FactoryValue::Array(vec![
+                    FactoryValue::String("a".into()),
+                    FactoryValue::path("~/x"),
+                ]),
+            ]
+        );
+        assert_eq!(repo.kwargs["at"], FactoryValue::path("/abs"));
+        assert_eq!(
+            repo.kwargs["odbt"],
+            FactoryValue::Table([("kind".into(), FactoryValue::String("db".into()))].into())
+        );
+        parse(REPO).validate(None).expect("valid");
+        // Serialized and read back, it is the same declaration.
+        let again = toml::to_string(&parse(REPO)).expect("serializes");
+        assert_eq!(binding(&again), repo, "{again}");
+    }
+
+    #[test]
+    fn serialize_is_false_when_absent() {
+        let minimal = binding("[bindings.x]\ndescription = \"d\"\nfactory = \"m:f\"\n");
+        assert!(!minimal.serialize);
+        assert!(minimal.requires.is_empty() && minimal.args.is_empty());
+    }
+
+    #[test]
+    fn a_serialize_that_is_not_a_boolean_names_the_key() {
+        let text = parse_err(
+            "[bindings.repo]\ndescription = \"d\"\nfactory = \"m:f\"\nserialize = \"yes\"\n",
+        );
+        assert!(text.contains("serialize = \"yes\""), "{text}");
+        assert!(text.contains("line 4"), "{text}");
+    }
+
+    #[test]
+    fn a_malformed_path_or_an_argument_json_cannot_carry_is_refused() {
+        for (args, said) in [
+            ("[{ path = 3 }]", "`{ path = ... }` takes a string"),
+            (
+                "[{ path = \".\", mode = \"r\" }]",
+                "holds `path` and nothing else; this one also holds mode",
+            ),
+            ("[1979-05-27T07:32:00Z]", "cannot be passed to a factory"),
+            ("[nan]", "cannot be passed to a factory"),
+        ] {
+            let text = parse_err(&format!(
+                "[bindings.x]\ndescription = \"d\"\nfactory = \"m:f\"\nargs = {args}\n"
+            ));
+            assert!(text.contains(said), "{args}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_factory_must_be_module_colon_callable() {
+        for factory in [
+            "git",
+            "git:",
+            ":Repo",
+            "git:Repo.head",
+            "git::Repo",
+            "1git:Repo",
+        ] {
+            let err = expect_validation_err(
+                &parse(&format!(
+                    "[bindings.repo]\ndescription = \"d\"\nfactory = {factory:?}\n"
+                )),
+                None,
+            );
+            assert!(
+                matches!(err, ConfigValidationError::BindingFactory { .. }),
+                "{factory}: {err}"
+            );
+            assert!(err.to_string().contains("bindings.repo.factory"), "{err}");
+        }
+        for factory in ["git:Repo", "git.repo.base:Repo", "_m:_f"] {
+            parse(&format!(
+                "[bindings.repo]\ndescription = \"d\"\nfactory = {factory:?}\n"
+            ))
+            .validate(None)
+            .unwrap_or_else(|e| panic!("{factory}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_description_and_every_requirement_are_checked() {
+        let err = expect_validation_err(
+            &parse("[bindings.repo]\ndescription = \" \"\nfactory = \"m:f\"\n"),
+            None,
+        );
+        assert!(
+            matches!(err, ConfigValidationError::BindingDescriptionEmpty { .. }),
+            "{err}"
+        );
+        let err = expect_validation_err(
+            &parse(
+                "[bindings.repo]\ndescription = \"d\"\nfactory = \"m:f\"\n\
+                 requires = [\"./local.whl\"]\n",
+            ),
+            None,
+        );
+        assert!(
+            matches!(err, ConfigValidationError::BindingRequires { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("is not a requirement specifier"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_repo_binding_replacing_a_global_one_is_the_repositorys() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let global = write_global_cfg(
+            home.path(),
+            "[bindings.repo]\ndescription = \"global\"\nfactory = \"m:f\"\n\
+             [bindings.tool]\ndescription = \"global tool\"\nfactory = \"m:g\"\n",
+        );
+        write_repo_cfg(
+            repo.path(),
+            "[bindings.repo]\ndescription = \"repo\"\nfactory = \"m:f\"\n",
+        );
+        let cfg = Config::load(repo.path(), Some(&global)).expect("no collision");
+        assert_eq!(cfg.bindings.len(), 2);
+        assert_eq!(cfg.bindings["repo"].description, "repo");
+        assert!(matches!(
+            cfg.bindings["repo"].config_source(),
+            Some(ConfigSource::Repo { .. })
+        ));
+        assert!(matches!(
+            cfg.bindings["tool"].config_source(),
+            Some(ConfigSource::Global { .. })
+        ));
+    }
+
+    #[test]
+    fn with_a_binding_a_container_path_must_be_its_host_path() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("data")).unwrap();
+        let root = repo.path().to_str().unwrap();
+        let binding = "[bindings.x]\ndescription = \"d\"\nfactory = \"m:f\"\n";
+
+        let err = expect_validation_err(
+            &parse(&format!(
+                "{binding}[workspace]\ncontainer-path = \"/src\"\n"
+            )),
+            Some(repo.path()),
+        );
+        let ConfigValidationError::BindingContainerPath { key, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(key, "workspace.container-path");
+        assert!(
+            err.to_string()
+                .contains("workspace.container-path \"/src\""),
+            "{err}"
+        );
+
+        let err = expect_validation_err(
+            &parse(&format!(
+                "{binding}[[workspace.mounts]]\nhost-path = \"data\"\ncontainer-path = \"/data\"\n"
+            )),
+            Some(repo.path()),
+        );
+        let ConfigValidationError::BindingContainerPath { key, host, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(key, "workspace.mounts[0].container-path");
+        assert_eq!(host, &repo.path().join("data"));
+
+        // The host path itself, or none at all, is fine.
+        parse(&format!(
+            "{binding}[workspace]\ncontainer-path = {root:?}\n\
+             [[workspace.mounts]]\nhost-path = \"data\"\ncontainer-path = \"{root}/./data\"\n"
+        ))
+        .validate(Some(repo.path()))
+        .expect("the host paths");
+        parse(&format!(
+            "{binding}[[workspace.mounts]]\nhost-path = \"data\"\n"
+        ))
+        .validate(Some(repo.path()))
+        .expect("defaulted to the host path");
+        // Without a binding, a container path is the config's to choose.
+        parse(
+            "[workspace]\ncontainer-path = \"/src\"\n\
+             [[workspace.mounts]]\nhost-path = \"data\"\ncontainer-path = \"/data\"\n",
+        )
+        .validate(Some(repo.path()))
+        .expect("no binding, no rule");
+    }
+
+    #[test]
+    fn a_mount_without_a_container_path_appears_at_its_host_path() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("data")).unwrap();
+        let cfg = parse("[[workspace.mounts]]\nhost-path = \"data/../data\"\n");
+        cfg.validate(Some(repo.path()))
+            .expect("valid without a binding");
+        let mount = &cfg.workspace.mounts[0];
+        assert_eq!(mount.declared_container_path(), None);
+        assert_eq!(
+            mount.resolved_container_path(repo.path()),
+            repo.path().join("data")
+        );
+        // Serialized, it stays undeclared.
+        let again = toml::to_string(&cfg).expect("serializes");
+        assert!(!again.contains("container-path"), "{again}");
     }
 }

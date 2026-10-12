@@ -15,6 +15,11 @@
 //!   session. Its state -- starting, idle, round running, executing, closing,
 //!   reported -- is among them, so an owner showing what the session is doing
 //!   reads it there rather than parsing text.
+//! - **Bindings.** Objects a process on the host holds for the agent, from the
+//!   configuration's `[bindings]` and [`SessionBuilder::bind`]. One a
+//!   repository's config declared starts only once its [`Approver`] approves
+//!   that exact declaration; each starts before the interpreter and stops with
+//!   the session.
 //! - **Stopping.** [`Session::close_admission`] refuses new work at once, and
 //!   [`Session::shutdown`] stops what is left and returns a
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
@@ -23,6 +28,8 @@
 //! No type of the model-provider library this is built on appears here, so a
 //! release of it cannot break this surface.
 
+mod approval;
+pub(crate) mod bindings;
 mod builder;
 mod error;
 pub mod event;
@@ -32,14 +39,21 @@ mod session;
 
 use std::time::Duration;
 
+pub use self::approval::{Approval, ApprovalRequest, Approver};
+pub use self::bindings::BindingSpec;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
-    EventDelivery, ExecutionOutcome, ExecutionStatus, LogLoss, ShutdownReport, Stopped, Verdict,
+    BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, LogLoss, ShutdownReport,
+    Stopped, Verdict,
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
+
+#[cfg(test)]
+#[path = "bindings_tests.rs"]
+mod bindings_tests;
 
 /// How long [`Session::shutdown`] lets an execution that is still running
 /// finish, as `outrig run-new` uses it: long enough for one about to end to

@@ -144,11 +144,23 @@ const ARCHIVE_SUFFIXES: [&str; 12] = [
 /// The set as it is hashed and installed: each requirement checked to be a specifier, then
 /// trimmed, sorted and deduplicated.
 fn requirement_set(requires: &[String]) -> Result<Vec<String>> {
+    if let Some(problem) = requirement_problem(requires) {
+        return Err(OutrigError::Configuration(problem));
+    }
     let mut set: Vec<String> = requires.iter().map(|req| req.trim().to_string()).collect();
+    set.sort();
+    set.dedup();
+    Ok(set)
+}
+
+/// Why `requires` cannot be installed, naming the first requirement that is not a specifier, or
+/// `None` when every one is. Config validation asks this too, so a bad `requires` fails when the
+/// config loads rather than when a session starts.
+pub(crate) fn requirement_problem(requires: &[String]) -> Option<String> {
     // pip reads a bare argument ending in an archive suffix -- its markers aside, and a
     // trailing `[extras]` stripped -- as a file in its working directory, whatever else it
     // looks like: `probe===1.0.tar.gz` is a file to pip.
-    let archive = |req: &String| {
+    let archive = |req: &str| {
         let argument = req.split(';').next().unwrap_or(req).trim_end();
         let argument = match argument
             .strip_suffix(']')
@@ -162,19 +174,17 @@ fn requirement_set(requires: &[String]) -> Result<Vec<String>> {
             .iter()
             .any(|suffix| lower.ends_with(suffix))
     };
-    if let Some(bad) = set
+    requires
         .iter()
+        .map(|req| req.trim())
         .find(|req| !SPECIFIER.is_match(req) || archive(req))
-    {
-        return Err(OutrigError::Configuration(format!(
-            "{bad:?} is not a requirement specifier: a binding's `requires` names distributions \
-             resolved from an index -- a name, extras, a version specifier, markers -- and not a \
-             path, an archive, a URL or a pip option"
-        )));
-    }
-    set.sort();
-    set.dedup();
-    Ok(set)
+        .map(|bad| {
+            format!(
+                "{bad:?} is not a requirement specifier: a binding's `requires` names \
+                 distributions resolved from an index -- a name, extras, a version specifier, \
+                 markers -- and not a path, an archive, a URL or a pip option"
+            )
+        })
 }
 
 /// The directory name for `set`: a digest of the requirement text, so the same set installs

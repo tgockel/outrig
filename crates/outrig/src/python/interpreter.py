@@ -1002,6 +1002,9 @@ class _Loop(asyncio.SelectorEventLoop):
 
 # The directory the interpreter started in: the workspace, since the host starts it there.
 _WORKSPACE = None
+# The directory packages the agent's pip installs land in, once `_open_imports` has made it. A
+# binding's package directory goes on `sys.path` ahead of it (`_bindings`).
+_SITE = None
 # This interpreter's version, as the host is told it and the agent reads it.
 _VERSION = sys.version.split()[0]
 # Its minor version, which names the environment's directories, as `3.13`.
@@ -1096,7 +1099,7 @@ def _open_imports():
     link, so `sys.executable -m pip` installs there as well, and a process started from it -- a
     `multiprocessing` child, a subprocess -- imports the same packages.
     """
-    global _WORKSPACE
+    global _WORKSPACE, _SITE
     try:
         _WORKSPACE = os.getcwd()
         sys.path.append(_WORKSPACE)
@@ -1108,6 +1111,7 @@ def _open_imports():
         _diag(f"packages pip installs will not import: the environment could not be made: {e!r}")
         return
     sys.path.append(site_packages)
+    _SITE = site_packages
     sys.executable = link
     os.environ["PATH"] = os.pathsep.join([*bins, os.environ.get("PATH", os.defpath)])
 
@@ -2906,6 +2910,9 @@ class Runtime:
 
     `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
     packages, and nothing compiled loads -- and where code that needs more can run.
+
+    `runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
+    each is; asking makes no request to any of them.
     """
 
     MessageAvailable = MessageAvailable
@@ -2935,6 +2942,17 @@ class Runtime:
     def python(self):
         """What this interpreter can import, and where code that needs more can run."""
         return _PYTHON
+
+    @property
+    def bindings(self):
+        """The session's bindings, by name, in the order the session gave them. Read-only.
+
+        Each is a `Binding`: its `name`, the global it is bound as; its `description`, as the
+        operator wrote it; and its `type`, the qualified name of the type of the object it holds on
+        the host. The answer comes from what the session said when it started, so asking reaches
+        no binding, runs no `repr()`, and reads no property.
+        """
+        return _BINDINGS
 
     def names(self):
         """Every name you have bound, as `{name: type name}`, sorted by name.
@@ -3650,6 +3668,54 @@ _HANDLE_RUN = asyncio.events.Handle._run.__code__
 _WRAPPER = Kernel._run.__code__
 
 
+# ---------------------------------------------------------------------------- bindings
+
+
+class Binding(collections.namedtuple("Binding", ("name", "description", "type"))):
+    """One of the session's bindings: an object a process on the host holds, bound as `name`.
+
+    `description` is what the operator says it is, and `type` the qualified name of the type of
+    the host's object. A record of what the session said at start; reading it asks the host
+    nothing.
+    """
+
+    __slots__ = ()
+
+
+# The session's bindings, by name, as the host declared them (`_bindings`); empty until then, and
+# for a session with none.
+_BINDINGS = types.MappingProxyType({})
+
+
+def _bindings(message):
+    """Take the session's bindings, which the host sends once, before anything runs.
+
+    Each binding's record goes in `runtime.bindings` for every kernel, and its package directory on
+    `sys.path`: after the workspace and before the agent's own pip installs, so that the container
+    imports the version of a library its binding runs rather than one the agent installed, in the
+    order the host gave them, which decides between two bindings that hold different versions of
+    one package.
+    """
+    global _BINDINGS
+    entries, paths = message.get("bindings"), message.get("paths")
+    if not isinstance(entries, list) or not isinstance(paths, list):
+        raise ValueError("bindings without a list of bindings and a list of paths")
+    records = {}
+    for entry in entries:
+        record = Binding(entry["name"], entry["description"], entry["type"])
+        if not all(isinstance(field, str) for field in record):
+            raise ValueError(f"a binding whose fields are not strings: {entry!r}")
+        records[record.name] = record
+    if not all(isinstance(path, str) for path in paths):
+        raise ValueError("a binding package path that is not a string")
+    _BINDINGS = types.MappingProxyType(records)
+    at = sys.path.index(_SITE) if _SITE in sys.path else len(sys.path)
+    for path in paths:
+        if path not in sys.path:
+            sys.path.insert(at, path)
+            at += 1
+
+
 # ---------------------------------------------------------------------------- routing
 
 def _open(agent):
@@ -3849,6 +3915,9 @@ def _route(line):
     kind, agent = message.get("t"), message.get("agent")
     if kind == "open":
         _open(agent)
+        return
+    if kind == "bindings":
+        _bindings(message)
         return
     handle = _ROUTES.get(kind) if isinstance(kind, str) else None
     if handle is None:

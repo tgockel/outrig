@@ -172,8 +172,10 @@ the session.
 
 - *Idle, or serving a call.* Outcome: after the drain the process group gets SIGTERM, then SIGKILL
   after a grace period; the binding counts as stopped once its process has been reaped and no
-  process is left in its group. Invoked: not itself a call; a call it was serving is a row below.
-  Effects: whatever its calls did stands.
+  process is left in its group. One not reaped soon after SIGKILL -- a thread stuck in I/O that
+  SIGKILL cannot interrupt -- is not proven stopped, and the shutdown goes on to the container.
+  Invoked: not itself a call; a call it was serving is a row below. Effects: whatever its calls
+  did stands.
 
 **Hosted calls and callbacks** (`0003-22`)
 

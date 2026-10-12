@@ -192,6 +192,7 @@ impl Agent {
         interpreter: Interpreter,
         container_name: &str,
         workspace: Option<&Path>,
+        bindings: &[crate::harness::bindings::Brief],
         ledger: Ledger,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
@@ -207,7 +208,8 @@ impl Agent {
             Arc::clone(&lifecycle),
         );
         let interrupts = tool.interrupts();
-        let preamble = orientation::preamble(workspace, resolved.preamble.as_deref(), window);
+        let preamble =
+            orientation::preamble(workspace, bindings, resolved.preamble.as_deref(), window);
         let definition = ToolDefinition {
             name: tool.name(),
             description: tool.description(),

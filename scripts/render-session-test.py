@@ -282,6 +282,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
     return [
         ("session.state", {"state": "starting"}, None),
         (
+            "binding.refused",
+            {"binding": "b", "declared_in": "/r/config.toml", "reason": "r"},
+            None,
+        ),
+        (
             "agent.started",
             {
                 "model": "m",

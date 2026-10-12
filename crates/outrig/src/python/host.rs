@@ -476,6 +476,23 @@ enum Status {
     Refused { holder: ExecId },
 }
 
+/// The line that tells the interpreter a session's bindings: each one's name,
+/// description, and the qualified name of the type its factory returned, in
+/// the session's order, and the package directories, as the interpreter sees
+/// them, in the order they go on `sys.path`. Handled by the interpreter as a
+/// whole, like `open`, rather than by any one kernel.
+pub(crate) fn bindings_message(
+    bindings: &[crate::harness::bindings::Brief],
+    paths: impl IntoIterator<Item = String>,
+) -> Value {
+    let bindings: Vec<Value> = bindings
+        .iter()
+        .map(|b| json!({"name": b.name, "description": b.description, "type": b.type_name}))
+        .collect();
+    let paths: Vec<String> = paths.into_iter().collect();
+    json!({"t": "bindings", "bindings": bindings, "paths": paths})
+}
+
 impl Interpreter {
     /// Start the interpreter in `container` and wait for it to greet.
     ///
@@ -733,6 +750,15 @@ impl Interpreter {
     /// on it hears. Replaces any earlier hook.
     pub(crate) fn on_exit(&self, exited: impl Fn() + Send + Sync + 'static) {
         lock(&self.table).on_exit = Some(Arc::new(exited));
+    }
+
+    /// Tell the interpreter the session's bindings, before anything runs: what
+    /// `runtime.bindings` answers in every kernel, and the package directories
+    /// that go on `sys.path`. `message` is [`bindings_message`]'s. Queued behind
+    /// nothing but what the start already sent, so it arrives before the first
+    /// execution.
+    pub(crate) fn declare_bindings(&self, message: &Value) {
+        let _ = self.lines.send(format!("{message}\n"));
     }
 
     /// Close the interpreter's stdin, which is its signal to exit, whatever

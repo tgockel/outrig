@@ -166,6 +166,7 @@ pub enum Payload {
         closed_by: super::ClosedBy,
         stopped: super::Stopped,
         executions: Vec<super::ExecutionOutcome>,
+        bindings: Vec<super::BindingStop>,
         verdict: super::Verdict,
     },
     #[non_exhaustive]
@@ -239,6 +240,15 @@ pub enum Payload {
     /// session.
     #[non_exhaustive]
     InterpreterExited { cause: String, expected: bool },
+    /// A binding a repository's config declared did not start, because the
+    /// operator did not approve that declaration or nobody could be asked; the
+    /// session runs without it. `reason` says which, and how to approve it.
+    #[non_exhaustive]
+    BindingRefused {
+        binding: String,
+        declared_in: Option<std::path::PathBuf>,
+        reason: String,
+    },
 
     // Integration audit: what crossed to a provider, or across a channel.
     #[non_exhaustive]
@@ -356,6 +366,7 @@ impl Payload {
             Payload::OutputUnattributed { .. } => "output.unattributed",
             Payload::InterpreterDiagnostic { .. } => "interpreter.diagnostic",
             Payload::InterpreterExited { .. } => "interpreter.exited",
+            Payload::BindingRefused { .. } => "binding.refused",
             Payload::ModelRoundCompleted { .. } => "model.round.completed",
             Payload::ModelRoundFailed { .. } => "model.round.failed",
             Payload::ModelRoundDropped { .. } => "model.round.dropped",
@@ -378,7 +389,8 @@ impl Payload {
             | Self::SessionReport { .. }
             | Self::OutputUnattributed { .. }
             | Self::InterpreterDiagnostic { .. }
-            | Self::InterpreterExited { .. } => None,
+            | Self::InterpreterExited { .. }
+            | Self::BindingRefused { .. } => None,
             _ => Some(Subject::PRIMARY),
         }
     }

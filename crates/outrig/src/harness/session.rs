@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::bindings::Bindings;
 use super::builder::SessionBuilder;
 use super::event::{Payload, SessionState};
 use super::lifecycle::Lifecycle;
@@ -14,6 +15,7 @@ use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
 use crate::agent::{Agent, AgentError};
 use crate::config::Config;
+use crate::python::supervisor::STOP_GRACE;
 
 /// How long an execution an interrupt reached has to end of its own accord --
 /// run its `finally` blocks, report an error -- before the container stops.
@@ -38,6 +40,7 @@ pub struct Session {
     pub(crate) agent: Agent,
     container: Option<Outrig>,
     lifecycle: Arc<Lifecycle>,
+    bindings: Bindings,
 }
 
 impl Session {
@@ -46,12 +49,14 @@ impl Session {
         agent: Agent,
         container: Option<Outrig>,
         lifecycle: Arc<Lifecycle>,
+        bindings: Bindings,
     ) -> Self {
         Self {
             id,
             agent,
             container,
             lifecycle,
+            bindings,
         }
     }
 
@@ -232,19 +237,24 @@ impl Session {
     /// Admission closes first, if the owner has not closed it. Executions
     /// already running are then left to finish until `deadline` has passed --
     /// [`DEFAULT_DRAIN`](super::DEFAULT_DRAIN) is a few seconds -- and one
-    /// still running is interrupted, given a second to end of its own accord,
-    /// and then the container is stopped, which ends the interpreter and
-    /// whatever an interrupt could not reach. Nothing waits on a subscriber.
+    /// still running is interrupted and given a second to end of its own
+    /// accord. Each binding's process group is then sent `SIGTERM`, and
+    /// `SIGKILL` after a grace of five seconds, which ends every program a
+    /// binding's library started; and then the container is stopped, which
+    /// ends the interpreter and whatever an interrupt could not reach. Nothing
+    /// waits on a subscriber.
     ///
     /// Returns a bounded time after `deadline`: typically a few seconds, while
     /// the container stops and the event log is finished; at worst the
-    /// container engine's own time limits, about a minute.
+    /// bindings' grace and the container engine's own time limits, about a
+    /// minute.
     pub async fn shutdown(self, deadline: Duration) -> ShutdownReport {
         let Self {
             id: _,
             agent,
             container,
             lifecycle,
+            mut bindings,
         } = self;
         lifecycle.close(ClosedBy::Owner);
         let events = lifecycle.events();
@@ -264,31 +274,43 @@ impl Session {
             }
             let _ = tokio::time::timeout(TERMINATE_GRACE, gate.drained()).await;
         }
+        // After the drain, so a hosted call still running had its time, and
+        // before the container, as `lifecycle.md`'s terminating step orders
+        // them.
+        let binding_stops = bindings.stop(STOP_GRACE).await;
+        let mut failed: Vec<String> = binding_stops
+            .iter()
+            .filter(|stop| !stop.group_empty)
+            .map(|stop| {
+                format!(
+                    "the binding `{}`'s process group is not proven empty: {}",
+                    stop.name,
+                    stop.survivors.join(", ")
+                )
+            })
+            .collect();
         let gone = interpreter.gone();
         interpreter.expect_exit();
-        let stopped = match container {
+        match container {
             Some(outrig) => {
-                let failed = outrig.stop().await;
+                failed.extend(outrig.stop().await);
                 // Recorded before the report, so the log says so too.
                 let _ = tokio::time::timeout(EXIT_WAIT, gone).await;
-                match failed.is_empty() {
-                    true => Stopped::Proven,
-                    false => Stopped::NotProven {
-                        reason: failed.join("; "),
-                    },
-                }
             }
             // A host session: its interpreter is stopped once it is seen to
             // exit after its input closes.
             None => {
                 interpreter.hang_up();
-                match tokio::time::timeout(EXIT_WAIT, gone).await {
-                    Ok(()) => Stopped::Proven,
-                    Err(_) => Stopped::NotProven {
-                        reason: format!("the interpreter did not exit within {EXIT_WAIT:?}"),
-                    },
+                if tokio::time::timeout(EXIT_WAIT, gone).await.is_err() {
+                    failed.push(format!("the interpreter did not exit within {EXIT_WAIT:?}"));
                 }
             }
+        }
+        let stopped = match failed.is_empty() {
+            true => Stopped::Proven,
+            false => Stopped::NotProven {
+                reason: failed.join("; "),
+            },
         };
         let executions: Vec<ExecutionOutcome> = gate
             .live_at_close()
@@ -305,6 +327,7 @@ impl Session {
             closed_by: closed_by.clone(),
             stopped: stopped.clone(),
             executions: executions.clone(),
+            bindings: binding_stops.clone(),
             verdict: report::verdict(&stopped, &executions),
         });
         let log = events
@@ -318,6 +341,7 @@ impl Session {
             closed_by,
             stopped,
             executions,
+            bindings: binding_stops,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,
@@ -330,6 +354,12 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn interpreter(&self) -> &crate::python::host::Interpreter {
         &self.agent.interpreter
+    }
+
+    /// The session's bindings, for a test.
+    #[cfg(test)]
+    pub(crate) fn bindings(&self) -> &Bindings {
+        &self.bindings
     }
 
     /// The session's container, for a test.

@@ -86,8 +86,9 @@ anything -- `factory = "os:system"` with an argument is a shell command. The rep
 `.agents/outrig/config.toml`, is repository content. A cloned project brings one, and the agent can
 write it through the workspace mount, which is read-write. Without approval, either could choose
 what the host runs the next time a session starts. Bindings from the global config or the embedding
-API need no approval: they come from the operator or the embedder directly. `0003-20` builds the
-prompt and the digest store, and decides what happens when nobody can be prompted.
+API need no approval: they come from the operator or the embedder directly. `0003-20` built the
+prompt and the digest store; when nobody can be prompted, the binding does not start and the
+session runs without it, saying so.
 
 ## Where it runs
 
@@ -156,8 +157,11 @@ pure-Python package published only as a source distribution does not, and cannot
 wheel of it exists. The cache is keyed by the requirement text, so an unpinned requirement resolves
 once and stays resolved until its cache entry is removed.
 
-The same directory is mounted read-only in the container and added to the agent's `sys.path`, so
-agent code can `import git`. That is what makes the library's types useful on the agent's side.
+The same directory is mounted read-only in the container, at `/outrig/bindings/<hash>` beside the
+payload rather than at its host path -- podman would make a host path's missing parents, such as
+`~/.cache`, root-owned in the container user's home (`0003-20`) -- and added to the agent's
+`sys.path`, after the workspace and before what the agent's own `pip` installs, so agent code can
+`import git`. That is what makes the library's types useful on the agent's side.
 `except git.GitCommandError` catches the host's exception, and `isinstance(c, git.Commit)` holds
 for a proxy `c` of a host commit, because RPyC gives a proxy the local class of the same module and
 name when that module has been imported in the container. The mount is read-only because the
@@ -390,7 +394,9 @@ The agent learns its bindings two ways, and neither crosses the boundary:
   runs no `repr`, and reads no property.
 
 A binding name that is not a Python identifier, or that collides with `runtime`, `asyncio`,
-`outrig`, or another binding, fails session startup rather than shadowing anything. The check runs
+`outrig`, or another binding, fails session startup rather than shadowing anything. A relative
+`{ path }` in a binding's arguments resolves against the repository's root, whichever layer
+declared it (`0003-20`). The check runs
 after the bindings from the global config, the repo config, and the embedding API are merged, in
 that order ("A binding"). By then a repo entry has replaced a global one of the same name, so a
 collision between bindings is an embedding-API binding that repeats a name already taken. Rebinding
@@ -684,8 +690,6 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
 
 ## Open questions
 
-- How a relative tagged path resolves. The config's general rule is the directory of the file that
-  declared it; `0003-20` states it for `[bindings]`.
 - What a binding process dying mid-session does. Its calls in flight are `unknown`; whether the
   session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-22`'s.
 - Whether the facade's `async for` fetches a returned container in batches with RPyC's

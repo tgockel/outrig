@@ -232,8 +232,8 @@ srv = { command = ["bin", "arg1"] }
             Path::new(".agents/outrig/resources/docs"),
         );
         assert_eq!(
-            cfg.workspace.mounts[0].container_path(),
-            Path::new("/resources/docs"),
+            cfg.workspace.mounts[0].declared_container_path(),
+            Some(Path::new("/resources/docs")),
         );
         assert_eq!(cfg.workspace.mounts[0].access(), MountAccess::ReadOnly);
         assert_eq!(
@@ -241,8 +241,8 @@ srv = { command = ["bin", "arg1"] }
             Path::new(".agents/outrig/resources/cache"),
         );
         assert_eq!(
-            cfg.workspace.mounts[1].container_path(),
-            Path::new("/resources/cache"),
+            cfg.workspace.mounts[1].declared_container_path(),
+            Some(Path::new("/resources/cache")),
         );
         assert_eq!(cfg.workspace.mounts[1].access(), MountAccess::ReadWrite);
 

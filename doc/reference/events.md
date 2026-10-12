@@ -166,7 +166,15 @@ recorded as a `model.call` of its own, right after the `model.failover` that mov
     `{"state": "not_proven", "reason": ...}` when something could not be confirmed stopped.
   - `executions`: each execution running at the close, as `{execid, status}`; `status` is `ok`
     or `error` if its result arrived, and `unknown` if it was cut off.
+  - `bindings`: how each binding's process stopped, as `{binding, group_empty, killed,
+    survivors}`: whether no process is left in its process group, whether `SIGKILL` was needed
+    after the grace, and what was still in the group when it could not be proven empty, each as
+    `<pid> <command> <state>`. A group not proven empty makes `stopped` `not_proven`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
+- `binding.refused` -- a binding a repository's config declared did not start, and the session
+  runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
+  `reason`, which says whether the operator did not approve the declaration, nobody could be
+  asked, or the session had no approver, and how to approve it.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
   and `tool_result_max`.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the

@@ -43,6 +43,29 @@ pub fn outrig::config::ConfigSource::config_path(&self) -> std::path::PathBuf
 #[non_exhaustive] pub enum outrig::config::ConfigValidationError
 pub outrig::config::ConfigValidationError::AgentMissingModel
 pub outrig::config::ConfigValidationError::AgentMissingModel::agent: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingContainerPath
+pub outrig::config::ConfigValidationError::BindingContainerPath::container: std::path::PathBuf
+pub outrig::config::ConfigValidationError::BindingContainerPath::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingContainerPath::host: std::path::PathBuf
+pub outrig::config::ConfigValidationError::BindingContainerPath::key: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingDescriptionEmpty
+pub outrig::config::ConfigValidationError::BindingDescriptionEmpty::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingDescriptionEmpty::name: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingFactory
+pub outrig::config::ConfigValidationError::BindingFactory::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingFactory::factory: alloc::string::String
+pub outrig::config::ConfigValidationError::BindingFactory::name: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingName
+pub outrig::config::ConfigValidationError::BindingName::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingName::name: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingNameTaken
+pub outrig::config::ConfigValidationError::BindingNameTaken::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingNameTaken::name: alloc::string::String
+pub outrig::config::ConfigValidationError::BindingNameTaken::taken: &'static str
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BindingRequires
+pub outrig::config::ConfigValidationError::BindingRequires::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::BindingRequires::name: alloc::string::String
+pub outrig::config::ConfigValidationError::BindingRequires::reason: alloc::string::String
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid::image: alloc::string::String
 pub outrig::config::ConfigValidationError::CapabilityDropAddConflict
@@ -281,6 +304,20 @@ pub outrig::config::EnvValueError::NotUnicode::var: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::EventsMode
 pub outrig::config::EventsMode::Off
 pub outrig::config::EventsMode::Record
+#[non_exhaustive] pub enum outrig::config::FactoryValue
+pub outrig::config::FactoryValue::Array(alloc::vec::Vec<outrig::config::FactoryValue>)
+pub outrig::config::FactoryValue::Boolean(bool)
+pub outrig::config::FactoryValue::Float(f64)
+pub outrig::config::FactoryValue::Integer(i64)
+pub outrig::config::FactoryValue::Path(std::path::PathBuf)
+pub outrig::config::FactoryValue::String(alloc::string::String)
+pub outrig::config::FactoryValue::Table(alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::FactoryValue>)
+impl outrig::config::FactoryValue
+pub fn outrig::config::FactoryValue::path(impl core::convert::Into<std::path::PathBuf>) -> Self
+impl serde_core::ser::Serialize for outrig::config::FactoryValue
+pub fn outrig::config::FactoryValue::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::FactoryValue
+pub fn outrig::config::FactoryValue::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 #[non_exhaustive] pub enum outrig::config::ImageSourceRef<'a>
 #[non_exhaustive] pub outrig::config::ImageSourceRef::Build
 pub outrig::config::ImageSourceRef::Build::build_args: &'a alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
@@ -424,8 +461,21 @@ impl serde_core::ser::Serialize for outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+#[non_exhaustive] pub struct outrig::config::Binding
+pub outrig::config::Binding::args: alloc::vec::Vec<outrig::config::FactoryValue>
+pub outrig::config::Binding::description: alloc::string::String
+pub outrig::config::Binding::factory: alloc::string::String
+pub outrig::config::Binding::kwargs: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::FactoryValue>
+pub outrig::config::Binding::requires: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::Binding::serialize: bool
+impl outrig::config::Binding
+pub fn outrig::config::Binding::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
+pub fn outrig::config::Binding::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::convert::From<outrig::config::Binding> for outrig::harness::BindingSpec
+pub fn outrig::harness::BindingSpec::from(outrig::config::Binding) -> Self
 #[non_exhaustive] pub struct outrig::config::Config
 pub outrig::config::Config::agents: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Agent>
+pub outrig::config::Config::bindings: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Binding>
 pub outrig::config::Config::default_agent: core::option::Option<alloc::string::String>
 pub outrig::config::Config::default_image: core::option::Option<alloc::string::String>
 pub outrig::config::Config::default_model: core::option::Option<alloc::string::String>
@@ -503,9 +553,10 @@ pub fn outrig::config::Model::source(&self) -> outrig::config::ModelSourceRef<'_
 impl outrig::config::MountConfig
 pub fn outrig::config::MountConfig::access(&self) -> outrig::config::MountAccess
 pub fn outrig::config::MountConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
-pub fn outrig::config::MountConfig::container_path(&self) -> &std::path::Path
+pub fn outrig::config::MountConfig::declared_container_path(&self) -> core::option::Option<&std::path::Path>
 pub fn outrig::config::MountConfig::host_path(&self) -> &std::path::Path
 pub fn outrig::config::MountConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
+pub fn outrig::config::MountConfig::resolved_container_path(&self, &std::path::Path) -> std::path::PathBuf
 pub fn outrig::config::MountConfig::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 pub fn outrig::config::MountConfig::set_access(&mut self, outrig::config::MountAccess)
 pub fn outrig::config::MountConfig::set_container_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
@@ -943,6 +994,10 @@ pub outrig::harness::event::Payload::AgentStarted::python: alloc::string::String
 pub outrig::harness::event::Payload::AgentStarted::tool_call_max: u64
 pub outrig::harness::event::Payload::AgentStarted::tool_result_max: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentStopped
+#[non_exhaustive] pub outrig::harness::event::Payload::BindingRefused
+pub outrig::harness::event::Payload::BindingRefused::binding: alloc::string::String
+pub outrig::harness::event::Payload::BindingRefused::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::harness::event::Payload::BindingRefused::reason: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::ContextDemoted
 pub outrig::harness::event::Payload::ContextDemoted::turns: alloc::vec::Vec<u64>
 #[non_exhaustive] pub outrig::harness::event::Payload::ContextPromoted
@@ -1054,6 +1109,7 @@ pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::St
 #[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
 pub outrig::harness::event::Payload::RoundStarted::round: u32
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionReport
+pub outrig::harness::event::Payload::SessionReport::bindings: alloc::vec::Vec<outrig::harness::BindingStop>
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
@@ -1210,6 +1266,10 @@ pub outrig::harness::event::Usage::total_tokens: u64
 impl core::iter::traits::accum::Sum for outrig::harness::event::Usage
 pub fn outrig::harness::event::Usage::sum<I: core::iter::traits::iterator::Iterator<Item = outrig::harness::event::Usage>>(I) -> outrig::harness::event::Usage
 pub const outrig::harness::event::DEFAULT_CAPACITY: usize
+#[non_exhaustive] pub enum outrig::harness::Approval
+pub outrig::harness::Approval::Approve
+pub outrig::harness::Approval::CannotAsk
+pub outrig::harness::Approval::Refuse
 #[non_exhaustive] pub enum outrig::harness::ClosedBy
 #[non_exhaustive] pub outrig::harness::ClosedBy::InterpreterExited
 pub outrig::harness::ClosedBy::InterpreterExited::cause: alloc::string::String
@@ -1234,7 +1294,9 @@ pub outrig::harness::SessionError::Resolve(outrig::harness::Failure)
 pub outrig::harness::SessionError::Round(outrig::harness::Failure)
 pub outrig::harness::SessionError::Start(outrig::harness::Failure)
 #[non_exhaustive] pub enum outrig::harness::Step
+pub outrig::harness::Step::Bindings
 pub outrig::harness::Step::Container
+pub outrig::harness::Step::Packages
 pub outrig::harness::Step::Python
 #[non_exhaustive] pub enum outrig::harness::Stopped
 #[non_exhaustive] pub outrig::harness::Stopped::NotProven
@@ -1249,6 +1311,24 @@ pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String
 pub outrig::harness::Verdict::Clean
 pub outrig::harness::Verdict::NotProvenStopped
 pub outrig::harness::Verdict::StoppedWithUnknown
+#[non_exhaustive] pub struct outrig::harness::ApprovalRequest
+pub outrig::harness::ApprovalRequest::declaration: alloc::string::String
+pub outrig::harness::ApprovalRequest::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::harness::ApprovalRequest::name: alloc::string::String
+pub outrig::harness::ApprovalRequest::repo_root: std::path::PathBuf
+impl outrig::harness::ApprovalRequest
+pub fn outrig::harness::ApprovalRequest::new(impl core::convert::Into<alloc::string::String>, core::option::Option<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>) -> Self
+pub struct outrig::harness::BindingSpec
+impl outrig::harness::BindingSpec
+pub fn outrig::harness::BindingSpec::env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>
+pub fn outrig::harness::BindingSpec::new(outrig::config::Binding) -> Self
+impl core::convert::From<outrig::config::Binding> for outrig::harness::BindingSpec
+pub fn outrig::harness::BindingSpec::from(outrig::config::Binding) -> Self
+#[non_exhaustive] pub struct outrig::harness::BindingStop
+pub outrig::harness::BindingStop::group_empty: bool
+pub outrig::harness::BindingStop::killed: bool
+pub outrig::harness::BindingStop::name: alloc::string::String
+pub outrig::harness::BindingStop::survivors: alloc::vec::Vec<alloc::string::String>
 pub struct outrig::harness::Closed
 impl outrig::harness::Closed
 pub fn outrig::harness::Closed::by(&self) -> &outrig::harness::ClosedBy
@@ -1301,16 +1381,20 @@ pub fn outrig::harness::Session::stop_held(&self) -> core::option::Option<alloc:
 pub fn outrig::harness::Session::user_channel(&self) -> outrig::harness::UserChannel
 pub struct outrig::harness::SessionBuilder
 impl outrig::harness::SessionBuilder
+pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::Approver + 'static) -> Self
+pub fn outrig::harness::SessionBuilder::bind(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<outrig::harness::BindingSpec>) -> Self
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
 pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function::FnMut(outrig::harness::Progress) + core::marker::Send + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
+pub fn outrig::harness::SessionBuilder::repo_root(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::harness::SessionBuilder::secrets(self, impl outrig::config::Secrets + 'static) -> Self
 pub async fn outrig::harness::SessionBuilder::start(self) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::subscribe(&mut self) -> outrig::harness::event::Subscription
 pub fn outrig::harness::SessionBuilder::subscribe_with_capacity(&mut self, usize) -> outrig::harness::event::Subscription
 #[non_exhaustive] pub struct outrig::harness::ShutdownReport
+pub outrig::harness::ShutdownReport::bindings: alloc::vec::Vec<outrig::harness::BindingStop>
 pub outrig::harness::ShutdownReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
@@ -1327,6 +1411,10 @@ pub async fn outrig::harness::UserChannel::receive(&self) -> core::option::Optio
 pub fn outrig::harness::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::harness::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
 pub const outrig::harness::DEFAULT_DRAIN: core::time::Duration
+pub trait outrig::harness::Approver: core::marker::Send + core::marker::Sync
+pub fn outrig::harness::Approver::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval
+impl<F> outrig::harness::Approver for F where F: core::ops::function::Fn(&outrig::harness::ApprovalRequest) -> outrig::harness::Approval + core::marker::Send + core::marker::Sync
+pub fn F::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval
 pub trait outrig::harness::Secrets: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::Secrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 impl outrig::config::Secrets for outrig::config::EnvSecrets

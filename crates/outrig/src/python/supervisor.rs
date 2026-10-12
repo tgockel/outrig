@@ -47,9 +47,6 @@
 //! on a host whose PID 1 reaps orphans, and never on one that does not, where the report says
 //! not proven rather than guess. A descendant that called `setsid` left the group and is outside
 //! everything here.
-//!
-//! Nothing in production starts a binding yet; `0003-20` does, from a session's config.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -105,6 +102,8 @@ const DEATH_SIGNAL: Signal = Signal::SIGHUP;
 
 /// How to start one binding process.
 pub(crate) struct Spec<'a> {
+    /// The binding's name, for the errors a failed start reports.
+    pub(crate) name: &'a str,
     /// The payload's `python3`.
     pub(crate) python: &'a Path,
     /// The vendored RPyC's directory.
@@ -113,6 +112,11 @@ pub(crate) struct Spec<'a> {
     pub(crate) packages: &'a Path,
     /// The factory, as `module:callable`.
     pub(crate) factory: &'a str,
+    /// The factory's positional arguments, a JSON array, and its keyword arguments, a JSON
+    /// object: the first line on the binding's stdin, so they never reach its command line,
+    /// which any user on the host can read.
+    pub(crate) args: Value,
+    pub(crate) kwargs: Value,
     /// One call at a time across the binding's connections (`--serialize`).
     pub(crate) serialize: bool,
     /// The process's working directory; the owner's when `None`.
@@ -139,6 +143,10 @@ pub(crate) struct Probe {
 
 /// A request the binding holds until [`Binding::answer`] is called with its id.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the relay `0003-22` builds reads it")
+)]
 pub(crate) struct Decision {
     pub(crate) id: u64,
     /// The decision line less its `t` and `id`.
@@ -149,6 +157,7 @@ pub(crate) struct Decision {
 #[derive(Debug)]
 pub(crate) struct Stopped {
     /// The binding's own exit status, when it could be reaped.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test reads it"))]
     pub(crate) status: Option<ExitStatus>,
     /// Whether the group is proven empty: `kill(-pgid, 0)` found no process in it. Only that
     /// answer proves anything; a killed member is a zombie until its parent reaps it, so on a
@@ -184,11 +193,29 @@ pub(crate) struct Binding {
     /// Its pid, which is also its process group's id.
     pid: Pid,
     /// `None` once [`Binding::close_stdin`] was called.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     stdin: Option<mpsc::Sender<Value>>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     rpc: Option<mpsc::Receiver<Value>>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     events: Option<mpsc::Receiver<Value>>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     decisions: Option<mpsc::Receiver<Decision>>,
     stderr: Arc<Mutex<VecDeque<String>>>,
+    /// The qualified name of the type of what the factory returned, as the binding reported it.
+    type_name: String,
     /// Whether `stop` reaped the binding, so `Drop` has nothing left to kill. Until then the
     /// unreaped process anchors the group's id, which names this group and no other.
     reaped: bool,
@@ -196,9 +223,10 @@ pub(crate) struct Binding {
 
 /// Start the binding `spec` describes and wait for its factory to return.
 ///
-/// The error for a process that exits, or says anything but `ready`, before then names the
-/// factory, carries the last of its stderr -- the factory's traceback -- and leaves nothing of
-/// its group running.
+/// The error for a factory that raises names the binding, the factory, and the exception's type
+/// and message; for a process that exits, or says anything but `ready`, before then, it names
+/// the binding and carries the last of its stderr. Either way nothing of its group is left
+/// running.
 pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
     let mut cmd = Command::new(spec.python);
     cmd.args(["-I", "-c", PROGRAM])
@@ -263,8 +291,8 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
 
     let armed = spawn_on_parent_thread(cmd).await.map_err(|e| {
         OutrigError::Configuration(format!(
-            "the binding {:?} did not start: cannot run {}: {e}",
-            spec.factory,
+            "the binding `{}` did not start: cannot run {}: {e}",
+            spec.name,
             spec.python.display()
         ))
     })?;
@@ -280,10 +308,13 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
     let (rpc_tx, rpc_rx) = mpsc::channel(QUEUE);
     let (events_tx, events_rx) = mpsc::channel(QUEUE);
     let (decisions_tx, decisions_rx) = mpsc::channel(QUEUE);
+    // The factory's arguments go first, ahead of anything else the owner sends; the queue is
+    // empty, so this cannot wait.
+    let _ = stdin_tx.try_send(json!({"t": "factory", "args": spec.args, "kwargs": spec.kwargs}));
     tokio::spawn(write_lines(stdin, stdin_rx));
     // The handle exists before anything waits, so a `start` dropped while the factory runs --
     // under a timeout, say -- takes the whole group with it rather than the binding alone.
-    let binding = Binding {
+    let mut binding = Binding {
         child,
         pid,
         stdin: Some(stdin_tx),
@@ -291,6 +322,7 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
         events: Some(events_rx),
         decisions: Some(decisions_rx),
         stderr: tail,
+        type_name: String::new(),
         reaped: false,
     };
 
@@ -301,7 +333,17 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
         Err(_) => Some(format!("it did not report ready within {READY_TIMEOUT:?}")),
         Ok(Err(_)) | Ok(Ok(None)) => Some("its output closed before it reported ready".into()),
         Ok(Ok(Some(_))) => match serde_json::from_slice::<Value>(&line) {
-            Ok(message) if message["t"] == "ready" => None,
+            Ok(message) if message["t"] == "ready" => {
+                binding.type_name = message["type"].as_str().unwrap_or_default().to_string();
+                None
+            }
+            Ok(message) if message["t"] == "failed" => Some(format!(
+                "its factory `{}` raised {}",
+                spec.factory,
+                message["error"]
+                    .as_str()
+                    .unwrap_or("an exception it could not describe")
+            )),
             Ok(message) => Some(format!("it said {} before ready", message["t"])),
             Err(_) => Some(format!(
                 "its first line was not a protocol message: {:?}",
@@ -310,7 +352,7 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
         },
     };
     if let Some(why) = why {
-        return Err(failed_start(binding, drain, spec.factory, why).await);
+        return Err(failed_start(binding, drain, spec.name, why).await);
     }
     tokio::spawn(route(stdout, rpc_tx, events_tx, decisions_tx));
     Ok(binding)
@@ -321,14 +363,15 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Binding> {
 async fn failed_start(
     mut binding: Binding,
     drain: JoinHandle<()>,
-    factory: &str,
+    name: &str,
     why: String,
 ) -> OutrigError {
     let _ = kill(group(binding.pid), Signal::SIGKILL);
-    let _ = binding.child.wait().await;
-    binding.reaped = true;
+    binding.reaped = reap_by(&mut binding.child, Instant::now() + KILL_WAIT)
+        .await
+        .is_some();
     let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
-    let mut message = format!("the binding {factory:?} did not start: {why}");
+    let mut message = format!("the binding `{name}` did not start: {why}");
     let stderr = binding.stderr();
     if !stderr.is_empty() {
         let _ = write!(message, "; its stderr:\n{stderr}");
@@ -338,18 +381,33 @@ async fn failed_start(
 
 impl Binding {
     /// The binding's pid, which is also its process group's id.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test reads it"))]
     pub(crate) fn pid(&self) -> Pid {
         self.pid
     }
 
+    /// The qualified name of the type of the object the factory returned, such as
+    /// `git.repo.base.Repo`.
+    pub(crate) fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
     /// A sender into the stdin queue, for a std thread's `blocking_send`. Panics once
     /// [`Binding::close_stdin`] was called.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) fn sender(&self) -> mpsc::Sender<Value> {
         self.stdin.clone().expect("the binding's stdin is open")
     }
 
     /// Queue `message` as one line on the binding's stdin -- an `rpc` frame, a decision's answer,
     /// a control line; `BrokenPipe` once stdin is closed or the binding is gone.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) async fn send(&self, message: Value) -> io::Result<()> {
         let broken = || io::Error::new(ErrorKind::BrokenPipe, "the binding's stdin is closed");
         let stdin = self.stdin.as_ref().ok_or_else(broken)?;
@@ -357,22 +415,38 @@ impl Binding {
     }
 
     /// Answer decision `id` with `answer`, which releases the request the binding held for it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) async fn answer(&self, id: u64, answer: Value) -> io::Result<()> {
         self.send(json!({"t": "decision", "id": id, "answer": answer}))
             .await
     }
 
     /// The binding's `rpc` lines, taken once.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) fn take_rpc(&mut self) -> mpsc::Receiver<Value> {
         self.rpc.take().expect("the rpc lines are taken once")
     }
 
     /// The binding's `event` lines, taken once.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) fn take_events(&mut self) -> mpsc::Receiver<Value> {
         self.events.take().expect("the event lines are taken once")
     }
 
     /// The binding's decision requests, taken once.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+    )]
     pub(crate) fn take_decisions(&mut self) -> mpsc::Receiver<Decision> {
         self.decisions.take().expect("the decisions are taken once")
     }
@@ -417,11 +491,14 @@ impl Binding {
         }
         // Before the reap: an unreaped binding keeps the group's id from being reused.
         let _ = kill(group, Signal::SIGKILL);
-        if status.is_none() {
-            status = self.child.wait().await.ok();
-        }
-        self.reaped = true;
         let deadline = Instant::now() + KILL_WAIT;
+        if status.is_none() {
+            // Bounded: a thread stuck in uninterruptible I/O -- a request to a hung FUSE
+            // daemon, say -- outlasts `SIGKILL`, and the binding is then left to `kill_on_drop`
+            // and tokio's orphan queue, its group not proven empty.
+            status = reap_by(&mut self.child, deadline).await;
+        }
+        self.reaped = status.is_some();
         while !group_empty(group) {
             if Instant::now() >= deadline {
                 return Stopped {
@@ -451,6 +528,14 @@ impl Drop for Binding {
             let _ = kill(group(self.pid), Signal::SIGKILL);
         }
     }
+}
+
+/// `child`'s exit status, if it can be reaped by `deadline`.
+async fn reap_by(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    tokio::time::timeout_at(deadline, child.wait())
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Every process whose group is `pgid`, by pid.

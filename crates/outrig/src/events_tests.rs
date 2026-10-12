@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
-use crate::harness::{ClosedBy, ExecutionOutcome, ExecutionStatus, Stopped, Verdict};
+use crate::harness::{BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, Stopped, Verdict};
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
 
@@ -227,10 +227,25 @@ fn each_event_has_exactly_its_data_fields() {
                     id,
                     status: ExecutionStatus::Unknown,
                 }],
+                bindings: vec![BindingStop {
+                    name: text("repo"),
+                    group_empty: true,
+                    killed: false,
+                    survivors: Vec::new(),
+                }],
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
-            &["closed_by", "stopped", "executions", "verdict"],
+            &["closed_by", "stopped", "executions", "bindings", "verdict"],
+        ),
+        (
+            Payload::BindingRefused {
+                binding: text("repo"),
+                declared_in: Some("/repo/.agents/outrig/config.toml".into()),
+                reason: text("the operator did not approve its declaration"),
+            },
+            "binding.refused",
+            &["binding", "declared_in", "reason"],
         ),
         (
             Payload::AgentStarted {
@@ -607,7 +622,19 @@ fn each_event_has_exactly_its_data_fields() {
             "closed_by": {"by": "owner"},
             "stopped": {"state": "proven"},
             "executions": [{"execid": 3, "status": "unknown"}],
+            "bindings": [
+                {"binding": "repo", "group_empty": true, "killed": false, "survivors": []}
+            ],
             "verdict": "stopped_with_unknown",
+        })
+    );
+    let refused = serde_json::to_value(case("binding.refused")).expect("encodes");
+    assert_eq!(
+        refused,
+        json!({
+            "binding": "repo",
+            "declared_in": "/repo/.agents/outrig/config.toml",
+            "reason": "the operator did not approve its declaration",
         })
     );
     let state = serde_json::to_value(case("session.state")).expect("encodes");

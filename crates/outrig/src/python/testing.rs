@@ -46,6 +46,29 @@ pub(crate) async fn slot_freed(interpreter: &Interpreter) {
     .await;
 }
 
+/// Whether no process is left in the process group `pgid`: `kill(-pgid, 0)` failing with
+/// `ESRCH`, and nothing else, since a zombie member still answers.
+pub(crate) fn group_gone(pgid: nix::unistd::Pid) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pgid.as_raw()), None)
+        == Err(nix::errno::Errno::ESRCH)
+}
+
+/// Wait up to `within` for the process group `pgid` to be gone, failing with what is left in it.
+pub(crate) fn wait_group_gone(pgid: nix::unistd::Pid, within: Duration) {
+    let deadline = Instant::now() + within;
+    while !group_gone(pgid) {
+        assert!(
+            Instant::now() < deadline,
+            "group {pgid} still holds {:?} after {within:?}",
+            super::supervisor::group_members(pgid)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Polls `check` until it answers, failing after [`TIMEOUT`] with what it was waiting for.
 pub(crate) fn eventually<T>(
     mut check: impl FnMut() -> Option<T>,
@@ -147,10 +170,9 @@ pub(crate) fn host_home() -> PathBuf {
 /// The payload's interpreter, started as `Interpreter::start` starts it but on
 /// the host, with `agent` as its argument when there is one.
 pub(super) async fn spawn(agent: Option<&str>) -> Child {
-    let python = payload::host_dir()
+    let python = payload::host_python()
         .await
-        .expect("the payload this build embedded")
-        .join("bin/python3");
+        .expect("the payload this build embedded");
     tokio::process::Command::new(python)
         .args(ARGS)
         .args(agent)
@@ -247,10 +269,9 @@ pub(crate) fn python() -> &'static Path {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("a runtime to unpack the payload on");
-        let dir = runtime
-            .block_on(payload::host_dir())
-            .expect("the payload this build embedded");
-        dir.join("bin/python3")
+        runtime
+            .block_on(payload::host_python())
+            .expect("the payload this build embedded")
     })
 }
 
@@ -477,6 +498,12 @@ def pip(*args, python=None, **options):
 /// distribution whose build backend marks the file `OUTRIG_CANARY` names when it runs; and
 /// `needs_url`, pure and depending on `evil` by URL. The directory the wheels end up in is the
 /// second argument, for that URL.
+///
+/// For the session's bindings: `verfix` 1.0 to 4.0, each whose `VERSION` is its own; and
+/// `recorder`, whose factories write what they were given to the file their `out` argument names,
+/// as JSON -- `make` its arguments, working directory, environment, pid and the `verfix` it
+/// imported; `failing` raises; and `spawning` also starts `sleep 1000` in its process group and
+/// records that child's pid.
 const WHEELS: &str = r#"
 import io, os, pathlib, sys, sysconfig, tarfile, zipfile
 
@@ -485,15 +512,16 @@ plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
 cp = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
 
-def wheel(name, tag, tags=None, purelib=True, requires=None, extra=()):
+def wheel(name, tag, tags=None, purelib=True, requires=None, extra=(), version="1.0",
+          body="ANSWER = 42\n"):
     """A wheel named for `tag`, whose WHEEL file lists `tags` -- one line per Python tag, as
     `bdist_wheel` writes a compressed tag -- or `tag` alone."""
-    dist = f"{name}-1.0.dist-info"
-    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+    dist = f"{name}-{version}.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
     if requires:
         metadata += f"Requires-Dist: {requires}\n"
-    with zipfile.ZipFile(os.path.join(out, f"{name}-1.0-{tag}.whl"), "w") as z:
-        z.writestr(f"{name}.py", "ANSWER = 42\n")
+    with zipfile.ZipFile(os.path.join(out, f"{name}-{version}-{tag}.whl"), "w") as z:
+        z.writestr(f"{name}.py", body)
         for member, data in extra:
             z.writestr(member, data)
         z.writestr(f"{dist}/METADATA", metadata)
@@ -512,6 +540,42 @@ wheel("universal", "py2.py3-none-any", tags=["py2-none-any", "py3-none-any"])
 wheel("compiled", f"{cp}-{cp}-{plat}", purelib=False)
 wheel("mislabeled", "py3-none-any", extra=[("mislabeled_ext.so", b"\x7fELF, or so it says")])
 wheel("needs_compiled", "py3-none-any", requires="compiled")
+for v in range(1, 5):
+    wheel("verfix", "py3-none-any", version=f"{v}.0", body=f"VERSION = '{v}.0'\n")
+wheel("recorder", "py3-none-any", body="""
+import json, os, subprocess
+
+
+class Recorded:
+    pass
+
+
+def _write(out, record):
+    with open(out + ".part", "w") as f:
+        json.dump(record, f)
+    os.replace(out + ".part", out)
+
+
+def make(*args, out, **kwargs):
+    try:
+        import verfix
+        version = verfix.VERSION
+    except ImportError:
+        version = None
+    _write(out, {"args": list(args), "kwargs": kwargs, "cwd": os.getcwd(),
+                 "env": dict(os.environ), "pid": os.getpid(), "verfix": version})
+    return Recorded()
+
+
+def failing(*args, **kwargs):
+    raise ValueError("the recorder was told to fail")
+
+
+def spawning(*, out):
+    child = subprocess.Popen(["sleep", "1000"])
+    _write(out, {"pid": os.getpid(), "child": child.pid})
+    return Recorded()
+""")
 
 def sdist(name, members):
     with tarfile.open(os.path.join(out, f"{name}-1.0.tar.gz"), "w:gz") as t:

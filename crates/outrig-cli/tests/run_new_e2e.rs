@@ -1018,6 +1018,45 @@ async fn quit_with_nothing_running_exits_0_and_reports_a_clean_stop() {
     assert!(podman_names(&format!("name={container}")).is_empty());
 }
 
+/// A binding the repository's config declares, with no terminal to ask the
+/// operator on, does not start: `run-new` says which and how to approve it,
+/// and the session runs without it.
+#[tokio::test]
+async fn an_unapproved_repo_binding_with_no_terminal_does_not_start() {
+    let (addr, mut requests) = start_mock_http(vec![
+        submit("toolu_1", "print(list(runtime.bindings))"),
+        text_reply("listed"),
+    ])
+    .await;
+    let repo = repo_with(
+        addr,
+        "[bindings.rec]\ndescription = \"Records.\"\nfactory = \"recorder:make\"\n",
+    );
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+    session.type_line("list them").await;
+    wait_for(&session.stderr, "listed", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("the binding `rec`, declared in")
+            && stderr.contains("is not approved and there is no terminal to ask on"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("move [bindings.rec] to the global config"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("starting bindings"), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(
+        tool_result(&recorded[1], "toolu_1"),
+        "[]\n",
+        "the agent sees no binding"
+    );
+}
+
 /// A round whose code leaves a task running says so as it closes, so a prompt
 /// that returns is not taken for work done.
 #[tokio::test]

@@ -1239,7 +1239,7 @@ fn container_mounts(repo_root: &Path, mounts: &[MountConfig]) -> Vec<ContainerMo
         .map(|mount| {
             ContainerMount::new(
                 mount.resolved_host_path(repo_root),
-                mount.container_path().to_path_buf(),
+                mount.resolved_container_path(repo_root),
                 mount.access(),
             )
         })

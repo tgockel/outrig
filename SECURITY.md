@@ -50,6 +50,9 @@ Issues that bear on **host integrity** are in scope, for example:
 - A container launched more permissively than its `[images.<name>.security]` block asks for --
   `--security-opt=no-new-privileges` missing when `no-new-privileges` was not set to `false`,
   or a device reaching a container that did not list it in `devices`.
+- A binding a repository's config declares (`[bindings.<name>]`) starting without the
+  operator's approval of that exact declaration in that repository. A binding's factory is code
+  the host runs as the user, and a repository's config is content the agent can write.
 
 ## Known boundaries (by design, not vulnerabilities)
 
@@ -73,6 +76,14 @@ Issues that bear on **host integrity** are in scope, for example:
   mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
 - Network filtering is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
+- A **binding** (`[bindings.<name>]`, 0.3) runs a library in a process **on the host, outside
+  the container**, with the host user's authority: their files, their `ssh-agent`, their
+  credential helpers, and every variable of their environment but the ones OutRig's config
+  names through `${VAR}`. Whatever the library does on the host is part of what the binding
+  grants -- GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names,
+  and the agent can write `.git/` through the workspace mount. With no policy configured,
+  every request the agent's code makes of a binding runs, and is published as events. Binding
+  a library is a deliberate grant by whoever wrote the config, not a vulnerability.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

@@ -645,13 +645,18 @@ access         = "read-write"
   existing directory. A relative value resolves against the directory of the
   file that declared it -- see [path resolution](#path-resolution).
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
-  workspace is mounted in the container.
+  workspace is mounted in the container. In a session with a
+  [binding](#bindingsname), the workspace is mounted at its host path instead, and a declared
+  `container-path` must be that path.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
 - `mounts[*].host-path` (path, required): host directory to mount. Relative paths
   resolve against the directory of the file that declared the entry -- see
   [path resolution](#path-resolution). Global and repo mounts are concatenated,
   so one list can hold entries with different base directories.
-- `mounts[*].container-path` (path, required): absolute in-container mount point.
+- `mounts[*].container-path` (path, optional, default: the resolved `host-path`): absolute
+  in-container mount point. Left unset, the directory appears in the container where it is on
+  the host. In a session with a [binding](#bindingsname) it must be left unset or be that
+  path.
 - `mounts[*].access` (string, optional, default: `"read-only"`): either
   `"read-only"` or `"read-write"`.
 
@@ -659,6 +664,65 @@ The primary workspace bind-mount is always read-write and uses `--userns=keep-id
 written inside the container appear with your host UID/GID. Extra mounts default to read-only;
 set `access = "read-write"` only for directories the agent should be able to modify. See
 [Concepts -> Workspace](../concepts/workspace.md).
+
+## `[bindings.<name>]`
+
+> `outrig run-new` and the library's `harness` only; `outrig run` ignores bindings.
+
+A binding is an object a process on the host holds for the agent, presented to its Python under
+`<name>`. OutRig installs the binding's packages, starts its process before the agent's
+interpreter, calls its factory there, tells the agent the name and description, and stops the
+process -- with every program it started -- when the session ends. Nothing is bound by default.
+
+```toml
+[bindings.repo]
+description = "The project's Git repository, on the host, with your remotes and credentials."
+requires    = ["GitPython==3.2.0"]
+factory     = "git:Repo"
+args        = [{ path = "." }]
+serialize   = true
+```
+
+- `description` (string, required): shown to the model beside the name.
+- `requires` (array of strings, optional, default: `[]`): requirement specifiers -- a name,
+  extras, a version specifier, markers, never a path, a URL or a pip option -- installed with
+  the embedded Python's pip into `~/.cache/outrig/bindings/<hash>/`, once per set. Only
+  pure-Python wheels install.
+- `factory` (string, required): the callable that builds the object, as `module:callable`.
+- `args` (array, optional, default: `[]`) and `kwargs` (table, optional, default: `{}`): literal
+  values passed to the factory. A table holding `path` -- `{ path = "..." }`, and nothing else
+  -- is a path, which reaches the factory as an absolute host path, its `..` left for the host
+  to resolve; any other string is a string. A datetime, a NaN or an infinity cannot be passed.
+- `serialize` (boolean, optional, default: `false`): `true` when the library is not
+  thread-safe. The binding then runs one call at a time across all its connections, every
+  kernel's included.
+
+The binding's process runs on the host, as you, in the workspace's host directory, with your
+environment less every variable the config names through `${VAR}` (each `api-key`,
+`build-args` value and MCP `env` value), which are OutRig's own secrets. What its library
+does on the host is part of what the binding grants; see `SECURITY.md`.
+
+**A repository's binding needs your approval.** A factory is code the host runs as you at
+session start, and a repository's config is content a cloned project brings and the agent can
+write. So a binding declared in the repo config -- or in a `--config` file, which takes its
+place -- starts only once you approve that exact declaration in that repository. `run-new`
+shows it whole and asks once; the approval is remembered under
+`$XDG_STATE_HOME/outrig/approved-bindings/` (or `~/.local/state/outrig/approved-bindings/`),
+by a digest of the declaration and the repository's root, so any edit asks again. With no
+terminal to ask on, the binding does not start, and the session runs without it. A binding in
+the global config needs no approval.
+
+**Same paths.** When a session has a binding, the workspace and every
+[`[[workspace.mounts]]`](#workspace) entry appear in the container at their host paths, so a
+path the agent writes and a path the library reads name the same file. A `container-path` that
+differs is a config error. Each binding's packages are mounted read-only in the container
+under `/outrig/bindings/` and put on the interpreter's import path, so `import git` works
+there too -- as a local copy of the library, which knows nothing of the host's object.
+
+Bindings are ordered: the global config's, then the repo config's, then those the library's
+`bind` adds, by name within each. That is the order the agent is told of them in, and the order
+their packages go on the container's import path, which decides which version of a package two
+bindings share the container imports.
 
 ## `[images.<name>]`
 
@@ -1075,6 +1139,9 @@ repo mounts. Duplicate final `container-path` values are rejected during validat
 `[sidecars.<sc>]` merges by name like the other top-level maps, so a repo image-config can
 reference a sidecar the user declared globally.
 
+`[bindings.<name>]` merges by name too. A repo binding that replaces a global one of the same
+name is the repository's, and needs your approval like any other.
+
 `[network].mode` merges per key like `[workspace]`'s primary fields: a repo `mode` overrides
 the global one, and when the repo is silent -- whether it omits `[network]` entirely or writes
 the table without a `mode` -- the global mode remains in effect. If neither file declares it,
@@ -1100,6 +1167,11 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 A `--config` path that ends in `.agents/outrig/config.toml` is that repo's own config and takes the
 first row; any other takes the second. See
 [Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
+
+A binding's `{ path = "..." }` arguments are the one exception: a relative one always
+resolves against the repository's root, whichever file declared it, so a global binding's
+`{ path = "." }` names the project each session works on rather than the directory holding
+the global config.
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
 `[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, and to `host-path` in
@@ -1338,9 +1410,20 @@ image-config in the merged config but does not require agent/model/provider wiri
   must exist and be a directory. Relative host paths resolve against the declaring file's
   directory, and a leading `~` is your home directory; an undeclared `workspace.host-path` is
   `.`, the repo root.
-- Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
+- Every `workspace.mounts[*].container-path` must be absolute and must not be `/`; one left
+  unset is its resolved host path.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
-  primary workspace `container-path`.
+  primary workspace `container-path` -- its host path, when the config declares a binding.
+- Every `[bindings.<name>]` name must be a Python identifier of ASCII letters, digits and `_`,
+  not starting with a digit, and not a Python keyword. `runtime`, `asyncio`, `outrig` and
+  `__dunder__` names are taken in every kernel and rejected too.
+- Every `bindings.<name>.factory` must be `module:callable`, the module a dotted path.
+- Every `bindings.<name>.description` must not be empty.
+- Every `bindings.<name>.requires` entry must be a requirement specifier: not a path, an archive
+  name, a URL, a direct reference or a pip option.
+- A binding's `serialize`, if set, must be a boolean.
+- With any binding declared, a `workspace.container-path` or `workspace.mounts[*].container-path`
+  that is declared must be its resolved host path. The error names the key.
 - Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.
 - Unknown keys at any level are rejected.
 

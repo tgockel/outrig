@@ -203,7 +203,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A thread started with `_thread.start_new_thread` and a pool's `initializer` still reach the
   interpreter's stderr, recorded as `output.unattributed` (#474).
 
+- **Bindings: an object a process on the host holds for a session's agent.** `[bindings.<name>]`
+  in config (`Config::bindings`, `Binding`, `FactoryValue`) and `SessionBuilder::bind` with a
+  `BindingSpec` declare one: a description, pure-Python `requires`, a `module:callable` factory,
+  literal `args` and `kwargs` in which `{ path = "..." }` is an absolute host path resolved
+  against the repository's root (`SessionBuilder::repo_root`, made absolute when the session
+  starts), its `..` left for the host to resolve, and `serialize` for a library that is not
+  thread-safe. A session installs each requirement set once, starts each binding's
+  process on the host before the interpreter -- in the workspace's host directory, with the
+  owner's environment less every variable the config names through `${VAR}`, or exactly the one
+  a `BindingSpec` gives -- tells the agent each name and description in its orientation and in
+  `runtime.bindings`, and stops each process group after the drain, reported in
+  `ShutdownReport::bindings` and `session.report` as `BindingStop`s; a group not proven empty,
+  or a binding not reaped within two seconds of `SIGKILL`, means not proven stopped, and the
+  shutdown goes on to the container. A factory that raises fails the start, naming the binding and the
+  exception, and leaves no binding running. A binding a repository's config declares starts only
+  once an `Approver` (`SessionBuilder::approver`, given an `ApprovalRequest`, answering an
+  `Approval`) approves that exact declaration in that repository; the approval is remembered
+  under the user's state directory by a digest of both, and any edit asks again. Without one, or
+  when nobody can be asked, the binding does not start, the session runs without it, and a
+  `binding.refused` event says why. With any binding, the workspace and every mount appear in the
+  container at their host paths, and each binding's packages are mounted read-only under
+  `/outrig/bindings/`. `Step::Packages` and `Step::Bindings` report the two new start steps.
+  Agent code cannot call a binding yet; the facade and the relay come next.
+
 ### Changed
+
+- **`[[workspace.mounts]].container-path` is optional, and defaults to the resolved
+  `host-path`.** `MountConfig::container_path` is replaced by `declared_container_path`, which
+  is `None` when the config left it unset, and `resolved_container_path(repo_root)`. A session
+  with a binding requires every mount at its host path; a declared one that differs, and a
+  `workspace.container-path` that differs, is a `ConfigValidationError::BindingContainerPath`
+  naming the key.
 
 - **`Outrig::launch` labels its primary `org.outrig.session=<id>`**, with the id its name carries.
   The sidecars it starts already carried it; the primary did not, so `outrig clean` could not

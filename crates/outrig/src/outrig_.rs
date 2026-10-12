@@ -457,6 +457,10 @@ pub struct LaunchSpec {
     /// before it builds or unpacks anything.
     pub session_id: Option<String>,
     pub log_dir: PathBuf,
+    /// Package directories of the session's bindings, bound read-only beside
+    /// the payload under OutRig's own root, where no caller's mount may go.
+    /// A session's builder fills it.
+    pub(crate) packages: Vec<ContainerMount>,
 }
 
 impl LaunchSpec {
@@ -492,6 +496,7 @@ impl LaunchSpec {
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
+            packages: Vec::new(),
         }
     }
 
@@ -513,6 +518,7 @@ impl LaunchSpec {
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
+            packages: Vec::new(),
         }
     }
 
@@ -573,7 +579,7 @@ impl LaunchSpec {
             .map(|mount| {
                 MountSpec::new(
                     mount.resolved_host_path(repo_root),
-                    mount.container_path().to_path_buf(),
+                    mount.resolved_container_path(repo_root),
                     mount.access(),
                 )
             })
@@ -609,6 +615,7 @@ impl LaunchSpec {
             sidecars,
             session_id: None,
             log_dir,
+            packages: Vec::new(),
         })
     }
 
@@ -725,6 +732,7 @@ fn primary_launch(
                 ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
             })
             .chain([python])
+            .chain(spec.packages.iter().cloned())
             .collect(),
         capabilities: ContainerCapabilities::from(&spec.security.capabilities),
         devices: spec.security.devices.clone(),
@@ -783,7 +791,7 @@ fn plan_to_launch_parts(
             .map(|mount| {
                 MountSpec::new(
                     mount.resolved_host_path(repo_root),
-                    mount.container_path().to_path_buf(),
+                    mount.resolved_container_path(repo_root),
                     mount.access(),
                 )
             })

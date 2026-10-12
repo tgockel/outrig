@@ -942,6 +942,7 @@ impl Relay {
             None => Some(std::env::vars_os().chain(owned(bind.env)).collect()),
         };
         let spec = Spec {
+            name,
             python: python(),
             rpyc_dir: rpyc_dir(),
             packages: match bind.packages {
@@ -949,11 +950,19 @@ impl Relay {
                 None => fixture_dir(),
             },
             factory: bind.factory,
+            args: json!([]),
+            kwargs: json!({}),
             serialize: bind.serialize,
             cwd: bind.cwd,
             env: exact.as_deref(),
             probe: None,
         };
+        self.bind_spec(name, spec);
+    }
+
+    /// Start binding `name`'s process from `spec` exactly, through the supervisor, and wait for
+    /// it to be ready: how a test runs what a session's own lowering of a declaration produced.
+    pub(crate) fn bind_spec(&mut self, name: &str, spec: Spec<'_>) {
         let mut binding = self
             .runtime
             .block_on(supervisor::start(spec))

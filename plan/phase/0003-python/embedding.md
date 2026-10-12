@@ -65,7 +65,8 @@ CocoClaw and any other embedder start a system the same way.
   is installed, with each binding declared in a repository's config that the operator has not
   approved in exactly that form. `run-new`'s approver prompts on the terminal; an embedder
   supplies its own decision, or refuses repository bindings. What a session does with no approver
-  at all is `0003-20`'s fork 1.
+  at all is what `0003-20` settled: the binding does not start, and the session runs without it,
+  publishing `binding.refused`.
 - **An escalation handler** (`boundary-policy.md`): trusted code that receives each escalated call,
   with a cancellation, and answers allow or deny for that one call. The call waits until it is
   answered, interrupted, or the session closes. OutRig sets no expiry: a handler that wants a

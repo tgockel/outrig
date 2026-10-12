@@ -19,8 +19,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, Model, ModelSourceRef,
-    NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
+    Binding, Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, Model,
+    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
     SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
     TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
@@ -488,6 +488,78 @@ pub enum ConfigValidationError {
          their server's name"
     )]
     SidecarNameCollision { image: String, name: String },
+
+    #[error(
+        "binding {name:?}: a binding's name must be a Python identifier -- ASCII letters, digits \
+         and `_`, not starting with a digit -- and not a keyword{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingName {
+        name: String,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "binding {name:?}: the name is taken in every kernel, by {taken}{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingNameTaken {
+        name: String,
+        taken: &'static str,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "bindings.{name}.factory {factory:?} must be `module:callable`, as `git:Repo`{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingFactory {
+        name: String,
+        factory: String,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "bindings.{name}.description must not be empty: it is how the agent learns what the \
+         binding is{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingDescriptionEmpty {
+        name: String,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "bindings.{name}.requires: {reason}{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingRequires {
+        name: String,
+        reason: String,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "{key} {container:?} is not its host path {host:?}: with a binding, every directory the \
+         session mounts appears in the container at its host path, so a path means the same file \
+         to the agent and to the binding; leave `container-path` unset, or set it to the host \
+         path{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    BindingContainerPath {
+        /// The key to edit: `workspace.container-path`, or
+        /// `workspace.mounts[<i>].container-path`.
+        key: String,
+        container: PathBuf,
+        host: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -528,6 +600,7 @@ pub(super) fn validate_with_options(
 ) -> Result<(), ConfigValidationError> {
     validate_workspace_host_path(cfg, repo_root)?;
     validate_workspace_mounts(cfg, repo_root)?;
+    validate_bindings(cfg, repo_root)?;
 
     if let Some(name) = &cfg.default_image
         && !cfg.images.contains_key(name)
@@ -1315,8 +1388,13 @@ pub(super) fn validate_workspace_mounts(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    let mut reserved = BTreeSet::new();
-    reserved.insert(cfg.workspace.container_path().to_path_buf());
+    // With a binding, the workspace appears at its host path rather than at
+    // its container path (`validate_bindings`).
+    let workspace = match cfg.bindings.is_empty() {
+        true => Some(cfg.workspace.container_path().to_path_buf()),
+        false => cfg.workspace.known_host_path(repo_root),
+    };
+    let reserved = workspace.into_iter().collect();
 
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {
@@ -1420,20 +1498,24 @@ fn check_mount_list(
         // Per entry, not per list: the list may be a concatenation of two files.
         let declared_in = mount.declared_in();
 
-        if !mount.container_path().is_absolute() {
-            return Err(MountRuleViolation::ContainerNotAbsolute {
-                path: mount.container_path().to_path_buf(),
-                declared_in,
-            });
-        }
-        if mount.container_path() == Path::new("/") {
-            return Err(MountRuleViolation::ContainerRoot { declared_in });
-        }
-        if !reserved.insert(mount.container_path().to_path_buf()) {
-            return Err(MountRuleViolation::ContainerDuplicate {
-                path: mount.container_path().to_path_buf(),
-                declared_in,
-            });
+        // An undeclared container path is the host path, which can only be
+        // judged once it can be resolved.
+        if let Some(container) = mount.known_container_path(repo_root) {
+            if !container.is_absolute() {
+                return Err(MountRuleViolation::ContainerNotAbsolute {
+                    path: container,
+                    declared_in,
+                });
+            }
+            if container == Path::new("/") {
+                return Err(MountRuleViolation::ContainerRoot { declared_in });
+            }
+            if !reserved.insert(container.clone()) {
+                return Err(MountRuleViolation::ContainerDuplicate {
+                    path: container,
+                    declared_in,
+                });
+            }
         }
 
         if let Some(root) = repo_root {
@@ -1454,6 +1536,129 @@ fn check_mount_list(
     }
 
     Ok(())
+}
+
+/// Every `[bindings.<name>]` entry, and -- when there is one -- that every
+/// mounted directory can appear in the container at its host path.
+fn validate_bindings(cfg: &Config, repo_root: Option<&Path>) -> Result<(), ConfigValidationError> {
+    for (name, binding) in &cfg.bindings {
+        validate_binding(name, binding)?;
+    }
+    if cfg.bindings.is_empty() {
+        return Ok(());
+    }
+    let same = |key: String, container: &Path, host: Option<PathBuf>, declared_in| match host {
+        Some(host) if super::lexical(container) != host => {
+            Err(ConfigValidationError::BindingContainerPath {
+                key,
+                container: container.to_path_buf(),
+                host,
+                declared_in,
+            })
+        }
+        _ => Ok(()),
+    };
+    if let Some(container) = cfg.workspace.declared_container_path() {
+        same(
+            "workspace.container-path".to_string(),
+            container,
+            cfg.workspace.known_host_path(repo_root),
+            cfg.workspace.declared_in(),
+        )?;
+    }
+    for (index, mount) in cfg.workspace.mounts.iter().enumerate() {
+        if let Some(container) = mount.declared_container_path() {
+            same(
+                format!("workspace.mounts[{index}].container-path"),
+                container,
+                mount.known_host_path(repo_root),
+                mount.declared_in(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One binding's own rules: its name, factory, description and requirements.
+pub(crate) fn validate_binding(name: &str, binding: &Binding) -> Result<(), ConfigValidationError> {
+    let declared_in = binding.declared_in();
+    check_binding_name(name, declared_in.clone())?;
+    if !binding_factory_re().is_match(&binding.factory) {
+        return Err(ConfigValidationError::BindingFactory {
+            name: name.to_string(),
+            factory: binding.factory.clone(),
+            declared_in,
+        });
+    }
+    if binding.description.trim().is_empty() {
+        return Err(ConfigValidationError::BindingDescriptionEmpty {
+            name: name.to_string(),
+            declared_in,
+        });
+    }
+    if let Some(reason) = crate::python::install::requirement_problem(&binding.requires) {
+        return Err(ConfigValidationError::BindingRequires {
+            name: name.to_string(),
+            reason,
+            declared_in,
+        });
+    }
+    Ok(())
+}
+
+/// Python's keywords, which no binding may be named: the name is bound as a
+/// global in every kernel, and code could not spell it.
+const PYTHON_KEYWORDS: [&str; 35] = [
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
+
+/// A binding's name is a global in every kernel, so it must be one Python can
+/// spell and one the interpreter has not taken: `runtime`, `asyncio`, the
+/// `outrig` module, or a module's own `__dunder__` attributes.
+fn check_binding_name(
+    name: &str,
+    declared_in: Option<PathBuf>,
+) -> Result<(), ConfigValidationError> {
+    if !binding_name_re().is_match(name) || PYTHON_KEYWORDS.contains(&name) {
+        return Err(ConfigValidationError::BindingName {
+            name: name.to_string(),
+            declared_in,
+        });
+    }
+    let taken = match name {
+        "runtime" => Some("the runtime"),
+        "asyncio" => Some("the asyncio module"),
+        "outrig" => Some("the outrig module"),
+        _ if name.len() > 4 && name.starts_with("__") && name.ends_with("__") => {
+            Some("Python's own module attributes")
+        }
+        _ => None,
+    };
+    match taken {
+        Some(taken) => Err(ConfigValidationError::BindingNameTaken {
+            name: name.to_string(),
+            taken,
+            declared_in,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn binding_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("binding-name regex compiles"))
+}
+
+/// `module:callable`: a dotted module path, then the name of a callable in it.
+fn binding_factory_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$")
+            .expect("binding-factory regex compiles")
+    })
 }
 
 pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
