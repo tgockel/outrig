@@ -586,14 +586,39 @@ fn render_outcome(outcome: &Outcome, waited: Waited) -> Rendered {
 }
 
 /// The traceback's last line -- the exception and its message -- bounded.
+///
+/// A group's traceback ends in a box border, so [`group_line`] is read first. A
+/// note on a plain exception, or a cut tail, is still read as its last line.
 fn exception_line(traceback: &str) -> &str {
-    let line = traceback
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
+    let line = group_line(traceback)
+        .or_else(|| traceback.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("an exception")
         .trim();
     &line[..floor_char_boundary(line, line.len().min(EXCEPTION_LINE_MAX))]
+}
+
+/// The group's own line -- `ExceptionGroup: ...` -- when the traceback ends in
+/// an exception group, whose lines all start with two spaces and a `|` or `+`.
+///
+/// Frames are indented past the bar, so the first `  | ` line that is not is
+/// the group's, above any note. A traceback the interpreter cut ends in a line
+/// of its own, outside the box, so it names no group: the group may be only the
+/// cause of an exception the cut took.
+fn group_line(traceback: &str) -> Option<&str> {
+    let mut own = None;
+    for line in traceback.lines() {
+        if line.starts_with("  ") && line.trim_start().starts_with(['|', '+']) {
+            if own.is_none()
+                && let Some(rest) = line.strip_prefix("  | ")
+                && rest.starts_with(|first: char| !first.is_whitespace())
+            {
+                own = Some(rest);
+            }
+        } else {
+            own = None;
+        }
+    }
+    own
 }
 
 /// What an execution wrote, then what it lost past the bound, then what

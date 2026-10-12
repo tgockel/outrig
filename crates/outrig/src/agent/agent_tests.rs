@@ -444,6 +444,52 @@ async fn a_raise_past_the_ceiling_still_reaches_the_model_as_a_raise() {
     );
 }
 
+/// A failing `TaskGroup` raises an exception group, whose traceback ends in
+/// the border of a box: the status names the group. A traceback the interpreter
+/// cuts cannot say what was raised -- the group may be only the cause of an
+/// exception the cut took -- so the status names no group then.
+#[tokio::test]
+async fn a_groups_status_names_it_unless_the_traceback_was_cut() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_GROUP_RAISE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_group",
+                "async def fails():\n    raise ValueError('boom')\n\
+                 async with asyncio.TaskGroup() as tg:\n    tg.create_task(fails())",
+            ),
+            submit(
+                "toolu_cut",
+                "async def fails():\n    raise ValueError('x' * 20000)\n\
+                 try:\n    async with asyncio.TaskGroup() as tg:\n        tg.create_task(fails())\n\
+                 except ExceptionGroup as earlier:\n    raise RuntimeError('final') from earlier",
+            ),
+            text_reply("done"),
+        ],
+    )
+    .await;
+
+    round(&mut agent, "fail in a group").await;
+
+    let recorded = mock_http::drain(&mut requests);
+    let group = tool_result(&recorded[1], "toolu_group");
+    assert!(
+        group.starts_with(
+            "[this code raised ExceptionGroup: unhandled errors in a TaskGroup \
+             (1 sub-exception)]\n"
+        ),
+        "{group}"
+    );
+    let cut = tool_result(&recorded[2], "toolu_cut");
+    assert!(
+        cut.starts_with("[this code raised [traceback truncated at "),
+        "{:?}",
+        cut.lines().next()
+    );
+}
+
 /// A model call that fails after the round ran Python keeps what it ran. The
 /// interpreter still holds what it did, so a conversation that forgot it
 /// would invite running it again; the error says to continue instead.
@@ -2458,6 +2504,165 @@ fn an_error_says_it_raised_then_gives_its_output_and_traceback() {
          before\n\
          Traceback ...\n\
          ZeroDivisionError: division by zero\n"
+    );
+}
+
+/// The status line `render` gives code that raised with `traceback`.
+fn status_for(traceback: &[&str]) -> String {
+    let outcome = Outcome::Error {
+        report: Report::default(),
+        traceback: traceback.join("\n") + "\n",
+    };
+    let text = all_shown(vec![], &outcome, WIDE);
+    text.lines().next().expect("a status line").to_string()
+}
+
+/// What Python 3.13 formats for a `TaskGroup` with a failing task.
+const TASK_GROUP_TRACEBACK: &[&str] = &[
+    "  + Exception Group Traceback (most recent call last):",
+    "  |   File \"<execution>\", line 2, in <module>",
+    "  |     async with asyncio.TaskGroup() as tg:",
+    "  |                ~~~~~~~~~~~~~~~~~^^",
+    "  |   File \"/usr/lib/python3.13/asyncio/taskgroups.py\", line 174, in _aexit",
+    "  |     raise BaseExceptionGroup(",
+    "  |     ...<2 lines>...",
+    "  |     ) from None",
+    "  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+    "  +-+---------------- 1 ----------------",
+    "    | Traceback (most recent call last):",
+    "    |   File \"<execution>\", line 2, in fails",
+    "    | ValueError: boom",
+    "    +------------------------------------",
+];
+
+/// A group's traceback ends in a box's border, and its last member's
+/// exception is not what was raised: the group is.
+#[test]
+fn an_exception_groups_status_names_the_group_not_its_border() {
+    assert_eq!(
+        status_for(TASK_GROUP_TRACEBACK),
+        "[this code raised ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)]"
+    );
+}
+
+/// A redirection raised in a task of a `TaskGroup` arrives as a
+/// `BaseExceptionGroup`, because `MessageAvailable` is a `BaseException`.
+#[test]
+fn a_redirections_group_status_names_the_group() {
+    assert_eq!(
+        status_for(&[
+            "  + Exception Group Traceback (most recent call last):",
+            "  |   File \"<execution>\", line 2, in <module>",
+            "  |     async with asyncio.TaskGroup() as tg:",
+            "  |                ~~~~~~~~~~~~~~~~~^^",
+            "  | BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)",
+            "  +-+---------------- 1 ----------------",
+            "    | Traceback (most recent call last):",
+            "    |   File \"<execution>\", line 3, in <module>",
+            "    | MessageAvailable: input is waiting on runtime.channels[\"user\"]",
+            "    +------------------------------------",
+        ]),
+        "[this code raised BaseExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)]"
+    );
+}
+
+/// Lines below the group's own -- a note, the rest of a message -- are in
+/// its box, and are not what was raised.
+#[test]
+fn a_groups_notes_and_message_lines_do_not_stand_for_it() {
+    assert_eq!(
+        status_for(&[
+            "  + Exception Group Traceback (most recent call last):",
+            "  |   File \"<execution>\", line 1, in <module>",
+            "  |     raise eg",
+            "  | ExceptionGroup: multi",
+            "  | line msg (1 sub-exception)",
+            "  | a hint",
+            "  | ",
+            "  +-+---------------- 1 ----------------",
+            "    | ValueError: v",
+            "    +------------------------------------",
+        ]),
+        "[this code raised ExceptionGroup: multi]"
+    );
+}
+
+/// A member that is itself a group does not take the outer one's place.
+#[test]
+fn a_nested_groups_status_names_the_outer_group() {
+    assert_eq!(
+        status_for(&[
+            "  + Exception Group Traceback (most recent call last):",
+            "  |   File \"<execution>\", line 1, in <module>",
+            "  | ExceptionGroup: outer (1 sub-exception)",
+            "  +-+---------------- 1 ----------------",
+            "    | ExceptionGroup: inner (2 sub-exceptions)",
+            "    +-+---------------- 1 ----------------",
+            "      | ValueError: x",
+            "      +---------------- 2 ----------------",
+            "      | TypeError: y",
+            "      +------------------------------------",
+        ]),
+        "[this code raised ExceptionGroup: outer (1 sub-exception)]"
+    );
+}
+
+/// What was raised is the last exception in a chain, whichever kind came
+/// first.
+#[test]
+fn a_chains_status_names_the_exception_that_ended_it() {
+    assert_eq!(
+        status_for(&[
+            "Traceback (most recent call last):",
+            "  File \"<execution>\", line 1, in <module>",
+            "KeyError: 'k'",
+            "",
+            "During handling of the above exception, another exception occurred:",
+            "",
+            "  + Exception Group Traceback (most recent call last):",
+            "  |   File \"<execution>\", line 2, in <module>",
+            "  | ExceptionGroup: after (1 sub-exception)",
+            "  +-+---------------- 1 ----------------",
+            "    | ValueError: v",
+            "    +------------------------------------",
+        ]),
+        "[this code raised ExceptionGroup: after (1 sub-exception)]",
+        "a group raised while handling an exception"
+    );
+    assert_eq!(
+        status_for(&[
+            "  + Exception Group Traceback (most recent call last):",
+            "  |   File \"<execution>\", line 1, in <module>",
+            "  | ExceptionGroup: first (1 sub-exception)",
+            "  +-+---------------- 1 ----------------",
+            "    | ValueError: v",
+            "    +------------------------------------",
+            "",
+            "During handling of the above exception, another exception occurred:",
+            "",
+            "Traceback (most recent call last):",
+            "  File \"<execution>\", line 2, in <module>",
+            "RuntimeError: then this",
+        ]),
+        "[this code raised RuntimeError: then this]",
+        "an exception raised while handling a group"
+    );
+}
+
+/// The interpreter cuts a traceback past its bound and says so on a line of
+/// its own. What follows the cut is unknown, and the group may be only the
+/// cause of the exception that was raised, so no group is named.
+#[test]
+fn a_cut_traceback_does_not_name_a_group_that_may_be_a_cause() {
+    let first_member = TASK_GROUP_TRACEBACK
+        .iter()
+        .position(|line| line.starts_with("  +-+"))
+        .expect("a member's separator");
+    let mut cut = TASK_GROUP_TRACEBACK[..=first_member].to_vec();
+    cut.push("[traceback truncated at 16384 bytes]");
+    assert_eq!(
+        status_for(&cut),
+        "[this code raised [traceback truncated at 16384 bytes]]"
     );
 }
 
