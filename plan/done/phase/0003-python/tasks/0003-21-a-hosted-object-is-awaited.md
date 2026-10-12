@@ -236,3 +236,193 @@ without an `await`; and no agent code writes `asyncio.to_thread` for one.
 - `crates/outrig/src/python/binding_tests.rs` and `relay.rs` -- the tests and the fixture.
 - `plan/next/hosted-calls-without-a-thread-per-call.md` and
   `plan/next/one-request-per-hosted-method-call.md` -- what this task leaves.
+
+## Decisions
+
+The forks were taken as recommended: `__class__` through the netref's class descriptor (fork 1),
+a coroutine callback's calls served on the outer call's connection (fork 2), the wake walking the
+kernel's pools (fork 3), a `ThreadPoolExecutor` per pool (fork 7). The maintainer chose, when
+asked: the facade itself makes a refused attribute read catchable as `AttributeError`, so
+`binding.py` stays untouched; and `_sync()` is refused on any kernel's event loop, not only while
+a coroutine callback is served. An independent review of the plan against the code found eleven
+problems before anything was written; each fix is below.
+
+The facade was then written a second time, independently, and the two compared for simplicity.
+The second had about half the logic -- 360 lines against 751, two new classes against five -- and
+was adopted, with what the comparison found it lacked taken from the first: the wake reaching the
+calls made inside an awaited call, one facade per proxy, the refusal of another kernel's hosted
+object, the report naming a task awaiting a hosted call, delivery through `_with_room`, no
+executor made after a close, and `help` describing the object. A review of the result then found
+four defects, fixed before it merged: a callback inside a plain callback's `_sync()` call got
+RPyC's proxies, a coroutine callback served inside another's call stranded the outer one's other
+calls, a call awaited in a coroutine callback ran its callbacks in the serving worker's context,
+and `async with` truth-tested a referenced `__exit__` result as a facade. The fixes too were written
+twice, independently, and behaved the same; the result takes the first's context, which each job
+carries, and the second's serving loop, which is shorter. A second review found two more: with both
+bindings serialized, a call to a second binding made inside a callback of the first hung when a
+coroutine callback of it called back into the first, and a clean `async with` failed when testing
+what `__exit__` gave back raised. Written twice again, the fixes had the same logic; the second's
+comments were kept, since the first's said a queued call to another binding ran on a connection the
+thread already held. The bullets describe the result.
+
+- **The facade.** `HostedObject`, `__module__` `outrig`, one class for a path and a resolved
+  proxy, in one slot: the pool, RPyC's proxy it was resolved to (`None` for a path from the
+  root), and the steps. A step is `(label, fn, *args)` -- `getattr`, `operator.getitem` or a
+  call, and `setattr`, `delattr`, `iter`, `next`, `__enter__`, `__exit__` or the instance check
+  for `_set`, `_delete`, `async for`, `async with` and `_isinstance` -- so every awaited operation
+  is a path that `_replay` runs on a worker, each step an ordinary operation on RPyC's proxy.
+  `Kernel.stub(binding)` returns the root's; `Kernel.hosted` and `_Pool.request` stay the engine,
+  and on any thread but a worker they behave as before.
+- **What a dunder is.** "The object machinery" is every dunder the host cannot answer: a dunder is
+  a step only when it is on RPyC's safe list -- the binding's own attribute rule -- or is
+  `__dir__` or `__call__`, which a proxy sends as `dir` and `call`; `__doc__` and `__new__` are
+  answered here. Every other dunder (`__name__`, `__wrapped__`, `__dict__`, `__module__`) goes to
+  `object.__getattribute__`, so `inspect.unwrap`, pydoc, `copy` and `vars` see an ordinary object
+  and nothing reachable is lost. Single-underscore names stay steps, so `await stub._private`
+  reaches the host's refusal as the acceptance requires.
+- **`__class__` claims only an ordinary class.** The descriptor's local class is returned for an
+  instance whose class has the host's module and name -- RPyC falls back to `type(module)` when a
+  module lacks the name -- and is not a type Python's machinery treats specially: `type`, module,
+  function and method types, code, frame, traceback, generator and coroutine types, descriptors,
+  `property`, `classmethod` and `staticmethod`, and the `Coroutine`, `Generator` and
+  `AsyncGenerator` ABCs. Claimed, those sent `inspect` after `__name__` and `__mro__`, and a class
+  that subclasses `Coroutine` would have put `HostedObject` in asyncio's coroutine type cache,
+  after which `create_task(path)` drove `.send`. A class object is never claimed: its descriptor
+  answers with the metaclass.
+- **A wake settles the awaiting code at once.** `_Job.wake` builds two exceptions with one text,
+  delivers one to the awaiting future through the loop and leaves the other as the job's `exc`. A
+  job is the wait of every request it makes to its binding, and `_pop_exc` returns a job's `exc`
+  without clearing it, so a woken job takes no further connection. A wait made inside a job -- a
+  plain callback's `_sync()` on another binding, or a call awaited in a coroutine callback and run
+  by the thread serving it -- names that job as `within`, and `_Wait.block` raises for the chain
+  too; a wake or a cancel notifies every pool of the kernel, since such a wait may be on another
+  binding's condition variable. Nothing reads `_waits` to find a worker's wait, which the review
+  showed could land a wake on the next job of a reused worker. A waiting worker raises at once, a
+  busy one -- boxing, running a callback -- at its next wait, and the awaiting code waits for
+  neither.
+- **Never sent means no connection was taken.** A job keeps the connection its last step took --
+  `take` puts it back after tidying an abandoned one -- so its `conn` is `None` only while no
+  request of it has taken one, and only then does the wake's text say the call was never sent.
+  The plan's first version said "never sent" for a job between steps, which after a `call` step
+  is false.
+- **0003-17's signal rule stands.** On the primary the signal is still sent unless the kernel's own
+  thread was woken, since other code of the execution may hold the loop. It is armed before any
+  job is woken, and an interrupt delivered to an awaiting future on the primary's loop disarms
+  it, so a signal arriving after the delivery declines rather than raising into the handler of
+  the first. A child with woken jobs gets no "cannot be interrupted" diagnostic. `runaway` does
+  not widen job waking.
+- **Interrupts of several calls are each reported.** `gather` makes a task per path, and asyncio
+  lets each task's `KeyboardInterrupt` out of the loop, while the single `_landed` slot holds one.
+  A delivered interrupt carries `(itself, task, execution)` as `_outrig_landed`, and
+  `_interrupted_task` takes it when `_landed` does not match, reporting "[outrig interrupted a
+  task awaiting a hosted call]". Only an interrupt carries it, and agent code that catches one
+  sees the attribute.
+- **A cancel keeps outrig's message.** `Kernel.cancel` wakes jobs before scheduling `_cancel`, and
+  both reach the loop through `call_soon_threadsafe` from the reader thread, so the delivery runs
+  first and the task keeps outrig's `CancelledError` (checked on the payload's 3.13). An agent's
+  cancel of the awaiting task sets the job's `exc` to a plain `CancelledError`; its connection is
+  abandoned to the next taker.
+- **Queuing a call is machinery.** `HostedObject.__await__` is in `_MACHINERY`, since it changes
+  the pool's state and may be starting a worker, so `interruptible` is read from the awaiting
+  frame. `_Pool.submit` makes the executor and queues the job under the pool's condition variable,
+  and queues nothing once the pool has closed, whose close settled the job. A failed
+  `executor.submit` -- the item is queued before its thread starts -- leaves the job's `exc` set,
+  so the item, if it runs, raises at its first wait and sends nothing. A hosted object of another
+  kernel is refused at the `await` and in `_sync()`: an interrupt of a kernel reaches only its own
+  pools' calls, and `_wake_jobs` walks only those.
+- **Arguments.** `_box` tests for a facade first -- a resolved facade of a host list answers
+  `isinstance(x, list)` -- and boxes a resolved one as its proxy; an unresolved one of the same
+  pool is resolved there, on the sending thread and nested on its connection, after the outer
+  request's callback is registered. OutRig's `_async_request` drops that callback and releases its
+  marks on any `BaseException`, so a wake or a close while resolving leaves nothing outstanding.
+  Dict keys are never hashed, which for RPyC's proxy would be a request. Another pool's facade is
+  refused when it is boxed, before its request is sent.
+- **Callbacks.** `_dispatch_request` wraps the host's objects among a callback's arguments as
+  facades whenever the serving thread is resolving an awaited call -- its innermost wait is a job or
+  is `within` one, as a plain callback's `_sync()` call is -- so the engine's tests keep RPyC's
+  proxies. A coroutine result is known by its type, and never a proxy's: RPyC gives a proxy's class
+  every name its host type has, so a proxy of a host coroutine passes `Coroutine`'s check, and
+  `asyncio.iscoroutine` of a proxy reads `__class__`, a request. `_awaited` runs the coroutine with
+  `asyncio.run_coroutine_threadsafe` -- refused on the kernel's own thread -- with `_SERVING` set in
+  the context the task copies, and the serving thread waits in the outer request's wait for a queued
+  nested job, a frame on its connection -- a callback a library thread makes, or the close -- or the
+  end of the task; when that wait raises, the task is cancelled. Tasks the coroutine starts inherit
+  `_SERVING`: their calls run on the serving thread while it serves and go to their binding's
+  executor after.
+- **A serving thread serves every callback it is inside.** A thread keeps, in `_served`, the waits
+  whose coroutine callbacks it is serving, and while it serves the innermost it runs the jobs queued
+  for any of them, innermost first, a job to the binding of a call the thread is inside on that
+  call's connection, which the thread still holds. One queue per wait stays, so only a callback's
+  own leftovers go to their bindings' executors when it ends. A job ends with the call its own
+  callback was served for -- whoever runs it gives `within` -- not with the call it happens to run
+  inside, so cancelling that one leaves it to finish. Queuing a job notifies every pool of the
+  kernel, since the serving thread may be waiting on another binding's condition variable.
+- **A coroutine callback's calls run on its worker, on any binding.** A call a coroutine callback
+  awaits on another binding is queued for the serving thread too, as a plain callback's `_sync()`
+  call runs on its own thread, rather than sent to that binding's executor. From the executor, a
+  call back into the first binding, made by a coroutine callback of the second binding's call, ran
+  on a worker holding no connection of the first: it took another and, under `serialize = true` on
+  both, waited for the turn the outer call held while it waited for that chain. On the serving
+  thread `_pick` gives it the connection the thread already holds. The append takes the condition
+  variable of the serving wait's own pool, which its thread empties the queue under, in a scope of
+  its own, since no code holds two pools' at once; a leftover goes to its own binding's executor.
+  The cost: the calls a coroutine callback awaits run one at a time on its worker, whichever binding
+  they go to, so one that blocks on the host until another of them has run now hangs until it is
+  cancelled, where before a call to another binding ran beside them. Queuing a call only for an
+  enclosing serving thread that holds a connection of its binding would keep that, but needs a link
+  from each serving job to the callback it was awaited in, and a rule for a `_sync()` call, whose
+  thread holds the binding's connection but serves no queue of that binding.
+- **A job runs in its awaiting task's context.** `__await__` copies the context and `_run_job`
+  resolves in it, on a worker or a serving thread, so a context variable a coroutine callback set
+  reads the same in the callbacks of a call it awaits, a leftover submitted from the serving
+  thread included. The copy has `_SERVING` unset: a plain callback may hold its thread until a
+  coroutine it started ends, so that coroutine's calls go to the executor.
+- **Results.** A netref becomes a facade, the same one for the same proxy through the connection's
+  `_facades`, so "`is` compares the proxies" holds as `hosted-objects.md` says; a tuple's items are
+  wrapped. A delivered exception's traceback is cut, so the agent sees it at its `await`, not in
+  RPyC's frames or the worker's.
+- **The refusal as `AttributeError`.** An attribute step whose `getattr` the binding refuses --
+  RPyC's generic class named `outrig.Refused` -- is raised as a class made from that class and
+  `AttributeError`, with the same name, text and attributes. `0003-22` may keep it or replace it
+  with OutRig's own class.
+- **Local answers.** `__doc__` is a descriptor answering the class's text for the class and, for a
+  facade, that text with "This is a path" or the methods the host listed, so pydoc documents the
+  object rather than its class, whose page would list every refused operator; the phase doc's
+  "Asking about a proxy is local" has `help` answer from the host type and its methods. A
+  refusal's text names the operation and the awaited spelling; the in-place operators fall back
+  to the refused binary ones. `isinstance(a, x)` with `x` a hosted class answers here for an
+  instance of exactly that class and, against `x`'s library here, for an object of this process.
+  `Kernel.held()` reports `HostedObject` or `HostedObject[<host type>]`. `runtime.wait` refuses a
+  facade, naming `_resolve()`; `asyncio.wait` cannot be guarded, and `hosted-objects.md` says what
+  it does.
+- **`async with`** keeps what `__aenter__` entered by the proxy's identity and the task, since one
+  proxy object may be entered by two tasks, and `__aexit__` sends `ctxexit` with the exception
+  itself: `Hosted._ctxexit_args` takes an instance as well as RPyC's type, since a worker has no
+  `sys.exception()`. The host's answer is truth-tested on the worker, and only when the body raised,
+  as `with` tests it: a referenced one, such as a list, would arrive as a facade, whose truth is
+  refused, and a clean body ends cleanly even when testing the answer would raise.
+- **The renumbering.** The deliverable's list of numbers to update was itself rewritten by commit
+  8216844, whose message says comments naming `0003-21`, `0003-22` or `0003-25` are updated here.
+  Those written before it moved to `0003-22`, `0003-23` and `0003-26`: `binding.py`,
+  `interpreter.py`, `payload.rs`, `relay.rs`, `supervisor.rs:90`, `binding_tests.rs`.
+  `supervisor.rs`'s eleven `0003-22` were written after it and stay.
+- **Tests.** The fixture gained what the acceptance names and lacked: `pair`, `call_with_nested`,
+  `call_twice`, `iterable`, `slow`, recorded `close` and `send`, `a.b.c`, `b`, a `taken` count in
+  `takes`, and `sequence` as a list subclass counting `__iter__` and `__next__` on the host; one
+  `__next__` per item and one for the end. `Relay` can close the interpreter's stdin. Counts leave
+  out the `inspect` RPyC sends to build a proxy's class for a type it has not seen, which the
+  inventory calls bookkeeping. "Two awaited calls and a queued third" cannot happen with four
+  workers, so the close test holds the pool's other two connections with engine calls and the
+  third waits for a connection, and a second test closes with four in flight and a fifth queued
+  for a worker. The queued call an interrupt finds never sent waits behind four calls of an
+  earlier execution, so only it belongs to the interrupted one. `isinstance` against the
+  fixture's class imports it before the first fetch: RPyC fixes a proxy's class when it unboxes it.
+  Cancelling an awaited call ends a call awaited in its coroutine callback and a plain callback's
+  `_sync()` on a second binding; the test fails without the `within` chain, and without the cancel
+  waking the second binding's pool. The fixture's `suppressing` and `propagating` managers give
+  back a list from `__exit__`, and `untestable` an object whose truth test raises. Each review fix
+  has a test that failed before it, and undoing each part of the fix -- the queue owner's `within`,
+  waking every pool on a queued job, `_SERVING` unset in a job's context, serving the outer queues,
+  the job's context, a leftover's own pool -- fails exactly the test written for it. The serialized
+  cycle is tested from a coroutine callback and from a plain callback's `_sync()`, each awaited
+  under `wait_for`, so a regression fails in ten seconds rather than at the relay's timeout.

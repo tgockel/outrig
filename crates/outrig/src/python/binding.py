@@ -13,10 +13,11 @@ and that `ping` and `close` never wait.
 Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by agent and
 connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `factory`
 line holding the factory's `args` and `kwargs`; a `ready` line once the factory has returned, naming
-the type of what it returned, or a `failed` line naming what it raised; `event` lines, which `0003-21` fills with a request's events; `decision` lines, each a
-request held on its serving thread until the owner's answer arrives under the same id, which
-`0003-22` asks for; and `control` lines from the owner, which `0003-21` gives a meaning. Everything
-else it writes goes to stderr, where the owner logs it.
+the type of what it returned, or a `failed` line naming what it raised; `event` lines, which
+`0003-22` fills with a request's events; `decision` lines, each a request held on its serving thread
+until the owner's answer arrives under the same id, which `0003-23` asks for; and `control` lines
+from the owner, which `0003-22` gives a meaning. Everything else it writes goes to stderr, where the
+owner logs it.
 
 The process is a supervised child of the owner, in a process group of its own, started with a
 parent-death signal (`SIGHUP`) the owner set before exec and left blocked until `main` has
@@ -236,7 +237,7 @@ def _decide(payload):
 
 
 def _control(message):
-    """A control line from the owner. `0003-21` gives the first one, the closed flag, its
+    """A control line from the owner. `0003-22` gives the first one, the closed flag, its
     meaning; until then every one is noted and nothing more."""
     _diag(f"a control line nothing handles yet: {json.dumps(message)}")
 
@@ -691,7 +692,7 @@ def connection_class(rpyc):
             self._objects = objects
             self._on_close = on_close
             self._context = _Context()
-            # The last exception's whole traceback text, for the event `0003-21` records. The
+            # The last exception's whole traceback text, for the event `0003-22` records. The
             # container gets one line of it.
             self.last_traceback_text = None
 

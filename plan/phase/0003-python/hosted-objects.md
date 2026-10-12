@@ -321,11 +321,11 @@ Arguments, from the container:
   coroutine function on the kernel's event loop, scheduled from that worker, which waits for it
   and meanwhile serves the connection ("Calls are awaited"). Each invocation is a reverse
   interaction, evented with the id of the call it ran inside. A hosted call made from inside a
-  coroutine callback is an ordinary request, travels on the outer call's connection, and goes
-  through policy (`boundary-policy.md`); a plain function cannot await and reads the proxies it is
-  given with `_sync()`, on the same connection. What it returns crosses back to the host by the
-  same rules as an argument -- by value, or as the shim's copy -- and any other reference into the
-  container is refused.
+  coroutine callback is an ordinary request, runs on that worker -- on the outer call's connection
+  when it is to the same binding -- and goes through policy (`boundary-policy.md`); a plain function
+  cannot await and reads the proxies it is given with `_sync()`, on the same connection. What it
+  returns crosses back to the host by the same rules as an argument -- by value, or as the shim's
+  copy -- and any other reference into the container is refused.
 - **Anything else** -- a generator, a dataclass instance, any other container object -- is refused
   before it is sent. Accepting it would give the host a reference into the container, and any use
   of that reference would run agent code inside the host library's call; that is how
@@ -439,7 +439,9 @@ awaited is a path and not a value, and its `repr` says so.
   `asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")`. The facade is not
   a coroutine because a coroutine has `send`, `throw` and `close` as public names, and hosted
   objects own those (`repo.close()`). `asyncio.wait` and `runtime.wait` take the task, as they
-  take any operation (`messages.md`).
+  take any operation (`messages.md`). `runtime.wait` refuses a path, naming `_resolve()`;
+  `asyncio.wait` cannot be guarded, and given a path it builds paths on it where it would add a
+  done callback, so it never returns, or with a timeout raises at the path's truthiness.
 - **Iteration is `async for`.** One request to start and one per item, as `0003-17` measured, and
   `[x async for x in proxy]` materializes. `for`, `iter`, `len` and truthiness on a proxy raise
   `TypeError` naming the awaited spelling -- `async for`, `await x.__len__()`,
@@ -453,8 +455,13 @@ awaited is a path and not a value, and its `repr` says so.
   under single-underscore names -- `_set`, `_delete`, `_resolve`, `_sync`, `_isinstance`,
   `_netref`, `_binding` -- and the host refuses every private name ("Interception"), so no hosted
   attribute can collide with them. The facade reserves no public name: `await repo.close()` and
-  `await gen.send(v)` are steps like any other. Dunder names outside the facade's own are steps
-  too, which is how `await x.__len__()` reaches RPyC's safe-list handler.
+  `await gen.send(v)` are steps like any other. A dunder name is a step when the host can answer
+  it -- one on RPyC's safe list, which is the binding's attribute rule, and `__dir__` and
+  `__call__`, which a proxy sends as `dir` and `call` -- which is how `await x.__len__()` reaches
+  the host. Every other dunder is the object machinery Python and its tools read off any object
+  -- `__name__`, `__module__`, `__wrapped__`, `__dict__` -- which the binding would refuse, and
+  is answered here as for an ordinary object, so `inspect`, pydoc and `copy` find no path where
+  they look for an attribute. `__doc__` is answered here too, though the safe list has it.
 - **`hasattr` cannot see the host.** A lookup builds a path and raises nothing, so
   `hasattr(x, "name")` is always true and `getattr(x, "name", default)` never chooses its
   default; the facade cannot tell either from an ordinary lookup, so it cannot refuse them the
@@ -488,11 +495,20 @@ reader thread can wake it, as a worker waiting for its reply does.
 
 **Callbacks run where the call is served.** A plain-function callback runs on the worker thread
 holding the call's connection and reads the proxies it is given with `_sync()`, which resolves on
-that thread and that connection, so nested calls complete with every connection occupied. A
+that thread and that connection, so nested calls complete with every connection occupied.
+`_sync()` is refused on a kernel's event loop, which it would hold until the host answered. A
 coroutine callback runs on the kernel's loop, scheduled from the worker, which waits for it and
-meanwhile serves the hosted calls the coroutine awaits, on the same connection; under
+meanwhile serves the hosted calls the coroutine awaits: on the same connection when they are to the
+same binding, and otherwise on a connection of their own binding, as `_sync()` would. Under
 `serialize = true` that is what lets the nested call through the re-entrant turn below, and it is
-what gives the nested call its parent id.
+what gives the nested call its parent id. A call back into the first binding, from a callback of a
+call to another, goes through the same way: the worker still holds the outer call's connection. The
+calls a coroutine callback awaits therefore run one at a time on its worker, whichever binding they
+go to. While the worker serves a coroutine callback nested inside one of those calls, it serves the
+outer callback's calls too, so a task of the outer callback that the inner one waits for is not held
+up. Wherever an awaited call runs, its callbacks run under a copy of the context of the task that
+awaited it, and the proxies the host passes them arrive as hosted objects, a callback inside a
+`_sync()` call's included.
 
 **The binding process serves each connection on a thread of its own.** That is RPyC's ordinary
 server model -- its `ThreadedServer` starts a thread per connection -- so calls from different
@@ -694,8 +710,6 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-22`'s.
 - Whether the facade's `async for` fetches a returned container in batches with RPyC's
   `buffiter`, which would make one request per batch rather than per item.
-- Whether a plain-function callback may make a hosted call through `_sync()` at all, or only a
-  coroutine callback may, since the plain one cannot await.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of
   two kernels against one binding, and of two sessions against one service, are the first
   evidence.
@@ -735,21 +749,22 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   `smmap` are `py3-none-any` was checked by downloading them for the payload's platform tag.
 - That building a kernel cannot resolve a binding is reasoned from the interpreter's startup order
   and `_open`, not observed.
-- The facade's claims, which `0003-21` tests: that an interrupt or a cancel reaches a worker's
-  wait, since `Kernel._wake` today finds a wait by the kernel thread's ident and
-  `interruptible` is read from the calling thread's frames, so the facade must register its waits
-  by the awaiting execution and mark them interruptible on its behalf; that a worker runs under a
-  copy of the awaiting task's context, so `outrig.runtime` and an invocation id resolve on it and
-  a callback's output is attributed; that a coroutine callback's nested hosted calls travel on the
-  outer call's connection, served by the worker holding it, since on a new connection they would
-  deadlock under `serialize = true` and lose the parent id; that `isinstance(c, git.Commit)` and
-  `except git.GitCommandError` hold through the facade; that `repr`, `str`, `dir` and `help` make
-  no request, since pydoc probes `__name__`, `__doc__` and `__module__`, which the facade must
-  answer locally; that `_resolve()` satisfies `asyncio.create_task`, that `gather` and `wait_for`
-  take a path as it is, and that `asyncio.wait` and `runtime.wait` take only the task; that a
-  woken worker settles the awaiting future through a loop that may be stopping because its
-  kernel is being released; and that the thread per call costs what `to_thread`'s did against
-  the memory ceiling (`plan/next/one-drain-thread-for-every-execution.md`).
+- The facade's claims. `0003-21` confirmed them with the fixture library, not GitPython, and
+  both programs on the host: an interrupt or a cancel reaches an awaited call on the primary and
+  on a child kernel -- each job is registered with its pool under the awaiting execution, with
+  `interruptible` read from the awaiting frames, and settled at once -- and one still queued for
+  a worker was never sent; a worker runs under a copy of the awaiting task's context, so a
+  context variable set there reads the same in a callback, and a callback's output is the
+  awaiting execution's; a coroutine callback's own hosted call travels on the outer call's
+  connection, and under `serialize = true` runs inside the outer call, a call back to it through a
+  second serialized binding's callback included; `isinstance` holds against the fixture's class
+  imported here, and a hosted exception arrives typed where the call is awaited; `repr`, `str`,
+  `dir` and `help` send nothing; and `_resolve()` satisfies `asyncio.create_task`, `gather` and
+  `wait_for` take a path, and `runtime.wait` refuses one. Its `## Decisions` record what else it
+  settled. Still unverified: that a worker settling a future through a loop closed with its kernel
+  drops the outcome quietly, which waits for the kernel release of `0003-26`; that the thread per
+  call costs what `to_thread`'s did against the memory ceiling
+  (`plan/next/one-drain-thread-for-every-execution.md`); and all of it with GitPython.
 - What the spikes must confirm before anything is built on this page. A spike that cannot confirm
   its part stops and reports to the maintainer, who decides what follows:
   - `0003-16` -- confirmed: every handler is intercepted, the conformance test fails on a changed

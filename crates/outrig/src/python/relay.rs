@@ -1,5 +1,5 @@
 //! A relay between one interpreter and the binding processes of its session, all started on
-//! the host, standing in for the one `0003-21` puts in `host.rs`.
+//! the host, standing in for the one `0003-22` puts in `host.rs`.
 //!
 //! The interpreter is started as `interpreter_tests.rs` starts it, with the vendored RPyC's
 //! directory as its second argument; each binding is started through `supervisor.rs`, as a
@@ -51,10 +51,11 @@ pub(crate) fn rpyc_dir() -> &'static Path {
 }
 
 /// The fixture library as a module: an object with public and private members, a nested object,
-/// a sequence, a context manager, methods that call back, report types, and return a large
-/// result, two exception classes, a counter around `pickle.loads`, a recording method that notes
-/// when it ran on the host and sleeps or waits for a file, and objects made on request with a
-/// weak reference kept, so a test can watch the binding's table drop them.
+/// a sequence that counts what iterating it asks for, a context manager, methods that call back,
+/// report types, and return a large result, two exception classes, a counter around
+/// `pickle.loads`, a recording method that notes when it ran on the host and sleeps or waits for
+/// a file, and objects made on request with a weak reference kept, so a test can watch the
+/// binding's table drop them.
 pub(crate) const FIXTURE_SOURCE: &str = r#"
 """The fixture library a binding process hosts in tests."""
 
@@ -66,6 +67,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import weakref
 
 
@@ -229,9 +231,12 @@ class Nested:
 
 
 class Manager:
-    def __init__(self):
+    """A context manager whose `__exit__` gives back `result`: a list crosses by reference."""
+
+    def __init__(self, result=False):
         self.entered = 0
         self.exits = []
+        self.result = result
 
     def __enter__(self):
         self.entered += 1
@@ -239,7 +244,40 @@ class Manager:
 
     def __exit__(self, typ, value, tb):
         self.exits.append((None if typ is None else typ.__name__, repr(value), tb is None))
-        return False
+        return self.result
+
+
+class Untestable:
+    """What an `__exit__` may give back: testing its truth raises."""
+
+    def __bool__(self):
+        raise ValueError("its truth cannot be told")
+
+
+class Counted(list):
+    """A list that counts, on the host, the iterations it starts and the items they take."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.iters = 0
+        self.nexts = 0
+
+    def __iter__(self):
+        self.iters += 1
+        return CountingIterator(self, list.__iter__(self))
+
+
+class CountingIterator:
+    def __init__(self, owner, iterator):
+        self._owner = owner
+        self._iterator = iterator
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._owner.nexts += 1
+        return next(self._iterator)
 
 
 class Callable:
@@ -273,13 +311,20 @@ class Root(Records):
         self._private = "private value"
         self.writable = "before"
         self.nested = Nested()
-        self.sequence = [10, 20, 30]
+        self.sequence = Counted([10, 20, 30])
         self.manager = Manager()
+        self.suppressing = Manager(["suppress"])
+        self.propagating = Manager([])
+        self.untestable = Manager(Untestable())
         self.callable = Callable()
         self.kept = None
         self.nested_type = Nested
         self.str_type = str
+        self.a = types.SimpleNamespace(b=types.SimpleNamespace(c="c"))
+        self.b = "b"
         self.calls = 0
+        self.taken = 0
+        self.received = []
         self.last_raised = None
         self._lock = threading.Lock()
         self._intervals = []
@@ -412,7 +457,28 @@ class Root(Records):
         return x + y
 
     def takes(self, obj):
+        self.taken += 1
         return obj is self.nested
+
+    def pair(self):
+        return (self.nested, 1)
+
+    def slow(self, seconds=0.2, label="slow"):
+        return self.record(seconds, label)
+
+    def close(self):
+        """A public name a coroutine would own, recorded when it is called."""
+        self.received.append("close")
+        return "closed"
+
+    def send(self, value):
+        """A public name a coroutine would own, recorded when it is called."""
+        self.received.append(("send", value))
+        return value
+
+    def iterable(self):
+        """A generator, as a library returns one."""
+        return (n for n in (1, 2, 3))
 
     def echo(self, x):
         """`x` itself, so a callable passed in comes back as a reference to it."""
@@ -437,6 +503,13 @@ class Root(Records):
 
     def call(self, fn, *args):
         return fn(*args)
+
+    def call_with_nested(self, fn):
+        """`fn(self.nested)`: a callback given a host object."""
+        return fn(self.nested)
+
+    def call_twice(self, fn, x):
+        return (fn(x), fn(x))
 
     def returned_type(self, fn):
         return type(fn()).__name__
@@ -830,7 +903,8 @@ struct Bound {
 
 pub(crate) struct Relay {
     interpreter: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// The interpreter's stdin, `None` once a test has closed it.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     other: Receiver<Result<Value, String>>,
     /// Messages read while looking for another, kept in order for the next `recv`.
     pending: VecDeque<Value>,
@@ -843,14 +917,15 @@ pub(crate) struct Relay {
     pub(crate) stats: Arc<Stats>,
 }
 
-/// Write `message` as one line, returning its length; a write to a process that has exited is
-/// dropped, since the test learns of the exit another way.
-fn write_line(stdin: &Mutex<ChildStdin>, message: &Value) -> usize {
+/// Write `message` as one line, returning its length; a write to a process that has exited, or
+/// whose stdin a test has closed, is dropped, since the test learns of that another way.
+fn write_line(stdin: &Mutex<Option<ChildStdin>>, message: &Value) -> usize {
     let line = format!("{message}\n");
-    let mut stdin = stdin.lock().expect("stdin lock");
-    let _ = stdin
-        .write_all(line.as_bytes())
-        .and_then(|()| stdin.flush());
+    if let Some(stdin) = stdin.lock().expect("stdin lock").as_mut() {
+        let _ = stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush());
+    }
     line.len()
 }
 
@@ -864,7 +939,9 @@ impl Relay {
             .arg(rpyc_dir())
             .spawn()
             .expect("the interpreter starts");
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin is piped")));
+        let stdin = Arc::new(Mutex::new(Some(
+            child.stdin.take().expect("stdin is piped"),
+        )));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = capture(child.stderr.take().expect("stderr is piped"));
         let targets = Arc::new(Mutex::new(HashMap::new()));
@@ -1040,6 +1117,25 @@ impl Relay {
         self.targets.lock().expect("targets lock").remove(name);
         let bound = self.bindings.remove(name).expect("a started binding");
         self.runtime.block_on(bound.binding.stop(grace))
+    }
+
+    /// Close the interpreter's stdin, as the host's end does.
+    pub(crate) fn close_stdin(&mut self) {
+        self.stdin.lock().expect("stdin lock").take();
+    }
+
+    /// The interpreter's exit status, once it has exited within `within`.
+    pub(crate) fn exit_within(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = self.interpreter.try_wait().expect("try_wait") {
+                return Some(status);
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Close binding `name`'s stdin, as the owner's death does.
@@ -1315,7 +1411,7 @@ impl Drop for Relay {
 fn pump_interpreter(
     stdout: impl Read,
     tx: Sender<Result<Value, String>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     targets: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
     stats: Arc<Stats>,
 ) {
@@ -1380,7 +1476,7 @@ fn pump_interpreter(
 fn pump_binding(
     name: String,
     mut rpc: mpsc::Receiver<Value>,
-    interpreter: Arc<Mutex<ChildStdin>>,
+    interpreter: Arc<Mutex<Option<ChildStdin>>>,
     stats: Arc<Stats>,
 ) {
     while let Some(mut message) = rpc.blocking_recv() {

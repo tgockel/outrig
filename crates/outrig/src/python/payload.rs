@@ -13,7 +13,7 @@
 //! binding process, arrives the same way: `build.rs` fetches the pinned wheel,
 //! lays its members out as a tar, and embeds that, and [`rpyc_dir`] unpacks it
 //! once into a directory named for the pin. A binding process imports RPyC
-//! from that directory, and `0003-21` mounts it read-only in the container
+//! from that directory, and `0003-22` mounts it read-only in the container
 //! beside the payload.
 
 use std::ffi::OsString;
@@ -106,7 +106,7 @@ pub(crate) async fn host_python() -> Result<PathBuf> {
 
 /// The vendored RPyC's directory on the host, holding the `rpyc` package,
 /// unpacked from the embedded wheel the first time it is asked for. Binding
-/// processes import from it, and `0003-21` mounts it read-only in the
+/// processes import from it, and `0003-22` mounts it read-only in the
 /// container beside the payload.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn rpyc_dir() -> Result<PathBuf> {

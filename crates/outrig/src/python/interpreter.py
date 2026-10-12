@@ -45,6 +45,7 @@ import asyncio
 import base64
 import builtins
 import collections
+import collections.abc
 import concurrent.futures.thread
 import contextlib
 import contextvars
@@ -59,6 +60,7 @@ import json
 import math
 import mmap
 import multiprocessing.pool
+import operator
 import os
 import resource
 import select
@@ -74,6 +76,7 @@ import time
 import traceback
 import types
 import typing
+import weakref
 
 # ---------------------------------------------------------------------------- limits
 
@@ -1576,15 +1579,17 @@ builtins.help = _Help()
 
 # ---------------------------------------------------------------------------- hosted objects
 
-# A binding is a library running in a process on the host, which agent code reaches through RPyC
-# proxies. Its frames travel as `rpc` lines of this protocol, tagged by agent, binding and
+# A binding is a library running in a process on the host, which agent code reaches through a
+# `HostedObject`: a path of attribute reads, item reads and calls that sends nothing until it is
+# awaited, and is then resolved through RPyC proxies on a worker thread while the kernel's loop
+# turns. Its frames travel as `rpc` lines of this protocol, tagged by agent, binding and
 # connection, and the host relays them to the binding's process: nothing here listens on a
 # socket. The reader thread routes each part of a frame to its connection's channel, and the
 # thread waiting for a reply waits on the condition variable the channel shares with its pool, so
 # it never reads the protocol itself and releases the GIL while it waits. A kernel holds a pool
-# of up to `POOL_MAX` connections per binding, one call in flight on each, so a call that blocks
-# for an hour blocks its thread and no other; the reader thread can wake a waiting thread with
-# an interrupt through the same condition variable, on any kernel.
+# of up to `POOL_MAX` connections per binding, one call in flight on each, and as many workers,
+# so a call that blocks for an hour blocks its worker and no other; the reader thread can wake a
+# waiting call with an interrupt through the same condition variable, on any kernel.
 #
 # Nothing on this side is enforcement. Agent code runs in this process and can write frames of its
 # own, so every check that matters is the binding's, on the host. What this side does is make the
@@ -1798,10 +1803,17 @@ class _Wait:
     `KeyboardInterrupt`, a `CancelledError`, the closing `EOFError` -- and `by` the kernel that
     set it, for the report when the call was a background task's. `interruptible` is decided
     once, from the calling thread's own frames, by the rule `_on_sigint` applies: a hosted call
-    this program makes for itself is not an interrupt's to end.
+    this program makes for itself is not an interrupt's to end. `within` is the awaited call this
+    one ends with, on any binding: the one the thread was resolving when this one began, for a call
+    a callback makes inside it, or when the host called back the coroutine callback this one was
+    awaited inside. `nested` holds the calls, on any binding, awaited inside a coroutine callback
+    the thread serves meanwhile, which run on it -- on the connection it holds to their binding,
+    if it holds one -- while it serves that callback or one nested inside it.
     """
 
-    __slots__ = ("pool", "execution", "interruptible", "waiting", "exc", "by", "conn")
+    __slots__ = (
+        "pool", "execution", "interruptible", "waiting", "exc", "by", "conn", "within", "nested"
+    )
 
     def __init__(self, pool, execution, interruptible):
         self.pool = pool
@@ -1811,13 +1823,21 @@ class _Wait:
         self.exc = None
         self.by = None
         self.conn = None
+        self.within = None
+        self.nested = None
 
     def block(self, ready, timeout=None):
         """Under the pool's condition variable: wait until `ready()`, or raise what the reader
-        thread left, which comes first. False when `timeout` seconds pass with neither."""
+        thread left for this call or one it is within, which comes first. False when `timeout`
+        seconds pass with neither."""
         while True:
             if self.exc is not None:
                 raise self.pool._pop_exc(self)
+            within = self.within
+            while within is not None:
+                if within.exc is not None:
+                    raise within.exc.with_traceback(None)
+                within = within.within
             if ready():
                 return True
             self.waiting = True
@@ -1827,6 +1847,68 @@ class _Wait:
                 self.waiting = False
             if not signalled:
                 return ready()
+
+
+class _Job(_Wait):
+    """An awaited call: the one wait every request of it to its binding uses, on whichever thread
+    resolves it, and what settles the code awaiting it -- `future`, on `loop`, in `task`. Its
+    callbacks run in `context`, a copy of the awaiting task's.
+
+    Its execution and `interruptible` are decided where it is awaited, since a worker's frames
+    hold no agent code. A wake settles the future itself, at once, whatever the worker is doing
+    -- waiting, running a callback, or still queued -- and leaves the worker an exception of its
+    own to raise at every wait from then on, so it takes no connection again. Cancelling `task`
+    from agent code wakes this call alone and leaves its connection for the next taker to tidy.
+    """
+
+    __slots__ = ("loop", "task", "future", "context")
+
+    def wake(self, make):
+        """Under the pool's condition variable: settle the awaiting code with what `make(self)`
+        builds. An interrupt carries where it lands, for `Kernel._interrupted_task`."""
+        self.exc, settled = make(self), make(self)
+        if type(settled) is KeyboardInterrupt:
+            settled._outrig_landed = (settled, self.task, self.execution)
+        _settle_soon(self, None, settled)
+
+    def abandoned(self, future):
+        """The future's done callback: its awaiting task was cancelled, so the worker stops, on
+        whichever binding a callback's call has it waiting."""
+        if future.cancelled():
+            with self.pool.cond:
+                if self.exc is None:
+                    self.exc = asyncio.CancelledError()
+            self.pool.kernel._notify_hosted()
+
+
+def _job_of(wait):
+    """The awaited call that `wait` is, or was made inside, if any."""
+    return wait if type(wait) is _Job else getattr(wait, "within", None)
+
+
+def _settle_soon(job, value, exc):
+    """Settle `job`'s awaiting code with `value`, or with `exc`, through its loop."""
+    with contextlib.suppress(RuntimeError):  # the loop has closed; nobody awaits the call
+        _with_room(job.loop.call_soon_threadsafe, _settle, job.future, value, exc)
+
+
+def _settle(future, value, exc):
+    """On the loop: settle an awaited call's future, unless it was settled first. On the primary,
+    an interrupt settled here disarms the signal on its way for the same interrupt, so the code
+    that has it is not interrupted twice."""
+    if future.done():
+        return
+    if exc is None:
+        future.set_result(value)
+        return
+    if type(exc) is KeyboardInterrupt and future.get_loop() is getattr(_primary, "loop", None):
+        _primary._interrupting = None
+    future.set_exception(exc)
+
+
+def _notify(cond):
+    with cond:
+        cond.notify_all()
 
 
 def _woken_text(wait, verb):
@@ -1858,6 +1940,10 @@ class _Pool:
     the late replies are dropped unread and a request made meanwhile is refused, so the
     connection is free again.
 
+    An awaited call is resolved on a worker of the pool's executor, `POOL_MAX` of them, so a
+    call past that many waits in the executor's queue with no thread; the pool keeps every
+    awaited call, queued or in progress, for the wake and the close to settle.
+
     Nothing dispatches, boxes or writes a frame while holding the condition variable.
     """
 
@@ -1867,8 +1953,33 @@ class _Pool:
         self.cond = threading.Condition()
         self.connections = []
         self.closed = None  # the reason, once `close` has run
+        self.jobs = set()  # the awaited calls, queued or in progress
+        self.executor = None  # their workers, started at first use
         self._root = None
         self._clock = itertools.count()  # orders the connections by their last take
+
+    @property
+    def names(self):
+        return f"binding {self.binding!r} on agent {self.kernel.agent!r}"
+
+    def submit(self, job, proxy):
+        """Queue `job`, resolving `proxy`, on the executor, unless the pool has closed, which
+        settled it. A call that cannot be queued is settled with why, and sends nothing should
+        its work run all the same."""
+        try:
+            with self.cond:
+                if self.closed is not None:
+                    return
+                if self.executor is None:
+                    self.executor = concurrent.futures.thread.ThreadPoolExecutor(
+                        POOL_MAX, f"hosted-{self.kernel.agent}-{self.binding}"
+                    )
+                self.executor.submit(_run_job, job, proxy)
+        except BaseException as e:
+            with self.cond:
+                self.jobs.discard(job)
+                job.exc = e
+            _settle_soon(job, None, e)
 
     def root(self):
         """The binding's root, fetched on a connection of this pool at first use, and again
@@ -1880,13 +1991,19 @@ class _Pool:
         return root
 
     def request(self, handler, *args):
-        """One synchronous request on whichever connection of the pool this thread may use."""
-        execution = _CURRENT.get()
-        kernel = self.kernel if execution is None else execution.kernel
-        wait = _Wait(self, execution, _agent_code_outward(sys._getframe(), kernel))
+        """One synchronous request on whichever connection of the pool this thread may use: a
+        step of the awaited call the thread is resolving, which waits as that call, or a call of
+        its own."""
         ident = threading.get_ident()
+        outer = _waits.get(ident)
+        if type(outer) is _Job and outer.pool is self:
+            wait = outer
+        else:
+            execution = _CURRENT.get()
+            kernel = self.kernel if execution is None else execution.kernel
+            wait = _Wait(self, execution, _agent_code_outward(sys._getframe(), kernel))
+            wait.within = _job_of(outer)
         with self.cond:
-            outer = _waits.get(ident)
             _waits[ident] = wait
         try:
             conn = self.take(wait)
@@ -1904,6 +2021,8 @@ class _Pool:
     def take(self, wait):
         """A connection for this thread's call, as the class comment describes."""
         ident = threading.get_ident()
+        # An awaited call keeps the connection its last step took, so a wake can tell it was sent.
+        taken = wait.conn
         while True:
             with self.cond:
                 wait.block(lambda: self._pick(ident, wait))
@@ -1915,7 +2034,7 @@ class _Pool:
             try:
                 conn.tidy()
             finally:
-                wait.conn = None
+                wait.conn = taken
                 self.release(conn)
 
     def _pick(self, ident, wait):
@@ -1967,11 +2086,17 @@ class _Pool:
     def close(self, reason):
         """Close every connection, waking every call waiting on them: one in flight is left to
         the binding to finish and its caller told the outcome is unknown; one waiting for a
-        connection was never sent. A connection a thread holds is closed by that thread when its
-        wait ends, since cleaning up releases locks only the holder may release."""
+        connection was never sent. Every awaited call is settled at once the same two ways, and
+        the executor is shut down without waiting for its workers. A connection a thread holds is
+        closed by that thread when its wait ends, since cleaning up releases locks only the holder
+        may release."""
         unknown = f"{reason}: the call's outcome on the host is unknown"
+        never = f"{reason}: the call was never sent"
         with self.cond:
             self.closed = reason
+            for job in self.jobs:
+                if job.exc is None:
+                    job.wake(lambda job: EOFError(never if job.conn is None else unknown))
             conns = list(self.connections)
             for conn in conns:
                 _rpc_channels.pop(conn.key, None)
@@ -1980,8 +2105,10 @@ class _Pool:
                     conn.close()
             for wait in list(_waits.values()):
                 if wait.pool is self and wait.conn is None and wait.exc is None:
-                    wait.exc = EOFError(f"{reason}: the call was never sent")
+                    wait.exc = EOFError(never)
             self.cond.notify_all()
+        if self.executor is not None:
+            self.executor.shutdown(wait=False, cancel_futures=True)
         for conn in conns:
             _rpc_notice(self.kernel.agent, self.binding, conn.number, reason)
 
@@ -1994,16 +2121,451 @@ class _Pool:
     @staticmethod
     def _pop_exc(wait):
         """Take the exception the reader thread left, noting where it lands as `_on_sigint`
-        does, so an interrupt that ends a background task's call is reported to its owner."""
+        does, so an interrupt that ends a background task's call is reported to its owner. An
+        awaited call's stays: its awaiting code has been told, and the worker only unwinds."""
+        if type(wait) is _Job:
+            return wait.exc
         exc, wait.exc = wait.exc, None
         if wait.by is not None:
             wait.by._landed = (exc, asyncio.current_task(wait.by.loop), wait.execution)
         return exc
 
 
+# What a hosted object answers itself. Its API is private, since the host refuses every private
+# name, so it shadows no hosted attribute; every other name is a step, and a dunder one only where
+# the host could answer it -- RPyC's safe list, `__dir__` and `__call__`, set when RPyC loads.
+_OWN = frozenset(("_set", "_delete", "_resolve", "_sync", "_isinstance", "_netref", "_binding"))
+_HOST_DUNDERS = frozenset()
+# The wait of the thread serving the coroutine callback a task runs in: what that task awaits, on
+# any binding, is resolved there, on the connection that thread holds to the binding if it holds
+# one, whose host thread holds the binding's `serialize` turn.
+_SERVING = contextvars.ContextVar("outrig_serving", default=None)
+# Per thread, as `waits`: the waits whose queued calls the thread serves, the innermost first. A
+# call it runs for one coroutine callback can call back another, which it serves inside that call
+# while calls the outer one's other tasks await are still queued for it.
+_served = threading.local()
+_END = object()  # what `next` gives back for an exhausted iterator
+_entered = {}  # by a hosted object's id and a task: the managers its `async with` entered
+# Types Python's machinery treats specially, which a hosted object never claims to be: it would be
+# taken for a class, a module, a function, a descriptor or a coroutine, and handled as one.
+_SPECIAL = (
+    type, types.ModuleType, types.FunctionType, types.MethodType, types.BuiltinFunctionType,
+    types.CodeType, types.FrameType, types.TracebackType, types.GeneratorType,
+    types.CoroutineType, types.AsyncGeneratorType, types.WrapperDescriptorType,
+    types.MethodWrapperType, types.MethodDescriptorType, types.ClassMethodDescriptorType,
+    types.GetSetDescriptorType, types.MemberDescriptorType, property, classmethod, staticmethod,
+    collections.abc.Coroutine, collections.abc.Generator, collections.abc.AsyncGenerator,
+)
+
+
+class _Doc:
+    """`HostedObject.__doc__`: the class's text for the class, and for one hosted object that text
+    with what is known of it here, so `help(x)` describes `x` rather than the class."""
+
+    def __init__(self, text):
+        self.text = inspect.cleandoc(text)
+
+    def __get__(self, obj, cls=None):
+        if obj is None:
+            return self.text
+        _, ref, path = _parts(obj)
+        if ref is None or path:
+            return f"{self.text}\n\nThis is a path: nothing has been asked of the host yet."
+        names = sorted(n for n, v in vars(type(ref)).items() if callable(v) and n[0] != "_")
+        return (
+            f"{self.text}\n\nThe methods the host listed for {_host_type(ref)}: "
+            f"{', '.join(names) or 'none'}."
+        )
+
+
+class HostedObject:
+    __doc__ = _Doc(
+        """An object on the host, reached through a binding, and used by awaiting it.
+
+        `x.name`, `x[key]` and `x(...)` build a path and send nothing. `await x` resolves the path
+        on the host, a request for each step, while the event loop turns, and gives back a value,
+        or a hosted object bound to what the host holds, which builds and awaits the same way; what
+        the host raises is raised there. `async for` iterates one, and `async with` enters one.
+
+        Nothing else asks the host anything. `repr`, `dir`, `help`, `type` and `hash` answer here,
+        and `len`, truthiness, `for`, `in`, `==`, operators, `with` and assignment raise
+        `TypeError` naming what to await instead, such as `await x.__len__()`. `hasattr(x, name)`
+        is always true: a missing attribute raises `AttributeError` where it is awaited.
+
+        `await x._set(name, value)` and `await x._delete(name)` set and delete an attribute, and
+        `await x._isinstance(obj)` asks the host whether `obj` is an instance of `x`.
+        `x._resolve()` is a coroutine that awaits `x`, for `asyncio.create_task(x._resolve(),
+        name=...)`. `x._sync()` resolves `x` on the calling thread, for a plain function the host
+        calls back; it is refused on an event loop's thread. `x._netref` is a resolved object's
+        RPyC proxy, and `x._binding` the binding's name."""
+    )
+    __module__ = "outrig"
+    __slots__ = ("_parts", "__weakref__")  # the pool, the proxy resolved to or `None`, the steps
+    __hash__ = object.__hash__
+
+    def __init__(self, pool, ref=None, path=()):
+        object.__setattr__(self, "_parts", (pool, ref, path))
+
+    def __getattribute__(self, name):
+        if name in _OWN or (name[:2] == name[-2:] == "__" and name not in _HOST_DUNDERS):
+            return object.__getattribute__(self, name)
+        return _then(self, f".{name}", getattr, name)
+
+    def __getitem__(self, key):
+        return _then(self, f"[{key!r}]", operator.getitem, key)
+
+    def __call__(self, *args, **kwargs):
+        return _then(self, "(...)", _call, args, kwargs)
+
+    def __setattr__(self, name, value):
+        raise TypeError(
+            f"an assignment cannot be awaited: `await x._set({name!r}, value)` assigns on the host"
+        )
+
+    def __delattr__(self, name):
+        raise TypeError(
+            f"a deletion cannot be awaited: `await x._delete({name!r})` deletes on the host"
+        )
+
+    def __await__(self):
+        """Queue the path on the pool's executor -- or, awaited in a coroutine callback, on the
+        thread serving its call -- with what a worker cannot read from its own frames, and settle
+        once it is resolved. In `_MACHINERY`, so an interrupt cannot land while it is queued."""
+        pool, ref, path = _parts(self)
+        if ref is not None and not path:
+            return self
+        execution = _awaiting(pool)
+        loop = asyncio.get_running_loop()
+        job = _Job(pool, execution, _agent_code_outward(sys._getframe(1), pool.kernel))
+        job.loop, job.task, job.future = loop, asyncio.current_task(loop), loop.create_future()
+        job.future.add_done_callback(job.abandoned)
+        # Without `_SERVING`: a plain callback may hold its thread until a coroutine it started
+        # ends, so that coroutine's calls go to the executor.
+        job.context = contextvars.copy_context()
+        job.context.run(_SERVING.set, None)
+        serving = _SERVING.get()
+        with pool.cond:
+            if pool.closed is not None:
+                raise EOFError(f"{pool.closed}: the call was never sent")
+            pool.jobs.add(job)
+        nested = False
+        if serving is not None:
+            # A queue holds calls to any binding, under its serving wait's condition variable.
+            with serving.pool.cond:
+                nested = serving.nested is not None
+                if nested:
+                    serving.nested.append((job, self))
+        if nested:
+            # The serving thread may be waiting on another binding, in a callback nested inside.
+            pool.kernel._notify_hosted()
+        else:
+            pool.submit(job, self)
+        return (yield from job.future)
+
+    def __aiter__(self):
+        return _items(self)
+
+    async def __anext__(self):
+        item = await _then(self, ".__next__()", next, _END)
+        if item is _END:
+            raise StopAsyncIteration
+        return item
+
+    async def __aenter__(self):
+        manager, value = await _then(self, ".__enter__()", _enter)
+        _entered.setdefault((id(self), asyncio.current_task()), []).append(manager)
+        return value
+
+    async def __aexit__(self, typ, exc, tb):
+        key = (id(self), asyncio.current_task())
+        managers = _entered[key]
+        manager = managers.pop()
+        if not managers:
+            del _entered[key]
+        return await _then(manager, ".__exit__(...)", _exit, exc)
+
+    def _set(self, name, value):
+        return _then(self, f"._set({name!r}, ...)", setattr, name, value)
+
+    def _delete(self, name):
+        return _then(self, f"._delete({name!r})", delattr, name)
+
+    async def _isinstance(self, obj):
+        if type(obj) is HostedObject:
+            obj = await obj  # on its own binding, as any await
+        return await _then(self, "._isinstance(...)", _instance_of, obj)
+
+    async def _resolve(self):
+        return await self
+
+    def _sync(self):
+        current = threading.current_thread()
+        if current is _reader_thread or any(k.thread is current for k in list(_kernels.values())):
+            raise TypeError(
+                f"{self!r}._sync() would hold this kernel's event loop until the host answered: "
+                f"`await` it instead. `_sync()` is for a plain-function callback, which runs on "
+                f"a worker and cannot await"
+            )
+        _awaiting(_parts(self)[0])
+        return _resolved(self)
+
+    @property
+    def _netref(self):
+        _, ref, path = _parts(self)
+        return None if path else ref
+
+    @property
+    def _binding(self):
+        return _parts(self)[0].binding
+
+    @property
+    def __class__(self):
+        return _local_class(self)
+
+    def __instancecheck__(self, obj):
+        """`isinstance(obj, x)` for a hosted class `x`: answered here for an instance of exactly
+        that class, and for an object of this process, against the class's library here; any
+        other answer is the host's, which `await x._isinstance(obj)` asks for."""
+        pool, cls, path = _parts(self)
+        if cls is None or path or object.__getattribute__(cls, "____id_pack__")[2]:
+            raise TypeError(f"isinstance() arg 2 must be a class, and {self!r} is not one")
+        if type(obj) is not HostedObject:
+            return _instance_of(cls, obj)
+        other, ref, rest = _parts(obj)
+        if other is pool and ref is not None and not rest:
+            a, b = (object.__getattribute__(p, "____id_pack__") for p in (cls, ref))
+            if a[1] == b[1]:
+                return b[2] != 0
+        raise TypeError(
+            f"whether {obj!r} is an instance of {self!r} is the host's to say: "
+            f"`await x._isinstance(obj)` asks it"
+        )
+
+    def __repr__(self):
+        pool, ref, path = _parts(self)
+        if ref is not None and not path:
+            return f"<hosted {_host_type(ref)} from {pool.binding}>"
+        start = pool.binding if ref is None else f"({_host_type(ref)} from {pool.binding})"
+        return f"<hosted {start}{''.join(step[0] for step in path)}: unresolved, await it>"
+
+    def __dir__(self):
+        _, ref, path = _parts(self)
+        names = set(_OWN)
+        if ref is not None and not path:
+            names.update(name for name, value in vars(type(ref)).items() if callable(value))
+        return sorted(names)
+
+
+_parts = HostedObject._parts.__get__
+
+
+def _refusing(name, advice):
+    """A special method of a hosted object, which would need the host's answer without an
+    await."""
+
+    def refused(self, *args):
+        raise TypeError(f"{name} of a hosted object needs the host's answer: {advice}")
+
+    return refused
+
+
+for _name, _advice in {
+    "__iter__": "iterate it with `async for item in x`",
+    "__len__": "`await x.__len__()`",
+    "__bool__": "`await x.__bool__()`, or `await x.__len__()` for a container",
+    "__contains__": "`await x.__contains__(item)`",
+    "__enter__": "enter it with `async with x:`",
+    "__exit__": "enter it with `async with x:`",
+    "__setitem__": "`await x.__setitem__(key, value)`",
+    "__delitem__": "`await x.__delitem__(key)`",
+    **{
+        f"__{op}__": f"`await x.__{op}__(other)`; `is` compares the proxies here"
+        for op in "eq ne lt le gt ge".split()
+    },
+    **{
+        f"__{op}__": f"`await x.__{op}__()`"
+        for op in "int float complex index neg pos abs invert round trunc floor ceil".split()
+    },
+    **{
+        f"__{form}{op}__": f"`await x.__{form}{op}__(other)`"
+        for op in (
+            "add sub mul matmul truediv floordiv mod divmod pow lshift rshift and xor or"
+        ).split()
+        for form in ("", "r")
+    },
+    "__reduce_ex__": "it names an object in another process, and cannot be copied or pickled",
+}.items():
+    setattr(HostedObject, _name, _refusing(_name, _advice))
+del _name, _advice
+
+
+def _then(proxy, label, fn, *args):
+    """`proxy` with one more step, shown as `label`: `fn(what the path gave, *args)`."""
+    pool, ref, path = _parts(proxy)
+    return HostedObject(pool, ref, (*path, (label, fn, *args)))
+
+
+def _call(fn, args, kwargs):
+    return fn(*args, **kwargs)
+
+
+def _enter(manager):
+    return manager, type(manager).__enter__(manager)
+
+
+def _exit(manager, exc):
+    # RPyC's proxy sends the type it is given first; `_ctxexit_args` takes the exception itself.
+    # Truth-tested here, which asks the host for a proxy: `async with` would test a hosted object,
+    # which refuses. Only for an exception, as `with` tests it.
+    suppress = type(manager).__exit__(manager, exc, None, None)
+    return exc is not None and bool(suppress)
+
+
+def _instance_of(cls, obj):
+    """`isinstance(obj, cls)` for the class a hosted object resolved to: RPyC's answer for a
+    hosted object -- a request, unless the class ids settle it -- and for an object of this
+    process the answer of the class's library here, `False` when it does not import."""
+    if type(obj) is HostedObject:
+        return isinstance(_parts(obj)[1], cls)
+    local = _named_class(cls)
+    return local is not None and isinstance(obj, local)
+
+
+async def _items(proxy):
+    """`async for` over a hosted object: a request for its iterator, then one for each item."""
+    it = await _then(proxy, ".__iter__()", iter)
+    if type(it) is not HostedObject:
+        it = HostedObject(_parts(proxy)[0], it)  # a value's own iterator, stepped the same way
+    while (item := await _then(it, ".__next__()", next, _END)) is not _END:
+        yield item
+
+
+def _replay(proxy):
+    """What `proxy` names, found on this thread: the binding's root, or the proxy it was resolved
+    to, then each step as RPyC's proxies do it -- a request for each, two for a method's call.
+    The host's refusal to read a name is raised as an `AttributeError`, as a missing one is."""
+    pool, obj, path = _parts(proxy)
+    if obj is None:
+        obj = pool.root()
+    for _, fn, *args in path:
+        try:
+            obj = fn(obj, *args)
+        except Exception as e:
+            if fn is not getattr or _type_name(type(e)) != "outrig.Refused":
+                raise
+            raise _attribute_error(e) from None
+    return obj
+
+
+def _attribute_error(e):
+    """The host's refusal `e`, as an `AttributeError` of the same name and text."""
+    cls = type(e)
+    error = type(_type_name(cls), (cls, AttributeError), {"__module__": cls.__module__})(*e.args)
+    error.__dict__.update(e.__dict__)
+    return error
+
+
+def _resolved(proxy):
+    """`proxy` resolved on this thread, as agent code receives it."""
+    return _wrapped(_replay(proxy))
+
+
+def _wrapped(obj):
+    """A host's answer as agent code sees it: a proxy as a resolved hosted object -- the same one
+    for the same proxy, so one host object returned twice on a connection is one object here --
+    inside a tuple too, and a value as itself."""
+    if issubclass(type(obj), _rpyc.core.netref.BaseNetref):
+        conn = object.__getattribute__(obj, "____conn__")
+        pack = object.__getattribute__(obj, "____id_pack__")
+        proxy = conn._facades.get(pack)
+        if proxy is None:
+            proxy = conn._facades[pack] = HostedObject(conn._pool, obj)
+        return proxy
+    if type(obj) is tuple:
+        return tuple(_wrapped(item) for item in obj)
+    return obj
+
+
+def _host_type(ref):
+    """The name of a proxy's host type, or of the class it is, from its id pack."""
+    name, _, instance = object.__getattribute__(ref, "____id_pack__")
+    return str(name) if instance else f"class {name}"
+
+
+_type_module = type.__dict__["__module__"].__get__
+
+
+def _named_class(ref):
+    """The local class RPyC's proxy class names for the host's type -- for a proxy of a class,
+    that class -- if it has the host's own module and name; else `None`."""
+    cls = getattr(vars(type(ref)).get("__class__"), "instance", None)
+    if not isinstance(cls, type):
+        return None
+    name = object.__getattribute__(ref, "____id_pack__")[0]
+    return cls if f"{_type_module(cls)}.{_type_name(cls)}" == name else None
+
+
+def _local_class(proxy):
+    """What a hosted object's `__class__` says, asking nothing: for a resolved instance, its host
+    type's class here -- so `isinstance(c, Commit)` holds where the library imports -- unless that
+    is one of `_SPECIAL`; else `HostedObject`."""
+    _, ref, path = _parts(proxy)
+    if ref is not None and not path and object.__getattribute__(ref, "____id_pack__")[2]:
+        cls = _named_class(ref)
+        if cls is not None and not issubclass(cls, _SPECIAL):
+            return cls
+    return HostedObject
+
+
+def _kind(value):
+    """The type `Kernel.held` reports for `value`, asking nothing: a resolved hosted object's
+    names the host's type."""
+    if type(value) is HostedObject:
+        _, ref, path = _parts(value)
+        if ref is not None and not path:
+            return f"HostedObject[{_host_type(ref)}]"
+    return _type_name(type(value))
+
+
+def _awaiting(pool):
+    """The execution using `pool`, refusing one of another kernel: an interrupt of a kernel
+    reaches only its own pools' calls."""
+    execution = _CURRENT.get()
+    if execution is not None and execution.kernel is not pool.kernel:
+        raise TypeError(
+            f"a hosted object of agent {pool.kernel.agent!r} cannot be used by agent "
+            f"{execution.kernel.agent!r}: each agent reaches a binding through its own"
+        )
+    return execution
+
+
+def _run_job(job, proxy, within=None):
+    """Resolve `proxy` for `job` on this thread, in its context -- a worker of the pool's executor,
+    or the thread serving the coroutine callback it was awaited in, where it ends with `within`,
+    the call that callback was served for -- and settle the awaiting code through its loop."""
+    pool, ident = job.pool, threading.get_ident()
+    with pool.cond:
+        outer = _waits.get(ident)
+        job.within = within
+        _waits[ident] = job
+    try:
+        value, exc = job.context.run(_resolved, proxy), None
+    except BaseException as e:
+        # Raised where the call is awaited, without this thread's frames.
+        value, exc = None, e.with_traceback(None)
+    finally:
+        with pool.cond:
+            if outer is None:
+                _waits.pop(ident, None)
+            else:
+                _waits[ident] = outer
+            pool.jobs.discard(job)
+    _settle_soon(job, value, exc)
+
+
 def _load_rpyc(directory):
     """Import RPyC from `directory` and build the connection class over it."""
-    global _rpyc, _Hosted, _rpyc_missing, _MACHINERY
+    global _rpyc, _Hosted, _rpyc_missing, _MACHINERY, _HOST_DUNDERS
     sys.path.append(directory)
     try:
         import rpyc
@@ -2013,6 +2575,8 @@ def _load_rpyc(directory):
         return
     _rpyc = rpyc
     _Hosted = _connection_class(rpyc)
+    safe = rpyc.core.protocol.DEFAULT_CONFIG["safe_attrs"]
+    _HOST_DUNDERS = frozenset(safe | {"__dir__", "__call__"}) - {"__doc__", "__new__"}
     # A signal landing while a request is encoded or written is declined, as one landing in
     # `_write_line` is: RPyC registers the request's callback before `_send` runs, so the
     # request is outstanding from before its first byte goes out.
@@ -2083,10 +2647,12 @@ def _connection_class(rpyc):
             # The callables each request handed out, by seq: released once its reply has been
             # delivered, or at once when the reply is dropped.
             self._marks = {}
+            # The hosted object of each proxy this connection made, by id pack, while it lives.
+            self._facades = weakref.WeakValueDictionary()
 
         @property
         def names(self):
-            return f"binding {self.binding!r} on agent {self.agent!r}"
+            return self._pool.names
 
         @property
         def key(self):
@@ -2159,12 +2725,15 @@ def _connection_class(rpyc):
 
         def _ctxexit_args(self, args):
             """A proxy's `__exit__` sends only the exception's type. The exception itself is
-            `sys.exception()` while a `with` block unwinds, and goes by value when its type is the
-            one sent; otherwise the type alone, and `None` stays `None`."""
+            `sys.exception()` while a `with` block unwinds -- or, from a hosted object's
+            `__aexit__`, sent in the type's place -- and goes by value when its type is the one
+            sent; otherwise the type alone, and `None` stays `None`."""
             proxy, exc = args
             if exc is None:
                 return (proxy, None)
             current = sys.exception()
+            if isinstance(exc, BaseException):
+                current, exc = exc, type(exc)
             if current is not None and type(current) is exc:
                 dump = vinegar.dump(
                     exc, current, None, include_local_traceback=False, include_local_version=False
@@ -2181,19 +2750,24 @@ def _connection_class(rpyc):
                 return consts.LABEL_VALUE, obj
             if type(obj) is tuple:
                 return consts.LABEL_TUPLE, tuple(self._box(item, seen) for item in obj)
-            # Before anything else: a proxy of a host list answers `isinstance(proxy, list)`, and
-            # a proxy of a host method is callable.
+            # Before anything else: a hosted object, or a proxy of a host list, answers
+            # `isinstance(x, list)`, and a proxy of a host method is callable.
+            if type(obj) is HostedObject:
+                pool, ref, path = _parts(obj)
+                if pool is not self._pool:
+                    raise self._foreign(pool.names)
+                if ref is None or path:
+                    # Resolved here, on the thread that sends this request, nested on its
+                    # connection; a dict's key is never rebuilt, so no proxy is hashed.
+                    return self._box(_replay(obj), seen)
+                obj = ref
             if isinstance(obj, netref.BaseNetref):
                 conn = object.__getattribute__(obj, "____conn__")
                 if getattr(conn, "_pool", None) is self._pool:
                     # Any connection of the same kernel to the same binding: the binding keeps
                     # one object table per kernel.
                     return consts.LABEL_LOCAL_REF, object.__getattribute__(obj, "____id_pack__")
-                raise TypeError(
-                    f"a proxy of {getattr(conn, 'names', 'another connection')} cannot be passed "
-                    f"to {self.names}: a hosted object crosses only to its own binding, from the "
-                    f"kernel that holds it"
-                )
+                raise self._foreign(getattr(conn, "names", "another connection"))
             for base, label, read in copies:
                 if isinstance(obj, base):
                     if id(obj) in seen:
@@ -2225,6 +2799,12 @@ def _connection_class(rpyc):
                 f"an object of type {_type_name(type(obj))} cannot be passed to a hosted object: "
                 f"only values, lists, dicts, sets, paths, callables, and the binding's own proxies "
                 f"cross. `list()` a generator, or pass what the object holds."
+            )
+
+        def _foreign(self, names):
+            return TypeError(
+                f"a proxy of {names} cannot be passed to {self.names}: a hosted object crosses "
+                f"only to its own binding, from the kernel that holds it"
             )
 
         def _unbox_exc(self, raw):
@@ -2347,10 +2927,13 @@ def _connection_class(rpyc):
                     self._queue_dels_of(item)
 
         def _dispatch_request(self, seq, raw_args, serving=True):
-            """Serve the host's call of a callback. What it returns goes back by the argument
-            rules with callables refused too; an interrupt, a cancel or an exit it raised is
-            answered and then raised here, so the execution ends with it. A request for a call
-            this side gave up on is refused, and the callback does not run."""
+            """Serve the host's call of a callback: a plain function runs here, and a coroutine
+            function's coroutine on the kernel's loop, served from here (`_awaited`). Inside an
+            awaited call -- its own request, or one a callback of it makes -- the proxies the host
+            passes arrive as hosted objects. What it returns goes back by the argument rules with
+            callables refused too; an interrupt, a cancel or an exit it raised is answered and
+            then raised here, so the execution ends with it. A request for a call this side gave
+            up on is refused, and the callback does not run."""
             if not serving:
                 exc = RuntimeError(
                     "the call this callback belongs to was interrupted in the container; the "
@@ -2365,7 +2948,14 @@ def _connection_class(rpyc):
                 try:
                     handler, args = raw_args
                     args = self._unbox(args)
+                    if _job_of(_waits.get(threading.get_ident())) is not None:
+                        args = _wrapped(args)
                     res = self._HANDLERS[handler](self, *args)
+                    # By its type: a proxy's class has every name its host type has, and its
+                    # `__class__` would be a request.
+                    coroutine = issubclass(type(res), collections.abc.Coroutine)
+                    if coroutine and not issubclass(type(res), netref.BaseNetref):
+                        res = self._awaited(res)
                     reply = (consts.MSG_REPLY, self._box(res))
                 except BaseException as e:
                     t, v, tb = sys.exc_info()
@@ -2383,6 +2973,61 @@ def _connection_class(rpyc):
                     raise
             if raised is not None:
                 raise raised
+
+        def _awaited(self, coro):
+            """Run the coroutine a callback returned on the kernel's loop and serve, meanwhile, on
+            this thread, the hosted calls it awaits, on any binding, and the frames that arrive
+            here. A call goes on the connection this thread holds to its binding, if any -- this
+            one, or that of a call this thread is inside -- whose host thread holds the `serialize`
+            turn the call needs. The calls queued for the coroutine callbacks this thread serves
+            further out are run meanwhile too: one of their tasks may be what this coroutine waits
+            for. Refused on the loop's own thread, which is waiting for the host."""
+            kernel, cond = self._pool.kernel, self._pool.cond
+            if threading.current_thread() is kernel.thread:
+                coro.close()
+                raise TypeError(
+                    "a coroutine function cannot be called back while its kernel's thread waits "
+                    "for the host: await the call it is passed to"
+                )
+            wait = _waits[threading.get_ident()]
+            created = wait.nested is None
+            if created:
+                wait.nested = collections.deque()
+            # Set while the task is made, which takes a copy of this thread's context.
+            token = _SERVING.set(wait)
+            try:
+                done = asyncio.run_coroutine_threadsafe(coro, kernel.loop)
+            finally:
+                _SERVING.reset(token)
+            done.add_done_callback(lambda _: _notify(cond))
+            outer = getattr(_served, "waits", ())
+            _served.waits = served = (wait, *outer)
+            try:
+                while not done.done():
+                    with cond:
+                        wait.block(
+                            lambda: done.done()
+                            or any(w.nested for w in served)
+                            or self._channel.ready
+                        )
+                    # Taken outside the queue's condition variable, which may be another pool's:
+                    # only this thread takes from a queue it serves. A call ends with the call its
+                    # own callback was served for.
+                    serving = next((w for w in served if w.nested), None)
+                    if serving is not None:
+                        _run_job(*serving.nested.popleft(), _job_of(serving))
+                    elif not done.done():
+                        self.serve()
+                return done.result()
+            finally:
+                _served.waits = outer
+                done.cancel()
+                if created:
+                    # What was queued too late to be served here goes to its binding's executor.
+                    with cond:
+                        leftover, wait.nested = wait.nested, None
+                    for job, proxy in leftover:
+                        job.pool.submit(job, proxy)
 
         # ------------------------------------------------------------------ closing
 
@@ -3194,6 +3839,12 @@ class Runtime:
         fs = set(fs)
         if any(asyncio.iscoroutine(f) for f in fs):
             raise TypeError("Passing coroutines is forbidden, use tasks explicitly.")
+        for f in fs:
+            if type(f) is HostedObject:
+                raise TypeError(
+                    f"{f!r} is awaitable, not a future: wait on a task, as "
+                    f"`asyncio.create_task(x._resolve(), name=...)`"
+                )
         # An iterator is not known to be empty until it is read. asyncio trips an assertion here.
         if not fs:
             raise ValueError("Set of Tasks/Futures is empty.")
@@ -3303,38 +3954,48 @@ class Kernel:
     def announce(self):
         _send({"t": "ready", "agent": self.agent, "version": _VERSION})
 
+    def stub(self, binding):
+        """The root of `binding` -- an object in a process on the host -- as the `HostedObject`
+        agent code awaits. Making it resolves nothing."""
+        return HostedObject(self._pool(binding))
+
     def hosted(self, binding):
-        """The root of `binding` -- an object in a process on the host -- as a proxy over one of
-        this kernel's connections to it.
+        """The root of `binding` as a proxy over one of this kernel's connections to it: the
+        synchronous engine under `stub`, for tests, bound to no name agent code sees.
 
         The first connection is opened on the calling thread at first use, and the root fetched
         then -- never on the reader thread, which is what delivers the reply this waits for. A
         proxy from a closed connection raises `EOFError` with the reason, and the next call here
         fetches the root again on a live connection.
         """
-        if _Hosted is None:
-            raise RuntimeError(_rpyc_missing)
         if threading.current_thread() is _reader_thread:
             raise RuntimeError("a hosted object cannot be resolved on the reader thread")
+        return self._pool(binding).root()
+
+    def _pool(self, binding):
+        """This kernel's pool of connections to `binding`, made anew once the last has closed."""
+        if _Hosted is None:
+            raise RuntimeError(_rpyc_missing)
         if not isinstance(binding, str) or not binding:
             raise TypeError("a binding is named by a non-empty str")
         with self._hosted_lock:
             pool = self._hosted.get(binding)
             if pool is None or pool.closed is not None:
                 pool = self._hosted[binding] = _Pool(self, binding)
-        return pool.root()
+        return pool
 
     def close_hosted(self, binding=None, reason="the kernel's connections are closing"):
         """Close this kernel's connections to `binding` -- to every binding, by default -- and
         wake every call waiting on them with `EOFError`: one in flight is left to the binding to
-        finish, its outcome unknown here, and one waiting for a connection was never sent. What a
-        release of the kernel (`0003-25`) and the session's close (`0003-21`) call; runs on any
-        thread."""
+        finish, its outcome unknown here, and one waiting for a connection, or queued, was never
+        sent. What a release of the kernel (`0003-26`) and the session's close (`0003-22`) call;
+        runs on any thread."""
         with self._hosted_lock:
             names = list(self._hosted) if binding is None else [binding]
             pools = [self._hosted.pop(name) for name in names if name in self._hosted]
         for pool in pools:
             pool.close(reason)
+        self._notify_hosted()  # a callback of a call it settled may wait on another binding
 
     def _open_hosted(self, binding, pool):
         """A new connection to `binding` for `pool`, which holds its condition variable. Called
@@ -3384,20 +4045,26 @@ class Kernel:
     def _interrupted_task(self, exc):
         """Report `exc` if it is an interrupt that ended a task rather than an execution's body.
 
-        The task was holding the loop -- which is why the interrupt went where it did -- and it
-        belongs to the execution that started it, so that is who is told, through the same route
-        the task's own output takes. Retrieving the exception keeps asyncio from reporting the
-        same death a second time when the task is collected; letting go of what the handler kept
-        is what allows it to be collected at all.
+        The task was holding the loop -- which is why the interrupt went where it did -- or
+        awaiting a hosted call the interrupt woke, and it belongs to the execution that started
+        it, so that is who is told, through the same route the task's own output takes.
+        Retrieving the exception keeps asyncio from reporting the same death a second time when
+        the task is collected; letting go of what the handler kept is what allows it to be
+        collected at all.
         """
         landed, self._landed = self._landed, None
+        what = "a task that was holding the event loop"
+        if (landed is None or landed[0] is not exc) and type(exc) is KeyboardInterrupt:
+            # An awaited call's: several can escape at once, so each says where it landed.
+            landed = exc.__dict__.pop("_outrig_landed", None)
+            what = "a task awaiting a hosted call"
         if landed is None or landed[0] is not exc:
             return False
         _, task, owner = landed
         if task is not None:
             with contextlib.suppress(BaseException):
                 task.exception()
-        text = f"[outrig interrupted a task that was holding the event loop]\n{_format_error(exc)}"
+        text = f"[outrig interrupted {what}]\n{_format_error(exc)}"
         if owner is None:
             _diag(f"agent {self.agent!r}: {text}")
             return True
@@ -3540,16 +4207,20 @@ class Kernel:
         Delivered through the loop, since a task is cancelled at its next suspension point -- so
         this reaches an execution suspended on an await and does nothing for one that has stopped
         yielding, which is what `interrupt` is for. The one blocking call it does reach is a
-        hosted call, whose wait this wakes with the `CancelledError` first; the loop's cancel
-        then finds a finished task, or one that caught the error and carried on. A request for
-        an execution that has already finished is the ordinary race of a Ctrl-C with a result,
-        and is dropped without comment.
+        hosted call, whose wait this wakes with the `CancelledError` first, as it settles every
+        awaited call of the execution; the loop's cancel then finds a finished task, or one that
+        caught the error and carried on. A request for an execution that has already finished is
+        the ordinary race of a Ctrl-C with a result, and is dropped without comment.
         """
         if not self._holds(exec_id):
             return
-        self._wake(
-            exec_id, False, lambda wait: asyncio.CancelledError(_woken_text(wait, "cancelled"))
-        )
+
+        def cancelled(wait):
+            return asyncio.CancelledError(_woken_text(wait, "cancelled"))
+
+        self._wake(exec_id, False, cancelled)
+        # On the loop's queue ahead of its own cancel, so the code sees this one's message.
+        self._wake_jobs(exec_id, cancelled)
         self.loop.call_soon_threadsafe(self._cancel, exec_id)
 
     def _holds(self, exec_id):
@@ -3566,9 +4237,9 @@ class Kernel:
         execution.task.cancel()
 
     def interrupt(self, exec_id, runaway):
-        """Interrupt `exec_id`'s agent code: wake the hosted call its thread is waiting in, on
-        any kernel, or aim a SIGINT at the loop's thread, on the primary. Runs on the reader
-        thread.
+        """Interrupt `exec_id`'s agent code: wake the hosted call its thread is waiting in and
+        every call it awaits, on any kernel, and aim a SIGINT at the loop's thread, on the
+        primary, unless that thread's call was woken. Runs on the reader thread.
 
         Handled here rather than through the loop, whose queue is exactly what a wedged loop is
         not draining. A thread waiting for a binding to answer waits on a condition variable
@@ -3578,19 +4249,31 @@ class Kernel:
         `waitpid` or `sleep` would never wake to run the handler. `runaway` widens where it may
         land -- see `_on_sigint`.
         """
-        woken = None
+        woken = jobs = None
         if self._holds(exec_id):
-            woken = self._wake(
-                exec_id, runaway, lambda wait: KeyboardInterrupt(_woken_text(wait, "interrupted"))
-            )
+            if self is _primary:
+                # Armed before an awaited call is woken, whose delivery disarms it: the code that
+                # receives the interrupt is not given a second by the signal.
+                self._interrupting, self._landed = (exec_id, runaway), None
+
+            def interrupted(wait):
+                return KeyboardInterrupt(_woken_text(wait, "interrupted"))
+
+            woken = self._wake(exec_id, runaway, interrupted)
+            jobs = self._wake_jobs(exec_id, interrupted)
             if woken == "woken":
+                self._interrupting = None
                 return
         if self is not _primary:
             # Python runs signal handlers on the main thread alone, and only the primary is
             # there. A wedged sub-agent is contained, not recoverable -- unless it is inside a
             # hosted call, which raises when it next waits.
-            later = "; it will raise when its hosted call next waits" if woken == "busy" else ""
-            _diag(f"agent {self.agent!r} cannot be interrupted: it is not on the main thread{later}")
+            if not jobs:
+                later = "; it will raise when its hosted call next waits" if woken == "busy" else ""
+                _diag(
+                    f"agent {self.agent!r} cannot be interrupted: it is not on the main "
+                    f"thread{later}"
+                )
             return
         if not self._holds(exec_id):
             return
@@ -3600,7 +4283,6 @@ class Kernel:
                 f"replaced, so only a cancel can reach it"
             )
             return
-        self._interrupting, self._landed = (exec_id, runaway), None
         signal.pthread_kill(self.thread.ident, signal.SIGINT)
 
     def _wake(self, exec_id, runaway, make_exc):
@@ -3637,6 +4319,31 @@ class Kernel:
                 wait.exc, wait.by = make_exc(wait), self
                 wait.pool.cond.notify_all()
             return "woken" if wait.waiting else "busy"
+
+    def _wake_jobs(self, exec_id, make_exc):
+        """Settle every call `exec_id`'s execution awaits from agent code -- queued, waiting, or
+        running a callback -- at once, with what `make_exc(call)` builds, and leave its worker the
+        same to raise. `runaway` does not widen this: a wedge is on the loop's thread, never in a
+        suspended await. Runs on the reader thread; returns whether any call was woken."""
+        running = self.running
+        if running is None or running.id != exec_id:
+            return False
+        woken = False
+        for pool in list(self._hosted.values()):
+            with pool.cond:
+                for job in pool.jobs:
+                    if job.execution is running and job.interruptible and job.exc is None:
+                        job.wake(make_exc)
+                        woken = True
+        self._notify_hosted()
+        return woken
+
+    def _notify_hosted(self):
+        """Wake every thread waiting on this kernel's connections to look again: a callback's
+        call can wait on one binding for an awaited call of another."""
+        for pool in list(self._hosted.values()):
+            with pool.cond:
+                pool.cond.notify_all()
 
     def cpu(self, request_id):
         """Report the CPU time the loop's thread has used, in seconds. Runs on the reader thread.
@@ -3712,10 +4419,11 @@ class Kernel:
 
         Reads only the namespace's keys and the type of each value. Nothing here calls `repr()`, a
         property, a descriptor, or an iterator -- all of those can execute code, block, or flood --
-        so it answers whatever the values are, and whoever asks.
+        so it answers whatever the values are, and whoever asks. A resolved hosted object's type
+        names the host's, from what its proxy already holds.
         """
         return sorted(
-            (name, _type_name(type(value)))
+            (name, _kind(value))
             for name, value in list(self.globals.items())
             if type(name) is str
             and not name.startswith("__")
@@ -3851,9 +4559,9 @@ def _in_agent_task(kernel):
 # callback the loop runs, this program's own included, runs beneath `Handle._run`, so the loop's
 # two dispatch frames cover them all -- including when agent code pumps the loop by hand. What else
 # agent code triggers synchronously and must not be interrupted is a protocol line on its way out,
-# which `Endpoint.send` writes, and the fork hooks. This program's output routing, by contrast, is
-# deliberately absent: a runaway that prints spends most of its time there, and must still be
-# interruptible.
+# which `Endpoint.send` writes, a hosted call being queued, which would run with nobody awaiting
+# it, and the fork hooks. This program's output routing, by contrast, is deliberately absent: a
+# runaway that prints spends most of its time there, and must still be interruptible.
 _MACHINERY = frozenset(
     fn.__code__
     for fn in (
@@ -3861,6 +4569,7 @@ _MACHINERY = frozenset(
         asyncio.events.Handle._run,
         _write_line,
         FrameChannel.send,
+        HostedObject.__await__,
         _before_fork,
         _after_fork_in_parent,
         _after_fork_in_child,

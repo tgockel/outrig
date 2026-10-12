@@ -87,7 +87,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const LINE_MAX: usize = 1 << 20;
 /// How much of a line that is not a message a diagnostic quotes.
 const QUOTED: usize = 200;
-/// Lines queued each way for one binding before a writer waits. `0003-21` chooses the bound a
+/// Lines queued each way for one binding before a writer waits. `0003-22` chooses the bound a
 /// session relies on.
 const QUEUE: usize = 64;
 /// What the binding prefixes its own diagnostics with on stderr.
