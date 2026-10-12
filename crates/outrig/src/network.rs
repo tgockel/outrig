@@ -123,6 +123,11 @@ const MAX_BINDING_TTL: Duration = Duration::from_secs(60 * 60);
 /// Cap on the distinct addresses one attachment holds bindings for, so a
 /// container that resolves in a loop cannot grow the map without bound.
 const MAX_BOUND_ADDRESSES: usize = 4096;
+/// Cap on the names held for one address -- the other half of the bound
+/// [`MAX_BOUND_ADDRESSES`] starts. A wildcard zone answers every name it is
+/// asked with the same address, so without it one address grows with the
+/// container's lookups, and each connection to it clones and scans them all.
+const MAX_NAMES_PER_ADDRESS: usize = 64;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
@@ -378,6 +383,8 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 /// The names one attachment's DNS listener validated for each destination
 /// address, each held until the answering record's TTL runs out. Scoped to the
 /// attachment: a lookup one container made never authorizes another's traffic.
+/// Bounded both ways: [`MAX_BOUND_ADDRESSES`] addresses, each holding at most
+/// [`MAX_NAMES_PER_ADDRESS`] names.
 #[derive(Debug, Default)]
 struct NameBindings {
     by_ip: BTreeMap<IpAddr, BTreeMap<String, Instant>>,
@@ -388,7 +395,10 @@ type Bindings = Arc<Mutex<NameBindings>>;
 impl NameBindings {
     /// Records that `ip` answered for `name`. One address can hold several
     /// names, so an allowed and a denied name behind one address of shared
-    /// hosting both survive, whichever was looked up last.
+    /// hosting both survive, whichever was looked up last -- up to
+    /// [`MAX_NAMES_PER_ADDRESS`], past which the name that expires soonest is
+    /// dropped to make room. The name just bound is never the one dropped: it
+    /// is the one the container is about to connect to.
     fn bind(&mut self, ip: IpAddr, name: &str, ttl: Duration, now: Instant) {
         let expires = now + ttl.clamp(MIN_BINDING_TTL, MAX_BINDING_TTL);
         if !self.by_ip.contains_key(&ip) && self.by_ip.len() >= MAX_BOUND_ADDRESSES {
@@ -397,12 +407,24 @@ impl NameBindings {
         let names = self.by_ip.entry(ip).or_default();
         // Probe before inserting: a container re-resolving a name it already
         // holds is the common case, and `entry` would allocate the key for it.
-        match names.get_mut(name) {
-            Some(slot) => *slot = (*slot).max(expires),
-            None => {
-                names.insert(name.to_ascii_lowercase(), expires);
+        // It adds nothing, so it is also the case that never needs room.
+        if let Some(slot) = names.get_mut(name) {
+            *slot = (*slot).max(expires);
+            return;
+        }
+        // Only a new name grows the map, so only it pays for a sweep: the
+        // expired names go before a live one is evicted in their place.
+        names.retain(|_, held_until| *held_until > now);
+        if names.len() >= MAX_NAMES_PER_ADDRESS {
+            let victim = names
+                .iter()
+                .min_by_key(|(_, held_until)| **held_until)
+                .map(|(name, _)| name.clone());
+            if let Some(victim) = victim {
+                names.remove(&victim);
             }
         }
+        names.insert(name.to_ascii_lowercase(), expires);
     }
 
     fn names(&self, ip: IpAddr, now: Instant) -> ResolvedNames {
@@ -8677,6 +8699,100 @@ options edns0
         }
 
         assert!(bindings.by_ip.len() <= MAX_BOUND_ADDRESSES);
+    }
+
+    /// A wildcard zone answers every name it is asked with the one address, so
+    /// the names behind an address are as unbounded as the container's loop.
+    #[test]
+    fn names_per_address_are_capped() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        let flood = MAX_NAMES_PER_ADDRESS + 16;
+        for n in 0..flood {
+            bindings.bind(
+                shared,
+                &format!("n{n}.wild.test"),
+                Duration::from_secs(60),
+                now,
+            );
+        }
+
+        assert_eq!(bindings.by_ip[&shared].len(), MAX_NAMES_PER_ADDRESS);
+        // The name a container has just resolved is the one it is about to
+        // connect to, so it is never the one left out.
+        assert!(
+            bindings
+                .names(shared, now)
+                .iter()
+                .any(|name| name == format!("n{}.wild.test", flood - 1))
+        );
+    }
+
+    #[test]
+    fn the_name_that_expires_soonest_is_evicted() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        // Bound out of order, so the victim is chosen by expiry and not by
+        // insertion or name order.
+        for n in (0..MAX_NAMES_PER_ADDRESS).rev() {
+            bindings.bind(
+                shared,
+                &format!("n{n}.test"),
+                Duration::from_secs(60 + n as u64),
+                now,
+            );
+        }
+        bindings.bind(shared, "newest.test", Duration::from_secs(60), now);
+
+        let held = bindings.by_ip[&shared].keys().cloned().collect::<Vec<_>>();
+        assert_eq!(held.len(), MAX_NAMES_PER_ADDRESS);
+        assert!(!held.contains(&"n0.test".to_string()), "{held:?}");
+        assert!(held.contains(&"n1.test".to_string()), "{held:?}");
+        assert!(held.contains(&"newest.test".to_string()), "{held:?}");
+    }
+
+    /// The probe path is what a container re-resolving a name it holds takes;
+    /// it adds nothing, so there is nothing to make room for.
+    #[test]
+    fn re_resolving_a_name_at_the_cap_evicts_nothing() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        for n in 0..MAX_NAMES_PER_ADDRESS {
+            bindings.bind(shared, &format!("n{n}.test"), Duration::from_secs(60), now);
+        }
+        bindings.bind(shared, "n0.test", Duration::from_secs(600), now);
+
+        assert_eq!(bindings.by_ip[&shared].len(), MAX_NAMES_PER_ADDRESS);
+        assert_eq!(
+            bindings.by_ip[&shared]["n0.test"],
+            now + Duration::from_secs(600)
+        );
+    }
+
+    /// `names` already filters what has expired; this is about what is still
+    /// held, which is what the clone and the policy scan are paid on.
+    #[test]
+    fn binding_a_new_name_drops_the_addresss_expired_names() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        bindings.bind(shared, "old.test", Duration::from_secs(60), now);
+        bindings.bind(shared, "older.test", Duration::from_secs(60), now);
+
+        bindings.bind(
+            shared,
+            "new.test",
+            Duration::from_secs(60),
+            now + Duration::from_secs(120),
+        );
+
+        assert_eq!(
+            bindings.by_ip[&shared].keys().collect::<Vec<_>>(),
+            ["new.test"]
+        );
     }
 
     /// The interceptor waits out its whole timeout for a datagram that

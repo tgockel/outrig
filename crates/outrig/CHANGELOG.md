@@ -91,6 +91,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The names a network attachment holds for one address are capped at 64.** The table of what
+  the attachment's DNS listener validated bounded the addresses it held (4096) but not the names
+  behind each, so a container resolving `n1.wild.example`, `n2.wild.example`, ... against a
+  wildcard zone grew it for the whole session, and every later connection to that address cloned
+  and policy-scanned every name. Binding a new name now drops that address's expired names, and
+  past 64 live ones drops the name that expires soonest; the name just resolved is never the one
+  dropped, and re-resolving a held name evicts nothing. A dropped name stops granting a hostname
+  allow until it is resolved again. (#360)
+
 - **`exec_capture` no longer reads the embedder's stdin.** It ran `podman exec -i` with outrig's
   own stdin inherited, and the client forwards what it reads into the container, so a library
   embedder that read its own stdin -- a REPL, an MCP-over-stdio server -- lost bytes to the
