@@ -79,8 +79,15 @@ pub enum ConfigValidationError {
     #[error("image {image:?} mcp server {server:?} has empty command")]
     EmptyMcpCommand { image: String, server: String },
 
-    #[error("image {image:?}: {}", build_image_name_reason(image))]
-    BuildImageNameInvalid { image: String },
+    /// `image` can't key a build image's block, for `reason`. The message is
+    /// built from `reason`; it is not a `source`, since its text would print
+    /// twice wherever an error chain is shown.
+    #[error("image {image:?}: {reason}")]
+    #[non_exhaustive]
+    BuildImageNameInvalid {
+        image: String,
+        reason: BuildImageNameError,
+    },
 
     #[error("image {image:?}: neither `image-name` nor `dockerfile`+`context` is set")]
     ImageSourceMissing { image: String },
@@ -562,6 +569,19 @@ pub enum ConfigValidationError {
     },
 }
 
+impl ConfigValidationError {
+    /// [`BuildImageNameInvalid`](Self::BuildImageNameInvalid) for `image`,
+    /// refused for `reason`. The variant is `#[non_exhaustive]`, so a tool that
+    /// holds the [`check_build_image_name`] error for a name and wants the
+    /// error a config load would give builds it here.
+    pub fn build_image_name_invalid(image: impl Into<String>, reason: BuildImageNameError) -> Self {
+        Self::BuildImageNameInvalid {
+            image: image.into(),
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ValidationOptions<'a> {
     pub agent_model_override: Option<&'a str>,
@@ -667,12 +687,10 @@ pub(super) fn validate_with_options(
         // must be a valid repository component. Image-name configs use the
         // `image-name` field as the tag, so their block key is just a label.
         // `validate_image_source` ran above, so `source()` won't panic here.
-        if matches!(image.source(), ImageSourceRef::Build { .. })
-            && check_build_image_name(image_name).is_err()
-        {
-            return Err(ConfigValidationError::BuildImageNameInvalid {
-                image: image_name.clone(),
-            });
+        if matches!(image.source(), ImageSourceRef::Build { .. }) {
+            check_build_image_name(image_name).map_err(|reason| {
+                ConfigValidationError::build_image_name_invalid(image_name, reason)
+            })?;
         }
         validate_image_security(image_name, image)?;
 
@@ -1739,17 +1757,6 @@ pub fn check_build_image_name(name: &str) -> Result<(), BuildImageNameError> {
         });
     }
     Ok(())
-}
-
-/// What [`check_build_image_name`] says is wrong with `image`, for the
-/// message of [`ConfigValidationError::BuildImageNameInvalid`], which can't
-/// carry the error without breaking its shape; #243 does that for 0.3.0.
-fn build_image_name_reason(image: &str) -> String {
-    match check_build_image_name(image) {
-        Err(reason) => reason.to_string(),
-        // Only an error built by hand names a name that passes.
-        Ok(()) => "a build image's name must be a valid image repository".to_string(),
-    }
 }
 
 pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {

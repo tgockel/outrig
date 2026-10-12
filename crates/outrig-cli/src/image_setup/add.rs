@@ -262,9 +262,8 @@ fn default_image_name(repo_root: &Path) -> String {
 /// A name that passes is also one component of the path it names under
 /// `.agents/outrig/images/`.
 pub(crate) fn check_name(name: &str) -> std::result::Result<(), ConfigValidationError> {
-    check_build_image_name(name).map_err(|_| ConfigValidationError::BuildImageNameInvalid {
-        image: name.to_string(),
-    })
+    check_build_image_name(name)
+        .map_err(|reason| ConfigValidationError::build_image_name_invalid(name, reason))
 }
 
 fn display_rel<'a>(path: &'a Path, root: &Path) -> std::path::Display<'a> {
@@ -354,7 +353,7 @@ fn mcp_value(server: McpServer) -> Item {
 
 #[cfg(test)]
 mod tests {
-    use outrig::config::Config;
+    use outrig::config::{BuildImageNameError, Config};
 
     use super::*;
 
@@ -377,6 +376,29 @@ mod tests {
         let images = images_table(&mut doc, Path::new("config.toml")).expect("images is a table");
         insert_image_block(images, "coding", &[McpServer::Fs]);
         doc.to_string()
+    }
+
+    /// A refused name is the error a config load would give, carrying the
+    /// reason `check_build_image_name` found rather than a recomputed one.
+    #[test]
+    fn a_refused_name_carries_the_reason_it_was_refused_for() {
+        let err = check_name("RustDev").expect_err("an uppercase name is refused");
+        match &err {
+            ConfigValidationError::BuildImageNameInvalid { image, reason, .. } => {
+                assert_eq!(image, "RustDev");
+                assert_eq!(
+                    reason,
+                    &BuildImageNameError::InvalidCharacter { character: 'R' }
+                );
+            }
+            other => panic!("expected BuildImageNameInvalid, got: {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "image \"RustDev\": a build image's name becomes its repository, which can't hold 'R': \
+             only lowercase letters, digits, `.`, `_`, and `-`"
+        );
+        assert!(check_name("rust-dev").is_ok());
     }
 
     /// #186's seed: `images` becomes a standard table after the top-level

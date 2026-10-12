@@ -283,6 +283,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_env` still takes plain strings, passed and shown as written, for values the caller
   chose. Nothing outrig runs itself changes: its own paths have kept each reference since 0.2.1.
 
+- **`ConfigValidationError::BuildImageNameInvalid` carries the `BuildImageNameError` it reports,
+  and is `#[non_exhaustive]`.** The variant gained a `reason` field, so 0.2.1's one-field shape
+  no longer matches or constructs. Match it with `BuildImageNameInvalid { image, reason, .. }`
+  and read `reason` for the cause, instead of calling `check_build_image_name(&image)` again. To
+  build one, use `ConfigValidationError::build_image_name_invalid(image, reason)`, since a
+  struct literal for a non-exhaustive variant only compiles in this crate. The message is the
+  same text as before, now built from `reason` with no second check. `reason` is a field and not
+  a `source()`, as its text is already in the message.
+
 ### Removed
 
 - **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:

@@ -373,9 +373,19 @@ context    = "ctx"
                 .starts_with("image \"Bad Name\": a build image's name becomes its repository, which can't hold 'B'"),
             "{err}"
         );
+        // The variant carries the reason, and its message is built from it.
         match err {
-            ConfigValidationError::BuildImageNameInvalid { image } => {
+            ConfigValidationError::BuildImageNameInvalid { image, reason, .. } => {
                 assert_eq!(image, "Bad Name");
+                assert_eq!(
+                    reason,
+                    BuildImageNameError::InvalidCharacter { character: 'B' }
+                );
+                assert_eq!(
+                    ConfigValidationError::build_image_name_invalid(&image, reason.clone())
+                        .to_string(),
+                    format!("image {image:?}: {reason}")
+                );
             }
             other => panic!("expected BuildImageNameInvalid, got: {other:?}"),
         }

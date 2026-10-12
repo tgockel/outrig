@@ -66,8 +66,9 @@ pub outrig::config::ConfigValidationError::BindingNameTaken::taken: &'static str
 pub outrig::config::ConfigValidationError::BindingRequires::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::BindingRequires::name: alloc::string::String
 pub outrig::config::ConfigValidationError::BindingRequires::reason: alloc::string::String
-pub outrig::config::ConfigValidationError::BuildImageNameInvalid
+#[non_exhaustive] pub outrig::config::ConfigValidationError::BuildImageNameInvalid
 pub outrig::config::ConfigValidationError::BuildImageNameInvalid::image: alloc::string::String
+pub outrig::config::ConfigValidationError::BuildImageNameInvalid::reason: outrig::config::BuildImageNameError
 pub outrig::config::ConfigValidationError::CapabilityDropAddConflict
 pub outrig::config::ConfigValidationError::CapabilityDropAddConflict::capability: alloc::string::String
 pub outrig::config::ConfigValidationError::CapabilityDropAddConflict::image: alloc::string::String
@@ -282,6 +283,8 @@ pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::path: std:
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory
 pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::path: std::path::PathBuf
+impl outrig::config::ConfigValidationError
+pub fn outrig::config::ConfigValidationError::build_image_name_invalid(impl core::convert::Into<alloc::string::String>, outrig::config::BuildImageNameError) -> Self
 #[non_exhaustive] pub enum outrig::config::EnvValue
 pub outrig::config::EnvValue::EnvRef(alloc::string::String)
 pub outrig::config::EnvValue::Literal(alloc::string::String)
