@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig clean --build-containers` no longer stops when a build elsewhere removes a working
+  container mid-listing.** buildah lists working containers in two steps -- every container, then
+  each one's directory -- so a container removed between them failed the whole listing with
+  `Error: reading build containers: container not known`, and the sweep ended on that error.
+  `podman ps -a --external`, the sweep's other listing, fails the same way, with
+  `Error: determining buildah container for container <id>: container not known`. A build on the
+  machine finishing or being cancelled while the sweep lists is enough, which is the situation
+  the `--older-than` cutoff exists for. Each listing is now taken again when it fails with
+  `container not known`, up to five attempts in all; the container that vanished is not in the
+  next one. Any other failure, and the same one five times running, is still an error. (#418)
+
 - **`outrig mcp --listen` finishes shutting down while an HTTP request body is incomplete.**
   Fixed in `outrig-cli` (#433). A signal now waits up to five seconds for in-flight requests,
   then abandons them and tears the session down; a second signal skips the wait. A client that

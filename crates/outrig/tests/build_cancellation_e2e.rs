@@ -88,12 +88,31 @@ fn buildah(args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("buildah {args:?}: {e}"))
 }
 
+/// Listings taken before a `container not known` is believed.
+///
+/// buildah lists in two steps -- every container, then each one's directory --
+/// so a working container removed between them fails the whole command. Here
+/// that is a cancelled build's own teardown, or a build in another test binary
+/// finishing, and this is polled every 100 ms while they happen: live-e2e
+/// failed this way on two branches. The container that vanished is not in the
+/// next listing, which is what any caller would have concluded a moment later.
+/// Bounded, so a listing that fails this way for another reason still fails.
+const LISTING_ATTEMPTS: usize = 5;
+
 /// Every buildah working container currently in the store.
 ///
 /// `--json` prints `null` rather than `[]` for an empty store on some
 /// versions, so both are read as "none".
 fn working_containers() -> Vec<WorkingContainer> {
-    let out = buildah(&["containers", "--json"]);
+    let mut out = buildah(&["containers", "--json"]);
+    for _ in 1..LISTING_ATTEMPTS {
+        if out.status.success()
+            || !String::from_utf8_lossy(&out.stderr).contains("container not known")
+        {
+            break;
+        }
+        out = buildah(&["containers", "--json"]);
+    }
     assert!(
         out.status.success(),
         "buildah containers --json failed: {}",
