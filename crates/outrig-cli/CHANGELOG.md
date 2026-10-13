@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sidecar whose entrypoint exits at once reports why.** Fixed in `outrig` (#422). An
+  entrypoint-stdio server that printed a line and exited within milliseconds -- `outrig-enter`
+  naming the program a `view = "primary"` sidecar's image lacks, a server rejecting its arguments
+  -- failed the session with `stderr (<session_dir>/logs/<server>.stderr): (empty)`, because
+  `podman start --attach` had dropped the line. The container is now created with a log of its
+  own, and a start that fails with nothing in the stderr file gets the container's stderr copied
+  into it, so the error and `outrig logs <server>` show it. See the `outrig` changelog for the
+  mechanism. These containers no longer log to the host's default driver (`journald` on most
+  systemd hosts); `podman logs` works while one runs. Under SELinux nothing changes.
+
 - **`outrig image add` installs Node 24, not Node 20.** The `node` toolchain on a Debian-family
   base ran NodeSource's `setup_20.x`, and the curated `node` base was `node:20-bookworm-slim`;
   Node 20 reached end-of-life on 2026-04-30. Both are now Node 24, the active LTS, and the base

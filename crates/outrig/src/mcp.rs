@@ -158,6 +158,8 @@ impl McpClient {
             declaration_source,
             log_dir,
             container.transcript(),
+            // An exec'd server's output is not in the container's log.
+            None,
             &command,
             STARTUP_TIMEOUT,
         )
@@ -208,6 +210,7 @@ impl McpClient {
             Some(declaration_source.description()),
             log_dir,
             container.transcript(),
+            container.ctr_log_path(),
             &argv,
             STARTUP_TIMEOUT,
         )
@@ -218,13 +221,16 @@ impl McpClient {
     /// stderr redirected to `<log_dir>/<name>.stderr`, then drive the MCP
     /// `initialize` handshake, giving the server `initialize_within` to
     /// answer. `display_command` is what a startup failure reports as the
-    /// attempted command.
+    /// attempted command, and `ctr_log` is where its stderr can still be read
+    /// if the attach stream that fills that file comes back empty.
+    #[allow(clippy::too_many_arguments)]
     async fn connect_stdio_cmd(
         cmd: Cmd,
         name: &str,
         declaration_source: Option<&'static str>,
         log_dir: &Path,
         transcript: Option<Transcript>,
+        ctr_log: Option<&Path>,
         display_command: &[String],
         initialize_within: Duration,
     ) -> Result<Self> {
@@ -285,6 +291,7 @@ impl McpClient {
             declaration_source,
             display_command,
             &stderr_path,
+            ctr_log,
             &mut child,
             source,
         )
@@ -583,11 +590,17 @@ pub fn resolve_mcp_env_values(
 /// tail of whatever the child wrote to stderr. The brief `child.wait()`
 /// timeout lets a child that crashed mid-write flush its last few bytes
 /// before we read them.
+///
+/// For `podman start --attach` the child is a client relaying the container's
+/// stderr, and it can relay none of it for a container that exits within
+/// milliseconds. `ctr_log` is where that text still is: see
+/// [`restore_lost_stderr`].
 async fn enrich_startup_error(
     name: &str,
     declaration_source: Option<&str>,
     command: &[String],
     stderr_path: &Path,
+    ctr_log: Option<&Path>,
     child: &mut Owned,
     source: Box<dyn std::error::Error + Send + Sync>,
 ) -> OutrigError {
@@ -596,6 +609,11 @@ async fn enrich_startup_error(
         _ => None,
     };
     let exit = format_exit(exit_status);
+    // Not before the client has exited: until then it may still be writing the
+    // file, and what is in it is not yet what it will hold.
+    if let (Some(ctr_log), Some(_)) = (ctr_log, exit_status) {
+        restore_lost_stderr(name, stderr_path, ctr_log).await;
+    }
     let stderr_tail = read_stderr_tail_settled(stderr_path).await;
 
     let what = match exit_status {
@@ -626,6 +644,59 @@ async fn enrich_startup_error(
     }))
 }
 
+/// Put the container's own stderr into `stderr_path` when the attach stream
+/// left it empty. That stream can relay none of a container that exits within
+/// milliseconds (#422, and [`crate::container::ctr_log`] for why), and the
+/// failure then arrives as `exit: code 1` beside `(empty)`.
+///
+/// conmon had logged the stderr by then, so `ctr_log` has it. It goes into the
+/// file, not only into the error, so `<server>.stderr`, `outrig logs` and the
+/// error agree. The client has exited, so nothing else writes the file and the
+/// log is complete: one look is enough, which is why this is not part of the
+/// settle that follows. A file that holds anything is left as it is.
+async fn restore_lost_stderr(name: &str, stderr_path: &Path, ctr_log: &Path) {
+    if !matches!(tokio::fs::metadata(stderr_path).await, Ok(metadata) if metadata.len() == 0) {
+        return;
+    }
+    let text = match crate::container::ctr_log::stderr_text(ctr_log).await {
+        Ok(text) if !text.is_empty() => text,
+        Ok(_) => {
+            tracing::info!(
+                target: "outrig::mcp",
+                server = name,
+                "mcp server {name:?}: neither podman's attach stream nor the container's log \
+                 holds any stderr"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "outrig::mcp",
+                server = name,
+                "mcp server {name:?}: could not read the container's log {}: {e}",
+                ctr_log.display()
+            );
+            return;
+        }
+    };
+    match tokio::fs::write(stderr_path, &text).await {
+        Ok(()) => tracing::warn!(
+            target: "outrig::mcp",
+            server = name,
+            "mcp server {name:?}: podman's attach stream carried none of its stderr; restored \
+             {} bytes of it from the container's log into {}",
+            text.len(),
+            stderr_path.display()
+        ),
+        Err(e) => tracing::warn!(
+            target: "outrig::mcp",
+            server = name,
+            "mcp server {name:?}: could not restore its stderr into {}: {e}",
+            stderr_path.display()
+        ),
+    }
+}
+
 /// How long [`enrich_startup_error`] gives the child to exit.
 ///
 /// The child is a container engine, not a process -- `podman start --attach`
@@ -639,13 +710,10 @@ const CHILD_EXIT_CEILING: Duration = Duration::from_secs(2);
 /// How long [`read_stderr_tail_settled`] keeps looking for stderr that has not
 /// landed yet.
 ///
-/// The bytes a reader needs are not necessarily written by the process that
-/// just exited: for a container whose entrypoint cannot be resolved, the
-/// message comes from the OCI runtime by way of conmon, whose write is not
-/// ordered against `podman start --attach` returning. Reading once wins on an
-/// idle machine and loses on a loaded one -- CI reported `exit: code 1` beside
-/// a `(empty)` tail for exactly that container, which is the one thing the
-/// field exists to prevent.
+/// A client that is still running can still write the file; one that has
+/// exited cannot, so for it an empty file is empty for good and this only
+/// waits. (#422's `(empty)` was output podman dropped, not output that was
+/// late: see [`restore_lost_stderr`].)
 ///
 /// Paid only on a failure path, and only while the file is *still* empty: a
 /// server that genuinely said nothing waits this out once, on its way to an
@@ -778,6 +846,7 @@ fn session_error_from_rmcp(source: &rmcp::service::ServiceError) -> McpSessionEr
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::container::ctr_log::testing::{entry, log_holding};
 
     fn transport_error() -> rmcp::transport::DynamicTransportError {
         rmcp::transport::DynamicTransportError::from_parts(
@@ -884,6 +953,7 @@ pub(crate) mod tests {
             None,
             dir.path(),
             Some(transcript),
+            None,
             &[],
             STARTUP_TIMEOUT,
         )
@@ -915,6 +985,7 @@ pub(crate) mod tests {
             "svc",
             None,
             dir.path(),
+            None,
             None,
             &["cat".to_string()],
             Duration::from_millis(200),
@@ -1384,11 +1455,10 @@ pub(crate) mod tests {
         writer.join().unwrap();
     }
 
-    /// The defect this exists for: the process that exits and the process that
-    /// writes the useful stderr are not always the same one. For a container
-    /// whose entrypoint cannot be resolved, `podman start --attach` returns
-    /// while the OCI runtime's message is still on its way through conmon, and
-    /// a single read gets an empty file.
+    /// A client that is still running can still write the file, so an empty
+    /// read is not the answer yet. (This was added for #422's `(empty)`, which
+    /// turned out to be bytes podman dropped rather than bytes that were late:
+    /// see `restore_lost_stderr`.)
     #[tokio::test]
     async fn a_tail_waits_for_a_writer_that_has_not_landed_yet() {
         let dir = tempfile::tempdir().unwrap();
@@ -1464,6 +1534,7 @@ pub(crate) mod tests {
             Some("launch spec"),
             &argv,
             &stderr_path,
+            None,
             &mut child,
             source,
         )
@@ -1488,6 +1559,187 @@ pub(crate) mod tests {
         assert!(display.contains("expect initialize response"));
         assert!(display.contains("code 7"));
         assert!(display.contains("boom"));
+    }
+
+    /// An empty `<name>.stderr` for a child to be handed, and the child: `sh -c <script>`
+    /// with that file as its stderr.
+    async fn silent_child_with_stderr_file(
+        dir: &Path,
+        script: &str,
+    ) -> (Owned, PathBuf, Vec<String>) {
+        let stderr_path = dir.join("svc.stderr");
+        let stderr_file = tokio::fs::File::create(&stderr_path).await.unwrap();
+        let child = Cmd::new("sh")
+            .args(["-c", script])
+            .spawn_owned(
+                StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_file.into_std().await)),
+                crate::process::Termination::Kill,
+            )
+            .unwrap();
+        let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        (child, stderr_path, argv)
+    }
+
+    fn connection_closed() -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(rmcp::service::ClientInitializeError::ConnectionClosed(
+            "initialize response".to_string(),
+        ))
+    }
+
+    /// #422: the container printed one line and exited, `podman start --attach` returned its
+    /// exit code and none of the line. The line is in the container's log.
+    #[tokio::test]
+    async fn a_start_whose_attach_stream_was_empty_reports_what_the_container_log_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "exit 1").await;
+        let log = log_holding(
+            &[
+                entry("stdout", "F", r#"{"jsonrpc":"2.0","id":0,"error":{}}"#),
+                entry("stderr", "P", "outrig-enter: open outrig-no-such-program"),
+                entry(
+                    "stderr",
+                    "F",
+                    ": No such file or directory (not found in PATH=/usr/bin)",
+                ),
+            ]
+            .concat(),
+        );
+
+        let started = std::time::Instant::now();
+        let err = enrich_startup_error(
+            "svc",
+            None,
+            &argv,
+            &stderr_path,
+            Some(log.path()),
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        // Not the settle's five seconds: nothing is going to land late.
+        assert!(
+            started.elapsed() < STDERR_SETTLE_CEILING / 2,
+            "took {:?}",
+            started.elapsed()
+        );
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.exit, "code 1");
+        let expected = "outrig-enter: open outrig-no-such-program: No such file or directory \
+                        (not found in PATH=/usr/bin)";
+        assert_eq!(failure.stderr_tail, expected);
+        assert!(err.to_string().contains(expected), "{err}");
+        // And `outrig logs` reads the same thing.
+        assert_eq!(
+            std::fs::read_to_string(&stderr_path).unwrap(),
+            format!("{expected}\n")
+        );
+    }
+
+    /// The log is for what the attach stream lost, not a second opinion on what it carried.
+    #[tokio::test]
+    async fn stderr_the_attach_stream_carried_is_not_added_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "echo from-attach >&2; exit 1").await;
+        let log = log_holding(&entry("stderr", "F", "from-the-log"));
+
+        let err = enrich_startup_error(
+            "svc",
+            None,
+            &argv,
+            &stderr_path,
+            Some(log.path()),
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.stderr_tail, "from-attach");
+        assert_eq!(
+            std::fs::read_to_string(&stderr_path).unwrap(),
+            "from-attach\n"
+        );
+    }
+
+    /// A container that wrote only its protocol stream has nothing to restore.
+    #[tokio::test]
+    async fn a_container_log_without_stderr_restores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("svc.stderr");
+        std::fs::write(&stderr_path, b"").unwrap();
+        let log = log_holding(&entry("stdout", "F", "protocol only"));
+
+        restore_lost_stderr("svc", &stderr_path, log.path()).await;
+
+        assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
+    }
+
+    /// While the client may still be writing, the file is its to fill. A handshake that timed out
+    /// against a server that is still running is that case.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_has_not_exited_has_its_file_left_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child, stderr_path, argv) =
+            silent_child_with_stderr_file(dir.path(), "exec sleep 600").await;
+        let log = log_holding(&entry("stderr", "F", "from-the-log"));
+
+        let err = enrich_startup_error(
+            "svc",
+            None,
+            &argv,
+            &stderr_path,
+            Some(log.path()),
+            &mut child,
+            connection_closed(),
+        )
+        .await;
+
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.exit, "still running (wait timed out)");
+        assert_eq!(failure.stderr_tail, "(empty)");
+        assert_eq!(std::fs::read_to_string(&stderr_path).unwrap(), "");
+    }
+
+    /// The whole path inside `McpClient`: a transport that exits at once with nothing on its
+    /// stderr, and a log.
+    #[tokio::test]
+    async fn a_connect_that_fails_at_once_reports_the_container_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_holding(&entry("stderr", "F", "last words"));
+        let cmd = Cmd::new("sh").args(["-c", "exit 1"]);
+
+        let started = std::time::Instant::now();
+        let err = McpClient::connect_stdio_cmd(
+            cmd,
+            "svc",
+            None,
+            dir.path(),
+            None,
+            Some(log.path()),
+            &["sh".to_string()],
+            STARTUP_TIMEOUT,
+        )
+        .await
+        .expect_err("a server that exits at once does not connect");
+
+        assert!(
+            started.elapsed() < STDERR_SETTLE_CEILING / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        let OutrigError::McpStartupFailed(failure) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(failure.stderr_tail, "last words");
     }
 
     #[test]

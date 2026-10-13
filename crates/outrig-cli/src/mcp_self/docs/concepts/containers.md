@@ -575,6 +575,21 @@ mount, or a co-hosted exec server). Do not assume the mapped ids for one. The si
 to the exception is a `view = "primary"` sidecar, whose launcher is handed the session's ids
 explicitly and drops to them before the payload runs.
 
+Its stderr normally reaches `<session_dir>/logs/<server>.stderr` through `podman start --attach`,
+which can drop all of it for a server that exits within milliseconds of starting. So that a server
+that fails at once still says why, outrig creates such a container with `--log-driver=json-file`,
+an empty `--log-opt=tag=`, a `--log-opt=path=` naming a private file of its own (under
+`$XDG_RUNTIME_DIR`, else the temporary directory), and `--log-opt=max-size=1mb`. When a start fails
+and the stderr file is empty, outrig copies the container's stderr from that file into it. The log
+replaces the host's default driver for this container -- `journald` on most systemd hosts --
+though `podman logs` still works while it runs, and it goes away with the session. The driver and
+the empty tag keep the host's `log_tag` from `containers.conf` off the container, since conmon
+refuses a tag with a file log. `json-file` is podman's alias of `k8s-file`, and podman before 6
+gives the host's tag to every driver but that one. The empty tag counts as one already given on
+podman 5.5.1 and later, which matters on podman 6, where `json-file` gets the host's tag too and a
+tag on any driver but `journald` is an error. Where SELinux is enforcing, or the log's path holds
+a `,`, `"` or `:`, outrig makes no log and the container logs as the host says.
+
 The working directory is the one exec flag that is conditional. Supply one and outrig emits
 `--workdir <path>`; leave it unset and no flag is emitted at all, so the exec lands wherever the
 container already is. That is the image's `WORKDIR` only when nothing overrode it -- a

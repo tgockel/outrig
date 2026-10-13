@@ -834,6 +834,15 @@ async fn primary_view_sidecar_with_an_unresolvable_entrypoint_names_the_path() {
         message.contains("outrig-no-such-program") && message.contains("PATH=/"),
         "the failure should name the program and the PATH searched, got: {message}",
     );
+    // The launcher exits within milliseconds, which is when `podman start --attach` can drop
+    // what the container wrote (#422), so this is what the container's own log is there for.
+    // The file the error cites, and `outrig logs` reads, holds the same text.
+    let stderr = std::fs::read_to_string(session_dir.path().join("logs/badentry.stderr"))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("outrig-no-such-program") && stderr.contains("PATH=/"),
+        "badentry.stderr should hold the launcher's line, got: {stderr:?}",
+    );
 
     assert_eq!(
         sidecar_containers_labeled("badentry"),

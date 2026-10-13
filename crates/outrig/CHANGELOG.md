@@ -91,6 +91,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sidecar whose entrypoint exits at once no longer reports an empty stderr.** The launcher's
+  `outrig-enter: open <program>: ... (not found in PATH=...)`, or any server that prints a line and
+  exits within milliseconds, arrived as `stderr (...): (empty)` beside `exit: code 1`. outrig starts
+  the MCP handshake when it spawns `podman start --attach`, so the client always has a request to
+  forward; if conmon closes the attach socket with that request unread, the kernel reports
+  `ECONNRESET` on podman's end ahead of the stderr conmon had queued there, and podman reads the
+  reset as the end of the stream. The exit code comes back and the output does not, on every podman
+  through 6.1. No wait recovers it, and the five-second wait for it that `McpClient` made ran out
+  for nothing. `Container::create_initialized` now gives the container a log of its own --
+  `--log-driver=json-file`, an empty `--log-opt=tag=`, `--log-opt=path=` a private file under
+  `$XDG_RUNTIME_DIR` (else the temporary directory), `--log-opt=max-size=1mb` -- which conmon
+  writes before it writes any attach socket. When `connect_via_podman_start` fails with an empty
+  stderr file and an exited client, it copies the container's stderr from that log into
+  `<name>.stderr`, so the error, the file and `outrig logs` agree, and logs a warning. The
+  container no longer logs to the host's default driver (`journald` on most systemd hosts);
+  `podman logs` still works while it runs, and the file goes with the `Container`. The driver and
+  the empty tag keep the host's `containers.conf` `log_tag` off the container: conmon exits on a
+  tag with a file log, so a host with `log_tag` set would otherwise fail every `podman init`, and
+  podman 6 fails the `podman create`. Neither is enough alone. `json-file`, podman's alias of
+  `k8s-file`, is not given the host's tag through podman 5.8 but is on podman 6, and an empty tag
+  counts as one already given only from podman 5.5.1. Where SELinux is enforcing, or the log's
+  path holds a `,`, `"` or `:` (podman and conmon split on them), there is no log and nothing
+  changes. An exec'd server (`podman exec -i`) is not affected. (#422)
+
 - **A build image's name over 237 characters is refused where names are checked.** The name is
   the repository of its `<name>:<hash>` tag, and buildah refuses a repository over 255
   characters once it prepends `docker.io/library/`, so such a name used to pass `Config::validate`

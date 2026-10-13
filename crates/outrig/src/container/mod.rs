@@ -21,11 +21,14 @@
 //! can grant it again; only the label is one attempt's alone. `NameGuard`
 //! carries the argument in full.
 
+pub(crate) mod ctr_log;
 pub mod embedded;
 pub mod enter;
 mod namespace;
 pub mod sidecar;
 mod userdb;
+
+pub(crate) use ctr_log::CtrLog;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -136,6 +139,11 @@ pub struct Container {
     /// point of [`stop_or_keep`](Self::stop_or_keep) -- cannot act on whatever
     /// holds the name by the time that retry runs.
     id: Option<ContainerId>,
+    /// Where an entrypoint-stdio container's output is also written, for a
+    /// failed start whose stderr the attach stream did not carry. Set by
+    /// [`Container::create_initialized`]; `None` for every other container,
+    /// and for one that was created where no log could be made.
+    ctr_log: Option<CtrLog>,
     /// Stands in for the engine call whose rendering contains the fragment,
     /// first match winning, so a test can wedge the stop or the removal in
     /// particular and hold the other one still. Every bounded-call path here
@@ -673,6 +681,14 @@ impl Container {
     /// A `podman init` that fails to materialize a PID surfaces later through
     /// the interceptor's pid probe. See [`ContainerCreateOptions`] for what
     /// each input does.
+    ///
+    /// The container logs to a file of outrig's own, which
+    /// [`McpClient::connect_via_podman_start`](crate::McpClient::connect_via_podman_start)
+    /// reads if the attach stream that should carry a failed start's stderr
+    /// comes back empty. That replaces the host's default log driver for this
+    /// container; `podman logs` still works while it runs. Where SELinux is
+    /// enforcing there is no such log, and the container logs as the host
+    /// says.
     pub async fn create_initialized(options: ContainerCreateOptions) -> Result<Self> {
         // As in start_named. The guard matters more here: an `init` that
         // fails, or a future dropped between `create` and `init`, leaves the
@@ -683,10 +699,16 @@ impl Container {
         reject_malformed_capabilities(&options.launch.capabilities)?;
         let reserved = NameGuard::reserve(&options.name);
 
+        let selinux = selinux_enforcing().await;
+        // Not on an SELinux host: conmon writing to a path outrig picked is
+        // unchecked there, and a log it could not open fails the `podman init`
+        // -- a worse outcome than a start that reports what it always did.
+        let ctr_log = if selinux { None } else { CtrLog::create() };
         let create = build_podman_create_cmd(
             &options,
-            selinux_enforcing().await,
+            selinux,
             &reserved.attempt_label(),
+            ctr_log.as_ref().map(CtrLog::path),
         );
         // The create's own output carries the engine's id for what it made,
         // which is the only name for this container that cannot later mean
@@ -705,7 +727,7 @@ impl Container {
             None => (PathBuf::new(), PathBuf::new()),
         };
         let attempt = reserved.release();
-        Ok(Self::handle(
+        let mut container = Self::handle(
             EngineIdentity::Owned {
                 name: options.name,
                 attempt,
@@ -718,7 +740,16 @@ impl Container {
                 dns_preconfigured: options.intercept_dns,
                 net_admin: options.launch.capabilities.grants_net_admin(),
             },
-        ))
+        );
+        container.ctr_log = ctr_log;
+        Ok(container)
+    }
+
+    /// The file [`Container::create_initialized`] had this container's log
+    /// written to, if it made one: where its stderr can still be read when the
+    /// attach stream did not carry it.
+    pub(crate) fn ctr_log_path(&self) -> Option<&Path> {
+        self.ctr_log.as_ref().map(CtrLog::path)
     }
 
     /// Build a handle for an already-running container that outrig does not
@@ -776,6 +807,7 @@ impl Container {
             net_admin,
             pid: OnceCell::new(),
             id,
+            ctr_log: None,
             #[cfg(test)]
             engine_override: Vec::new(),
             #[cfg(test)]
@@ -1828,10 +1860,17 @@ fn build_podman_run_cmd(
 /// exec-form ENTRYPOINT and *replaces* CMD, so it is for images whose server
 /// is an ENTRYPOINT. Empty `args` emits nothing, leaving the argument vector
 /// byte-identical to the pre-`args` one.
+///
+/// `ctr_log` is the file conmon writes the container's output to: the driver
+/// is pinned to a file log, because the host's default is often `journald`,
+/// which outrig cannot read back, and the file is named, because podman's own
+/// is out of reach. See [`CtrLog`]. Without one the container logs as the host
+/// says, and the argument vector is the one it was before.
 fn build_podman_create_cmd(
     options: &ContainerCreateOptions,
     selinux: bool,
     attempt_label: &str,
+    ctr_log: Option<&Path>,
 ) -> Cmd {
     let mut cmd = Cmd::new("podman")
         .args(["create", "--name"])
@@ -1854,11 +1893,29 @@ fn build_podman_create_cmd(
     cmd = options.env_sources.push(cmd, &options.env);
 
     // After the caller's labels; see `build_podman_run_cmd`.
-    cmd.arg("--label")
+    cmd = cmd
+        .arg("--label")
         .arg(attempt_label)
-        .args(["--interactive", "--rm"])
-        .arg(options.image.as_str())
-        .args(&options.args)
+        .args(["--interactive", "--rm"]);
+    if let Some(path) = ctr_log {
+        // The host's `log_tag` must stay off this container: conmon exits on a
+        // tag with a file log, so a host that sets one would fail every `podman
+        // init`, and podman 6 refuses the create (a tag is for `journald`
+        // alone). Neither of the first two flags is enough on every podman, so
+        // both are given. `json-file`, podman's documented alias for `k8s-file`
+        // (conmon is handed `k8s-file:<path>` either way), is spared the host's
+        // tag through podman 5.8, which `k8s-file` is not, but podman 6 spares
+        // no driver. An empty `tag` counts as one already given from podman
+        // 5.5.1, but before that the host's tag replaces it. The cap bounds a
+        // chatty server's stdout, which the log holds too, and is far above
+        // what a startup writes.
+        cmd = cmd
+            .arg("--log-driver=json-file")
+            .arg("--log-opt=tag=")
+            .arg("--log-opt=max-size=1mb")
+            .arg(format!("--log-opt=path={}", path.display()));
+    }
+    cmd.arg(options.image.as_str()).args(&options.args)
 }
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
@@ -3029,6 +3086,7 @@ mod tests {
             .with_intercept_dns(true),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3075,6 +3133,7 @@ mod tests {
             ),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3114,6 +3173,7 @@ mod tests {
             &ContainerCreateOptions::new(image, ContainerLaunchSpec::default(), "outrig-test"),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
         for (path, args) in [("run", run), ("create", create)] {
             assert!(
@@ -3121,6 +3181,54 @@ mod tests {
                 "`podman {path}` would copy the host's proxy into the container: {args:?}"
             );
         }
+    }
+
+    /// The container log is named on the command line, and every piece of it
+    /// goes before the image ref, where podman reads flags. The driver is
+    /// pinned and the size capped, because the host's default driver is not
+    /// one outrig can read back. A host `log_tag`, which conmon refuses with a
+    /// file log, is kept off by two flags: the `json-file` driver, which older
+    /// podmans spare it, and an empty `tag`, which podman 6 needs. Without a
+    /// log the argv is the one it was before there was one (#422).
+    #[test]
+    fn a_container_log_is_pinned_to_a_capped_file_before_the_image() {
+        let options = ContainerCreateOptions::new(
+            ImageTag::new("docker.io/mcp/filesystem:latest"),
+            ContainerLaunchSpec::default(),
+            "outrig-test-fs",
+        )
+        .with_args(vec!["/workspace".to_string()]);
+
+        let logged = argv(build_podman_create_cmd(
+            &options,
+            false,
+            "org.outrig.attempt=testtoken",
+            Some(Path::new("/run/user/1000/outrig-ctr-log-a1b2/ctr.log")),
+        ));
+        let rm = logged.iter().position(|arg| arg == "--rm").expect("--rm");
+        assert_eq!(
+            logged[rm + 1..rm + 6],
+            [
+                "--log-driver=json-file",
+                "--log-opt=tag=",
+                "--log-opt=max-size=1mb",
+                "--log-opt=path=/run/user/1000/outrig-ctr-log-a1b2/ctr.log",
+                "docker.io/mcp/filesystem:latest",
+            ],
+            "{logged:?}"
+        );
+        assert_eq!(logged.last().map(String::as_str), Some("/workspace"));
+
+        let unlogged = argv(build_podman_create_cmd(
+            &options,
+            false,
+            "org.outrig.attempt=testtoken",
+            None,
+        ));
+        assert!(
+            unlogged.iter().all(|arg| !arg.starts_with("--log-")),
+            "{unlogged:?}"
+        );
     }
 
     /// `args` is the trailing argv: strictly after the image ref, so podman
@@ -3137,6 +3245,7 @@ mod tests {
             .with_args(vec!["/workspace".to_string(), "--read-only".to_string()]),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3206,6 +3315,7 @@ mod tests {
             .with_args(launcher_argv),
             true,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3261,6 +3371,7 @@ mod tests {
             ),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
         assert_eq!(
             args,
@@ -3813,6 +3924,7 @@ mod tests {
             &ContainerCreateOptions::new(ImageTag::new("local:test"), launch, "outrig-test-fetch"),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3859,6 +3971,7 @@ mod tests {
             &options,
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert!(args.contains(&"outrig-test-fs".to_string()), "{args:?}");
@@ -4015,7 +4128,7 @@ mod tests {
         .with_resolved_env(resolved_env());
         assert_eq!(options.env["TOKEN"], "s3cret", "env holds the values");
 
-        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken");
+        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken", None);
 
         let args = argv(cmd.clone());
         assert!(args.windows(2).any(|w| w == ["--env", "TOKEN"]), "{args:?}");
@@ -4068,6 +4181,7 @@ mod tests {
             .with_env(plain),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         );
 
         for cmd in [exec, create] {
