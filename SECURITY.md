@@ -89,6 +89,9 @@ Issues that bear on **host integrity** are in scope, for example:
   connects by address and asserts no name at all offers nothing to match against. Hostname deny
   rules describe traffic, not a containment boundary; bound a hostile container with address,
   CIDR, and port rules, or with `default = "deny"`.
+- A hostname **allow** rule grants the addresses its name resolved to, not the site: on shared
+  hosting or a CDN, a container that resolved the allowed name can reach any other site served
+  from that address. Name a host in `allow` only where you would trust everything served there.
 - Under `default = "deny"` a container resolves only the names an `allow` hostname entry could
   match, and every lookup is recorded; address and CIDR `allow` entries open no lookups. An
   allowed name can still carry data in its labels to that zone's name servers, so a wildcard

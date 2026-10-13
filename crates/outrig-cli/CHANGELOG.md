@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The network docs state two limits of a hostname rule.** A hostname `deny` does not stop a
+  container that reaches an address by literal IP and announces no name, and a hostname `allow`
+  grants the address its name resolved to, so any other site served from it. Both were always
+  so; nothing in the policy changed. See
+  [What a hostname rule matches](../../doc/reference/config.md#what-a-hostname-rule-matches).
+  (#362)
+
 - **A config key outrig does not know is a warning, not an error.** A global config shared with
   a newer outrig -- the 0.3 line's `[events]`, a model's `context-window`, a provider's
   `role-alternation` -- stopped every command that reads config, `run`, `mcp`, `build`, `ls`,

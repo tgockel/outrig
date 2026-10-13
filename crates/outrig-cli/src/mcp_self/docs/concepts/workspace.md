@@ -207,10 +207,11 @@ deny    = ["*:22"]
 ```
 
 Policy is global-only because it belongs to the machine running the agent. Repo config may
-choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Deny entries win over
-allow entries, and unmatched connections use `default`. A denied connection is closed
-immediately and still writes a `network.jsonl` record with `outrig.action = "deny"` and zero
-byte counts, so the audit log is the place to diagnose network policy failures.
+choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Where both match, a deny
+entry wins over an allow entry, and a connection neither matches uses `default`. A denied
+connection is closed immediately and still writes a `network.jsonl` record with
+`outrig.action = "deny"` and zero byte counts, so the audit log is the place to diagnose
+network policy failures.
 
 Entries match TCP connections. Anything else the container sends -- UDP to any port but 53,
 which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no entry and takes
@@ -233,6 +234,11 @@ address instead, and never against a name. An `allow` entry with no such binding
 match, and evaluation falls through to the remaining entries and then `default`. This
 narrowed in 0.2.0; see
 [Reference -> Config](../reference/config.md) for what an existing allowlist now permits.
+
+Two limits follow. A hostname `deny` entry cannot stop a container that reaches an address
+without a lookup here and announces no name, and a hostname `allow` entry grants the address
+its name resolved to, so any other site served from it. See
+[Reference -> Config](../reference/config.md#what-a-hostname-rule-matches).
 
 When network mode is `default`, outrig leaves Podman's configured default networking in place,
 does not install nftables rules, does not rewrite container DNS, and does not create

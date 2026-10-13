@@ -196,6 +196,10 @@ metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule
 `outrig.host`, and `outrig.host_source`. The last of those is `resolved` when the name in
 `outrig.host` is one the interceptor validated for that address and `asserted` when the
 container merely claimed it -- only a resolved name can have granted a hostname allow rule. A
+connection that a hostname `allow` entry granted may therefore show an `asserted` host: the name
+that earned the grant is a resolved one, which can be the name shown or another the container
+resolved to that address. `outrig.rule` says which entry decided, so read it against the policy;
+see [Reference -> Config](../reference/config.md#what-a-hostname-rule-matches). A
 connection refused because its container already had 256 open through the interceptor is recorded
 with `outrig.action` `deny` and `outrig.rule` `connection-limit`. One that reached the
 interceptor's own listener without being redirected there -- a process in the container

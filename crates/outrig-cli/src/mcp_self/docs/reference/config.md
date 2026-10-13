@@ -208,7 +208,8 @@ CIDRs such as `"10.0.0.0/8"` or `"2001:db8::/32"` match IP destinations. Inline 
 Filter evaluation checks `deny` entries first, then `allow` entries, then `default`. Denied
 connections are closed immediately and still write an audit record with
 `outrig.action = "deny"`, `outrig.rule`, and zero byte counts. `mode = "filter"` requires at
-least one `allow` or `deny` entry, even when `default = "allow"`.
+least one `allow` or `deny` entry, even when `default = "allow"`. What a hostname entry can
+match, and so stop, is bounded: see [What a hostname rule matches](#what-a-hostname-rule-matches).
 
 `allow` and `deny` entries match TCP connections, which the interceptor carries and can name a
 host for. Anything else the container sends -- UDP to any port but 53, which is how QUIC and so
@@ -290,7 +291,7 @@ A hostname `allow` entry with no binding simply does not match. Evaluation conti
 remaining entries and then `default`; the entry is never turned into a deny, so
 `default = "allow"` keeps meaning what it says.
 
-Three consequences worth planning for:
+Consequences worth planning for:
 
 - A container that reaches an address without asking the interceptor's resolver -- a baked
   `/etc/hosts` entry, a hardcoded address, DNS carried over TCP or HTTPS -- earns no binding, so
@@ -306,6 +307,18 @@ Three consequences worth planning for:
   names: it is matched against the destination address and never against a resolved name, so a
   registrable hostname that happens to match it (`10.0.attacker.example` against `10.0.*`)
   grants nothing. `allow = ["*"]` and `deny = ["*:22"]` mean exactly what they always did.
+- A hostname `deny` entry is advisory against a client that does not cooperate. A container that
+  reaches an address without a lookup here, and announces no name, leaves it nothing to match:
+  under `default = "allow"`, `deny = ["evil.example"]` lets a connection to that address by
+  literal IP through. A portless entry also refuses the lookup (see
+  [Name lookups](#name-lookups)), which shuts the interceptor's own resolver and no other path.
+  Only an address, a CIDR, an address glob (`203.0.113.0/24`, `*:22`), or `default = "deny"`
+  binds such a client.
+- A hostname `allow` entry grants the address its name resolved to, not the site. Under the
+  policy above, a container that has looked up `allowed.example` can connect to that address and
+  announce `other.example`, a name served from the same address by a CDN or shared host, and is
+  allowed for as long as the binding lasts. Only `deny` entries weigh the announced name; nothing
+  checks it against the entry that earned the allow.
 
 Client-asserted names are still recorded. An audit record carries the best known name in
 `outrig.host` and says where it came from in `outrig.host_source`, which is `resolved` for a

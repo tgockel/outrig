@@ -285,6 +285,12 @@ impl CompiledNetworkPolicy {
     /// entries never see the claim. That asymmetry is the whole property: a
     /// client-supplied name may cost a client its own connection, and may
     /// never buy it one.
+    ///
+    /// Two limits follow, written up under "What a hostname rule matches" in
+    /// `doc/reference/config.md`. The one a "fix" would trip on: an `allow` a
+    /// resolved name earned is not re-checked against a claimed name, only
+    /// `deny` is. Narrowing that would stop little -- a client omits the name
+    /// or sends it inside TLS -- and would refuse a named forward proxy.
     fn decide(
         &self,
         dst: SocketAddr,
@@ -8608,6 +8614,46 @@ options edns0
 
         assert_eq!(decision.action, NetworkAction::Deny);
         assert_eq!(decision.rule, "deny[0]");
+    }
+
+    /// A documented limit (see `decide`): with no lookup and no claim, only an
+    /// address entry has anything to match.
+    #[test]
+    fn a_hostname_deny_does_not_see_an_address_reached_without_a_lookup() {
+        let dst = "203.0.113.66:443";
+        let by_name = lookup_policy(NetworkAction::Allow, &[], &["evil.example"]);
+        let by_address = lookup_policy(NetworkAction::Allow, &[], &["203.0.113.66"]);
+
+        let announced = by_name.decide(
+            addr(dst),
+            &ResolvedNames::default(),
+            &ClientAssertion::tls("evil.example".to_string()),
+        );
+
+        assert_eq!(decide_bare(&by_name, dst), PolicyDecision::allow_default());
+        assert_eq!(announced, refused("deny[0]"));
+        assert_eq!(decide_bare(&by_address, dst), refused("deny[0]"));
+    }
+
+    /// A documented limit (see `decide`): another name announced on an address
+    /// a resolved name earned is weighed only against `deny`.
+    #[test]
+    fn an_address_one_resolved_name_earned_admits_another_announced_name() {
+        let dst = addr("203.0.113.66:443");
+        let shared = resolved(&["allowed.example"]);
+        let other = ClientAssertion::tls("other.example".to_string());
+
+        let open = lookup_policy(NetworkAction::Deny, &["allowed.example"], &[])
+            .decide(dst, &shared, &other);
+        let denied = lookup_policy(
+            NetworkAction::Deny,
+            &["allowed.example"],
+            &["other.example"],
+        )
+        .decide(dst, &shared, &other);
+
+        assert_eq!(open, allowed("allow[0]"));
+        assert_eq!(denied, refused("deny[0]"));
     }
 
     #[test]
