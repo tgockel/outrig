@@ -908,11 +908,13 @@ pub outrig::error::OutrigError::FilesystemHelperUnavailable
 pub outrig::error::OutrigError::Io(std::io::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::McpArgsNotObject
 pub outrig::error::OutrigError::McpArgsNotObject::kind: &'static str
+#[non_exhaustive] pub outrig::error::OutrigError::McpCallToolFailed
+pub outrig::error::OutrigError::McpCallToolFailed::name: alloc::string::String
+pub outrig::error::OutrigError::McpCallToolFailed::source: outrig::error::McpSessionError
 #[non_exhaustive] pub outrig::error::OutrigError::McpEnvResolveFailed
 pub outrig::error::OutrigError::McpEnvResolveFailed::key: alloc::string::String
 pub outrig::error::OutrigError::McpEnvResolveFailed::name: alloc::string::String
 pub outrig::error::OutrigError::McpEnvResolveFailed::source: outrig::config::EnvValueError
-pub outrig::error::OutrigError::McpService(outrig::error::McpSessionError)
 pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error::McpStartupFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
 pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String

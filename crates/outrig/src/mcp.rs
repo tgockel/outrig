@@ -259,11 +259,12 @@ impl McpClient {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        let result = self
-            .service
-            .call_tool(request)
-            .await
-            .map_err(|source| OutrigError::McpService(session_error_from_rmcp(&source)))?;
+        let result = self.service.call_tool(request).await.map_err(|source| {
+            OutrigError::McpCallToolFailed {
+                name: self.name.clone(),
+                source: session_error_from_rmcp(&source),
+            }
+        })?;
         Ok(result_from_rmcp(result))
     }
 

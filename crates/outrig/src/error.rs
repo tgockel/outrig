@@ -130,12 +130,6 @@ pub enum OutrigError {
         source: std::io::Error,
     },
 
-    /// A request on a live MCP session failed. Carries outrig's own
-    /// [`McpSessionError`] rather than the MCP SDK's error type -- see that
-    /// type for why.
-    #[error("mcp service: {0}")]
-    McpService(#[source] McpSessionError),
-
     #[error("mcp server {name:?} env key {key:?}: {source}")]
     #[non_exhaustive]
     McpEnvResolveFailed {
@@ -172,6 +166,18 @@ pub enum OutrigError {
     #[error("mcp server {name:?} tools/list failed: {source}")]
     #[non_exhaustive]
     McpToolsListFailed {
+        name: String,
+        #[source]
+        source: McpSessionError,
+    },
+
+    /// A `tools/call` on a live MCP session failed. `name` is the server's
+    /// local name, as in [`OutrigError::McpToolsListFailed`]. Carries outrig's
+    /// own [`McpSessionError`] rather than the MCP SDK's error type -- see
+    /// that type for why.
+    #[error("mcp server {name:?} tools/call failed: {source}")]
+    #[non_exhaustive]
+    McpCallToolFailed {
         name: String,
         #[source]
         source: McpSessionError,
@@ -680,11 +686,27 @@ mod tests {
             "nothing below it, or the same text renders twice: {session}"
         );
 
-        let called = OutrigError::McpService(McpSessionError::new(
-            McpFailureKind::Transport,
-            "Transport closed",
-        ));
-        assert_eq!(called.to_string(), "mcp service: Transport closed");
+        let called = OutrigError::McpCallToolFailed {
+            name: "fs".to_string(),
+            source: McpSessionError::new(McpFailureKind::Transport, "Transport closed"),
+        };
+        assert_eq!(
+            called.to_string(),
+            r#"mcp server "fs" tools/call failed: Transport closed"#
+        );
+        let OutrigError::McpCallToolFailed { name, .. } = &called else {
+            panic!("a tools/call failure is its own variant: {called}");
+        };
+        assert_eq!(name, "fs", "the server is a field, not only message text");
+
+        let source = called
+            .source()
+            .unwrap_or_else(|| panic!("a tools/call failure has a cause: {called}"));
+        let session = source
+            .downcast_ref::<McpSessionError>()
+            .unwrap_or_else(|| panic!("and the cause is the classified failure: {source}"));
+        assert_eq!(session.kind, McpFailureKind::Transport);
+        assert!(session.source().is_none(), "{session}");
     }
 
     fn spawn_err(kind: ErrorKind) -> OutrigError {

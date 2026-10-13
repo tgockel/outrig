@@ -413,15 +413,16 @@ impl<C: BackingClient> ProxyServer<C> {
         match client.call_tool(&entry.backend_tool, args).await {
             Ok(result) => result_to_rmcp(result),
             Err(e) => {
-                let server = client.name();
+                // The error names the server itself, so the text is not
+                // prefixed with it; the log keeps it as a field for an error
+                // that does not (`McpArgsNotObject`).
                 tracing::warn!(
                     target: "outrig::mcp_proxy",
-                    "backing server {server:?} call to {tool:?} failed: {e}",
-                    tool = entry.backend_tool,
+                    server = client.name(),
+                    tool = entry.backend_tool.as_str(),
+                    "call failed: {e}",
                 );
-                CallToolResult::error(vec![ContentBlock::text(format!(
-                    "outrig: backing server `{server}` call failed: {e}"
-                ))])
+                CallToolResult::error(vec![ContentBlock::text(format!("outrig: {e}"))])
             }
         }
     }

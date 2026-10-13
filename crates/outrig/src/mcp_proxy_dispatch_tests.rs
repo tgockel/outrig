@@ -12,15 +12,17 @@ use rmcp::model::{CacheScope, CallToolRequestParams, ProtocolVersion};
 use serde_json::{Value, json};
 
 use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_MS, sealed};
-use crate::error::OutrigError;
+use crate::error::{McpFailureKind, McpSessionError, OutrigError};
 use crate::mcp_content::mcp_content_tests::{MIXED_RENDERING, rmcp_mixed_result, rmcp_rich_tool};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::process_tests::with_captured_tracing_at;
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
-/// `Err` becomes the "backing client failed" path that surfaces as
+/// `Err` is the message of a failed `tools/call`, which the fake reports the
+/// way [`crate::McpClient`] does -- as an [`OutrigError::McpCallToolFailed`]
+/// naming this client -- and which surfaces as
 /// `CallToolResult { is_error: Some(true), ... }` carrying the error text.
-type CallResponse = Result<McpToolResult, OutrigError>;
+type CallResponse = Result<McpToolResult, String>;
 
 #[derive(Default)]
 struct FakeClient {
@@ -72,10 +74,8 @@ impl FakeClient {
     }
 
     fn respond_err(mut self, tool_name: &str, msg: &str) -> Self {
-        self.responses.insert(
-            tool_name.to_string(),
-            Err(OutrigError::Configuration(msg.to_string())),
-        );
+        self.responses
+            .insert(tool_name.to_string(), Err(msg.to_string()));
         self
     }
 }
@@ -95,7 +95,10 @@ impl BackingClient for FakeClient {
         self.received.lock().unwrap().push((name.to_string(), args));
         match self.responses.get(name) {
             Some(Ok(r)) => Ok(r.clone()),
-            Some(Err(e)) => Err(OutrigError::Configuration(e.to_string())),
+            Some(Err(msg)) => Err(OutrigError::McpCallToolFailed {
+                name: self.name.clone(),
+                source: McpSessionError::new(McpFailureKind::Transport, msg.as_str()),
+            }),
             None => Err(OutrigError::Configuration(format!(
                 "FakeClient({}) has no response for {name:?}",
                 self.name
@@ -247,12 +250,22 @@ async fn backend_error_surfaces_as_call_tool_result_is_error() {
     let result = proxy.dispatch_call(call("fs__read_file", json!({}))).await;
     assert_eq!(result.is_error, Some(true));
     let body = text_body(&result);
-    // Body identifies the backing server by name and carries the upstream
-    // error verbatim. The prefix lets an MCP client distinguish a proxy
-    // failure from a backend's own `is_error=true` response.
+    // The `outrig: ` lead lets an MCP client distinguish a proxy failure from
+    // a backend's own `is_error=true` response. The server is named by the
+    // error the client returned, so it appears once: the proxy adds no
+    // `backing server` prefix of its own to say it a second time.
     assert!(
-        body.contains("outrig: backing server `fs`"),
-        "body should identify the backing server, was {body:?}"
+        body.starts_with("outrig: "),
+        "body should be marked as outrig's, was {body:?}"
+    );
+    assert_eq!(
+        body.matches("\"fs\"").count(),
+        1,
+        "body should name the server exactly once, was {body:?}"
+    );
+    assert!(
+        !body.contains("backing server"),
+        "the proxy should not prepend the server itself, was {body:?}"
     );
     assert!(
         body.contains("permission denied"),

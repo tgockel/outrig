@@ -292,6 +292,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same text as before, now built from `reason` with no second check. `reason` is a field and not
   a `source()`, as its text is already in the message.
 
+- **`OutrigError::McpService` is `McpCallToolFailed { name, source }`, and names the server.** A
+  failed `tools/call` reported `mcp service: Transport closed`, with nothing to say which server
+  it came from, where `McpToolsListFailed` has always carried the name. The variant is renamed
+  and gains the `name` field, and is `#[non_exhaustive]`. A pattern on `McpService(e)` becomes
+  `McpCallToolFailed { source: e, .. }`, and `name` is the server's local name. The message is now
+  `mcp server "fs" tools/call failed: Transport closed`. The `outrig mcp` proxy's tool result,
+  which prepended `backing server `fs` call failed:` to say what the error did not, now reads
+  `outrig: ` followed by that message, so the server is named once.
+
 ### Removed
 
 - **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:
