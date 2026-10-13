@@ -1556,10 +1556,10 @@ fn context_changed(table: &Mutex<Table>, change: ContextChange) {
 
 /// Log the interpreter's stderr line by line, keeping the last few to explain
 /// an exit. Its own diagnostics are warnings. Everything else is output no
-/// execution can be billed for -- `os.write(1, ...)`, `os.system` -- and is
-/// logged at debug so an agent's stray output does not reach the terminal.
-/// Each line is recorded as one or the other, too: output no agent can be
-/// billed for should not vanish.
+/// execution can be billed for -- `os.write(1, ...)` -- and is logged at
+/// debug so an agent's stray output does not reach the terminal. Each line is
+/// recorded as one or the other, too: output no agent can be billed for
+/// should not vanish.
 async fn drain_stderr<R: AsyncRead + Unpin>(
     stderr: R,
     tail: Arc<Mutex<VecDeque<String>>>,

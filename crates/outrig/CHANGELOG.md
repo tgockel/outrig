@@ -205,6 +205,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A thread started with `_thread.start_new_thread` and a pool's `initializer` still reach the
   interpreter's stderr, recorded as `output.unattributed` (#474).
 
+- **`os.system` in the interpreter is interruptible, and its output is billed to its
+  execution.** libc's `system()` ignores SIGINT for the whole process while it waits, so an
+  interrupt sent then -- the user's Ctrl-C included -- was discarded, for every agent in the
+  process. `os.system` is now a `subprocess.run(cmd, shell=True)` that returns the same wait
+  status: an interrupt ends the execution with `KeyboardInterrupt`, and what the command prints
+  lands in the execution's result like any other child's (#463).
+
 - **Bindings: an object a process on the host holds for a session's agent.** `[bindings.<name>]`
   in config (`Config::bindings`, `Binding`, `FactoryValue`) and `SessionBuilder::bind` with a
   `BindingSpec` declare one: a description, pure-Python `requires`, a `module:callable` factory,

@@ -128,10 +128,12 @@ A `threading.Thread`
   result's, for either kind of pool. A future's callback that raises is reported in that context
   too, where `Future` would log it once the callback's context had been left for the work's.
 
-`subprocess.run([...])`, and `asyncio.create_subprocess_exec`, which goes through it
+`subprocess.run([...])`, `os.system(cmd)`, and `asyncio.create_subprocess_exec`, which go through it
 : A pipe per **execution**, supplied as the default `stdout` and `stderr` by one patch on
   `Popen.__init__`, which reads the same contextvar. `stdout=sys.stdout` is treated as the
   default, and `sys.stdout.fileno()` returns that descriptor while the execution runs.
+  libc's `system()` spawns without `Popen`, so the interpreter replaces `os.system` with
+  `subprocess.run(cmd, shell=True)`.
 
   Per-execution rather than per-agent, because a child's bytes carry no writer identity: two
   executions' children sharing one agent pipe produce a stream the drain cannot attribute, and no
@@ -146,8 +148,8 @@ A `threading.Thread`
   the pipe. A child started after its execution reported -- by a task it left running -- gets a
   pipe of its own, billed the same way.
 
-`os.write(1, ...)` and `os.system()`
-: Not attributable. These name the descriptor directly. fd 1 and fd 2 are the exec's stderr, the
+`os.write(1, ...)`
+: Not attributable. It names the descriptor directly. fd 1 and fd 2 are the exec's stderr, the
   stream the host already reads as diagnostics, so what lands there is recorded as an event
   rather than dropped -- `observability.md` -- because it cannot be billed to an agent and a
   silent hole is worse than an unattributed line. It never reaches the protocol, which has
@@ -180,6 +182,9 @@ What stays unattributed, stated rather than implied:
   it inherited. A pool made in one execution and used from the next bills the next's output to
   the first, so make one pool per execution
   (`plan/next/process-pool-workers-are-billed-to-their-creator.md`).
+- **`posix.system`, and a libc `system()` called from native code or `ctypes`.** Only `os.system`
+  is replaced, so these spawn without `Popen`: the output goes to stderr, never to another
+  execution.
 - **A `fileno()` kept past its execution.** The number is closed when the execution reports and
   may be reused by the next one's pipe.
 - **`contextlib.redirect_stdout`.** It rebinds `sys.stdout` for the whole process, so one agent's

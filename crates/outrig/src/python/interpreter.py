@@ -99,7 +99,7 @@ os.dup2(_devnull, 0)
 os.close(_devnull)
 
 # fd 1 joins fd 2 on the exec's stderr. What reaches either without passing through the
-# dispatcher below -- `os.write(1, ...)`, `os.system`, a thread started with `_thread` rather than
+# dispatcher below -- `os.write(1, ...)`, a thread started with `_thread` rather than
 # `threading`, a pool's `initializer` -- cannot be billed to any agent, and the host records it
 # instead of dropping it.
 os.dup2(2, 1)
@@ -544,6 +544,28 @@ def _attributed_popen_init(self, *args, **kwargs):
 
 
 subprocess.Popen.__init__ = _attributed_popen_init
+
+
+# libc's `system()` ignores SIGINT for the whole process while it waits, as POSIX asks of it, so an
+# interrupt the host sends then is discarded -- for every agent, since the disposition is
+# process-wide. It also spawns without `Popen`, so the patch above never sees it. Through
+# `subprocess.run` it ends with `KeyboardInterrupt` like any other child -- the direct child
+# killed, what that child started not -- and its output is billed to its execution.
+@functools.wraps(os.system)
+def _system(command):
+    # `fsencode` because `os.system` takes a path-like, which `run` refuses with `shell=True`.
+    # `close_fds=False` because libc's `system()` passes on every descriptor agent code marked
+    # inheritable, and `run` would close them. None of this program's own is inheritable.
+    code = subprocess.run(os.fsencode(command), shell=True, close_fds=False).returncode
+    # The wait status `os.system` returns: the exit code in the high byte, or the signal's number
+    # where `returncode` is its negation.
+    return code << 8 if code >= 0 else -code
+
+
+# `wraps` copied the builtin's `posix`, which still holds the builtin: a pool pickles a function by
+# the module it names, and finds it there.
+_system.__module__ = os.__name__
+os.system = _system
 
 # A fork -- `os.fork`, `multiprocessing` -- copies the forking thread's context, and with it the
 # execution that context names. Its copy of that execution must write somewhere this process

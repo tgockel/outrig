@@ -647,6 +647,20 @@ fn a_child_process_writes_into_its_execution() {
     );
 }
 
+/// `os.system`'s output belongs to its execution, as any child's does.
+#[test]
+fn os_system_writes_into_its_execution() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import os
+            os.system('echo from-system; echo from-system-err >&2')
+            "#),
+    );
+    assert_eq!(out, "from-system\nfrom-system-err\n0\n");
+}
+
 #[test]
 fn python_and_child_output_keep_their_order() {
     // Python's writes go through the execution's pipe while it runs, so they
@@ -1756,6 +1770,82 @@ fn an_interrupt_ends_a_blocking_run_but_not_what_it_started() {
         && !crate::process::process_tests::is_zombie(grandchild);
     assert!(alive, "the grandchild {grandchild} is gone");
     assert_eq!(k.output(2, "2"), "2\n");
+}
+
+/// An interrupt sent while `os.system` waits ends the execution. The file only
+/// exists once the shell is running, which is after libc's `system()` would
+/// have set SIGINT to ignored: an interrupt that landed before the call would
+/// prove nothing.
+#[test]
+fn an_interrupt_ends_os_system() {
+    let mut k = Interpreter::start();
+    let started = Flag::new();
+    let source = format!(
+        "import os, shlex\n\
+         os.system('echo up > ' + shlex.quote({path}) + '; sleep 60')",
+        path = started.py()
+    );
+    k.submit(1, &source);
+    started.wait();
+
+    k.interrupt(1, false);
+    let error = error_of(&k.result_of(1));
+    assert!(error.contains(INTERRUPTED), "{error}");
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
+/// `os.system` returns the wait status: the exit code in the high byte, or
+/// the number of the signal that ended the shell.
+#[test]
+fn os_system_returns_the_wait_status() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import os, pathlib
+            [os.system('exit 3'), os.system(b'exit 4'), os.system(pathlib.PurePath('exit 5')),
+             os.system('kill -9 $$')]
+            "#),
+    );
+    assert_eq!(out, "[768, 1024, 1280, 9]\n");
+}
+
+/// A pool pickles its function by reference, to the module it names. The
+/// replacement must be found where it is, not under the builtin's `posix`.
+#[test]
+fn os_system_can_be_given_to_a_process_pool() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import multiprocessing, os
+            with multiprocessing.get_context('fork').Pool(1) as pool:
+                statuses = pool.map(os.system, ['exit 3'])
+            statuses
+            "#),
+    );
+    assert_eq!(out, "[768]\n");
+}
+
+/// What agent code marks inheritable reaches the shell, as it does through
+/// libc's `system()`; `subprocess` would close it.
+#[test]
+fn os_system_passes_on_an_inheritable_descriptor() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+            import os, tempfile
+            fd, path = tempfile.mkstemp()
+            os.set_inheritable(fd, True)
+            status = os.system(f'echo kept > /proc/self/fd/{fd}')
+            os.close(fd)
+            kept = open(path).read()
+            os.unlink(path)
+            [status, kept]
+            "#),
+    );
+    assert_eq!(out, "[0, 'kept\\n']\n");
 }
 
 /// Agent code that pumps the loop by hand puts the loop's own machinery nearer

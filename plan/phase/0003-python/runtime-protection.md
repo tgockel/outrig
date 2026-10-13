@@ -335,8 +335,10 @@ the front end's to decide.
   code, cancels the wait only, and the call goes on. The rule for whose code an interrupt may
   end is the handler's, applied when the call is awaited; the interpreter makes no hosted call
   for itself once `repr` is answered locally.
-- **`os.system`.** musl's `system()` ignores SIGINT process-wide for as long as it waits, so an
-  interrupt sent then is discarded. A later check sends another.
+- **`os.system`.** libc's `system()` ignores SIGINT process-wide for as long as it waits, so an
+  interrupt sent then would be discarded -- for every agent, not only the one that called it. The
+  interpreter replaces `os.system` with `subprocess.run(cmd, shell=True)`, which is the case
+  above. `posix.system` and `ctypes` still reach libc's, and so still discard it.
 - **Agent code that blocks or replaces SIGINT.** Blocked with `pthread_sigmask`, the signal waits
   to be unblocked. Replaced, the reader thread notices before arming and says so, and only a
   cancel can reach the execution.
@@ -467,11 +469,11 @@ What the ceiling does not do:
 
 **A call Python cannot break into.** On the main thread a signal breaks a system call, so the
 primary's `time.sleep` or blocking read can be interrupted. What remains is native code that holds
-the GIL, `os.system`, and any call on another thread: Python takes an asynchronous exception at a
-bytecode boundary, and there is none coming. The exception is a hosted call, whose wait is on a
-worker thread the reader thread can wake (above). Nothing short of stopping the container frees
-the rest, and the host learns of them only by the absence of a result. This is the documented
-final containment action and it stays that way.
+the GIL, a libc `system()` reached other than through `os.system`, and any call on another
+thread: Python takes an asynchronous exception at a bytecode boundary, and there is none coming.
+The exception is a hosted call, whose wait is on a worker thread the reader thread can wake
+(above). Nothing short of stopping the container frees the rest, and the host learns of them only
+by the absence of a result. This is the documented final containment action and it stays that way.
 
 **A wedged subagent, which is contained but not recoverable.** The interrupt above reaches the
 main thread, and subagents are not on it -- so a subagent awaiting a hosted call can be
