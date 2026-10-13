@@ -165,7 +165,9 @@ impl SessionStore {
     /// same path for convenience.
     ///
     /// An explicit directory is created if absent and refused unless empty, so
-    /// that nothing in it predates the session.
+    /// that nothing in it predates the session. Writing the record claims the
+    /// directory: of two launches given one at once, the second to write is
+    /// refused.
     pub fn create(
         &self,
         sid: &SessionId,
@@ -173,7 +175,9 @@ impl SessionStore {
         session: &mut Session,
     ) -> Result<PathBuf> {
         // Before the root is created, so a root nested inside the explicit
-        // directory is not taken for something already there.
+        // directory is not taken for something already there. These checks are
+        // the policy and the messages for a directory that is plainly taken;
+        // the claim below holds when two launches pass them together.
         if let Some(dir) = explicit_dir {
             if dir.exists() && !dir.is_dir() {
                 return Err(OutrigError::Configuration(format!(
@@ -203,12 +207,14 @@ impl SessionStore {
             Some(dir) => {
                 let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
                 session.session_dir = canon.clone();
-                write_session_json_atomic(&canon, session)?;
+                claim_session_json(&canon, session)?;
                 let link = self.root.join(&sid.0);
                 std::os::unix::fs::symlink(&canon, &link).path_ctx("symlink", &link)?;
                 canon
             }
             None => {
+                // Replacing, not claiming, until #382 makes the `create_dir`
+                // of a fresh id the claim.
                 let dir = self.root.join(&sid.0);
                 session.session_dir = dir.clone();
                 fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
@@ -507,17 +513,41 @@ fn read_session_json(path: &Path) -> Result<Session> {
     })
 }
 
-/// Atomic write: temp file in the same dir, fsync, rename. Skipping the
-/// parent-dir fsync is a deliberate v0 punt; outrig is a developer tool, not
-/// a database.
-fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
+/// The record written and fsynced to a temp file in `dir`, ready to be
+/// renamed into place. Skipping the parent-dir fsync is a deliberate v0 punt;
+/// outrig is a developer tool, not a database.
+fn stage_session_json(dir: &Path, session: &Session) -> Result<tempfile::NamedTempFile> {
     let payload = serde_json::to_vec_pretty(session)
         .map_err(|e| OutrigError::Configuration(format!("encoding session.json: {e}")))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.as_file_mut().write_all(&payload)?;
     tmp.as_file_mut().sync_all()?;
-    tmp.persist(dir.join(SESSION_JSON))?;
+    Ok(tmp)
+}
+
+/// Atomic write: [`stage_session_json`], then rename over whatever
+/// `session.json` is there.
+fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
+    stage_session_json(dir, session)?.persist(dir.join(SESSION_JSON))?;
     Ok(())
+}
+
+/// The first write of a record into an explicit directory, which is also the
+/// claim on it: the rename fails rather than replace a `session.json` another
+/// launch wrote first (#430). `create`'s checks have already turned away a
+/// directory that is plainly taken, so a refusal here is two launches racing.
+fn claim_session_json(dir: &Path, session: &Session) -> Result<()> {
+    match stage_session_json(dir, session)?.persist_noclobber(dir.join(SESSION_JSON)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(OutrigError::Configuration(format!(
+                "--session-dir {} was claimed by another session that started at the \
+                 same moment; name a different directory",
+                dir.display()
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub(crate) mod iso_systime {

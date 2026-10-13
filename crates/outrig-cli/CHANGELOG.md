@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two launches started at once with one `--session-dir` no longer both register.** Fixed in
+  `outrig-cli` (#430). Of two `outrig run` or `outrig mcp` processes given the same directory at
+  the same moment, one now claims it and the other is refused, saying another session claimed it;
+  the first keeps its record. Both used to pass the check that the directory was empty, so the
+  second `session.json` replaced the first: `outrig ls` listed the survivor twice and the other
+  not at all, and `outrig discard` of the lost id removed the survivor's directory and link.
+  A same-second collision between two *auto-allocated* session ids is a separate case (#382).
+
 - **`--network audit` and `--network filter`, or the same `[network] mode`, refuse a container
   that holds `NET_ADMIN`.** Fixed in `outrig` (#363). An image-config or sidecar with
   `cap-add = ["NET_ADMIN"]` (or `ALL` without `NET_ADMIN` in `cap-drop`) used to start under

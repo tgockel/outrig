@@ -270,7 +270,8 @@ When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`,
 `outrig-enter` (only for a `view = "primary"` sidecar) directly under `<path>`, and
 additionally creates a symlink `<session-root>/<sid> -> <path>` so
 `outrig ls`/`logs`/`discard`/`clean` still find it. A `<path>` that does not exist is created,
-with any missing parents; one that already holds anything is refused. When omitted, outrig
+with any missing parents; one that already holds anything is refused, as is the second of two
+launches started at once with one `<path>`. When omitted, outrig
 auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image

@@ -1,6 +1,7 @@
 //! SessionStore on-disk behavior. Each test owns its own tempdir as the
 //! session root; symlinks land inside that tree so cleanup is automatic.
 
+use std::sync::Barrier;
 use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
@@ -173,6 +174,62 @@ fn explicit_path_that_is_a_file_is_refused() {
         other => panic!("expected Configuration error, got: {other:?}"),
     }
     assert_eq!(std::fs::read(&file).expect("file kept"), b"my notes\n");
+}
+
+/// #430: checking that an explicit directory was free, then writing into it,
+/// left a gap two simultaneous launches both fit through. The write is the
+/// claim now, so exactly one wins and the other is refused.
+#[test]
+fn concurrent_creates_on_one_explicit_dir_claim_it_once() {
+    let a = SessionId("20261005T205313-aaaa".into());
+    let b = SessionId("20261005T205313-bbbb".into());
+    for _ in 0..10 {
+        let root = tempfile::tempdir().expect("tempdir root");
+        let explicit = tempfile::tempdir().expect("tempdir explicit");
+        let store = SessionStore::new(root.path().to_path_buf());
+        let barrier = Barrier::new(2);
+        let launch = |sid: &SessionId| {
+            let mut session = sample_session(sid);
+            barrier.wait();
+            store.create(sid, Some(explicit.path()), &mut session)
+        };
+        let (ra, rb) = std::thread::scope(|scope| {
+            let (ha, hb) = (scope.spawn(|| launch(&a)), scope.spawn(|| launch(&b)));
+            (
+                ha.join().expect("create thread"),
+                hb.join().expect("create thread"),
+            )
+        });
+        let (winner, loser) = match (ra, rb) {
+            (Ok(_), Err(e)) => (&a, e),
+            (Err(e), Ok(_)) => (&b, e),
+            both => panic!("exactly one create should win, got {both:?}"),
+        };
+
+        assert!(
+            matches!(loser, OutrigError::Configuration(_)),
+            "the loser is refused, got: {loser:?}"
+        );
+        let ids: Vec<_> = store
+            .list()
+            .expect("list")
+            .sessions
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            ids,
+            std::slice::from_ref(winner),
+            "one link, reading the winner's record"
+        );
+        assert_eq!(
+            std::fs::read_dir(explicit.path())
+                .expect("read explicit")
+                .count(),
+            1,
+            "the loser leaves no temp file behind"
+        );
+    }
 }
 
 #[test]
