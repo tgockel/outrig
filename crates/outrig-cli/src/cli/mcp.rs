@@ -48,6 +48,7 @@ use outrig::image::ImageTag;
 use outrig::mcp_proxy::ProxyServer;
 
 const ATTACH_MONITOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const HTTP_SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HTTP_SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,7 +552,23 @@ where
         }
     }
 
-    server.await?;
+    // A request still reading its body never observes `ct`, so graceful shutdown can wait on
+    // it forever. Bound the wait; a second signal cuts it short. Dropping `server` abandons
+    // whatever has not finished so teardown still runs.
+    let stopped = tokio::select! {
+        result = tokio::time::timeout(HTTP_SERVER_SHUTDOWN_GRACE, &mut server) => result.ok(),
+        sig = signals.any() => {
+            tracing::info!(target: "outrig::cli::mcp", "received {sig}; abandoning open requests");
+            None
+        }
+    };
+    match stopped {
+        Some(result) => result?,
+        None => tracing::warn!(
+            target: "outrig::cli::mcp",
+            "abandoning HTTP requests still open at shutdown"
+        ),
+    }
     Ok(0)
 }
 

@@ -473,6 +473,10 @@ backing MCP server, and finalize the session record. Fresh-container mode then s
 containers -- sidecars first, primary last. Attach mode leaves the borrowed container
 running. A signal is how a server is stopped, so once startup has finished it exits `0`.
 
+Under `--listen`, a signal gives requests still in flight five seconds to finish. Anything
+unfinished after that -- a request whose body has stalled, say -- is abandoned so teardown can
+proceed, and a second signal ends the wait early.
+
 A signal during startup -- while the image builds, the container starts, a backing server
 initializes, or a stdio client has yet to send `initialize` -- stops whatever had started and
 finalizes the record too, and exits with 128 plus the signal number: `130`, `143`, `129`. A

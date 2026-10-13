@@ -269,6 +269,46 @@ async fn mcp_sigterm_while_serving_over_stdio_exits_zero() {
     outrig.assert_torn_down(0).await;
 }
 
+/// A request whose body never completes does not observe the shutdown, so
+/// the HTTP server's graceful wait is bounded and the session is torn down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_listen_sigterm_with_an_incomplete_request_body_tears_the_session_down() {
+    use tokio::io::AsyncWriteExt;
+
+    common::init_tracing();
+    let mut outrig = Outrig::spawn(&["mcp", "--listen", "127.0.0.1:0"], FS_SERVER);
+    let url = wait_for_stderr_value(outrig.stderr.clone(), "[outrig] listen: ").await;
+    outrig.wait_for_line("[outrig] mcp server ready").await;
+    let addr = url
+        .trim_start_matches("http://")
+        .trim_end_matches("/mcp")
+        .to_string();
+
+    let mut stalled = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect to the listener");
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: 100\r\n\r\n"
+    );
+    stalled
+        .write_all(head.as_bytes())
+        .await
+        .expect("send headers");
+    stalled
+        .write_all(b"{\"jsonrpc\":")
+        .await
+        .expect("send part of the body");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    outrig.signal(Signal::SIGTERM);
+    let (status, stderr) = outrig.exit().await;
+    drop(stalled);
+
+    assert_eq!(status.code(), Some(0), "stderr: {stderr}");
+    outrig.assert_torn_down(0).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_sighup_during_an_unanswered_initialize_tears_the_session_down() {
     common::init_tracing();

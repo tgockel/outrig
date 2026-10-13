@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig mcp --listen` finishes shutting down while an HTTP request body is incomplete.**
+  Fixed in `outrig-cli` (#433). A signal now waits up to five seconds for in-flight requests,
+  then abandons them and tears the session down; a second signal skips the wait. A client that
+  stalled mid-body used to hold shutdown open indefinitely, leaving the container running and
+  the session record unfinalized.
 - **Two launches started at once with one `--session-dir` no longer both register.** Fixed in
   `outrig-cli` (#430). Of two `outrig run` or `outrig mcp` processes given the same directory at
   the same moment, one now claims it and the other is refused, saying another session claimed it;
