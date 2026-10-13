@@ -546,6 +546,16 @@ const SHORTEN_THE_REPORT: &str = "\
     quoting at length. If it genuinely cannot be shortened, say so via \
     `status: \"error\"` with a short `body`.";
 
+/// [`SHORTEN_THE_REPORT`], for a round whose report already stands (#521).
+/// Offering `status: "error"` here would invite a model to publish a short
+/// error over the report, which the inbox keeps only the latest of.
+const SHORTEN_A_REVISION: &str = "\
+    nothing was recorded by this call: `status` arrived but `body` did not. \
+    That usually means the reply hit the output token limit part-way through. \
+    The report you recorded earlier stands, and the agent that launched you \
+    will read it. If the revision matters, call again with a shorter `body`; \
+    otherwise stop calling outrig__set_result.";
+
 /// What every truncated call gets once the round has given up and told the
 /// parent so.
 ///
@@ -582,6 +592,14 @@ const SEND_A_SHORT_ERROR: &str = "\
     -- it will be cut off in the same place. Call once more with `status: \
     \"error\"` and a one-sentence `body` naming what you found and that the \
     report did not fit.";
+
+/// [`SEND_A_SHORT_ERROR`], for a round whose report already stands (#521).
+const LEAVE_THE_REPORT: &str = "\
+    still nothing recorded: `body` was missing again, so the revision is being \
+    cut off before it is written. The report you recorded earlier stands, and \
+    the agent that launched you will read it. Do not attempt the longer \
+    revision again -- it will be cut off in the same place. Stop calling \
+    outrig__set_result.";
 
 /// `outrig__set_result`: the subagent-side tool. Publishes into the inbox the
 /// parent reads, and does **not** end the round -- the subagent may keep
@@ -708,9 +726,17 @@ impl ToolDyn for SetResultTool {
                 return match attempt {
                     1 => {
                         self.warn_about_the_ceiling();
-                        fail(SHORTEN_THE_REPORT)
+                        fail(if self.shared.report_stands() {
+                            SHORTEN_A_REVISION
+                        } else {
+                            SHORTEN_THE_REPORT
+                        })
                     }
-                    n if n <= TRUNCATION_RETRY_BUDGET => fail(SEND_A_SHORT_ERROR),
+                    n if n <= TRUNCATION_RETRY_BUDGET => fail(if self.shared.report_stands() {
+                        LEAVE_THE_REPORT
+                    } else {
+                        SEND_A_SHORT_ERROR
+                    }),
                     // Out of retries. Publishing on the subagent's behalf is
                     // what makes this converge: `end_round` sees a round that
                     // published, and a parent blocked in `get_result` wakes now
@@ -1185,6 +1211,76 @@ mod tests {
             Some(Outcome::Result("the short version".to_string()))
         );
         assert_eq!(snapshot.version, 1, "nothing is published over it");
+    }
+
+    /// #521: the earlier rungs of the ladder offered `status: "error"` too, so
+    /// a compliant model replaced the report that fit with it. While the
+    /// report stands, no ask mentions an error.
+    #[tokio::test]
+    async fn a_revision_cut_off_after_a_report_is_not_asked_for_an_error() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        for call in 1..=2 {
+            let err = truncated_call(&tool).await.expect_err("cut off");
+            let text = err.to_string();
+            assert!(
+                text.contains("recorded earlier stands"),
+                "call {call}: {text}"
+            );
+            assert!(!text.contains("\"error\""), "call {call}: {text}");
+        }
+
+        let snapshot = shared.snapshot();
+        assert_eq!(
+            snapshot.outcome,
+            Some(Outcome::Result("the findings".to_string()))
+        );
+        assert_eq!(snapshot.version, 1);
+    }
+
+    /// A report the parent has steered past answers nothing, so the short
+    /// error is still the right ask.
+    #[tokio::test]
+    async fn a_revision_cut_off_after_a_steer_is_still_asked_for_a_short_error() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        shared.accept("and what about the tests?".into());
+        let first = truncated_call(&tool).await.expect_err("first attempt");
+        assert!(first.to_string().contains("`status: \"error\"`"), "{first}");
+        let second = truncated_call(&tool).await.expect_err("second attempt");
+        assert!(
+            second.to_string().contains("Call once more with"),
+            "{second}"
+        );
+    }
+
+    /// A steer that lands while the model request is in flight is accepted
+    /// before the report that request publishes, but that report was written
+    /// without it. Until a report follows the steer's delivery, the short
+    /// error stays the ask.
+    #[tokio::test]
+    async fn a_report_written_without_a_steer_does_not_stand_against_it() {
+        let (tool, shared) = set_result_tool();
+
+        shared.accept("and what about the tests?".into());
+        tool.call(r#"{"status":"result","body":"composed before the steer"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        let (steers, _) = shared.deliver_injections();
+        assert_eq!(steers.len(), 1);
+        let first = truncated_call(&tool).await.expect_err("first attempt");
+        assert!(first.to_string().contains("`status: \"error\"`"), "{first}");
+        let second = truncated_call(&tool).await.expect_err("second attempt");
+        assert!(
+            second.to_string().contains("Call once more with"),
+            "{second}"
+        );
     }
 
     /// `required` keeps `body` present but not meaningful; an empty report

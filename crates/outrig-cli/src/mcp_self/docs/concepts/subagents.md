@@ -148,6 +148,12 @@ body and fails the same way, so retrying only spends model calls:
 | 3rd     | The failure has been reported upward already -- stop calling.               |
 | 4th on  | The same refusal, unchanged.                                                |
 
+When the round has already reported and the parent sent nothing after that report, the earlier
+report stands and the 1st and 2nd asks say so instead: shorten the revision if it matters, or
+stop calling. They never ask for `status: "error"`, because a short error that fits would replace
+the report in the inbox. If the parent did send something after the report, the report is no
+answer to it, and the table above applies as written.
+
 The third attempt is what makes this end. OutRig publishes the truncation as that round's outcome
 on the subagent's behalf, so a parent blocked in `outrig__get_result` wakes with the cause
 immediately instead of once the subagent's whole tool-call budget has drained into one call that

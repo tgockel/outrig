@@ -81,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent whose report stands is no longer told to send an error over it.** When a subagent
+  had reported with `outrig__set_result` and then tried a longer report that was cut off at the
+  output-token ceiling, the first two retry asks offered, then demanded, a one-sentence
+  `status: "error"`. A compliant model sent it, it fit, and it replaced the report in the inbox:
+  the parent read "did not fit" and never saw the findings. While the report stands, the asks now
+  say so and ask for a shorter revision or for the subagent to stop. A parent that sent a message
+  after the report still gets the short-error ask, since the report does not answer it. (#521)
 - **`outrig clean --build-containers` no longer stops when a build elsewhere removes a working
   container mid-listing.** buildah lists working containers in two steps -- every container, then
   each one's directory -- so a container removed between them failed the whole listing with

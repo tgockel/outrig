@@ -185,6 +185,9 @@ struct Prompts {
     steers: Vec<String>,
     /// The inbox version when the round in flight last took a steer.
     steered_at: Option<u64>,
+    /// The inbox version when the round in flight last sent steers to its
+    /// model. A report published at or before it was composed without them.
+    delivered_at: Option<u64>,
     /// How many of `steers` have gone out on a tool result the round's history
     /// keeps. They go out in order, so the rest are still to go.
     delivered: usize,
@@ -222,6 +225,7 @@ impl SubagentShared {
                 open: false,
                 steers: Vec::new(),
                 steered_at: None,
+                delivered_at: None,
                 delivered: 0,
                 rounds: VecDeque::new(),
             }),
@@ -324,6 +328,7 @@ impl SubagentShared {
         let mut prompts = self.lock_prompts();
         prompts.open = true;
         prompts.steered_at = None;
+        prompts.delivered_at = None;
         drop(prompts);
         self.tx.send_modify(|snap| {
             snap.state = RunState::Running;
@@ -350,6 +355,24 @@ impl SubagentShared {
             self.tx
                 .send_modify(|snap| snap.state = RunState::Idle { published });
         }
+    }
+
+    /// Whether the round in flight holds a report that answers every steer the
+    /// parent has sent it: one published this round, after the last steer was
+    /// accepted and after the last one reached the model.
+    ///
+    /// Stricter than [`Self::steered_since_publish`], which a steer accepted
+    /// while a model request was in flight slips past: the request's report
+    /// publishes after the steer was accepted, yet was written without it.
+    pub fn report_stands(&self) -> bool {
+        if !self.published_this_round() {
+            return false;
+        }
+        let version = self.tx.borrow().version;
+        let prompts = self.lock_prompts();
+        prompts.steered_at != Some(version)
+            && prompts.delivered == prompts.steers.len()
+            && prompts.delivered_at != Some(version)
     }
 
     /// Whether the round in flight has published yet.
@@ -422,6 +445,9 @@ impl SubagentShared {
         let mut prompts = self.lock_prompts();
         let span = prompts.delivered..prompts.steers.len();
         prompts.delivered = span.end;
+        if !span.is_empty() {
+            prompts.delivered_at = Some(self.tx.borrow().version);
+        }
         (prompts.steers[span.clone()].to_vec(), span)
     }
 
@@ -964,6 +990,26 @@ mod tests {
         shared.begin_round();
         assert!(shared.deliver_injections().0.is_empty());
         assert!(shared.close_injections(true).is_empty());
+    }
+
+    #[test]
+    fn a_report_stands_until_the_parent_steers_past_it() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        assert!(!shared.report_stands(), "nothing published yet");
+        shared.publish(Outcome::Result("report".into()));
+        assert!(shared.report_stands());
+        shared.accept("follow-up".into());
+        assert!(!shared.report_stands(), "the steer is not answered");
+        shared.publish(Outcome::Result("revised".into()));
+        assert!(
+            !shared.report_stands(),
+            "a report composed while the steer was in flight predates it"
+        );
+        shared.deliver_injections();
+        assert!(!shared.report_stands(), "delivered, but nothing since");
+        shared.publish(Outcome::Result("answer".into()));
+        assert!(shared.report_stands());
     }
 
     #[test]
