@@ -84,7 +84,7 @@ fn entrypoint_in_sidecar_equals_what_the_toml_parses_to() {
     cfg.validate(None).expect("the parsed form is valid");
 
     assert_eq!(
-        cfg.images["coding"].mcp["fs"],
+        cfg.images["coding"].mcp()["fs"],
         McpServerSpec::entrypoint_in_sidecar("tools"),
     );
 }
@@ -96,11 +96,11 @@ fn the_builtin_default_shape_is_reachable_from_constructors() {
     let mut built = Config::default();
 
     let mut primary = ImageConfig::from_image_name("docker.io/library/buildpack-deps:bookworm-scm");
-    primary.mcp.insert(
+    primary.mcp_mut().insert(
         "fs".to_string(),
         McpServerSpec::entrypoint_in_sidecar("outrig-default-fs"),
     );
-    primary.mcp.insert(
+    primary.mcp_mut().insert(
         "shell".to_string(),
         McpServerSpec::entrypoint_in_sidecar("outrig-default-shell"),
     );
@@ -135,7 +135,7 @@ fn entrypoint_in_sidecar_requires_a_declared_block() {
     cfg.images
         .get_mut("coding")
         .expect("the image block parsed")
-        .mcp
+        .mcp_mut()
         .insert(
             "fs".to_string(),
             McpServerSpec::entrypoint_in_sidecar("nope"),
@@ -169,7 +169,7 @@ fn an_image_and_a_sidecar_are_still_a_placement_conflict() {
     cfg.images
         .get_mut("coding")
         .expect("the image block parsed")
-        .mcp
+        .mcp_mut()
         .insert(
             "fs".to_string(),
             McpServerSpec::entrypoint("ghcr.io/example/mcp-fs:1").with_sidecar("tools"),
@@ -199,7 +199,7 @@ fn entrypoint_in_sidecar_carries_args_the_block_does_not() {
     cfg.images
         .get_mut("coding")
         .expect("the image block parsed")
-        .mcp
+        .mcp_mut()
         .insert(
             "fs".to_string(),
             McpServerSpec::entrypoint_in_sidecar("tools").with_args(["/workspace"]),
@@ -221,7 +221,7 @@ fn entrypoint_in_sidecar_rejects_args_the_block_already_declares() {
     cfg.images
         .get_mut("coding")
         .expect("the image block parsed")
-        .mcp
+        .mcp_mut()
         .insert(
             "fs".to_string(),
             McpServerSpec::entrypoint_in_sidecar("tools").with_args(["/elsewhere"]),

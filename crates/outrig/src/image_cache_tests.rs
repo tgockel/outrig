@@ -685,7 +685,7 @@ async fn named_build_tag_uses_image_config_name_as_repo() {
 async fn named_build_tag_tracks_repo_mcp_labels() {
     let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
     let mut with_fs = build_cfg(ctx.path());
-    with_fs.mcp.insert(
+    with_fs.mcp_mut().insert(
         "fs".to_string(),
         McpServerSpec::Short(vec![
             "mcp-server-filesystem".to_string(),
@@ -693,7 +693,7 @@ async fn named_build_tag_tracks_repo_mcp_labels() {
         ]),
     );
     let mut with_git = build_cfg(ctx.path());
-    with_git.mcp.insert(
+    with_git.mcp_mut().insert(
         "git".to_string(),
         McpServerSpec::Short(vec!["mcp-server-git".to_string()]),
     );

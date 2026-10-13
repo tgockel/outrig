@@ -95,7 +95,7 @@ async fn a_referenced_build_arg_reaches_buildah_by_name() {
     .expect("write Dockerfile");
 
     let mut cfg = common::fixture_build_config();
-    cfg.build_args = std::collections::BTreeMap::from([(
+    *cfg.build_args_mut() = std::collections::BTreeMap::from([(
         "PROBE".to_string(),
         outrig::config::EnvValue::EnvRef(var.to_string()),
     )]);

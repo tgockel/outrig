@@ -662,14 +662,14 @@ pub async fn container_spec(
     config.sidecars.clear();
     let mut left_out = Vec::new();
     if let Some(block) = config.images.get_mut(image) {
-        left_out = block.mcp.keys().cloned().collect();
+        left_out = block.mcp().keys().cloned().collect();
         match pinned {
             Some(tag) => {
-                let security = std::mem::take(&mut block.security);
+                let security = std::mem::take(block.security_mut());
                 *block = ImageConfig::from_image_name(tag.as_str());
-                block.security = security;
+                *block.security_mut() = security;
             }
-            None => block.mcp.clear(),
+            None => block.mcp_mut().clear(),
         }
     }
     let spec = LaunchSpec::from_config(&config, image, repo_root, log_dir)

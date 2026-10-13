@@ -136,7 +136,7 @@ pub(crate) fn inject_primary(cfg: &mut Config) -> Injection {
         .images
         .remove(DEFAULT_IMAGE)
         .expect("the built-in default declares its primary image-config");
-    primary.mcp.clear();
+    primary.mcp_mut().clear();
     cfg.images
         .entry(DEFAULT_IMAGE.to_string())
         .or_insert(primary);
@@ -220,7 +220,7 @@ fn shape(launcher: bool, shell_dir: Option<&Path>) -> Config {
         None => {
             cfg.sidecars.remove(SHELL_IMAGE);
             if let Some(primary) = cfg.images.get_mut(DEFAULT_IMAGE) {
-                primary.mcp.remove(SHELL_SERVER);
+                primary.mcp_mut().remove(SHELL_SERVER);
             }
         }
     }
@@ -341,9 +341,9 @@ mod tests {
         let cfg = shape(true, Some(ctx.path()));
 
         let primary = &cfg.images[DEFAULT_IMAGE];
-        assert_eq!(primary.mcp.len(), 2, "fs and shell");
-        assert_eq!(primary.mcp["fs"].sidecar(), Some(FS_IMAGE));
-        assert_eq!(primary.mcp[SHELL_SERVER].sidecar(), Some(SHELL_IMAGE));
+        assert_eq!(primary.mcp().len(), 2, "fs and shell");
+        assert_eq!(primary.mcp()["fs"].sidecar(), Some(FS_IMAGE));
+        assert_eq!(primary.mcp()[SHELL_SERVER].sidecar(), Some(SHELL_IMAGE));
 
         for name in [FS_IMAGE, SHELL_IMAGE] {
             assert_eq!(cfg.sidecars[name].view, SidecarView::Primary, "{name}");
@@ -372,7 +372,7 @@ mod tests {
 
         assert!(!cfg.sidecars.contains_key(SHELL_IMAGE));
         assert!(!cfg.images.contains_key(SHELL_IMAGE));
-        assert!(!cfg.images[DEFAULT_IMAGE].mcp.contains_key(SHELL_SERVER));
+        assert!(!cfg.images[DEFAULT_IMAGE].mcp().contains_key(SHELL_SERVER));
     }
 
     /// The launcher is present but the cache directory was not writable.
@@ -381,7 +381,7 @@ mod tests {
         let cfg = shape(true, None);
 
         assert!(!cfg.images.contains_key(SHELL_IMAGE));
-        assert!(!cfg.images[DEFAULT_IMAGE].mcp.contains_key(SHELL_SERVER));
+        assert!(!cfg.images[DEFAULT_IMAGE].mcp().contains_key(SHELL_SERVER));
         assert_eq!(
             cfg.sidecars[FS_IMAGE].view,
             SidecarView::Primary,
@@ -581,10 +581,10 @@ mod tests {
         assert!(injection.applied, "the built-in is in play");
         assert!(injection.notes.is_empty(), "{:?}", injection.notes);
         assert_eq!(cfg.images.keys().collect::<Vec<_>>(), [DEFAULT_IMAGE]);
-        assert!(cfg.images[DEFAULT_IMAGE].mcp.is_empty());
+        assert!(cfg.images[DEFAULT_IMAGE].mcp().is_empty());
         assert_eq!(
-            cfg.images[DEFAULT_IMAGE].image_name,
-            shape(true, None).images[DEFAULT_IMAGE].image_name,
+            cfg.images[DEFAULT_IMAGE].image_name(),
+            shape(true, None).images[DEFAULT_IMAGE].image_name(),
         );
         assert!(cfg.sidecars.is_empty());
     }

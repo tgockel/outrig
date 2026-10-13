@@ -596,11 +596,11 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             format!("{:?}", spec.security),
             format!(
                 "{:?}",
-                outrig::SecuritySpec::from(&cfg.images["primary"].security)
+                outrig::SecuritySpec::from(cfg.images["primary"].security())
             ),
         );
         assert!(
-            cfg.images["primary"].mcp.contains_key("leaky") && cfg.sidecars.contains_key("tools"),
+            cfg.images["primary"].mcp().contains_key("leaky") && cfg.sidecars.contains_key("tools"),
             "the session's own config is left whole"
         );
     }

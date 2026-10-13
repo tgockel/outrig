@@ -28,15 +28,15 @@ build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "$
         );
 
         assert_eq!(
-            image.build_args["NODE_VERSION"],
+            image.build_args()["NODE_VERSION"],
             EnvValue::Literal("20".to_string()),
         );
         assert_eq!(
-            image.build_args["GH_TOKEN"],
+            image.build_args()["GH_TOKEN"],
             EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
         );
         assert_eq!(
-            image.build_args["STILL_LIT"],
+            image.build_args()["STILL_LIT"],
             EnvValue::Literal("${lower_case}".to_string()),
         );
     }
@@ -88,7 +88,7 @@ build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
         std::fs::write(repo.path().join("Dockerfile"), "FROM alpine\n").expect("write Dockerfile");
         let tag_with = |value: EnvValue| {
             let mut cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
-            cfg.build_args = BTreeMap::from([("TOKEN".to_string(), value)]);
+            *cfg.build_args_mut() = BTreeMap::from([("TOKEN".to_string(), value)]);
             let root = repo.path().to_path_buf();
             async move { compute_tag_for("coding", &cfg, &root).await.expect("tag") }
         };

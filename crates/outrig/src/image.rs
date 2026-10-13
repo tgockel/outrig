@@ -246,7 +246,7 @@ pub(crate) fn resolve_build_args(
     cfg: &ImageConfig,
 ) -> Result<BTreeMap<String, ResolvedEnvValue>> {
     let mut resolved = BTreeMap::new();
-    for (key, value) in &cfg.build_args {
+    for (key, value) in cfg.build_args() {
         let value = ResolvedEnvValue::resolve(value.clone()).map_err(|source| {
             OutrigError::BuildArgResolveFailed {
                 image: image.to_string(),
@@ -262,7 +262,7 @@ pub(crate) fn resolve_build_args(
 fn repo_build_cache_labels(cfg: &ImageConfig) -> Result<BTreeMap<String, String>> {
     // Sidecar-placed entries run in other containers; they neither belong in
     // this image's label nor affect its cache key.
-    mcp_config_to_labels(&embedded::primary_scoped_mcp(&cfg.mcp))
+    mcp_config_to_labels(&embedded::primary_scoped_mcp(cfg.mcp()))
 }
 
 /// Compute the deterministic `<repo>:<key>` tag for `cfg` without touching
@@ -454,7 +454,7 @@ async fn build_image_with_build_args(
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, None).await
+        stamp_repo_image_labels(temp_tag, tag, cfg.mcp(), None).await
     })
     .await
 }
@@ -475,7 +475,7 @@ async fn build_image_logged_with_build_args(
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, transcript).await
+        stamp_repo_image_labels(temp_tag, tag, cfg.mcp(), transcript).await
     })
     .await
 }

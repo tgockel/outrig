@@ -446,7 +446,7 @@ async fn an_inline_images_is_checked_and_extended() {
     let mut cfg = Config::load_from_str(&text).expect("config must parse");
     cfg.validate(None).expect("config must validate");
     let coding = cfg.images.remove("coding").expect("coding is added");
-    assert!(coding.mcp.contains_key("fs"), "{text}");
+    assert!(coding.mcp().contains_key("fs"), "{text}");
     assert_eq!(
         cfg.images,
         Config::load_from_str(INLINE_SEED).unwrap().images,

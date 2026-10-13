@@ -442,7 +442,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
     let (image_cfg, raw_local_image) =
         resolve_image_config(&cfg, &image_cfg_name, allow_raw_image)?;
-    let declares_sidecars = image_cfg.mcp.values().any(|spec| spec.is_placed());
+    let declares_sidecars = image_cfg.mcp().values().any(|spec| spec.is_placed());
     if attach.is_some() && declares_sidecars {
         return Err(OutrigError::Configuration(
             "sidecars cannot be used with `outrig mcp --attach`; an attached session \
@@ -499,10 +499,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let mut launch =
         ContainerLaunchSpec::workspace(host_workspace.clone(), container_workspace.clone());
     launch.mounts = container_mounts(&repo_root, &cfg.workspace.mounts);
-    launch.capabilities = (&image_cfg.security).into();
-    launch.devices = image_cfg.security.devices.clone();
-    launch.no_new_privileges = image_cfg.security.no_new_privileges;
-    launch.unmask = image_cfg.security.unmask.clone();
+    let security = image_cfg.security();
+    launch.capabilities = security.into();
+    launch.devices = security.devices.clone();
+    launch.no_new_privileges = security.no_new_privileges;
+    launch.unmask = security.unmask.clone();
     launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
     if let Some(p) = args.explicit_session_dir
@@ -1691,7 +1692,7 @@ mod tests {
             resolve_image_config(&cfg, "outrig-standard:53e082e721df8ecc", true).unwrap();
 
         assert!(!raw_local);
-        assert_eq!(image_cfg.image_name.as_deref(), Some("configured"));
+        assert_eq!(image_cfg.image_name(), Some("configured"));
     }
 
     #[test]
@@ -1703,10 +1704,10 @@ mod tests {
 
         assert!(raw_local);
         assert_eq!(
-            image_cfg.image_name.as_deref(),
+            image_cfg.image_name(),
             Some("outrig-standard:53e082e721df8ecc")
         );
-        assert!(image_cfg.mcp.is_empty());
+        assert!(image_cfg.mcp().is_empty());
     }
 
     #[test]

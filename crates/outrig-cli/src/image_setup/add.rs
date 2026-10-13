@@ -481,7 +481,7 @@ mod tests {
                 .validate(None)
                 .unwrap_or_else(|e| panic!("{seed:?}: {e}\n{text}"));
             let coding = after.images.remove("coding").expect("coding is added");
-            assert!(coding.mcp.contains_key("fs"), "{seed:?}:\n{text}");
+            assert!(coding.mcp().contains_key("fs"), "{seed:?}:\n{text}");
             assert_eq!(after.images, before.images, "{seed:?}:\n{text}");
         }
     }

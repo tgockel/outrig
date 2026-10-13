@@ -608,7 +608,7 @@ impl LaunchSpec {
             source,
             workspace: Some(ws),
             mounts,
-            security: SecuritySpec::from(&cfg.security),
+            security: SecuritySpec::from(cfg.security()),
             network: NetworkSpec::from(&config.network),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
@@ -917,7 +917,7 @@ impl Outrig {
                 // empty `repo_root` fallback leaves the spec's paths as given,
                 // apart from expanding a leading `~`.
                 let mut cfg = ImageConfig::from_dockerfile(dockerfile.clone(), context.clone());
-                cfg.build_args = build_args.clone();
+                *cfg.build_args_mut() = build_args.clone();
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
             }
             LaunchSource::Image { tag } => ImageTag::new(tag.clone()),

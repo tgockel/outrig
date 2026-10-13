@@ -1460,7 +1460,7 @@ async fn a_failed_build_reports_a_referenced_build_arg_by_name() {
     refuse_for(journal, "build", &token, 1);
 
     let mut cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    cfg.build_args = std::collections::BTreeMap::from([(
+    *cfg.build_args_mut() = std::collections::BTreeMap::from([(
         "GH_TOKEN".to_string(),
         outrig::config::EnvValue::EnvRef(var.to_string()),
     )]);

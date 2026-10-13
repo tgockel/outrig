@@ -301,6 +301,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which prepended `backing server `fs` call failed:` to say what the error did not, now reads
   `outrig: ` followed by that message, so the server is named once.
 
+- **Breaking: `ImageConfig` has no public field.** `image_name`, `build_args`, `security` and `mcp`
+  join `dockerfile` and `context` behind accessors, so no sequence of setter calls leaves a config
+  that `ImageConfig::source` rejects. `image_name` was the way in: assigning it on a build-source
+  config left the name and both paths set, and `LaunchSpec::from_config`, `compute_tag_for`,
+  `ensure_image_for` and `ensure_tagged_image_for` then panicked inside the library.
+
+  To migrate, an `image.image_name` read becomes `image.image_name()`, an `Option<&str>`, and a
+  write becomes `image.set_image_name(name)`. Each of `build_args`, `security` and `mcp` becomes a
+  getter, `x()`, and an in-place writer, `x_mut()`: `image.mcp_mut().insert(..)`, or
+  `*image.security_mut() = security`.
+
+  `set_image_name` replaces the whole source shape, clearing `dockerfile`, `context` and the
+  recorded `ConfigSource`. `set_build_paths` now clears `image_name` too, which changes behavior
+  only on a config that named an image, where it used to leave a state that could be neither
+  validated nor launched. The TOML and JSON Schema keys are unchanged.
+
 ### Removed
 
 - **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:

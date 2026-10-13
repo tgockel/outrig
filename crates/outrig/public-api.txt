@@ -528,19 +528,23 @@ impl outrig::config::EventsConfig
 pub fn outrig::config::EventsConfig::mode(&self) -> outrig::config::EventsMode
 pub fn outrig::config::EventsConfig::set_mode(&mut self, outrig::config::EventsMode)
 #[non_exhaustive] pub struct outrig::config::ImageConfig
-pub outrig::config::ImageConfig::build_args: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
-pub outrig::config::ImageConfig::image_name: core::option::Option<alloc::string::String>
-pub outrig::config::ImageConfig::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
-pub outrig::config::ImageConfig::security: outrig::config::ContainerSecurity
 impl outrig::config::ImageConfig
 pub fn outrig::config::ImageConfig::base_dir<'a>(&'a self, &'a std::path::Path) -> &'a std::path::Path
+pub fn outrig::config::ImageConfig::build_args(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub fn outrig::config::ImageConfig::build_args_mut(&mut self) -> &mut alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub fn outrig::config::ImageConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
 pub fn outrig::config::ImageConfig::context(&self) -> core::option::Option<&std::path::Path>
 pub fn outrig::config::ImageConfig::dockerfile(&self) -> core::option::Option<&std::path::Path>
 pub fn outrig::config::ImageConfig::from_dockerfile(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::config::ImageConfig::from_image_name(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::ImageConfig::image_name(&self) -> core::option::Option<&str>
+pub fn outrig::config::ImageConfig::mcp(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
+pub fn outrig::config::ImageConfig::mcp_mut(&mut self) -> &mut alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
 pub fn outrig::config::ImageConfig::resolved_build_paths(&self, &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
+pub fn outrig::config::ImageConfig::security(&self) -> &outrig::config::ContainerSecurity
+pub fn outrig::config::ImageConfig::security_mut(&mut self) -> &mut outrig::config::ContainerSecurity
 pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>)
+pub fn outrig::config::ImageConfig::set_image_name(&mut self, impl core::convert::Into<alloc::string::String>)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::Model
 pub outrig::config::Model::alias: core::option::Option<alloc::vec::Vec<alloc::string::String>>

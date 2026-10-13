@@ -694,7 +694,7 @@ pub(super) fn validate_with_options(
         }
         validate_image_security(image_name, image)?;
 
-        for (server_name, spec) in &image.mcp {
+        for (server_name, spec) in image.mcp() {
             if !is_valid_mcp_server_name(server_name) {
                 return Err(ConfigValidationError::InvalidMcpServerName {
                     image: image_name.clone(),
@@ -720,7 +720,7 @@ pub(super) fn validate_with_options(
         // it never references is inert here, and never starts. Every name has
         // resolved above, so the lookup cannot miss.
         for (_, sidecar_name) in image
-            .mcp
+            .mcp()
             .iter()
             .filter_map(|(name, spec)| spec.sidecar().map(|sc| (name, sc)))
         {
@@ -883,7 +883,7 @@ fn validate_image_security(
     image_name: &str,
     image: &ImageConfig,
 ) -> Result<(), ConfigValidationError> {
-    validate_security(image_name, &image.security)
+    validate_security(image_name, image.security())
 }
 
 /// Validate a `[security]` block. `scope` names the owning block in errors --
@@ -1145,7 +1145,7 @@ fn servers_hosted_in<'a>(
     sidecar_name: &'a str,
 ) -> impl Iterator<Item = (&'a String, &'a McpServerSpec)> {
     image
-        .mcp
+        .mcp()
         .iter()
         .filter(move |(_, spec)| spec.sidecar() == Some(sidecar_name))
 }
@@ -1935,7 +1935,7 @@ fn validate_image_source(
     image: &ImageConfig,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    let has_image_name = image.image_name.is_some();
+    let has_image_name = image.image_name().is_some();
     let has_dockerfile = image.dockerfile().is_some();
     let has_context = image.context().is_some();
 
@@ -1954,12 +1954,12 @@ fn validate_image_source(
                 fields: conflicts,
             });
         }
-        if !image.build_args.is_empty() {
+        if !image.build_args().is_empty() {
             return Err(ConfigValidationError::ImageNameWithBuildArgs {
                 image: image_name.to_string(),
             });
         }
-        let name = image.image_name.as_deref().unwrap();
+        let name = image.image_name().unwrap();
         if name.is_empty() {
             return Err(ConfigValidationError::ImageNameEmpty {
                 image: image_name.to_string(),

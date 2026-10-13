@@ -360,7 +360,7 @@ pub(crate) fn bootstrap_needed(
 pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan {
     let mut plan = SessionMcpPlan::default();
 
-    let referenced = image_cfg.mcp.values().filter_map(|spec| spec.sidecar());
+    let referenced = image_cfg.mcp().values().filter_map(|spec| spec.sidecar());
     for sc in referenced {
         let Some(sidecar) = cfg.sidecars.get(sc) else {
             continue;
@@ -382,7 +382,7 @@ pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan
         );
     }
 
-    for (name, spec) in &image_cfg.mcp {
+    for (name, spec) in image_cfg.mcp() {
         let placement = if let Some(sc) = spec.sidecar() {
             Placement::Sidecar(sc.to_string())
         } else if let Some(image) = spec.image() {

@@ -54,7 +54,7 @@ mod mcp_env_table {
 
     fn build_env(toml_src: &str) -> std::collections::BTreeMap<String, EnvValue> {
         let cfg = Config::load_from_str(toml_src).expect("config parses");
-        let McpServerSpec::Full { env, .. } = cfg.images["c"].mcp["srv"].clone() else {
+        let McpServerSpec::Full { env, .. } = cfg.images["c"].mcp()["srv"].clone() else {
             panic!("expected Full form, got Short");
         };
         env

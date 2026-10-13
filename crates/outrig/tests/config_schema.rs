@@ -100,8 +100,8 @@ srv = { command = ["bin", "arg1"] }
         let short = Config::load_from_str(short_toml).expect("short form parses");
         let full = Config::load_from_str(full_toml).expect("full form parses");
 
-        let short_spec = short.images["c"].mcp["srv"].clone();
-        let full_spec = full.images["c"].mcp["srv"].clone();
+        let short_spec = short.images["c"].mcp()["srv"].clone();
+        let full_spec = full.images["c"].mcp()["srv"].clone();
 
         assert!(
             matches!(short_spec, McpServerSpec::Short(_)),
@@ -114,7 +114,7 @@ srv = { command = ["bin", "arg1"] }
 
         assert_eq!(short_spec.normalize(), full_spec.normalize());
         assert_eq!(
-            short.images["c"].mcp["srv"].normalize(),
+            short.images["c"].mcp()["srv"].normalize(),
             (vec!["bin".to_string(), "arg1".to_string()], BTreeMap::new()),
         );
     }
@@ -258,18 +258,19 @@ srv = { command = ["bin", "arg1"] }
         // Inner map keys (build-args ARG names, mcp env-var names) keep user
         // casing -- they're not subject to the outer `rename_all = kebab-case`.
         assert_eq!(
-            coding_ctr.build_args["NODE_VERSION"],
+            coding_ctr.build_args()["NODE_VERSION"],
             EnvValue::Literal("20".to_string()),
         );
+        let coding_security = coding_ctr.security();
         assert_eq!(
-            coding_ctr.security.capability_profile,
-            CapabilityProfile::NoNetRaw,
+            coding_security.capability_profile,
+            CapabilityProfile::NoNetRaw
         );
-        assert_eq!(coding_ctr.security.cap_drop, ["MKNOD", "SETFCAP"]);
-        assert_eq!(coding_ctr.security.cap_add, ["NET_BIND_SERVICE"]);
-        assert!(!coding_ctr.security.no_new_privileges);
-        assert_eq!(coding_ctr.security.devices, ["/dev/fuse"]);
-        assert_eq!(coding_ctr.security.unmask, ["/proc/*"]);
+        assert_eq!(coding_security.cap_drop, ["MKNOD", "SETFCAP"]);
+        assert_eq!(coding_security.cap_add, ["NET_BIND_SERVICE"]);
+        assert!(!coding_security.no_new_privileges);
+        assert_eq!(coding_security.devices, ["/dev/fuse"]);
+        assert_eq!(coding_security.unmask, ["/proc/*"]);
         // The sidecar block sets `devices` and `unmask` but leaves
         // `no-new-privileges` alone, so it keeps the safe default independently
         // of the primary.
@@ -278,11 +279,11 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(tools_security.unmask, ["/proc/*"]);
         assert!(tools_security.no_new_privileges);
 
-        assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
-        let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].normalize();
+        assert!(matches!(coding_ctr.mcp()["shell"], McpServerSpec::Short(_)));
+        let (fs_cmd, fs_env) = coding_ctr.mcp()["fs"].normalize();
         assert_eq!(fs_cmd, vec!["mcp-server-filesystem", "/workspace"]);
         assert!(fs_env.is_empty());
-        let (build_cmd, build_env) = coding_ctr.mcp["build"].normalize();
+        let (build_cmd, build_env) = coding_ctr.mcp()["build"].normalize();
         assert_eq!(build_cmd, vec!["cargo-mcp"]);
         assert_eq!(
             build_env["CARGO_HOME"],
@@ -384,7 +385,7 @@ context    = "ctx"
 "#,
         )
         .expect("config parses");
-        let security = &cfg.images["coding"].security;
+        let security = cfg.images["coding"].security();
         assert_eq!(security.capability_profile, CapabilityProfile::Default);
         assert!(security.cap_drop.is_empty());
         assert!(security.cap_add.is_empty());
@@ -412,7 +413,7 @@ context    = "ctx"
 "#,
         )
         .expect("config parses");
-        let security = &cfg.images["coding"].security;
+        let security = cfg.images["coding"].security();
         assert!(security.no_new_privileges);
         assert!(security.devices.is_empty());
         assert!(security.unmask.is_empty());

@@ -2103,31 +2103,35 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
 /// One `[images.<name>]` entry: either a build source (`dockerfile` plus
 /// `context`) or a pull source (`image_name`), never both.
 ///
-/// The two build paths are private because a single [`ConfigSource`] is the
-/// base directory for both: either one replaced without clearing that pairing
-/// would be resolved against the directory of a file it never came from. Read
-/// them with [`dockerfile`](Self::dockerfile) / [`context`](Self::context),
-/// write them with [`set_build_paths`](Self::set_build_paths).
+/// No field is public. [`set_build_paths`](Self::set_build_paths) and
+/// [`set_image_name`](Self::set_image_name) each replace the whole source
+/// shape, so no sequence of calls leaves a config [`source`](Self::source)
+/// rejects. Read the shape with [`image_name`](Self::image_name),
+/// [`dockerfile`](Self::dockerfile) and [`context`](Self::context).
+///
+/// [`build_args`](Self::build_args), [`security`](Self::security) and
+/// [`mcp`](Self::mcp) take no part in the shape, so each has a `_mut`
+/// accessor for in-place edits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct ImageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_name: Option<String>,
+    image_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dockerfile: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub build_args: BTreeMap<String, EnvValue>,
+    build_args: BTreeMap<String, EnvValue>,
     #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
-    pub security: ContainerSecurity,
+    security: ContainerSecurity,
     /// Set at load time, never deserialized. See [`ConfigSource`].
     #[serde(skip)]
     #[schemars(skip)]
     source: Option<ConfigSource>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub mcp: BTreeMap<String, McpServerSpec>,
+    mcp: BTreeMap<String, McpServerSpec>,
 }
 
 /// A named sidecar container declared under `[sidecars.<sc>]`. Sidecars host
@@ -2314,6 +2318,12 @@ impl ImageConfig {
         }
     }
 
+    /// The image reference of a pull-source config, or `None` on a build-source
+    /// one.
+    pub fn image_name(&self) -> Option<&str> {
+        self.image_name.as_deref()
+    }
+
     /// `dockerfile` exactly as declared, or `None` on a pull-source config.
     /// Relative values are resolved by
     /// [`resolved_build_paths`](Self::resolved_build_paths).
@@ -2327,19 +2337,66 @@ impl ImageConfig {
         self.context.as_deref()
     }
 
-    /// Declare both build paths, dropping any recorded [`ConfigSource`]: the
-    /// new values did not come from a config file, so they resolve against the
-    /// `repo_root` passed to
-    /// [`resolved_build_paths`](Self::resolved_build_paths).
+    /// Make this a build-source config: declare both build paths, and drop the
+    /// `image_name` and any recorded [`ConfigSource`]. The new values did not
+    /// come from a config file, so they resolve against the `repo_root` passed
+    /// to [`resolved_build_paths`](Self::resolved_build_paths). `build_args`
+    /// are kept.
     ///
-    /// The pair is replaced together because one source backs both: a setter
+    /// The pair is written together because one source backs both: a setter
     /// for one path alone would clear the source its untouched sibling still
-    /// depends on. [`source`](Self::source) requires the two to be set together
-    /// in any case.
+    /// depends on.
     pub fn set_build_paths(&mut self, dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) {
+        self.image_name = None;
         self.dockerfile = Some(dockerfile.into());
         self.context = Some(context.into());
         self.source = None;
+    }
+
+    /// Make this a pull-source config naming `image_name`: drop both build
+    /// paths and the [`ConfigSource`] that backed them, the mirror of
+    /// [`set_build_paths`](Self::set_build_paths).
+    ///
+    /// `build_args` are kept, as there; a pull source with any left is
+    /// reported by [`Config::validate`] as `ImageNameWithBuildArgs`, not
+    /// silently emptied.
+    pub fn set_image_name(&mut self, image_name: impl Into<String>) {
+        self.image_name = Some(image_name.into());
+        self.dockerfile = None;
+        self.context = None;
+        self.source = None;
+    }
+
+    /// The `--build-arg` values a build-source config passes, by name. Empty on
+    /// a pull-source config, where a non-empty map is a validation error.
+    pub fn build_args(&self) -> &BTreeMap<String, EnvValue> {
+        &self.build_args
+    }
+
+    /// Edit [`build_args`](Self::build_args) in place. The map has no bearing
+    /// on which source shape this config has.
+    pub fn build_args_mut(&mut self) -> &mut BTreeMap<String, EnvValue> {
+        &mut self.build_args
+    }
+
+    /// The container security settings sessions on this image start with.
+    pub fn security(&self) -> &ContainerSecurity {
+        &self.security
+    }
+
+    /// Edit [`security`](Self::security) in place.
+    pub fn security_mut(&mut self) -> &mut ContainerSecurity {
+        &mut self.security
+    }
+
+    /// The MCP servers this image declares, by name.
+    pub fn mcp(&self) -> &BTreeMap<String, McpServerSpec> {
+        &self.mcp
+    }
+
+    /// Edit [`mcp`](Self::mcp) in place.
+    pub fn mcp_mut(&mut self) -> &mut BTreeMap<String, McpServerSpec> {
+        &mut self.mcp
     }
 
     /// The config file this image-config was declared in, or `None` for a
@@ -2385,9 +2442,11 @@ impl ImageConfig {
         self.source.as_ref().map(ConfigSource::config_path)
     }
 
-    /// Return the discriminated source variant. Panics if validation has not
-    /// run (i.e. both or neither shape is set). Every real call path goes
-    /// through `Config::load` which validates first.
+    /// Return the discriminated source variant. Panics unless exactly one of
+    /// `image_name` or `dockerfile` plus `context` is set, which
+    /// [`Config::validate`] establishes and the setters preserve. A value
+    /// deserialized without validation, such as an `[images.<name>]` table
+    /// that sets neither, can still reach the panic.
     pub fn source(&self) -> ImageSourceRef<'_> {
         match (&self.image_name, &self.dockerfile, &self.context) {
             (Some(name), None, None) => ImageSourceRef::Image { image_name: name },

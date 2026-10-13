@@ -489,7 +489,7 @@ context    = "ctx"
         );
         // Sanity: shape is Short with empty command.
         assert!(matches!(
-            cfg.images["coding"].mcp["srv"],
+            cfg.images["coding"].mcp()["srv"],
             McpServerSpec::Short(ref v) if v.is_empty(),
         ));
         let err = expect_validation_err(&cfg, None);
@@ -1055,7 +1055,7 @@ unmask = ["ALL"]
 "#,
         );
         cfg.validate(None).expect("`ALL` is not a relative path");
-        assert_eq!(cfg.images["coding"].security.unmask, ["ALL"]);
+        assert_eq!(cfg.images["coding"].security().unmask, ["ALL"]);
     }
 
     /// Measured against podman 5.7: lowercase `all` still clears the *masked*
@@ -2889,7 +2889,7 @@ context    = "ctx"
         assert_eq!(sc.start, SidecarStart::Manual);
         assert_eq!(sc.on_failure, SidecarOnFailure::Warn);
         assert_eq!(sc.mounts.len(), 1);
-        assert_eq!(cfg.images["coding"].mcp["fs"].sidecar(), Some("tools"));
+        assert_eq!(cfg.images["coding"].mcp()["fs"].sidecar(), Some("tools"));
     }
 
     #[test]
@@ -3019,7 +3019,7 @@ context    = "ctx"
   fs = { sidecar = "tools" }
 "#,
         );
-        let spec = &cfg.images["coding"].mcp["fs"];
+        let spec = &cfg.images["coding"].mcp()["fs"];
         assert!(!spec.has_command());
         assert!(spec.is_entrypoint_stdio());
         cfg.validate(None)
@@ -3035,7 +3035,7 @@ context    = "ctx"
 "#,
         );
         // Parse-level: Full form with no command.
-        let spec = &cfg.images["coding"].mcp["fetch"];
+        let spec = &cfg.images["coding"].mcp()["fetch"];
         assert!(!spec.has_command());
         assert_eq!(spec.image(), Some("ghcr.io/example/mcp-fetch:2"));
         // Validation-level: the image's ENTRYPOINT is the server.
@@ -3070,7 +3070,10 @@ context    = "ctx"
         );
         cfg.validate(None)
             .expect("inline view=primary validates clean");
-        assert_eq!(cfg.images["coding"].mcp["fs"].view(), SidecarView::Primary);
+        assert_eq!(
+            cfg.images["coding"].mcp()["fs"].view(),
+            SidecarView::Primary
+        );
     }
 
     #[test]
@@ -3310,11 +3313,11 @@ context    = "ctx"
   fs = { command = ["mcp-fs"], sidecar = "tools" }
 "#,
         );
-        let rendered = toml::to_string(&cfg.images["coding"].mcp).expect("serialize");
+        let rendered = toml::to_string(cfg.images["coding"].mcp()).expect("serialize");
         assert!(rendered.contains("sidecar = \"tools\""), "got: {rendered}");
         let back: std::collections::BTreeMap<String, McpServerSpec> =
             toml::from_str(&rendered).expect("round-trip");
-        assert_eq!(back["fs"], cfg.images["coding"].mcp["fs"]);
+        assert_eq!(back["fs"], cfg.images["coding"].mcp()["fs"]);
     }
 
     // -- `args` on entrypoint-stdio servers ------------------------------
@@ -3327,7 +3330,7 @@ context    = "ctx"
   fs = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
 "#,
         );
-        let spec = &cfg.images["coding"].mcp["fs"];
+        let spec = &cfg.images["coding"].mcp()["fs"];
         assert!(spec.is_entrypoint_stdio());
         assert_eq!(spec.args(), ["/workspace"]);
         cfg.validate(None).expect("inline image + args validates");
@@ -3455,7 +3458,7 @@ context    = "ctx"
 "#,
         );
         cfg.validate(None).expect("empty args validates");
-        let rendered = toml::to_string(&cfg.images["coding"].mcp).expect("serialize");
+        let rendered = toml::to_string(cfg.images["coding"].mcp()).expect("serialize");
         assert!(!rendered.contains("args"), "args should elide: {rendered}");
     }
 
@@ -3467,7 +3470,7 @@ context    = "ctx"
   fs = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
 "#,
         );
-        let rendered = toml::to_string(&cfg.images["coding"].mcp).expect("serialize");
+        let rendered = toml::to_string(cfg.images["coding"].mcp()).expect("serialize");
         assert!(rendered.contains("\"/workspace\""), "got: {rendered}");
         let back: std::collections::BTreeMap<String, McpServerSpec> =
             toml::from_str(&rendered).expect("round-trip");
@@ -3476,7 +3479,7 @@ context    = "ctx"
             "must stay Full, got: {:?}",
             back["fs"]
         );
-        assert_eq!(back["fs"], cfg.images["coding"].mcp["fs"]);
+        assert_eq!(back["fs"], cfg.images["coding"].mcp()["fs"]);
     }
 
     // -- named entrypoint hosts -------------------------------------------
