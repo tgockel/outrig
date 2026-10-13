@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
+use crate::cli::run_new_only_keys;
 use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
@@ -375,6 +376,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             args.agent_flag.or(cfg.default_agent.as_deref()),
             args.model_override,
         )?;
+        // Keys only `run-new` reads; delete with `run_new_only_keys` once `run`
+        // is retargeted at the Python loop.
+        let models = resolved.candidates.iter().map(|c| c.model_name.as_str());
+        for line in run_new_only_keys::warnings(&cfg, models) {
+            eprintln!("{line}");
+        }
         (resolved.agent_name.clone(), resolved.image.clone())
     } else {
         (None, None)

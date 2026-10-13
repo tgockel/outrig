@@ -71,14 +71,31 @@ async fn outrig(cwd: &Path, args: &[&str]) -> Output {
     .expect("spawn outrig")
 }
 
-/// A repo holding [`CONFIG`].
-fn configured_repo() -> tempfile::TempDir {
+/// A repo holding `config`.
+fn repo_holding(config: &str) -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("a repo");
     let cfg_dir = repo.path().join(".agents/outrig");
     std::fs::create_dir_all(&cfg_dir).expect("create config dir");
-    std::fs::write(cfg_dir.join("config.toml"), CONFIG).expect("write repo config");
+    std::fs::write(cfg_dir.join("config.toml"), config).expect("write repo config");
     repo
 }
+
+/// A repo holding [`CONFIG`].
+fn configured_repo() -> tempfile::TempDir {
+    repo_holding(CONFIG)
+}
+
+/// The two keys only `run-new` reads: a context window on a second model,
+/// `windowed`, which a run opts into with `--model windowed`, and the event log.
+const RUN_NEW_ONLY_KEYS: &str = r#"
+[models.windowed]
+provider       = "openai"
+identifier     = "test-model"
+context-window = 32000
+
+[events]
+mode = "record"
+"#;
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
@@ -161,6 +178,12 @@ async fn run_legacy_behaves_as_run() {
         assert_eq!(run, legacy, "`run-legacy {flags:?}` diverged from `run`");
         assert_eq!(run.0, Some(1), "{}", run.1);
         assert!(run.1.contains(expect), "{flags:?}: {}", run.1);
+        // A config that sets neither key gets no word about them.
+        assert!(
+            !run.1.contains(ONLY_RUN_NEW_READS_IT),
+            "{flags:?}: {}",
+            run.1
+        );
     }
 }
 
@@ -266,4 +289,46 @@ async fn run_new_refuses_a_session_dir_another_is_starting_in() {
     assert!(!dir.path().join("session.json").exists());
     assert!(!dir.path().join("logs").exists());
     drop(held);
+}
+
+/// What `run` says at startup about a key only `run-new` reads.
+const ONLY_RUN_NEW_READS_IT: &str = "only `run-new` reads it";
+
+/// A config that sets `context-window` on the session's model and turns the
+/// event log on gets one warning per key from `run`, ahead of the first pull,
+/// because it parses both and does nothing with either. `run-new` reads both,
+/// so it says nothing. (`run-legacy` is `run`; `run_legacy_behaves_as_run`
+/// holds that.)
+#[tokio::test]
+async fn run_warns_once_per_key_only_run_new_reads() {
+    let repo = repo_holding(&format!("{CONFIG}{RUN_NEW_ONLY_KEYS}"));
+    let flags = ["--model", "windowed"];
+
+    let (code, stderr, _) = observed(repo.path(), "run", &flags).await;
+    assert_eq!(code, Some(1), "{stderr}");
+    let warned: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains(ONLY_RUN_NEW_READS_IT))
+        .collect();
+    assert_eq!(
+        warned,
+        [
+            "[outrig] warning: context-window on [models.windowed] is ignored by \
+             `run`; only `run-new` reads it",
+            "[outrig] warning: [events] mode = \"record\" is ignored by \
+             `run`; only `run-new` reads it",
+        ],
+        "{stderr}"
+    );
+    let first_warning = stderr.find(ONLY_RUN_NEW_READS_IT).expect("a warning");
+    let pull = stderr.find("ensuring image").expect("it reached the pull");
+    assert!(first_warning < pull, "{stderr}");
+
+    let (code, stderr, _) = observed(repo.path(), "run-new", &flags).await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("ensuring image"),
+        "it reached the pull: {stderr}"
+    );
+    assert!(!stderr.contains(ONLY_RUN_NEW_READS_IT), "{stderr}");
 }

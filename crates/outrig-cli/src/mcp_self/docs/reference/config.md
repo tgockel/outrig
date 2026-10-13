@@ -252,8 +252,8 @@ mode = "off"
   conversation.
 
 The mode can live in either file, and a repo that declares it wins for that repo, as with
-`[network].mode`. `outrig run` reads the key and records nothing. There is no command-line flag
-for it yet.
+`[network].mode`. `outrig run` reads the key and records nothing, and with `record` set it says
+so at startup. There is no command-line flag for it yet.
 
 ## `[providers.<name>]`
 
@@ -514,7 +514,8 @@ reply, and warns once at startup; it never infers a window from `identifier`. A 
 larger window is sent less than it could take until its row says so, and one with a smaller
 window can still refuse a request as too long. A `max-tokens` at or above `context-window` is
 refused when the session starts. Under an alias each model is held to its own window: a call
-that moves to the next model is sent what fits that model's. `outrig run` ignores the key.
+that moves to the next model is sent what fits that model's. `outrig run` ignores the key, and
+says so at startup: one line naming the models that set it, which only `outrig run-new` reads.
 
 #### anthropic models
 

@@ -12,8 +12,9 @@ mode = "record"          # off (default) | record
 
 See [Config](config.md#events) for where the key can live, and
 [Sessions](../usage/sessions.md#the-event-log) for how the file fits beside the session's other
-logs. `outrig run` reads the key and records nothing. To read a recording as a page rather than as
-JSON, see [Reading it in a browser](../usage/sessions.md#reading-it-in-a-browser).
+logs. `outrig run` reads the key and records nothing, and with `record` set it says so at
+startup. To read a recording as a page rather than as JSON, see
+[Reading it in a browser](../usage/sessions.md#reading-it-in-a-browser).
 
 The file is one reader of the session's events. A program that runs a session itself, through the
 `outrig` library's `harness` module, receives the same events as values, in the same order, through

@@ -253,6 +253,20 @@ A typical startup looks like:
 >
 ```
 
+Two config keys are read only by `outrig run-new`: `context-window` on a `[models.<name>]` row,
+and `[events] mode = "record"`. `outrig run` parses them and does nothing with them, so when a
+config sets either, it says so with one line per key before it pulls or starts anything:
+
+```
+[outrig] warning: context-window on [models.fast] is ignored by `run`; only `run-new` reads it
+[outrig] warning: [events] mode = "record" is ignored by `run`; only `run-new` reads it
+```
+
+When the session's model is an alias for several, the `context-window` line names each model
+that sets one. Without either key, startup is as above. See
+[Config](../reference/config.md#remote-provider-models) for `context-window` and
+[Config](../reference/config.md#events) for the event log.
+
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
 the assistant's natural-language reply, printed when the turn finishes. The stream separation
 makes it easy to capture just the model output:

@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod mcp_self;
 pub mod run;
 pub mod run_new;
+pub mod run_new_only_keys;
 pub mod session_setup;
 pub mod volume_arg;
 pub mod watcher;

@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once; a package with compiled parts cannot load, and the error says so.
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
-  ignores it.
+  ignores it, saying so in one line at startup.
 - **`[providers.<name>].role-alternation = "strict"`**, for a provider that refuses a request in
   which one role follows itself, as a Bedrock-backed Claude behind an OpenAI-compatible gateway
   does. `run-new` then sends it a conversation that alternates, leaving out a turn promoted
@@ -64,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model that answered each call, each request sent and each retry and failover, and the
   session's own state, ending with what its stop found. The file is readable by its owner only,
   and the agent never waits for it; a warning at exit counts any events it could not take, and
-  each shows as a jump in the file's ids. Off by default, with no flag yet, and `run` ignores it.
+  each shows as a jump in the file's ids. Off by default, with no flag yet, and `run` ignores it,
+  saying so in one line at startup.
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py
   <session>` renders a recording to one HTML page, written beside it as `report.html`; it takes
   a session id as `outrig logs` does, or a session directory.
