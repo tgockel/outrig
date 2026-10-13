@@ -38,7 +38,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 mod common;
-use common::{E2E_TIMEOUT, fixture_mcp_fs_dir, stream_lines, wait_for_stderr_value};
+use common::{E2E_TIMEOUT, fixture_mcp_fs_dir, podman_names, stream_lines, wait_for_stderr_value};
 
 fn fs_spec() -> McpServerSpec {
     McpServerSpec::Short(vec![
@@ -861,14 +861,13 @@ async fn mcp_attach_exits_when_host_stops_container() {
     );
 }
 
-/// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
-/// assert it fails with the undeclared-server error. Returns the session
-/// records left under `session_root`.
-async fn run_mcp_with_undeclared_env_server(
+/// Run `outrig mcp <args>` with stdin closed and assert it fails. Returns its
+/// stderr and the session records left under `session_root`.
+async fn run_mcp_expecting_failure(
     session_root: &Path,
     repo: &Path,
     args: &[&str],
-) -> Vec<Session> {
+) -> (String, Vec<Session>) {
     let output = timeout(
         E2E_TIMEOUT,
         Command::new(env!("CARGO_BIN_EXE_outrig"))
@@ -876,7 +875,6 @@ async fn run_mcp_with_undeclared_env_server(
             .arg(session_root)
             .arg("mcp")
             .args(args)
-            .args(["--env", "no_such_server:DEBUG=1"])
             .current_dir(repo)
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -885,20 +883,38 @@ async fn run_mcp_with_undeclared_env_server(
     .await
     .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
     .expect("run outrig mcp");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     eprintln!("--- subprocess stderr ---\n{stderr}");
     assert!(
         !output.status.success(),
         "outrig mcp should fail; stderr was: {stderr}"
     );
+    let sessions = SessionStore::new(session_root.to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions;
+    (stderr, sessions)
+}
+
+/// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
+/// assert it fails with the undeclared-server error. Returns the session
+/// records left under `session_root`.
+async fn run_mcp_with_undeclared_env_server(
+    session_root: &Path,
+    repo: &Path,
+    args: &[&str],
+) -> Vec<Session> {
+    let args: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(["--env", "no_such_server:DEBUG=1"])
+        .collect();
+    let (stderr, sessions) = run_mcp_expecting_failure(session_root, repo, &args).await;
     assert!(
         stderr.contains("image 'smoke' has no MCP server 'no_such_server'"),
         "stderr should name the undeclared server: {stderr}"
     );
-    SessionStore::new(session_root.to_path_buf())
-        .list()
-        .expect("list sessions")
-        .sessions
+    sessions
 }
 
 /// An undeclared `--env SERVER:` name is refused after the session record
@@ -929,6 +945,54 @@ async fn mcp_env_for_undeclared_server_finalizes_session_and_stops_container() {
         "container `{}` is still alive: {leftovers}",
         session.container_name
     );
+}
+
+/// Run `outrig mcp <args>` over [`write_mcp_config`]'s repo with `cap-add =
+/// ["NET_ADMIN"]` on its image and `extra` appended, and assert the session is
+/// refused interception (#363): the error names the capability and the key,
+/// the session record is finalized, and the container is stopped before any
+/// MCP server ran.
+async fn assert_net_admin_refused_under_interception(args: &[&str], extra: &str) {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let config = repo_dir.path().join(".agents/outrig/config.toml");
+    let mut toml = std::fs::read_to_string(&config).expect("read config");
+    toml.push_str("\n  [images.smoke.security]\n  cap-add = [\"NET_ADMIN\"]\n");
+    toml.push_str(extra);
+    std::fs::write(&config, toml).expect("write config");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let (stderr, listed) = run_mcp_expecting_failure(sessions.path(), repo_dir.path(), args).await;
+    assert!(
+        stderr.contains("CAP_NET_ADMIN") && stderr.contains("`cap-add`"),
+        "stderr should name the capability and the key: {stderr}"
+    );
+    assert_eq!(listed.len(), 1, "expected one session record: {listed:?}");
+    let session = &listed[0];
+    assert!(
+        session.exit_code.is_some_and(|code| code != 0),
+        "{session:?}"
+    );
+    assert!(session.ended_at.is_some(), "{session:?}");
+    let leftovers = podman_names(&format!("name={}", session.container_name)).await;
+    assert!(
+        leftovers.is_empty(),
+        "container `{}` is still alive: {leftovers:?}",
+        session.container_name
+    );
+}
+
+/// `--network audit` over a config that never mentions the mode: nothing in
+/// config validation can see it, which is why the refusal is the interceptor's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_network_flag_refuses_a_container_holding_net_admin() {
+    assert_net_admin_refused_under_interception(&["--network", "audit"], "").await;
+}
+
+/// The same refusal when the repo config declares the mode itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_network_config_mode_refuses_a_container_holding_net_admin() {
+    assert_net_admin_refused_under_interception(&[], "\n[network]\nmode = \"audit\"\n").await;
 }
 
 /// The same refusal under `--attach` finalizes only the attacher's own record

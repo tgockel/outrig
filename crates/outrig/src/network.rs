@@ -685,11 +685,24 @@ impl NetworkInterceptor {
     /// needs. Attaching before `podman start` is what closes the
     /// entrypoint-stdio race: policy is live in the netns before the
     /// entrypoint's first packet.
+    ///
+    /// A container launched holding `CAP_NET_ADMIN` -- `cap-add` of
+    /// `NET_ADMIN`, or of `ALL` with no `NET_ADMIN` in `cap-drop` -- is
+    /// refused before anything is changed: whatever it runs as root could
+    /// delete the table this installs and leave no record. Only the launch is
+    /// consulted, so a borrowed container is never refused.
     pub async fn attach(&mut self, container: &Container) -> Result<()> {
         let name = container.name();
         if self.attachments.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "container {name:?} is already attached to the network interceptor"
+            )));
+        }
+        if container.holds_net_admin() {
+            return Err(OutrigError::Configuration(format!(
+                "container {name:?} holds CAP_NET_ADMIN through `cap-add`, which would let it \
+                 remove the nftables redirect that network interception installs; remove \
+                 NET_ADMIN (or ALL) from `cap-add`, or run with `[network] mode = \"default\"`"
             )));
         }
 
@@ -10343,5 +10356,48 @@ options edns0
             assert_eq!(record["outrig.session_id"], "sid-1");
             assert_eq!(record["outrig.container"], container);
         }
+    }
+
+    /// A container launched holding `CAP_NET_ADMIN` is refused before the
+    /// interceptor reads anything about it. The handle here names no container
+    /// that exists, so a refusal that came any later would be the engine's
+    /// error and never name the capability, and an attach that got that far
+    /// would already have changed something.
+    #[tokio::test]
+    async fn a_container_holding_net_admin_is_refused_before_anything_is_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+        };
+        let container = Container::holding_net_admin();
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("a container that can delete the table is not attached");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        for expected in [
+            container.name(),
+            "CAP_NET_ADMIN",
+            "`cap-add`",
+            "mode = \"default\"",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal names {expected:?}: {message}"
+            );
+        }
+        assert!(interceptor.attachments.is_empty());
     }
 }

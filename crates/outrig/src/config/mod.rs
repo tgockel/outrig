@@ -2115,9 +2115,12 @@ pub(crate) fn capability_name_without_prefix(name: &str) -> &str {
     name.strip_prefix("CAP_").unwrap_or(name)
 }
 
+/// The name `name` stands for, or `None` if it is not one. A second `CAP_` is
+/// not a name: podman rejects `CAP_CAP_X`, but once one prefix is stripped on
+/// the way to it the rest reads as `CAP_X`, which it takes for `X`.
 pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
     let name = capability_name_without_prefix(name);
-    if name.is_empty() {
+    if name.is_empty() || name.starts_with("CAP_") {
         return None;
     }
     if name

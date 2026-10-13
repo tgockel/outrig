@@ -829,6 +829,41 @@ cap-drop = ["net_raw"]
         }
     }
 
+    /// podman rejects `CAP_CAP_NET_ADMIN`, but outrig strips one `CAP_` before
+    /// it hands a name over, which would turn this into `CAP_NET_ADMIN`.
+    #[test]
+    fn doubled_capability_prefix_errors() {
+        for (field, other) in [
+            ("cap-add", r#"cap-drop = ["NET_RAW"]"#),
+            ("cap-drop", r#"cap-add = ["ALL"]"#),
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+{field} = ["CAP_CAP_NET_ADMIN"]
+{other}
+"#
+            ));
+            let err = expect_validation_err(&cfg, None);
+            match err {
+                ConfigValidationError::CapabilityNameInvalid {
+                    image,
+                    field: reported,
+                    capability,
+                } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(reported, field);
+                    assert_eq!(capability, "CAP_CAP_NET_ADMIN");
+                }
+                other => panic!("expected CapabilityNameInvalid, got: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn empty_capability_name_errors() {
         let cfg = parse(

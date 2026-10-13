@@ -184,6 +184,10 @@ cap-add = ["NET_BIND_SERVICE"]
 Explicit `cap-add` values are rendered last, so a container can start from `drop-all` and add
 back one narrow capability. Capability names may include or omit the `CAP_` prefix.
 
+`NET_ADMIN` (or `ALL`) in `cap-add` does not combine with network interception: under
+`mode = "audit"` or `"filter"` the container is refused, since it could delete the table that
+intercepts it. See [`[network]`](../reference/config.md#network).
+
 ### Devices and privilege escalation
 
 Three further keys in the same block cover what capabilities cannot express. A device node is

@@ -1800,3 +1800,105 @@ async fn a_connection_made_straight_to_the_listener_is_refused_not_dialed_by_the
         .expect("shutdown the interceptor");
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
+
+/// A container started with `cap-add = ["NET_ADMIN"]` is refused by `attach`
+/// before it is touched (#363). `NET_ADMIN` in its network namespace is
+/// control of the nftables table the interception is, so a root process in it
+/// could delete the redirect and leave no record; the refusal leaves no table
+/// and the resolver as it was. Every other spelling that grants it is in
+/// `grants_net_admin`'s unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_holding_net_admin_is_refused_and_left_untouched() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let mut launch = ContainerLaunchSpec::workspace(&workspace, PathBuf::from("/workspace"));
+    launch.capabilities.cap_add = vec!["NET_ADMIN".to_string()];
+    let container = Container::start(&image, launch)
+        .await
+        .expect("start container");
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let refused = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect_err("a container holding NET_ADMIN is not attached");
+    let message = refused.to_string();
+    assert!(
+        message.contains("CAP_NET_ADMIN") && message.contains("`cap-add`"),
+        "the refusal names the capability and the key: {message}"
+    );
+    assert!(
+        !netns_has_outrig_table(pid),
+        "a refused attach installs no table"
+    );
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "a refused attach leaves the resolver alone"
+    );
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// `SYS_ADMIN` is not `NET_ADMIN`: netlink checks `CAP_NET_ADMIN` in the
+/// namespace's owning user namespace and nothing else, so a nested container
+/// runtime's `cap-add = ["SYS_ADMIN"]` still runs under interception (#363).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_holding_sys_admin_is_still_attached() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let mut launch = ContainerLaunchSpec::workspace(&workspace, PathBuf::from("/workspace"));
+    launch.capabilities.cap_add = vec!["SYS_ADMIN".to_string()];
+    let container = Container::start(&image, launch)
+        .await
+        .expect("start container");
+    let pid = container_root_pid(&container);
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("a container holding SYS_ADMIN attaches");
+
+    // The point of refusing NET_ADMIN, from the other side: root with
+    // SYS_ADMIN cannot configure the namespace's netfilter.
+    let tried = try_capture(
+        common::root_cmd(container.name()).args(["ip", "link", "add", "outrig0", "type", "dummy"]),
+    );
+    let stderr = String::from_utf8_lossy(&tried.stderr);
+    assert!(
+        !tried.status.success() && stderr.contains("Operation not permitted"),
+        "SYS_ADMIN alone must not configure the network namespace: {stderr}"
+    );
+    assert!(netns_has_outrig_table(pid));
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}

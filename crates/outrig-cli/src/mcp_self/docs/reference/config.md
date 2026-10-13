@@ -171,6 +171,19 @@ container connecting straight to the listener's port, is closed as soon as it is
 recorded with `outrig.action = "deny"` and `outrig.rule = "not-redirected"`, in either mode. If
 either mode is requested and setup fails, the session fails before MCP servers launch.
 
+Either mode refuses a container that holds `NET_ADMIN`. `CAP_NET_ADMIN` in a container's own
+network namespace is control of its nftables, so a root process in that container could delete the
+redirect table and leave no record. A container holds it when its `cap-add` lists `NET_ADMIN` --
+`CAP_NET_ADMIN` and `net_admin` mean the same -- or lists `ALL` without `NET_ADMIN` in `cap-drop`;
+no `capability-profile` adds it. The refusal applies whether the mode came from the config or from
+`--network`, and the error names `cap-add`. The primary fails the session before MCP servers
+launch, a sidecar follows its `on-failure` (`warn` drops it, `abort` ends the session), and
+`Outrig::launch` and `Outrig::add_sidecar` return the error. `SYS_ADMIN` is not refused: it does
+not let a container change its netfilter, so the nested-runtime recipe in
+[Containers](../concepts/containers.md) runs under either mode. A container that needs
+`NET_ADMIN` runs under `mode = "default"`, or `--network default`, which installs nothing to
+remove. A container outrig did not start is not inspected.
+
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback
 entry answers just as it does for the host. On a host using systemd-resolved, that entry is its

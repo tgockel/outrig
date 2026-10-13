@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--network audit` and `--network filter`, or the same `[network] mode`, refuse a container
+  that holds `NET_ADMIN`.** Fixed in `outrig` (#363). An image-config or sidecar with
+  `cap-add = ["NET_ADMIN"]` (or `ALL` without `NET_ADMIN` in `cap-drop`) used to start under
+  interception, where a root process in it could delete the redirect table and the policy with it.
+  The session now fails at `starting network audit interceptor` -- before any MCP server launches
+  -- with an error naming `cap-add`, and a sidecar follows its `on-failure`: `warn` drops it,
+  `abort` ends the session. `cap-add = ["SYS_ADMIN"]`, which the nested-runtime recipe uses, is
+  unaffected. To keep `NET_ADMIN`, run with `--network default`. See
+  [`[network]`](../../doc/reference/config.md#network).
+
 - **Under `--network filter` and a deny default, a container resolves only the names an `allow`
   hostname entry could match, and every lookup is in `network.jsonl`.** Fixed in `outrig` (#361).
   Name lookups, which the interceptor forwarded to the host's resolvers whatever the policy, are

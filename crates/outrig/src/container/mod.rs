@@ -41,7 +41,7 @@ use serde_json::Value;
 use tokio::process::Child;
 
 use crate::config::{
-    CapabilityProfile, EnvValue, MountAccess, ResolvedEnvValue, capability_name_without_prefix,
+    CapabilityProfile, EnvValue, MountAccess, ResolvedEnvValue, normalize_capability_name,
 };
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
@@ -117,6 +117,12 @@ pub struct Container {
     ///
     /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
     dns_preconfigured: bool,
+    /// Launched holding `CAP_NET_ADMIN` ([`ContainerCapabilities::grants_net_admin`]),
+    /// which [`NetworkInterceptor::attach`] refuses. `false` for a container
+    /// outrig only borrowed.
+    ///
+    /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
+    net_admin: bool,
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
@@ -570,6 +576,32 @@ impl ContainerCapabilities {
             ..Self::default()
         }
     }
+
+    /// Whether these flags leave the container holding `CAP_NET_ADMIN`, which
+    /// in its own network namespace is control of the nftables table the
+    /// network interceptor installs there.
+    ///
+    /// `cap-add` of `NET_ADMIN` does, and so does `ALL` unless `NET_ADMIN` is
+    /// also dropped: podman takes the drops off the `ALL` base, and an
+    /// explicit add alongside `ALL` is discarded rather than restored. No
+    /// profile adds it, and `SYS_ADMIN` does not stand in for it -- netlink
+    /// checks `CAP_NET_ADMIN` in the namespace's owning user namespace.
+    /// Names compare upper-cased, as podman reads them, because a hand-built
+    /// spec skips config validation's normalizer. An entry that is not one
+    /// name never gets this far: [`reject_malformed_capabilities`] refuses
+    /// it at launch, so this does not have to parse podman's flag syntax.
+    /// The spellings are measured in the unit test.
+    pub(crate) fn grants_net_admin(&self) -> bool {
+        fn lists(list: &[String], wanted: &str) -> bool {
+            list.iter()
+                .any(|entry| canonical_capability_name(entry).as_deref() == Some(wanted))
+        }
+        if lists(&self.cap_add, "ALL") {
+            !lists(&self.cap_drop, "NET_ADMIN")
+        } else {
+            lists(&self.cap_add, "NET_ADMIN")
+        }
+    }
 }
 
 impl Container {
@@ -597,6 +629,7 @@ impl Container {
         // attempt made and discharges its obligation -- neither of which `Drop
         // for Container` can do, because no `Container` exists yet.
         reject_reserved_labels(&launch.labels)?;
+        reject_malformed_capabilities(&launch.capabilities)?;
         let reserved = NameGuard::reserve(&name);
 
         let cmd = build_podman_run_cmd(
@@ -623,7 +656,10 @@ impl Container {
             image.clone(),
             workspace,
             transcript,
-            false,
+            LaunchFacts {
+                net_admin: launch.capabilities.grants_net_admin(),
+                ..LaunchFacts::default()
+            },
         ))
     }
 
@@ -644,6 +680,7 @@ impl Container {
         // `create` that failed on a name collision records no id, so the same
         // guard removes nothing.
         reject_reserved_labels(&options.launch.labels)?;
+        reject_malformed_capabilities(&options.launch.capabilities)?;
         let reserved = NameGuard::reserve(&options.name);
 
         let create = build_podman_create_cmd(
@@ -677,7 +714,10 @@ impl Container {
             options.image,
             workspace,
             options.transcript,
-            options.intercept_dns,
+            LaunchFacts {
+                dns_preconfigured: options.intercept_dns,
+                net_admin: options.launch.capabilities.grants_net_admin(),
+            },
         ))
     }
 
@@ -699,7 +739,7 @@ impl Container {
             image_tag,
             workspace,
             transcript,
-            false,
+            LaunchFacts::default(),
         )
     }
 
@@ -710,7 +750,10 @@ impl Container {
         image_tag: ImageTag,
         (host_workspace, container_workspace): (PathBuf, PathBuf),
         transcript: Option<Transcript>,
-        dns_preconfigured: bool,
+        LaunchFacts {
+            dns_preconfigured,
+            net_admin,
+        }: LaunchFacts,
     ) -> Self {
         let (name, attempt, id, ownership) = match engine {
             EngineIdentity::Owned { name, attempt, id } => {
@@ -730,6 +773,7 @@ impl Container {
             transcript,
             ownership,
             dns_preconfigured,
+            net_admin,
             pid: OnceCell::new(),
             id,
             #[cfg(test)]
@@ -768,7 +812,7 @@ impl Container {
             ImageTag::new("outrig-test-unstoppable"),
             (PathBuf::new(), PathBuf::new()),
             None,
-            false,
+            LaunchFacts::default(),
         );
         container.engine_override = vec![("stop", Cmd::new("/bin/false"))];
         container
@@ -786,8 +830,18 @@ impl Container {
             ImageTag::new("outrig-test-borrowed"),
             (PathBuf::new(), PathBuf::new()),
             None,
-            false,
+            LaunchFacts::default(),
         )
+    }
+
+    /// A handle that says it was launched holding `CAP_NET_ADMIN`, for tests
+    /// of what the network interceptor does with one. Nothing is run against
+    /// it: the refusal comes before the interceptor reads the container.
+    #[cfg(test)]
+    pub(crate) fn holding_net_admin() -> Self {
+        let mut container = Self::stops_cleanly();
+        container.net_admin = true;
+        container
     }
 
     /// Inspect an existing podman container by name. This is intentionally
@@ -881,6 +935,12 @@ impl Container {
     /// the field doc.
     pub(crate) fn dns_preconfigured(&self) -> bool {
         self.dns_preconfigured
+    }
+
+    /// Whether the container was launched holding `CAP_NET_ADMIN`; see the
+    /// field doc.
+    pub(crate) fn holds_net_admin(&self) -> bool {
+        self.net_admin
     }
 
     pub fn image_tag(&self) -> &ImageTag {
@@ -1550,6 +1610,17 @@ fn classify_engine_call(cmd: &Cmd, outcome: Result<Output>) -> EngineOutcome {
     }
 }
 
+/// What the launch that made a [`Container`] established about it, for the
+/// facts a handle cannot learn later. A borrowed handle has none, which is
+/// why the default is every flag `false`.
+#[derive(Clone, Copy, Default)]
+struct LaunchFacts {
+    /// The interceptor's resolver was baked in at `podman create`.
+    dns_preconfigured: bool,
+    /// The launch flags leave the container holding `CAP_NET_ADMIN`.
+    net_admin: bool,
+}
+
 /// Everything podman knows one container by, in the two shapes there are.
 ///
 /// The three names are not interchangeable and the difference is the whole
@@ -1646,6 +1717,45 @@ fn reject_reserved_labels(labels: &BTreeMap<String, String>) -> Result<()> {
             "`{ATTEMPT_LABEL}` is reserved: outrig sets it per container-start attempt \
              so that a cancelled start removes what it created and nothing else"
         )));
+    }
+    Ok(())
+}
+
+/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
+/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
+/// single name.
+///
+/// Flag lowering and [`ContainerCapabilities::grants_net_admin`] both go
+/// through this, so podman is handed the name the classifier compares and the
+/// two cannot read one entry differently.
+fn canonical_capability_name(entry: &str) -> Option<String> {
+    normalize_capability_name(&entry.to_ascii_uppercase())
+}
+
+/// Reject a `cap-add` or `cap-drop` entry that is not one capability name.
+///
+/// podman reads each `--cap-add`/`--cap-drop` value as a CSV list: it would
+/// take `SYS_ADMIN,NET_ADMIN` as two capabilities and `"NET_ADMIN"` as one
+/// with its quotes removed. Config validation already allows only a name, and
+/// a hand-built spec is held to the same, so that
+/// [`ContainerCapabilities::grants_net_admin`] reads what podman is given
+/// instead of re-implementing its parser -- a spelling it misread would leave
+/// a container holding `CAP_NET_ADMIN` under network interception. Case and a
+/// `CAP_` prefix stay allowed, since podman accepts both.
+fn reject_malformed_capabilities(capabilities: &ContainerCapabilities) -> Result<()> {
+    let lists = [
+        ("cap-drop", &capabilities.cap_drop),
+        ("cap-add", &capabilities.cap_add),
+    ];
+    for (field, entries) in lists {
+        for entry in entries {
+            if canonical_capability_name(entry).is_none() {
+                return Err(OutrigError::Configuration(format!(
+                    "`{field}` entry {entry:?} is not a capability name: write one name per \
+                     entry, such as \"NET_RAW\" or \"CAP_NET_RAW\""
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1852,17 +1962,15 @@ fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -
         }
     }
 
+    // The same name `grants_net_admin` compares. A launch refuses an entry
+    // that has none ([`reject_malformed_capabilities`]), so the raw entry is
+    // only what a caller bypassing that check would have sent anyway.
+    let flag_value = |entry: &String| canonical_capability_name(entry).unwrap_or(entry.clone());
     for capability in &capabilities.cap_drop {
-        cmd = cmd.arg(format!(
-            "--cap-drop={}",
-            capability_name_without_prefix(capability)
-        ));
+        cmd = cmd.arg(format!("--cap-drop={}", flag_value(capability)));
     }
     for capability in &capabilities.cap_add {
-        cmd = cmd.arg(format!(
-            "--cap-add={}",
-            capability_name_without_prefix(capability)
-        ));
+        cmd = cmd.arg(format!("--cap-add={}", flag_value(capability)));
     }
 
     cmd
@@ -3219,6 +3327,205 @@ mod tests {
                 "infinity",
             ]
         );
+    }
+
+    /// What podman gives a container is what decides, so each row is a
+    /// `--cap-add`/`--cap-drop` spelling measured against podman 5.7 with
+    /// `ip link add` in the container: `NET_ADMIN`, `ALL`, and either one in
+    /// any case or with `CAP_` configure a link; `ALL` less `NET_ADMIN` (even
+    /// beside an explicit `NET_ADMIN` add) and `SYS_ADMIN` do not.
+    #[test]
+    fn grants_net_admin_follows_what_podman_would_hand_the_container() {
+        let caps = |profile, drop: &[&str], add: &[&str]| ContainerCapabilities {
+            profile,
+            cap_drop: drop.iter().map(|c| c.to_string()).collect(),
+            cap_add: add.iter().map(|c| c.to_string()).collect(),
+        };
+        let default = CapabilityProfile::Default;
+
+        for add in [
+            "NET_ADMIN",
+            "CAP_NET_ADMIN",
+            "net_admin",
+            "cap_net_admin",
+            "Cap_Net_Admin",
+            "ALL",
+            "all",
+            // Rendered as `--cap-add=ALL`: the prefix is stripped before
+            // podman sees it, and config validation lets it through.
+            "CAP_ALL",
+        ] {
+            assert!(
+                caps(default, &[], &[add]).grants_net_admin(),
+                "cap-add {add:?} grants it"
+            );
+        }
+        // A profile only drops, and an explicit add is rendered after it.
+        assert!(caps(CapabilityProfile::DropAll, &[], &["NET_ADMIN"]).grants_net_admin());
+        assert!(caps(CapabilityProfile::NoNetRaw, &[], &["ALL"]).grants_net_admin());
+        assert!(caps(default, &["NET_RAW"], &["ALL"]).grants_net_admin());
+
+        // `ALL` is the base the drops come off.
+        assert!(!caps(default, &["NET_ADMIN"], &["ALL"]).grants_net_admin());
+        assert!(!caps(default, &["CAP_NET_ADMIN"], &["all"]).grants_net_admin());
+        // An explicit add beside `ALL` is discarded, not restored over the drop.
+        assert!(!caps(default, &["NET_ADMIN"], &["ALL", "NET_ADMIN"]).grants_net_admin());
+        assert!(!caps(default, &["NET_ADMIN"], &["NET_ADMIN", "ALL"]).grants_net_admin());
+
+        assert!(!ContainerCapabilities::default().grants_net_admin());
+        assert!(!ContainerCapabilities::new(CapabilityProfile::DropAll).grants_net_admin());
+        for add in ["SYS_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "NET_BROADCAST"] {
+            assert!(
+                !caps(default, &[], &[add]).grants_net_admin(),
+                "cap-add {add:?} does not"
+            );
+        }
+        assert!(!caps(default, &["NET_ADMIN"], &[]).grants_net_admin());
+    }
+
+    /// Podman reads a capability flag value as CSV -- measured against 5.7,
+    /// `--cap-add=SYS_ADMIN,NET_ADMIN` grants `NET_ADMIN`, as does a quoted
+    /// `--cap-add='"NET_ADMIN"'`, and a quoted drop takes it off `ALL` -- so
+    /// an entry that is not one name is refused rather than read.
+    #[test]
+    fn a_capability_entry_that_is_not_one_name_is_refused() {
+        let spec = |drop: &[&str], add: &[&str]| ContainerCapabilities {
+            profile: CapabilityProfile::Default,
+            cap_drop: drop.iter().map(|c| c.to_string()).collect(),
+            cap_add: add.iter().map(|c| c.to_string()).collect(),
+        };
+
+        for entry in [
+            "SYS_ADMIN,NET_ADMIN",
+            "NET_RAW,",
+            "\"NET_ADMIN\"",
+            "\"SYS_ADMIN,NET_ADMIN\"",
+            // podman rejects `CAP_CAP_NET_ADMIN` itself; stripping one prefix
+            // on the way out would hand it `CAP_NET_ADMIN`, which it grants.
+            "CAP_CAP_NET_ADMIN",
+            "cap_cap_net_admin",
+            "CAP_CAP_",
+            " NET_ADMIN",
+            "NET_ADMIN ",
+            "NET_ADMIN\n",
+            "NET ADMIN",
+            "NET-ADMIN",
+            "CAP_",
+            "",
+        ] {
+            for (field, capabilities) in [
+                ("cap-add", spec(&[], &[entry])),
+                ("cap-drop", spec(&[entry], &["ALL"])),
+            ] {
+                let error = reject_malformed_capabilities(&capabilities)
+                    .expect_err(&format!("{field} entry {entry:?} is refused"));
+                let OutrigError::Configuration(message) = error else {
+                    panic!("{field} entry {entry:?}: expected Configuration, got {error:?}");
+                };
+                assert!(
+                    message.contains(field) && message.contains(&format!("{entry:?}")),
+                    "names the field and the entry: {message}"
+                );
+            }
+        }
+
+        for entry in [
+            "NET_ADMIN",
+            "CAP_NET_ADMIN",
+            "net_admin",
+            "cap_net_admin",
+            "ALL",
+            "all",
+            "SYS_ADMIN",
+        ] {
+            reject_malformed_capabilities(&spec(&[entry], &[entry]))
+                .unwrap_or_else(|e| panic!("{entry:?} is one name: {e}"));
+        }
+        reject_malformed_capabilities(&ContainerCapabilities::default()).unwrap();
+    }
+
+    /// The classifier and the flags are two readings of the same entry, so
+    /// they must not drift: whatever spelling is accepted, podman is handed
+    /// the one name the classifier compares. `podman_reads` is how podman
+    /// takes a flag value, measured against 5.7: upper-cased, `CAP_` added
+    /// when it is missing, and no `CAP_` stripped or doubled.
+    #[test]
+    fn every_accepted_capability_spelling_reaches_podman_as_the_name_compared() {
+        let podman_reads = |value: &str| {
+            let value = value.to_ascii_uppercase();
+            if value.starts_with("CAP_") {
+                value
+            } else {
+                format!("CAP_{value}")
+            }
+        };
+        for (entry, name) in [
+            ("NET_ADMIN", "NET_ADMIN"),
+            ("CAP_NET_ADMIN", "NET_ADMIN"),
+            ("net_admin", "NET_ADMIN"),
+            ("cap_net_admin", "NET_ADMIN"),
+            ("Cap_Net_Admin", "NET_ADMIN"),
+            ("CAP_Net_Admin", "NET_ADMIN"),
+            ("ALL", "ALL"),
+            ("CAP_ALL", "ALL"),
+            ("all", "ALL"),
+        ] {
+            for (flag, capabilities) in [
+                (
+                    "--cap-add=",
+                    ContainerCapabilities {
+                        cap_add: vec![entry.to_string()],
+                        ..ContainerCapabilities::default()
+                    },
+                ),
+                (
+                    "--cap-drop=",
+                    ContainerCapabilities {
+                        cap_drop: vec![entry.to_string()],
+                        ..ContainerCapabilities::default()
+                    },
+                ),
+            ] {
+                reject_malformed_capabilities(&capabilities)
+                    .unwrap_or_else(|e| panic!("{entry:?} is accepted: {e}"));
+                let args = argv(append_capability_flags(Cmd::new("podman"), &capabilities));
+                let [_, emitted] = args.as_slice() else {
+                    panic!("one flag for {entry:?}: {args:?}");
+                };
+                let value = emitted.strip_prefix(flag).expect("the flag asked for");
+                assert_eq!(
+                    podman_reads(value),
+                    format!("CAP_{name}"),
+                    "{flag}{entry} reaches podman as {name}"
+                );
+            }
+        }
+    }
+
+    /// Neither launch path may reach podman with one: the refusal comes before
+    /// anything is spawned, so this needs no engine.
+    #[tokio::test]
+    async fn both_launch_paths_refuse_a_capability_entry_that_is_not_one_name() {
+        let launch = || ContainerLaunchSpec {
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::Default,
+                cap_drop: Vec::new(),
+                cap_add: vec!["SYS_ADMIN,NET_ADMIN".to_string()],
+            },
+            ..ContainerLaunchSpec::default()
+        };
+        let image = ImageTag::new("outrig-test-never-run");
+
+        let error = Container::start_named(&image, launch(), "outrig-test-never".into(), None)
+            .await
+            .expect_err("start_named refuses it");
+        assert!(matches!(error, OutrigError::Configuration(_)), "{error:?}");
+
+        let options = ContainerCreateOptions::new(image, launch(), "outrig-test-never");
+        let error = Container::create_initialized(options)
+            .await
+            .expect_err("create_initialized refuses it");
+        assert!(matches!(error, OutrigError::Configuration(_)), "{error:?}");
     }
 
     #[test]

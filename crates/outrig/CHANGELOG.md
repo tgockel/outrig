@@ -91,6 +91,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Network interception is refused for a container that holds `NET_ADMIN`.** `CAP_NET_ADMIN` in a
+  container's own network namespace is control of its nftables, so a root process in a container
+  started with `cap-add = ["NET_ADMIN"]` could delete the redirect table that audit and filter
+  mode install, and the egress policy and the audit log went with it, silently. A container holds
+  it when its `cap-add` lists `NET_ADMIN` -- in any case, with or without `CAP_` -- or `ALL`
+  without `NET_ADMIN` in `cap-drop`; `SYS_ADMIN` does not, and is still accepted.
+  `NetworkInterceptor::attach`, which `start` and `start_with_policy` call, now returns
+  `OutrigError::Configuration` naming `cap-add` before it changes anything. The check is on the
+  launch, not the mode's source, so it holds for a config, `--network`, and `LaunchSpec`'s
+  `with_network_mode`, and for sidecars and `Outrig::add_sidecar`. A container outrig only
+  borrowed (`Container::attach`) is not inspected and is never refused. A session that asked for
+  `NET_ADMIN` and for interception now has to give up one: run it under `mode = "default"`. See
+  [`[network]`](../../doc/reference/config.md#network). To keep that check from being read around,
+  `Container::start_named` and `Container::create_initialized`, and so everything that launches,
+  now reject a `ContainerCapabilities` entry that is not one capability name: podman splits a
+  flag value on commas and strips quotes, so `"SYS_ADMIN,NET_ADMIN"` used to grant `NET_ADMIN`
+  from a hand-built spec. Config validation already allowed only names, and now also rejects a
+  doubled `CAP_CAP_` prefix: podman refuses that spelling, but one prefix was stripped on the way
+  to it, leaving `CAP_NET_ADMIN`, which it grants. (#363)
+
 - **Under `[network] mode = "filter"` and a deny default, a container resolves only the names an
   `allow` hostname entry could match, and every lookup is recorded.** The interceptor's DNS
   listener forwarded every lookup to the host's resolvers whatever the policy, and wrote nothing

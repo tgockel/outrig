@@ -40,6 +40,9 @@ Issues that bear on **host integrity** are in scope, for example:
   configured to, including through a podman default OutRig leaves in place, such as
   `--http-proxy`.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
+- The network interceptor attaching to a container that holds `CAP_NET_ADMIN` -- `cap-add` of
+  `NET_ADMIN`, or of `ALL` without `NET_ADMIN` in `cap-drop` -- since whatever it runs as root
+  could delete the nftables table that is the interception. Attaching refuses such a container.
 - The network interceptor dialing, from the host's network namespace, an address that means
   something only inside the container's -- its loopback, or the interceptor's own listener --
   so that a container reaches a host service the policy never named.
