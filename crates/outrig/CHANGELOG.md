@@ -118,8 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a cancel and an interrupt, and says so; how it ended reaches the model with the next call.
   Separately, code that keeps its event loop from turning while a CPU stays busy is taken for a
   runaway after about half a minute and interrupted without anyone asking, while code waiting on a
-  subprocess, a sleep, or a read is left to finish. The interpreter's `podman exec` client runs in
-  a process group of its own, so the terminal's Ctrl-C does not end it.
+  subprocess, a sleep, or a read is left to finish. That holds for as long as the code keeps the
+  interpreter, whether or not a call still waits on it: one the model's call gave up on is
+  interrupted too, and a later submission refused behind it is told what the last check found, at
+  once, rather than after a check of its own. The interpreter's `podman exec` client runs in a
+  process group of its own, so the terminal's Ctrl-C does not end it.
 
   The interpreter lowers its own `RLIMIT_DATA` soft limit at start, to half the memory the
   container can see: its cgroup's limit, or `MemTotal`. Python that allocates past it gets a

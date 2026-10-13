@@ -2668,7 +2668,11 @@ fn a_cut_traceback_does_not_name_a_group_that_may_be_a_cause() {
 
 #[test]
 fn a_refusal_names_the_execution_holding_the_slot() {
-    let text = all_shown(vec![], &Outcome::Refused { holder: exec_id(4) }, WIDE);
+    let refused = Outcome::Refused {
+        holder: exec_id(4),
+        checked: None,
+    };
+    let text = all_shown(vec![], &refused, WIDE);
     assert!(text.contains("execution 4 has not finished"), "{text}");
     assert!(text.contains("Nothing from this call ran"), "{text}");
 }
@@ -4505,11 +4509,11 @@ fn what_was_done_is_rendered_with_the_outcome_it_led_to() {
         (Verdict::Starved, "native code"),
     ] {
         let refused = render_one(
-            &Outcome::Refused { holder: id },
-            Waited {
-                holder: Some(verdict),
-                ..Waited::default()
+            &Outcome::Refused {
+                holder: id,
+                checked: Some(verdict),
             },
+            Waited::default(),
         );
         assert!(
             refused.starts_with("Not run: execution 7 still holds"),

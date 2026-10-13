@@ -21,6 +21,7 @@ use super::host::{
     PRIMARY, Report, USER, Unknown,
 };
 use super::payload::PAYLOAD;
+use super::recovery::Timings;
 use super::testing::{
     Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, start_on_host_with, within,
 };
@@ -191,6 +192,12 @@ async fn an_interpreter_that_cannot_start_says_why() {
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_execution_keeps_its_slot_and_its_late_reply() {
     let (interpreter, mut fake) = Fake::connected().await;
+    // The watch is `recovery`'s to test. Checking later than this waits keeps
+    // its requests off the wire the fake reads.
+    interpreter.set_timings(Timings {
+        check_every: Duration::from_secs(3600),
+        ..Timings::default()
+    });
 
     let mut first = interpreter
         .submit("await never_resolves()")
@@ -215,7 +222,10 @@ async fn an_unanswered_execution_keeps_its_slot_and_its_late_reply() {
     assert!(!second.queued(), "a refused submission never went to run");
     assert_eq!(
         within(second.outcome()).await,
-        Outcome::Refused { holder: id }
+        Outcome::Refused {
+            holder: id,
+            checked: None
+        }
     );
     round_trip(&interpreter, &mut fake).await;
 
@@ -231,7 +241,10 @@ async fn an_unanswered_execution_keeps_its_slot_and_its_late_reply() {
     );
     assert_eq!(
         within(second.outcome()).await,
-        Outcome::Refused { holder: id }
+        Outcome::Refused {
+            holder: id,
+            checked: None
+        }
     );
 
     // The slot is free. A stray reply for the first id, arriving while the
@@ -360,7 +373,7 @@ async fn the_interpreters_results_decode_into_outcomes() {
     fake.exec(refused.id()).await;
     fake.result(refused.id(), json!({"status": "refused", "holder": 77}))
         .await;
-    let Outcome::Refused { holder } = within(refused.outcome()).await else {
+    let Outcome::Refused { holder, .. } = within(refused.outcome()).await else {
         panic!("expected a refusal");
     };
     assert_eq!(holder.to_string(), "77");

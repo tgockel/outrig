@@ -33,6 +33,16 @@
 //! Choosing between them is `recovery`'s, from [`Interpreter::inventory`],
 //! answered on the loop, and [`Interpreter::cpu`], answered beside it.
 //!
+//! # Watching the slot
+//!
+//! An execution holds the slot from [`Interpreter::submit`] until its reply
+//! arrives, and `recovery` watches it for all of that time -- a task started
+//! with the slot, ended with it -- whether or not anything waits on the
+//! execution. What the watch finds and does is kept in the [`Slot`], as
+//! `recovery::Watched`, so it outlasts the call that was waiting: an
+//! [`Execution`] reads it, and a submission refused behind an abandoned
+//! execution carries the last verdict.
+//!
 //! # The user's channel
 //!
 //! The host is the other end of the agent's `user` channel.
@@ -65,7 +75,9 @@
 //! interpreter, which runs under conmon and outlives its client (see
 //! [`Container::exec_stdio`]). Dropping every handle closes the interpreter's
 //! stdin, which is what makes it exit on the ordinary path; otherwise it ends
-//! when the container stops. The client runs in a process group of its own:
+//! when the container stops. A slot's watch holds a handle that does not count
+//! ([`Interpreter::downgrade`]), or it would keep stdin open for as long as an
+//! execution held the slot. The client runs in a process group of its own:
 //! it exits on the SIGINT a terminal's Ctrl-C sends its group, and the
 //! interpreter would see its stdin close with it.
 
@@ -89,6 +101,7 @@ use crate::harness::event::{self, ExecStatus, Payload, Refusal};
 use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
 use super::payload::PAYLOAD_MOUNT;
+use super::recovery::{self, Found, Timings, Verdict, Watched};
 
 /// The program the interpreter runs, passed on its command line: `build.rs`
 /// stages `interpreter.py` compressed behind a one-line bootstrap, since Linux
@@ -208,7 +221,14 @@ pub(crate) enum Outcome {
     Error { report: Report, traceback: String },
     /// Not run: `holder` has the agent's one slot. Not an outcome of an
     /// execution, since nothing ran, but it arrives the way one does.
-    Refused { holder: ExecId },
+    ///
+    /// `checked` is what the host's latest check of `holder` found, when
+    /// nothing is waiting for `holder` any more and a check has run. It is
+    /// read at the refusal, so a refusal never waits on one.
+    Refused {
+        holder: ExecId,
+        checked: Option<Verdict>,
+    },
     /// The host cannot say, and must not retry.
     Unknown(Unknown),
 }
@@ -291,12 +311,43 @@ pub(crate) struct Interpreter {
     table: Arc<Mutex<Table>>,
     /// Whole protocol lines for the writer task. Queued rather than written by
     /// the caller, so a caller cancelled mid-write cannot tear a line.
-    lines: mpsc::UnboundedSender<String>,
+    lines: Lines,
     /// The Python version the interpreter greeted with, as `sys.version`'s
     /// first word.
     version: Arc<str>,
     /// Where what this interpreter's agent does is recorded.
     events: Events,
+}
+
+/// The writer's queue, held by a handle either strongly or weakly. A strong
+/// one keeps the writer, and with it the interpreter's stdin, open for as long
+/// as it lives. A weak one does not: what it sends fails once every strong one
+/// is gone, which is what lets a task that runs as long as an execution holds
+/// the slot hold a handle without keeping the interpreter alive.
+#[derive(Clone)]
+enum Lines {
+    Open(mpsc::UnboundedSender<String>),
+    Weak(mpsc::WeakUnboundedSender<String>),
+}
+
+impl Lines {
+    /// Queue `line`, and say whether it was: not once the writer has stopped
+    /// or, for a weak one, every strong handle is gone.
+    fn send(&self, line: String) -> bool {
+        match self {
+            Lines::Open(lines) => lines.send(line).is_ok(),
+            Lines::Weak(lines) => lines
+                .upgrade()
+                .is_some_and(|lines| lines.send(line).is_ok()),
+        }
+    }
+
+    fn downgrade(&self) -> Self {
+        match self {
+            Lines::Open(lines) => Lines::Weak(lines.downgrade()),
+            Lines::Weak(lines) => Lines::Weak(lines.clone()),
+        }
+    }
 }
 
 /// One submission's handle. Its id is fixed at submission, which is what a
@@ -310,6 +361,9 @@ pub(crate) struct Execution {
     /// The outcome once [`Execution::outcome`] has returned it.
     settled: Option<Outcome>,
     table: Arc<Mutex<Table>>,
+    /// What the host found and did about it, which stays readable once the
+    /// slot is free. A refusal has no slot of its own, so its is never written.
+    watched: watch::Receiver<Watched>,
 }
 
 /// The correlation state the reader task shares with every handle.
@@ -338,6 +392,8 @@ struct Table {
     on_exit: Option<ExitHook>,
     /// Set once the interpreter has exited and everything it left is settled.
     gone: watch::Sender<bool>,
+    /// How long each step of watching an execution takes.
+    timings: Timings,
     /// Set once the session has started stopping the interpreter, so its exit
     /// is recorded as expected.
     stopping: bool,
@@ -379,6 +435,16 @@ struct Slot {
     waiter: oneshot::Sender<Outcome>,
     /// When it was sent, which its recorded duration counts from.
     submitted: Instant,
+    /// What the host has found out and done about it. Dropped with the slot,
+    /// which is how its watch learns the slot is free.
+    watched: watch::Sender<Watched>,
+}
+
+impl Slot {
+    /// Whether nothing is waiting for the outcome any more.
+    fn abandoned(&self) -> bool {
+        self.waiter.is_closed()
+    }
 }
 
 /// Who is waiting for a request's answer.
@@ -576,6 +642,7 @@ impl Interpreter {
             ));
         }
         tokio::spawn(write_requests(requests, queued, Arc::clone(&table)));
+        let lines = Lines::Open(lines);
         tokio::spawn(read_replies(
             replies,
             Arc::clone(&table),
@@ -588,6 +655,30 @@ impl Interpreter {
             version: version.into(),
             events,
         })
+    }
+
+    /// A handle on this interpreter that does not keep it alive: dropping
+    /// every other handle still closes its stdin, and what is sent through
+    /// this one fails as [`InterpreterError::Gone`] from then on. For a task
+    /// that runs as long as something else does, like a slot's watch.
+    pub(crate) fn downgrade(&self) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            lines: self.lines.downgrade(),
+            version: Arc::clone(&self.version),
+            events: self.events.clone(),
+        }
+    }
+
+    /// How long each step of watching an execution takes.
+    pub(crate) fn timings(&self) -> Timings {
+        lock(&self.table).timings
+    }
+
+    /// Shorten the steps of watching an execution, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_timings(&self, timings: Timings) {
+        lock(&self.table).timings = timings;
     }
 
     /// The Python version the interpreter reported when it started, such as
@@ -607,8 +698,12 @@ impl Interpreter {
     /// unresolved -- nothing is sent, and the outcome is already
     /// [`Outcome::Refused`] naming it. An unanswered execution may still be
     /// running, so its slot is not free.
+    ///
+    /// Taking the slot starts its watch (see [`recovery::watch`]), which runs
+    /// until the slot is free again. Must be called within a runtime.
     pub(crate) fn submit(&self, source: &str) -> Result<Execution, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
+        let (told, watched) = watch::channel(Watched::default());
         let mut table = lock(&self.table);
         table.open()?;
         let id = table.next_id();
@@ -626,12 +721,19 @@ impl Interpreter {
         let queued = match &table.slot {
             Some(slot) => {
                 let holder = slot.id;
+                // Read here, under the lock, rather than asked for: a
+                // refusal behind an abandoned execution reports what the
+                // watch last found and waits on nothing.
+                let checked = slot
+                    .abandoned()
+                    .then(|| slot.watched.borrow().verdict)
+                    .flatten();
                 table.events.emit(Payload::ExecRefused {
                     execid: id.public(),
                     holder: Some(holder.public()),
                     reason: Refusal::Held,
                 });
-                let _ = waiter.send(Outcome::Refused { holder });
+                let _ = waiter.send(Outcome::Refused { holder, checked });
                 false
             }
             None => {
@@ -648,7 +750,14 @@ impl Interpreter {
                     id,
                     waiter,
                     submitted: Instant::now(),
+                    watched: told,
                 });
+                tokio::spawn(recovery::watch(
+                    self.downgrade(),
+                    id,
+                    table.timings,
+                    watched.clone(),
+                ));
                 true
             }
         };
@@ -659,6 +768,7 @@ impl Interpreter {
             receiver,
             settled: None,
             table: Arc::clone(&self.table),
+            watched,
         })
     }
 
@@ -758,7 +868,7 @@ impl Interpreter {
     /// nothing but what the start already sent, so it arrives before the first
     /// execution.
     pub(crate) fn declare_bindings(&self, message: &Value) {
-        let _ = self.lines.send(format!("{message}\n"));
+        self.lines.send(format!("{message}\n"));
     }
 
     /// Close the interpreter's stdin, which is its signal to exit, whatever
@@ -771,7 +881,7 @@ impl Interpreter {
         }
         // The writer's sign to stop: every line it is given otherwise ends
         // with a newline.
-        let _ = self.lines.send(String::new());
+        self.lines.send(String::new());
     }
 
     /// Wait until the interpreter has exited and everything it left was
@@ -862,10 +972,12 @@ impl Interpreter {
     pub(crate) fn cancel(&self, id: ExecId) {
         self.stop(
             id,
+            None,
             json!({"t": "cancel", "agent": PRIMARY, "id": id}),
             Payload::ExecCancelSent {
                 execid: id.public(),
             },
+            |_| {},
         );
     }
 
@@ -880,24 +992,115 @@ impl Interpreter {
     /// it is what lets `id` start. It does nothing to an execution suspended
     /// on an await, whose remedy is [`Interpreter::cancel`].
     pub(crate) fn interrupt(&self, id: ExecId, runaway: bool) {
+        self.interrupting(id, runaway, None, |_| {});
+    }
+
+    /// [`Interpreter::interrupt`] of a runaway, as the host sends one on its
+    /// own account rather than for the user: noted in `id`'s [`Watched`] as it
+    /// is sent, so it is never noted for one that was not.
+    ///
+    /// Sent only if no interrupt has been sent for `id` since the count was
+    /// `seen` (see [`Interpreter::interrupts`]), which is how a decision made on
+    /// a check's findings is held to the thread those findings were of. Says
+    /// whether it was sent.
+    pub(crate) fn interrupt_runaway(&self, id: ExecId, seen: u32) -> bool {
+        self.interrupting(id, true, Some(seen), |watched| watched.interrupted = true)
+    }
+
+    fn interrupting(
+        &self,
+        id: ExecId,
+        runaway: bool,
+        since: Option<u32>,
+        noted: impl FnOnce(&mut Watched),
+    ) -> bool {
         self.stop(
             id,
+            since,
             json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}),
             Payload::ExecInterruptSent {
                 execid: id.public(),
                 runaway,
             },
-        );
+            |watched| {
+                watched.interrupts += 1;
+                noted(watched);
+            },
+        )
     }
 
-    /// Send `message` if `id` still holds the slot, recording `sent` if it
-    /// was. One that no longer does has replied, and there is nothing left to
-    /// stop.
-    fn stop(&self, id: ExecId, message: Value, sent: Payload) {
+    /// Send `message` if `id` still holds the slot -- and, when `since` is
+    /// given, if its interrupt count is still that -- recording `sent` if it
+    /// was, and handing `noted` the slot's [`Watched`] under the same lock. Says
+    /// whether it was sent. One that no longer holds the slot has replied, and
+    /// there is nothing left to stop.
+    fn stop(
+        &self,
+        id: ExecId,
+        since: Option<u32>,
+        message: Value,
+        sent: Payload,
+        noted: impl FnOnce(&mut Watched),
+    ) -> bool {
         let table = lock(&self.table);
-        if table.open().is_ok() && table.slot.as_ref().is_some_and(|slot| slot.id == id) {
+        if table.open().is_ok()
+            && let Some(slot) = table.slot.as_ref().filter(|slot| slot.id == id)
+            && since.is_none_or(|seen| slot.watched.borrow().interrupts == seen)
+        {
             table.events.emit(sent);
             let _ = self.send(message);
+            slot.watched.send_modify(noted);
+            return true;
+        }
+        false
+    }
+
+    /// How many interrupts have been sent for `id`, by anyone, or `None` once
+    /// it no longer holds the slot. A check reads it before it begins, and
+    /// [`Interpreter::found`] holds its verdict to it.
+    pub(crate) fn interrupts(&self, id: ExecId) -> Option<u32> {
+        let table = lock(&self.table);
+        let slot = table.slot.as_ref().filter(|slot| slot.id == id)?;
+        let interrupts = slot.watched.borrow().interrupts;
+        Some(interrupts)
+    }
+
+    /// Record what a check of `id`'s loop found, if `id` still holds the slot
+    /// and the verdict still stands. Done under the lock the slot is taken
+    /// under, so a check is never recorded for an execution that has completed.
+    ///
+    /// `seen` is the interrupt count the check began at. A verdict drawn from
+    /// the thread's CPU clock -- spinning or blocked -- does not stand if an
+    /// interrupt was sent while the check ran: the thread did one thing before
+    /// it and may do another after, and the reading is an average of both. The
+    /// one that was spinning and is now in a `finally:` that sleeps reads as
+    /// spinning, and interrupting it again would skip the cleanup.
+    pub(crate) fn found(&self, id: ExecId, seen: u32, verdict: Verdict) -> Found {
+        let table = lock(&self.table);
+        let Some(slot) = table.slot.as_ref().filter(|slot| slot.id == id) else {
+            return Found::Freed;
+        };
+        if matches!(verdict, Verdict::Blocked | Verdict::Spinning)
+            && slot.watched.borrow().interrupts != seen
+        {
+            return Found::Stale;
+        }
+        if let Some(verdict) = verdict.failed() {
+            table.events.emit(Payload::ExecProbeFailed {
+                execid: id.public(),
+                verdict,
+            });
+        }
+        slot.watched
+            .send_modify(|watched| watched.verdict = Some(verdict));
+        Found::Recorded
+    }
+
+    /// Change what the host has noted of `id`'s execution, if `id` still holds
+    /// the slot.
+    pub(crate) fn note(&self, id: ExecId, update: impl FnOnce(&mut Watched)) {
+        if let Some(slot) = lock(&self.table).slot.as_ref().filter(|slot| slot.id == id) {
+            slot.watched.send_modify(update);
         }
     }
 
@@ -908,7 +1111,7 @@ impl Interpreter {
         lock(&self.table)
             .slot
             .as_ref()
-            .filter(|slot| slot.waiter.is_closed())
+            .filter(|slot| slot.abandoned())
             .map(|slot| slot.id)
     }
 
@@ -946,10 +1149,14 @@ impl Interpreter {
 
     fn send(&self, message: Value) -> Result<(), InterpreterError> {
         // The writer records why it stopped before it lets go of the queue, and
-        // `open` has checked since; only a runtime shutting down gets here.
-        self.lines
-            .send(format!("{message}\n"))
-            .map_err(|_| InterpreterError::Gone("its stdin closed".into()))
+        // `open` has checked since; only a runtime shutting down gets here, or
+        // a [`downgrade`](Interpreter::downgrade)d handle whose every other
+        // handle has been dropped.
+        if self.lines.send(format!("{message}\n")) {
+            Ok(())
+        } else {
+            Err(InterpreterError::Gone("its stdin closed".into()))
+        }
     }
 }
 
@@ -1067,6 +1274,12 @@ impl Execution {
     /// and the outcome is already [`Outcome::Refused`].
     pub(crate) fn queued(&self) -> bool {
         self.queued
+    }
+
+    /// What the host has found out and done about the execution, which
+    /// outlives its slot: the last value stays readable once it is free.
+    pub(crate) fn watched(&self) -> watch::Receiver<Watched> {
+        self.watched.clone()
     }
 
     /// Wait for the outcome. Cancel-safe, and may be awaited again after a
@@ -1237,7 +1450,10 @@ impl Table {
                     "the interpreter refused execution {}: it says {holder} holds the slot",
                     result.id
                 );
-                Outcome::Refused { holder }
+                Outcome::Refused {
+                    holder,
+                    checked: None,
+                }
             }
         };
         if let Err(outcome) = slot.waiter.send(outcome) {
@@ -1255,10 +1471,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Queue the line telling the interpreter a message the agent sent on
 /// `channel` was received.
-fn acknowledge(table: &mut Table, lines: &mpsc::UnboundedSender<String>, channel: &str) {
+fn acknowledge(table: &mut Table, lines: &Lines, channel: &str) {
     let id = table.next_id();
     let received = json!({"t": "received", "agent": PRIMARY, "id": id, "channel": channel});
-    let _ = lines.send(format!("{received}\n"));
+    lines.send(format!("{received}\n"));
 }
 
 /// A request's answer, or why none can come.
@@ -1330,12 +1546,8 @@ async fn write_requests<W: AsyncWrite + Unpin>(
 ///
 /// `lines` is the writer's queue, held weakly so that the reader does not keep
 /// the interpreter's stdin open once every handle is gone.
-async fn read_replies<R, E>(
-    mut replies: R,
-    table: Arc<Mutex<Table>>,
-    lines: mpsc::WeakUnboundedSender<String>,
-    ended: E,
-) where
+async fn read_replies<R, E>(mut replies: R, table: Arc<Mutex<Table>>, lines: Lines, ended: E)
+where
     R: AsyncBufRead + Unpin,
     E: Future<Output = String>,
 {
@@ -1420,7 +1632,7 @@ async fn read_replies<R, E>(
     table.gone.send_replace(true);
 }
 
-fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, line: &[u8]) {
+fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
     let Envelope { agent, reply } = match serde_json::from_slice(line) {
         Ok(envelope) => envelope,
         Err(e) => {
@@ -1509,9 +1721,7 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
                 );
                 // Acknowledged all the same: no receive is coming, and the
                 // agent must not wait for one.
-                if let Some(lines) = lines.upgrade() {
-                    acknowledge(&mut table, &lines, &channel);
-                }
+                acknowledge(&mut table, lines, &channel);
             }
         }
         Reply::Promote { turns } => context_changed(table, ContextChange::Promote(turns)),

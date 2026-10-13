@@ -252,18 +252,26 @@ below any plausible number of busy siblings.
 
 ### When the host acts
 
-**On its own, only against a runaway.** From 30 seconds after submission and every 30 seconds
-after, the host checks. A loop that answers is healthy however long the execution has run. A loop
-that does not answer with its thread idle -- a synchronous `subprocess.run`, a `time.sleep`, a
+**On its own, only against a runaway.** From 30 seconds after submission and every 30 seconds after,
+for as long as the execution holds the slot -- a task started with the slot, whether or not a call
+waits on it -- the host checks. A loop that answers is healthy however long the execution has run. A
+loop that does not answer with its thread idle -- a synchronous `subprocess.run`, a `time.sleep`, a
 blocking read -- is left alone, since the failed probe is no evidence about the child. A loop that
-does not answer while its thread stays busy is interrupted with the widest scope, and checked
-again five seconds later rather than concluded about: the interrupt may have ended a task another
-execution left spinning, and this one may be healthy. A probe the loop has not answered is waited
-on again rather than sent again, so a loop blocked for an hour does not return to a queue of them;
-one it answered before a check began is dropped, since it says the loop turned then, not now.
-After three interrupts that each leave the loop spinning, the host stops waiting -- the execution
-is `unknown`, keeps its slot, and the model is told why. The host never cancels on its own, so a
-suspended execution keeps its slot indefinitely.
+does not answer while its thread stays busy is interrupted with the widest scope, and checked again
+five seconds later rather than concluded about: the interrupt may have ended a task another
+execution left spinning, and this one may be healthy. A probe the loop has not answered is waited on
+again rather than sent again, so a loop blocked for an hour does not return to a queue of them; one
+it answered before a check began is dropped, since it says the loop turned then, not now. So is a
+reading of the thread's CPU across an interrupt, from the user's press or a stop with nobody
+waiting as much as the host's own: it is of neither the thread before the interrupt nor the thread
+after it, and a spinner a press has interrupted into a `finally:` that sleeps for ten seconds would
+still average as spinning and be interrupted out of its cleanup. The host counts the interrupts it
+sends for an execution, runs a check again if the count moved while it ran, and sends its own only
+if the count is what the check began at. After three interrupts that each leave the loop spinning,
+the host stops waiting -- the execution is `unknown`, keeps its slot, and the model is told why. It
+does not stop watching: with nobody waiting, an interrupt is all the host has to keep a CPU from
+burning, so every later check that finds the loop spinning interrupts it again. The host never
+cancels on its own, so a suspended execution keeps its slot indefinitely.
 
 **For the user, anything goes.** Ctrl-C during a call cancels the execution -- cheap, and the
 right remedy for a suspended one -- and checks. A loop that does not answer is interrupted too:
@@ -278,21 +286,22 @@ execution it was made during, so a press racing a result never reaches the next 
 probe is not proof the cancel was delivered -- `task.cancel()` schedules a wake-up that lands a
 loop turn after the probe's reply -- and nothing relies on it.
 
-**Behind an abandoned execution.** A submission refused behind an execution nobody waits for any
-more is the host's one chance to look at that execution again. It checks, interrupts it if it is
-spinning, and tells the model what it found.
+**Behind an abandoned execution.** The watch goes on for an execution nobody waits for any more, so
+one found spinning is interrupted with no submission to prompt it. A submission refused behind it
+reads what the last check found, at once, and tells the model; it checks nothing, so a model that
+retries is refused as fast as it asks. Before the first check there is nothing to read, and the
+refusal says only that the execution has not finished.
 
-**Stopping an abandoned execution is the user's alone.** The check behind a refusal never cancels,
-since a suspended execution may be a long wait rather than a dead one. A Ctrl-C at the prompt, with
-no call waiting, cancels the execution holding the slot and aims an interrupt at its own code, with
-no check between. The check a press runs is for what an aimed interrupt cannot do: widen to
-whatever spins on the loop, and give the model a verdict. The aimed interrupt needs no evidence to
-be safe, since the handler declines it everywhere but in that execution's own code -- with the
-exception the handler's third condition makes: for an execution that has not started, it lands in
-whatever keeps it from starting. So stopping an abandoned execution that never got to start ends
-the earlier task holding the loop, as a first press would. A spin another execution's task left is
-still the refusal check's. Code that catches both keeps the slot; what a further press means is
-the front end's to decide.
+**Stopping an abandoned execution is the user's alone.** The watch never cancels, since a suspended
+execution may be a long wait rather than a dead one. A Ctrl-C at the prompt, with no call waiting,
+cancels the execution holding the slot and aims an interrupt at its own code, with no check between.
+The check a press runs is for what an aimed interrupt cannot do: widen to whatever spins on the
+loop, and give the model a verdict. The aimed interrupt needs no evidence to be safe, since the
+handler declines it everywhere but in that execution's own code -- with the exception the handler's
+third condition makes: for an execution that has not started, it lands in whatever keeps it from
+starting. So stopping an abandoned execution that never got to start ends the earlier task holding
+the loop, as a first press would. A spin another execution's task left is still the watch's. Code
+that catches both keeps the slot; what a further press means is the front end's to decide.
 
 ### Every shape, and what happens
 
@@ -306,10 +315,10 @@ the front end's to decide.
   the submission's frames. Run as a task -- `create_task`, `gather` -- it is found as a task agent
   code started. Either way it is interrupted like any other.
 - **A task an earlier execution left running wedges, with nothing in the foreground.** Nothing
-  notices until the next submission, which is admitted but cannot start. Its check, or Ctrl-C,
-  interrupts the task. The task ends with `KeyboardInterrupt` as its exception, reported once,
-  billed to the execution that started it. The submission then runs -- or, if Ctrl-C was pressed,
-  reports that it was stopped before it started.
+  notices until the next submission, which is admitted but cannot start. Its watch, which starts
+  with it, or Ctrl-C, interrupts the task. The task ends with `KeyboardInterrupt` as its exception,
+  reported once, billed to the execution that started it. The submission then runs -- or, if Ctrl-C
+  was pressed, reports that it was stopped before it started.
 - **The same, while another execution is suspended.** The host's interrupt ends the task, and the
   suspended execution keeps waiting, not marked a runaway. With Ctrl-C, its cancel lands once the
   loop turns again. Every id stays its own.

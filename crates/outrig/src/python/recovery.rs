@@ -12,7 +12,9 @@
 //!
 //! # When the host acts on its own
 //!
-//! A long execution keeps its slot for as long as it runs. Every
+//! A long execution keeps its slot for as long as it runs, and is watched for
+//! all of that time ([`watch`], started with the slot by
+//! [`Interpreter::submit`]), whether or not a call waits on it. Every
 //! [`Timings::check_every`] the host checks, and it interrupts on its own only
 //! when the loop does not answer *and* the thread burned CPU while it did not:
 //! a runaway. A loop that does not answer while its thread is idle is blocked
@@ -23,9 +25,29 @@
 //! An interrupt is not proof of anything. The loop can resume between the
 //! check and the signal, and the interrupt may land in a task another
 //! execution left running rather than in this one, so the host checks again
-//! after [`Timings::grace`] rather than concluding. It gives up -- the
+//! after [`Timings::grace`] rather than concluding. It stops waiting -- the
 //! execution becomes [`Unresolved`](super::host::Unknown::Unresolved), keeping its slot -- only after
 //! [`ATTEMPTS`] interrupts have each left the loop spinning.
+//!
+//! Stopping waiting is not stopping watching. The watch reports that it has
+//! stopped waiting through [`Watched`], which [`settle`] reads, and goes on
+//! checking every [`Timings::check_every`], interrupting whenever it finds the
+//! loop spinning: with nobody waiting, an interrupt is all the host has to
+//! keep a CPU from burning until the next submission. What it found last is
+//! kept in the slot too, and a submission refused behind an abandoned
+//! execution reads it at once ([`Outcome::Refused`]) rather than checking.
+//!
+//! The watch and a press each run checks of their own, so an interrupt sent
+//! for one can land while the other is taking its reading, and a reading of
+//! the thread's CPU clock across an interrupt is of neither the thread before
+//! it nor the thread after. A spinner a press has interrupted into a `finally:`
+//! that sleeps would still average as spinning, and the watch would interrupt
+//! it out of its cleanup. So every interrupt sent for the execution is counted
+//! in its [`Watched`], by whoever sends it ([`stop_abandoned`]'s too); a check
+//! that finds the count moved while it ran is run again ([`examine`]), and the
+//! interrupt the watch decides on is sent only if the count is still what the
+//! check began at ([`Interpreter::interrupt_runaway`]). The check that comes
+//! after reads the thread as the interrupt left it.
 //!
 //! # When the user asks
 //!
@@ -61,7 +83,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use super::host::{ExecId, Execution, Interpreter, InterpreterError, Inventory, Outcome};
@@ -81,8 +103,9 @@ const BUSY: f64 = 0.1;
 /// the loop still spinning, before the host stops waiting for it.
 pub(crate) const ATTEMPTS: u32 = 3;
 
-/// How long each step of waiting takes. A test shortens them.
-#[derive(Debug, Clone)]
+/// How long each step of waiting takes, kept by the interpreter (see
+/// [`Interpreter::timings`]). A test shortens them.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Timings {
     /// From submission to the first check, and between checks.
     pub(crate) check_every: Duration,
@@ -127,9 +150,24 @@ pub(crate) struct Waited {
     pub(crate) runaway_interrupted: bool,
     /// Why the host stopped waiting, when it did.
     pub(crate) gave_up: Option<GaveUp>,
-    /// Refused behind an execution nobody is waiting for any more: what a
-    /// check found that execution doing. One found spinning was interrupted.
-    pub(crate) holder: Option<Verdict>,
+}
+
+/// What the host has found out and done about the execution holding the slot,
+/// kept with the slot so that it outlasts whatever was waiting on it. Written
+/// by the watch, and by a user's check; read by [`settle`], and by a refusal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Watched {
+    /// What the latest check found, or nothing before the first.
+    pub(crate) verdict: Option<Verdict>,
+    /// Whether the host has interrupted a runaway on its own account.
+    pub(crate) interrupted: bool,
+    /// How many interrupts have been sent for the execution, by anyone: the
+    /// watch's, a press's, a stop with nobody waiting. A check begins at one
+    /// count and is held to it (see [`Interpreter::found`]).
+    pub(crate) interrupts: u32,
+    /// Whether the host has stopped waiting: [`ATTEMPTS`] interrupts have each
+    /// left the loop spinning.
+    pub(crate) gave_up: bool,
 }
 
 /// Why the host stopped waiting, leaving the outcome
@@ -160,7 +198,7 @@ pub(crate) enum Verdict {
 impl Verdict {
     /// As the event log records a check that found the loop not turning, or
     /// `None` for one that found it turning.
-    fn failed(self) -> Option<ProbeVerdict> {
+    pub(super) fn failed(self) -> Option<ProbeVerdict> {
         match self {
             Verdict::Turning => None,
             Verdict::Blocked => Some(ProbeVerdict::Blocked),
@@ -168,6 +206,28 @@ impl Verdict {
             Verdict::Starved => Some(ProbeVerdict::Starved),
         }
     }
+}
+
+/// What became of a check's verdict when it was recorded
+/// ([`Interpreter::found`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Found {
+    /// It is the execution's latest, and stands.
+    Recorded,
+    /// An interrupt was sent while the check ran, so a reading of the thread's
+    /// CPU clock across it is of neither the thread before nor the thread
+    /// after. Nothing was recorded.
+    Stale,
+    /// The execution has completed.
+    Freed,
+}
+
+/// A verdict [`examine`] stands behind, and the interrupt count its check
+/// began at.
+#[derive(Debug, Clone, Copy)]
+struct Examined {
+    verdict: Verdict,
+    seen: u32,
 }
 
 /// An execution's outcome, and what the host did while waiting for it.
@@ -267,72 +327,79 @@ impl Drop for Waiting {
     }
 }
 
-/// Wait for `execution`'s outcome, acting on presses and on what checks find
-/// as described above. The outcome wins every race: whatever the host is in
-/// the middle of when it arrives, it is what is returned.
+/// Wait for `execution`'s outcome, acting on presses, and on the watch's having
+/// given up, as described above. The outcome wins every race: whatever the host
+/// is in the middle of when it arrives, it is what is returned.
+///
+/// What the host does on its own account is the watch's, and is only read
+/// here, from the execution's [`Watched`].
 pub(crate) async fn settle(
     interpreter: &Interpreter,
     mut execution: Execution,
     presses: &Presses,
-    timings: &Timings,
 ) -> Settled {
-    let id = execution.id();
     let mut waited = Waited::default();
     if !execution.queued() {
+        // Nothing ran, and the refusal is already here.
         let outcome = execution.outcome().await;
-        if let Outcome::Refused { holder } = outcome
-            && interpreter.abandoned() == Some(holder)
-        {
-            waited.holder = Some(rescue(interpreter, holder, timings).await);
-        }
         return Settled { outcome, waited };
     }
+    let mut watched = execution.watched();
+    let outcome = wait(interpreter, execution, presses, &mut watched, &mut waited).await;
+    waited.runaway_interrupted = watched.borrow().interrupted;
+    Settled { outcome, waited }
+}
 
-    let mut probe = None;
+/// [`settle`]'s wait, noting in `waited` what the user did and why the host
+/// stopped waiting.
+async fn wait(
+    interpreter: &Interpreter,
+    mut execution: Execution,
+    presses: &Presses,
+    watched: &mut watch::Receiver<Watched>,
+    waited: &mut Waited,
+) -> Outcome {
+    let id = execution.id();
+    let timings = interpreter.timings();
     let mut handled = 0;
-    let mut attempts = 0;
-    let mut starved_said = false;
-    let mut next_check = Instant::now() + timings.check_every;
     loop {
-        // Biased, so a press already made wins over a check already due.
+        // Biased, so a press already made wins over the host's giving up.
         let pressed = tokio::select! {
             biased;
-            outcome = execution.outcome() => return Settled { outcome, waited },
+            outcome = execution.outcome() => return outcome,
             () = presses.pressed(id, handled) => true,
-            () = sleep_until(next_check) => false,
+            () = given_up(watched) => false,
         };
-        if pressed && handled > 0 {
-            // Asked again: stop waiting, after a last look for an outcome
-            // that may be on its way.
-            let outcome = match timeout(timings.last_look, execution.outcome()).await {
-                Ok(outcome) => outcome,
-                Err(_) => give_up(interpreter, execution, &mut waited, GaveUp::User),
-            };
-            return Settled { outcome, waited };
+        if !pressed {
+            return give_up(interpreter, execution, waited, GaveUp::Runaway);
         }
-        let wait = if pressed {
-            handled += 1;
-            waited.user_stopped = true;
-            interpreter.cancel(id);
-            timings.user_probe
-        } else {
-            timings.probe
-        };
-        let verdict = tokio::select! {
+        if handled > 0 {
+            // Asked again: stop waiting, after a last look for an outcome that
+            // may be on its way.
+            return match timeout(timings.last_look, execution.outcome()).await {
+                Ok(outcome) => outcome,
+                Err(_) => give_up(interpreter, execution, waited, GaveUp::User),
+            };
+        }
+        handled += 1;
+        waited.user_stopped = true;
+        interpreter.cancel(id);
+        // This check's own probe. One the watch has out is that task's to
+        // wait on again, so a press with the loop blocked sends one more.
+        let mut probe = None;
+        let examined = tokio::select! {
             biased;
-            outcome = execution.outcome() => return Settled { outcome, waited },
+            outcome = execution.outcome() => return outcome,
             // A press is acted on now rather than once the check has run its
-            // course. The check's probe stays in `probe`, to be waited on
-            // again rather than sent again.
+            // course.
             () = presses.pressed(id, handled) => continue,
-            verdict = check(interpreter, id, &mut probe, wait, timings.cpu) => verdict,
+            examined = examine(interpreter, id, &mut probe, timings.user_probe, timings.cpu) => examined,
         };
-        next_check = Instant::now() + timings.check_every;
-        probe_failed(interpreter, id, verdict);
+        let Some(Examined { verdict, .. }) = examined else {
+            // The slot is free, so the outcome is here.
+            return execution.outcome().await;
+        };
         match verdict {
-            // Healthy, or at least not spinning: nothing is done on the host's
-            // own account.
-            Verdict::Turning | Verdict::Blocked if !pressed => attempts = 0,
             // The cancel lands when the loop next runs it, and the code may
             // still catch it; either way the reply says.
             Verdict::Turning => {}
@@ -344,59 +411,161 @@ pub(crate) async fn settle(
                 );
                 interpreter.interrupt(id, false);
             }
-            Verdict::Spinning if !pressed && attempts == ATTEMPTS => {
-                tracing::warn!(
-                    "execution {id} is still spinning after {ATTEMPTS} interrupts; no longer \
-                     waiting for it"
-                );
-                let outcome = give_up(interpreter, execution, &mut waited, GaveUp::Runaway);
-                return Settled { outcome, waited };
-            }
+            // Not the host's own interrupt, so it is no attempt, and the call
+            // was not interrupted as a runaway.
             Verdict::Spinning => {
                 tracing::warn!(
                     "execution {id}: the event loop stopped answering while a CPU stayed busy; \
                      interrupting the code spinning on it"
                 );
                 interpreter.interrupt(id, true);
-                if !pressed {
+            }
+            Verdict::Starved => starved(id),
+        }
+    }
+}
+
+/// Watch `id`, which holds the slot, for as long as it does: check on its loop
+/// every [`Timings::check_every`], and interrupt a runaway, as described above.
+/// Nothing here depends on a call waiting, so it goes on for an execution
+/// nobody waits for, and ends when the slot is free.
+///
+/// Holds a [`downgrade`](Interpreter::downgrade)d handle, which does not keep
+/// the interpreter's stdin open: dropping every other handle ends the
+/// interpreter, the slot with it, and so this.
+pub(crate) async fn watch(
+    interpreter: Interpreter,
+    id: ExecId,
+    timings: Timings,
+    mut told: watch::Receiver<Watched>,
+) {
+    let mut probe = None;
+    let mut attempts = 0;
+    let mut gave_up = false;
+    let mut starved_said = false;
+    let mut next_check = Instant::now() + timings.check_every;
+    loop {
+        tokio::select! {
+            biased;
+            () = freed(&mut told) => return,
+            () = sleep_until(next_check) => {}
+        }
+        let examined = tokio::select! {
+            biased;
+            () = freed(&mut told) => return,
+            examined = examine(&interpreter, id, &mut probe, timings.probe, timings.cpu) => examined,
+        };
+        let Some(Examined { verdict, seen }) = examined else {
+            return;
+        };
+        next_check = Instant::now() + timings.check_every;
+        match verdict {
+            // Healthy, or at least not spinning: nothing is done on the host's
+            // own account.
+            Verdict::Turning | Verdict::Blocked => attempts = 0,
+            // Every interrupt left it spinning. Whoever waits stops waiting,
+            // and nothing is sent at this check: the next one is the first
+            // that is for an execution nobody waits for.
+            Verdict::Spinning if !gave_up && attempts == ATTEMPTS => {
+                tracing::warn!(
+                    "execution {id} is still spinning after {ATTEMPTS} interrupts; no longer \
+                     waiting for it"
+                );
+                gave_up = true;
+                interpreter.note(id, |watched| watched.gave_up = true);
+            }
+            Verdict::Spinning => {
+                tracing::warn!(
+                    "execution {id}: the event loop stopped answering while a CPU stayed busy; \
+                     interrupting the code spinning on it"
+                );
+                if interpreter.interrupt_runaway(id, seen) {
                     attempts += 1;
-                    waited.runaway_interrupted = true;
-                    next_check = Instant::now() + timings.grace;
+                    if !gave_up {
+                        next_check = Instant::now() + timings.grace;
+                    }
+                } else {
+                    // Another interrupt came between the check and this one,
+                    // and may have done what this was to: look again at once.
+                    next_check = Instant::now();
                 }
             }
             Verdict::Starved => {
                 if !starved_said {
                     starved_said = true;
-                    tracing::warn!(
-                        "execution {id}: the interpreter is not answering at all -- native code \
-                         is holding it, and nothing can interrupt that. Waiting for it to return"
-                    );
+                    starved(id);
                 }
             }
         }
     }
 }
 
-/// Check `holder`, which holds the slot with nobody waiting for it, and
-/// interrupt it if it is spinning. What it reports, it reports as a late
-/// result.
-async fn rescue(interpreter: &Interpreter, holder: ExecId, timings: &Timings) -> Verdict {
-    let verdict = check(interpreter, holder, &mut None, timings.probe, timings.cpu).await;
-    probe_failed(interpreter, holder, verdict);
-    if verdict == Verdict::Spinning {
-        tracing::warn!(
-            "execution {holder}, which nobody is waiting for, is spinning; interrupting it"
-        );
-        interpreter.interrupt(holder, true);
+/// [`check`] `id`'s loop, and record what it found.
+///
+/// A check is of the loop as it was while the check ran, and a verdict drawn
+/// from the thread's CPU clock is only that if nothing sent the thread an
+/// interrupt meanwhile. The watch and a press run checks of their own, side by
+/// side, so one's interrupt can land in the middle of the other's reading. A
+/// check that an interrupt has made stale is run again, at once, with the probe
+/// it left kept; the reading it takes then begins after that interrupt. Without
+/// this, a spinner a press has interrupted into a `finally:` that sleeps for ten
+/// seconds still reads as spinning to a watch that began before it, and is
+/// interrupted again, out of the cleanup.
+///
+/// The decision made on the verdict is held to the same count, which is why it
+/// is returned: [`Interpreter::interrupt_runaway`] sends only if it is still
+/// what the check began at.
+///
+/// `None` once the slot is free.
+async fn examine<'a>(
+    interpreter: &'a Interpreter,
+    id: ExecId,
+    probe: &mut Option<Probe<'a>>,
+    wait: Duration,
+    cpu: Duration,
+) -> Option<Examined> {
+    loop {
+        let seen = interpreter.interrupts(id)?;
+        let verdict = check(interpreter, id, probe, wait, cpu).await;
+        match interpreter.found(id, seen, verdict) {
+            Found::Recorded => return Some(Examined { verdict, seen }),
+            Found::Stale => {}
+            Found::Freed => return None,
+        }
     }
-    verdict
+}
+
+/// Resolves once the slot is free: its record, whose sender goes with it, will
+/// not change again.
+async fn freed(told: &mut watch::Receiver<Watched>) {
+    while told.changed().await.is_ok() {}
+}
+
+/// Resolves once the host has given up on the execution; never if its slot is
+/// freed first, when its outcome is already here.
+async fn given_up(told: &mut watch::Receiver<Watched>) {
+    loop {
+        if told.borrow_and_update().gave_up {
+            return;
+        }
+        if told.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+fn starved(id: ExecId) {
+    tracing::warn!(
+        "execution {id}: the interpreter is not answering at all -- native code is holding it, \
+         and nothing can interrupt that. Waiting for it to return"
+    );
 }
 
 /// Stop the execution holding the slot with nobody waiting for it -- recorded
 /// [`Unresolved`](super::host::Unknown::Unresolved), or whose [`Execution`]
 /// was dropped -- and say which; `None`, sending nothing, when there is none.
-/// The user's request, which the host never makes on its own: [`rescue`] is
-/// what it does on its own account, and that never cancels.
+/// The user's request, which the host never makes on its own: what [`watch`]
+/// does on its own account never cancels.
 ///
 /// Both remedies go, with no check between (see the module docs): the cancel
 /// for an execution suspended on an await, and an interrupt aimed at its own
@@ -426,16 +595,6 @@ fn give_up(
         },
     });
     execution.stop_waiting()
-}
-
-/// Record a check of `id`'s loop that found it not turning.
-fn probe_failed(interpreter: &Interpreter, id: ExecId, verdict: Verdict) {
-    if let Some(verdict) = verdict.failed() {
-        interpreter.events().emit(Payload::ExecProbeFailed {
-            execid: id.public(),
-            verdict,
-        });
-    }
 }
 
 /// A probe of the loop, sent and not yet answered.

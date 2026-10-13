@@ -30,7 +30,7 @@ use crate::harness::ClosedBy;
 use crate::harness::event::{Payload, SessionState};
 use crate::harness::lifecycle::Lifecycle;
 use crate::python::host::{ExecId, Interpreter, InterpreterError, Late, Outcome, Report, Unknown};
-use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Timings, Verdict, Waited};
+use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Verdict, Waited};
 
 /// What the model calls the tool.
 pub(crate) const NAME: &str = "submit_python";
@@ -226,13 +226,8 @@ impl ToolDyn for SubmitPython {
             if queued {
                 self.lifecycle.set(SessionState::Executing);
             }
-            let settled = recovery::settle(
-                &self.interpreter,
-                execution,
-                &self.interrupts.presses,
-                &Timings::default(),
-            )
-            .await;
+            let settled =
+                recovery::settle(&self.interpreter, execution, &self.interrupts.presses).await;
             if queued {
                 self.lifecycle.set(SessionState::RoundRunning);
             }
@@ -526,7 +521,10 @@ fn render_outcome(outcome: &Outcome, waited: Waited) -> Rendered {
                 detail,
             }
         }
-        Outcome::Refused { holder } if let Some(verdict) = waited.holder => Rendered {
+        Outcome::Refused {
+            holder,
+            checked: Some(verdict),
+        } => Rendered {
             status: Some(format!(
                 "Not run: execution {holder} still holds the interpreter, which runs one \
                  execution at a time, and nothing is waiting for it any more. {} Nothing from \
@@ -547,7 +545,7 @@ fn render_outcome(outcome: &Outcome, waited: Waited) -> Rendered {
             )),
             detail: String::new(),
         },
-        Outcome::Refused { holder } => Rendered {
+        Outcome::Refused { holder, .. } => Rendered {
             status: Some(format!(
                 "Not run: execution {holder} has not finished, and the interpreter runs one \
                  execution at a time. Nothing from this call ran. Its result will be reported \
