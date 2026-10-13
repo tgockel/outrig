@@ -13,9 +13,9 @@ use serde_json::{Map, Value};
 use tokio::process::Child;
 
 use crate::config::{
-    CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
-    McpServerSpec, MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart,
-    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
+    CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, McpServerSpec,
+    MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
     check_sidecar_image, check_sidecar_name, check_view_exclusions, effective_mcp_call_timeout,
     is_valid_mcp_server_name,
 };
@@ -580,6 +580,11 @@ impl LaunchSpec {
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
     ///   servers come only from the repo config's placement entries.
     ///
+    /// Like `outrig run`, this acquires the primary image before it returns:
+    /// an `image-name` is pulled when absent, and a Dockerfile image-config is
+    /// built (or found in the cache) under `image_name`, the tag `run` and
+    /// `build` share.
+    ///
     /// Assumes `config` has passed validation (see [`Config`]); an unvalidated
     /// config can silently drop a server that names a missing sidecar block.
     pub async fn from_config(
@@ -610,18 +615,12 @@ impl LaunchSpec {
                 )
             })
             .collect();
-        let source = match cfg.source() {
-            ImageSourceRef::Build { build_args, .. } => {
-                let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
-                LaunchSource::Build {
-                    dockerfile,
-                    context,
-                    build_args: build_args.clone(),
-                }
-            }
-            ImageSourceRef::Image { image_name } => LaunchSource::Image {
-                tag: image_name.to_string(),
-            },
+        // Ensured under the image-config's name, as `outrig run` does: the
+        // pull or build happens here, and `launch` is handed the local tag.
+        let tag = image::compute_tag_for(image_name, cfg, repo_root).await?;
+        image::ensure_tagged_image_for(image_name, cfg, repo_root, &tag, false, None).await?;
+        let source = LaunchSource::Image {
+            tag: tag.into_string(),
         };
 
         let plan = sidecar::plan_from_config(config, cfg);

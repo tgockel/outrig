@@ -473,7 +473,8 @@ async fn run_shown_or_captured(
 ) -> Result<()> {
     match output {
         BuildOutput::Captured => {
-            process::run_capture_logged_terminating(cmd, prefix, transcript, termination).await?;
+            process::run_capture_logged_terminating(cmd, prefix, transcript, termination, false)
+                .await?;
         }
         BuildOutput::Stderr => {
             process::run_capture_shown(cmd, prefix, transcript, termination).await?;

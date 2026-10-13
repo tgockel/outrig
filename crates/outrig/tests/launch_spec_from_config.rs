@@ -7,8 +7,10 @@
 //! rather than the enforcement -- `library_surface.rs` carries the e2e half
 //! that checks an interceptor actually starts.
 //!
-//! Every config here is sidecar-free, which is what keeps the file out of the
-//! `e2e` feature: `from_config` only reaches podman to resolve a sidecar image.
+//! `from_config` ensures the primary image, so each config names a real one
+//! and the file needs the `e2e` feature.
+
+#![cfg(feature = "e2e")]
 
 use std::path::Path;
 
@@ -49,7 +51,7 @@ fn config_with_network(network: &str) -> Config {
     parse(&format!(
         r#"
 [images.primary]
-image-name = "localhost/outrig-unused:latest"
+image-name = "docker.io/library/alpine:latest"
 {network}"#
     ))
 }
@@ -210,7 +212,7 @@ host-path      = "{root}"
 container-path = "/workspace"
 
 [images.primary]
-image-name = "localhost/outrig-unused:latest"
+image-name = "docker.io/library/alpine:latest"
 {GLOBAL_NETWORK}"#,
         root = repo_root.path().display(),
     ));
@@ -240,7 +242,7 @@ async fn lowering_carries_the_session_call_timeout_beside_the_servers() {
 mcp-call-timeout-secs = 900
 
 [images.primary]
-image-name = "localhost/outrig-unused:latest"
+image-name = "docker.io/library/alpine:latest"
 
 [images.primary.mcp]
 fs    = ["mcp-fs"]

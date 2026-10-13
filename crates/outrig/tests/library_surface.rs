@@ -1492,3 +1492,110 @@ async fn from_image_can_ignore_embedded_mcp_label() {
 
     outrig.shutdown().await.expect("shutdown");
 }
+
+/// `from_config` pulls an `image-name` the host does not have, as `outrig
+/// run` would, instead of leaving `launch` to fail with `image not known`.
+#[tokio::test]
+async fn from_config_pulls_an_absent_image_name_primary() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let image = "docker.io/library/alpine:3.20";
+    // Absent is the precondition. No `--force`: that would also remove any
+    // container using the image, and this is the contributor's own store. A
+    // plain `rmi` refuses when one does, and the test then has nothing to say.
+    let _ = std::process::Command::new("podman")
+        .args(["rmi", image])
+        .output();
+    let present = std::process::Command::new("podman")
+        .args(["image", "exists", image])
+        .status()
+        .expect("spawn podman image exists")
+        .success();
+    if present {
+        eprintln!("skipping: {image} is in use and cannot be removed without --force");
+        return;
+    }
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    let config: Config = toml::from_str(&format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.probe]
+image-name = "{image}"
+"#,
+        host_ws = host_ws.path().display(),
+    ))
+    .expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "probe",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config pulls the image");
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// A Dockerfile image-config is built under its own name -- the tag `outrig
+/// run` and `build` use -- not under `outrig-cache`.
+#[tokio::test]
+async fn from_config_builds_a_dockerfile_primary_under_its_config_name() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(
+        repo_root.path().join("Dockerfile"),
+        format!(
+            "FROM docker.io/library/alpine:latest\n# marker: {}\n",
+            std::process::id()
+        ),
+    )
+    .expect("write Dockerfile");
+    let config: Config = toml::from_str(&format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.shared]
+dockerfile = "Dockerfile"
+context = "."
+"#,
+        host_ws = host_ws.path().display(),
+    ))
+    .expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "shared",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config builds the image");
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let cfg = config.images.get("shared").expect("shared image-config");
+    let tag = outrig::image::compute_tag_for("shared", cfg, repo_root.path())
+        .await
+        .expect("compute_tag_for");
+    let status = std::process::Command::new("podman")
+        .args(["image", "exists", tag.as_str()])
+        .status()
+        .expect("spawn podman image exists");
+    assert!(status.success(), "{tag} should exist after from_config");
+
+    outrig.shutdown().await.expect("shutdown");
+}

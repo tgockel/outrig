@@ -91,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`LaunchSpec::from_config` now pulls or builds the primary image.** It used to hand `launch` a
+  bare source: an `image-name` that was not already local failed with podman's `image not known`
+  (the create runs `--pull=never`), and a Dockerfile image-config was built under `outrig-cache`
+  with a key `outrig run` never uses. `from_config` now ensures the primary under the
+  image-config's name, as it already did each sidecar, so a pull or build happens inside it and
+  `run`, `build`, and `launch` share one tag. (#456)
+
 - **Network interception is refused for a container that holds `NET_ADMIN`.** `CAP_NET_ADMIN` in a
   container's own network namespace is control of its nftables, so a root process in a container
   started with `cap-add = ["NET_ADMIN"]` could delete the redirect table that audit and filter

@@ -1218,7 +1218,12 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
 
     let drained = tokio::time::timeout(
         Duration::from_secs(20),
-        super::capture_stream(reader, "test", Tee::new(Some(transcript), false)),
+        super::capture_stream(
+            reader,
+            "test",
+            Tee::new(Some(transcript), false),
+            Some(usize::MAX),
+        ),
     )
     .await
     .expect("the drain stopped reading and never returned");
@@ -1304,6 +1309,57 @@ async fn a_shown_failure_carries_no_tail() {
         !err.to_string().contains(marker),
         "the rendered error must not repeat a shown line: {err}"
     );
+}
+
+/// A build-sized log must not accumulate in memory: stderr keeps its last
+/// `STDERR_TAIL_LIMIT` bytes and a discarded stdout keeps none.
+#[tokio::test]
+async fn a_captured_run_retains_a_bounded_tail() {
+    let _emitting = emitting().await;
+    let limit = super::STDERR_TAIL_LIMIT;
+    let script = format!(
+        "yes out | head -c {n}; yes err | head -c {n} >&2; echo last >&2",
+        n = 3 * limit
+    );
+    let output = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect("exit 0");
+    assert!(output.stdout.is_empty(), "stdout was not asked for");
+    assert!(
+        output.stderr.len() <= limit + 1,
+        "{} bytes kept",
+        output.stderr.len()
+    );
+    assert!(output.stderr.ends_with(b"last\n"), "the tail is the end");
+}
+
+/// A failure whose stderr was clipped still says so in the error.
+#[tokio::test]
+async fn a_clipped_failure_tail_keeps_its_truncation_marker() {
+    let _emitting = emitting().await;
+    let script = format!(
+        "yes err | head -c {n} >&2; exit 3",
+        n = 3 * super::STDERR_TAIL_LIMIT
+    );
+    let err = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect_err("exit 3");
+    let OutrigError::Process { stderr_tail, .. } = &err else {
+        panic!("expected a Process error, got {err:?}");
+    };
+    assert!(stderr_tail.starts_with("... (truncated) ..."), "{err}");
 }
 
 // ---------------------------------------------------------------------------

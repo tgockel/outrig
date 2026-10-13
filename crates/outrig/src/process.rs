@@ -883,17 +883,23 @@ pub(crate) async fn try_capture_logged_until(
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
     let tee = Tee::new(transcript.cloned(), false);
-    try_capture_tee_until(cmd, prefix, tee, termination, stop).await
+    try_capture_tee_until(cmd, prefix, tee, termination, true, stop).await
 }
 
 /// [`try_capture_logged_until`] over any [`Tee`]: the body every logged
 /// capture shares, so the recorded and the shown variants differ only in
 /// where their lines go.
+///
+/// Stderr keeps its last `STDERR_TAIL_LIMIT + 1` bytes, the same bound
+/// [`run_capture`] applies, so a chatty command cannot grow the process
+/// without limit. Stdout is kept whole when `keep_stdout` and dropped (after
+/// reaching the tee) otherwise, for the commands whose stdout nobody reads.
 async fn try_capture_tee_until(
     cmd: Cmd,
     prefix: &'static str,
     tee: Tee,
     termination: Termination,
+    keep_stdout: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
     if let Some(t) = &tee.transcript {
@@ -906,8 +912,20 @@ async fn try_capture_tee_until(
     let started = Instant::now();
 
     let mut child = cmd.spawn_owned(StdioSpec::captured(), termination)?;
-    let stdout_task = Drain::spawn(capture_stream(child.take_stdout(), prefix, tee.clone()));
-    let stderr_task = Drain::spawn(capture_stream(child.take_stderr(), prefix, tee));
+    let stdout_task = Drain::spawn(capture_stream(
+        child.take_stdout(),
+        prefix,
+        tee.clone(),
+        keep_stdout.then_some(usize::MAX),
+    ));
+    let stderr_task = Drain::spawn(capture_stream(
+        child.take_stderr(),
+        prefix,
+        tee,
+        // One byte past the limit, so `tail_string` can still see a clip and
+        // mark it.
+        Some(STDERR_TAIL_LIMIT + 1),
+    ));
 
     // Pinned so the same signal can be awaited twice: once against the child,
     // and again against the drain that outlives it.
@@ -987,7 +1005,7 @@ pub(crate) async fn run_capture_logged(
     prefix: &'static str,
     transcript: Option<&Transcript>,
 ) -> Result<Output> {
-    run_capture_logged_terminating(cmd, prefix, transcript, Termination::Kill).await
+    run_capture_logged_terminating(cmd, prefix, transcript, Termination::Kill, true).await
 }
 
 /// [`run_capture_logged`] for a caller that owns the termination claim.
@@ -997,17 +1015,23 @@ pub(crate) async fn run_capture_logged(
 /// of them would bury the single exception in a column of identical
 /// arguments instead of naming it. [`run_capture_shown`] is the same shape
 /// for the other exception a session's build makes.
+///
+/// `keep_stdout` is false for the build and the pull, whose stdout is not read
+/// and can run to the length of a build log.
 pub(crate) async fn run_capture_logged_terminating(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
     termination: Termination,
+    keep_stdout: bool,
 ) -> Result<Output> {
-    let output = try_capture_logged_until(
+    let tee = Tee::new(transcript.cloned(), false);
+    let output = try_capture_tee_until(
         cmd.clone(),
         prefix,
-        transcript,
+        tee,
         termination,
+        keep_stdout,
         std::future::pending(),
     )
     .await?;
@@ -1047,6 +1071,7 @@ pub(crate) async fn run_capture_shown(
         prefix,
         tee,
         termination,
+        false,
         std::future::pending(),
     )
     .await?;
@@ -1226,7 +1251,15 @@ impl BoundedStderrTail {
     }
 }
 
-async fn capture_stream<R>(stream: R, prefix: &'static str, tee: Tee) -> std::io::Result<Vec<u8>>
+/// Drain `stream` through `tee`, retaining the last `retain` bytes: `None`
+/// keeps nothing, `Some(usize::MAX)` everything. A bounded buffer is trimmed
+/// back to the limit at twice its size, so the copying stays amortized.
+async fn capture_stream<R>(
+    stream: R,
+    prefix: &'static str,
+    tee: Tee,
+    retain: Option<usize>,
+) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
@@ -1244,7 +1277,12 @@ where
         if n == 0 {
             break;
         }
-        captured.extend_from_slice(&line);
+        if let Some(limit) = retain {
+            captured.extend_from_slice(&line);
+            if captured.len() / 2 > limit {
+                captured.drain(..captured.len() - limit);
+            }
+        }
         if tee_failed.is_none() {
             let rendered = String::from_utf8_lossy(&line);
             let rendered = rendered.trim_end_matches(['\r', '\n']);
@@ -1252,6 +1290,9 @@ where
                 tee_failed = Some(e);
             }
         }
+    }
+    if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
+        captured.drain(..captured.len() - limit);
     }
     match tee_failed {
         Some(e) => Err(e),
