@@ -1020,7 +1020,8 @@ class _Loop(asyncio.SelectorEventLoop):
 # Compiled code never loads. This is a static build, with no way to load a shared object, so a
 # compiled module fails however it was installed -- as `Dynamic loading not supported` when its
 # file carries this interpreter's suffix, and as a bare "No module named" when it was built for
-# another. `_explain_imports` says so where a failure is reported.
+# another. `_explain_imports` says so where a failure is reported, and `_PIP_GUARD` where `pip`'s
+# build of a package with compiled parts fails.
 
 # The directory the interpreter started in: the workspace, since the host starts it there.
 _WORKSPACE = None
@@ -1041,14 +1042,178 @@ _MINOR = f"{sys.version_info.major}.{sys.version_info.minor}"
 # it; the second so that `-m` does not put the working directory -- the workspace -- ahead of
 # everything, where a project's `pip.py` would run instead of pip and its `types.py` would stop it
 # starting, and so that `--user`, with no user site in view, fails rather than installing where this
-# interpreter does not look.
+# interpreter does not look. The second runs `_PIP_GUARD`, which is pip's own `main` with a note
+# on its failures, in place of `-m pip`.
 _PIP = """#!/bin/sh
 exec {python} -I -c '
 import os, sys
 env = {{k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}}
-os.execve(sys.executable, [sys.executable, "-I", "-m", "pip", *sys.argv[1:]], env)
-' "$@"
+os.execve(sys.executable, [sys.executable, "-I", *sys.argv[1:]], env)
+' {guard} "$@"
 """
+
+# What the agent's `pip` runs: this interpreter's pip, saying why when a package this interpreter
+# cannot load is the reason pip failed. `_make_environment` puts two lines ahead of it,
+# `NO_COMPILED` and `ROUTE`: the reason, and where such code can run.
+#
+# pip decides which wheels fit from the tags its interpreter supports, and this one has no glibc or
+# musl loader to read, so it supports only `linux_<arch>`. No package with compiled parts has a
+# wheel for that, so pip falls back to its source distribution, and the build fails on a dependency
+# or makes a module that cannot load. What pip rejects on the way is evidence: a project whose
+# index page lists wheels for a version, none of them `*-none-any`, has compiled parts. Only
+# evidence, never grounds to refuse. MarkupSafe lists such wheels and its source builds to pure
+# Python, so `pip install jinja2` works because pip builds.
+#
+# Four pieces of pip are wrapped. Each runs pip's own function first, and only what it observes is
+# guarded, so the guard cannot change what pip does. The evaluation of each link records the
+# evidence. Reading a source distribution's metadata and building its wheel, where pip starts its
+# build backend and the two places a build can fail, remember that one did; a failure before them,
+# such as a hash that does not match, is not a failed build. The error pip raises when nothing
+# fits says why for a package whose compiled wheels are all there is of the versions asked for,
+# where nothing could be built. The note for the rest is written after pip has exited with an
+# error, as the last of its output.
+#
+# The supported tags are left alone: widening them would make pip prefer a compiled wheel to a pure
+# fallback wheel of the same version, as `charset-normalizer` publishes. The rule for a pure
+# wheel -- every tag is `*-none-any` -- is the one `check_pure` in `install.rs` applies to a
+# binding's installed packages.
+#
+# The seams are pip's own and move with its version. If one is gone when pip starts the guard
+# stands down, and pip runs as it would have: a pip that changed costs the note, not the install.
+# Only the commands that reach the seams get the guard, since importing them is most of what it
+# costs.
+_PIP_GUARD = r'''
+import sys
+
+
+def guard():
+    from pip._internal import wheel_builder
+    from pip._internal.exceptions import DistributionNotFound
+    from pip._internal.distributions.sdist import SourceDistribution
+    from pip._internal.index.package_finder import LinkEvaluator, LinkType
+    from pip._internal.resolution.resolvelib.factory import Factory
+    from pip._vendor.packaging.utils import canonicalize_name
+    from pip._vendor.packaging.version import Version
+
+    evaluate_link = LinkEvaluator.evaluate_link
+    prepare_distribution_metadata = SourceDistribution.prepare_distribution_metadata
+    build_one = wheel_builder._build_one
+    get_installation_error = Factory.get_installation_error
+
+    # project -> the versions, as their wheels' file names write them, that have a wheel this pip
+    # cannot match that is not pure Python
+    compiled = {}
+    # project -> the versions, as pip reads them, that have a candidate pip could install
+    usable = {}
+    # a source distribution's URL -> (project as named, version as written)
+    sources = {}
+    # the source distributions with compiled wheels that pip could not prepare or build, in order
+    failed = {}
+
+    def why(project, rest):
+        return f"{project} has compiled parts, and {NO_COMPILED}: {rest} {ROUTE}"
+
+    def evaluate(self, link):
+        result = evaluate_link(self, link)
+        try:
+            kind, detail = result
+            name = canonicalize_name(self.project_name)
+            if kind is LinkType.candidate:
+                usable.setdefault(name, set()).add(detail)
+                if not link.is_wheel:
+                    sources[link.url_without_fragment] = (self.project_name, detail)
+            elif kind is LinkType.platform_mismatch and link.is_wheel:
+                if not link.filename.endswith("-none-any.whl"):
+                    compiled.setdefault(name, set()).add(link.filename.split("-", 2)[1])
+        except Exception:
+            pass
+        return result
+
+    def remember(req):
+        try:
+            link = req.original_link or req.link
+            source = sources.get(link.url_without_fragment)
+            if source is not None:
+                project, text = source
+                versions = compiled.get(canonicalize_name(project), ())
+                if Version(text) in {Version(version) for version in versions}:
+                    failed[source] = None
+        except Exception:
+            pass
+
+    def prepare(self, *args, **kwargs):
+        try:
+            return prepare_distribution_metadata(self, *args, **kwargs)
+        except Exception:
+            remember(self.req)
+            raise
+
+    def build(req, *args, **kwargs):
+        wheel = build_one(req, *args, **kwargs)
+        if wheel is None:
+            remember(req)
+        return wheel
+
+    def fits(specifier, versions):
+        return any(specifier.contains(Version(version), prereleases=True) for version in versions)
+
+    def stuck(cause):
+        """The project of a requirement whose versions that fit are all compiled, if it is one."""
+        try:
+            requirement = cause.requirement
+            specifier = requirement.get_candidate_lookup()[1].req.specifier
+            name = requirement.project_name
+            if fits(specifier, compiled.get(name, ())):
+                if not fits(specifier, usable.get(name, ())):
+                    return name
+        except Exception:
+            pass
+
+    def installation_error(self, e, *args, **kwargs):
+        error = get_installation_error(self, e, *args, **kwargs)
+        try:
+            names = sorted(filter(None, map(stuck, e.causes)))
+            if names and isinstance(error, DistributionNotFound):
+                rest = (
+                    "the versions asked for are published only as wheels for platforms this "
+                    "interpreter does not match."
+                )
+                error = DistributionNotFound(f"{error}\n{why(names[0], rest)}")
+        except Exception:
+            pass
+        return error
+
+    def report(status):
+        if status:
+            for project, text in failed:
+                rest = (
+                    "its wheels are all for platforms this interpreter does not match, so pip "
+                    "had to build its source distribution, and a package with compiled parts "
+                    "will not import here however it is built."
+                )
+                sys.stderr.write(f"note: {why(f'{project} {text}', rest)}\n")
+
+    LinkEvaluator.evaluate_link = evaluate
+    SourceDistribution.prepare_distribution_metadata = prepare
+    wheel_builder._build_one = build
+    Factory.get_installation_error = installation_error
+    return report
+
+
+report = None
+if {"install", "download", "wheel"} & set(sys.argv[1:]):
+    try:
+        report = guard()
+    except Exception:
+        pass
+from pip._internal.cli.main import main
+
+sys.argv[0] = "pip"
+status = main()
+if report is not None:
+    report(status)
+sys.exit(status)
+'''
 
 # The environment's interpreter link. Its `bin/` goes on `PATH` for the scripts pip installs there,
 # so the name is one no image provides: `python3.13` would shadow the image's own Python of that
@@ -1072,6 +1237,11 @@ def _write(path, data, mode):
         _write_all(fd, data)
     finally:
         os.close(fd)
+
+
+def _guard_source():
+    """`_PIP_GUARD`, ahead of which go the reason its refusals give and where such code can run."""
+    return f"NO_COMPILED = {_NO_COMPILED!r}\nROUTE = {_elsewhere(pip=True)!r}\n{_PIP_GUARD}"
 
 
 def _make_environment():
@@ -1102,7 +1272,9 @@ def _make_environment():
     _replace(os.path.join(site_packages, "outrig.pth"), lambda made: _write(made, payload, 0o644))
     link = os.path.join(bin_dir, _LINK)
     _replace(link, lambda made: os.symlink(sys.executable, made))
-    script = _PIP.format(python=shlex.quote(link)).encode()
+    guard = os.path.join(share, "pip-guard.py")
+    _replace(guard, lambda made: _write(made, _guard_source().encode(), 0o644))
+    script = _PIP.format(python=shlex.quote(link), guard=shlex.quote(guard)).encode()
     for name in ("pip", "pip3", f"pip{_MINOR}"):
         _replace(os.path.join(pip, name), lambda made: _write(made, script, 0o755))
     return link, site_packages, [pip, bin_dir]
@@ -1156,14 +1328,18 @@ _COMPILED_SUFFIXES = (".so", ".pyd")
 _NamespacePath = importlib._bootstrap_external._NamespacePath
 
 
-def _elsewhere():
-    """Where code that needs compiled packages can run, as a sentence."""
+def _elsewhere(pip=False):
+    """Where code that needs compiled packages can run, as a sentence; with `pip`, and the image's
+    own Python found, a second sentence on how to install for it."""
     found = _image_python()
     python = f"the image's own Python, {found}," if found else "a Python the image provides"
-    return (
+    text = (
         f"Code that needs a compiled package can run with {python} through subprocess, or as a "
         f"service."
     )
+    if pip and found:
+        text += f" `{found} -m pip` installs packages for it."
+    return text
 
 
 def _compiled_file(name):
@@ -1274,16 +1450,20 @@ class Python:
     - `pip install` adds pure-Python packages, which import at once, with no restart. This `pip`
       is the interpreter's own: it installs into an environment of this interpreter's under your
       home, which is on `sys.path` and which no other Python in the container reads, and puts a
-      package's scripts on `PATH`. `sys.executable -m pip` installs there too. `pip install
-      --target DIR` works as well, once `DIR` is appended to `sys.path`. What the image's own
-      Python has installed, or installs with `python3 -m pip`, is not on this interpreter's
-      `sys.path`.
+      package's scripts on `PATH`. `sys.executable -m pip` installs there too, without the note on
+      a compiled package below. `pip install --target DIR` works as well, once `DIR` is appended
+      to `sys.path`. What the image's own Python has installed, or installs with `python3 -m pip`,
+      is not on this interpreter's `sys.path`.
     - Modules in the workspace -- the directory the interpreter started in, `workspace` below --
       import too. It comes after the standard library on `sys.path`, so a file of yours named like
       a standard module does not replace it.
     - Compiled code never loads: this is a static build, with no way to load a shared object. A
       package with compiled parts -- numpy, pandas, pydantic, lxml, cryptography -- does not
-      import however it is installed, and `ctypes` imports but cannot load a library.
+      import however it is installed, and `ctypes` imports but cannot load a library. `pip` finds
+      no wheel of such a package that fits this interpreter, so it builds the source distribution,
+      which fails or makes a module that cannot load; when it fails, `pip` says why at the end of
+      its output. A package that lists compiled wheels and builds to pure Python from source, as
+      MarkupSafe does, installs and imports.
     - Code that needs such a package runs with the image's own Python, `image_python` below,
       through `subprocess`, where `python3 -m pip` installs for that Python. Or it runs as a
       service.

@@ -3910,6 +3910,151 @@ fn pip_installs_a_pure_package_that_imports_at_once() {
     );
 }
 
+/// pip offers this interpreter only the bare platform tag, so a package whose
+/// wheels are all compiled goes to its source distribution. Whether that builds
+/// to something usable is not known until it is built -- MarkupSafe's does, as
+/// pure Python -- so nothing is refused. When the build fails, or a package has
+/// nothing to build, pip says why last: the package has compiled parts, and
+/// this interpreter cannot load them. Only the `pip` command says so:
+/// `sys.executable -m pip` is the same pip, unwrapped.
+#[test]
+fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let index = tempfile::tempdir().expect("tempdir");
+    let mut k = Interpreter::spawn(&Start {
+        home: Some(home.path()),
+        ..Start::default()
+    });
+    k.output(1, PIP_PROBE);
+    let setup = format!(
+        "import importlib.util, sys\n\
+         index = {index:?}\n\
+         # What numpy is without a compiler: compiled wheels for other platforms, and a source\n\
+         # distribution whose build fails, either reading its metadata or building the wheel.\n\
+         project(index, 'ext', tag=COMPILED, build='fails')\n\
+         project(index, 'extlate', tag=COMPILED, build='late')\n\
+         # What MarkupSafe is: the same listing, and a source distribution that builds pure.\n\
+         project(index, 'extpure', tag=COMPILED, build='pure')\n\
+         # What torch is: compiled wheels and nothing else.\n\
+         project(index, 'extonly', tag=COMPILED)\n\
+         # A wheel for Python 2 does not fit either, and is not compiled.\n\
+         project(index, 'py2only', tag='py2-none-any', build='fails')\n\
+         project(index, 'buildable', build='pure')\n\
+         # Versions: 1.0 is pure and 2.0 compiled only, so 2.0 is the one that is not there to use.\n\
+         wheel(index, 'mixed')\n\
+         wheel(index, 'mixed', tag=COMPILED, version='2.0')\n\
+         # A hash that does not match, which pip finds before it builds anything.\n\
+         open(os.path.join(index, 'bad.txt'), 'w').write('ext==1.0 --hash=sha256:' + '0' * 64)\n\
+         def said(*args, python=None):\n\
+         \x20   run = pip('install', '--no-index', '--find-links', index, *args, python=python, \
+                          check=False)\n\
+         \x20   return run.returncode, run.stdout + run.stderr\n\
+         None",
+        index = index.path(),
+    );
+    k.output(2, &setup);
+    // A failed build ends with the note, after pip's own error, naming the package and the
+    // reason first, and the image's own Python as the route.
+    let failed = "out = {}\n\
+                  for name in ('ext', 'extlate'):\n\
+                  \x20   code, text = said(name)\n\
+                  \x20   last = text.rstrip().rsplit('\\n', 1)[-1]\n\
+                  \x20   out[name] = (code != 0, text.index('error:') < text.index(f'note: {name} 1.0'), \
+                                     last.startswith(f'note: {name} 1.0 has compiled parts, and \
+                                                       this interpreter cannot load compiled \
+                                                       code: '), \
+                                     'Code that needs a compiled package can run with' in last, \
+                                     importlib.util.find_spec(name))\n\
+                  out";
+    assert_eq!(
+        k.output(3, failed),
+        "{'ext': (True, True, True, True, None), 'extlate': (True, True, True, True, None)}\n"
+    );
+    // A package with nothing to build gets the reason on pip's own error.
+    let only = "code, text = said('extonly')\n\
+                (code != 0, 'No matching distribution found for extonly' in text, \
+                 'extonly has compiled parts, and this interpreter cannot load compiled code' \
+                 in text)";
+    assert_eq!(k.output(4, only), "(True, True, True)\n");
+    // A wheel for another Python is not compiled, and a build that works needs no note.
+    let pure = "code, text = said('py2only')\n\
+                code2, text2 = said('extpure')\n\
+                code3, text3 = said('buildable')\n\
+                import extpure, buildable\n\
+                (code != 0, 'compiled parts' not in text, \
+                 (code2, 'compiled parts' in text2), (code3, 'compiled parts' in text3), \
+                 extpure.ANSWER, buildable.ANSWER)";
+    assert_eq!(
+        k.output(5, pure),
+        "(True, True, (0, False), (0, False), 42, 42)\n"
+    );
+    // The note is for a build that failed, and for versions that are not there to use. A hash that
+    // does not match is found before any build, a version that does not exist is not compiled,
+    // and a project with a pure 1.0 and a compiled 2.0 is missing 2.0 for that reason.
+    let versions = "code, text = said('-r', os.path.join(index, 'bad.txt'))\n\
+                    code2, text2 = said('extonly==2.0')\n\
+                    code3, text3 = said('mixed==2.0')\n\
+                    (code != 0, 'DO NOT MATCH THE HASHES' in text, 'compiled parts' in text, \
+                     (code2 != 0, 'compiled parts' in text2), \
+                     (code3 != 0, 'mixed has compiled parts' in text3))";
+    assert_eq!(
+        k.output(7, versions),
+        "(True, True, False, (True, False), (True, True))\n"
+    );
+    // The same pip run as `sys.executable -m pip` fails the same way, with no note.
+    let unwrapped = "code, text = said('ext', python=sys.executable)\n\
+                     (code != 0, 'the build failed' in text, 'compiled parts' in text)";
+    assert_eq!(k.output(6, unwrapped), "(True, True, False)\n");
+}
+
+/// The guard stands down when a seam it wraps is gone from pip, as one may be
+/// after a pip upgrade: pip then runs as it would have, minus the note. Here a
+/// copy of the payload's pip lacks `Factory.get_installation_error`, which only
+/// a failed resolution calls, so installs that resolve still run.
+#[test]
+fn the_pip_guard_stands_down_when_a_seam_it_wraps_is_gone() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let work = tempfile::tempdir().expect("tempdir");
+    let mut k = Interpreter::spawn(&Start {
+        home: Some(home.path()),
+        ..Start::default()
+    });
+    k.output(1, PIP_PROBE);
+    let setup = format!(
+        "import shutil, sys, sysconfig\n\
+         work = {work:?}\n\
+         index = os.path.join(work, 'index')\n\
+         os.makedirs(index)\n\
+         project(index, 'ext', tag=COMPILED, build='fails')\n\
+         project(index, 'buildable', build='pure')\n\
+         shutil.copytree(os.path.join(sysconfig.get_path('purelib'), 'pip'), os.path.join(work, 'pip'))\n\
+         factory = os.path.join(work, 'pip/_internal/resolution/resolvelib/factory.py')\n\
+         text = open(factory).read()\n\
+         assert 'def get_installation_error' in text\n\
+         open(factory, 'w').write(text.replace('def get_installation_error', 'def renamed_error'))\n\
+         guard = os.path.expanduser('~/.local/share/outrig/pip-guard.py')\n\
+         def said(name):\n\
+         \x20   run = subprocess.run([sys.executable, '-I', '-c', \"import sys; \
+                                      sys.path.insert(0, sys.argv[1]); guard = sys.argv[2]; \
+                                      sys.argv[1:3] = []; \
+                                      exec(compile(open(guard).read(), guard, 'exec'))\", \
+                                     work, guard, '--isolated', '--disable-pip-version-check', \
+                                     '--no-cache-dir', 'install', '--no-index', \
+                                     '--find-links', index, name], \
+                                    capture_output=True, text=True)\n\
+         \x20   return run.returncode, run.stdout + run.stderr\n\
+         None",
+        work = work.path(),
+    );
+    k.output(2, &setup);
+    let check = "code, text = said('buildable')\n\
+                 code2, text2 = said('ext')\n\
+                 import buildable\n\
+                 (code, buildable.ANSWER, code2 != 0, 'the build failed' in text2, \
+                  'compiled parts' in text2)";
+    assert_eq!(k.output(3, check), "(0, 42, True, True, False)\n");
+}
+
 /// What another Python installs for the container user -- the image's own,
 /// with `python3 -m pip install --user` -- is not this interpreter's: the user
 /// site is off `sys.path`, and a module put there does not import. Nor does

@@ -901,6 +901,40 @@ mod e2e {
             .expect("the container stops");
     }
 
+    /// The note on a package with compiled parts is the payload's pip alone,
+    /// because only that interpreter cannot load them. In the same container
+    /// the image's own `python3 -m pip` builds the same source distribution
+    /// and fails with its own error and no note: it can load what it builds.
+    #[tokio::test]
+    async fn the_compiled_parts_note_is_the_payloads_pip_and_not_the_images() {
+        let container = session(PYTHON_ALPINE, true).await;
+        let interpreter = within(Interpreter::start(&container, Events::off()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
+        let setup = "os.makedirs('/tmp/index')\n\
+                     project('/tmp/index', 'ext', tag=COMPILED, build='fails')\n\
+                     def failure(python=None):\n\
+                     \x20   try:\n\
+                     \x20       pip('install', '--no-index', *(['--user'] if python else []), \
+                              '--find-links', '/tmp/index', 'ext', python=python)\n\
+                     \x20   except RuntimeError as e:\n\
+                     \x20       return str(e)";
+        assert_eq!(run(&interpreter, setup).await, ok(""));
+        let agents = "text = failure()\n\
+                      ('the build failed' in text, 'ext 1.0 has compiled parts' in text, \
+                       '`/usr/local/bin/python3 -m pip` installs packages for it' in text)";
+        assert_eq!(run(&interpreter, agents).await, ok("(True, True, True)\n"));
+        let images = "text = failure('python3')\n\
+                      ('the build failed' in text, 'compiled parts' in text)";
+        assert_eq!(run(&interpreter, images).await, ok("(True, False)\n"));
+        drop(interpreter);
+        container
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("the container stops");
+    }
+
     /// podman's own error is the cause, and it arrives when podman gives up
     /// rather than when the ready timeout would.
     #[tokio::test]

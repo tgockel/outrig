@@ -304,7 +304,13 @@ interpreter finds the package at once and no other Python in the image looks; `p
 installs for the image's Python. Fetching one needs the network and CA certificates the image and
 `[network]` allow. Compiled code never loads in a static interpreter, so numpy and other packages
 with compiled parts do not import however they are installed, and the error the model reads says
-so and names the image's own Python, if it has one, as the place to run such code. In its Python,
+so and names the image's own Python, if it has one, as the place to run such code. The interpreter's
+`pip` finds no wheel of such a package that fits, so it builds the package's source distribution
+instead: that fails for numpy, and succeeds for a package such as MarkupSafe whose source builds
+to pure Python, which then imports. When `pip` fails on a package that lists compiled wheels, it
+ends its output with a note saying so and naming the image's own Python. The note is the `pip`
+command's: `sys.executable -m pip` runs the same pip without it, and `python3 -m pip` is the
+image's own, unchanged. In its Python,
 `runtime.python` summarizes this, `runtime.names()` lists what the agent has bound, and `help(x)`
 describes anything in at most 8 KiB.
 

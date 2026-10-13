@@ -320,7 +320,9 @@ fn check_reported(dists: &[Dist], report: &Path, set: &[String]) -> Result<()> {
 }
 
 /// Refuse anything in `stage` that is not pure Python: a wheel whose tags say otherwise, and an
-/// extension module among the files of one whose tags do not.
+/// extension module among the files of one whose tags do not. The tag rule -- every tag
+/// `*-none-any` -- is the one `_PIP_GUARD` in `interpreter.py` applies to wheels pip cannot match,
+/// where it is the evidence that a package has compiled parts.
 fn check_pure(stage: &Path, dists: &[Dist], set: &[String]) -> Result<()> {
     for dist in dists {
         let wheel = dist.dir.join("WHEEL");

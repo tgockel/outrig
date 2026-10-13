@@ -40,6 +40,10 @@ and the agent would import what the project imports.
     one.
   - `pip` should then mean the image's Python's pip, installing where that Python looks. The
     `PATH` shim `_open_imports` sets up is the payload's and would have to follow the choice.
+    - The note on a failed install of a package with compiled parts (#465, `_PIP_GUARD` in
+      `interpreter.py`) is part of that shim and exists only because the payload's interpreter
+      cannot load compiled code. On the image's Python compiled wheels load, so the note must go
+      with the shim: its "this interpreter cannot load compiled code" would be false.
   - The image's Python may be externally managed (PEP 668), which refuses a plain
     `pip install`. Say what happens then rather than working around it.
 - What is lost: working in an image without Python, and one interpreter version to test against.

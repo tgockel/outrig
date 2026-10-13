@@ -447,21 +447,32 @@ pub(crate) async fn pull(image: &str) {
 
 // ---------------------------------------------------------------------------- pip
 
-/// Python binding `wheel(directory, module, script=None, requires=None)`,
-/// which writes a pure-Python wheel whose one module holds `ANSWER = 42` and a
-/// `main()` that prints it, as the console script `script` when one is named
-/// and requiring the distribution `requires` when one is, and returns its
-/// path; and `pip(*args, python=None, **options)`, which runs the `pip` on
-/// `PATH`, or `python -m pip`, with `options` for `subprocess.run`, and raises
-/// with everything it said if it fails. A wheel installed with `--no-index`
-/// needs no network.
+/// Python binding `wheel(directory, module, script=None, requires=None, tag=...,
+/// version="1.0")`, which writes a wheel, pure Python unless `tag` says otherwise, whose one
+/// module holds `ANSWER = 42` and a `main()` that prints it, as the console
+/// script `script` when one is named and requiring the distribution `requires`
+/// when one is, and returns its path; `project(directory, name, tag=None,
+/// build=None)`, which writes what an index lists for `name` 1.0 -- a wheel
+/// tagged `tag` if one is given, and a source distribution if `build` is -- and
+/// `build` says what the source distribution's in-tree build backend does:
+/// `"pure"` builds a pure-Python wheel, as MarkupSafe's source does,
+/// `"fails"` raises while reading its metadata, as numpy's does without a
+/// compiler, and `"late"` raises building the wheel after its metadata read
+/// fine; `COMPILED`, the tag of a compiled wheel built for a platform this
+/// interpreter does not match; and `pip(*args, python=None, check=True,
+/// **options)`, which runs the `pip` on `PATH`, or `python -m pip`, with
+/// `options` for `subprocess.run`, and returns the run -- or, if it fails and
+/// `check` is true, raises with everything it said. A wheel installed with
+/// `--no-index` needs no network.
 pub(crate) const PIP_PROBE: &str = r#"
-import os, subprocess, zipfile
+import io, os, subprocess, tarfile, tempfile, zipfile
 
-def wheel(directory, module, script=None, requires=None):
-    dist = f"{module}-1.0.dist-info"
-    path = os.path.join(directory, f"{module}-1.0-py3-none-any.whl")
-    metadata = f"Metadata-Version: 2.1\nName: {module}\nVersion: 1.0\n"
+COMPILED = "cp313-cp313-manylinux_2_17_x86_64"
+
+def wheel(directory, module, script=None, requires=None, tag="py3-none-any", version="1.0"):
+    dist = f"{module}-{version}.dist-info"
+    path = os.path.join(directory, f"{module}-{version}-{tag}.whl")
+    metadata = f"Metadata-Version: 2.1\nName: {module}\nVersion: {version}\n"
     if requires:
         metadata += f"Requires-Dist: {requires}\n"
     with zipfile.ZipFile(path, "w") as z:
@@ -469,14 +480,14 @@ def wheel(directory, module, script=None, requires=None):
         z.writestr(f"{dist}/METADATA", metadata)
         z.writestr(
             f"{dist}/WHEEL",
-            "Wheel-Version: 1.0\nGenerator: outrig-tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            f"Wheel-Version: 1.0\nGenerator: outrig-tests\nRoot-Is-Purelib: true\nTag: {tag}\n",
         )
         if script:
             z.writestr(f"{dist}/entry_points.txt", f"[console_scripts]\n{script} = {module}:main\n")
         z.writestr(f"{dist}/RECORD", "")
     return path
 
-def pip(*args, python=None, **options):
+def pip(*args, python=None, check=True, **options):
     command = [python, "-m", "pip"] if python else ["pip"]
     run = subprocess.run(
         [*command, "--isolated", "--disable-pip-version-check", "--no-cache-dir", *args],
@@ -484,8 +495,51 @@ def pip(*args, python=None, **options):
         text=True,
         **options,
     )
-    if run.returncode:
+    if check and run.returncode:
         raise RuntimeError(f"pip {args} exited {run.returncode}:\n{run.stdout}{run.stderr}")
+    return run
+
+BACKEND = """
+import os, shutil
+
+BUILD = "BUILD"
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    if BUILD == "fails":
+        raise RuntimeError("the build failed, as one with no compiler does")
+    dist = "NAME-1.0.dist-info"
+    os.makedirs(os.path.join(metadata_directory, dist))
+    with open(os.path.join(metadata_directory, dist, "METADATA"), "w") as f:
+        f.write("Metadata-Version: 2.1\\nName: NAME\\nVersion: 1.0\\n")
+    return dist
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    if BUILD != "pure":
+        raise RuntimeError("the build failed, as one with no compiler does")
+    name = "NAME-1.0-py3-none-any.whl"
+    shutil.copy(os.path.join(os.path.dirname(__file__), "built.whl"),
+                os.path.join(wheel_directory, name))
+    return name
+"""
+
+def project(directory, name, tag=None, build=None):
+    if tag:
+        wheel(directory, name, tag=tag)
+    if build:
+        members = [
+            ("pyproject.toml", b'[build-system]\nrequires = []\nbuild-backend = "backend"\n'
+                               b'backend-path = ["."]\n'),
+            ("backend.py", BACKEND.replace("NAME", name).replace('"BUILD"', repr(build)).encode()),
+        ]
+        if build == "pure":
+            with tempfile.TemporaryDirectory() as built:
+                with open(wheel(built, name), "rb") as f:
+                    members.append(("built.whl", f.read()))
+        with tarfile.open(os.path.join(directory, f"{name}-1.0.tar.gz"), "w:gz") as t:
+            for member, data in members:
+                info = tarfile.TarInfo(f"{name}-1.0/{member}")
+                info.size = len(data)
+                t.addfile(info, io.BytesIO(data))
 "#;
 
 /// Builds, into the directory it is given, the wheels and the source distribution the install

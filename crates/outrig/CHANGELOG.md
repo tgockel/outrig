@@ -60,7 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the package imports without a restart. Compiled code cannot load in the static interpreter,
   and a failed import says so -- naming the compiled file, or for a module found nowhere, saying
   that `pip install` works for pure-Python packages only -- along with the image's own Python as
-  the place to run such code.
+  the place to run such code. So does a failed `pip install` of a package that lists compiled
+  wheels, which pip builds from source because none fits this interpreter: the output ends with a
+  note that the package has compiled parts and where they can run, instead of leaving only a
+  build error about dependencies. A package that lists the same wheels but builds to pure Python,
+  such as MarkupSafe, installs as before, and the image's own `python3 -m pip` is unchanged.
 
   The conversation is kept whole, and each model call is sent part of it. `round` commits each
   turn -- one model call and the tool results it asked for -- as it completes, so a round that
