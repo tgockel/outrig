@@ -505,6 +505,13 @@ mod tests {
         // Raw mode appears only well past the budget the guard used to give up
         // on, standing in for a reader the scheduler kept off the CPU.
         let flip_at = OLD_BUDGET * 3;
+
+        // Taken before the spawn, not after: the flipper's sleep begins as soon
+        // as it is scheduled, which can be before this thread runs again. With
+        // the clock already started the flip is at least `flip_at` past it
+        // however the two threads interleave, and `await_quiescence` can only
+        // report `Reading` after the flip.
+        let started = Instant::now();
         let flipper = {
             let raw = Arc::clone(&raw);
             std::thread::spawn(move || {
@@ -513,7 +520,6 @@ mod tests {
             })
         };
 
-        let started = Instant::now();
         let verdict = lease.await_quiescence(
             &|| raw.load(Ordering::SeqCst),
             // Generous: the point is that it returns on the state, not the bound.
