@@ -179,8 +179,9 @@ warning: unused import: `std::collections::HashMap`
 returns when EOF is reached and no further writes are expected.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
-`conn.log`-style JSON object per outbound TCP connection. It is not selected with the server-name
-argument because it is not an MCP stderr log; read it directly from the session directory:
+`conn.log`-style JSON object per outbound TCP connection and one per name lookup. It is not
+selected with the server-name argument because it is not an MCP stderr log; read it directly from
+the session directory:
 
 ```sh
 $ jq . /tmp/my-debug-run/logs/network.jsonl
@@ -202,6 +203,18 @@ connecting straight to the listener's port, which the redirect leaves alone beca
 loopback -- is closed on arrival and recorded with `outrig.action` `deny` and `outrig.rule`
 `not-redirected`. Its only destination is the listener itself, which the interceptor would
 otherwise dial from the host's network namespace.
+
+A name lookup is recorded as the UDP exchange with the interceptor's DNS listener that it is:
+`proto` is `udp`, `service` is `dns`, `id.resp_p` is 53, and `outrig.host` is the name the
+container asked for, with `outrig.host_source` `asserted`. `id.resp_h` is the address the query
+reached the listener at, which is loopback whichever resolver the tool aimed at, since the
+redirect has rewritten it by then. `orig_bytes` is the query's size. The record is written when
+the lookup is decided, before any resolver is asked, so `duration` and `resp_bytes` are zero and
+`conn_state` is `S0` however the lookup came out; `outrig.action` and `outrig.rule` say whether
+it was answered or refused, and why. A query that is not a plain
+question for one name is refused under `outrig.rule` `dns-unparsed` where any lookup could be,
+and has no `outrig.host` when even its question could not be read. See
+[Reference -> Config](../reference/config.md#name-lookups) for what decides a lookup.
 
 Interception ends with the session, and ending it is the exact inverse of starting it. Every
 connection still open through the interceptor is cut, and each one is recorded before teardown

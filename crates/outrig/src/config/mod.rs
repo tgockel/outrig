@@ -1985,6 +1985,20 @@ pub(crate) enum NetworkHostPattern {
     AddressGlob(String),
 }
 
+impl NetworkHostPattern {
+    /// Whether this pattern matches every address of the family it describes:
+    /// a `*` glob, or a CIDR with no prefix. The one kind of address entry that
+    /// could grant a connection to any name, since any name can resolve to an
+    /// address of that family.
+    pub(crate) fn covers_every_address(&self) -> bool {
+        match self {
+            Self::Cidr { prefix, .. } => *prefix == 0,
+            Self::AddressGlob(pattern) => pattern.chars().all(|c| c == '*'),
+            Self::Ip(_) | Self::HostGlob(_) => false,
+        }
+    }
+}
+
 pub(crate) fn parse_network_host_pattern(
     host: &str,
 ) -> std::result::Result<NetworkHostPattern, String> {

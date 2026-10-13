@@ -91,6 +91,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under `[network] mode = "filter"` and a deny default, a container resolves only the names an
+  `allow` hostname entry could match, and every lookup is recorded.** The interceptor's DNS
+  listener forwarded every lookup to the host's resolvers whatever the policy, and wrote nothing
+  to `network.jsonl`, so a container under `default = "deny"` could send data out as the labels of
+  names in any zone -- `<data>.attacker.example` reaches that zone's name servers -- with no
+  record of it, and `deny = ["*:53"]` only ever covered TCP. A lookup is now decided by its
+  name. A portless hostname `deny` entry refuses the lookups it matches under either default. Under `default = "deny"` a name resolves
+  only when an `allow` hostname entry matches it, whatever that entry's port, or when an `allow`
+  entry matches every address (`*`, `0.0.0.0/0`, `::/0`); `*.example.com` does not match
+  `example.com`. A refused lookup is answered REFUSED and never reaches a resolver. A query that
+  is not a plain question for one name -- not a query, extra records beyond one EDNS record, a
+  compressed or over-long name -- is refused wherever a lookup could be, under rule
+  `dns-unparsed`. Every lookup writes a record, in audit mode too, with `proto` `udp`, `service`
+  `dns`, and the name asked for in `outrig.host`, before its query is forwarded. Two behaviors
+  change: under a deny default, a name that resolved only because it fell in an allowed address
+  or CIDR now needs an `allow` entry of its own, and under an allow default a name a hostname
+  `deny` entry matches stops resolving, where its connection used to be denied. See
+  [Name lookups](../../doc/reference/config.md#name-lookups). (#361)
+
 - **The names a network attachment holds for one address are capped at 64.** The table of what
   the attachment's DNS listener validated bounded the addresses it held (4096) but not the names
   behind each, so a container resolving `n1.wild.example`, `n2.wild.example`, ... against a

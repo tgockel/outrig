@@ -850,12 +850,14 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
 
     // The entrypoint touched example.com *before* serving MCP; an audit
     // record attributed to the sidecar proves interception was live ahead of
-    // the entrypoint's first packet.
+    // the entrypoint's first packet. A connection's, not its lookup's: the
+    // lookup is recorded too, and says nothing of the proxy.
     let log = std::fs::read_to_string(session_dir.join("logs/network.jsonl"))
         .expect("network.jsonl exists");
     assert!(
-        log.lines()
-            .any(|l| l.contains(&sidecar) && l.contains("example.com")),
+        log.lines().any(|l| l.contains(&sidecar)
+            && l.contains("example.com")
+            && l.contains(r#""proto":"tcp""#)),
         "audit log should attribute the entrypoint's startup traffic to the \
          sidecar container:\n{log}"
     );

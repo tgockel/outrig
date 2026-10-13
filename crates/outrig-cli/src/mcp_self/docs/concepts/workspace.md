@@ -188,12 +188,12 @@ outbound container traffic:
 mode = "audit"
 ```
 
-Audit mode writes one Zeek `conn.log`-style JSON object per TCP connection to
-`<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection is still
-allowed, but records include the best known host, destination IP and port, transport, service,
-byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
-body inspection are deferred. The interceptor carries TCP and DNS over UDP/53; any other
-datagram leaves by podman's default route and is not recorded.
+Audit mode writes one Zeek `conn.log`-style JSON object per TCP connection, and one per name
+lookup, to `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection
+and every lookup is still allowed, but records include the best known host, destination IP and
+port, transport, service, byte counts, and duration. HTTPS remains opaque except for TLS SNI.
+URL, method, status, and body inspection are deferred. The interceptor carries TCP and DNS over
+UDP/53; any other datagram leaves by podman's default route and is not recorded.
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:
@@ -217,6 +217,12 @@ which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no 
 `default` directly, so a deny default stops it. Such a datagram never reaches the interceptor
 and writes no `network.jsonl` record; see [Reference -> Config](../reference/config.md) for
 what is carried and what the sending tool sees.
+
+Name lookups, which are UDP/53, are decided by the name asked for, since a name travels to
+whoever serves its zone. Under a deny default the container resolves only the names an `allow`
+hostname entry matches, and an address or CIDR entry opens none; a refused lookup is answered
+REFUSED without a resolver being asked. Every lookup is recorded either way. See
+[Reference -> Config](../reference/config.md#name-lookups).
 
 A hostname entry in `allow` grants only against a destination outrig resolved to that name
 itself, through the container's own lookup at the interceptor's DNS listener. A name the

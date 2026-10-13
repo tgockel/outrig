@@ -81,6 +81,9 @@ const PASTA_HOST_STAND_IN: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The port a resolver answers on, which is the one the redirect carries to the
+/// DNS listener.
+const DNS_PORT: u16 = 53;
 /// How many lookups one attachment forwards at once. Each holds an ephemeral
 /// socket until its answer or its `DNS_TIMEOUT` per resolver, so this is also
 /// the attachment's bound on those. Past it the listener stops reading and
@@ -100,6 +103,11 @@ const CONNECTION_LIMIT_RULE: &str = "connection-limit";
 /// recorded under; see [`not_redirected`]. Labelled like
 /// [`CONNECTION_LIMIT_RULE`], and for the same reason.
 const UNREDIRECTED_RULE: &str = "not-redirected";
+/// The `outrig.rule` a lookup is refused under when it is not a plain question
+/// for one name, so there is no name to decide on; see
+/// [`CompiledNetworkPolicy::decide_lookup`]. Labelled like
+/// [`CONNECTION_LIMIT_RULE`], and for the same reason.
+const UNPARSED_LOOKUP_RULE: &str = "dns-unparsed";
 /// How long a listener waits before trying again after a failure that is not
 /// about one connection -- out of descriptors, buffers, memory. Connections
 /// finishing is what frees those, which takes time, and trying again at once
@@ -132,26 +140,39 @@ const MAX_NAMES_PER_ADDRESS: usize = 64;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_AAAA: u16 = 28;
+const DNS_TYPE_OPT: u16 = 41;
+/// The RCODEs the interceptor answers with itself.
+const DNS_RCODE_SERVFAIL: u16 = 2;
+const DNS_RCODE_REFUSED: u16 = 5;
 /// Longest CNAME chain followed inside one answer section.
 const MAX_CNAME_DEPTH: usize = 8;
+/// How many compression pointers one name may follow before it is refused.
+const MAX_DNS_POINTERS: usize = 8;
 /// Longest single label a name may carry, per RFC 1035.
 const MAX_DNS_LABEL: usize = 63;
+/// Longest name in presentation form, without the root's trailing dot: the 255
+/// bytes a name may take on the wire, less its first length byte and its
+/// terminator.
+const MAX_DNS_NAME: usize = 253;
 /// Chunk size for the bridge's two copy directions.
 const COPY_BUFFER: usize = 8 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PolicyDecision {
     action: NetworkAction,
     rule: String,
 }
 
 impl PolicyDecision {
-    #[cfg(test)]
-    fn allow_default() -> Self {
+    fn new(action: NetworkAction, rule: impl Into<String>) -> Self {
         Self {
-            action: NetworkAction::Allow,
-            rule: "default".to_string(),
+            action,
+            rule: rule.into(),
         }
+    }
+
+    fn allow_default() -> Self {
+        Self::new(NetworkAction::Allow, "default")
     }
 }
 
@@ -186,26 +207,40 @@ impl<S: Into<String>> FromIterator<S> for ResolvedNames {
 struct ClientAssertion {
     http_host: Option<String>,
     sni: Option<String>,
+    /// The name of a DNS lookup, which is the client saying where it means to
+    /// go before it has gone. Names a lookup's record; no policy decision is
+    /// ever made on it as a claim.
+    query: Option<String>,
 }
 
 impl ClientAssertion {
     fn http(host: String) -> Self {
         Self {
             http_host: Some(host.to_ascii_lowercase()),
-            sni: None,
+            ..Self::default()
         }
     }
 
     fn tls(sni: String) -> Self {
         Self {
-            http_host: None,
             sni: Some(sni.to_ascii_lowercase()),
+            ..Self::default()
+        }
+    }
+
+    fn dns(query: String) -> Self {
+        Self {
+            query: Some(query),
+            ..Self::default()
         }
     }
 
     /// The name the client claimed, whichever parser found it.
     fn asserted_host(&self) -> Option<&str> {
-        self.http_host.as_deref().or(self.sni.as_deref())
+        self.http_host
+            .as_deref()
+            .or(self.sni.as_deref())
+            .or(self.query.as_deref())
     }
 
     fn is_empty(&self) -> bool {
@@ -278,9 +313,86 @@ impl CompiledNetworkPolicy {
             rule: "default".to_string(),
         }
     }
+
+    /// Whether the container may look `name` up, which the interceptor
+    /// answers from the host's resolvers and so is a way out of the container
+    /// like any connection: the name travels to whoever serves its zone.
+    /// `None` is a query that is not a plain question for one name, whose
+    /// destination there is no telling.
+    ///
+    /// A lookup carries no port, so a port on an entry counts neither for nor
+    /// against it: an `allow` host glob opens the lookups it matches whatever
+    /// port it names, and only a `deny` host glob with no port forbids one.
+    /// `deny` wins, as it does in [`decide`](Self::decide), under either
+    /// default, so the log never calls a name `allow` that a `deny` entry
+    /// matches.
+    ///
+    /// Under `default = "allow"` everything else is open. Under
+    /// `default = "deny"` a lookup is open only to a name some `allow` entry
+    /// could grant a connection to by name: a host glob matching it, or an
+    /// entry matching every address. An `allow` entry for one address or range
+    /// opens none: a name is not an address, and the entry is evidence only of
+    /// connections to that address.
+    fn decide_lookup(&self, name: Option<&str>) -> PolicyDecision {
+        let Some(name) = name else {
+            return if self.gates_lookups() {
+                PolicyDecision::new(NetworkAction::Deny, UNPARSED_LOOKUP_RULE)
+            } else {
+                PolicyDecision::allow_default()
+            };
+        };
+        if let Some(idx) = self.deny.iter().position(|entry| {
+            entry
+                .lookup_deny_glob()
+                .is_some_and(|pattern| glob_matches(pattern, name))
+        }) {
+            return PolicyDecision::new(NetworkAction::Deny, format!("deny[{idx}]"));
+        }
+        if self.default == NetworkAction::Allow {
+            return PolicyDecision::allow_default();
+        }
+        match self
+            .allow
+            .iter()
+            .position(|entry| entry.admits_lookup_of(name))
+        {
+            Some(idx) => PolicyDecision::new(NetworkAction::Allow, format!("allow[{idx}]")),
+            None => PolicyDecision::new(NetworkAction::Deny, "default"),
+        }
+    }
+
+    /// Whether some lookup can be refused by name: when none can, a query
+    /// that cannot be read is no different from one that can, and is let
+    /// through as it always was.
+    fn gates_lookups(&self) -> bool {
+        self.default == NetworkAction::Deny
+            || self
+                .deny
+                .iter()
+                .any(|entry| entry.lookup_deny_glob().is_some())
+    }
 }
 
 impl CompiledNetworkEntry {
+    /// The host glob of this `deny` entry when it refuses the lookups it
+    /// covers: one with no port. An entry for one port forbids connections
+    /// there and no more, and an address entry has no name to forbid.
+    fn lookup_deny_glob(&self) -> Option<&str> {
+        match &self.pattern {
+            NetworkHostPattern::HostGlob(pattern) if self.port.is_none() => Some(pattern),
+            _ => None,
+        }
+    }
+
+    /// Whether this `allow` entry could grant a connection to `name`,
+    /// whatever port it asks for. See [`CompiledNetworkPolicy::decide_lookup`].
+    fn admits_lookup_of(&self, name: &str) -> bool {
+        match &self.pattern {
+            NetworkHostPattern::HostGlob(pattern) => glob_matches(pattern, name),
+            pattern => pattern.covers_every_address(),
+        }
+    }
+
     /// `claimed` is the name the client asserted, or `None` where a claim is
     /// not admissible evidence.
     fn matches(
@@ -662,7 +774,14 @@ impl NetworkInterceptor {
             cancel.clone(),
             live,
         ));
-        tasks.spawn(dns_loop(sockets.dns, resolvers, bindings, cancel.clone()));
+        tasks.spawn(dns_loop(
+            sockets.dns,
+            resolvers,
+            bindings,
+            self.policy.clone(),
+            self.audit.for_attachment(name, generation),
+            cancel.clone(),
+        ));
 
         self.attachments.insert(
             name.to_string(),
@@ -832,7 +951,7 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// drops that set, which requests their abort and does not wait. The caller
 /// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
 /// need no such wait: it aborts them itself on the way out, and they owe
-/// nothing that would be lost if it were aborted first.
+/// nothing that would be lost if it were aborted first; see [`answer_dns`].
 ///
 /// A task that returned an error is reported with it: that is a listener
 /// that had stopped taking traffic before it was asked to.
@@ -2050,7 +2169,7 @@ impl AuditRecord {
             id_orig_p: event.orig.port(),
             id_resp_h: event.dst.ip().to_string(),
             id_resp_p: event.dst.port(),
-            proto: "tcp",
+            proto: event.proto,
             service: event.service,
             duration: event.duration.as_secs_f64(),
             orig_bytes: event.bytes_tx,
@@ -2072,6 +2191,8 @@ impl AuditRecord {
 
 #[derive(Debug, Clone)]
 struct AuditEvent {
+    /// `tcp` for a connection, `udp` for a lookup.
+    proto: &'static str,
     opened: SystemTime,
     duration: Duration,
     orig: SocketAddr,
@@ -2405,6 +2526,7 @@ async fn record_refused(
         &audit.session_id,
         &audit.container,
         AuditEvent {
+            proto: "tcp",
             opened: SystemTime::now(),
             duration: Duration::ZERO,
             orig,
@@ -2579,6 +2701,7 @@ async fn handle_tcp(
     write_audit(
         &audit,
         AuditEvent {
+            proto: "tcp",
             opened,
             duration: started.elapsed(),
             orig,
@@ -2868,9 +2991,21 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
     }
 }
 
+/// Everything one attachment's lookups are decided and answered with, shared
+/// by the tasks that answer them.
+struct DnsContext {
+    /// Passed in rather than read where they are used, so a caller -- and a
+    /// test -- decides who lookups are forwarded to.
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
+}
+
 /// Answers the container's lookups from the host's resolvers, recording what
-/// each name validly resolved to. `resolvers` is passed in rather than read
-/// here so a caller -- and a test -- decides who this forwards to.
+/// each name validly resolved to, for the names `policy` lets it look up; a
+/// lookup it does not is refused without a resolver being asked. Every lookup
+/// is recorded in `audit` either way. See [`answer_dns`].
 ///
 /// Each lookup is forwarded in a task of its own. Every process in the
 /// container shares this listener, and a forward can wait out `DNS_TIMEOUT`
@@ -2888,10 +3023,17 @@ async fn dns_loop(
     socket: UdpSocket,
     resolvers: Vec<SocketAddr>,
     bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
     cancel: CancellationToken,
 ) -> Result<()> {
     let socket = Arc::new(socket);
-    let resolvers: Arc<[SocketAddr]> = resolvers.into();
+    let context = Arc::new(DnsContext {
+        resolvers,
+        bindings,
+        policy,
+        audit,
+    });
     let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
     let mut warned = false;
@@ -2925,17 +3067,15 @@ async fn dns_loop(
                     },
                 };
                 let raw = buf[..n].to_vec();
-                let (socket, resolvers, bindings) =
-                    (socket.clone(), resolvers.clone(), bindings.clone());
+                let (socket, context) = (socket.clone(), context.clone());
                 lookups.spawn(async move {
-                    answer_dns(&socket, &raw, peer, asked, &resolvers, &bindings).await
+                    answer_dns(&socket, &raw, peer, asked, &context).await
                 });
             }
         }
     };
     // Aborted rather than waited out: a forward outlasts the grace a detach
-    // gives this task, and a lookup owes no record, so abandoning one loses
-    // nothing a detach has to account for.
+    // gives this task, and a lookup owes nothing; see [`answer_dns`].
     lookups.shutdown().await;
     ended.map_err(|source| OutrigError::NetworkListenerFailed {
         listener: "dns",
@@ -2943,16 +3083,28 @@ async fn dns_loop(
     })
 }
 
-/// Forwards one query and sends `peer` whatever validly answers it, from
-/// `asked`, the address the query was sent to. When no resolver answers,
-/// `peer` is sent a SERVFAIL instead and the forward's failure is returned.
+/// Decides one query, records the decision, and then either refuses it or
+/// forwards it and sends `peer` whatever validly answers it, from `asked`, the
+/// address the query was sent to. When no resolver answers, `peer` is sent a
+/// SERVFAIL instead and the forward's failure is returned.
+///
+/// A lookup is a way out of the container -- the name reaches whoever serves
+/// its zone -- so it is decided like a connection is: by
+/// [`CompiledNetworkPolicy::decide_lookup`]. What it is decided on is the
+/// question when the query is nothing but a question, and nothing otherwise: a
+/// query that carries more, or that does not parse, has no name the policy
+/// can speak for, and what a resolver would make of it is not something to
+/// find out.
+///
+/// The record is written before the decision takes effect, and waited for, so
+/// a query that reached a resolver is in the audit log. A refusal is answered
+/// REFUSED and is not a failure to forward: it returns `Ok`.
 async fn answer_dns(
     socket: &UdpSocket,
     raw: &[u8],
     peer: SocketAddr,
     asked: Asked,
-    resolvers: &[SocketAddr],
-    bindings: &Bindings,
+    context: &DnsContext,
 ) -> io::Result<()> {
     let query = dns_query(raw);
     tracing::debug!(
@@ -2960,14 +3112,49 @@ async fn answer_dns(
         "dns query from {peer}: {:?}",
         query.as_ref().map(|query| &query.question.name)
     );
-    match forward_dns(raw, query.as_ref(), resolvers).await {
+    let plain = query.as_ref().filter(|query| query.is_plain_question(raw));
+    let decision = context
+        .policy
+        .decide_lookup(plain.map(|query| query.question.name.as_str()));
+    let refused = decision.action == NetworkAction::Deny;
+    // `orig` and `dst` are as the dual-stack listener reports them, v4-mapped
+    // for an IPv4 client. The record describes the exchange before any
+    // resolver is asked, so it has no duration and no response: `S0`.
+    write_audit(
+        &context.audit,
+        AuditEvent {
+            proto: "udp",
+            opened: SystemTime::now(),
+            duration: Duration::ZERO,
+            orig: canonical(peer),
+            dst: canonical(SocketAddr::new(asked.addr(), DNS_PORT)),
+            resolved: ResolvedNames::default(),
+            assertion: query
+                .as_ref()
+                .map_or_else(ClientAssertion::default, |query| {
+                    ClientAssertion::dns(query.question.name.clone())
+                }),
+            service: "dns",
+            bytes_tx: raw.len() as u64,
+            bytes_rx: 0,
+            decision,
+        },
+    )
+    .await;
+    if refused {
+        if let Some(reply) = dns_error_reply(raw, query.as_ref(), DNS_RCODE_REFUSED) {
+            let _ = send_answer(socket, &reply, peer, asked).await;
+        }
+        return Ok(());
+    }
+    match forward_dns(raw, query.as_ref(), &context.resolvers).await {
         Ok(response) => {
             // Bound before the answer goes out, so a connection the client
             // opens on the strength of it is decided with the name in hand.
             if let Some(query) = &query
                 && dns_response_is_bindable(&response)
             {
-                record_dns_bindings(bindings, &query.question.name, &response);
+                record_dns_bindings(&context.bindings, &query.question.name, &response);
             }
             tracing::debug!(
                 target: "outrig::network",
@@ -2994,6 +3181,16 @@ async fn answer_dns(
 enum Asked {
     V6(libc::in6_pktinfo),
     V4(libc::in_pktinfo),
+}
+
+impl Asked {
+    /// The address the query was sent to, as the packet named it.
+    fn addr(&self) -> IpAddr {
+        match self {
+            Asked::V6(info) => IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)),
+            Asked::V4(info) => IpAddr::V4(Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr))),
+        }
+    }
 }
 
 /// The DNS listener, from the socket the namespace helper bound: reporting
@@ -3267,7 +3464,7 @@ fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
             continue;
         };
         if let Ok(ip) = raw.parse::<IpAddr>() {
-            out.push(SocketAddr::new(ip, 53));
+            out.push(SocketAddr::new(ip, DNS_PORT));
         }
     }
     out
@@ -3422,7 +3619,7 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
         Ok(listener) => listener,
         Err(e) => return fail(BindStep::TcpListener, e),
     };
-    let dns = match bind_any(SockType::Datagram, 53) {
+    let dns = match bind_any(SockType::Datagram, DNS_PORT) {
         Ok(socket) => socket,
         Err(e) => return fail(BindStep::DnsListener, e),
     };
@@ -3917,6 +4114,29 @@ fn dns_query(packet: &[u8]) -> Option<DnsQuery> {
 }
 
 impl DnsQuery {
+    /// Whether `raw`, the packet this was parsed from, is nothing but a
+    /// question: a query rather than an answer or any other opcode, with no
+    /// records in it and at most the one EDNS record a stub appends to say what
+    /// it can read. Whatever else a packet carries is something the question's
+    /// name does not account for, and so is not decided by it.
+    fn is_plain_question(&self, raw: &[u8]) -> bool {
+        // The header's counts are the answer, authority and additional ones; a
+        // question parsed, so the 12 bytes of header are all there.
+        let [_, _, flags, _, _, _, 0, 0, 0, 0, 0, additional, ..] = *raw else {
+            return false;
+        };
+        // QR clear, and the opcode QUERY.
+        if flags & 0xf8 != 0 {
+            return false;
+        }
+        let rest = &raw[self.question.end..];
+        match additional {
+            0 => rest.is_empty(),
+            1 => is_one_opt_record(rest),
+            _ => false,
+        }
+    }
+
     /// Whether `datagram` may be treated as the answer to this query.
     /// Everything checked here is evidence the interceptor holds itself: an
     /// off-path host that guesses the ephemeral port still has to come from
@@ -3943,25 +4163,61 @@ fn dns_response_is_bindable(datagram: &[u8]) -> bool {
     dns_flags(datagram).is_some_and(|flags| flags & 0x0200 == 0 && flags & 0x000f == 0)
 }
 
+/// Whether `bytes` are exactly one EDNS OPT record, whose options are framed:
+/// the root as its owner, the OPT type, the sender's payload size, flags, and
+/// RDATA that is a run of whole options, each a code and a length and that many
+/// bytes. What the options say is not read. A resolver may still be handed
+/// them.
+fn is_one_opt_record(bytes: &[u8]) -> bool {
+    opt_record_framing(bytes).is_some()
+}
+
+fn opt_record_framing(bytes: &[u8]) -> Option<()> {
+    let mut off = 0;
+    checked_skip(bytes, &mut off, 1)?;
+    let owner_is_root = bytes[0] == 0;
+    let is_opt = read_u16(bytes, &mut off)? == DNS_TYPE_OPT;
+    // The sender's payload size, then the extended RCODE and flags.
+    checked_skip(bytes, &mut off, 2 + 4)?;
+    let rdlen = usize::from(read_u16(bytes, &mut off)?);
+    if !owner_is_root || !is_opt || bytes.len() - off != rdlen {
+        return None;
+    }
+    while off < bytes.len() {
+        // The option's code, then its length and that many bytes.
+        checked_skip(bytes, &mut off, 2)?;
+        let len = usize::from(read_u16(bytes, &mut off)?);
+        checked_skip(bytes, &mut off, len)?;
+    }
+    Some(())
+}
+
 /// The reply to a query no resolver answered: SERVFAIL, so its client stops
 /// asking rather than waiting out every try its own timeout allows -- by
-/// glibc's defaults, two of 5 seconds each. It echoes the transaction id and
-/// the question, which a stub matches an answer against (glibc discards one
+/// glibc's defaults, two of 5 seconds each. See [`dns_error_reply`]; a lookup
+/// the policy refuses is answered the same way with REFUSED, which says it was
+/// declined rather than that the resolvers failed.
+fn dns_servfail(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
+    dns_error_reply(raw, query, DNS_RCODE_SERVFAIL)
+}
+
+/// An answer to `raw` that carries only `rcode`. It echoes the transaction id
+/// and the question, which a stub matches an answer against (glibc discards one
 /// whose question differs from its query's). `query` is `raw` parsed, as
 /// [`forward_dns`] takes it; a query that did not parse gets the header
 /// alone, since where its question ends is not known.
 ///
 /// `None` for a datagram too short to hold a header, and for one that is
 /// itself an answer: that is not a query, and is owed nothing.
-fn dns_servfail(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
+fn dns_error_reply(raw: &[u8], query: Option<&DnsQuery>, rcode: u16) -> Option<Vec<u8>> {
     let flags = dns_flags(raw)?;
     if raw.len() < 12 || flags & 0x8000 != 0 {
         return None;
     }
     let end = query.map_or(12, |query| query.question.end);
     let mut reply = raw[..end].to_vec();
-    // QR; the query's opcode and RD; RA; RCODE 2.
-    let flags = 0x8000 | (flags & 0x7900) | 0x0080 | 2;
+    // QR; the query's opcode and RD; RA; the RCODE.
+    let flags = 0x8000 | (flags & 0x7900) | 0x0080 | rcode;
     reply[2..4].copy_from_slice(&flags.to_be_bytes());
     // The one question echoed, or none. No answer, authority or additional
     // records: an EDNS record the query carried is not echoed either.
@@ -3978,11 +4234,26 @@ fn dns_flags(packet: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]))
 }
 
+/// The question a packet carries, if it carries exactly one whose name is one a
+/// policy can be asked about: written out in full, no longer than a name may
+/// be, and made of labels [`dns_label`] accepts.
+///
+/// The name is never compressed. A stub has nothing to point at when it writes
+/// the first name in a packet, so a pointer here is a packet built to be read
+/// two ways, and a resolver that follows it can be asked for a name this one
+/// decoded as another -- `bad.example` followed by a pointer to the root
+/// decodes with a dot on the end, which no `deny` glob for `bad.example`
+/// matches. An answer echoes the question as the resolver read it, and gets the
+/// same treatment.
 fn dns_question(packet: &[u8]) -> Option<DnsQuestion> {
     if packet.len() < 12 || u16::from_be_bytes([packet[4], packet[5]]) != 1 {
         return None;
     }
+    // No pointer to follow, which is what a budget of none refuses.
     let (mut name, next) = read_dns_name(packet, 12, 0)?;
+    if name.len() > MAX_DNS_NAME {
+        return None;
+    }
     name.make_ascii_lowercase();
     Some(DnsQuestion {
         name,
@@ -4057,7 +4328,7 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
         let Some(next) = skip_dns_name(packet, off) else {
             break;
         };
-        let owner = read_dns_name(packet, off, 0).map(|(owner, _)| owner);
+        let owner = read_dns_name(packet, off, MAX_DNS_POINTERS).map(|(owner, _)| owner);
         off = next;
         if off + 10 > packet.len() {
             break;
@@ -4098,7 +4369,7 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
                     });
                 }
                 (DNS_TYPE_CNAME, _) => {
-                    if let Some((mut target, _)) = read_dns_name(packet, off, 0) {
+                    if let Some((mut target, _)) = read_dns_name(packet, off, MAX_DNS_POINTERS) {
                         target.make_ascii_lowercase();
                         answers.push(DnsAnswer::Alias { owner, target });
                     }
@@ -4119,10 +4390,9 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
 /// genuinely delegated to whoever runs `attacker.example` -- would decode to
 /// `allowed.evil.attacker.example` and satisfy `allow = ["allowed.*"]`,
 /// letting that authority bind any address under a glob it does not own.
-fn read_dns_name(packet: &[u8], mut off: usize, depth: usize) -> Option<(String, usize)> {
-    if depth > 8 {
-        return None;
-    }
+///
+/// Follows at most `pointers_left` compression pointers.
+fn read_dns_name(packet: &[u8], mut off: usize, pointers_left: usize) -> Option<(String, usize)> {
     let mut name = String::new();
     let end;
     loop {
@@ -4130,7 +4400,7 @@ fn read_dns_name(packet: &[u8], mut off: usize, depth: usize) -> Option<(String,
         if len & 0b1100_0000 == 0b1100_0000 {
             let b2 = *packet.get(off + 1)?;
             let ptr = (((len & 0b0011_1111) as usize) << 8) | b2 as usize;
-            let (suffix, _) = read_dns_name(packet, ptr, depth + 1)?;
+            let (suffix, _) = read_dns_name(packet, ptr, pointers_left.checked_sub(1)?)?;
             push_dns_label(&mut name, &suffix);
             end = off + 2;
             break;
@@ -4691,6 +4961,7 @@ mod tests {
     /// whether the write landed rather than what it said.
     fn audit_event() -> AuditEvent {
         AuditEvent {
+            proto: "tcp",
             opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             duration: Duration::from_millis(1),
             orig: addr("10.0.2.100:50123"),
@@ -6406,11 +6677,24 @@ mod tests {
     }
 
     /// A `dns_loop` on a listener bound the way attach binds one, forwarding
-    /// to `resolvers`: its IPv4 loopback address, the token that ends the
-    /// loop, and the set holding it.
+    /// to `resolvers` whatever is asked: its IPv4 loopback address, the token
+    /// that ends the loop, and the set holding it. Its records go to a log
+    /// nothing reads; [`spawned_dns_loop_under`] is the one to read them from.
     async fn spawned_dns_loop(
         resolvers: Vec<SocketAddr>,
         bindings: Bindings,
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        spawned_dns_loop_under(resolvers, bindings, allow_all_policy(), audit).await
+    }
+
+    /// [`spawned_dns_loop`] under `policy`, recording to `audit`.
+    async fn spawned_dns_loop_under(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+        policy: Arc<CompiledNetworkPolicy>,
+        audit: AuditSink,
     ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
         let socket = dns_listener(bind_any(SockType::Datagram, 0).expect("bind dns listener"))
             .expect("dns listener");
@@ -6418,7 +6702,14 @@ mod tests {
         let listener = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(dns_loop(socket, resolvers, bindings, cancel.clone()));
+        tasks.spawn(dns_loop(
+            socket,
+            resolvers,
+            bindings,
+            policy,
+            audit,
+            cancel.clone(),
+        ));
         (listener, cancel, tasks)
     }
 
@@ -6586,6 +6877,239 @@ mod tests {
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A `dns_loop` forwarding to `resolver`, which the test plays, under a
+    /// policy: with the client that asks it and the log it records to.
+    struct FilteringLoop {
+        listener: SocketAddr,
+        client: UdpSocket,
+        cancel: CancellationToken,
+        tasks: JoinSet<Result<()>>,
+        dir: tempfile::TempDir,
+        audit: AuditSink,
+    }
+
+    impl FilteringLoop {
+        async fn spawn(resolver: &UdpSocket, policy: CompiledNetworkPolicy) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let audit = audit_sink(dir.path()).await;
+            let (listener, cancel, tasks) = spawned_dns_loop_under(
+                vec![resolver.local_addr().expect("resolver addr")],
+                empty_bindings(),
+                Arc::new(policy),
+                audit.clone(),
+            )
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+            Self {
+                listener,
+                client,
+                cancel,
+                tasks,
+                dir,
+                audit,
+            }
+        }
+
+        /// The next reply the client gets, which has to come from the address
+        /// it asked.
+        async fn reply(&self) -> Vec<u8> {
+            let mut reply = [0u8; 512];
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(2), self.client.recv_from(&mut reply))
+                    .await
+                    .expect("the lookup got no reply")
+                    .expect("receive reply");
+            assert_eq!(from, self.listener, "the reply came from elsewhere");
+            reply[..n].to_vec()
+        }
+
+        async fn reply_to(&self, packet: &[u8]) -> Vec<u8> {
+            self.client
+                .send_to(packet, self.listener)
+                .await
+                .expect("send query");
+            self.reply().await
+        }
+
+        /// Ends the loop, which has to stop with nothing to report.
+        async fn stop(&mut self) {
+            self.cancel.cancel();
+            let failures = stop_tasks(&mut self.tasks).await;
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+    }
+
+    /// The point of the gate: a name no `allow` entry could cover is answered
+    /// without any resolver being asked, so nothing about it leaves.
+    #[tokio::test]
+    async fn a_lookup_the_policy_refuses_is_answered_refused_and_never_reaches_the_resolver() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "x.attacker.test", &[]);
+        let reply = dns.reply_to(&query).await;
+        assert!(
+            asked("x.attacker.test").answered_by(dns.listener, dns.listener, &reply),
+            "the reply does not answer the query"
+        );
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert!(
+            forwarded_query(&resolver, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "a refused lookup reached the resolver"
+        );
+
+        dns.stop().await;
+    }
+
+    /// Refused or not, the lookup is in the log, and in it by the time its
+    /// client has its reply: the record is written before the answer goes out.
+    #[tokio::test]
+    async fn a_refused_lookup_writes_one_deny_record_naming_the_name() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "x.attacker.test", &[]);
+        dns.reply_to(&query).await;
+
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], "x.attacker.test");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(record["proto"], "udp");
+        assert_eq!(record["service"], "dns");
+        assert_eq!(record["id.resp_p"], 53);
+        assert_eq!(record["orig_bytes"], query.len());
+
+        dns.stop().await;
+    }
+
+    /// A lookup the policy lets through is forwarded and answered as it always
+    /// was, and its record -- the rule that let it through -- is in the file
+    /// before the resolver has the query, read here with no wait.
+    #[tokio::test]
+    async fn an_allowed_lookup_has_its_record_in_the_file_before_the_resolver_sees_it() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        send_query(&dns.client, dns.listener, 0x1234, "allowed.test").await;
+        let (forwarded, from) = forwarded_query(&resolver, Duration::from_secs(2))
+            .await
+            .expect("an allowed lookup should reach the resolver");
+        assert_eq!(forwarded.question.name, "allowed.test");
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "allow[0]");
+        assert_eq!(record["outrig.host"], "allowed.test");
+
+        let answer = dns_packet(
+            forwarded.txid,
+            DNS_RESPONSE_FLAGS,
+            "allowed.test",
+            &[Rr::A("allowed.test", [198, 51, 100, 9], 60)],
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+        assert_eq!(dns.reply().await, answer);
+
+        dns.stop().await;
+    }
+
+    /// Audit mode, and a filter policy that leaves lookups open, forward every
+    /// lookup but still say what was asked.
+    #[tokio::test]
+    async fn a_lookup_under_an_allow_default_is_recorded_and_forwarded_as_before() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(&resolver, compiled(NetworkPolicy::allow_all())).await;
+
+        send_query(&dns.client, dns.listener, 0x1234, "anything.test").await;
+        forwarded_query(&resolver, Duration::from_secs(2))
+            .await
+            .expect("a lookup under an allow default should reach the resolver");
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], "anything.test");
+
+        dns.stop().await;
+    }
+
+    /// A packet whose question the interceptor cannot read is not a way round
+    /// the gate: it is refused, with the header alone to say so, and recorded
+    /// without a name.
+    #[tokio::test]
+    async fn an_unparsable_lookup_is_refused_under_a_deny_default() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        // Two questions, so `dns_question` refuses it.
+        let mut query = dns_packet(0x1234, DNS_QUERY_FLAGS, "allowed.test", &[]);
+        query[5] = 2;
+        let reply = dns.reply_to(&query).await;
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert!(
+            forwarded_query(&resolver, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "an unparsable lookup reached the resolver"
+        );
+
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], UNPARSED_LOOKUP_RULE);
+        assert!(record.get("outrig.host").is_none());
+
+        dns.stop().await;
+    }
+
+    /// Every query the loop forwarded has its record, even when the detach
+    /// that cancels it comes while they are all still in flight: the records
+    /// were written first, so nothing the abort abandons is owed.
+    #[tokio::test]
+    async fn a_lookup_cut_off_by_a_cancellation_leaves_no_record_unaccounted_for() {
+        const PENDING: u16 = 4;
+        // Receives the queries and never answers them.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let mut dns = FilteringLoop::spawn(&blackhole, compiled(NetworkPolicy::allow_all())).await;
+        for txid in 0..PENDING {
+            send_query(&dns.client, dns.listener, txid, "example.test").await;
+        }
+        for _ in 0..PENDING {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query should reach the resolver");
+        }
+
+        dns.stop().await;
+        dns.audit
+            .drain()
+            .await
+            .expect("everything queued was written");
+        assert!(dns.audit.take_unwritten().is_empty());
+        assert_eq!(audit_records(dns.dir.path()).len(), usize::from(PENDING));
     }
 
     /// The loop forwards at most `DNS_IN_FLIGHT` lookups at once. Past that it
@@ -7180,11 +7704,14 @@ mod tests {
         let listener = socket.local_addr().expect("dns addr");
         let fd = socket.as_raw_fd();
         let cancel = CancellationToken::new();
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut tasks = JoinSet::new();
         tasks.spawn(dns_loop(
             socket,
             Vec::new(),
             empty_bindings(),
+            allow_all_policy(),
+            audit_sink(dir.path()).await,
             cancel.clone(),
         ));
 
@@ -7232,7 +7759,14 @@ mod tests {
                 cancel.clone(),
                 mpsc::channel(1).0,
             ));
-            tasks.spawn(dns_loop(dns, Vec::new(), empty_bindings(), cancel.clone()));
+            tasks.spawn(dns_loop(
+                dns,
+                Vec::new(),
+                empty_bindings(),
+                allow_all_policy(),
+                audit.clone(),
+                cancel.clone(),
+            ));
 
             cancel.cancel();
             let failures = stop_tasks(&mut tasks).await;
@@ -7869,6 +8403,7 @@ options edns0
             "20260513T000000-abcd",
             "outrig-test",
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(125),
                 orig: addr("10.0.2.100:50123"),
@@ -7914,6 +8449,7 @@ options edns0
                 "sid",
                 "outrig-test",
                 AuditEvent {
+                    proto: "tcp",
                     opened: UNIX_EPOCH,
                     duration: Duration::from_millis(1),
                     orig: addr("10.0.2.100:50123"),
@@ -7945,12 +8481,91 @@ options edns0
         assert!(unknown.get("outrig.host_source").is_none());
     }
 
+    /// A lookup is recorded as the UDP exchange with the DNS listener it is,
+    /// by the name it asked for, which is a claim and says so.
+    #[test]
+    fn a_lookup_audit_record_says_udp_dns_and_an_asserted_host() {
+        let record = |assertion: ClientAssertion| {
+            let record = AuditRecord::new(
+                "20260513T000000-abcd",
+                "outrig-test",
+                AuditEvent {
+                    proto: "udp",
+                    opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    duration: Duration::ZERO,
+                    orig: addr("10.0.2.100:50123"),
+                    dst: addr("127.0.0.1:53"),
+                    resolved: ResolvedNames::default(),
+                    assertion,
+                    service: "dns",
+                    bytes_tx: 29,
+                    bytes_rx: 0,
+                    decision: PolicyDecision::new(NetworkAction::Deny, "default"),
+                },
+            );
+            serde_json::to_value(record).expect("record json")
+        };
+
+        let json = record(ClientAssertion::dns("example.test".to_string()));
+        assert_eq!(json["ts"], 1_700_000_000.0);
+        assert_eq!(json["id.orig_h"], "10.0.2.100");
+        assert_eq!(json["id.orig_p"], 50123);
+        assert_eq!(json["id.resp_h"], "127.0.0.1");
+        assert_eq!(json["id.resp_p"], 53);
+        assert_eq!(json["proto"], "udp");
+        assert_eq!(json["service"], "dns");
+        assert_eq!(json["duration"], 0.0);
+        assert_eq!(json["orig_bytes"], 29);
+        assert_eq!(json["resp_bytes"], 0);
+        assert_eq!(json["conn_state"], "S0");
+        assert_eq!(json["outrig.container"], "outrig-test");
+        assert_eq!(json["outrig.host"], "example.test");
+        assert_eq!(json["outrig.host_source"], "asserted");
+        assert_eq!(json["outrig.action"], "deny");
+        assert_eq!(json["outrig.rule"], "default");
+        assert!(json.get("server_name").is_none());
+
+        // A query with no name to record has no host either.
+        let json = record(ClientAssertion::default());
+        assert!(json.get("outrig.host").is_none());
+        assert!(json.get("outrig.host_source").is_none());
+        assert_eq!(json["service"], "dns");
+    }
+
+    /// The listener is dual-stack, so the address a query was sent to arrives
+    /// v4-mapped for an IPv4 client, and is recorded as the IPv4 address it is.
+    #[test]
+    fn the_address_a_query_was_sent_to_reads_the_same_from_either_family() {
+        let mut mapped = [0u8; 16];
+        mapped[10..12].copy_from_slice(&[0xff, 0xff]);
+        mapped[12..].copy_from_slice(&[127, 0, 0, 1]);
+        let from_v6 = Asked::V6(libc::in6_pktinfo {
+            ipi6_addr: libc::in6_addr { s6_addr: mapped },
+            ipi6_ifindex: 0,
+        });
+        let from_v4 = Asked::V4(libc::in_pktinfo {
+            ipi_ifindex: 0,
+            ipi_spec_dst: libc::in_addr { s_addr: 0 },
+            ipi_addr: libc::in_addr {
+                s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+            },
+        });
+
+        for asked in [from_v6, from_v4] {
+            assert_eq!(
+                canonical(SocketAddr::new(asked.addr(), DNS_PORT)),
+                addr("127.0.0.1:53")
+            );
+        }
+    }
+
     #[test]
     fn audit_record_writes_deny_decision_with_zero_bytes() {
         let record = AuditRecord::new(
             "20260513T000000-abcd",
             "outrig-test",
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(1),
                 orig: addr("10.0.2.100:50123"),
@@ -8328,6 +8943,214 @@ options edns0
         ] {
             assert!(!glob_matches(pattern, value), "{pattern} vs {value}");
         }
+    }
+
+    /// A filter policy with `default`, whose `allow` and `deny` entries are
+    /// the hosts a config would write, none with a port.
+    fn lookup_policy(
+        default: NetworkAction,
+        allow: &[&str],
+        deny: &[&str],
+    ) -> CompiledNetworkPolicy {
+        let mut policy = NetworkPolicy::builder().default_action(default);
+        for host in allow {
+            policy = policy.allow_host(*host);
+        }
+        for host in deny {
+            policy = policy.deny_host(*host);
+        }
+        compiled(policy.build().expect("policy"))
+    }
+
+    /// An allow default that denies only connections to port 22, so no
+    /// lookup is refused by name.
+    fn ports_only_policy() -> CompiledNetworkPolicy {
+        compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host_port("*", 22)
+                .build()
+                .expect("policy"),
+        )
+    }
+
+    fn allowed(rule: &str) -> PolicyDecision {
+        PolicyDecision::new(NetworkAction::Allow, rule)
+    }
+
+    fn refused(rule: &str) -> PolicyDecision {
+        PolicyDecision::new(NetworkAction::Deny, rule)
+    }
+
+    #[test]
+    fn a_lookup_under_an_allow_default_is_allowed_with_the_default_rule() {
+        let open = compiled(NetworkPolicy::allow_all());
+        assert_eq!(
+            open.decide_lookup(Some("anything.example")),
+            PolicyDecision::allow_default()
+        );
+        // A deny entry for a port, or for an address, forbids no lookup.
+        assert_eq!(
+            ports_only_policy().decide_lookup(Some("anything.example")),
+            PolicyDecision::allow_default()
+        );
+    }
+
+    #[test]
+    fn a_lookup_under_a_deny_default_is_refused_when_no_allow_entry_could_cover_it() {
+        let policy = lookup_policy(NetworkAction::Deny, &["github.com", "*.npmjs.org"], &[]);
+        assert_eq!(
+            policy.decide_lookup(Some("x.attacker.example")),
+            refused("default")
+        );
+        // The names of a zone it does not name, however close.
+        assert_eq!(
+            policy.decide_lookup(Some("github.com.attacker.example")),
+            refused("default")
+        );
+    }
+
+    /// A question has no port, so an entry that names one still opens the
+    /// lookups of its host: the connection it grants is to a name that has to
+    /// be resolved first.
+    #[test]
+    fn a_hostname_allow_opens_the_lookups_it_matches_whatever_its_port() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host_port("github.com", 443)
+                .allow_host("*.npmjs.org")
+                .build()
+                .expect("policy"),
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("github.com")),
+            allowed("allow[0]")
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("registry.npmjs.org")),
+            allowed("allow[1]")
+        );
+    }
+
+    /// `*.npmjs.org` grants no connection to `npmjs.org` itself, so it opens
+    /// no lookup of it either: the apex needs an entry of its own.
+    #[test]
+    fn a_wildcard_hostname_allow_does_not_open_the_lookup_of_its_own_apex() {
+        let policy = lookup_policy(NetworkAction::Deny, &["*.npmjs.org"], &[]);
+        assert_eq!(policy.decide_lookup(Some("npmjs.org")), refused("default"));
+    }
+
+    /// Deny wins, as it does for a connection, so the log never calls a name
+    /// `allow` that a deny entry matches -- under either default.
+    #[test]
+    fn a_portless_hostname_deny_refuses_a_lookup_an_allow_would_cover() {
+        for default in [NetworkAction::Deny, NetworkAction::Allow] {
+            let policy = lookup_policy(default, &["*.example.com"], &["*.evil.example.com"]);
+            assert_eq!(
+                policy.decide_lookup(Some("x.evil.example.com")),
+                refused("deny[0]"),
+                "default {default:?}"
+            );
+            assert_ne!(
+                policy.decide_lookup(Some("x.good.example.com")).action,
+                NetworkAction::Deny,
+                "default {default:?}"
+            );
+        }
+    }
+
+    /// An entry for one port forbids connections there and no more, and an
+    /// address has no name to forbid.
+    #[test]
+    fn a_deny_entry_with_a_port_or_an_address_never_refuses_a_lookup() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host("*.example.com")
+                .deny_host_port("evil.example.com", 443)
+                .deny_host("203.0.113.0/24")
+                .deny_host("203.0.113.9")
+                .deny_host("203.0.*")
+                .build()
+                .expect("policy"),
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("evil.example.com")),
+            allowed("allow[0]")
+        );
+    }
+
+    /// The entry grants connections to that address, and a name is not one:
+    /// whoever picks the name picks where it resolves, so the entry is no
+    /// evidence the name is wanted.
+    #[test]
+    fn an_allow_of_an_address_or_a_range_opens_no_lookup() {
+        let policy = lookup_policy(
+            NetworkAction::Deny,
+            &[
+                "203.0.113.7",
+                "10.0.0.0/8",
+                "2001:db8::/32",
+                "10.0.*",
+                "*.*",
+            ],
+            &[],
+        );
+        assert_eq!(policy.decide_lookup(Some("svc.corp")), refused("default"));
+    }
+
+    /// `allow = ["*"]` has always meant everything, and what it grants a
+    /// connection to is whatever a name resolves to.
+    #[test]
+    fn an_allow_covering_every_address_opens_every_lookup() {
+        for host in ["*", "**", "0.0.0.0/0", "::/0"] {
+            let policy = lookup_policy(NetworkAction::Deny, &["github.com", host], &[]);
+            assert_eq!(
+                policy.decide_lookup(Some("anything.example")),
+                allowed("allow[1]"),
+                "allow = {host:?}"
+            );
+        }
+    }
+
+    /// A query that is not a plain question has no name for the policy to
+    /// speak for. Where nothing is refused by name it is let through as it
+    /// always was; where something is, it is not a way round.
+    #[test]
+    fn an_unparsed_lookup_is_refused_only_where_a_name_could_be_refused() {
+        let unparsed = refused(UNPARSED_LOOKUP_RULE);
+
+        assert_eq!(
+            lookup_policy(NetworkAction::Deny, &["github.com"], &[]).decide_lookup(None),
+            unparsed
+        );
+        assert_eq!(
+            lookup_policy(NetworkAction::Allow, &[], &["*.evil.example"]).decide_lookup(None),
+            unparsed
+        );
+        assert_eq!(
+            compiled(NetworkPolicy::allow_all()).decide_lookup(None),
+            PolicyDecision::allow_default()
+        );
+        assert_eq!(
+            ports_only_policy().decide_lookup(None),
+            PolicyDecision::allow_default()
+        );
+    }
+
+    /// A name is decided as the lowercase one the resolver treats it as: a
+    /// stub that randomizes case, or a container that writes `GitHub.com`,
+    /// asks for the same name.
+    #[test]
+    fn a_mixed_case_question_is_decided_as_its_lowercase() {
+        let policy = lookup_policy(NetworkAction::Deny, &["github.com"], &[]);
+        let packet = dns_packet(0x1234, DNS_QUERY_FLAGS, "GitHub.COM", &[]);
+        let query = dns_query(&packet).expect("parses");
+        assert_eq!(
+            policy.decide_lookup(Some(&query.question.name)),
+            allowed("allow[0]")
+        );
     }
 
     /// Whoever runs a denied zone's DNS can answer for any name under it, so
@@ -8913,6 +9736,133 @@ options edns0
         assert_eq!(response, answer);
     }
 
+    /// A query for `name_bytes` as its one question, written as given.
+    fn dns_query_with_question_bytes(name_bytes: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(name_bytes);
+        // QTYPE A, QCLASS IN.
+        packet.extend_from_slice(&[0, 1, 0, 1]);
+        packet
+    }
+
+    /// No stub compresses the first name in a packet, and one that is
+    /// compressed can be read two ways. Here `bad` followed by a pointer to a
+    /// root byte -- the first byte of the question's own type -- decoded as
+    /// `bad.`, which no deny glob for `bad` matches.
+    #[test]
+    fn a_question_using_a_compression_pointer_does_not_parse() {
+        let pointer_to_root = dns_query_with_question_bytes(&[3, b'b', b'a', b'd', 0xc0, 18]);
+        assert!(dns_question(&pointer_to_root).is_none());
+        assert!(dns_query(&pointer_to_root).is_none());
+
+        let looping = dns_query_with_question_bytes(&[3, b'b', b'a', b'd', 0xc0, 16]);
+        assert!(dns_question(&looping).is_none());
+
+        let plain = dns_query_with_question_bytes(&dns_labels_bytes(&["bad"]));
+        assert_eq!(dns_question(&plain).expect("parses").name, "bad");
+    }
+
+    /// The longest name there is, 253 characters of 127 labels, parses; one
+    /// label more is not a name, and is not one a log line should carry.
+    #[test]
+    fn a_question_name_longer_than_a_name_may_be_does_not_parse() {
+        let name_of =
+            |labels: usize| dns_query_with_question_bytes(&dns_labels_bytes(&vec!["a"; labels]));
+        let longest = dns_question(&name_of(127)).expect("a name of 253 characters parses");
+        assert_eq!(longest.name.len(), MAX_DNS_NAME);
+        assert!(dns_question(&name_of(128)).is_none());
+    }
+
+    /// The EDNS record a stub appends parses as part of a plain question;
+    /// nothing else does, since a name decides only what it accounts for.
+    #[test]
+    fn a_query_is_a_plain_question_only_when_it_is_nothing_but_one() {
+        // Root owner, OPT, a 4096-byte payload size, no flags, no options.
+        const OPT: [u8; 11] = [0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        let bare = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let with = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut packet = bare.clone();
+            edit(&mut packet);
+            packet
+        };
+        // The query with `record` as its one additional record.
+        let with_additional = |record: &[u8]| {
+            with(&|p| {
+                p[11] = 1;
+                p.extend_from_slice(record);
+            })
+        };
+        let is_plain = |packet: &[u8]| {
+            dns_query(packet)
+                .expect("the question parses")
+                .is_plain_question(packet)
+        };
+
+        assert!(is_plain(&bare));
+        assert!(is_plain(&with_additional(&OPT)));
+        // The same with a cookie option, which is framed and nothing more.
+        let cookie = [&OPT[..9], &[0, 12, 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]].concat();
+        assert!(is_plain(&with_additional(&cookie)));
+
+        let mut not_opt = OPT;
+        not_opt[2] = 16;
+        let not_plain = [
+            ("QR set", with(&|p| p[2] |= 0x80)),
+            ("opcode NOTIFY", with(&|p| p[2] |= 4 << 3)),
+            ("opcode UPDATE", with(&|p| p[2] |= 5 << 3)),
+            ("an answer record", with(&|p| p[7] = 1)),
+            ("an authority record", with(&|p| p[9] = 1)),
+            ("two additional records", with(&|p| p[11] = 2)),
+            ("trailing bytes", with(&|p| p.extend_from_slice(&[1, 2, 3]))),
+            (
+                "an additional record that is not OPT",
+                with_additional(&not_opt),
+            ),
+            (
+                "an OPT whose length is not what follows",
+                with_additional(&[&OPT[..], &[0]].concat()),
+            ),
+            (
+                "an OPT whose option is cut short",
+                with_additional(&[&OPT[..9], &[0, 3, 0, 10, 0]].concat()),
+            ),
+            (
+                "an OPT whose option overruns it",
+                with_additional(&[&OPT[..9], &[0, 6, 0, 10, 0, 8, 1, 2]].concat()),
+            ),
+        ];
+        for (what, packet) in not_plain {
+            assert!(!is_plain(&packet), "{what}");
+        }
+    }
+
+    /// A refusal is an answer the client takes for the one to its query, with
+    /// the one code that says the lookup was declined.
+    #[test]
+    fn a_refusal_echoes_the_question_and_carries_rcode_5() {
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let parsed = dns_query(&query).expect("parses");
+        let reply = dns_error_reply(&query, Some(&parsed), DNS_RCODE_REFUSED).expect("a reply");
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert_eq!(reply[12..], query[12..parsed.question.end]);
+        assert_eq!(reply[4..12], [0, 1, 0, 0, 0, 0, 0, 0], "one question only");
+        assert!(parsed.answered_by(addr("127.0.0.1:53"), addr("127.0.0.1:53"), &reply));
+
+        // The header alone for a query that did not parse, and nothing for a
+        // datagram that is itself an answer.
+        let mut two = query.clone();
+        two[5] = 2;
+        let reply = dns_error_reply(&two, None, DNS_RCODE_REFUSED).expect("a header to answer");
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_flags(&reply), Some(0x8185));
+        let answer = dns_packet(0x1234, DNS_RESPONSE_FLAGS, "example.test", &[]);
+        assert_eq!(
+            dns_error_reply(&answer, dns_query(&answer).as_ref(), DNS_RCODE_REFUSED),
+            None
+        );
+    }
+
     /// A SERVFAIL echoes only what the interceptor knows of its query: a
     /// question it could not parse is left out, and a datagram that is no
     /// query gets nothing.
@@ -9315,6 +10265,7 @@ options edns0
     async fn audit_sink_stamps_container_per_handle() {
         fn event() -> AuditEvent {
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(1),
                 orig: addr("10.0.2.100:50123"),

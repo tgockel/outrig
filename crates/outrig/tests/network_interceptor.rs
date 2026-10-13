@@ -1417,6 +1417,106 @@ async fn a_lookup_sent_to_another_resolver_is_answered() {
         .expect("stop container");
 }
 
+/// The lookup records `records` holds for `name`: what the DNS listener wrote
+/// when a container asked it, as opposed to the connections that followed.
+fn lookup_records<'a>(records: &'a [Value], name: &str) -> Vec<&'a Value> {
+    records
+        .iter()
+        .filter(|record| {
+            record.get("service").and_then(Value::as_str) == Some("dns")
+                && record_host(record) == Some(name)
+        })
+        .collect()
+}
+
+/// Under a deny default a name resolves only if some hostname `allow` could
+/// cover it, and every lookup is recorded either way. The refused name never
+/// reaches a resolver -- the listener answers REFUSED itself -- so nothing of
+/// it leaves the container's namespace but the record. Needs working outbound
+/// DNS for the name that is allowed.
+///
+/// Asked with `nslookup`, not `curl`: musl's resolver does not take REFUSED
+/// as an answer and waits out its timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_under_a_deny_default_is_refused_unless_a_hostname_allow_covers_it() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let nslookup = |name: &str| {
+        try_capture(
+            Command::new("podman")
+                .arg("exec")
+                .arg(container.name())
+                .args(["nslookup", name]),
+        )
+    };
+    let allowed = nslookup("example.com");
+    assert!(
+        allowed.status.success(),
+        "a name an allow entry covers should resolve: {:?}\nstdout: {}\nstderr: {}",
+        allowed.status,
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let refused = nslookup("data.attacker.example.net");
+    assert!(
+        !refused.status.success(),
+        "a name no allow entry covers should be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    let records = read_audit_records_until(&log_dir, |records| {
+        !lookup_records(records, "example.com").is_empty()
+            && !lookup_records(records, "data.attacker.example.net").is_empty()
+    })
+    .await;
+    for (name, action, rule) in [
+        ("example.com", "allow", "allow[0]"),
+        ("data.attacker.example.net", "deny", "default"),
+    ] {
+        for record in lookup_records(&records, name) {
+            assert_eq!(record["proto"], "udp", "{record:#?}");
+            assert_eq!(record["id.resp_p"], 53, "{record:#?}");
+            assert_eq!(record["outrig.host_source"], "asserted", "{record:#?}");
+            assert_eq!(record["outrig.action"], action, "{record:#?}");
+            assert_eq!(record["outrig.rule"], rule, "{record:#?}");
+        }
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 /// systemd-resolved's stub listener address.
 const RESOLVED_STUB: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 53);
 

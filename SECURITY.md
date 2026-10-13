@@ -89,6 +89,11 @@ Issues that bear on **host integrity** are in scope, for example:
   connects by address and asserts no name at all offers nothing to match against. Hostname deny
   rules describe traffic, not a containment boundary; bound a hostile container with address,
   CIDR, and port rules, or with `default = "deny"`.
+- Under `default = "deny"` a container resolves only the names an `allow` hostname entry could
+  match, and every lookup is recorded; address and CIDR `allow` entries open no lookups. An
+  allowed name can still carry data in its labels to that zone's name servers, so a wildcard
+  such as `*.example.com` is only as tight as the zone is trusted. Under `default = "allow"`
+  lookups are open apart from names a hostname `deny` entry matches.
 
 Treat the container as you would any environment where you grant an agent real tools: put only
 what the agent should be able to use inside the boundary.

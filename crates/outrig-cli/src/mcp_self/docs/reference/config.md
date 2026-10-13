@@ -147,10 +147,12 @@ Accepted modes:
 - `default`: use Podman's configured default networking, do not install the interceptor, and do
   not write `logs/network.jsonl`.
 - `audit`: allow all outbound session-container traffic, short of the per-container connection
-  limit below, but write Zeek `conn.log`-style records to `<session_dir>/logs/network.jsonl`.
+  limit below, but write Zeek `conn.log`-style records to `<session_dir>/logs/network.jsonl`:
+  one per TCP connection and one per name lookup.
 - `filter`: install the same interceptor as audit mode, write the same audit log, and enforce
-  global allow/deny policy before opening upstream TCP connections. Traffic the interceptor
-  cannot carry -- UDP to any port but 53, ICMP, anything else -- follows `default` directly.
+  global allow/deny policy before opening upstream TCP connections and before answering a name
+  lookup (see [Name lookups](#name-lookups)). Traffic the interceptor cannot carry -- UDP to any
+  port but 53, ICMP, anything else -- follows `default` directly.
 
 Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
 container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
@@ -214,8 +216,51 @@ HTTP/3 travel, ICMP, any other transport -- matches no entry and takes `default`
 `default = "deny"` the kernel drops it, by a rule in the same nftables table: the sending tool
 fails at once with "Operation not permitted" rather than reaching the network. Such a datagram
 never reaches the interceptor, so it writes no `network.jsonl` record. Under `default = "allow"`,
-and in audit mode, it leaves by podman's default route, unrecorded. DNS over UDP/53 and traffic
-between processes in the container over loopback are carried either way.
+and in audit mode, it leaves by podman's default route, unrecorded. Name lookups, which are
+UDP/53, are decided by the name asked for instead; see below. Traffic between processes in the
+container over loopback is carried either way.
+
+### Name lookups
+
+A name the container looks up travels to whoever serves its zone, so a lookup is a way out of the
+container like a connection is. The interceptor's DNS listener decides each one by policy and
+records it. A lookup carries no port, so an entry's port counts neither for nor against it.
+
+- A `deny` entry that names a host and has no port refuses the lookups it matches, under either
+  default. A `deny` entry with a port, or one that is an address or a CIDR, refuses none.
+- Under `default = "allow"`, every other lookup is answered.
+- Under `default = "deny"`, a lookup is answered only when an `allow` hostname entry matches the
+  name, whatever its port: `github.com:443` opens the lookup of `github.com`. `*.npmjs.org` does
+  not match `npmjs.org`, so list the apex too. An `allow` entry that is an address or a CIDR
+  opens no lookup -- it grants connections to that address, and a name is not one -- unless it
+  matches every address (`*`, `0.0.0.0/0`, `::/0`), which opens every lookup.
+- A query that is not a plain question for one name is not decided by its name: an answer, an
+  opcode other than QUERY, extra records beyond one EDNS record, a compressed name, or one
+  longer than 253 bytes. It is refused wherever some lookup could be -- under `default = "deny"`,
+  and wherever a `deny` entry names a host without a port -- and answered as before elsewhere.
+
+A refused lookup is answered REFUSED without any resolver being asked, so nothing about the name
+leaves the host. The tool that asked sees the lookup fail: glibc tries again before giving up,
+and musl waits out its own timeout. Under `default = "deny"` a reverse lookup, or the lookup of
+a name no `allow` entry names, fails the same way.
+
+Every lookup writes a `network.jsonl` record, answered or refused, before the query is sent to a
+resolver. It is a UDP record for service `dns`, its `outrig.host` is the name asked for (with
+`outrig.host_source` `asserted`, since the container chose it), and `outrig.action` and
+`outrig.rule` say what was decided and by which entry; a query that is not a plain question is
+refused under `outrig.rule` `dns-unparsed`. Its other fields are those of a connection's record.
+
+An allowed name can still carry data. `allow = ["*.example.com"]` lets the container look up
+`<data>.example.com`, which reaches the name servers of example.com, and the same entry grants
+connections to every host under it, so name only zones you would trust with either. An EDNS
+record a query carries is forwarded to the host's resolver whole. Entries for port 53 apply to
+TCP connections, which are decided by their destination like any other.
+
+> **Changed in 0.2.2.** Before this release every lookup was answered, whatever the policy.
+> Under `default = "deny"`, a name that resolved only because it fell in an allowed address or
+> CIDR now needs an `allow` entry of its own, or the container has to connect by address. Under
+> `default = "allow"`, a name a hostname `deny` entry matches is no longer resolved; its
+> connection used to be denied, and now the denial is recorded as the lookup.
 
 ### What a hostname rule matches
 

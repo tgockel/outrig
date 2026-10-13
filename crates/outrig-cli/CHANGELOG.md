@@ -74,6 +74,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under `--network filter` and a deny default, a container resolves only the names an `allow`
+  hostname entry could match, and every lookup is in `network.jsonl`.** Fixed in `outrig` (#361).
+  Name lookups, which the interceptor forwarded to the host's resolvers whatever the policy, are
+  now decided by it: a name no `allow` hostname entry matches is answered REFUSED without any
+  resolver being asked, so nothing about it leaves the host. That includes a name that used to
+  resolve only because it fell in an allowed address or CIDR, which now needs an `allow` entry of
+  its own; `allow = ["*"]` still opens every name. Under an allow default, a name a hostname
+  `deny` entry matches stops resolving rather than being denied at connect. Each lookup, answered
+  or refused, writes a `network.jsonl` record with `proto` `udp`, `service` `dns`, and the name
+  in `outrig.host`, in `--network audit` too. See
+  [Name lookups](../../doc/reference/config.md#name-lookups).
+
 - **An empty or relative `XDG_CONFIG_HOME` no longer moves the global config into the working
   directory.** The variable was used as written, so `XDG_CONFIG_HOME= outrig run` read
   `./outrig/config.toml` as the global config and `XDG_CONFIG_HOME=conf` read
