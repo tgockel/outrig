@@ -160,9 +160,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # node toolchain
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+RUN node_major=24 \
+ && curl -fsSL "https://deb.nodesource.com/setup_$node_major.x" | bash - \
  && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && case "$(node --version)" in \
+      "v$node_major".*) ;; \
+      *) echo "node toolchain: expected Node $node_major, found $(node --version)" >&2; exit 1 ;; \
+    esac \
+ && npm --version
 
 # MCP servers
 RUN npm install -g @modelcontextprotocol/server-filesystem
@@ -183,6 +189,12 @@ keeps its registry cache in `CARGO_HOME`, and rustup installs any toolchain a pr
 `rust-toolchain.toml` pins into `RUSTUP_HOME`. To add to either -- `rustup component add`,
 `cargo install` -- extend that `RUN` ahead of its `chmod`; a `RUN` of its own leaves what it adds
 writable by root alone.
+
+The `node` toolchain checks its own result. NodeSource's setup script exits 0 even when one of
+its steps failed, and `apt-get install nodejs` then takes the distro's Node 18, which has no
+`npm`; the build passes and the image is cached. So the `RUN` ends by requiring `node` to report
+the major its `setup_N.x` URL names -- set once, as `node_major` -- and `npm` to run, and fails
+the build otherwise.
 
 Appended to `.agents/outrig/config.toml`:
 

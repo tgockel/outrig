@@ -2,7 +2,7 @@
 //! invariants on the generated Dockerfile across every (base x toolchain x
 //! mcp) combination, plus determinism + ordering properties.
 
-use outrig_cli::image_setup::render::{self, BaseImage, McpServer, Toolchain};
+use outrig_cli::image_setup::render::{self, BaseImage, Family, McpServer, Toolchain};
 
 fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps: &[McpServer]) {
     let label = format!("base={:?} toolchains={toolchains:?} mcps={mcps:?}", base);
@@ -71,6 +71,33 @@ fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps:
                 out.contains(needle),
                 "[{label}] the go archive must be chosen by `uname -m` and checked by \
                  `sha256sum -c`; no `{needle}`:\n{out}",
+            );
+        }
+    }
+
+    // NodeSource's setup script exits 0 whatever goes wrong in it, so the `RUN`
+    // that pipes it to `bash` cannot tell a failed setup from a good one, and
+    // `apt-get install nodejs` then takes the distro's Node 18, which ships no
+    // `npm`. Only a look at what was installed fails that build, and the major
+    // it looks for has to be the one the setup URL names (#565).
+    if toolchains.contains(&Toolchain::Node) && base.family() == Family::Debian {
+        let (_, rest) = out
+            .split_once("# node toolchain\n")
+            .unwrap_or_else(|| panic!("[{label}] no node toolchain section:\n{out}"));
+        let section = rest.split("\n\n").next().unwrap_or(rest);
+        assert!(
+            section.contains("setup_$node_major.x"),
+            "[{label}] the NodeSource URL must take its major from the variable the check \
+             uses:\n{section}",
+        );
+        let (_, after_install) = section
+            .split_once("apt-get install")
+            .unwrap_or_else(|| panic!("[{label}] the node toolchain installs no nodejs:\n{out}"));
+        for check in ["node --version", "npm --version"] {
+            assert!(
+                after_install.contains(check),
+                "[{label}] a failed NodeSource setup must fail the build, but `{check}` does \
+                 not follow the install:\n{section}",
             );
         }
     }

@@ -81,6 +81,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `node` toolchain whose NodeSource setup failed no longer builds.** On a Debian-family
+  base the toolchain ran NodeSource's `setup_24.x` and then `apt-get install nodejs`, and that
+  script exits 0 whatever goes wrong in it: it reports each error it handles through
+  `handle_error "$?"` after an `if !`, where `$?` is 0. When a step failed after it had refreshed
+  the package indexes -- a signing key that would not download, say -- the install took the
+  distro's own `nodejs`, Node 18 with no `npm`, and the build succeeded and was cached. Nothing
+  said so until something in the image ran `node` or `npm`. The step now fails the build, naming
+  the Node it found, unless `node` is the major its `setup_N.x` URL names and `npm` runs; that
+  major is set once, as `node_major` at the top of the step. A Dockerfile generated earlier
+  keeps its old lines; replace its `# node toolchain` section with the one `image add` writes
+  now. (#565)
+
 - **A sidecar whose entrypoint exits at once reports why.** Fixed in `outrig` (#422). An
   entrypoint-stdio server that printed a line and exited within milliseconds -- `outrig-enter`
   naming the program a `view = "primary"` sidecar's image lacks, a server rejecting its arguments
