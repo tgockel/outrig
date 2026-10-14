@@ -224,13 +224,14 @@ own, after which the session passes through closing to reported. These are how a
 what its session is doing without parsing text (`embedding.md`), and the outcomes a shutdown
 report lists are events too (`lifecycle.md`).
 
-**The boundary, once there is one.** The integration-audit category has no producer until hosted
-objects are built, and then three tasks add one each:
+**The boundary.** The integration-audit category's producers are hosted objects, one task adding
+each:
 
-- `0003-22`: each hosted request's receipt, dispatch and outcome, sharing its id -- binding, agent,
-  operation, member, host type, bounded previews, the outcome (`returned`, `raised`, `refused`,
-  `cancelled` or `unknown`, as `lifecycle.md` defines them), duration, and the call a callback ran
-  under;
+- `0003-22`, built: each hosted request's receipt, dispatch and outcome -- `hosted.received`,
+  `hosted.dispatched`, `hosted.ended` -- sharing its id: binding, agent, operation, member, host
+  type, bounded previews, the outcome (`returned`, `raised`, `refused`, `cancelled` or `unknown`,
+  as `lifecycle.md` defines them), duration, and the call a callback ran under; each callback's
+  invocation, `hosted.callback`; and the bindings process's exit mid-session, `binding.exited`;
 - `0003-23`: each request's decision -- a rule's action with the rule's position and layer, the
   `default`, or the approver's answer -- with the effective policy's version; and each escalation
   with its answer, its cancellation, or the late answer that changed nothing;

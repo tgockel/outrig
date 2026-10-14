@@ -1632,6 +1632,28 @@ POOL_MAX = 4
 # The hosted call each thread is inside, by thread ident -- the innermost one, which is the one
 # the reader thread wakes. Installed and removed under the pool's condition variable.
 _waits = {}
+# The operations recorded only when refused; every other one is a boundary request.
+_BOOKKEEPING = frozenset(("ping", "close", "getroot", "inspect", "pickle", "del"))
+# The session's closing error, once the host has said it closed to new work: a boundary call
+# from then on is refused here, raising `outrig.Closed`.
+_closing = None
+
+
+def _say(lines):
+    """Send each of `lines` that is one, giving up on any that cannot be written: the host learns
+    of the call from its other lines then."""
+    for line in lines:
+        if line is not None:
+            with contextlib.suppress(Exception):
+                _send(line)
+
+
+def _closed(text):
+    """`outrig.Closed(text)`, for a call the close kept from running: the class the bindings
+    process's own `Closed` arrives as through RPyC -- RPyC's generic class for the name, made
+    without importing anything, since the reader thread makes one too."""
+    raw = (("outrig", "Closed"), (), (), "")
+    return type(_rpyc.core.vinegar.load(raw, False, False, False))(text)
 
 
 class FrameChannel:
@@ -1643,15 +1665,17 @@ class FrameChannel:
     under the process's send lock.
 
     Bounds are enforced here, in both directions: a part over `PART_MAX`, a part before a frame's
-    last that is not full, a frame whose header claims more than `FRAME_MAX`, a compressed frame,
-    or more than `BUFFER_MAX` bytes held unread -- each frame charged `FRAME_OVERHEAD` beyond its
-    bytes -- closes the channel with the reason, and the waiting reader raises `EOFError` saying
-    why. A frame is never half-delivered: `recv` returns whole frames or raises.
+    last that is not full, a frame whose header claims no data or more than `FRAME_MAX`, a
+    compressed frame, or more than `BUFFER_MAX` bytes held unread -- each frame charged
+    `FRAME_OVERHEAD` beyond its bytes -- closes the channel with the reason, and the waiting
+    reader raises `EOFError` saying why. A frame is never half-delivered: `recv` returns whole
+    frames or raises.
     """
 
     def __init__(self, write, cond=None):
-        # `write(part, more)` writes one part as one protocol line. `cond` is the condition
-        # variable to wait on, when the caller shares one between channels.
+        # `write(part, more, label)` writes one part as one protocol line, `label` the fields of
+        # the frame's first line beyond the part. `cond` is the condition variable to wait on,
+        # when the caller shares one between channels.
         self._write = write
         self._cond = threading.Condition() if cond is None else cond
         self._reason = None  # why the channel closed; `None` while it is open
@@ -1709,6 +1733,9 @@ class FrameChannel:
                 length, compressed = FRAME_HEADER.unpack_from(part)
                 if compressed:
                     return self.close("a compressed frame; compression is off on this transport")
+                if not length:
+                    # RPyC sends none, and serves none: it would be taken and never dispatched.
+                    return self.close("a frame with no data")
                 if length > FRAME_MAX:
                     return self.close(
                         f"a frame of {length} bytes is past the {FRAME_MAX}-byte bound"
@@ -1758,10 +1785,10 @@ class FrameChannel:
                 return data
             raise EOFError(self._reason or "no frame is ready")
 
-    def send(self, data):
-        """Send one frame of `data`, in parts. Refuses a frame past the bound before writing any of
-        it; a write that fails part way closes the channel, since the other side holds a torn
-        frame."""
+    def send(self, data, label=None):
+        """Send one frame of `data`, in parts, `label` on the first. Refuses a frame past the
+        bound before writing any of it; a write that fails part way closes the channel, since the
+        other side holds a torn frame."""
         if len(data) > FRAME_MAX:
             raise ValueError(f"a frame of {len(data)} bytes is past the {FRAME_MAX}-byte bound")
         if self._reason is not None:
@@ -1779,10 +1806,11 @@ class FrameChannel:
                     segments.appendleft(segment[take:])
             more = bool(segments)
             try:
-                self._write(bytes(part), more)
+                self._write(bytes(part), more, label)
             except BaseException:
                 self.close("a frame could not be written whole")
                 raise
+            label = None
             if not more:
                 return
 
@@ -1808,11 +1836,15 @@ class _Wait:
     a callback makes inside it, or when the host called back the coroutine callback this one was
     awaited inside. `nested` holds the calls, on any binding, awaited inside a coroutine callback
     the thread serves meanwhile, which run on it -- on the connection it holds to their binding,
-    if it holds one -- while it serves that callback or one nested inside it.
+    if it holds one -- while it serves that callback or one nested inside it. `asking` is what a
+    boundary request it is waiting to send asks -- its operation, member and target -- while it
+    waits for a free connection, or for a worker: a call woken then was never sent, which the
+    waker tells the host.
     """
 
     __slots__ = (
-        "pool", "execution", "interruptible", "waiting", "exc", "by", "conn", "within", "nested"
+        "pool", "execution", "interruptible", "waiting", "exc", "by", "conn", "within", "nested",
+        "asking",
     )
 
     def __init__(self, pool, execution, interruptible):
@@ -1825,6 +1857,31 @@ class _Wait:
         self.conn = None
         self.within = None
         self.nested = None
+        self.asking = None
+
+    def wake(self, make):
+        """Under the pool's condition variable: leave what `make(self)` builds to be raised."""
+        self.exc = make(self)
+
+    def never_sent(self, outcome, reason):
+        """Under the pool's condition variable: the line that tells the host this call was never
+        sent -- `cancelled` as it is woken, or `refused` -- if it is to send a boundary request,
+        for `_say` once the condition variable is let go; else `None`. Once."""
+        if self.asking is None:
+            return None
+        (operation, member, target), self.asking = self.asking, None
+        execution = self.execution
+        return {
+            "t": "hosted",
+            "agent": self.pool.kernel.agent,
+            "binding": self.pool.binding,
+            "exec": None if execution is None else execution.id,
+            "operation": operation,
+            "member": member,
+            "target": target,
+            "outcome": outcome,
+            "reason": reason,
+        }
 
     def block(self, ready, timeout=None):
         """Under the pool's condition variable: wait until `ready()`, or raise what the reader
@@ -1861,7 +1918,7 @@ class _Job(_Wait):
     from agent code wakes this call alone and leaves its connection for the next taker to tidy.
     """
 
-    __slots__ = ("loop", "task", "future", "context")
+    __slots__ = ("loop", "task", "future", "context", "first")
 
     def wake(self, make):
         """Under the pool's condition variable: settle the awaiting code with what `make(self)`
@@ -1875,9 +1932,12 @@ class _Job(_Wait):
         """The future's done callback: its awaiting task was cancelled, so the worker stops, on
         whichever binding a callback's call has it waiting."""
         if future.cancelled():
+            said = None
             with self.pool.cond:
                 if self.exc is None:
+                    said = self.never_sent("cancelled", "interrupted")
                     self.exc = asyncio.CancelledError()
+            _say([said])
             self.pool.kernel._notify_hosted()
 
 
@@ -2003,12 +2063,24 @@ class _Pool:
             kernel = self.kernel if execution is None else execution.kernel
             wait = _Wait(self, execution, _agent_code_outward(sys._getframe(), kernel))
             wait.within = _job_of(outer)
+        asking = _Hosted.asked(handler, args)
+        if asking[0] == "getroot" and type(wait) is _Job:
+            # Fetched for a call: what the call asks first is what was never sent, if it is woken.
+            asking = wait.first
+        elif asking[0] in _BOOKKEEPING:
+            asking = None
         with self.cond:
             _waits[ident] = wait
         try:
-            conn = self.take(wait)
+            conn = self.take(wait, asking)
             try:
                 return conn._request_here(handler, *args)
+            except BaseException:
+                # The caller gave up on replies still to come -- interrupted, say -- so the host
+                # is told, and drops a request it has not run.
+                if conn.depth == 1 and conn._marks and not conn.closed_either():
+                    conn.cancel()
+                raise
             finally:
                 self.release(conn)
         finally:
@@ -2018,14 +2090,29 @@ class _Pool:
                 else:
                     _waits[ident] = outer
 
-    def take(self, wait):
-        """A connection for this thread's call, as the class comment describes."""
+    def take(self, wait, asking=None):
+        """A connection for this thread's call, as the class comment describes. While it waits,
+        `asking` -- what its request asks, when that is a boundary request -- is the wait's; after
+        the session closed, such a request is refused instead. Under the condition variable, so a
+        close either finds the wait to wake or has set what refuses it."""
         ident = threading.get_ident()
         # An awaited call keeps the connection its last step took, so a wake can tell it was sent.
         taken = wait.conn
         while True:
+            refused = None
             with self.cond:
-                wait.block(lambda: self._pick(ident, wait))
+                wait.asking = asking
+                try:
+                    # A call already woken raises what woke it, and was told of then.
+                    if asking is not None and _closing is not None and wait.exc is None:
+                        refused = wait.never_sent("refused", "admission_closed")
+                    else:
+                        wait.block(lambda: self._pick(ident, wait))
+                finally:
+                    wait.asking = None
+            if refused is not None:
+                _say([refused])
+                raise _closed(_closing)
             conn = wait.conn
             # Its own, or free: the call's. Otherwise abandoned, with frames to drop -- outside
             # the condition variable, since refusing a request writes -- and then another look.
@@ -2237,6 +2324,11 @@ class HostedObject:
         execution = _awaiting(pool)
         loop = asyncio.get_running_loop()
         job = _Job(pool, execution, _agent_code_outward(sys._getframe(1), pool.kernel))
+        # What it asks first, while it waits for a worker; after the close, it is refused here.
+        job.asking = job.first = _first_ask(self)
+        if job.asking is not None and _closing is not None:
+            _say([job.never_sent("refused", "admission_closed")])
+            raise _closed(_closing)
         job.loop, job.task, job.future = loop, asyncio.current_task(loop), loop.create_future()
         job.future.add_done_callback(job.abandoned)
         # Without `_SERVING`: a plain callback may hold its thread until a coroutine it started
@@ -2431,6 +2523,43 @@ def _instance_of(cls, obj):
     return local is not None and isinstance(obj, local)
 
 
+# The request each kind of step makes, as `Hosted.asked` names it: its operation and member. An
+# attribute step's member is the name it is given.
+_STEP_ASKS = {
+    getattr: ("getattr", None),
+    setattr: ("setattr", None),
+    delattr: ("delattr", None),
+    _call: ("call", None),
+    operator.getitem: ("callattr", "__getitem__"),
+    iter: ("callattr", "__iter__"),
+    next: ("callattr", "__next__"),
+    _enter: ("callattr", "__enter__"),
+    _exit: ("ctxexit", None),
+    _instance_of: ("instancecheck", None),
+}
+
+
+def _first_ask(proxy):
+    """What a call resolving `proxy` asks the host first -- the request its path's first step
+    makes -- for the notice of a call woken while it waits for a worker; `None` when that is no
+    boundary request: the root alone, or a step on a value of this process."""
+    pool, ref, path = _parts(proxy)
+    if not path or (ref is not None and _target_type(ref) is None):
+        return None
+    _, fn, *args = path[0]
+    operation, member = _STEP_ASKS[fn]
+    if fn in (getattr, setattr, delattr) and type(args[0]) is str:
+        member = args[0]
+    return operation, member, _target_type(pool._root if ref is None else ref)
+
+
+def _target_type(obj):
+    """The host type a proxy names, as a request's target says it; `None` for anything else."""
+    if issubclass(type(obj), _rpyc.core.netref.BaseNetref):
+        return str(object.__getattribute__(obj, "____id_pack__")[0])
+    return None
+
+
 async def _items(proxy):
     """`async for` over a hosted object: a request for its iterator, then one for each item."""
     it = await _then(proxy, ".__iter__()", iter)
@@ -2547,6 +2676,7 @@ def _run_job(job, proxy, within=None):
     with pool.cond:
         outer = _waits.get(ident)
         job.within = within
+        job.asking = None  # no longer waiting for a worker: each request says what it asks
         _waits[ident] = job
     try:
         value, exc = job.context.run(_resolved, proxy), None
@@ -2621,6 +2751,22 @@ def _connection_class(rpyc):
         (set, LABEL_SET, set.__iter__),
         (frozenset, LABEL_FROZENSET, frozenset.__iter__),
     )
+    # Each handler's operation, as a request's label names it -- its `HANDLE_` name, lower-cased
+    # -- and the handlers whose second argument names an attribute.
+    operations = {
+        value: name[len("HANDLE_") :].lower()
+        for name, value in vars(consts).items()
+        if name.startswith("HANDLE_")
+    }
+    naming = frozenset(
+        [
+            consts.HANDLE_GETATTR,
+            consts.HANDLE_SETATTR,
+            consts.HANDLE_DELATTR,
+            consts.HANDLE_CALLATTR,
+            consts.HANDLE_OLDSLICING,
+        ]
+    )
 
     class Hosted(Connection):
         """One of a kernel's connections to one binding, a member of a `_Pool`."""
@@ -2665,15 +2811,32 @@ def _connection_class(rpyc):
 
         # ------------------------------------------------------------------ requests
 
-        def _send(self, msg, seq, args):
+        @staticmethod
+        def asked(handler, args):
+            """What a request asks, as its label and a notice of it say: its operation, the
+            attribute it names, and the host type of its target."""
+            if handler in naming:
+                member = args[1] if len(args) > 1 else None
+            else:
+                member = args[2] if handler == consts.HANDLE_CMP and len(args) > 2 else None
+            return (
+                operations.get(handler, "unknown"),
+                member if type(member) is str else None,
+                _target_type(args[0]) if args else None,
+            )
+
+        def _send(self, msg, seq, args, label=None):
             """RPyC's, without its shared send queue -- a frame past the bound raises in the thread
             that asked, and a finalizer's release is queued by `_async_request` rather than sent --
             and when a frame could not be written whole, which closed the channel, the binding is
-            told, so it releases the connection's objects and thread."""
+            told, so it releases the connection's objects and thread. `label`, with the frame's
+            size, goes on its first line."""
             data = brine.I1.pack(msg) + brine.dump((seq, args))
+            if label is not None:
+                label = {**label, "size": len(data)}
             try:
                 with self._sendlock:
-                    self._channel.send(data)
+                    self._channel.send(data, label)
             except BaseException:
                 if self._channel.closed and not self._closed:
                     self.close_with(self._channel.reason)
@@ -2689,14 +2852,23 @@ def _connection_class(rpyc):
             self._flush_dels()
             if handler == consts.HANDLE_CTXEXIT:
                 args = self._ctxexit_args(args)
+            operation, member, target = self.asked(handler, args)
+            execution = _CURRENT.get()
             saved = self._context.marks
             self._context.marks = marks = []
             try:
                 seq = self._get_seq_id()
                 self._request_callbacks[seq] = callback
                 self._marks[seq] = marks
+                label = {
+                    "request": seq,
+                    "op": operation,
+                    "member": member,
+                    "target": target,
+                    "exec": None if execution is None else execution.id,
+                }
                 try:
-                    self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+                    self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)), label)
                 except BaseException:
                     self._request_callbacks.pop(seq, None)
                     self._release(self._marks.pop(seq, ()))
@@ -2721,7 +2893,8 @@ def _connection_class(rpyc):
                     consts.LABEL_TUPLE,
                     ((consts.LABEL_LOCAL_REF, id_pack), (consts.LABEL_VALUE, count)),
                 )
-                self._send(consts.MSG_REQUEST, seq, (consts.HANDLE_DEL, boxed))
+                label = {"request": seq, "op": "del"}
+                self._send(consts.MSG_REQUEST, seq, (consts.HANDLE_DEL, boxed), label)
 
         def _ctxexit_args(self, args):
             """A proxy's `__exit__` sends only the exception's type. The exception itself is
@@ -2839,13 +3012,18 @@ def _connection_class(rpyc):
             -- a callback's own hosted call -- runs on that same thread. The wait is on the
             pool's condition variable, where the reader thread wakes it with a frame or with the
             exception an interrupt, a cancel or a close carries; that exception is raised here,
-            between frames, and nowhere else.
+            between frames, and nowhere else. A request the host refused is answered by the
+            reader thread (`refused`), which ends the wait with no frame to serve.
             """
             wait = _waits.get(threading.get_ident()) or _Wait(self._pool, None, False)
             channel = self._channel
             with self._pool.cond:
-                if not wait.block(lambda: channel.ready, rpyc.lib.Timeout(timeout).timeleft()):
+                if not wait.block(
+                    lambda: channel.ready or not waiting(), rpyc.lib.Timeout(timeout).timeleft()
+                ):
                     return False
+                if not waiting():
+                    return True
             try:
                 data = channel.recv()
             except EOFError:
@@ -2861,6 +3039,31 @@ def _connection_class(rpyc):
             with contextlib.suppress(EOFError):
                 while self._request_callbacks and self._channel.ready:
                     self._dispatch(self._channel.recv(), serving=False)
+
+        def refused(self, seq, reason, error):
+            """The host refused request `seq` and never sent it on: answered here -- with the
+            closing error when admission had closed, else `EOFError` -- its caller woken and the
+            callables it handed out given back. Reader thread only."""
+            exc = _closed(error) if reason == "admission_closed" else EOFError(error)
+            with self._pool.cond:
+                callback = self._request_callbacks.pop(seq, None)
+                self._release(self._marks.pop(seq, ()))
+                if callback is not None:
+                    callback(True, exc)
+                self._pool.cond.notify_all()
+
+        def cancel(self):
+            """Tell the host the caller of each request outstanding here gave up on it."""
+            with contextlib.suppress(Exception):
+                _send(
+                    {
+                        "t": "rpc",
+                        "agent": self.agent,
+                        "binding": self.binding,
+                        "id": self.number,
+                        "cancel": list(self._marks),
+                    }
+                )
 
         # ------------------------------------------------------------------ dispatch
 
@@ -2939,7 +3142,8 @@ def _connection_class(rpyc):
                     "the call this callback belongs to was interrupted in the container; the "
                     "callback did not run"
                 )
-                self._send(consts.MSG_EXCEPTION, seq, self._box_exc(RuntimeError, exc, None))
+                boxed = self._box_exc(RuntimeError, exc, None)
+                self._send(consts.MSG_EXCEPTION, seq, boxed, {"reply": seq})
                 return
             saved = self._context.marks
             self._context.marks = None
@@ -2966,7 +3170,7 @@ def _connection_class(rpyc):
             finally:
                 self._context.marks = saved
             try:
-                self._send(reply[0], seq, reply[1])
+                self._send(reply[0], seq, reply[1], {"reply": seq})
             except Exception:
                 # The interrupt is the result; a channel that closed meanwhile is not.
                 if raised is None:
@@ -3950,9 +4154,21 @@ class Kernel:
         self._hosted = {}
         self._hosted_lock = threading.Lock()
         self._hosted_numbers = collections.defaultdict(lambda: itertools.count(1))
+        # The stub of each of the session's bindings, the runtime's own reference to what is bound
+        # under the binding's name.
+        self.stubs = {}
+        self.bind_stubs()
 
     def announce(self):
         _send({"t": "ready", "agent": self.agent, "version": _VERSION})
+
+    def bind_stubs(self):
+        """Bind each of the session's bindings under its name, as its stub, among the names bound
+        at boot, which the inventory leaves out. Nothing, without RPyC."""
+        if _Hosted is None:
+            return
+        for name in _BINDINGS:
+            self.stubs[name] = self.globals[name] = self._boot[name] = self.stub(name)
 
     def stub(self, binding):
         """The root of `binding` -- an object in a process on the host -- as the `HostedObject`
@@ -4003,7 +4219,7 @@ class Kernel:
         agent = self.agent
         number = next(self._hosted_numbers[binding])
 
-        def write(part, more):
+        def write(part, more, label=None):
             # Encoded without the reserve: running out of memory while sending the agent's own
             # frame is the agent's to see.
             _write_line(
@@ -4015,6 +4231,7 @@ class Kernel:
                         "id": number,
                         "data": base64.b64encode(part).decode("ascii"),
                         "more": more,
+                        **(label or {}),
                     }
                 )
             )
@@ -4315,10 +4532,14 @@ class Kernel:
                 return None
             if not wait.interruptible:
                 return None
+            said = None
             if wait.exc is None:
                 wait.exc, wait.by = make_exc(wait), self
+                said = wait.never_sent("cancelled", "interrupted")
                 wait.pool.cond.notify_all()
-            return "woken" if wait.waiting else "busy"
+            woken = "woken" if wait.waiting else "busy"
+        _say([said])
+        return woken
 
     def _wake_jobs(self, exec_id, make_exc):
         """Settle every call `exec_id`'s execution awaits from agent code -- queued, waiting, or
@@ -4330,11 +4551,14 @@ class Kernel:
             return False
         woken = False
         for pool in list(self._hosted.values()):
+            said = []
             with pool.cond:
                 for job in pool.jobs:
                     if job.execution is running and job.interruptible and job.exc is None:
+                        said.append(job.never_sent("cancelled", "interrupted"))
                         job.wake(make_exc)
                         woken = True
+            _say(said)
         self._notify_hosted()
         return woken
 
@@ -4605,7 +4829,7 @@ def _bindings(message):
     `sys.path`: after the workspace and before the agent's own pip installs, so that the container
     imports the version of a library its binding runs rather than one the agent installed, in the
     order the host gave them, which decides between two bindings that hold different versions of
-    one package.
+    one package. Each kernel open then binds a stub for each, as one opened later does.
     """
     global _BINDINGS
     entries, paths = message.get("bindings"), message.get("paths")
@@ -4625,6 +4849,33 @@ def _bindings(message):
         if path not in sys.path:
             sys.path.insert(at, path)
             at += 1
+    for kernel in list(_kernels.values()):
+        kernel.bind_stubs()
+
+
+def _close(message):
+    """The session has closed to new work. A boundary call is refused here from now on, and each
+    one still waiting to be sent -- for a free connection, or for a worker -- raises the closing
+    error now; what was sent is the binding's to finish."""
+    global _closing
+    _closing = text = message["reason"]
+    for kernel in list(_kernels.values()):
+        for pool in list(kernel._hosted.values()):
+            said = []
+            with pool.cond:
+                for wait in [*pool.jobs, *_waits.values()]:
+                    if wait.pool is pool and wait.asking is not None and wait.exc is None:
+                        said.append(wait.never_sent("cancelled", "closed"))
+                        wait.wake(lambda _: _closed(text))
+                pool.cond.notify_all()
+            _say(said)
+
+
+def _unbind(message):
+    """The process holding the bindings has ended: every kernel's connections to them close, a
+    call in flight told its outcome on the host is unknown, and a later use raises with why."""
+    for kernel in list(_kernels.values()):
+        kernel.close_hosted(reason=message["reason"])
 
 
 # ---------------------------------------------------------------------------- routing
@@ -4762,7 +5013,8 @@ def _rpc(kernel, number, message):
     A part for a connection that has closed, or that this kernel never opened, is answered with a
     close notice rather than buffered, so nothing waits on it. The part is decoded before anything
     changes, so `_handle`'s retry after running out of memory never applies one twice; the notice
-    comes after, and is given up rather than retried.
+    comes after, and is given up rather than retried. A request the host refused is answered
+    here.
     """
     binding = message.get("binding")
     if not isinstance(binding, str):
@@ -4771,6 +5023,12 @@ def _rpc(kernel, number, message):
     if "closed" in message:
         if channel is not None:
             channel.close(f"the host closed this connection: {message['closed']}")
+        return
+    if "refused" in message:
+        pool = kernel._hosted.get(binding)
+        for conn in list(pool.connections) if pool is not None else ():
+            if conn.number == number:
+                conn.refused(message["refused"], message.get("reason"), message.get("error"))
         return
     part = base64.b64decode(message.get("data", ""), validate=True)
     if channel is None or channel.closed:
@@ -4829,6 +5087,12 @@ def _route(line):
         return
     if kind == "bindings":
         _bindings(message)
+        return
+    if kind == "close":
+        _close(message)
+        return
+    if kind == "unbind":
+        _unbind(message)
         return
     handle = _ROUTES.get(kind) if isinstance(kind, str) else None
     if handle is None:

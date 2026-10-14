@@ -69,11 +69,14 @@ session's own: the one `session.json` and `outrig ls` show, which its containers
 
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
-and neither do the session's own, `session.state` and `session.report`.
+and neither do the session's own, `session.state` and `session.report`, or those of the process
+holding its bindings, `binding.refused` and `binding.exited`. A request to a binding is the
+agent's that made it.
 
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
-them means nothing. Turns and calls are each counted from 0 on their own.
+them means nothing. Turns and calls are each counted from 0 on their own, and requests to
+bindings from 1.
 
 ## Three categories
 
@@ -89,10 +92,14 @@ category says what it may hold.
   16 KiB of output and of traceback per execution, 4 KiB per line of stderr, 200 names in an
   inventory, and names and types only, never values. An execution's full output is never
   recorded.
-- **Integration audit** -- what crossed to a provider or across a channel. Provider calls are
-  recorded as their token counts, never their bodies, which are model view. Channel messages are
-  recorded with their bodies, at most 1 MiB each as a channel carries them. A message the user
-  types can hold a secret; this category is why the file is its owner's alone.
+- **Integration audit** -- what crossed to a provider, across a channel, or to a binding.
+  Provider calls are recorded as their token counts, never their bodies, which are model view.
+  Channel messages are recorded with their bodies, at most 1 MiB each as a channel carries them.
+  A message the user types can hold a secret; this category is why the file is its owner's alone.
+  A request to a binding is recorded with a preview of each argument, built from what crossed by
+  value and cut to 200 characters, 16 items of a container, and 3 levels deep; an object of the
+  host's is named by its type and a reference number, never by its `repr`, which would run its
+  code.
 
 ## Model view
 
@@ -169,16 +176,24 @@ the same call, and records no new `model.call`.
     `{"state": "not_proven", "reason": ...}` when something could not be confirmed stopped.
   - `executions`: each execution running at the close, as `{execid, status}`; `status` is `ok`
     or `error` if its result arrived, and `unknown` if it was cut off.
+  - `hosted`: each request to a binding that ended after the close, in the order they ended, as
+    `{request, agent, binding, outcome, reason}`, from its `hosted.ended`. One `unknown` makes
+    the verdict `stopped_with_unknown`, as an execution's does.
   - `bindings`: how the process holding the session's bindings stopped, as `{names,
-    group_empty, killed, survivors}`, or `null` when the session had none: the bindings it held,
-    whether no process is left in its process group, whether `SIGKILL` was needed after the
-    grace, and what was still in the group when it could not be proven empty, each as
-    `<pid> <command> <state>`. A group not proven empty makes `stopped` `not_proven`.
+    group_empty, killed, survivors, exited}`, or `null` when the session had none: the bindings
+    it held, whether no process is left in its process group, whether `SIGKILL` was needed after
+    the grace, what was still in the group when it could not be proven empty, each as
+    `<pid> <command> <state>`, and how the process ended when it ended before the stop, as its
+    `binding.exited` says, or `null`. A group not proven empty makes `stopped` `not_proven`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
   `reason`, which says whether the operator did not approve the declaration, nobody could be
   asked, or the session had no approver, and how to approve it.
+- `binding.exited` -- the process holding the session's bindings ended while the session ran:
+  `bindings`, the names it held, and `cause`, such as `it was killed by SIGKILL`. The session goes
+  on without them: each request the process was running ends `unknown`, and a later one raises an
+  error saying how the process ended.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
   and `tool_result_max`.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the
@@ -278,6 +293,42 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
 - `message.received` -- the other end took a message: `message`, the id its `message.sent` gave,
   then `channel`, `from`, and `to`. For a message to the agent, that is its code receiving it,
   which can be well after it arrived.
+- `hosted.received` -- a request agent code made of a binding's object, as it arrived, before
+  anything is decided about it. `request`, an id OutRig gives it, which the request's other events
+  carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `operation`, what it
+  asks of its target; `member`, the attribute it names, or `null`; `target`, the qualified name of
+  its target's type on the host, or `null`; `arguments`, a preview of each positional argument,
+  and `keywords`, one per keyword argument, by name; `parent`, the request a callback made it
+  under, or `null`; and `by`: `binding` when the bindings process received it, or, for one it
+  never received, `relay` -- refused, or lost with the process or its connection, on its way
+  there -- or `interpreter`, never sent. `operation` is `getattr`, `setattr`, `delattr`, `call`,
+  `callattr`, `repr`, `str`, `cmp`, `hash`, `dir`, `instancecheck`, `buffiter`, `oldslicing` or
+  `ctxexit`, each recorded every time; `ping`, `close`, `getroot`, `inspect`, `pickle` or `del`,
+  bookkeeping, recorded only when refused; or `unknown`, a request type outside the protocol. A
+  method call is two requests, a `getattr` and a `call`; `async for` is a `callattr` of `__iter__`,
+  then one of `__next__` per item, the last of which raises `StopIteration`.
+- `hosted.dispatched` -- `request`, `agent`, `binding`: the request's target is about to run,
+  published before it does. A request whose target never runs has none.
+- `hosted.ended` -- how a request ended: `request`, `agent`, `binding`; `outcome`; `reason`, for
+  an outcome that has one, else `null`; `detail`, what refused it, or `null`; `exception`, the
+  qualified name of what a `raised` call raised, and `traceback`, the host's traceback text, its
+  last 16 KiB, which agent code does not get; `interrupted`, `true` when the caller was
+  interrupted while the target ran; and `duration`, seconds from its receipt. `outcome` is:
+  - `returned` or `raised` -- the target ran.
+  - `refused` -- the target never ran: `interception`, the bindings process's checks refused it;
+    `admission_closed`, the session was closed to new work; `queue_full`, the bindings process
+    was not taking calls and the queue to it had no room, or the agent already had 1,024 requests
+    in flight; or `exited`, the process had ended.
+  - `cancelled` -- the target never ran: `interrupted`, its caller was interrupted first;
+    `closed`, the session closed while it waited for its binding's turn or a free connection; or
+    `disconnected`, its connection closed before the bindings process read it.
+  - `unknown` -- no reply came: `killed`, the bindings process was killed at shutdown, or
+    `exited`, it ended on its own. Whether the target ran is open.
+
+  That a target never ran is read from `refused` or `cancelled` alone: a missing
+  `hosted.dispatched` may be one a gap lost.
+- `hosted.callback` -- a binding's library called a callable agent code passed it: `parent`, the
+  request it was passed to; `agent`; `binding`.
 
 **Totals.** What a session spent is the sum of its `model.attempt` usage, each `attempt_id`
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a

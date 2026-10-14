@@ -699,6 +699,12 @@ serialize   = true
   thread-safe. The binding then runs one call at a time across all its connections, every
   kernel's included.
 
+The agent's Python reaches a binding under its name, as an object it awaits: `await
+repo.head.commit` asks the host for `repo.head`, then for its `commit`, and gives back a value or
+another such object. Each request is checked on the host, where a private name -- one that starts
+with `_` -- is refused, and, with [`[events] mode = "record"`](#events), recorded with what it
+asked and how it ended (see `doc/reference/events.md`).
+
 The bindings' process runs on the host, as you, in the workspace's host directory, with your
 environment less every variable the config names through `${VAR}` (each `api-key`,
 `build-args` value and MCP `env` value), which are OutRig's own secrets. Every binding's
@@ -719,8 +725,11 @@ the global config needs no approval.
 [`[[workspace.mounts]]`](#workspace) entry appear in the container at their host paths, so a
 path the agent writes and a path the library reads name the same file. A `container-path` that
 differs is a config error. Each binding's packages are mounted read-only in the container
-under `/outrig/bindings/` and put on the interpreter's import path, so `import git` works
-there too -- as a local copy of the library, which knows nothing of the host's object.
+under `/outrig/bindings/` and put on the interpreter's import path, so the library can be
+imported there too -- as a local copy, which knows nothing of the host's object -- and its
+exception classes catch what a call to the binding raised. A library may need more to import:
+GitPython looks for a `git` program as it is imported, which an image without one lacks, unless
+`GIT_PYTHON_REFRESH=quiet` is set first.
 
 Bindings are ordered: the global config's, then the repo config's, then those the library's
 `bind` adds, by name within each. That is the order the agent is told of them in, the order

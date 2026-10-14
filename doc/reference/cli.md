@@ -428,17 +428,19 @@ reported and the session carries on; the messages it had not read are still wait
 typed next is announced with them.
 
 **Leaving.** `/quit`, the end of input, and a second Ctrl-C at the prompt each close the session
-to new work, then stop it: Python still running is given five seconds to finish, is interrupted,
+to new work, then stop it: Python still running, and calls into bindings, are given five seconds
+to finish; Python is then interrupted, the bindings process is stopped with everything it started,
 and the container is stopped, which ends whatever an interrupt could not. A round running at
 `/quit` is dropped; one still running when input ends is let finish first. `run-new` then prints
-what the stop found -- whether everything stopped, and how each execution that was running ended,
-`ok`, `error`, or `unknown` for one cut off -- and exits with the status it decides:
+what the stop found -- whether everything stopped, how each execution that was running ended,
+`ok`, `error`, or `unknown` for one cut off, and how each call into a binding that ended after
+the close ended -- and exits with the status it decides:
 
-| Status | What the stop found                                                                |
-|--------|------------------------------------------------------------------------------------|
-| 0      | Everything stopped, and every outcome is known.                                    |
-| 2      | Everything stopped, and some Python was cut off: what it did may or may not stand. |
-| 3      | Something could not be confirmed stopped, and may still be running.                |
+| Status | What the stop found                                                                 |
+|--------|-------------------------------------------------------------------------------------|
+| 0      | Everything stopped, and every outcome is known.                                     |
+| 2      | Everything stopped, and some Python or binding call was cut off: it may have acted. |
+| 3      | Something could not be confirmed stopped, and may still be running.                 |
 
 If the interpreter exits -- Python that calls `os._exit`, say -- nothing typed could reach the
 agent any more, and the session ends, through the same report, with exit status 1, or 3 if the
@@ -477,7 +479,10 @@ repository's config declares is shown whole before anything is installed, with a
 question; a yes is remembered for that exact declaration in that repository, and an edit asks
 again. With no terminal on stdin -- a script, CI -- `run-new` says which binding it skipped and
 how to approve it, and the session runs without it. The agent is told each binding's name and
-description; calling one from its Python is not built yet.
+description, and its Python reaches each under that name, as an object it awaits: `await
+repo.head.commit`. Every call it makes is checked on the host and, with `[events] mode = "record"`,
+recorded. If the bindings process dies, the session goes on without its bindings, and a call to
+one raises an error saying how the process ended.
 
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each

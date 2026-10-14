@@ -66,6 +66,14 @@ pub struct Subject(Cow<'static, str>);
 impl Subject {
     pub(crate) const PRIMARY: Subject = Subject(Cow::Borrowed(crate::events::PRIMARY_SUBJECT));
 
+    /// The agent the interpreter's protocol names `agent`.
+    pub(crate) fn agent(agent: &str) -> Subject {
+        if agent == crate::python::host::PRIMARY {
+            return Subject::PRIMARY;
+        }
+        Subject(Cow::Owned(format!("agent/{agent}")))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -121,6 +129,12 @@ id_type!(
     /// within its session.
     AttemptId
 );
+id_type!(
+    /// One request agent code made of a hosted object -- an attribute read, a
+    /// call, a step of an iteration -- for the life of the session. Every event
+    /// about the request carries it.
+    RequestId
+);
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -166,6 +180,7 @@ pub enum Payload {
         closed_by: super::ClosedBy,
         stopped: super::Stopped,
         executions: Vec<super::ExecutionOutcome>,
+        hosted: Vec<super::HostedCall>,
         bindings: Option<super::BindingStop>,
         verdict: super::Verdict,
     },
@@ -248,6 +263,14 @@ pub enum Payload {
         binding: String,
         declared_in: Option<std::path::PathBuf>,
         reason: String,
+    },
+    /// The process holding the session's bindings exited while the session
+    /// ran, for `cause`. The session goes on without them: each call it was
+    /// running is `unknown`, and a later call to any of them fails.
+    #[non_exhaustive]
+    BindingExited {
+        bindings: Vec<String>,
+        cause: String,
     },
 
     // Integration audit: what crossed to a provider, or across a channel.
@@ -337,6 +360,54 @@ pub enum Payload {
         from: String,
         to: String,
     },
+    /// A request agent code made of a hosted object, as it arrived: published
+    /// before anything is decided about it. `by` says who saw it -- the
+    /// bindings process, which received it, or, for one it never received,
+    /// the owner's relay or the interpreter.
+    #[non_exhaustive]
+    HostedReceived {
+        request: RequestId,
+        agent: String,
+        binding: String,
+        execid: Option<ExecId>,
+        operation: Operation,
+        member: Option<String>,
+        target: Option<String>,
+        arguments: Vec<String>,
+        keywords: std::collections::BTreeMap<String, String>,
+        parent: Option<RequestId>,
+        by: ReceivedBy,
+    },
+    /// A request's target is about to be invoked: published before it is.
+    #[non_exhaustive]
+    HostedDispatched {
+        request: RequestId,
+        agent: String,
+        binding: String,
+    },
+    /// How a request ended.
+    #[non_exhaustive]
+    HostedEnded {
+        request: RequestId,
+        agent: String,
+        binding: String,
+        outcome: HostedOutcome,
+        reason: Option<HostedReason>,
+        detail: Option<String>,
+        exception: Option<String>,
+        traceback: Option<String>,
+        interrupted: bool,
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
+    },
+    /// A hosted library called back a callable agent code passed it, in the
+    /// call `parent`.
+    #[non_exhaustive]
+    HostedCallback {
+        parent: RequestId,
+        agent: String,
+        binding: String,
+    },
 }
 
 impl Payload {
@@ -378,6 +449,11 @@ impl Payload {
             Payload::MessageSent { .. } => "message.sent",
             Payload::MessageRefused { .. } => "message.refused",
             Payload::MessageReceived { .. } => "message.received",
+            Payload::BindingExited { .. } => "binding.exited",
+            Payload::HostedReceived { .. } => "hosted.received",
+            Payload::HostedDispatched { .. } => "hosted.dispatched",
+            Payload::HostedEnded { .. } => "hosted.ended",
+            Payload::HostedCallback { .. } => "hosted.callback",
         }
     }
 
@@ -390,10 +466,148 @@ impl Payload {
             | Self::OutputUnattributed { .. }
             | Self::InterpreterDiagnostic { .. }
             | Self::InterpreterExited { .. }
-            | Self::BindingRefused { .. } => None,
+            | Self::BindingRefused { .. }
+            | Self::BindingExited { .. } => None,
+            Self::HostedReceived { agent, .. }
+            | Self::HostedDispatched { agent, .. }
+            | Self::HostedEnded { agent, .. }
+            | Self::HostedCallback { agent, .. } => Some(Subject::agent(agent)),
             _ => Some(Subject::PRIMARY),
         }
     }
+}
+
+/// What a hosted request asked of its target: one of the handlers of the
+/// transport's protocol, named as `0003-16`'s inventory names them.
+/// `getroot`, `inspect`, `del`, `ping`, `close` and `pickle` are bookkeeping,
+/// recorded only when they are refused; the rest are boundary requests,
+/// recorded every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Operation {
+    Getattr,
+    Setattr,
+    Delattr,
+    Call,
+    Callattr,
+    Repr,
+    Str,
+    Cmp,
+    Hash,
+    Dir,
+    Instancecheck,
+    Buffiter,
+    Oldslicing,
+    Ctxexit,
+    Ping,
+    Close,
+    Getroot,
+    Inspect,
+    Pickle,
+    Del,
+    /// A request type outside the protocol's table, which is refused.
+    Unknown,
+}
+
+impl Operation {
+    /// The operation the protocol's lines name `name`.
+    pub(crate) fn named(name: &str) -> Operation {
+        match name {
+            "getattr" => Operation::Getattr,
+            "setattr" => Operation::Setattr,
+            "delattr" => Operation::Delattr,
+            "call" => Operation::Call,
+            "callattr" => Operation::Callattr,
+            "repr" => Operation::Repr,
+            "str" => Operation::Str,
+            "cmp" => Operation::Cmp,
+            "hash" => Operation::Hash,
+            "dir" => Operation::Dir,
+            "instancecheck" => Operation::Instancecheck,
+            "buffiter" => Operation::Buffiter,
+            "oldslicing" => Operation::Oldslicing,
+            "ctxexit" => Operation::Ctxexit,
+            "ping" => Operation::Ping,
+            "close" => Operation::Close,
+            "getroot" => Operation::Getroot,
+            "inspect" => Operation::Inspect,
+            "pickle" => Operation::Pickle,
+            "del" => Operation::Del,
+            _ => Operation::Unknown,
+        }
+    }
+
+    /// Whether a request of this operation is bookkeeping, recorded only when it is refused.
+    pub(crate) fn bookkeeping(self) -> bool {
+        matches!(
+            self,
+            Operation::Ping
+                | Operation::Close
+                | Operation::Getroot
+                | Operation::Inspect
+                | Operation::Pickle
+                | Operation::Del
+        )
+    }
+}
+
+/// Who saw a hosted request arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReceivedBy {
+    /// The bindings process, which received it.
+    Binding,
+    /// The owner's relay, which refused it, or lost it with the process or
+    /// its connection, before the process received it as the request its
+    /// label numbers; described from what the interpreter said of it.
+    Relay,
+    /// The interpreter, which never sent it.
+    Interpreter,
+}
+
+/// How a hosted request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HostedOutcome {
+    /// Its target was invoked and returned.
+    Returned,
+    /// Its target was invoked and raised.
+    Raised,
+    /// Its target was never invoked: something refused it.
+    Refused,
+    /// Its target was never invoked: its caller was interrupted, its
+    /// connection closed, or the session closed, while it waited.
+    Cancelled,
+    /// It was sent and no reply came: its process was killed, or died.
+    /// Whether its target was invoked is open.
+    Unknown,
+}
+
+/// Why a hosted request was refused, cancelled, or ended unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HostedReason {
+    /// The bindings process's checks refused it; `detail` says which.
+    Interception,
+    /// The session was closed to new work.
+    AdmissionClosed,
+    /// The bindings process was not reading, and its queue had no room; or
+    /// its agent had as many requests in flight as the relay holds.
+    QueueFull,
+    /// The bindings process had exited.
+    Exited,
+    /// Its caller was interrupted, or cancelled.
+    Interrupted,
+    /// The session closed while it waited.
+    Closed,
+    /// The bindings process was killed at shutdown.
+    Killed,
+    /// Its connection closed before the bindings process read it.
+    Disconnected,
 }
 
 /// A tool a model call carries, as the provider is told of it.

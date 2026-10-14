@@ -19,6 +19,7 @@ use crate::events::{Events, StreamBuilder};
 use crate::image::ImageTag;
 use crate::outrig_::resolve_session_id;
 use crate::python::host::Interpreter;
+use crate::python::payload::RPYC_MOUNT;
 use crate::{EmbeddedMcpPolicy, LaunchSpec, Outrig};
 
 /// A step of a session's start, as a progress callback is told of it.
@@ -320,13 +321,15 @@ impl SessionBuilder {
         self.report(Progress::Finished(Step::Container));
 
         self.report(Progress::Started(Step::Python));
-        let interpreter = match Interpreter::start(outrig.primary(), events.clone()).await {
+        let rpyc = (!bindings.is_empty()).then_some(RPYC_MOUNT);
+        let interpreter = match Interpreter::start(outrig.primary(), events.clone(), rpyc).await {
             Ok(interpreter) => interpreter,
             Err(e) => {
                 stop(outrig, &mut bindings).await;
                 return Err(SessionError::Start(Failure(e.into())));
             }
         };
+        bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, bindings::container_path);
         self.report(Progress::Finished(Step::Python));
 
@@ -484,7 +487,9 @@ impl SessionBuilder {
             .await
             .map_err(start_error)?;
         self.report(Progress::Started(Step::Python));
-        let interpreter = crate::python::testing::start_on_host_with(events.clone()).await;
+        let interpreter =
+            crate::python::testing::start_on_host_rpyc(events.clone(), bindings.rpyc_dir()).await;
+        bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         self.report(Progress::Finished(Step::Python));
         match assemble(
@@ -598,7 +603,8 @@ fn start_error(e: OutrigError) -> SessionError {
 /// `spec`, rewritten for a session with bindings: every directory it mounts
 /// appears in the container at its host path, so a path the agent writes and
 /// a path the library reads name one file, and each binding's package
-/// directory is bound read-only beside the payload.
+/// directory, and the vendored RPyC the interpreter reaches them with, is
+/// bound read-only beside the payload.
 ///
 /// The workspace's container path becomes its host path, unless `config`
 /// declared another, which is an error naming the key. A `LaunchSpec` cannot
@@ -646,6 +652,11 @@ fn same_paths(
         .package_dirs()
         .into_iter()
         .map(|dir| ContainerMount::shared_read_only(dir, bindings::container_path(dir)))
+        .chain(
+            bindings
+                .rpyc_dir()
+                .map(|dir| ContainerMount::shared_read_only(dir, Path::new(RPYC_MOUNT))),
+        )
         .collect();
     Ok(())
 }

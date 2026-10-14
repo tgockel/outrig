@@ -3,8 +3,9 @@
 What decides whether a request from the container reaches a hosted object, and what is recorded
 about it. `hosted-objects.md` carries requests to the host and intercepts every one there; this
 page is what the interception enforces. It replaces `call-inspection.md`. The design was settled in
-the planning round of 2026-09-30 and none of it is built: `0003-22` intercepts and events every
-crossing, `0003-23` builds rules, deny, and escalation, and `0003-24` the evaluator.
+the planning round of 2026-09-30. `0003-22` built the default -- every request runs, recorded --
+and admission's two places; `0003-23` builds rules, deny, and escalation, and `0003-24` the
+evaluator.
 
 Three decisions apply throughout:
 
@@ -449,9 +450,9 @@ how risky a member is, and per-library tables are rejected above.
   produces through RPyC are reasoned from RPyC's proxy code, not observed.
 - That the providers' strict modes reject map-valued schemas comes from reading their
   documentation, not from a request made here.
-- That the owner's gate lets exactly one of interrupt, close, and allow win for a held request, and
-  that a binding's closed flag refuses every rule-allowed request the binding reads after it, is a
-  design, not a measurement. `0003-22` and `0003-23` test them.
+- That the owner's gate lets exactly one of interrupt, close, and allow win for a held request is
+  a design, not a measurement; `0003-23` tests it. `0003-22` tested the other half: a binding's
+  closed flag refused a request the binding read after it, one whose frame claimed bookkeeping.
 - That delimiting evidence keeps the evaluator from following instructions inside it is not
   established by any test. Delimiting reduces a model's tendency to act on text it reads; it does
   not remove it, which is one reason the verdict is judgment.

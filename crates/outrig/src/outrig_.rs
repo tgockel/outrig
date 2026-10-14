@@ -457,9 +457,10 @@ pub struct LaunchSpec {
     /// before it builds or unpacks anything.
     pub session_id: Option<String>,
     pub log_dir: PathBuf,
-    /// Package directories of the session's bindings, bound read-only beside
-    /// the payload under OutRig's own root, where no caller's mount may go.
-    /// A session's builder fills it.
+    /// Package directories of the session's bindings, and the vendored RPyC
+    /// the interpreter reaches them with, bound read-only beside the payload
+    /// under OutRig's own root, where no caller's mount may go. A session's
+    /// builder fills it.
     pub(crate) packages: Vec<ContainerMount>,
 }
 

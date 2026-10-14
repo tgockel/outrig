@@ -9,12 +9,12 @@
 //! to whatever `python3` the image happens to carry, which would be a different
 //! interpreter with a different library, or none at all.
 //!
-//! RPyC, which carries hosted-object requests between the interpreter and each
-//! binding process, arrives the same way: `build.rs` fetches the pinned wheel,
+//! RPyC, which carries hosted-object requests between the interpreter and the
+//! bindings process, arrives the same way: `build.rs` fetches the pinned wheel,
 //! lays its members out as a tar, and embeds that, and [`rpyc_dir`] unpacks it
-//! once into a directory named for the pin. A binding process imports RPyC
-//! from that directory, and `0003-22` mounts it read-only in the container
-//! beside the payload.
+//! once into a directory named for the pin. The bindings process imports RPyC
+//! from that directory, and a session with bindings mounts it read-only in the
+//! container at [`RPYC_MOUNT`], where the interpreter imports it.
 
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -40,6 +40,11 @@ pub(crate) const PAYLOAD_MOUNT: &str = "/outrig/python";
 /// directories podman makes for the mount point root-owned in the container
 /// user's home.
 pub(crate) const BINDINGS_MOUNT: &str = "/outrig/bindings";
+
+/// Where the vendored RPyC is bound, read-only, inside the primary container of
+/// a session with bindings: the interpreter imports it from there to reach
+/// them.
+pub(crate) const RPYC_MOUNT: &str = "/outrig/rpyc";
 
 /// The pinned archive, as `build.rs` verified it; empty when that build could
 /// not fetch it.
@@ -105,10 +110,9 @@ pub(crate) async fn host_python() -> Result<PathBuf> {
 }
 
 /// The vendored RPyC's directory on the host, holding the `rpyc` package,
-/// unpacked from the embedded wheel the first time it is asked for. Binding
-/// processes import from it, and `0003-22` mounts it read-only in the
-/// container beside the payload.
-#[cfg_attr(not(test), allow(dead_code))]
+/// unpacked from the embedded wheel the first time it is asked for. The
+/// bindings process imports from it, and a session with bindings mounts it
+/// read-only in the container at [`RPYC_MOUNT`].
 pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
     if RPYC_ARCHIVE.is_empty() {
         return Err(wheel_not_embedded());

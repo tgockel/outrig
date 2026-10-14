@@ -44,8 +44,8 @@ pub use self::bindings::BindingSpec;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
-    BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, LogLoss, ShutdownReport,
-    Stopped, Verdict,
+    BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
+    ShutdownReport, Stopped, Verdict,
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use crate::agent::UserChannel;

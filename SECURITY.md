@@ -76,15 +76,15 @@ Issues that bear on **host integrity** are in scope, for example:
   mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
 - Network filtering is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
-- A **binding** (`[bindings.<name>]`, 0.3) runs a library in a process **on the host, outside
-  the container**, with the host user's authority: their files, their `ssh-agent`, their
-  credential helpers, and every variable of their environment but the ones OutRig's config
-  names through `${VAR}`. One process holds every binding of a session, so every binding's
-  library runs with that one environment. Whatever the library does on the host is part of what the binding
-  grants -- GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names,
-  and the agent can write `.git/` through the workspace mount. With no policy configured,
-  every request the agent's code makes of a binding runs, and is published as events. Binding
-  a library is a deliberate grant by whoever wrote the config, not a vulnerability.
+- A **binding** (`[bindings.<name>]`, 0.3) runs a library in a process **on the host, outside the
+  container**, with the host user's authority: their files, their `ssh-agent`, their credential
+  helpers, and every variable of their environment but the ones OutRig's config names through
+  `${VAR}`. One process holds every binding of a session, so every binding's library runs with that
+  one environment. Whatever the library does on the host is part of what the binding grants --
+  GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names, and the agent
+  can write `.git/` through the workspace mount. With no policy configured, every request the
+  agent's code makes of a binding runs, and is published as events. Binding a library is a
+  deliberate grant by whoever wrote the config, not a vulnerability.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

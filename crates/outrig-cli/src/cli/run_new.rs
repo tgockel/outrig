@@ -239,6 +239,8 @@ struct Summary {
     /// Why it is not proven stopped, when it is not.
     not_stopped: Option<String>,
     executions: Vec<(u64, ExecutionStatus)>,
+    /// Each call into a binding whose outcome came after the close, as a line.
+    hosted: Vec<String>,
     last_sequence: u64,
     /// What the terminal's own subscription missed.
     missed: u64,
@@ -262,6 +264,25 @@ fn summarize(report: &ShutdownReport) -> Summary {
             .iter()
             .map(|execution| (execution.id.get(), execution.status))
             .collect(),
+        hosted: report
+            .hosted
+            .iter()
+            .map(|call| {
+                let outcome = serde_json::to_value(call.outcome)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let reason = call
+                    .reason
+                    .and_then(|reason| serde_json::to_value(reason).ok())
+                    .and_then(|v| v.as_str().map(|r| format!(" ({})", r.replace('_', " "))))
+                    .unwrap_or_default();
+                format!(
+                    "call {} to binding {}: {outcome}{reason}",
+                    call.request, call.binding
+                )
+            })
+            .collect(),
         last_sequence: report.events.last_sequence,
         missed: report.events.missed.first().copied().unwrap_or(0),
         log: report.events.log.as_ref().map(ToString::to_string),
@@ -269,13 +290,14 @@ fn summarize(report: &ShutdownReport) -> Summary {
 }
 
 /// The report, on stderr: whether the session is stopped, how each execution
-/// running at the close ended, and anything its events lost.
+/// running at the close ended, how each binding call that ended after the
+/// close ended, and anything its events lost.
 fn render_report(summary: &Summary) -> String {
     let mut text = String::from(match summary.verdict {
         Verdict::Clean => "[outrig] session closed: stopped, every outcome known\n",
         Verdict::StoppedWithUnknown => {
-            "[outrig] session closed: stopped, but some Python was cut off -- what it did may or \
-             may not have happened\n"
+            "[outrig] session closed: stopped, but some Python or binding call was cut off -- what \
+             it did may or may not have happened\n"
         }
         _ => "[outrig] session closed: NOT proven stopped -- something it started may still be \
               running\n",
@@ -293,6 +315,9 @@ fn render_report(summary: &Summary) -> String {
             _ => "unknown",
         };
         text.push_str(&format!("[outrig]   execution {id}: {status}\n"));
+    }
+    for call in &summary.hosted {
+        text.push_str(&format!("[outrig]   {call}\n"));
     }
     if summary.missed > 0 {
         text.push_str(&format!(
@@ -613,6 +638,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             closed: None,
             not_stopped: None,
             executions: Vec::new(),
+            hosted: Vec::new(),
             last_sequence: 0,
             missed: 0,
             log: None,
@@ -649,12 +675,19 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
 
         let cut = render_report(&Summary {
             executions: vec![(7, ExecutionStatus::Unknown), (9, ExecutionStatus::Ok)],
+            hosted: vec!["call 4 to binding repo: unknown (killed)".to_string()],
             last_sequence: 80,
             missed: 3,
             ..summary(Verdict::StoppedWithUnknown)
         });
-        assert!(cut.starts_with("[outrig] session closed: stopped, but some Python was cut off"));
+        assert!(cut.starts_with(
+            "[outrig] session closed: stopped, but some Python or binding call was cut off"
+        ));
         assert!(cut.contains("[outrig]   execution 7: unknown\n"), "{cut}");
+        assert!(
+            cut.contains("[outrig]   call 4 to binding repo: unknown (killed)\n"),
+            "{cut}"
+        );
         assert!(cut.contains("[outrig]   execution 9: ok\n"), "{cut}");
         assert!(cut.contains("80 published; 3 were not shown here"), "{cut}");
 

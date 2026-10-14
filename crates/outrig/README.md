@@ -10,8 +10,9 @@ library crate. It does two things:
   interpreter in it, and an agent whose one tool runs Python there. Your program starts it,
   drives its rounds, watches its events, and stops it with a report that says whether everything
   it started has stopped. A session can host bindings -- objects a process on the host holds for
-  the agent, such as a GitPython `Repo` -- each started before the interpreter and stopped with
-  the session, and one a repository's config declares only once its operator approves it.
+  the agent, such as a GitPython `Repo` -- which the agent's Python awaits under their names, each
+  request checked on the host and recorded; they start before the interpreter and stop with the
+  session, and one a repository's config declares only once its operator approves it.
   `outrig run-new` is built on it and nothing else of the loop.
 
 The `outrig` command-line tool lives in the companion
@@ -26,7 +27,8 @@ the build warns and every launch fails with a message saying so. The same build 
 embeds the pinned RPyC wheel that carries hosted-object requests between the interpreter and the
 bindings process; `OUTRIG_RPYC_WHEEL` names a local copy of it for a build with no network.
 OutRig reserves `/outrig` inside the container, so neither the workspace nor a mount may be
-placed there; a session's bindings mount their packages read-only under `/outrig/bindings`.
+placed there; a session's bindings mount their packages read-only under `/outrig/bindings`, and
+RPyC at `/outrig/rpyc`.
 
 ## Example
 

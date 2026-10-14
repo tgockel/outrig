@@ -100,6 +100,7 @@ use crate::events::{Events, PRIMARY_SUBJECT};
 use crate::harness::event::{self, ExecStatus, Payload, Refusal};
 use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
+use super::hosted::{Notice, Relay, Rpc};
 use super::payload::PAYLOAD_MOUNT;
 use super::recovery::{self, Found, Timings, Verdict, Watched};
 
@@ -118,7 +119,7 @@ pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 
 /// The primary agent's id: the program's one argument, and the agent every
 /// request here addresses.
-pub(super) const PRIMARY: &str = "primary";
+pub(crate) const PRIMARY: &str = "primary";
 
 /// How long a started interpreter has to greet. CPython starts and compiles
 /// the program in well under a second; this only has to be finite.
@@ -402,6 +403,8 @@ struct Table {
     /// its cause is known, and no other close comes first: an owner who closes
     /// on seeing the user's channel end, which ends here, would otherwise.
     exiting: Option<ClosedBy>,
+    /// What carries hosted calls to the session's bindings, when it has any.
+    relay: Option<Relay>,
 }
 
 /// What an exit is told.
@@ -518,6 +521,11 @@ enum Reply {
         channel: String,
         message: ExecId,
     },
+    /// A part of an RPyC frame for a binding, a connection's close, or a
+    /// cancel of requests in flight: the relay's.
+    Rpc(Rpc),
+    /// A hosted call the interpreter never sent: the relay records it.
+    Hosted(Notice),
     #[serde(other)]
     Other,
 }
@@ -568,12 +576,14 @@ impl Interpreter {
     pub(crate) async fn start(
         container: &Container,
         events: Events,
+        rpyc: Option<&str>,
     ) -> Result<Self, InterpreterError> {
         let python = format!("{PAYLOAD_MOUNT}/bin/python3");
         let argv: Vec<String> = [python.as_str()]
             .into_iter()
             .chain(ARGS)
             .chain([PRIMARY])
+            .chain(rpyc)
             .map(String::from)
             .collect();
         let child = container
@@ -860,6 +870,22 @@ impl Interpreter {
     /// on it hears. Replaces any earlier hook.
     pub(crate) fn on_exit(&self, exited: impl Fn() + Send + Sync + 'static) {
         lock(&self.table).on_exit = Some(Arc::new(exited));
+    }
+
+    /// Carry hosted calls through `relay`, built over [`Interpreter::relay_line`]: from now on
+    /// the interpreter's `rpc` lines and its notices go to it, and the session's close reaches
+    /// it with admission's.
+    pub(crate) fn attach_relay(&self, relay: Relay) {
+        lock(&self.table).relay = Some(relay);
+    }
+
+    /// What a relay sends the interpreter through: a line queued for the writer, which never
+    /// waits, held weakly, so the relay does not keep the interpreter's stdin open.
+    pub(crate) fn relay_line(&self) -> super::hosted::ToInterpreter {
+        let lines = self.lines.downgrade();
+        Arc::new(move |line: Value| {
+            lines.send(format!("{line}\n"));
+        })
     }
 
     /// Tell the interpreter the session's bindings, before anything runs: what
@@ -1387,6 +1413,11 @@ impl Table {
         }
         let live: Vec<_> = self.slot.iter().map(|slot| (slot.id, None)).collect();
         let drained = watch::channel(live.is_empty()).0;
+        // Under this lock, so a hosted request and an execution are ordered against the one
+        // close alike.
+        if let Some(relay) = &self.relay {
+            relay.close(&Closed::from(by.clone()).to_string());
+        }
         self.closing = Some(Closing { by, live, drained });
         true
     }
@@ -1640,6 +1671,21 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             return;
         }
     };
+    // Any agent the host opened may use a binding; the relay knows which those are.
+    if let Reply::Rpc(_) | Reply::Hosted(_) = &reply {
+        let Some(relay) = lock(table).relay.clone() else {
+            tracing::warn!(
+                "ignored a hosted-call line from agent {agent:?}: the session has no bindings"
+            );
+            return;
+        };
+        match reply {
+            Reply::Rpc(rpc) => relay.rpc(&agent, rpc),
+            Reply::Hosted(notice) => relay.noticed(&agent, notice),
+            _ => {}
+        }
+        return;
+    }
     if agent != PRIMARY {
         tracing::warn!("ignored a message for agent {agent:?}, which this host did not open");
         return;
@@ -1735,6 +1781,7 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
             });
         }
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
+        Reply::Rpc(_) | Reply::Hosted(_) => {}
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
             String::from_utf8_lossy(line)

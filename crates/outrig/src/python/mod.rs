@@ -13,6 +13,7 @@
 //! binary, and any other owner, reaches that.
 
 pub(crate) mod host;
+pub(crate) mod hosted;
 pub(crate) mod install;
 pub(crate) mod payload;
 pub(crate) mod recovery;
@@ -53,3 +54,7 @@ mod binding_tests;
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod supervisor_tests;
+
+#[cfg(test)]
+#[path = "hosted_tests.rs"]
+mod hosted_tests;

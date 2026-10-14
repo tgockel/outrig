@@ -482,12 +482,36 @@ class Builder:
             f"exec {text(e.get('execid'))}: {text(e.get('status'))}"
             for e in objs(d.get("executions"))
         ]
+        calls = [
+            f"hosted call {text(c.get('request'))} on {text(c.get('binding'))} by "
+            f"{text(c.get('agent'))}: {text(c.get('outcome'))}"
+            + (f" ({text(c.get('reason'))})" if c.get("reason") is not None else "")
+            for c in objs(d.get("hosted"))
+        ]
+        bindings = obj(d.get("bindings"))
+        stop = (
+            [
+                f"bindings process ({', '.join(text(n) for n in bindings.get('names') or [])}): "
+                f"{'group empty' if bindings.get('group_empty') else 'group not proven empty'}"
+                + (", killed" if bindings.get("killed") else ""),
+                *(
+                    [f"it had ended earlier: {text(bindings.get('exited'))}"]
+                    if bindings.get("exited") is not None
+                    else []
+                ),
+                *(f"left: {text(s)}" for s in bindings.get("survivors") or []),
+            ]
+            if bindings
+            else []
+        )
         lines = [
             f"closed by: {text(closed.get('by'))}",
             *([f"cause: {text(closed.get('cause'))}"] if "cause" in closed else []),
             f"stopped: {text(stopped.get('state'))}",
             *([f"why not: {text(stopped.get('reason'))}"] if "reason" in stopped else []),
             *(outcomes or ["no execution was running at the close"]),
+            *calls,
+            *stop,
         ]
         self.add(text(d.get("verdict")), parts=[Part("the shutdown report", "\n".join(lines))])
 

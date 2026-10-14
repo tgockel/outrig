@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::ClosedBy;
-use super::event::ExecId;
+use super::event::{ExecId, HostedOutcome, HostedReason, RequestId};
 
 /// What [`Session::shutdown`](super::Session::shutdown) found. Read it before
 /// deciding anything about the work the session did: it is the first point at
@@ -23,6 +23,10 @@ pub struct ShutdownReport {
     pub stopped: Stopped,
     /// Each execution running when admission closed, and how it ended.
     pub executions: Vec<ExecutionOutcome>,
+    /// Each hosted request whose outcome came after admission closed -- one
+    /// in flight then, one the close refused or cancelled, one made after --
+    /// and that outcome.
+    pub hosted: Vec<HostedCall>,
     /// How the process holding the session's bindings stopped, or `None` when the session had
     /// none.
     pub bindings: Option<BindingStop>,
@@ -32,20 +36,24 @@ pub struct ShutdownReport {
 impl ShutdownReport {
     /// What the report adds up to.
     pub fn verdict(&self) -> Verdict {
-        verdict(&self.stopped, &self.executions)
+        verdict(&self.stopped, &self.executions, &self.hosted)
     }
 }
 
-pub(crate) fn verdict(stopped: &Stopped, executions: &[ExecutionOutcome]) -> Verdict {
+pub(crate) fn verdict(
+    stopped: &Stopped,
+    executions: &[ExecutionOutcome],
+    hosted: &[HostedCall],
+) -> Verdict {
+    let unknown = executions
+        .iter()
+        .any(|execution| execution.status == ExecutionStatus::Unknown)
+        || hosted
+            .iter()
+            .any(|call| call.outcome == HostedOutcome::Unknown);
     match stopped {
         Stopped::NotProven { .. } => Verdict::NotProvenStopped,
-        Stopped::Proven
-            if executions
-                .iter()
-                .any(|execution| execution.status == ExecutionStatus::Unknown) =>
-        {
-            Verdict::StoppedWithUnknown
-        }
+        Stopped::Proven if unknown => Verdict::StoppedWithUnknown,
         Stopped::Proven => Verdict::Clean,
     }
 }
@@ -83,6 +91,20 @@ pub struct BindingStop {
     /// `<pid> <command> <state>`: a state of `Z` is a zombie not yet reaped, and `D` an
     /// uninterruptible sleep.
     pub survivors: Vec<String>,
+    /// How the process ended, when it ended while the session ran rather than at its stop.
+    pub exited: Option<String>,
+}
+
+/// A hosted request whose outcome came after admission closed, and that
+/// outcome. Its events say the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct HostedCall {
+    pub request: RequestId,
+    pub agent: String,
+    pub binding: String,
+    pub outcome: HostedOutcome,
+    pub reason: Option<HostedReason>,
 }
 
 /// One execution running when admission closed.
@@ -115,8 +137,8 @@ pub enum ExecutionStatus {
 pub enum Verdict {
     /// Everything stopped, and every outcome is known: the stop is clean.
     Clean,
-    /// Everything stopped, and some execution was cut off. Its outcome is
-    /// unknown, never failed: its effect may stand.
+    /// Everything stopped, and some execution or hosted call was cut off.
+    /// Its outcome is unknown, never failed: its effect may stand.
     StoppedWithUnknown,
     /// Something could not be confirmed stopped. The stop is not clean, and
     /// what the session ran on should not be reused.

@@ -996,6 +996,43 @@ pub outrig::harness::event::ExecStatus::Error
 pub outrig::harness::event::ExecStatus::Lost
 pub outrig::harness::event::ExecStatus::Ok
 pub outrig::harness::event::ExecStatus::Refused
+#[non_exhaustive] pub enum outrig::harness::event::HostedOutcome
+pub outrig::harness::event::HostedOutcome::Cancelled
+pub outrig::harness::event::HostedOutcome::Raised
+pub outrig::harness::event::HostedOutcome::Refused
+pub outrig::harness::event::HostedOutcome::Returned
+pub outrig::harness::event::HostedOutcome::Unknown
+#[non_exhaustive] pub enum outrig::harness::event::HostedReason
+pub outrig::harness::event::HostedReason::AdmissionClosed
+pub outrig::harness::event::HostedReason::Closed
+pub outrig::harness::event::HostedReason::Disconnected
+pub outrig::harness::event::HostedReason::Exited
+pub outrig::harness::event::HostedReason::Interception
+pub outrig::harness::event::HostedReason::Interrupted
+pub outrig::harness::event::HostedReason::Killed
+pub outrig::harness::event::HostedReason::QueueFull
+#[non_exhaustive] pub enum outrig::harness::event::Operation
+pub outrig::harness::event::Operation::Buffiter
+pub outrig::harness::event::Operation::Call
+pub outrig::harness::event::Operation::Callattr
+pub outrig::harness::event::Operation::Close
+pub outrig::harness::event::Operation::Cmp
+pub outrig::harness::event::Operation::Ctxexit
+pub outrig::harness::event::Operation::Del
+pub outrig::harness::event::Operation::Delattr
+pub outrig::harness::event::Operation::Dir
+pub outrig::harness::event::Operation::Getattr
+pub outrig::harness::event::Operation::Getroot
+pub outrig::harness::event::Operation::Hash
+pub outrig::harness::event::Operation::Inspect
+pub outrig::harness::event::Operation::Instancecheck
+pub outrig::harness::event::Operation::Oldslicing
+pub outrig::harness::event::Operation::Pickle
+pub outrig::harness::event::Operation::Ping
+pub outrig::harness::event::Operation::Repr
+pub outrig::harness::event::Operation::Setattr
+pub outrig::harness::event::Operation::Str
+pub outrig::harness::event::Operation::Unknown
 #[non_exhaustive] pub enum outrig::harness::event::Payload
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentStarted
 pub outrig::harness::event::Payload::AgentStarted::container: alloc::string::String
@@ -1004,6 +1041,9 @@ pub outrig::harness::event::Payload::AgentStarted::python: alloc::string::String
 pub outrig::harness::event::Payload::AgentStarted::tool_call_max: u64
 pub outrig::harness::event::Payload::AgentStarted::tool_result_max: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentStopped
+#[non_exhaustive] pub outrig::harness::event::Payload::BindingExited
+pub outrig::harness::event::Payload::BindingExited::bindings: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::BindingExited::cause: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::BindingRefused
 pub outrig::harness::event::Payload::BindingRefused::binding: alloc::string::String
 pub outrig::harness::event::Payload::BindingRefused::declared_in: core::option::Option<std::path::PathBuf>
@@ -1038,6 +1078,37 @@ pub outrig::harness::event::Payload::ExecRefused::reason: outrig::harness::event
 #[non_exhaustive] pub outrig::harness::event::Payload::ExecSubmitted
 pub outrig::harness::event::Payload::ExecSubmitted::execid: outrig::harness::event::ExecId
 pub outrig::harness::event::Payload::ExecSubmitted::source: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::HostedCallback
+pub outrig::harness::event::Payload::HostedCallback::agent: alloc::string::String
+pub outrig::harness::event::Payload::HostedCallback::binding: alloc::string::String
+pub outrig::harness::event::Payload::HostedCallback::parent: outrig::harness::event::RequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::HostedDispatched
+pub outrig::harness::event::Payload::HostedDispatched::agent: alloc::string::String
+pub outrig::harness::event::Payload::HostedDispatched::binding: alloc::string::String
+pub outrig::harness::event::Payload::HostedDispatched::request: outrig::harness::event::RequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::HostedEnded
+pub outrig::harness::event::Payload::HostedEnded::agent: alloc::string::String
+pub outrig::harness::event::Payload::HostedEnded::binding: alloc::string::String
+pub outrig::harness::event::Payload::HostedEnded::detail: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::HostedEnded::duration: core::time::Duration
+pub outrig::harness::event::Payload::HostedEnded::exception: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::HostedEnded::interrupted: bool
+pub outrig::harness::event::Payload::HostedEnded::outcome: outrig::harness::event::HostedOutcome
+pub outrig::harness::event::Payload::HostedEnded::reason: core::option::Option<outrig::harness::event::HostedReason>
+pub outrig::harness::event::Payload::HostedEnded::request: outrig::harness::event::RequestId
+pub outrig::harness::event::Payload::HostedEnded::traceback: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub outrig::harness::event::Payload::HostedReceived
+pub outrig::harness::event::Payload::HostedReceived::agent: alloc::string::String
+pub outrig::harness::event::Payload::HostedReceived::arguments: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::HostedReceived::binding: alloc::string::String
+pub outrig::harness::event::Payload::HostedReceived::by: outrig::harness::event::ReceivedBy
+pub outrig::harness::event::Payload::HostedReceived::execid: core::option::Option<outrig::harness::event::ExecId>
+pub outrig::harness::event::Payload::HostedReceived::keywords: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::harness::event::Payload::HostedReceived::member: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::HostedReceived::operation: outrig::harness::event::Operation
+pub outrig::harness::event::Payload::HostedReceived::parent: core::option::Option<outrig::harness::event::RequestId>
+pub outrig::harness::event::Payload::HostedReceived::request: outrig::harness::event::RequestId
+pub outrig::harness::event::Payload::HostedReceived::target: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Payload::InterpreterDiagnostic
 pub outrig::harness::event::Payload::InterpreterDiagnostic::text: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::InterpreterExited
@@ -1122,6 +1193,7 @@ pub outrig::harness::event::Payload::RoundStarted::round: u32
 pub outrig::harness::event::Payload::SessionReport::bindings: core::option::Option<outrig::harness::BindingStop>
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
+pub outrig::harness::event::Payload::SessionReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
 pub outrig::harness::event::Payload::SessionReport::verdict: outrig::harness::Verdict
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionState
@@ -1145,6 +1217,10 @@ pub outrig::harness::event::ProbeVerdict::Starved
 #[non_exhaustive] pub enum outrig::harness::event::Received
 pub outrig::harness::event::Received::Event(alloc::sync::Arc<outrig::harness::event::Event>)
 pub outrig::harness::event::Received::Missed(u64)
+#[non_exhaustive] pub enum outrig::harness::event::ReceivedBy
+pub outrig::harness::event::ReceivedBy::Binding
+pub outrig::harness::event::ReceivedBy::Interpreter
+pub outrig::harness::event::ReceivedBy::Relay
 #[non_exhaustive] pub enum outrig::harness::event::Refusal
 pub outrig::harness::event::Refusal::Closed
 pub outrig::harness::event::Refusal::Held
@@ -1249,6 +1325,11 @@ pub outrig::harness::event::ModelCall::withheld: alloc::vec::Vec<outrig::harness
 #[non_exhaustive] pub struct outrig::harness::event::Repeat
 pub outrig::harness::event::Repeat::role: outrig::harness::event::Role
 pub outrig::harness::event::Repeat::turn: core::option::Option<u64>
+pub struct outrig::harness::event::RequestId(_)
+impl outrig::harness::event::RequestId
+pub fn outrig::harness::event::RequestId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::RequestId
+pub fn outrig::harness::event::RequestId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct outrig::harness::event::Subject(_)
 impl outrig::harness::event::Subject
 pub fn outrig::harness::event::Subject::as_str(&self) -> &str
@@ -1334,6 +1415,7 @@ pub fn outrig::harness::BindingSpec::new(outrig::config::Binding) -> Self
 impl core::convert::From<outrig::config::Binding> for outrig::harness::BindingSpec
 pub fn outrig::harness::BindingSpec::from(outrig::config::Binding) -> Self
 #[non_exhaustive] pub struct outrig::harness::BindingStop
+pub outrig::harness::BindingStop::exited: core::option::Option<alloc::string::String>
 pub outrig::harness::BindingStop::group_empty: bool
 pub outrig::harness::BindingStop::killed: bool
 pub outrig::harness::BindingStop::names: alloc::vec::Vec<alloc::string::String>
@@ -1362,6 +1444,12 @@ pub outrig::harness::ExecutionOutcome::status: outrig::harness::ExecutionStatus
 pub struct outrig::harness::Failure(_)
 impl outrig::harness::Failure
 pub fn outrig::harness::Failure::ran_python(&self) -> bool
+#[non_exhaustive] pub struct outrig::harness::HostedCall
+pub outrig::harness::HostedCall::agent: alloc::string::String
+pub outrig::harness::HostedCall::binding: alloc::string::String
+pub outrig::harness::HostedCall::outcome: outrig::harness::event::HostedOutcome
+pub outrig::harness::HostedCall::reason: core::option::Option<outrig::harness::event::HostedReason>
+pub outrig::harness::HostedCall::request: outrig::harness::event::RequestId
 #[non_exhaustive] pub struct outrig::harness::LogLoss
 pub outrig::harness::LogLoss::first: alloc::string::String
 pub outrig::harness::LogLoss::integrity: core::option::Option<alloc::string::String>
@@ -1408,6 +1496,7 @@ pub outrig::harness::ShutdownReport::bindings: core::option::Option<outrig::harn
 pub outrig::harness::ShutdownReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
+pub outrig::harness::ShutdownReport::hosted: alloc::vec::Vec<outrig::harness::HostedCall>
 pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped
 impl outrig::harness::ShutdownReport
 pub fn outrig::harness::ShutdownReport::verdict(&self) -> outrig::harness::Verdict

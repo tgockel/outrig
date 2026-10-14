@@ -17,11 +17,11 @@ proxies, and OutRig puts no credential in it. The **bindings process** runs ever
 of a session on the host, with the same static CPython and whatever environment its bindings were
 given. Unqualified "the interpreter" means the agent interpreter.
 
-`0003-18` proved the bindings process and its supervision, and `0003-20` built it into the
-session, with the declarations, the approval of repo-declared ones, and same-path mounts;
-`0003-22` builds the interception and its events, and `0003-23` the policy. `SECURITY.md`'s
-"Known boundaries" carries the entry `0003-20` added: a binding acts with the host user's
-authority, and the default -- allow, published as events -- runs every call and publishes it.
+`0003-18` proved the bindings process and its supervision, and `0003-20` built it into the session,
+with the declarations, the approval of repo-declared ones, and same-path mounts; `0003-22` put the
+interception in every session and records every request it decides, and `0003-23` builds the policy.
+`SECURITY.md`'s "Known boundaries" carries the entry `0003-20` added: a binding acts with the host
+user's authority, and the default -- allow, published as events -- runs every call and publishes it.
 
 Until then, OutRig starts nothing that holds a credential from its config where the agent can
 reach it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
@@ -206,6 +206,17 @@ that assumption and no more:
   Admission holds the same way: the owner's gate and each binding's closed flag are on the host,
   so nothing in the container can get a request admitted once the owner has closed admission
   (`boundary-policy.md`).
+- **What the container sends is bounded on the host.** The relay counts what each line it holds
+  for the bindings process holds, not what a label claims, and closes a connection whose frame is
+  declared past the bound or outruns its declaration, or that would be an agent's 65th to a
+  binding; it holds at most 1,024 requests of an agent that have not ended, and 256 bytes of each
+  name a label gives. The bindings process closes a connection whose request is numbered past what
+  the owner records or is not the request the relay holds its frame as, or that would have it keep
+  more than 16 cancels ahead of their requests; it ends a request whose frame it never serves as
+  that request, so the relay holds nothing for ever; and it runs a boundary request only under the
+  number the relay holds it by (`hosted-objects.md`).
+  What the host queues for an interpreter that stops reading is not yet bounded
+  (`plan/next/bound-what-the-host-queues-for-the-interpreter.md`).
 - **What an allowed call does is the operator's grant.** Under the default -- allow, published as
   events -- with a library that runs programs, a steered model can do on the host what the user
   can, and the events record it. Nothing here makes that safe; the operator's policy narrows it,

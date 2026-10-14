@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
-use crate::harness::{BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, Stopped, Verdict};
+use crate::harness::{
+    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, Stopped, Verdict,
+};
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
 
@@ -227,16 +229,113 @@ fn each_event_has_exactly_its_data_fields() {
                     id,
                     status: ExecutionStatus::Unknown,
                 }],
+                hosted: vec![HostedCall {
+                    request: RequestId::new(4),
+                    agent: text("primary"),
+                    binding: text("repo"),
+                    outcome: HostedOutcome::Refused,
+                    reason: Some(HostedReason::AdmissionClosed),
+                }],
                 bindings: Some(BindingStop {
                     names: vec![text("repo")],
                     group_empty: true,
                     killed: false,
                     survivors: Vec::new(),
+                    exited: None,
                 }),
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
-            &["closed_by", "stopped", "executions", "bindings", "verdict"],
+            &[
+                "closed_by",
+                "stopped",
+                "executions",
+                "hosted",
+                "bindings",
+                "verdict",
+            ],
+        ),
+        (
+            Payload::BindingExited {
+                bindings: vec![text("repo")],
+                cause: text("it was killed by SIGKILL"),
+            },
+            "binding.exited",
+            &["bindings", "cause"],
+        ),
+        (
+            Payload::HostedReceived {
+                request: RequestId::new(4),
+                agent: text("primary"),
+                binding: text("repo"),
+                execid: Some(execid(3)),
+                operation: Operation::Callattr,
+                member: Some(text("commit")),
+                target: Some(text("git.repo.base.Repo")),
+                arguments: vec![text("'fix: x'")],
+                keywords: [(text("author"), text("<git.util.Actor #9>"))].into(),
+                parent: None,
+                by: ReceivedBy::Binding,
+            },
+            "hosted.received",
+            &[
+                "request",
+                "agent",
+                "binding",
+                "execid",
+                "operation",
+                "member",
+                "target",
+                "arguments",
+                "keywords",
+                "parent",
+                "by",
+            ],
+        ),
+        (
+            Payload::HostedDispatched {
+                request: RequestId::new(4),
+                agent: text("primary"),
+                binding: text("repo"),
+            },
+            "hosted.dispatched",
+            &["request", "agent", "binding"],
+        ),
+        (
+            Payload::HostedEnded {
+                request: RequestId::new(4),
+                agent: text("primary"),
+                binding: text("repo"),
+                outcome: HostedOutcome::Raised,
+                reason: None,
+                detail: None,
+                exception: Some(text("git.exc.GitCommandError")),
+                traceback: Some(text("Traceback (most recent call last):\n...")),
+                interrupted: false,
+                duration: Duration::from_millis(250),
+            },
+            "hosted.ended",
+            &[
+                "request",
+                "agent",
+                "binding",
+                "outcome",
+                "reason",
+                "detail",
+                "exception",
+                "traceback",
+                "interrupted",
+                "duration",
+            ],
+        ),
+        (
+            Payload::HostedCallback {
+                parent: RequestId::new(4),
+                agent: text("primary"),
+                binding: text("repo"),
+            },
+            "hosted.callback",
+            &["parent", "agent", "binding"],
         ),
         (
             Payload::BindingRefused {
@@ -622,10 +721,33 @@ fn each_event_has_exactly_its_data_fields() {
             "closed_by": {"by": "owner"},
             "stopped": {"state": "proven"},
             "executions": [{"execid": 3, "status": "unknown"}],
-            "bindings": {"names": ["repo"], "group_empty": true, "killed": false, "survivors": []},
+            "hosted": [{
+                "request": 4,
+                "agent": "primary",
+                "binding": "repo",
+                "outcome": "refused",
+                "reason": "admission_closed",
+            }],
+            "bindings": {
+                "names": ["repo"],
+                "group_empty": true,
+                "killed": false,
+                "survivors": [],
+                "exited": null,
+            },
             "verdict": "stopped_with_unknown",
         })
     );
+    let received = serde_json::to_value(case("hosted.received")).expect("encodes");
+    assert_eq!(received["operation"], json!("callattr"));
+    assert_eq!(received["by"], json!("binding"));
+    assert_eq!(
+        received["keywords"],
+        json!({"author": "<git.util.Actor #9>"})
+    );
+    let ended = serde_json::to_value(case("hosted.ended")).expect("encodes");
+    assert_eq!(ended["outcome"], json!("raised"));
+    assert_eq!(ended["duration"], json!(0.25), "seconds, as a number");
     let refused = serde_json::to_value(case("binding.refused")).expect("encodes");
     assert_eq!(
         refused,

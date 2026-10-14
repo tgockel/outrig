@@ -238,11 +238,13 @@ impl Session {
     /// already running are then left to finish until `deadline` has passed --
     /// [`DEFAULT_DRAIN`](super::DEFAULT_DRAIN) is a few seconds -- and one
     /// still running is interrupted and given a second to end of its own
-    /// accord. The process holding the bindings is then sent `SIGTERM` with
-    /// its process group, and `SIGKILL` after a grace of five seconds, which
-    /// ends every program a binding's library started; and then the container
-    /// is stopped, which ends the interpreter and whatever an interrupt could
-    /// not reach. Nothing waits on a subscriber.
+    /// accord. A hosted call the bindings process was sent drains with them,
+    /// until `deadline` and through that second. The process holding the
+    /// bindings is then sent `SIGTERM` with its process group, and `SIGKILL`
+    /// after a grace of five seconds, which ends every program a binding's
+    /// library started; and then the container is stopped, which ends the
+    /// interpreter and whatever an interrupt could not reach. Nothing waits on
+    /// a subscriber.
     ///
     /// Returns a bounded time after `deadline`: typically a few seconds, while
     /// the container stops and the event log is finished; at worst the
@@ -257,22 +259,33 @@ impl Session {
             mut bindings,
         } = self;
         lifecycle.close(ClosedBy::Owner);
+        let until = tokio::time::Instant::now() + deadline;
         let events = lifecycle.events();
         let interpreter = agent.interpreter.clone();
         let gate = interpreter.gate();
-        if tokio::time::timeout(deadline, gate.drained())
-            .await
-            .is_err()
         {
-            // Interrupted first, which agent code can answer: a `finally` runs,
-            // and the execution ends `error` rather than `unknown`.
-            for (id, end) in gate.live_at_close() {
-                if end.is_none() {
-                    interpreter.cancel(id);
-                    interpreter.interrupt(id, false);
+            // What the drain waits for: the executions running at the close,
+            // and the hosted calls the bindings process was sent.
+            let (gate, hosted) = (&gate, &bindings);
+            let drained = move || async move {
+                gate.drained().await;
+                if let Some(hosted) = hosted.drained() {
+                    hosted.await;
                 }
+            };
+            if tokio::time::timeout_at(until, drained()).await.is_err() {
+                // Interrupted first, which agent code can answer: a `finally`
+                // runs, the execution ends `error` rather than `unknown`, and a
+                // hosted call whose coroutine callback the interrupt wakes is
+                // answered with it, so the call ends `raised`.
+                for (id, end) in gate.live_at_close() {
+                    if end.is_none() {
+                        interpreter.cancel(id);
+                        interpreter.interrupt(id, false);
+                    }
+                }
+                let _ = tokio::time::timeout(TERMINATE_GRACE, drained()).await;
             }
-            let _ = tokio::time::timeout(TERMINATE_GRACE, gate.drained()).await;
         }
         // After the drain, so a hosted call still running had its time, and
         // before the container, as `lifecycle.md`'s terminating step orders
@@ -305,6 +318,9 @@ impl Session {
                 }
             }
         }
+        // Last, once the interpreter has stopped too, so the calls it never
+        // sent are in: nothing hosted is published after.
+        let hosted = bindings.report();
         let stopped = match failed.is_empty() {
             true => Stopped::Proven,
             false => Stopped::NotProven {
@@ -326,8 +342,9 @@ impl Session {
             closed_by: closed_by.clone(),
             stopped: stopped.clone(),
             executions: executions.clone(),
+            hosted: hosted.clone(),
             bindings: binding_stop.clone(),
-            verdict: report::verdict(&stopped, &executions),
+            verdict: report::verdict(&stopped, &executions, &hosted),
         });
         let log = events
             .close_after(Payload::SessionState {
@@ -340,6 +357,7 @@ impl Session {
             closed_by,
             stopped,
             executions,
+            hosted,
             bindings: binding_stop,
             events: EventDelivery {
                 last_sequence: tally.last,

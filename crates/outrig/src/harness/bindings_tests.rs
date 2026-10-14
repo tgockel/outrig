@@ -5,23 +5,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::Value;
 
-use super::event::{Payload, Received, Subscription};
+use super::event::{Event, HostedOutcome, HostedReason, Payload, Received, Subscription};
 use super::{
-    Approval, ApprovalRequest, DEFAULT_DRAIN, Session, SessionBuilder, SessionError,
-    ShutdownReport, Stopped,
+    Approval, ApprovalRequest, DEFAULT_DRAIN, HostedCall, Session, SessionBuilder, SessionError,
+    ShutdownReport, Stopped, Verdict,
 };
 use crate::agent::mock_http::MODEL;
 use crate::config::{Binding, Config, ConfigValidationError, FactoryValue};
 use crate::error::OutrigError;
 use crate::python::host::Outcome;
-use crate::python::testing::{group_gone, pip_env, wait_group_gone, wheel_links, within};
+use crate::python::testing::{Flag, group_gone, pip_env, wait_group_gone, wheel_links, within};
 
 const VAR: &str = "OUTRIG_TEST_BINDINGS_KEY";
 
@@ -206,6 +206,66 @@ fn refusals(events: &mut Subscription) -> Vec<(String, String)> {
 /// The process `pid` a recorder wrote down, which leads its binding's group.
 fn pid_of(pid: &Value) -> Pid {
     Pid::from_raw(pid.as_i64().expect("a pid") as i32)
+}
+
+/// `[bindings.fx]`: the hosted-call fixture, installed from the test wheels.
+const FIXTURE: &str = r#"
+[bindings.fx]
+description = "the fixture"
+requires    = ["outrig_fixture"]
+factory     = "outrig_fixture:make"
+"#;
+
+/// A session holding [`FIXTURE`], its events subscribed to, and the bindings process's pid.
+async fn with_fixture(bed: &Bed) -> (Session, Subscription, Pid) {
+    bed.write(FIXTURE, "");
+    let mut builder = bed.builder(bed.load());
+    let events = builder.subscribe();
+    let session = start(builder).await;
+    let pid = session.bindings().pid().expect("the bindings process");
+    (session, events, pid)
+}
+
+/// Wait, without holding the runtime, until `flag` is raised.
+async fn raised(flag: &Flag) {
+    within(async {
+        while !flag.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+/// The events the subscription holds.
+fn taken(events: &mut Subscription) -> Vec<Arc<Event>> {
+    let mut held = Vec::new();
+    while let Ok(received) = events.try_recv() {
+        if let Received::Event(event) = received {
+            held.push(event);
+        }
+    }
+    held
+}
+
+/// The hosted calls -- `call` requests -- the report holds, with their outcomes and reasons.
+fn calls_of(report: &ShutdownReport, events: &[Arc<Event>]) -> Vec<HostedCall> {
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            Payload::HostedReceived {
+                request,
+                operation: super::event::Operation::Call,
+                ..
+            } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    report
+        .hosted
+        .iter()
+        .filter(|call| calls.contains(&call.request))
+        .cloned()
+        .collect()
 }
 
 /// The text of a session that failed to start.
@@ -590,12 +650,30 @@ kwargs      = {{ out = {:?} }}
         ),
         "",
     );
-    let session = start(bed.builder(bed.load())).await;
+    let mut builder = bed.builder(bed.load());
+    let mut events = builder.subscribe();
+    let session = start(builder).await;
     let record = bed.recorded("spawner");
     let (pid, child) = (pid_of(&record["pid"]), pid_of(&record["child"]));
     // The binding alone dies; what it started lives on in its group.
     kill(pid, Signal::SIGKILL).expect("kill the binding");
     assert!(!group_gone(pid), "the sleep is still in the group");
+    // The stream records the exit, and how the process ended.
+    let exited = within(async {
+        loop {
+            match events.recv().await {
+                Some(Received::Event(event)) => {
+                    if let Payload::BindingExited { cause, .. } = &event.payload {
+                        return cause.clone();
+                    }
+                }
+                Some(Received::Missed(_)) => {}
+                None => panic!("the stream ended before the exit"),
+            }
+        }
+    })
+    .await;
+    assert!(exited.contains("SIGKILL"), "{exited}");
     let report = stop(session).await;
     assert_eq!(report.stopped, Stopped::Proven, "{report:?}");
     let stop_of = report
@@ -604,8 +682,249 @@ kwargs      = {{ out = {:?} }}
         .expect("the bindings process stopped");
     assert_eq!(stop_of.names, ["spawner"]);
     assert!(stop_of.group_empty, "{report:?}");
+    assert!(
+        stop_of
+            .exited
+            .as_deref()
+            .is_some_and(|cause| cause.contains("SIGKILL")),
+        "{report:?}"
+    );
     assert!(group_gone(pid), "nothing is left of the group");
     assert_eq!(kill(child, None), Err(Errno::ESRCH), "the sleep is gone");
+}
+
+/// Agent code in a session reaches its binding through the binding's name, and each request is
+/// recorded in the session's stream.
+#[tokio::test]
+async fn agent_code_reaches_its_binding_by_name() {
+    let bed = Bed::new();
+    let (session, mut events, _) = with_fixture(&bed).await;
+    assert_eq!(
+        output(&session, "print(await fx.public)").await,
+        "public value\n"
+    );
+    let report = stop(session).await;
+    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+    let kinds: Vec<&str> = taken(&mut events)
+        .iter()
+        .map(|event| event.kind())
+        .filter(|kind| kind.starts_with("hosted."))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["hosted.received", "hosted.dispatched", "hosted.ended"]
+    );
+}
+
+/// Shutdown during a slow hosted call kills the bindings process once the drain's deadline has
+/// passed: the call is `unknown`, its binding killed at shutdown, in the report and in its
+/// outcome event, and nothing is left of the process's group.
+#[tokio::test]
+async fn shutdown_during_a_slow_call_kills_it_and_reports_it_unknown() {
+    let bed = Bed::new();
+    let (session, mut events, pid) = with_fixture(&bed).await;
+    let started = Flag::new();
+    let _slow = session
+        .interpreter()
+        .submit(&format!(
+            "await fx.record(60, 'slow', started={})",
+            started.py()
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    raised(&started).await;
+    let report = within(session.shutdown(Duration::from_millis(300))).await;
+    let events = taken(&mut events);
+    let calls = calls_of(&report, &events);
+    assert_eq!(calls.len(), 1, "{report:?}");
+    assert_eq!(
+        (calls[0].outcome, calls[0].reason),
+        (HostedOutcome::Unknown, Some(HostedReason::Killed))
+    );
+    assert!(
+        events.iter().any(|event| matches!(&event.payload,
+            Payload::HostedEnded { request, outcome: HostedOutcome::Unknown,
+                reason: Some(HostedReason::Killed), .. } if *request == calls[0].request)),
+        "no outcome event"
+    );
+    assert_eq!(report.verdict(), Verdict::StoppedWithUnknown, "{report:?}");
+    assert!(
+        group_gone(pid),
+        "something of the bindings process's group is left"
+    );
+}
+
+/// The helper `fx.escape` forked, killed with the test.
+struct Escaped(Pid);
+
+impl Drop for Escaped {
+    fn drop(&mut self) {
+        let _ = kill(self.0, Signal::SIGKILL);
+    }
+}
+
+/// A helper the binding's library forked into a session of its own holds the bindings process's
+/// output open past the stop. The shutdown waits for the relay a bounded time and then takes the
+/// process as gone: the call in flight is `unknown`, its binding killed, in the report and in its
+/// outcome event, and nothing hosted is recorded after the report.
+#[tokio::test]
+async fn an_output_held_past_the_stop_leaves_the_call_unknown() {
+    let bed = Bed::new();
+    let (session, mut events, _) = with_fixture(&bed).await;
+    let pidfile = bed.records.join("escaped");
+    let _call = session
+        .interpreter()
+        .submit(&format!(
+            "await fx.escape({:?}, 60)",
+            pidfile.to_str().expect("a UTF-8 path")
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let escaped = within(async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+                return Escaped(Pid::from_raw(pid.parse().expect("a pid")));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let report = within(session.shutdown(Duration::from_millis(300))).await;
+    assert!(
+        kill(escaped.0, None).is_ok(),
+        "the helper did not outlive the stop"
+    );
+    let events = taken(&mut events);
+    let calls = calls_of(&report, &events);
+    assert_eq!(calls.len(), 1, "{report:?}");
+    assert_eq!(
+        (calls[0].outcome, calls[0].reason),
+        (HostedOutcome::Unknown, Some(HostedReason::Killed))
+    );
+    assert!(
+        events.iter().any(|event| matches!(&event.payload,
+            Payload::HostedEnded { request, outcome: HostedOutcome::Unknown,
+                reason: Some(HostedReason::Killed), .. } if *request == calls[0].request)),
+        "no outcome event"
+    );
+    assert_eq!(report.verdict(), Verdict::StoppedWithUnknown, "{report:?}");
+    let reported = events
+        .iter()
+        .position(|event| matches!(event.payload, Payload::SessionReport { .. }))
+        .expect("the report");
+    assert!(
+        !events[reported..]
+            .iter()
+            .any(|event| event.kind().starts_with("hosted.")),
+        "a hosted event after the report"
+    );
+}
+
+/// A call draining at the close calls back into the agent's code: the callback runs during the
+/// drain, and the call ends `returned`.
+#[tokio::test]
+async fn a_draining_calls_callback_runs() {
+    let bed = Bed::new();
+    let (session, mut events, _) = with_fixture(&bed).await;
+    let (started, called) = (Flag::new(), Flag::new());
+    let _call = session
+        .interpreter()
+        .submit(&format!(
+            "async def back():\n    open({}, 'w').close()\n    return 'back'\n\
+             print(await fx.call_after(1, back, started={}))",
+            called.py(),
+            started.py()
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    raised(&started).await;
+    let report = stop(session).await;
+    assert!(called.exists(), "the callback did not run");
+    let events = taken(&mut events);
+    let calls = calls_of(&report, &events);
+    assert_eq!(calls.len(), 1, "{report:?}");
+    assert_eq!(calls[0].outcome, HostedOutcome::Returned);
+    assert!(
+        events.iter().any(|event| matches!(&event.payload,
+            Payload::HostedCallback { parent, .. } if *parent == calls[0].request)),
+        "no callback event under the call"
+    );
+    assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+}
+
+/// Callbacks that never return -- a coroutine that catches every cancel, and a plain function that
+/// loops on its worker -- made by calls draining at the close leave shutdown bounded. The interrupt
+/// the shutdown sends wakes the thread serving the coroutine, which answers its call with it, so
+/// that call ends `raised` while the coroutine runs on; nothing can answer the plain function's
+/// call, which ends `unknown`, its binding killed. Nothing is left of the bindings process's
+/// group.
+#[tokio::test]
+async fn a_callback_that_never_returns_leaves_shutdown_bounded() {
+    let bed = Bed::new();
+    let (session, mut events, pid) = with_fixture(&bed).await;
+    let (a, b) = (Flag::new(), Flag::new());
+    let _calls = session
+        .interpreter()
+        .submit(&format!(
+            "import asyncio, time\n\
+             async def stubborn():\n\
+             \x20   while True:\n\
+             \x20       try:\n\
+             \x20           await asyncio.sleep(3600)\n\
+             \x20       except asyncio.CancelledError:\n\
+             \x20           pass\n\
+             def spin():\n\
+             \x20   while True:\n\
+             \x20       time.sleep(0.01)\n\
+             await asyncio.gather(fx.call_after(0.2, stubborn, started={})._resolve(),\n\
+             \x20                    fx.call_after(0.2, spin, started={})._resolve())",
+            a.py(),
+            b.py()
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    raised(&a).await;
+    raised(&b).await;
+    // Both callbacks are running.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = Duration::from_secs(1);
+    let begun = Instant::now();
+    let report = within(session.shutdown(deadline)).await;
+    // The terminating step's own limits: the interrupt's grace, the bindings' grace and the
+    // group's kill, and the interpreter's exit.
+    let bound = deadline + Duration::from_secs(20);
+    assert!(
+        begun.elapsed() < bound,
+        "shutdown took {:?}",
+        begun.elapsed()
+    );
+    let events = taken(&mut events);
+    let calls = calls_of(&report, &events);
+    assert_eq!(calls.len(), 2, "{report:?}");
+    // Which call was passed which callback, by the flag each was given.
+    let passed = |flag: &Flag| {
+        let path = flag.path().to_str().expect("a UTF-8 path");
+        events
+            .iter()
+            .find_map(|event| match &event.payload {
+                Payload::HostedReceived {
+                    request, keywords, ..
+                } if keywords.get("started").is_some_and(|it| it.contains(path)) => Some(*request),
+                _ => None,
+            })
+            .and_then(|request| calls.iter().find(|call| call.request == request))
+            .map(|call| (call.outcome, call.reason))
+    };
+    assert_eq!(
+        passed(&a),
+        Some((HostedOutcome::Raised, None)),
+        "{report:?}"
+    );
+    assert_eq!(
+        passed(&b),
+        Some((HostedOutcome::Unknown, Some(HostedReason::Killed))),
+        "{report:?}"
+    );
+    assert!(
+        group_gone(pid),
+        "something of the bindings process's group is left"
+    );
 }
 
 #[cfg(feature = "e2e")]

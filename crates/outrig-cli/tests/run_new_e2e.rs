@@ -160,13 +160,36 @@ impl Session {
     }
 
     fn spawn(repo: &Path, sessions: &Path, reader: Reader) -> Self {
+        Self::launch(
+            repo,
+            sessions,
+            &repo.join("no-such-global.toml"),
+            &[],
+            reader,
+        )
+    }
+
+    /// [`Session::start`], with `global` as the global config and `env` added
+    /// to the binary's environment.
+    fn with_global(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, String)]) -> Self {
+        Self::launch(repo, sessions, global, env, Reader::Live)
+    }
+
+    fn launch(
+        repo: &Path,
+        sessions: &Path,
+        global: &Path,
+        env: &[(&str, String)],
+        reader: Reader,
+    ) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
             .args(["--global-config"])
-            .arg(repo.join("no-such-global.toml"))
+            .arg(global)
             .arg("--session-root")
             .arg(sessions)
             .arg("run-new")
             .current_dir(repo)
+            .envs(env.iter().map(|(name, value)| (name, value)))
             .env(KEY_VAR, "sk-ant-mock-key")
             .env_remove(SECRET_VAR)
             .env("OUTRIG_LOG", "info")
@@ -1071,7 +1094,9 @@ async fn a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running() {
     // so.
     assert_eq!(status.code(), Some(2), "{status}: {stderr}");
     assert!(
-        stderr.contains("[outrig] session closed: stopped, but some Python was cut off"),
+        stderr.contains(
+            "[outrig] session closed: stopped, but some Python or binding call was cut off"
+        ),
         "{stderr}"
     );
     assert!(
@@ -1227,7 +1252,9 @@ async fn quit_while_an_execution_ignores_interrupts_exits_2() {
     let (status, _, stderr) = session.exit(false).await;
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("[outrig] session closed: stopped, but some Python was cut off"),
+        stderr.contains(
+            "[outrig] session closed: stopped, but some Python or binding call was cut off"
+        ),
         "{stderr}"
     );
     assert!(
@@ -1240,4 +1267,274 @@ async fn quit_while_an_execution_ignores_interrupts_exits_2() {
     assert_eq!(record["exit_code"], 2, "{record:#}");
     let container = record["container_name"].as_str().expect("a name");
     assert!(podman_names(&format!("name={container}")).is_empty());
+}
+
+/// The hosted-call fixture library the `outrig` crate's tests host, as a
+/// module.
+const FIXTURE: &str = include_str!("../../outrig/src/python/outrig_fixture.py");
+
+/// Build the fixture's wheel into `dir` with the host's `python3`, versioned
+/// by its content -- `1.0+<digest>` -- so the install cache, keyed by the
+/// requirement, never serves an older fixture; and return the requirement
+/// that names it.
+fn fixture_wheel(dir: &Path) -> String {
+    const BUILD: &str = r#"
+import hashlib, os, sys, zipfile
+source, out = sys.argv[1], sys.argv[2]
+body = open(source, "rb").read()
+version = "1.0+" + hashlib.sha256(body).hexdigest()[:16]
+dist = f"outrig_fixture-{version}.dist-info"
+with zipfile.ZipFile(os.path.join(out, f"outrig_fixture-{version}-py3-none-any.whl"), "w") as z:
+    z.writestr("outrig_fixture.py", body)
+    z.writestr(f"{dist}/METADATA", f"Metadata-Version: 2.1\nName: outrig_fixture\nVersion: {version}\n")
+    z.writestr(
+        f"{dist}/WHEEL",
+        "Wheel-Version: 1.0\nGenerator: outrig-tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    )
+    z.writestr(f"{dist}/RECORD", "")
+print(f"outrig_fixture=={version}")
+"#;
+    let source = dir.join("outrig_fixture.py");
+    std::fs::write(&source, FIXTURE).expect("write the fixture's source");
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-c", BUILD])
+        .arg(&source)
+        .arg(dir)
+        .output()
+        .expect("the host's python3 builds the fixture's wheel");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(&source).expect("only wheels in the links directory");
+    String::from_utf8(output.stdout)
+        .expect("UTF-8")
+        .trim()
+        .to_string()
+}
+
+/// pip's environment for installing from the wheels in `dir` alone.
+fn wheels_only(dir: &Path) -> Vec<(&'static str, String)> {
+    vec![
+        ("PIP_NO_INDEX", "1".into()),
+        ("PIP_FIND_LINKS", format!("file://{}", dir.display())),
+        ("PIP_CONFIG_FILE", "/dev/null".into()),
+    ]
+}
+
+/// Every record of the one session under `sessions`.
+fn the_log(sessions: &Path) -> Vec<Value> {
+    let dir = std::fs::read_dir(sessions)
+        .expect("the session root")
+        .next()
+        .expect("one session")
+        .expect("an entry")
+        .path();
+    let text = std::fs::read_to_string(dir.join("logs/events.jsonl")).expect("the event log");
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("a whole record"))
+        .collect()
+}
+
+/// Each hosted request in `log`, in the order received: its id and the kinds
+/// and data of its events.
+fn hosted_requests(log: &[Value]) -> Vec<(u64, Vec<(String, Value)>)> {
+    let mut requests: Vec<(u64, Vec<(String, Value)>)> = Vec::new();
+    for record in log {
+        let kind = record["type"].as_str().expect("a type");
+        let Some(kind) = kind.strip_prefix("org.outrig.hosted.") else {
+            continue;
+        };
+        if kind == "callback" {
+            continue;
+        }
+        let id = record["data"]["request"].as_u64().expect("a request id");
+        let data = record["data"].clone();
+        match requests.iter_mut().find(|(request, _)| *request == id) {
+            Some((_, events)) => events.push((kind.to_string(), data)),
+            None => requests.push((id, vec![(kind.to_string(), data)])),
+        }
+    }
+    requests
+}
+
+/// Every hosted request agent code makes through `run-new` is recorded,
+/// receipt first: a read through two attributes is two requests, iteration a
+/// request per item, a method call two, and a call that raises names the
+/// fixture's exception while the agent catches it by its own class.
+#[tokio::test]
+async fn every_hosted_request_is_recorded_through_run_new() {
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let requirement = fixture_wheel(wheels.path());
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_1",
+            "from outrig_fixture import FixtureError\n\
+             print(await fx.a.b)\n\
+             print([x async for x in fx.sequence])\n\
+             print(await fx.method(1))\n\
+             try:\n    await fx.raise_fixture()\n\
+             except FixtureError as e:\n    print('caught', e.status)",
+        ),
+        text_reply("recorded"),
+    ])
+    .await;
+    let repo = repo_with(addr, "[events]\nmode = \"record\"");
+    let home = tempfile::tempdir().expect("a home for the global config");
+    let global = home.path().join("config.toml");
+    std::fs::write(
+        &global,
+        format!(
+            "[bindings.fx]\ndescription = \"The fixture.\"\nrequires = [{requirement:?}]\n\
+             factory = \"outrig_fixture:make\"\n"
+        ),
+    )
+    .expect("write the global config");
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session.type_line("record it").await;
+    wait_for(&session.stderr, "recorded", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(
+        tool_result(&recorded[1], "toolu_1"),
+        "<hosted types.SimpleNamespace from fx>\n[10, 20, 30]\n2\ncaught 3\n"
+    );
+    let log = the_log(sessions.path());
+    let requests = hosted_requests(&log);
+    let asked: Vec<(&str, Option<&str>)> = requests
+        .iter()
+        .map(|(_, events)| {
+            let kinds: Vec<&str> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+            assert_eq!(kinds, ["received", "dispatched", "ended"], "{events:?}");
+            let receipt = &events[0].1;
+            (
+                receipt["operation"].as_str().expect("an operation"),
+                receipt["member"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            ("getattr", Some("a")),
+            ("getattr", Some("b")),
+            ("getattr", Some("sequence")),
+            ("callattr", Some("__iter__")),
+            ("callattr", Some("__next__")),
+            ("callattr", Some("__next__")),
+            ("callattr", Some("__next__")),
+            ("callattr", Some("__next__")),
+            ("getattr", Some("method")),
+            ("call", None),
+            ("getattr", Some("raise_fixture")),
+            ("call", None),
+        ]
+    );
+    let raised: Vec<&str> = requests
+        .iter()
+        .filter_map(|(_, events)| {
+            let end = &events.last().expect("an end").1;
+            (end["outcome"] == "raised").then(|| end["exception"].as_str().expect("a type"))
+        })
+        .collect();
+    assert_eq!(
+        raised,
+        ["builtins.StopIteration", "outrig_fixture.FixtureError"]
+    );
+}
+
+/// GitPython, as a binding over the repository the session works in: agent
+/// code commits a change and pushes it to a bare repository over `file://`,
+/// which then holds the commit, and the stream holds every request the commit
+/// and the push made, each to its end. Installs GitPython from the index, so it
+/// needs the network.
+#[tokio::test]
+async fn a_gitpython_binding_commits_and_pushes() {
+    let bare = tempfile::tempdir().expect("a bare repository");
+    let git = |dir: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8")
+    };
+    git(bare.path(), &["init", "--bare", "-b", "main"]);
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_1",
+            "open('change.txt', 'w').write('a change\\n')\n\
+             await repo.index.add(['change.txt'])\n\
+             commit = await repo.index.commit('add a change')\n\
+             await repo.remote('origin').push('HEAD:refs/heads/main')\n\
+             print(await commit.hexsha)",
+        ),
+        text_reply("pushed"),
+    ])
+    .await;
+    let work = repo_with(addr, "[events]\nmode = \"record\"");
+    git(work.path(), &["init", "-b", "main"]);
+    git(work.path(), &["config", "user.name", "OutRig Test"]);
+    git(
+        work.path(),
+        &["config", "user.email", "test@outrig.invalid"],
+    );
+    git(work.path(), &["add", "-A"]);
+    git(work.path(), &["commit", "-m", "the start"]);
+    let url = format!("file://{}", bare.path().display());
+    git(work.path(), &["remote", "add", "origin", &url]);
+    let home = tempfile::tempdir().expect("a home for the global config");
+    let global = home.path().join("config.toml");
+    std::fs::write(
+        &global,
+        "[bindings.repo]\ndescription = \"The repository, through GitPython.\"\n\
+         requires = [\"GitPython==3.2.0\"]\nfactory = \"git:Repo\"\nargs = [{ path = \".\" }]\n",
+    )
+    .expect("write the global config");
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(work.path(), sessions.path(), &global, &[]);
+    session.type_line("commit and push").await;
+    wait_for(&session.stderr, "pushed", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    let sha = tool_result(&recorded[1], "toolu_1");
+    assert_eq!(sha.trim().len(), 40, "{sha}");
+    assert_eq!(
+        git(bare.path(), &["rev-parse", "refs/heads/main"]).trim(),
+        sha.trim(),
+        "the bare repository holds the commit"
+    );
+    let requests = hosted_requests(&the_log(sessions.path()));
+    let members: Vec<&str> = requests
+        .iter()
+        .filter_map(|(_, events)| events[0].1["member"].as_str())
+        .collect();
+    for member in ["index", "add", "commit", "remote", "push", "hexsha"] {
+        assert!(
+            members.contains(&member),
+            "no request for {member}: {members:?}"
+        );
+    }
+    for (id, events) in &requests {
+        let end = &events.last().expect("an end");
+        assert_eq!(end.0, "ended", "request {id} did not end: {events:?}");
+        assert_eq!(end.1["outcome"], "returned", "request {id}: {events:?}");
+    }
 }

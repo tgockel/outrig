@@ -308,3 +308,216 @@ drained, then killed and reported.
   failure closes admission, and stopping a call on the host.
 - `plan/next/hosted-calls-without-a-thread-per-call.md` -- deferred: a serving thread per
   connection in place of a worker per in-flight call.
+
+## Decisions
+
+- **One process holds every binding of a session.** The maintainer's call during planning,
+  replacing `0003-18` and `0003-20`'s process per binding: one process is simpler to start, relay
+  to, account for and stop. The accepted losses, to be fixed in pure Python if they ever matter:
+  one environment for every binding (`BindingSpec::env` gave way to
+  `SessionBuilder::bindings_env`), one version of each package -- the first binding's, as in the
+  container -- and one failure ending every binding. It landed first, as a commit of its own,
+  without renumbering anything. `/simplify` judged an independent rewrite of it simpler, and its
+  pieces were taken -- a serializable `Factory` sent as the start line, one `who` for a start's
+  errors, the ready line's types kept as JSON, a per-binding `lower`, no `Programs` or `distinct`,
+  one start path in the test relay -- while the first version's names (`Process`, `stop_process`)
+  were kept.
+- **Fork 1, as recommended, by a whole-frame refusal.** The interpreter labels each frame's first
+  part with its size; the relay admits or refuses the whole frame at that part, gathers its parts,
+  and queues it whole once the last arrives, so the close's control line never lands inside a
+  forwarded frame. A request that does not fit is refused whole and its connection stays open;
+  only a reply that does not fit -- its call waits in the process, and cannot be refused -- or a
+  frame whose parts outrun the size it declared closes its connection, on both sides. The queue
+  holds 64 MiB of frame data, and one frame always fits an empty one; an unlabeled frame, which a
+  raw client can send, is passed on a part at a time against the same bound. The supervisor's
+  stdin queue holds one line, so what waits for a slow process waits in the relay's queue, where
+  it can be refused.
+- **Fork 2, as recommended, with three refinements.** Bookkeeping and replies to callbacks pass the
+  close, at the relay and at the binding's flag alike: a call the binding was forwarded may need a
+  proxy's methods listed to finish, and a reference released. The close also reaches the
+  interpreter, which refuses a call made after it before sending it, recorded `by: interpreter`. And
+  a request the relay refuses is recorded from the interpreter's labels on its frame -- its
+  operation, member, target and execution -- rather than from a notice of the interpreter's, since
+  the relay is what refused it. A forwarded request is always ahead of the control line, so the
+  binding reads it before its flag and runs it; the flag decides only a frame forwarded after the
+  close, which the relay forwards only when its label claims bookkeeping or it has none, and refuses
+  one whose request is a boundary request, admission closed. Each connection's channel counts the
+  frames put before the control line, and a request is judged where it was received, under RPyC's
+  receive lock: a library thread calling a callback can receive the connection's next frame.
+- **Fork 3, as recommended.** The relay sees the process's output close, reads how it ended without
+  reaping it, records each call it had sent `unknown` (`exited`) and refuses each it still held,
+  publishes `binding.exited`, and tells the interpreter, which closes every kernel's connections to
+  the bindings; a later call raises an error naming the bindings and how their process ended.
+  `BindingStop::exited` carries the cause into the report. With one process, the criteria's "a
+  second binding works as usual" no longer holds: a second binding shares the process, so it stops
+  with a `SIGSTOP` and dies with a `SIGKILL`. The tests show plain Python and the user channel going
+  on.
+- **Fork 4, as recommended.** The bindings process holds a request after writing its dispatch
+  event until the relay answers that the event is published, so the dispatch is in the stream
+  before the target runs. Each request is `RequestId`, counted from 1 per session.
+- **What a refused or never-sent call raises.** A call the close kept from running raises
+  `outrig.Closed`, RPyC's generic exception class for that name, so the interpreter's own refusal
+  and the binding's arrive as one class; a call the queue had no room for, or that the dead
+  process never got, raises `EOFError` saying why.
+- **Previews are of arguments only.** A result is not previewed: the outcome names how a call
+  ended, and a result's contents are the agent's business, not the audit's. A preview is built
+  from what crossed, by value, cut to 200 characters, 16 items of a container and 3 levels deep;
+  an object of the host's is `<type #reference>`. A raised call's traceback keeps its last 16 KiB.
+- **Bookkeeping a handler refuses is recorded too**, not only what the checks before dispatch
+  refuse: a `del` with an inflated count and an `inspect` of an object never handed out are
+  refused inside their handlers.
+- **The hand-written-client suite runs through the production relay.** The binding tests' harness
+  hands the interpreter's `rpc` lines and notices to `python::hosted::Relay`, as `host.rs`'s
+  reader does, and writes what the relay sends; it stands in for that reader alone. The fixture's
+  source moved to `outrig_fixture.py`, which the session tests install as a wheel and the CLI's
+  e2e builds one from.
+- **Shutdown** drains hosted calls until the same deadline as executions, then marks the relay
+  stopping, so the process's exit is expected and a call it cut off is `unknown` (`killed`), and
+  waits up to five seconds after the stop for the relay to handle the process's last lines.
+- **A coroutine callback's call ends `raised` at terminating, not `unknown`,** departing from the
+  criterion's "each outer call is `unknown`". Shutdown's interrupt wakes the thread serving the
+  coroutine, and `0003-17`'s serving code answers the outer call with it at once, whatever the
+  coroutine does after; its call then ends `raised`. Whether that reached the record before the
+  bindings process was killed was a race, which load decided either way, so the terminate step's
+  one-second grace now covers hosted calls as well as executions: an answered call is recorded
+  before the stop. A plain callback looping on its worker cannot be answered, and its call ends
+  `unknown`, its binding killed. Shutdown takes up to a second longer when a hosted call never
+  ends.
+- **`/simplify` replaced all three of this task's own pieces.** Independent rewrites of the relay,
+  the bindings process's side and the interpreter's side were each judged simpler, and each
+  review found defects in the first versions that the rewrite did not have: the relay queued a
+  frame's parts as they came, so the control line could land between the parts of a forwarded
+  request, which the process then refused; it missed a wakeup of the drain, leaked queue room when
+  a connection closed mid-frame, and dropped queued calls with no record when the process died.
+  The bindings process read only one of the two forms RPyC sends a tuple in, so plain arguments
+  and every keyword went unpreviewed; a library thread's callback lost its parent; and an outcome
+  with a lone surrogate in its text was never written. The interpreter could notice one call twice,
+  cancel requests on a connection another call had taken, and raise from a by-value `async for`
+  after the close. All three rewrites were taken, with the reviews' fixes for their own gaps: the
+  relay counts a request's duration from its receipt, bounds unlabeled frames, checks the binding's
+  name, and looks for an exit for a bounded time; the bindings process keeps a cancel that arrives
+  before its request is registered, drops a request a cancel reaches before its target runs,
+  records bookkeeping only when a check refuses it, and writes the outcome before the reply; the
+  interpreter writes its notices once it has let go of the pool's lock, notices a call whose root
+  was still to be fetched, notices a call agent code cancelled, and names a comparison's operator.
+  A preview cut at 16 items ends in `...`, as `reprlib` writes it.
+- **`run-new` says "binding call"** where the stream says hosted: the stop's verdict line, and a
+  line per call that ended after the close, `call 4 to binding repo: unknown (killed)`.
+- **The round's closing line** does not name hosted calls in flight; whether it should is
+  `plan/next/a-round-names-the-hosted-calls-it-left-running.md`.
+- **Where a GitPython 3.2.0 proxy behaves unlike the local object**, seen through `run-new` in an
+  Alpine container with no `git` program:
+  - *Identity.* Two awaits of `repo.head.commit` gave two objects, as they do locally: GitPython
+    builds a new `Commit` on each access. One host object on one connection is one hosted object
+    (`0003-21`).
+  - *`isinstance` and type.* `type(c)` and `c.__class__` are `outrig.HostedObject`. GitPython's
+    package does not import in a container without `git` -- it looks for the program as it is
+    imported -- so the host type's class is not there for `isinstance(c, git.Commit)`, which
+    needs `git` in the image or `GIT_PYTHON_REFRESH=quiet` set before `import git`.
+  - *`repr` and `str`* answer in the container without a request:
+    `<hosted git.objects.commit.Commit from repo>`. The host's is `await c.__repr__()`.
+  - *What iteration costs.* `async for` over `c.parents` or `repo.iter_commits()` is a `callattr`
+    of `__iter__` and one of `__next__` per item, plus the one that raises `StopIteration`.
+  - *Truthiness, `len`, `in`, `==` and plain `for`* raise `TypeError` naming the awaited
+    spelling: `await x.__bool__()`, `await x.__len__()`, `await x.__contains__(item)`,
+    `await x.__eq__(other)`, `async for`. `await c.parents.__len__()` gave 1.
+  - *Assignment.* `c.message = 'x'` raises `TypeError`; `await c._set('message', 'x')` sets it on
+    the host.
+  - *A missing attribute.* `hasattr` is always true; the `AttributeError` raises where the
+    attribute is awaited. A private one raises `outrig.Refused`, an `AttributeError` too.
+  - *`hash` and `dir`* answer in the container: `dir(c)` lists the facade's names, not `hexsha`.
+  - *Exceptions.* A failed `git` command raises RPyC's generic class for
+    `git.exc.GitCommandError` where `git` does not import; `except Exception` catches it, and
+    `str(e)` reads `<Unprintable exception>`, then the host's last traceback line, since
+    GitPython's `__str__` reads attributes the generic class does not carry.
+  - *Values* -- a commit's `hexsha`, a config value -- come back by value.
+- **A review after the rebase onto `e324d69` found five defects, fixed on this branch:**
+  - *The library did not compile.* The relay's line to the interpreter called `upgrade()` on
+    `host::Lines`, which the rebase made an enum whose weak form upgrades inside `send`.
+  - *The relay's bound counted what labels claimed.* An empty queue admitted a frame of any
+    declared size, and a frame's parts were kept until its last, so a label declaring a terabyte,
+    or parts with no data, grew the host's memory without limit. The queue now counts what each
+    line it queues holds, the relay's own included -- its data as text, and `LINE`, 1 KiB, for the
+    rest -- and a frame reserves what the parts its declared size takes hold, split as both
+    programs split one; a label past 128 MiB, or parts that outrun the reservation in bytes or in
+    number, close the connection. The rest of what the interpreter's lines put in the queue was
+    uncounted too: a cancel now names at most 16 requests, reaches only a connection the process
+    was sent a part on, and is dropped when there is no room, its requests running as if their
+    callers had waited; a close reaches the process once, and only for such a connection; and an
+    agent holds at most 64 connections to a binding, past which a part is answered with a close
+    and leaves nothing behind, in the relay or the process. A frame larger than the bound crosses
+    only when nothing else is queued, as before, and a line of the relay's own now counts as
+    something. That cap settles `0003-16`'s `binding-connections-are-uncounted.md`,
+    with the process remembering the last 1,024 connections that closed rather than every one,
+    and the entry is gone from `plan/next/`.
+  - *A request numbered outside 0 to 2^64 - 1 held a serialized binding's turn for ever.* Its
+    records carried a number the relay could not read, so its dispatch was never answered. The
+    process now closes the connection before recording or waiting, and so for a request numbered
+    as one its connection is still serving, which would share its record. Request numbers are not
+    in arrival order on a connection -- a hosted argument's resolution sends its own requests
+    before the one it is an argument of -- so the check is against the requests in flight. The
+    relay answers a dispatch it could not record, unreadable or of a request it never saw
+    received, with `"answer": false`, and the process refuses the request rather than run it
+    unrecorded. A labeled request under the number of one in flight on its connection closes the
+    connection in the relay too, where its record would have replaced the first's.
+  - *A cancel naming no registered request was kept for ever*, in one set for the whole process.
+    It is now its connection's channel's, kept only while a frame that arrived on the channel is
+    not yet claimed -- registered as a request, or found to hold none -- at most 16, past which the
+    connection closes; a cancel of a request that ended, or of none, keeps nothing. A frame with no
+    data, which RPyC takes without dispatching, would never be claimed, so both programs' frame
+    channels now refuse one.
+  - *A stop whose output stayed open left calls unresolved.* A child the library forked that
+    called `setsid` holds the process's output past the group's kill, so the relay never saw it
+    close: the report left the calls out, and could say `Clean`, and their outcomes could follow
+    it. After the five-second wait the relay now takes the process as gone (`Relay::abandon`):
+    each call it was sent and never answered is `unknown`, `killed`, and what the process writes
+    later is ignored. The report's hosted calls are read last, once the container has stopped, by
+    `Relay::report`, after which the relay publishes nothing.
+- **What the host queues for the interpreter is not bounded yet**: the bindings process's replies
+  and the relay's answers wait in the interpreter's writer queue, which an interpreter that stops
+  reading can grow. Backpressure there can deadlock the two pipes, so it is
+  `plan/next/bound-what-the-host-queues-for-the-interpreter.md`.
+- **`/simplify` on the review's fixes** had an independent version written against the same tests,
+  and the review of the two found each simpler in places. Its bindings-process side and shutdown
+  were taken: the cancels kept on each connection's channel, closing a connection from where the
+  request was read rather than through a new exception class, and `abandon` called after every
+  wait for the output, since a second `gone` does nothing. This relay was kept, since the other let
+  each connection past the 64 leave a frame behind, without limit; from the other it took counting
+  the relay's own lines, a `gone` that is safe to repeat, and checking for the report at the
+  relay's two entries rather than at each publication. The review found two defects common to
+  both, fixed here: a frame with no data threw off the count of unclaimed frames, and a labeled
+  request under a number in flight took the first's record.
+- **A second review found requests the relay held for ever under a label**, fixed on this branch.
+  The relay held a request under the number the interpreter's label gave it, and the process
+  recorded what it read under the frame's own number, so a frame the process read as something
+  else -- a request under another number or one past 64 bits, a reply, a bookkeeping request -- or
+  dropped unread when its connection closed left the relay's request held: memory past the queue's
+  bound and the connection cap, a drain held until its deadline, and an `unknown` at the end. The
+  relay now sends the process the number with the frame's first part. The process closes the
+  connection on a frame that is not that request and ends the request `refused` by the
+  interception; it ends one whose frame it drops unread `cancelled`, `disconnected`, a new
+  `HostedReason` -- held or in progress when the connection closes, arriving after, or a part
+  that is not base64, which now closes the connection rather than being skipped; and the relay
+  records the receipt of either, described from the label. A labeled request is a boundary
+  request in the process whatever its frame asks, so it always ends. The relay holds at most
+  1,024 requests of an agent that have not ended, refusing one more `queue_full`, and keeps 256
+  bytes of a member or target name a label or notice gives.
+- **A boundary request runs only under the relay's label.** An unlabeled frame, which a
+  hand-written client sends, used to be served and recorded under its own number, and the relay
+  attached its receipt to any request it held by that number: agent code could send one under
+  the number of a labeled frame still to arrive, and the labeled frame's refusal then ended the
+  record of the unlabeled call while it ran, as `refused` -- a call that ran, recorded as one that
+  never did. The process now refuses such a request after its receipt, before anything waits,
+  so it never runs and its record ends at once; the closed flag still refuses one read after the
+  close first. The hand-written clients in the binding and hosted tests label what they send, as
+  the interpreter does. With nothing unlabeled running, the 1,024 bound needs no check at the
+  receipt.
+- **`/simplify` on the second review's fix** had an independent version written to the same
+  tests, and the review judged it simpler. Taken from it: one queue of labels on each channel,
+  appended at a frame's first part and taken by `recv`; the module-level `_record` and `_dropped`,
+  with no callback handed to the channel; the part that is not base64; and the relay's bound
+  returning its refusal. Kept from the first: a failed write on the close paths does not stop the
+  cleanup; the label is handed to the request once it is read, so no second `ended` follows the
+  request's own; a labeled request is recorded as a boundary one rather than refused; and the
+  documentation of the new reason. The review found the gap common to both that the previous
+  bullet closes.

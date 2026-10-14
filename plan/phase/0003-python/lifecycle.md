@@ -133,13 +133,17 @@ interrupted with its kernel. The drain ends when nothing it waits for is left, o
 The deadline is the owner's argument to `shutdown`; its default is `0003-19`'s design fork.
 
 **Terminating** stops what is left, starting with the step agent code can respond to. Kernels are
-interrupted first, so code still running can run its `finally` blocks and an execution can end
-with `error` rather than `unknown`. Then the bindings process's group gets SIGTERM, and SIGKILL
-after a grace period, which ends a call still running on the host and every program it started --
-a git process, a hook, a credential helper. Last the container is stopped, which ends the
-interpreter and whatever an interrupt could not reach: native code holding the GIL, which
-`runtime-protection.md` names as the case no interrupt can end, and processes the agent started in
-the container.
+interrupted first, so code still running can run its `finally` blocks and an execution can end with
+`error` rather than `unknown`, and given a second, which hosted calls drain through too: a call
+whose callback the interrupt answers ends then. Then the bindings process's group gets SIGTERM, and
+SIGKILL after a grace period, which ends a call still running on the host and every program it
+started -- a git process, a hook, a credential helper. A program that left the group -- a child the
+library forked that called `setsid` -- outlives it and can hold the process's output open, so the
+shutdown waits five seconds for that output to close and then takes the process as gone: a call it
+was serving is `unknown`, and nothing the process writes later is recorded. Last the container is
+stopped, which ends the interpreter and whatever an interrupt could not reach: native code holding
+the GIL, which `runtime-protection.md` names as the case no interrupt can end, and processes the
+agent started in the container.
 
 `shutdown` returns a bounded time after the deadline. SIGKILL cannot be caught or ignored, and a
 container stop is an engine call with its own grace and its own time limit. A process that still
@@ -185,16 +189,22 @@ the session.
   host has no record of it and the interpreter reports it. Outcome: woken with the closing error
   and recorded `cancelled`, with the close as the reason. Invoked: no. Effects: none possible.
 - *Queued in the relay, or made after the close* -- not forwarded when the relay stopped, so
-  refused in Rust and never seen by its binding. Outcome: `refused`, the reason admission closed;
-  the caller gets the closing error. A request Rust's gate holds is cancelled by the gate instead
-  (**Pending approvals and evaluations**, below). Invoked: no. Effects: none possible.
+  refused in Rust and never seen by its binding; once the close has reached the interpreter, a
+  call made after it is refused there, before it is sent. Outcome: `refused`, the reason
+  admission closed; the caller gets the closing error, an `outrig.Closed`. A request Rust's gate
+  holds is cancelled by the gate instead (**Pending approvals and evaluations**, below). Invoked:
+  no. Effects: none possible. Bookkeeping -- fetching a root, listing a proxy's methods,
+  releasing a reference -- is not refused: a call the binding was forwarded may need it to
+  finish.
 - *Forwarded, not yet read by its binding* -- in the pipe ahead of the control line, which cannot
-  overtake it. The owner cannot take it back, so it belongs to the drain, and the binding decides
-  it: one that reads it before the line runs it, after the close has returned, and it is then a
-  running call, below; one that reads it after its flag refuses it. Outcome: `returned` or
-  `raised` when it ran; `refused`, admission closed, when read after the flag; `unknown` when the
-  binding's group is killed before it reports. Invoked: as the outcome says, and `unknown` leaves
-  it open. Effects: as for a running call when it ran; none when refused.
+  overtake it, so its binding reads it before its flag and runs it, after the close has
+  returned: it is then a running call, below. The owner cannot take it back, so it belongs to the
+  drain. Outcome: `returned` or `raised`; `unknown` when the binding's group is killed before it
+  reports. Invoked: as the outcome says, and `unknown` leaves it open. Effects: as for a running
+  call. After the close the relay forwards only bookkeeping and replies to callbacks, so the flag
+  decides only a frame whose label claimed bookkeeping and whose request is not: the binding
+  refuses it, admission closed, its target not invoked. A frame its connection's close leaves
+  unread ends `cancelled`, `disconnected`, its target not invoked.
 - *Waiting for the serialize lock* -- read before the binding observed its flag, in a binding
   declared `serialize = true`, behind the call the binding is running (`hosted-objects.md`,
   `0003-17`). A binding without that setting invokes a request's target on its connection's
@@ -209,9 +219,11 @@ the session.
 - *Making a callback* -- the running call has called back into agent code in the container
   (`hosted-objects.md`); the callback runs on the worker thread that holds the call's connection,
   or on the kernel's loop when it is a coroutine. Outcome: the callback is part of a call allowed
-  to finish, so it runs during the drain; at terminating a coroutine callback still running is
-  cancelled with its kernel's tasks, a plain one on a worker thread is ended by the container
-  stop, and the outer call ends with its binding as above. Invoked: yes, the outer call's target.
+  to finish, so it runs during the drain. At terminating, the interrupt wakes the thread serving a
+  coroutine callback, which answers the outer call with it, so that call ends `raised` within the
+  interrupt's grace while the coroutine, cancelled with its kernel's tasks, may run on; nothing
+  answers a plain callback looping on its worker thread, so its outer call ends with its binding,
+  `unknown`, and the container stop ends the callback. Invoked: yes, the outer call's target.
   Effects: as for a running call.
 
 **Pending approvals and evaluations** (`0003-23`, `0003-24`)
@@ -264,7 +276,9 @@ own task. It holds:
 - whether owned execution is proven stopped: the bindings process reaped with its group empty,
   and the container stopped, which takes the interpreter and its kernels with it;
 - an outcome for each execution, each hosted call, each child work item and each request on a
-  child's request channel that was live at the close;
+  child's request channel that was live at the close. The hosted calls are read last, once the
+  container has stopped, and no hosted call is recorded after them, so `session.report` lists
+  every hosted outcome the stream holds from after the close;
 - event delivery: the last sequence the stream published, and how many events each subscriber
   missed (`observability.md`). The stream never waits on a subscriber, so a stalled one cannot
   delay shutdown; the report says what it missed instead.
@@ -527,10 +541,12 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - ~~Whether a round still being driven at the close ends at once.~~ Settled by `0003-19`: it runs
   on, each submission refused with the closing reason as its result, until the model yields or
   the owner drops it.
-- Whether a callback a draining call makes into the container should be refused after the close
-  rather than run. The row above lets it run, as part of a call allowed to finish. Refusing it
-  would stop agent code running in a session that is ending, at the cost of failing a call that
-  could have returned. `0003-22`'s callback tests are where a reason either way would show.
+- ~~Whether a callback a draining call makes into the container should be refused after the
+  close rather than run.~~ Settled by `0003-22`: it runs, as the row above has it. A callback a
+  draining call made ran and its call returned; and callbacks that never return -- a coroutine
+  that catches every cancel, a plain function that loops on its worker -- left `shutdown` bounded,
+  the coroutine's outer call `raised`, answered by the interrupt, and the plain one's `unknown`,
+  its binding killed. Nothing showed a reason to refuse one.
 
 ## Unverified
 

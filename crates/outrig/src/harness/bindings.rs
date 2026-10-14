@@ -16,11 +16,12 @@ use std::time::Duration;
 
 use super::approval::{self, Approval, Approver, Store};
 use super::event::Payload;
-use super::report::BindingStop;
+use super::report::{BindingStop, HostedCall};
 use crate::config::{Binding, Config};
 use crate::error::{OutrigError, Result};
 use crate::events::Events;
 use crate::python::host::Interpreter;
+use crate::python::hosted::Relay;
 use crate::python::install::{self, Install};
 use crate::python::payload::{self, BINDINGS_MOUNT};
 use crate::python::supervisor::{self, Factory, STOP_GRACE, Spec};
@@ -272,7 +273,7 @@ pub(crate) async fn start(
             .map(|(declared, dir)| (!declared.spec.binding.requires.is_empty()).then_some(dir))
             .collect(),
         declared,
-        process: None,
+        ..Bindings::default()
     };
     let (python, rpyc_dir) = (payload::host_python().await?, payload::rpyc_dir().await?);
     let inherited = inherited_env(setup.config);
@@ -288,8 +289,13 @@ pub(crate) async fn start(
     })
     .await?;
     bindings.process = Some(process);
+    bindings.rpyc_dir = Some(rpyc_dir);
     Ok(bindings)
 }
+
+/// How long the shutdown waits, once the bindings process is stopped, for the relay to handle the
+/// last lines it wrote: what accounts for each request it was running.
+const FINISH_WAIT: Duration = Duration::from_secs(5);
 
 /// A session's bindings, in the session's order, and the process holding them.
 #[derive(Debug, Default)]
@@ -297,8 +303,12 @@ pub(crate) struct Bindings {
     declared: Vec<Declared>,
     /// Each binding's package directory on the host, or `None` when it requires nothing.
     packages: Vec<Option<PathBuf>>,
+    /// The vendored RPyC's directory on the host, which the interpreter imports too.
+    rpyc_dir: Option<PathBuf>,
     /// `None` once stopped, and for a session with no binding.
     process: Option<supervisor::Process>,
+    /// What carries the interpreter's hosted calls to the process, once connected.
+    relay: Option<Relay>,
 }
 
 /// What the agent is told of one binding.
@@ -345,6 +355,37 @@ impl Bindings {
         dirs
     }
 
+    /// The vendored RPyC's directory on the host, when there are bindings.
+    pub(crate) fn rpyc_dir(&self) -> Option<&Path> {
+        self.rpyc_dir.as_deref()
+    }
+
+    /// Carry `interpreter`'s hosted calls to the process from now on, recording them to `events`.
+    /// Before [`Bindings::declare`], so the relay is in place before agent code can know a
+    /// binding to call.
+    pub(crate) fn connect(&mut self, interpreter: &Interpreter, events: &Events) {
+        let Some(process) = &mut self.process else {
+            return;
+        };
+        let names = self.declared.iter().map(|d| d.name.clone()).collect();
+        let relay = Relay::new(interpreter.relay_line(), events.clone(), names);
+        relay.attach(process);
+        interpreter.attach_relay(relay.clone());
+        self.relay = Some(relay);
+    }
+
+    /// Resolves once no hosted request the process was sent is still to end; `None` when there
+    /// is no relay.
+    pub(crate) fn drained(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.relay.as_ref().map(Relay::drained)
+    }
+
+    /// Each hosted request whose outcome came after admission closed, and that outcome. Read
+    /// last: nothing hosted is published after.
+    pub(crate) fn report(&self) -> Vec<HostedCall> {
+        self.relay.as_ref().map(Relay::report).unwrap_or_default()
+    }
+
     /// Tell `interpreter` the bindings, with each package directory as `path` names it where the
     /// interpreter runs: in the container, or as itself for one on the host. Nothing, when there
     /// are none.
@@ -366,12 +407,22 @@ impl Bindings {
     /// and say how it stopped; `None` when there was none, or it was already stopped.
     pub(crate) async fn stop(&mut self, grace: Duration) -> Option<BindingStop> {
         let process = self.process.take()?;
+        if let Some(relay) = &self.relay {
+            relay.stopping();
+        }
         let stopped = process.stop(grace).await;
+        if let Some(relay) = &self.relay {
+            // The process's output closes with it, unless a program it started into a session
+            // of its own holds the pipe: the relay then takes the process as gone all the same.
+            let _ = tokio::time::timeout(FINISH_WAIT, relay.finished()).await;
+            relay.abandon();
+        }
         Some(BindingStop {
             names: self.declared.iter().map(|d| d.name.clone()).collect(),
             group_empty: stopped.group_empty,
             killed: stopped.killed,
             survivors: stopped.survivors.iter().map(ToString::to_string).collect(),
+            exited: self.relay.as_ref().and_then(Relay::exited),
         })
     }
 

@@ -20,10 +20,12 @@ Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagge
 and connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `start`
 line holding the bindings and the package directories; a `ready` line once every factory has
 returned, naming the type of what each returned, or a `failed` line naming the binding whose factory
-raised and what it raised; `event` lines, which `0003-22` fills with a request's events; `decision`
-lines, each a request held on its serving thread until the owner's answer arrives under the same
-id, which `0003-23` asks for; and `control` lines from the owner, which `0003-22` gives a meaning.
-Everything else it writes goes to stderr, where the owner logs it.
+raised and what it raised; `event` lines -- a library's own, and each request's record: its
+receipt, its dispatch, which holds the request until the owner answers whether the event is
+`published`, refused if it is not, and its end; `decision` lines, each a request held on its
+serving thread until the owner's answer arrives under the same id, which `0003-23` asks for;
+`cancel` notices of requests whose callers were interrupted; and the `control` line that says the
+session has closed. Everything else it writes goes to stderr, where the owner logs it.
 
 The process is a supervised child of the owner, in a process group of its own, started with a
 parent-death signal (`SIGHUP`) the owner set before exec and left blocked until `main` has
@@ -43,6 +45,12 @@ in the same process as the other end of this transport and can write frames of i
 one of RPyC's 20 request handlers is replaced, and each request is checked before anything acts on
 it:
 
+- A request's number, which the owner records it by, must be an integer below 2**64, not that of
+  a request its connection is serving, and the number of the request the owner labeled its frame
+  as, if it did; otherwise the connection closes, and that labeled request ends refused. A labeled
+  frame dropped unread with its connection ends its request cancelled, so nothing the owner holds
+  waits on a frame that will never be served. A boundary request the owner did not label is
+  refused: it runs only under the owner's record of it.
 - A request's target must be an object this binding handed out to this agent, on this connection
   or another of its. A by-value target would let `str.format` read attributes through its format
   string, past the attribute rule.
@@ -68,6 +76,7 @@ import itertools
 import json
 import os
 import queue
+import reprlib
 import select
 import signal
 import struct
@@ -83,6 +92,27 @@ PART_MAX = 512 * 1024  # bytes of frame data in one `rpc` line
 FRAME_MAX = 128 << 20  # bytes of data in one RPyC frame, either direction
 BUFFER_MAX = 2 * FRAME_MAX  # bytes one connection holds unread, the frame in progress included
 FRAME_OVERHEAD = 64  # bytes charged for each frame held, for the object that holds it
+TEXT_MAX = 16 << 10  # characters of a refusal's text, and the last of a traceback's, in an event
+CANCELS_MAX = 16  # requests one connection keeps cancelled before they are registered
+CLOSED_MAX = 1024  # closed connections remembered, so a part still arriving for one is refused
+
+# A request's receipt previews its arguments from what crossed by value: rendered as `repr`
+# renders builtins, cut to 200 characters, 16 items of a container and 3 levels deep. Bytes are
+# cut before they are rendered, as strings are.
+PREVIEW_CHARS = 200
+PREVIEW_ITEMS = 16
+_PREVIEW = reprlib.Repr(
+    maxlevel=3,
+    maxtuple=PREVIEW_ITEMS,
+    maxlist=PREVIEW_ITEMS,
+    maxdict=PREVIEW_ITEMS,
+    maxset=PREVIEW_ITEMS,
+    maxfrozenset=PREVIEW_ITEMS,
+    maxstring=PREVIEW_CHARS,
+    maxlong=PREVIEW_CHARS,
+    maxother=PREVIEW_CHARS,
+)
+_PREVIEW.repr_bytes = _PREVIEW.repr_str
 
 # RPyC's own frame header: a 4-byte length and a 1-byte compressed flag, then the data and a
 # newline. Kept on the wire as RPyC's `Channel` writes it, so a compressed frame is refused by a
@@ -228,6 +258,25 @@ def _event(payload):
     _write(_line("event", payload))
 
 
+def _record(key, kind, seq, **fields):
+    """Publish an event of request `seq` on connection `key`, `(binding, agent, id)`. Written as
+    UTF-8 with a lone surrogate -- which a library's text can hold -- replaced: the owner's reader
+    would drop the line."""
+    binding, agent, cid = key
+    line = dict(t="event", kind=kind, binding=binding, agent=agent, conn=cid, seq=seq)
+    text = json.dumps({**line, **fields}, ensure_ascii=False)
+    _write(f"{text}\n".encode("utf-8", "replace"))
+
+
+def _dropped(key, label, reason):
+    """End request `label` on connection `key`, whose frame was dropped unread, the connection
+    closed for `reason`. Nothing for a frame the owner did not label."""
+    if label is not None:
+        with contextlib.suppress(Exception):
+            ended = dict(outcome="cancelled", reason="disconnected", detail=reason[:TEXT_MAX])
+            _record(key, "ended", label, **ended)
+
+
 def _decide(payload):
     """Ask the owner to decide `payload`, a dict, holding the calling thread -- and the request
     it is serving -- until the answer arrives; returns the answer. A payload the owner would
@@ -243,10 +292,32 @@ def _decide(payload):
     return waiter.get()
 
 
+# The session's closing error once the owner's control line has said it closed -- the closed flag,
+# set by the reading thread -- else `None`.
+_closing = None
+# Every request being served, by `(binding, agent, connection, seq)`, from its receipt until it
+# ends: what a cancel and the close find it by. Serving threads add and pop entries and the
+# reading thread reads them, each one dict operation, atomic under the GIL.
+_requests = {}
+# Held while a cancel looks for its requests and while one is registered, with what each
+# connection's `Channel` keeps for cancels, so neither misses the other.
+_cancel_lock = threading.Lock()
+
+
 def _control(message):
-    """A control line from the owner. `0003-22` gives the first one, the closed flag, its
-    meaning; until then every one is noted and nothing more."""
-    _diag(f"a control line nothing handles yet: {json.dumps(message)}")
+    """The owner's control line: the session has closed to new work, `closed` its closing error.
+    It comes behind every frame the owner forwarded before the close, so a boundary request read
+    from now on is refused; one waiting for its binding's turn is cancelled now. Bookkeeping, and
+    what is running, go on."""
+    global _closing
+    text = message.get("closed")
+    if not isinstance(text, str):
+        _diag(f"a control line nothing handles: {json.dumps(message)}")
+        return
+    _closing = text
+    for request in list(_requests.values()):
+        if request.boundary:
+            request.turn.drop(request, Closed(text))
 
 
 # ---------------------------------------------------------------------------- frames
@@ -261,15 +332,17 @@ class FrameChannel:
     under the process's send lock.
 
     Bounds are enforced here, in both directions: a part over `PART_MAX`, a part before a frame's
-    last that is not full, a frame whose header claims more than `FRAME_MAX`, a compressed frame,
-    or more than `BUFFER_MAX` bytes held unread -- each frame charged `FRAME_OVERHEAD` beyond its
-    bytes -- closes the channel with the reason, and the waiting reader raises `EOFError` saying
-    why. A frame is never half-delivered: `recv` returns whole frames or raises.
+    last that is not full, a frame whose header claims no data or more than `FRAME_MAX`, a
+    compressed frame, or more than `BUFFER_MAX` bytes held unread -- each frame charged
+    `FRAME_OVERHEAD` beyond its bytes -- closes the channel with the reason, and the waiting
+    reader raises `EOFError` saying why. A frame is never half-delivered: `recv` returns whole
+    frames or raises.
     """
 
     def __init__(self, write, cond=None):
-        # `write(part, more)` writes one part as one protocol line. `cond` is the condition
-        # variable to wait on, when the caller shares one between channels.
+        # `write(part, more, label)` writes one part as one protocol line, `label` the fields of
+        # the frame's first line beyond the part. `cond` is the condition variable to wait on,
+        # when the caller shares one between channels.
         self._write = write
         self._cond = threading.Condition() if cond is None else cond
         self._reason = None  # why the channel closed; `None` while it is open
@@ -327,6 +400,9 @@ class FrameChannel:
                 length, compressed = FRAME_HEADER.unpack_from(part)
                 if compressed:
                     return self.close("a compressed frame; compression is off on this transport")
+                if not length:
+                    # RPyC sends none, and serves none: it would be taken and never dispatched.
+                    return self.close("a frame with no data")
                 if length > FRAME_MAX:
                     return self.close(
                         f"a frame of {length} bytes is past the {FRAME_MAX}-byte bound"
@@ -376,10 +452,10 @@ class FrameChannel:
                 return data
             raise EOFError(self._reason or "no frame is ready")
 
-    def send(self, data):
-        """Send one frame of `data`, in parts. Refuses a frame past the bound before writing any of
-        it; a write that fails part way closes the channel, since the other side holds a torn
-        frame."""
+    def send(self, data, label=None):
+        """Send one frame of `data`, in parts, `label` on the first. Refuses a frame past the
+        bound before writing any of it; a write that fails part way closes the channel, since the
+        other side holds a torn frame."""
         if len(data) > FRAME_MAX:
             raise ValueError(f"a frame of {len(data)} bytes is past the {FRAME_MAX}-byte bound")
         if self._reason is not None:
@@ -397,12 +473,81 @@ class FrameChannel:
                     segments.appendleft(segment[take:])
             more = bool(segments)
             try:
-                self._write(bytes(part), more)
+                self._write(bytes(part), more, label)
             except BaseException:
                 self.close("a frame could not be written whole")
                 raise
+            label = None
             if not more:
                 return
+
+
+class Channel(FrameChannel):
+    """The frame channel of a connection here, which tells the thread receiving a frame whether
+    the frame arrived after the close: `late`, set by `recv`. The reading thread puts frames in
+    the order the owner wrote them, and the owner writes the close's control line behind every
+    frame it forwarded before the close, so a frame put once the flag is set is late.
+
+    It keeps, too, what a cancel named ahead of its request. The owner sends a cancel behind the
+    frames of the requests it names, so a request the cancel finds unregistered is in a frame not
+    yet claimed -- registered as a request, or found to hold none -- or has ended, or never was:
+    `cancelled` keeps it while a frame is unclaimed, for its registration to take.
+
+    And it keeps each frame's label: the number of the request the owner holds it as, which the
+    owner sends on the frame's first part, or `None`. `recv` sets `label` beside `late`; a labeled
+    frame the channel drops unread -- held, or in progress, when it closes, or arriving after --
+    ends its request."""
+
+    early = 0  # frames held that arrived before the close
+    late = False  # whether the frame `recv` last returned arrived after it
+    label = None  # the label of the frame `recv` last returned
+    unclaimed = 0  # frames put and not yet claimed, under `_cancel_lock`
+
+    def __init__(self, write, key):
+        super().__init__(write)
+        self.key = key  # (binding, agent, connection id)
+        self.cancelled = set()  # seqs a cancel named while a frame was unclaimed
+        self.labels = collections.deque()  # those of the frames held, and of the one in progress
+
+    def put(self, part, more, label=None):
+        with self._cond:
+            if self._reason is not None:
+                _dropped(self.key, label, self._reason)
+            elif not self._parts:
+                self.labels.append(label)
+            held = len(self._frames)
+            reason = super().put(part, more)
+            if _closing is None:
+                self.early += len(self._frames) - held
+            with _cancel_lock:
+                self.unclaimed += len(self._frames) - held
+            return reason
+
+    def recv(self):
+        with self._cond:
+            data = super().recv()
+            self.label = self.labels.popleft()
+            self.late = not self.early
+            self.early = max(self.early - 1, 0)
+            return data
+
+    def close(self, reason="closed"):
+        with self._cond:
+            reason = super().close(reason)
+            while self.labels:
+                _dropped(self.key, self.labels.popleft(), reason)
+            return reason
+
+    def claim(self, seq=None):
+        """Claim a frame `recv` returned, registered as request `seq` or holding none; whether a
+        cancel named `seq` first. Once none is unclaimed, what was kept names nothing to come."""
+        with _cancel_lock:
+            self.unclaimed -= 1
+            early = seq in self.cancelled
+            self.cancelled.discard(seq)
+            if not self.unclaimed:
+                self.cancelled.clear()
+            return early
 
 
 # ---------------------------------------------------------------------------- the interception
@@ -416,6 +561,15 @@ class Refused(Exception):
     that package resolves it to the class there, and one that does not gets RPyC's generic class
     under the same name.
     """
+
+    __module__ = "outrig"
+
+
+class Closed(Exception):
+    """A request the session's close kept from running: read after the closed flag, or still
+    waiting for its binding's turn when the flag was set. It carries the session's closing error,
+    and crosses as `outrig.Closed`, the class the interpreter's own refusals after the close
+    raise."""
 
     __module__ = "outrig"
 
@@ -453,12 +607,15 @@ COMPARISONS = frozenset(["__eq__", "__ne__", "__lt__", "__gt__", "__le__", "__ge
 
 
 class _Context(threading.local):
-    """Per thread: the callbacks the request being served created, or `None` while a reply to
-    this side's own request is being unboxed, where a callable is refused; and the references
-    handed out while one message is boxed, taken back if that message is never sent."""
+    """Per thread: the request being served, which the callables it was passed belong to, or
+    `None` while a reply to this side's own request is being unboxed, where a callable is
+    refused; the references handed out while one message is boxed, taken back if that message is
+    never sent; and the seq of the request whose callback this thread is calling, the parent of
+    a request the container makes inside it."""
 
-    marks = None
+    request = None
     boxed = None
+    parent = None
 
 
 # ---------------------------------------------------------------------------- the agent's objects
@@ -538,57 +695,102 @@ class Objects:
 
 class Turn:
     """One request at a time across every connection of a binding declared to serialize: taken
-    with `with`, granted to waiters in the order they arrived -- which `threading.RLock` does not
-    promise -- and re-entrant for the thread whose turn it is, so a callback's nested request,
-    served on that thread, runs at once.
+    with `with turn.taking()`, granted to waiters in the order they arrived -- which
+    `threading.RLock` does not promise -- and re-entrant for the thread whose turn it is, so a
+    callback's nested request, served on that thread, runs at once. A binding that does not
+    serialize has a turn nothing waits for.
 
-    Each waiter is a record a later task can mark `dropped` with a reason; it then stops waiting
-    and raises `EOFError(reason)` instead of taking its turn.
+    A waiter is the record `taking` is given, or one of its own; `drop` takes it out of the line,
+    and it raises the exception `drop` gave instead of taking its turn.
     """
 
-    def __init__(self):
+    def __init__(self, serialize=True):
+        self._serialize = serialize
         self._cond = threading.Condition()
         self._owner = None  # the ident of the thread whose turn it is
         self._depth = 0  # how many times that thread has taken it
         self._waiters = collections.deque()  # in arrival order
 
-    def __enter__(self):
+    @contextlib.contextmanager
+    def taking(self, waiter=None):
+        if not self._serialize:
+            yield
+            return
         me = threading.get_ident()
         with self._cond:
             if self._owner == me:
                 self._depth += 1
-                return
-            waiter = types.SimpleNamespace(dropped=None)
-            self._waiters.append(waiter)
-            try:
-                self._cond.wait_for(
-                    lambda: waiter.dropped is not None
-                    or (self._owner is None and self._waiters[0] is waiter)
-                )
-            finally:
-                # However the wait ends, nobody waits behind a waiter that is gone.
-                self._waiters.remove(waiter)
-            if waiter.dropped is not None:
-                self._cond.notify_all()  # the next in line may be first now
-                raise EOFError(waiter.dropped)
-            self._owner, self._depth = me, 1
+            else:
+                waiter = waiter or types.SimpleNamespace(dropped=None)
+                self._waiters.append(waiter)
+                try:
+                    self._cond.wait_for(
+                        lambda: waiter.dropped is not None
+                        or (self._owner is None and self._waiters[0] is waiter)
+                    )
+                finally:
+                    # However the wait ends, nobody waits behind a waiter that is gone.
+                    self._waiters.remove(waiter)
+                if waiter.dropped is not None:
+                    self._cond.notify_all()  # the next in line may be first now
+                    raise waiter.dropped
+                self._owner, self._depth = me, 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._depth -= 1
+                if not self._depth:
+                    self._owner = None
+                    self._cond.notify_all()
 
-    def __exit__(self, *exc):
+    def drop(self, waiter, exc):
+        """Take `waiter` out of the line, to raise `exc`, if it still waits there; whether it
+        did."""
         with self._cond:
-            self._depth -= 1
-            if not self._depth:
-                self._owner = None
-                self._cond.notify_all()
+            if waiter not in self._waiters:
+                return False
+            waiter.dropped = exc
+            self._cond.notify_all()
+            return True
 
 
 class Hosted:
     """One binding this process holds: the object its factory returned, and the turn every
-    request to it takes once checked -- a `Turn` when it serializes, otherwise nothing, and
-    requests on different connections run at the same time."""
+    request to it takes once checked, which only a binding that serializes makes it wait for."""
 
     def __init__(self, root, serialize):
         self.root = root
-        self.turn = Turn() if serialize else contextlib.nullcontext()
+        self.turn = Turn(serialize)
+
+
+class Request:
+    """A request a connection serves, from its receipt until it ends: whether it is recorded every
+    time -- a boundary request -- or is bookkeeping, its binding's turn, and the callables it was
+    passed. A cancel or the close finds it in `_requests`: `dropped` is what it raises instead of
+    running, once one of them took it out of the turn's line or a cancel came before its target
+    was invoked; `interrupted` says a cancel came while it ran. `lock` orders a cancel against the
+    invocation, so a request is either dropped or noted, never run unnoted."""
+
+    dropped = None
+    interrupted = False
+    invoked = False
+
+    def __init__(self, seq, boundary, turn):
+        self.seq, self.boundary, self.turn = seq, boundary, turn
+        self.marks = []
+        self.lock = threading.Lock()
+
+    def cancel(self):
+        """Its caller was interrupted: dropped if it has not run, else noted."""
+        dropped = EOFError("the call was cancelled before it ran: its caller was interrupted")
+        if self.turn.drop(self, dropped):
+            return
+        with self.lock:
+            if self.invoked:
+                self.interrupted = True
+            else:
+                self.dropped = dropped
 
 
 def connection_class(rpyc):
@@ -627,6 +829,29 @@ def connection_class(rpyc):
     )
     # Requests that run no library code, so they wait for no turn under `--serialize`.
     unserialized = frozenset([consts.HANDLE_PING, consts.HANDLE_CLOSE])
+    # Each request type by the name its record gives it: the `HANDLE_` constant's suffix.
+    operations = {
+        value: name[len("HANDLE_") :].lower()
+        for name, value in vars(consts).items()
+        if name.startswith("HANDLE_")
+    }
+    # The operations recorded only when refused; every other one is a boundary request.
+    bookkeeping = frozenset(["ping", "close", "getroot", "inspect", "pickle", "del"])
+    # Where in a request's arguments the member it names is: an attribute, or `cmp`'s operator.
+    member_at = {
+        consts.HANDLE_GETATTR: 1,
+        consts.HANDLE_SETATTR: 1,
+        consts.HANDLE_DELATTR: 1,
+        consts.HANDLE_CALLATTR: 1,
+        consts.HANDLE_OLDSLICING: 1,
+        consts.HANDLE_CMP: 2,
+    }
+    containers = {
+        consts.LABEL_TUPLE: tuple,
+        LABEL_LIST: list,
+        LABEL_SET: set,
+        LABEL_FROZENSET: frozenset,
+    }
 
     def allowed(name):
         """The attribute rule: a public name, or one on RPyC's safe list."""
@@ -643,6 +868,40 @@ def connection_class(rpyc):
             raise Refused(f"str.{name} reads attributes through its format string; it is refused")
         return name
 
+    def check_member(handler, args):
+        """The checks on the member a request names, made before its dispatch: the attribute
+        rule, and only comparison operators for `cmp`."""
+        if handler == consts.HANDLE_CMP:
+            if args[2] not in COMPARISONS:
+                raise Refused(f"{args[2]!r} is not a comparison operator")
+        elif handler in member_at:
+            check_attr(args[0], args[member_at[handler]])
+
+    class Named:
+        """An object in a preview, by reference: its claimed type and number, never its own
+        `repr`, which would run its code."""
+
+        def __init__(self, id_pack):
+            self.text = f"<{id_pack[0]} #{id_pack[2]}>"
+
+        def __repr__(self):
+            return self.text
+
+    def shown(package):
+        """An argument as it crossed, rebuilt for a preview: values as they came, in the
+        containers they came in, and anything by reference as `Named`."""
+        label, value = package
+        if label == consts.LABEL_VALUE:
+            return value
+        if label == LABEL_DICT:
+            return {shown(key): shown(item) for key, item in value}
+        if label in containers:
+            return containers[label](map(shown, value))
+        return Named(value)
+
+    def preview(value):
+        return _PREVIEW.repr(value)[:PREVIEW_CHARS]
+
     class Callback:
         """A callable the container passed as an argument: callable and nothing else, for as long
         as the request it was passed to is running.
@@ -654,13 +913,14 @@ def connection_class(rpyc):
         reply is sent, so a call that got through precedes the reply on the wire.
         """
 
-        __slots__ = ("_conn", "_id_pack", "_live", "_lock")
+        __slots__ = ("_conn", "_id_pack", "_live", "_lock", "_seq")
 
-        def __init__(self, conn, id_pack):
+        def __init__(self, conn, id_pack, seq):
             self._conn = conn
             self._id_pack = id_pack
             self._live = True
             self._lock = threading.Lock()
+            self._seq = seq  # the request it was passed to
 
         def __call__(self, *args, **kwargs):
             with self._lock:
@@ -668,10 +928,19 @@ def connection_class(rpyc):
                     raise Refused(
                         "this callback cannot be called: the request it was passed to has returned"
                     )
+                with contextlib.suppress(Exception):
+                    _record(self._conn._key, "callback", self._seq)
                 result = self._conn.async_request(
                     consts.HANDLE_CALL, self, args, tuple(kwargs.items())
                 )
-            return result.value
+            # This thread serves the connection until the reply comes, so a request the
+            # container makes inside the callback is received here, whichever thread called it.
+            context = self._conn._context
+            saved, context.parent = context.parent, self._seq
+            try:
+                return result.value
+            finally:
+                context.parent = saved
 
         def revoke(self):
             with self._lock:
@@ -695,9 +964,10 @@ def connection_class(rpyc):
         """One connection of one kernel to one binding, every request checked; what it hands out
         goes in the table the agent's connections to the binding share."""
 
-        def __init__(self, channel, *, hosted, objects, on_close):
+        def __init__(self, channel, *, key, hosted, objects, on_close):
             # First: cleanup takes it, and a connection that fails to initialize is cleaned up.
             self._turn = hosted.turn
+            self._key = key  # (binding, agent, connection id), as its records name it
             # The connection's RPyC root is a service of nothing, whose `on_disconnect` RPyC
             # calls at cleanup; `getroot` answers with the object the factory returned.
             super().__init__(rpyc.core.service.VoidService(), channel, config)
@@ -707,9 +977,6 @@ def connection_class(rpyc):
             self._objects = objects
             self._on_close = on_close
             self._context = _Context()
-            # The last exception's whole traceback text, for the event `0003-22` records. The
-            # container gets one line of it.
-            self.last_traceback_text = None
 
         # ------------------------------------------------------------------ dispatch
 
@@ -740,16 +1007,23 @@ def connection_class(rpyc):
 
         def _dispatch(self, data):
             """Route one frame. Every path releases the receive lock exactly once, and a frame
-            that cannot be decoded closes the connection rather than killing its thread."""
+            that cannot be decoded closes the connection rather than killing its thread, as does
+            a reply the owner labeled as a request; that request ends refused."""
             released = False
+            # Read under the receive lock, as the frame was.
+            late, label = self._channel.late, self._channel.label
             try:
                 msg = data[0]
                 if msg == consts.MSG_REQUEST:
                     self._recvlock.release()
                     released = True
                     seq, args = brine.load(data[1:])
-                    self._dispatch_request(seq, args)
+                    labeled, label = label, None  # the request ends under it from here
+                    self._dispatch_request(seq, args, late, labeled)
+                elif label is not None:
+                    raise ValueError(f"a reply labeled as request {label}")
                 elif msg == consts.MSG_REPLY:
+                    self._channel.claim()
                     seq, args = brine.load(data[1:])
                     try:
                         obj = self._unbox_reply(args)
@@ -761,6 +1035,7 @@ def connection_class(rpyc):
                     self._recvlock.release()
                     released = True
                 elif msg == consts.MSG_EXCEPTION:
+                    self._channel.claim()
                     self._recvlock.release()
                     released = True
                     seq, args = brine.load(data[1:])
@@ -773,16 +1048,54 @@ def connection_class(rpyc):
                 if not released:
                     self._recvlock.release()
                 reason = f"an undecodable frame: {type(e).__name__}: {e}"
-                self.close_with(reason)
+                self.close_with(reason, label)
                 raise EOFError(reason) from None
 
-        def _dispatch_request(self, seq, raw_args):
-            saved = self._context.marks
-            self._context.marks = marks = []
+        def _dispatch_request(self, seq, raw_args, late=False, label=None):
+            """Serve one request, `late` when it arrived after the closed flag, and record it:
+            a boundary request's receipt before anything is decided, its dispatch before its
+            target runs -- held until the owner answers that the event is published, and
+            refused if it is not -- and how it ended; bookkeeping only when it is refused. A
+            request the owner labeled, as `label`, is a boundary request whatever it asks, and a
+            boundary request it did not label is refused. A request numbered as the owner cannot
+            record, as one this connection is serving, or other than its label closes the
+            connection instead, recorded nowhere but as its label's refusal."""
+            receipt = self._receipt(raw_args)
+            boundary = label is not None or receipt["operation"] not in bookkeeping
+            request = Request(seq, boundary, self._turn)
+            key = (*self._key, seq)
+            with _cancel_lock:
+                if type(seq) is not int or not 0 <= seq < 1 << 64:
+                    shown = _PREVIEW.repr(seq)[:PREVIEW_CHARS]
+                    reason = f"a request numbered {shown}, not an integer below 2**64"
+                elif key in _requests:
+                    reason = (
+                        f"request {seq} arrived while one of that number is served on this "
+                        f"connection"
+                    )
+                elif label is not None and seq != label:
+                    reason = f"request {seq} arrived labeled as request {label}"
+                else:
+                    reason = None
+                    _requests[key] = request
+            if reason is not None:
+                self.close_with(reason, label)
+                raise EOFError(reason)
+            if self._channel.claim(seq):
+                request.cancel()
+            saved, self._context.request = self._context.request, request
             handed = []
             try:
                 with contextlib.ExitStack() as turn:
                     try:
+                        if request.boundary:
+                            _record(self._key, "received", seq, **receipt)
+                            if late:
+                                raise Closed(_closing)
+                            if label is None:
+                                # Its events would land on any request the owner holds under
+                                # its number: a boundary request runs only under its label.
+                                raise Refused(f"request {seq} came without the owner's label")
                         handler, boxed = raw_args
                         method = self._HANDLERS.get(handler) if type(handler) is int else None
                         if method is None:
@@ -796,23 +1109,59 @@ def connection_class(rpyc):
                             args = (target, *map(self._unbox, boxed[1][1:]))
                         else:
                             args = self._unbox(boxed)
+                            check_member(handler, args)
                         if handler not in unserialized:
                             # Once the request is checked, so a refused one waits for nobody; held
                             # until its exception, if any, is rendered below.
-                            turn.enter_context(self._turn)
+                            turn.enter_context(self._turn.taking(request))
+                        with request.lock:
+                            if request.dropped is not None:
+                                raise request.dropped
+                            request.invoked = True
+                        if request.boundary:
+                            ack = next(_decision_ids)
+                            published = _decisions[ack] = queue.SimpleQueue()
+                            try:
+                                _record(self._key, "dispatched", seq, ack=ack)
+                            except BaseException:
+                                _decisions.pop(ack, None)
+                                raise
+                            if published.get() is not True:
+                                raise Refused("the owner could not record this request")
                         res = method(self, *args)
                         reply = (consts.MSG_REPLY, self._box_tracked(res, handed))
-                    except BaseException:
+                        ended = {"outcome": "returned"}
+                    except BaseException as e:
                         # The reply never goes out, so nothing it would have referenced is held.
                         self._release(handed)
                         t, v, tb = sys.exc_info()
                         self._last_traceback = tb
                         reply = (consts.MSG_EXCEPTION, self._box_exc(t, v, tb))
+                        if e is request.dropped:
+                            reason = "closed" if t is Closed else "interrupted"
+                            ended = {"outcome": "cancelled", "reason": reason}
+                        elif request.invoked and (request.boundary or t is not Refused):
+                            ended = {
+                                "outcome": "raised",
+                                "exception": f"{t.__module__}.{t.__qualname__}",
+                                "traceback": "".join(traceback.format_exception(e))[-TEXT_MAX:],
+                            }
+                        else:
+                            ended = {
+                                "outcome": "refused",
+                                "reason": "admission_closed" if t is Closed else "interception",
+                                "detail": str(e)[:TEXT_MAX],
+                            }
             finally:
                 # Before the reply goes out, so no call can be queued after it.
-                for mark in marks:
+                for mark in request.marks:
                     mark.revoke()
-                self._context.marks = saved
+                self._context.request = saved
+                _requests.pop(key, None)
+            if request.boundary or ended["outcome"] == "refused":
+                if not request.boundary:
+                    _record(self._key, "received", seq, **receipt)
+                _record(self._key, "ended", seq, interrupted=request.interrupted, **ended)
             try:
                 self._send(reply[0], seq, reply[1])
             except ValueError as e:
@@ -827,13 +1176,49 @@ def connection_class(rpyc):
                 self._release(handed)
                 raise
 
+        def _receipt(self, raw_args):
+            """What a request's receipt says of it: its operation, the member it names, its
+            target's type when that is an object this agent was handed, a preview of each
+            argument built from what crossed, and the request a callback made it inside. Decides
+            nothing and never raises: a request too malformed to read is received all the
+            same."""
+            receipt = dict(
+                operation="unknown",
+                member=None,
+                target=None,
+                arguments=[],
+                keywords={},
+                parent=self._context.parent,
+            )
+            with contextlib.suppress(Exception):
+                handler, boxed = raw_args
+                receipt["operation"] = operations[handler] if type(handler) is int else "unknown"
+                args = shown(boxed)
+                at = member_at.get(handler)
+                if at is not None and type(args[at]) is str:
+                    receipt["member"] = args[at][:PREVIEW_CHARS]
+                rest = [a for i, a in enumerate(args) if i != at and (i or handler in targetless)]
+                if handler in (consts.HANDLE_CALL, consts.HANDLE_CALLATTR):
+                    # A call's own arguments: its positional ones, and its keywords as pairs.
+                    rest, keywords = args[-2:]
+                    receipt["keywords"] = {
+                        str(name)[:PREVIEW_CHARS]: preview(value)
+                        for name, value in keywords[:PREVIEW_ITEMS]
+                    }
+                receipt["arguments"] = [preview(arg) for arg in rest[:PREVIEW_ITEMS]]
+                target = self._target(handler, boxed)
+                if target is not None and self._lookup(target, required=False) is not None:
+                    receipt["target"] = self._claimed(target)
+            return receipt
+
         def _send(self, msg, seq, args):
             """RPyC's, without its shared send queue: a frame past the bound raises in the thread
             that asked, and no thread sends another's frame. The queue exists for a send from a
-            finalizer, and this side makes none -- it holds no proxies."""
+            finalizer, and this side makes none -- it holds no proxies. A reply's first line
+            names the request it answers."""
             data = brine.I1.pack(msg) + brine.dump((seq, args))
             with self._sendlock:
-                self._channel.send(data)
+                self._channel.send(data, None if msg == consts.MSG_REQUEST else {"reply": seq})
 
         def _async_request(self, handler, args=(), callback=(lambda a, b: None)):
             """RPyC's, with the references a request's arguments hand out taken back when the
@@ -906,26 +1291,25 @@ def connection_class(rpyc):
             if label == LABEL_FROZENSET:
                 return frozenset(self._unbox(item) for item in value)
             if label == LABEL_CALLABLE:
-                marks = self._context.marks
-                if marks is None:
+                request = self._context.request
+                if request is None:
                     raise Refused(
                         f"a callable of type {self._claimed(value)} was returned from a callback; "
                         f"only values come back"
                     )
-                proxy = Callback(self, value)
-                marks.append(proxy)
+                proxy = Callback(self, value, request.seq)
+                request.marks.append(proxy)
                 return proxy
             raise Refused(f"unknown label {label!r}")
 
         def _unbox_reply(self, package):
             """A reply to this side's own request -- a callback's return value -- where a callable
             is refused too."""
-            saved = self._context.marks
-            self._context.marks = None
+            saved, self._context.request = self._context.request, None
             try:
                 return self._unbox(package)
             finally:
-                self._context.marks = saved
+                self._context.request = saved
 
         @staticmethod
         def _claimed(id_pack):
@@ -985,8 +1369,7 @@ def connection_class(rpyc):
         def _box_exc(self, typ, val, tb):
             """An exception for the container: its type, args and public attributes, with one line
             of text -- how this side renders it -- where the traceback would go. The whole
-            traceback stays here."""
-            self.last_traceback_text = "".join(traceback.format_exception(typ, val, tb))
+            traceback stays here, in the request's record."""
             try:
                 dumped = vinegar.dump(
                     typ, val, tb, include_local_traceback=False, include_local_version=True
@@ -1066,8 +1449,13 @@ def connection_class(rpyc):
             self._closed = True
             self._cleanup(_anyway=True)
 
-        def close_with(self, reason):
-            """Close for `reason`, telling the other side first."""
+        def close_with(self, reason, label=None):
+            """Close for `reason`, telling the other side first. `label`, the request the owner
+            holds the frame that caused it as, ends refused."""
+            if label is not None:
+                refused = dict(outcome="refused", reason="interception", detail=reason[:TEXT_MAX])
+                with contextlib.suppress(Exception):
+                    _record(self._key, "ended", label, **refused)
             with contextlib.suppress(Exception):
                 self._on_close(reason)
             self._channel.close(reason)
@@ -1076,7 +1464,7 @@ def connection_class(rpyc):
         def _cleanup(self, _anyway=True):
             """RPyC's, and then this connection's references go back to the agent's table -- under
             the turn when the binding serializes, since the last of them may run a destructor."""
-            with self._turn:
+            with self._turn.taking():
                 super()._cleanup(_anyway)
                 self._objects.forget(self)
 
@@ -1113,8 +1501,6 @@ def connection_class(rpyc):
             return str(obj)
 
         def _handle_cmp(self, obj, other, op="__cmp__"):
-            if op not in COMPARISONS:
-                raise Refused(f"{op!r} is not a comparison operator")
             return getattr(type(obj), op)(obj, other)
 
         def _handle_hash(self, obj):
@@ -1190,7 +1576,8 @@ class Connections:
         self._hosted = hosted  # binding -> its `Hosted`
         self._lock = threading.Lock()
         self._open = {}  # (binding, agent, id) -> channel
-        self._closed = set()  # (binding, agent, id) of connections that have closed
+        # (binding, agent, id) of the last `CLOSED_MAX` connections that have closed, oldest first
+        self._closed = collections.OrderedDict()
         self._objects = {}  # (binding, agent) -> its Objects
         self._serving = collections.Counter()  # (binding, agent) -> its connections still serving
 
@@ -1207,23 +1594,19 @@ class Connections:
             channel = self._open.get(key)
             if channel is not None:
                 return channel
-            channel = FrameChannel(
-                lambda part, more: _send(
-                    {
-                        "t": "rpc",
-                        "binding": binding,
-                        "agent": agent,
-                        "id": cid,
-                        "data": base64.b64encode(part).decode("ascii"),
-                        "more": more,
-                    }
-                )
-            )
+
+            def write(part, more, label=None):
+                data = base64.b64encode(part).decode("ascii")
+                line = {"t": "rpc", "binding": binding, "agent": agent, "id": cid, "data": data}
+                _send({**line, "more": more, **(label or {})})
+
+            channel = Channel(write, key)
             self._serving[table] += 1
             if self._serving[table] == 1:
                 self._objects[table] = Objects()
             conn = self._Binding(
                 channel,
+                key=key,
                 hosted=self._hosted[binding],
                 objects=self._objects[table],
                 on_close=lambda reason: self.notice(binding, agent, cid, reason),
@@ -1264,7 +1647,9 @@ class Connections:
     def forget(self, binding, agent, cid):
         with self._lock:
             self._open.pop((binding, agent, cid), None)
-            self._closed.add((binding, agent, cid))
+            self._closed[(binding, agent, cid)] = None
+            if len(self._closed) > CLOSED_MAX:
+                self._closed.popitem(last=False)
 
     def notice(self, binding, agent, cid, reason):
         """Tell the other side that `(binding, agent, cid)` has closed, and why."""
@@ -1279,14 +1664,37 @@ class Connections:
         if channel is not None:
             channel.close(reason)
 
+    def cancel(self, binding, agent, cid, seqs):
+        """The callers of requests `seqs` on `(binding, agent, cid)` were interrupted: one still
+        waiting for its turn is dropped, never to run, and one running is noted. One not yet
+        registered is kept for its registration while a frame of the connection is unclaimed,
+        and a connection that would keep more than `CANCELS_MAX` closes."""
+        with self._lock:
+            channel = self._open.get((binding, agent, cid))
+        if channel is None:
+            return
+        for seq in seqs:
+            with _cancel_lock:
+                request = _requests.get((binding, agent, cid, seq))
+                if request is None and channel.unclaimed:
+                    channel.cancelled.add(seq)
+                over = len(channel.cancelled) > CANCELS_MAX
+            if request is not None:
+                request.cancel()
+            if over:
+                reason = f"more than {CANCELS_MAX} requests cancelled before they arrived"
+                channel.close(reason)
+                self.notice(binding, agent, cid, reason)
+                return
+
 
 def _handle(connections, line):
     """Route one protocol line by its kind: an `rpc` line to its connection, a decision's answer
-    to the thread holding the request, a control line to `_control`; or say on stderr why it
-    could not be."""
+    or a dispatch's publication to the thread holding the request, a control line to `_control`;
+    or say on stderr why it could not be."""
     message = json.loads(line)
     kind = message.get("t") if isinstance(message, dict) else None
-    if kind == "decision":
+    if kind in ("decision", "published"):
         waiter = _decisions.pop(message.get("id"), None)
         if waiter is None:
             _diag(f"an answer to decision {message.get('id')!r}, which nothing awaits")
@@ -1306,20 +1714,31 @@ def _handle(connections, line):
             binding, agent, cid, f"the other side closed this connection: {message['closed']}"
         )
         return
-    part = base64.b64decode(message.get("data", ""), validate=True)
+    if "cancel" in message:
+        connections.cancel(binding, agent, cid, message["cancel"])
+        return
     more = message.get("more") is True
+    # On a frame's first part: the number of the request the owner holds the frame as.
+    label = message.get("request")
     if not connections.holds(binding):
         connections.notice(binding, agent, cid, f"this process holds no binding {binding!r}")
         return
     channel = connections.channel(binding, agent, cid)
     if channel is None:
+        _dropped((binding, agent, cid), label, "this connection has closed")
         connections.notice(binding, agent, cid, "this connection has closed")
         return
     try:
-        reason = channel.put(part, more)
+        reason = channel.put(base64.b64decode(message.get("data", ""), validate=True), more, label)
     except MemoryError:
-        # Rather than leave the kernel waiting on a frame that will never finish.
+        # Rather than leave the kernel waiting on a frame that will never finish. A part that
+        # failed before it was put leaves its label here.
         reason = channel.close("no memory to hold a frame from the interpreter")
+        _dropped((binding, agent, cid), label, reason)
+    except ValueError as e:
+        # Never put, so the label it carries is dropped here.
+        reason = channel.close(f"a part that is not base64: {e}")
+        _dropped((binding, agent, cid), label, reason)
     if reason is not None:
         connections.notice(binding, agent, cid, reason)
 

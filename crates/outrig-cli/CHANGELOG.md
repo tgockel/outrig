@@ -81,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again. With no terminal on stdin, `run-new` says which binding it skipped and how to approve it,
   and the session runs without it. A `[[workspace.mounts]]` entry may now leave `container-path`
   unset, to mount the directory at its host path.
+- **The agent's Python calls its bindings.** Each binding is bound under its name as an object the
+  agent's code awaits -- `await repo.head.commit` -- and every request is checked on the host and,
+  with `[events] mode = "record"`, recorded as `hosted.received`, `hosted.dispatched` and
+  `hosted.ended`. At `/quit`, calls into bindings are given the same five seconds as Python,
+  then the bindings process is stopped, and the stop names each call that ended after the close
+  (`call 4 to binding repo: unknown (killed)`); a call cut off makes the exit status 2, as cut-off
+  Python does. A call made after the close raises `outrig.Closed`. If the bindings process dies,
+  the session goes on without its bindings, and a call to one raises an error saying how the
+  process ended.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

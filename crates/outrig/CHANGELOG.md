@@ -249,7 +249,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding.refused` event says why. With any binding, the workspace and every mount appear in the
   container at their host paths, and each binding's packages are mounted read-only under
   `/outrig/bindings/`. `Step::Packages` and `Step::Bindings` report the two new start steps.
-  Agent code cannot call a binding yet; the facade and the relay come next.
+
+- **Agent code calls its bindings, and every call is recorded.** Each binding is bound under its
+  name in every kernel -- the primary and every one opened later -- as a `HostedObject` the agent's
+  code awaits, and the inventory lists none of them; the runtime keeps its own reference, so
+  rebinding the name changes nothing it uses. Requests cross through a relay in the session, one
+  queue bounded in bytes to the process holding the bindings: a request that does not fit is refused
+  whole, raising in its caller. The queue counts what each line holds, not what a frame's label
+  claims; a frame declared past 128 MiB or whose parts outrun its label closes its connection, and
+  an agent holds at most 64 connections to a binding and 1,024 requests that have not ended. The
+  process is sent the number each request is held under, and a frame it reads as anything but that
+  request closes its connection and ends the request `refused`; one left unread when its connection
+  closes ends `cancelled`, `disconnected`; and it refuses a boundary request that carries no such
+  number. Every request the process's checks see is recorded in the stream, under a `RequestId`:
+  `hosted.received` before anything is decided about it, with its `Operation`, member, host-side
+  type and a bounded preview of each argument -- an object named by its type and a reference number,
+  never by its `repr`; `hosted.dispatched` before its target runs, which the process waits for; and
+  `hosted.ended` with a `HostedOutcome` -- `returned`, `raised` with the type and the host's
+  traceback text, `refused`, `cancelled`, or `unknown` -- and a `HostedReason`. Bookkeeping is
+  recorded only when refused. A callback a library makes is `hosted.callback`, and a request made
+  inside one names its parent. An interrupt ends the caller's wait; a call already running runs on,
+  and its outcome notes the interrupt, while one still waiting for its binding's turn or for a
+  connection is `cancelled`.
+
+  `close_admission` closes the relay in the same state change as the gate, and returns at once: a
+  request not yet forwarded is refused, admission closed, and its caller gets an `outrig.Closed`;
+  one forwarded is the binding's to finish, and the drain waits for it; and the process refuses a
+  request read after the close reaches it, and cancels one still waiting for its turn. Shutdown
+  drains hosted calls with executions, then stops the bindings process, and a call it cut off is
+  `unknown` -- also when a program the library forked out of the process's group holds its output
+  open, which the shutdown waits five seconds for. `ShutdownReport::hosted` and `session.report`'s
+  `hosted` list each request that ended after the close, as a `HostedCall`, and an `unknown` one
+  makes the verdict `StoppedWithUnknown`. If the bindings process dies, the session goes on without
+  its bindings: `binding.exited` records how it ended, as `BindingStop::exited` does, each call it
+  was running is `unknown`, and a later call raises an error that says so. The vendored RPyC is
+  mounted read-only at `/outrig/rpyc` in a session with bindings, where the interpreter imports it.
 
 ### Changed
 
@@ -283,12 +317,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the archive warns and embeds nothing (`OUTRIG_REQUIRE_PYTHON=1` makes that an error), and every
   `Outrig::launch` in the result fails with `OutrigError::Configuration` saying why. The embedded
   archive adds about 36 MB to a binary that links the crate.
-- **The build also embeds RPyC 6.0.2**, the library that will carry requests between the agent's
-  interpreter and a library hosted in a process on the host. `build.rs` fetches the pinned wheel,
-  verifies its SHA-256, and embeds its members as a tar; the first use unpacks them under
+- **The build also embeds RPyC 6.0.2**, the library that carries requests between the agent's
+  interpreter and the libraries hosted in a process on the host. `build.rs` fetches the pinned
+  wheel, verifies its SHA-256, and embeds its members as a tar; the first use unpacks them under
   `$XDG_CACHE_HOME/outrig/wheels`. `OUTRIG_RPYC_WHEEL` names a local copy for a build with no
-  network, and a build that cannot fetch it degrades as one without the Python payload does. The
-  transport runs in this crate's tests on the host alone; no session uses it yet.
+  network, and a build that cannot fetch it degrades as one without the Python payload does.
 - **`/outrig` is reserved inside the container.** `Outrig::launch` refuses a workspace or mount
   whose container path is `/outrig` or under it, with `OutrigError::Configuration`.
 

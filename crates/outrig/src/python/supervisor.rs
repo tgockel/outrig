@@ -90,8 +90,12 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const LINE_MAX: usize = 1 << 20;
 /// How much of a line that is not a message a diagnostic quotes.
 const QUOTED: usize = 200;
-/// Lines queued each way before a writer waits. `0003-22` chooses the bound a session relies on.
+/// Lines queued from the process before its reader waits.
 const QUEUE: usize = 64;
+/// Lines queued for the process's stdin beyond the one being written: one, so what waits for a
+/// slow process waits in the relay's queue (`python::hosted`), bounded in bytes, where a request
+/// can still be refused.
+const STDIN_QUEUE: usize = 1;
 /// What the process prefixes its own diagnostics with on stderr.
 const DIAGNOSTIC: &str = "outrig-binding:";
 /// How often `stop` looks at the group during the grace, and after `SIGKILL`.
@@ -205,20 +209,8 @@ pub(crate) struct Process {
     /// Its pid, which is also its process group's id.
     pid: Pid,
     /// `None` once [`Process::close_stdin`] was called.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     stdin: Option<mpsc::Sender<Value>>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     rpc: Option<mpsc::Receiver<Value>>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     events: Option<mpsc::Receiver<Value>>,
     #[cfg_attr(
         not(test),
@@ -321,7 +313,7 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
 
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&tail)));
-    let (stdin_tx, stdin_rx) = mpsc::channel(QUEUE);
+    let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
     let (rpc_tx, rpc_rx) = mpsc::channel(QUEUE);
     let (events_tx, events_rx) = mpsc::channel(QUEUE);
     let (decisions_tx, decisions_rx) = mpsc::channel(QUEUE);
@@ -407,7 +399,6 @@ async fn failed_start(
 
 impl Process {
     /// The process's pid, which is also its process group's id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "a test reads it"))]
     pub(crate) fn pid(&self) -> Pid {
         self.pid
     }
@@ -420,10 +411,6 @@ impl Process {
 
     /// A sender into the stdin queue, for a std thread's `blocking_send`. Panics once
     /// [`Process::close_stdin`] was called.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     pub(crate) fn sender(&self) -> mpsc::Sender<Value> {
         self.stdin.clone().expect("the process's stdin is open")
     }
@@ -432,7 +419,7 @@ impl Process {
     /// a control line; `BrokenPipe` once stdin is closed or the process is gone.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
+        expect(dead_code, reason = "the policy `0003-23` builds reads it")
     )]
     pub(crate) async fn send(&self, message: Value) -> io::Result<()> {
         let broken = || io::Error::new(ErrorKind::BrokenPipe, "the process's stdin is closed");
@@ -451,19 +438,11 @@ impl Process {
     }
 
     /// The process's `rpc` lines, taken once.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     pub(crate) fn take_rpc(&mut self) -> mpsc::Receiver<Value> {
         self.rpc.take().expect("the rpc lines are taken once")
     }
 
     /// The process's `event` lines, taken once.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the relay `0003-22` builds reads it")
-    )]
     pub(crate) fn take_events(&mut self) -> mpsc::Receiver<Value> {
         self.events.take().expect("the event lines are taken once")
     }

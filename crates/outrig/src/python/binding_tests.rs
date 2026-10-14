@@ -122,8 +122,8 @@ fn ids_used(relay: &Relay, agent: &str) -> Vec<u64> {
 }
 
 /// Python that binds `raw(handler, boxed)`: a request written by hand, past the shim, with its
-/// arguments already boxed; `idp` for a proxy's id_pack; the labels; and `attempt`, which prints
-/// what a call gave or how it was refused.
+/// arguments already boxed, its frame labeled as the interpreter labels one; `idp` for a proxy's
+/// id_pack; the labels; and `attempt`, which prints what a call gave or how it was refused.
 const RAW: &str = r#"
     import rpyc, struct, zlib
     from rpyc.core import consts
@@ -131,11 +131,14 @@ const RAW: &str = r#"
     idp = lambda proxy: object.__getattribute__(proxy, "____id_pack__")
     L, V, T, R = (consts.LABEL_LOCAL_REF, consts.LABEL_VALUE, consts.LABEL_TUPLE,
                   consts.LABEL_REMOTE_REF)
+    ops = {v: k[len("HANDLE_"):].lower()
+           for k, v in vars(consts).items() if k.startswith("HANDLE_")}
     def raw_on(on, handler, boxed):
         res = rpyc.core.async_.AsyncResult(on)
         seq = on._get_seq_id()
         on._request_callbacks[seq] = res
-        on._send(consts.MSG_REQUEST, seq, (handler, boxed))
+        op = ops.get(handler, "unknown") if type(handler) is int else "unknown"
+        on._send(consts.MSG_REQUEST, seq, (handler, boxed), {"request": seq, "op": op})
         return res.value
     def raw(handler, boxed):
         return raw_on(conn, handler, boxed)
@@ -596,6 +599,33 @@ fn a_compressed_frame_closes_the_connection_which_reopens() {
     );
     assert!(
         out.starts_with("closed: the host closed this connection: a compressed frame"),
+        "{out}"
+    );
+    assert!(out.ends_with("reopened public value True\n"), "{out}");
+}
+
+/// A frame with no data, which RPyC never sends and would take without dispatching, closes its
+/// connection the same way.
+#[test]
+fn a_frame_with_no_data_closes_the_connection_which_reopens() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_raw(
+            r#"
+            conn._channel._write(struct.pack("!LB", 0, 0) + b"\n", False)
+            try:
+                root.public
+            except EOFError as e:
+                print("closed:", e)
+            root = __main__._kernels['primary'].hosted('fx')
+            print("reopened", root.public, object.__getattribute__(root, "____conn__") is not conn)
+            "#,
+        ),
+    );
+    assert!(
+        out.starts_with("closed: the host closed this connection: a frame with no data\n"),
         "{out}"
     );
     assert!(out.ends_with("reopened public value True\n"), "{out}");
@@ -1227,10 +1257,10 @@ fn a_torn_send_tells_the_binding() {
         &with_raw(&format!(
             r#"
             real_write = conn._channel._write
-            def failing(part, more):
+            def failing(part, more, label=None):
                 if more:
                     raise OSError("the pipe tore")
-                real_write(part, more)
+                real_write(part, more, label)
             conn._channel._write = failing
             try:
                 root.method(b"x" * {PART_MAX})
@@ -1798,12 +1828,13 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
         exec(compile(open(source).read(), source, "exec"), ns)
         turn = ns["Turn"]()
         order = []
-        turn.__enter__()
-        turn.__enter__()  # re-entrant for the holder: nobody is queued
+        outer, inner = turn.taking(), turn.taking()
+        outer.__enter__()
+        inner.__enter__()  # re-entrant for the holder: nobody is queued
         queued_by_holder = len(turn._waiters)
-        turn.__exit__(None, None, None)
+        inner.__exit__(None, None, None)
         def waiter(i):
-            with turn:
+            with turn.taking():
                 order.append(i)
         threads = []
         for i in range(4):
@@ -1815,7 +1846,7 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
                 if time.monotonic() > deadline:
                     raise TimeoutError("a waiter never queued")
                 time.sleep(0.001)
-        turn.__exit__(None, None, None)  # depth 1 -> 0: the head of the queue takes it
+        outer.__exit__(None, None, None)  # depth 1 -> 0: the head of the queue takes it
         for t in threads:
             t.join(20)
         print(json.dumps({"queued_by_holder": queued_by_holder, "order": order,
@@ -2547,10 +2578,10 @@ const COUNTING: &str = r#"
     names = {v: n for n, v in vars(consts).items() if n.startswith('HANDLE_')}
     counts = collections.Counter()
     original = H._send
-    def counting(self, msg, seq, args):
+    def counting(self, msg, seq, args, label=None):
         if msg == consts.MSG_REQUEST:
             counts[names.get(args[0], str(args[0]))] += 1
-        return original(self, msg, seq, args)
+        return original(self, msg, seq, args, label)
     H._send = counting
     report = {}
     def measure(label, fn):
@@ -2966,10 +2997,10 @@ const AWAITED_COUNTING: &str = r#"
     names = {v: n for n, v in vars(consts).items() if n.startswith('HANDLE_')}
     counts = collections.Counter()
     original = __main__._Hosted._send
-    def counting(self, msg, seq, args):
+    def counting(self, msg, seq, args, label=None):
         if msg == consts.MSG_REQUEST:
             counts[names.get(args[0], str(args[0]))] += 1
-        return original(self, msg, seq, args)
+        return original(self, msg, seq, args, label)
     __main__._Hosted._send = counting
     report = {}
     async def measure(label, awaitable):

@@ -233,17 +233,30 @@ code's own install of a package named `rpyc` is kept from shadowing that copy in
 a design fork of `0003-16`. Both sides run RPyC in service mode and never in classic mode, which
 would give the container the host's interpreter -- `eval`, `execute`, and arbitrary imports.
 
-**There is no socket.** RPyC frames are carried as messages of the interpreter protocol that
-already connects the host to the interpreter (`harness-components.md`), as their own message kind,
-`rpc`. The Rust owner relays them to the binding's process over its stdin and stdout, through a
-bounded queue per binding, and replies return the same way. A frame travels in parts of at most
-512 KiB, one per line, so no protocol line passes 1 MiB; a frame holds at most 128 MiB of data,
-and one declaring more is refused rather than buffered, in either direction, by closing the
-connection it arrived on with the reason (`0003-16`). RPyC's own compression is off on both
-sides, and a frame flagged compressed is refused the same way: a small frame could otherwise
+**There is no socket.** RPyC frames are carried as messages of the interpreter protocol that already
+connects the host to the interpreter (`harness-components.md`), as their own message kind, `rpc`.
+The Rust owner relays them to the bindings process over its stdin and stdout, through one queue
+bounded in bytes, and replies return the same way: a request that does not fit is refused whole,
+raising in its caller, and a reply that does not fit closes its connection, since the call waiting
+for it cannot be refused (`0003-22`). A frame travels in parts of at most 512 KiB, one per line, so
+no protocol line passes 1 MiB; a frame holds at most 128 MiB of data, and one declaring more is
+refused rather than buffered, in either direction, by closing the connection it arrived on with the
+reason (`0003-16`), as is one declaring none, which RPyC never sends (`0003-22`). The relay holds
+frames too, so it holds what the interpreter sends to the same bounds, counting what each line it
+queues holds rather than what a label claims, its own lines included: a frame reserves what the
+parts its declared size takes hold -- each part's data as text, and a fixed charge for the line --
+and one declared past 128 MiB, or whose parts outrun that, in bytes or in number, closes its
+connection. An agent holds at most 64 connections to a binding, and at most 1,024 requests that
+have not ended, past which another is refused; the relay keeps 256 bytes of a member or target name
+a label gives. The relay passes a close on only for a connection the process was sent a part of,
+once, and a cancel only to such a connection, naming at most 16 requests, when the queue has room
+(`0003-22`). The lines the host queues for the interpreter
+are not bounded that way yet: an interpreter that stops reading can grow them
+(`plan/next/bound-what-the-host-queues-for-the-interpreter.md`). RPyC's own compression is off on
+both sides, and a frame flagged compressed is refused the same way: a small frame could otherwise
 inflate without limit inside the bindings process. Only the interpreter can reach a binding: a
-program the agent starts inherits neither protocol descriptor, and a forked child closes both, so
-a subprocess -- and everything else in the container -- has no channel to a binding at all. Code
+program the agent starts inherits neither protocol descriptor, and a forked child closes both, so a
+subprocess -- and everything else in the container -- has no channel to a binding at all. Code
 inside the interpreter does, which is why enforcement does not trust the container side.
 
 **Connections belong to kernels, up to four per kernel and binding.** RPyC serves an incoming
@@ -282,6 +295,16 @@ table. Every request a kernel sends passes through it before RPyC acts on it, an
 - **Frames and tracebacks never leave.** A generator's `gi_frame` is a public name, and a frame's
   `f_globals` another, so a result that is or holds a frame or traceback object is denied.
 - **Pickle is off.** No request is answered with pickled bytes.
+- **A request's number is one the owner can record.** RPyC numbers each request, and the record
+  of it carries the number. The relay holds a request it admitted under the number its label
+  gives, and sends that number with the frame. A request numbered outside 0 to 2^64 - 1, with the
+  number of a request its connection is still serving, or with another than its label's -- or a
+  frame labeled as a request that holds a reply -- closes the connection before anything is
+  recorded or waited for, and the labeled request ends `refused`. A labeled frame left unread when
+  its connection closes ends its request `cancelled`, `disconnected`, so the relay holds nothing
+  for a frame that will never be served. A boundary request whose frame carries no label of the
+  relay's is refused: run, it would be recorded under whatever request the relay holds by its
+  number (`0003-22`).
 - **The host never imports a module the container names.** An exception a container callback
   raises reaches the host as itself only if its type is a builtin; any other type arrives as RPyC's
   generic exception class. The container may import a module the host names, which is how the
@@ -544,8 +567,9 @@ The cost is the one the default avoids: under `serialize = true`, a call that bl
 holds every other call to that binding for an hour, from every kernel. `0003-20` delivers the
 setting; `0003-17` proved both modes, starting the binding program with `--serialize`, which is
 how the setting reaches it. The lock is granted in arrival order and is re-entrant for the thread
-holding it; a waiter holds a ticket, which `0003-22` drops when a cancel names its request or
-when the session closes.
+holding it. A waiter stops waiting, and its request is recorded `cancelled`, when a cancel names
+its request or when the binding observes the close; bookkeeping still waits its turn, since a call
+the binding was forwarded may need it to finish (`0003-22`).
 
 **Why every binding is not serialized.** Until the review of 2026-10-02 this page said the
 opposite: one request at a time per binding process, so that no hosted library had to be
@@ -561,23 +585,26 @@ file while a hosted call writes the same file -- the repository's index, a file 
 -- is not serialized with that call, and the file holds whatever the two writes leave.
 
 **An interrupt raises where the call is awaited** -- by waking the worker's wait through the pool's
-condition variable, on every kernel the primary included, rather than by the primary's SIGINT
-path, which could raise between a frame's header and its body (`0003-17`). A call whose target
-had been invoked keeps running on the host, because RPyC has no request that cancels one. Its
-reply, when it comes, is not handed to anyone, but it is recorded: the call's outcome is
-`returned` or `raised`, with the note that the caller had been interrupted, and the connection
-stays usable -- though not before that reply has arrived: the next call into the pool reads it
-and drops it, and the connection is free again. A callback the library makes after its caller was
-interrupted is refused the same way, when that next call reads it, so a library that calls back
-then waits for the kernel's next call into the pool (`0003-17`). Only a call whose binding is
-killed or dies before replying is `unknown`, in the sense `execution-and-rounds.md` gives it: the
-host cannot say whether it took effect, and nothing retries it. A call not yet invoked -- held for
-a decision, waiting in the executor's queue or for a free connection, or waiting for the serialize
-lock -- is `cancelled`, with the reason interrupted, and its target never runs
-(`boundary-policy.md`). Cancelling the task that awaits a hosted call wakes the worker the same
-way -- a task's cancellation, the second of the four `execution-and-rounds.md` distinguishes --
-and the call goes on, the fourth: an accepted remote operation; `runtime.wait` leaves the task and
-its call running.
+condition variable, on every kernel the primary included, rather than by the primary's SIGINT path,
+which could raise between a frame's header and its body (`0003-17`). A call whose target had been
+invoked keeps running on the host, because RPyC has no request that cancels one. Its reply, when it
+comes, is not handed to anyone, but it is recorded: the call's outcome is `returned` or `raised`,
+with the note that the caller had been interrupted, and the connection stays usable -- though not
+before that reply has arrived: the next call into the pool reads it and drops it, and the connection
+is free again. A callback the library makes after its caller was interrupted is refused the same
+way, when that next call reads it, so a library that calls back then waits for the kernel's next
+call into the pool (`0003-17`). Only a call whose binding is killed or dies before replying is
+`unknown`, in the sense `execution-and-rounds.md` gives it: the host cannot say whether it took
+effect, and nothing retries it. A call not yet invoked -- held for a decision, waiting in the
+executor's queue or for a free connection, or waiting for the serialize lock -- is `cancelled`, with
+the reason interrupted, and its target never runs (`boundary-policy.md`). The interpreter tells the
+binding with a cancel line, which the relay sends behind the request it names, so it can reach the
+binding before the connection's thread has taken that request: the binding keeps it for the
+request's receipt while a frame on the connection is untaken, at most 16 at a time, and closes a
+connection that would have it keep more (`0003-22`). Cancelling the task that awaits a hosted call
+wakes the worker the same way -- a task's cancellation, the second of the four
+`execution-and-rounds.md` distinguishes -- and the call goes on, the fourth: an accepted remote
+operation; `runtime.wait` leaves the task and its call running.
 
 Awaiting a hosted call costs a worker thread per call in flight, the cost `to_thread` paid in the
 synchronous design; removing it is `plan/next/hosted-calls-without-a-thread-per-call.md`.
@@ -591,31 +618,31 @@ A binding lives as long as its session (`0003-20`): its process starts before th
 killed with its process group at shutdown. A proxy is usable while its session lives and not after.
 Nothing reconnects, nothing rebinds an old proxy to a new process, and no record of calls outlives
 the session. A call running at shutdown is given until the drain deadline, and one still running
-then is `unknown`, its binding killed. A call the owner still holds at the close is never
-forwarded: one queued in the relay is refused there, one held for a decision is `cancelled`, and
-one still waiting in the container for a free connection is woken with the closing error. A call
-the relay had forwarded is its binding's to finish: the binding may run it after the close has
-returned, refuses it if it reads it after its closed flag, and cancels one it had read but not
-started, waiting for the serialize lock, once it observes the flag (`lifecycle.md`). The
-interpreter's death ends the session, bindings included: it is reported as an event, and the
-session then closes and reports as at shutdown
-(`plan/next/interpreter-restart-with-a-reset-notice.md`).
+then is `unknown`, its binding killed -- also when a program the library forked out of the binding's
+process group holds the process's output open past the stop, which the shutdown waits five seconds
+for before it takes the process as gone (`lifecycle.md`). A call the owner still holds at the close
+is never forwarded: one queued in the relay is refused there, one held for a decision is
+`cancelled`, and one still waiting in the container for a free connection is woken with the closing
+error. A call the relay had forwarded is its binding's to finish: the binding reads it ahead of its
+closed flag and runs it, which may be after the close has returned, unless it is still waiting for
+the serialize lock when the binding observes the flag, which cancels it (`lifecycle.md`). The
+interpreter's death ends the session, bindings included: it is reported as an event, and the session
+then closes and reports as at shutdown (`plan/next/interpreter-restart-with-a-reset-notice.md`).
 
-**A call that outlives its caller runs to completion.** A call still running in its binding when
-its kernel is released (`0003-26`, through `Kernel.close_hosted`, which closes the kernel's pool
-and wakes every call waiting on it), or when the connection that carried it closes for another
-reason -- the relay closing it after a frame that did not fit (`0003-22`), the interpreter's
-death -- cannot be stopped: RPyC has no cancel, so the binding runs it on its thread until it
-returns, and the reply reaches nobody. Its caller is told `unknown`, since its wait ended with no
-result, while the call's outcome event records `returned` or `raised` when the reply comes, and
-`unknown` only if it never does. From then on no limit counts the call: the kernel's pool, which
-bounded it at four in flight, is gone with the kernel; `children-max` stops counting the child
-once its kernel is gone; and the agent that released the child is charged nothing. A child that
-is spawned, awaits in a background task a call that never returns, and is released, repeated,
-accumulates threads and calls in the bindings process for as long as the session lives: the
-container's worker ends when `close_hosted` wakes it, and the host's thread runs on. The
-maintainer documents this as unbounded for now; bounding it is
-`plan/next/bound-surviving-binding-calls.md`.
+**A call that outlives its caller runs to completion.** A call still running in its binding when its
+kernel is released (`0003-26`, through `Kernel.close_hosted`, which closes the kernel's pool and
+wakes every call waiting on it), or when the connection that carried it closes for another reason --
+the relay closing it after a reply that did not fit its queue (`0003-22`), the interpreter's death
+-- cannot be stopped: RPyC has no cancel, so the binding runs it on its thread until it returns, and
+the reply reaches nobody. Its caller is told `unknown`, since its wait ended with no result, while
+the call's outcome event records `returned` or `raised` when the reply comes, and `unknown` only if
+it never does. From then on no limit counts the call: the kernel's pool, which bounded it at four in
+flight, is gone with the kernel; `children-max` stops counting the child once its kernel is gone;
+and the agent that released the child is charged nothing. A child that is spawned, awaits in a
+background task a call that never returns, and is released, repeated, accumulates threads and calls
+in the bindings process for as long as the session lives: the container's worker ends when
+`close_hosted` wakes it, and the host's thread runs on. The maintainer documents this as unbounded
+for now; bounding it is `plan/next/bound-surviving-binding-calls.md`.
 
 A limit on live references, and on payloads beyond the frame bound, is
 `plan/next/hosted-reference-and-payload-bounds.md`.
@@ -717,8 +744,10 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
 
 ## Open questions
 
-- What the bindings process dying mid-session does. Its calls in flight are `unknown`; whether the
-  session continues without its bindings, and how later uses fail, is `0003-22`'s.
+- ~~What the bindings process dying mid-session does.~~ Settled by `0003-22`, fork 3: its calls
+  in flight are `unknown`, the process gone; `binding.exited` records how it ended, as the shutdown
+  report's `bindings` does; and the session goes on without its bindings, a later call raising an
+  error that names them and how their process ended.
 - Whether the facade's `async for` fetches a returned container in batches with RPyC's
   `buffiter`, which would make one request per batch rather than per item.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of
@@ -748,8 +777,8 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   callers `unknown`, leaves the binding to finish the calls, and leaves its table gone; and a
   proxy released on one connection frees its object only when no connection holds it. All four
   held, so fork 4's alternative -- one connection per kernel and binding, with replies out of
-  order -- was not measured. What stood in for the outcome event, which `0003-22` builds, was
-  the binding's record of the finished call and the reply crossing to a closed connection.
+  order -- was not measured. What stood in for the outcome event, which `0003-22` later built,
+  was the binding's record of the finished call and the reply crossing to a closed connection.
 - The two CVEs are described from their published advisories. `0003-16` sent each one's request
   by hand -- a comparison naming `__getattribute__`, and a host method copying and pickling a
   callback it was given -- and both are refused; neither was reproduced against stock RPyC.

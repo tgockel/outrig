@@ -23,6 +23,7 @@ use tokio::process::Child;
 
 use super::host::{ARGS, ExecId, Interpreter, InterpreterError, Outcome, PRIMARY, Report};
 use super::payload;
+use super::relay::FIXTURE_SOURCE;
 use crate::events::Events;
 
 /// How long any one step may take before a test fails rather than hangs.
@@ -115,6 +116,10 @@ impl Flag {
         self.path.exists()
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Block until the flag exists, failing after [`TIMEOUT`].
     pub(crate) fn wait(&self) {
         eventually(
@@ -170,12 +175,19 @@ pub(crate) fn host_home() -> PathBuf {
 /// The payload's interpreter, started as `Interpreter::start` starts it but on
 /// the host, with `agent` as its argument when there is one.
 pub(super) async fn spawn(agent: Option<&str>) -> Child {
+    spawn_with(agent, None).await
+}
+
+/// [`spawn`], with `rpyc` -- the vendored RPyC's directory -- after the agent,
+/// as a session with bindings starts it.
+async fn spawn_with(agent: Option<&str>, rpyc: Option<&Path>) -> Child {
     let python = payload::host_python()
         .await
         .expect("the payload this build embedded");
     tokio::process::Command::new(python)
         .args(ARGS)
         .args(agent)
+        .args(rpyc)
         .env("HOME", host_home())
         .env_remove("PYTHONUSERBASE")
         .stdin(Stdio::piped())
@@ -193,9 +205,18 @@ pub(crate) async fn start_on_host() -> Interpreter {
 
 /// [`start_on_host`], recording to `events`.
 pub(crate) async fn start_on_host_with(events: Events) -> Interpreter {
-    within(Interpreter::from_child(spawn(Some(PRIMARY)).await, events))
-        .await
-        .unwrap_or_else(|e| panic!("{e}"))
+    start_on_host_rpyc(events, None).await
+}
+
+/// [`start_on_host_with`], importing RPyC from `rpyc` when given: an interpreter
+/// that can reach a session's bindings.
+pub(crate) async fn start_on_host_rpyc(events: Events, rpyc: Option<&Path>) -> Interpreter {
+    within(Interpreter::from_child(
+        spawn_with(Some(PRIMARY), rpyc).await,
+        events,
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// How a test starts the interpreter on the host. By default: in the test's
@@ -561,7 +582,7 @@ def project(directory, name, tag=None, build=None):
 const WHEELS: &str = r#"
 import io, os, pathlib, sys, sysconfig, tarfile, zipfile
 
-out, final = sys.argv[1], sys.argv[2]
+out, final, fixture = sys.argv[1], sys.argv[2], sys.argv[3]
 plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
 cp = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
@@ -589,6 +610,8 @@ def wheel(name, tag, tags=None, purelib=True, requires=None, extra=(), version="
 
 
 wheel("pure", "py3-none-any")
+# The hosted-call fixture, as a session installs a binding's requirement.
+wheel("outrig_fixture", "py3-none-any", body=pathlib.Path(fixture).read_text())
 wheel("other", "py3-none-any")
 wheel("universal", "py2.py3-none-any", tags=["py2-none-any", "py3-none-any"])
 wheel("compiled", f"{cp}-{cp}-{plat}", purelib=False)
@@ -660,7 +683,7 @@ wheel("needs_url", "py3-none-any", requires=f"evil @ {pathlib.Path(final, 'evil-
 pub(crate) fn wheel_links() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let key = blake3::hash(WHEELS.as_bytes());
+        let key = blake3::hash(format!("{WHEELS}\0{FIXTURE_SOURCE}").as_bytes());
         let dir = std::env::temp_dir().join(format!(
             "outrig-test-wheels-{}-{}",
             nix::unistd::getuid(),
@@ -673,10 +696,13 @@ pub(crate) fn wheel_links() -> &'static Path {
             .prefix(".outrig-wheels-")
             .tempdir_in(std::env::temp_dir())
             .expect("a staging directory");
+        let fixture = tempfile::NamedTempFile::new().expect("a file for the fixture's source");
+        std::fs::write(fixture.path(), FIXTURE_SOURCE).expect("write the fixture's source");
         let output = Command::new(python())
             .args(["-I", "-c", WHEELS])
             .arg(stage.path())
             .arg(&dir)
+            .arg(fixture.path())
             .env("HOME", host_home())
             .output()
             .expect("the payload's Python runs");

@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-22` | A hosted call crosses the boundary and is recorded                 |
 | `0003-23` | Policy decides what crosses, and the user can be asked             |
 | `0003-24` | An evaluator judges what no rule settled                           |
 

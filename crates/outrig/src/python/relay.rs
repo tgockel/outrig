@@ -1,13 +1,15 @@
-//! A relay between one interpreter and the process holding its session's bindings, both started
-//! on the host, standing in for the one `0003-22` puts in `host.rs`.
+//! A test harness around the relay in `hosted.rs`: one interpreter and the process holding its
+//! session's bindings, both started on the host, with the session's relay between them.
 //!
 //! The interpreter is started as `interpreter_tests.rs` starts it, with the vendored RPyC's
 //! directory as its second argument; the bindings process is started through `supervisor.rs`, as
-//! a session starts it, over the fixture package with a factory per binding. `rpc` lines go
-//! between the two as they are, each naming its binding, and everything else the interpreter says
-//! is handed to the test, as are the process's event lines and decision requests. The relay
-//! counts the lines each way and remembers the longest, which is how a test checks the frame
-//! bound held in transit.
+//! a session starts it, over the fixture package with a factory per binding. The interpreter's
+//! `rpc` lines and notices go to the session's relay, as `host.rs` hands them to it, and what the
+//! relay sends the interpreter is written to its stdin; everything else the interpreter says is
+//! handed to the test, as are the process's decision requests and the event lines the relay does
+//! not know. The relay's events are recorded on a stream the test reads. The harness counts the
+//! `rpc` lines each way and remembers the longest, which is how a test checks the frame bound
+//! held in transit.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -25,10 +27,15 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use super::host::PRIMARY;
+use super::host::{PRIMARY, bindings_message};
+use super::hosted::{self, Notice, Rpc};
 use super::payload;
 use super::supervisor::{self, Decision, Factory, Process, Spec, Stopped};
 use super::testing::{Start, capture, host_home, interpreter_command, python, python_command};
+use crate::events::{Events, StreamBuilder};
+use crate::harness::bindings::Brief;
+use crate::harness::event::{Event, Received, Subscription, TryRecvError};
+use crate::harness::{Closed, ClosedBy};
 
 /// How long any one reply may take. A 64 MiB result crosses in a few seconds on a loaded runner.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(60);
@@ -50,575 +57,14 @@ pub(crate) fn rpyc_dir() -> &'static Path {
     })
 }
 
-/// The fixture library as a module: an object with public and private members, a nested object,
-/// a sequence that counts what iterating it asks for, a context manager, methods that call back,
-/// report types, and return a large result, two exception classes, a counter around
-/// `pickle.loads`, a recording method that notes when it ran on the host and sleeps or waits for
-/// a file, and objects made on request with a weak reference kept, so a test can watch the
-/// binding's table drop them.
-pub(crate) const FIXTURE_SOURCE: &str = r#"
-"""The fixture library a binding process hosts in tests."""
-
-import itertools
-import os
-import pickle
-import signal
-import subprocess
-import sys
-import threading
-import time
-import types
-import weakref
-
-
-class Records:
-    """The service shape: a wait that blocks until someone answers, a question asked for a ticket
-    and polled for, and records in bulk. One implementation of the state, used in the binding's
-    process by `Root` and in the service process the two-session measurement starts."""
-
-    def __init__(self):
-        self._answer = threading.Event()
-        self._answer_value = None
-        self._tickets = {}  # ticket -> [question, polls so far]
-        self._next_ticket = itertools.count(1)
-        self._records_lock = threading.Lock()
-        self._records = [
-            {"id": i, "name": f"record {i}", "score": i * 1.5, "flag": bool(i % 2)}
-            for i in range(1000)
-        ]
-
-    def wait_for_answer(self, until=None, timeout=600):
-        """Block until `answer` is called -- or, given `until`, until that file exists: the one
-        release that works inside a binding started with `--serialize`, where `answer` would
-        wait for the lock this call holds."""
-        deadline = time.monotonic() + timeout
-        while True:
-            if self._answer.wait(0.05):
-                return self._answer_value
-            if until is not None and os.path.exists(until):
-                return "released by file"
-            if time.monotonic() > deadline:
-                raise TimeoutError("nobody answered")
-
-    def answer(self, value):
-        self._answer_value = value
-        self._answer.set()
-
-    def ask(self, question):
-        """A ticket for `question`, answered on the second poll."""
-        ticket = next(self._next_ticket)
-        self._tickets[ticket] = [question, 0]
-        return ticket
-
-    def poll(self, ticket):
-        entry = self._tickets[ticket]
-        entry[1] += 1
-        return f"answer to {entry[0]}" if entry[1] >= 2 else None
-
-    def list_records(self, n):
-        """The first `n` records as a list of dicts, which the agent receives proxied."""
-        with self._records_lock:
-            return [dict(record) for record in self._records[:n]]
-
-    def records_by_value(self, n):
-        """The first `n` records as field names and a tuple of tuples, which cross by value."""
-        with self._records_lock:
-            rows = tuple(
-                (record["id"], record["name"], record["score"], record["flag"])
-                for record in self._records[:n]
-            )
-        return ("id", "name", "score", "flag"), rows
-
-    def update_records(self, changes):
-        """Apply `changes`, dicts with an `id`, and return how many."""
-        with self._records_lock:
-            by_id = {record["id"]: record for record in self._records}
-            for change in changes:
-                by_id[change["id"]].update(change)
-        return len(changes)
-
-
-class ServiceClient:
-    """A client of the service process, as a Rust service would ship one: each method is one
-    round trip over a Unix socket. One connection per calling thread, since the binding serves
-    its connections on several threads and one socket cannot carry two exchanges at once."""
-
-    def __init__(self, address):
-        self._address = address
-        self._local = threading.local()
-
-    def _connection(self):
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            from multiprocessing.connection import Client
-
-            conn = self._local.conn = Client(self._address, family="AF_UNIX", authkey=b"fixture")
-        return conn
-
-    def _call(self, method, *args, **kwargs):
-        conn = self._connection()
-        conn.send((method, args, kwargs))
-        status, value = conn.recv()
-        if status == "error":
-            raise RuntimeError(value)
-        return value
-
-    def wait_for_answer(self, until=None, timeout=600):
-        return self._call("wait_for_answer", until=until, timeout=timeout)
-
-    def answer(self, value):
-        return self._call("answer", value)
-
-    def ask(self, question):
-        return self._call("ask", question)
-
-    def poll(self, ticket):
-        return self._call("poll", ticket)
-
-    def list_records(self, n):
-        return self._call("list_records", n)
-
-    def records_by_value(self, n):
-        return self._call("records_by_value", n)
-
-    def update_records(self, changes):
-        return self._call("update_records", changes)
-
-
-def service_client():
-    """The factory of a binding that is a client of the service process."""
-    return ServiceClient(os.environ["OUTRIG_FIXTURE_SERVICE"])
-
-
-class Fresh:
-    """An object made on request, so a test can watch the binding's table drop it."""
-
-    def __init__(self, root, name):
-        self._root = root
-        self.name = name
-
-    def record(self, **kwargs):
-        return self._root.record(**kwargs)
-
-
-class FixtureError(Exception):
-    """Carries a public attribute beside its args."""
-
-    def __init__(self, message, status):
-        super().__init__(message)
-        self.status = status
-
-
-class CommandError(Exception):
-    """Reads private state in __str__, as GitPython's GitCommandError reads _cmdline."""
-
-    def __init__(self, command, status):
-        super().__init__(command, status)
-        self._cmdline = " ".join(command)
-        self.status = status
-
-    def __str__(self):
-        return f"command {self._cmdline!r} failed with status {self.status}"
-
-
-class Nested:
-    def __init__(self):
-        self.value = 7
-        self._secret = "hidden"
-
-    def method(self):
-        return "nested method"
-
-
-class Manager:
-    """A context manager whose `__exit__` gives back `result`: a list crosses by reference."""
-
-    def __init__(self, result=False):
-        self.entered = 0
-        self.exits = []
-        self.result = result
-
-    def __enter__(self):
-        self.entered += 1
-        return self
-
-    def __exit__(self, typ, value, tb):
-        self.exits.append((None if typ is None else typ.__name__, repr(value), tb is None))
-        return self.result
-
-
-class Untestable:
-    """What an `__exit__` may give back: testing its truth raises."""
-
-    def __bool__(self):
-        raise ValueError("its truth cannot be told")
-
-
-class Counted(list):
-    """A list that counts, on the host, the iterations it starts and the items they take."""
-
-    def __init__(self, items):
-        super().__init__(items)
-        self.iters = 0
-        self.nexts = 0
-
-    def __iter__(self):
-        self.iters += 1
-        return CountingIterator(self, list.__iter__(self))
-
-
-class CountingIterator:
-    def __init__(self, owner, iterator):
-        self._owner = owner
-        self._iterator = iterator
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        self._owner.nexts += 1
-        return next(self._iterator)
-
-
-class Callable:
-    def __call__(self, x):
-        return x * 2
-
-    def public(self):
-        return 1
-
-    def _private(self):
-        return 2
-
-
-unpickled = 0
-_real_loads = pickle.loads
-
-
-def _counting_loads(data, *args, **kwargs):
-    global unpickled
-    unpickled += 1
-    return _real_loads(data, *args, **kwargs)
-
-
-pickle.loads = _counting_loads
-
-
-class Root(Records):
-    def __init__(self):
-        Records.__init__(self)
-        self.public = "public value"
-        self._private = "private value"
-        self.writable = "before"
-        self.nested = Nested()
-        self.sequence = Counted([10, 20, 30])
-        self.manager = Manager()
-        self.suppressing = Manager(["suppress"])
-        self.propagating = Manager([])
-        self.untestable = Manager(Untestable())
-        self.callable = Callable()
-        self.kept = None
-        self.nested_type = Nested
-        self.str_type = str
-        self.a = types.SimpleNamespace(b=types.SimpleNamespace(c="c"))
-        self.b = "b"
-        self.calls = 0
-        self.taken = 0
-        self.received = []
-        self.last_raised = None
-        self._lock = threading.Lock()
-        self._intervals = []
-        self._kept = {}  # name -> (weak reference, strong reference or None)
-
-    def _private_method(self):
-        return "private"
-
-    def record(self, seconds=0, label="", started=None, until=None):
-        """The recording method: notes when it starts and ends here, on the host, and the thread
-        that served it. It sleeps `seconds`, or, given `until`, waits for that file to exist with
-        `seconds or 60` as the ceiling; `started` is a file it creates on starting, so a test
-        knows the call is in flight."""
-        start = time.monotonic()
-        if started:
-            open(started, "w").close()
-        if until is None:
-            time.sleep(seconds)
-        else:
-            deadline = start + (seconds or 60)
-            while not os.path.exists(until):
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"{until} never appeared")
-                time.sleep(0.01)
-        self._note(label, start)
-        return label
-
-    def hold_callable(self, fn, started=None, until=None):
-        """Wait as `record` does, holding `fn` without calling it: a call that carries a callable
-        and blocks."""
-        self.record(0, "hold", started=started, until=until)
-
-    def call_then_fresh(self, fn, name):
-        """Call `fn`, swallow what it raises -- a connection that closed under it -- and return a
-        fresh object under `name`, as a library that survives a failed callback and still
-        answers would."""
-        try:
-            fn()
-        except Exception:
-            pass
-        return self.fresh(name)
-
-    def call_recorded(self, fn, label):
-        """`fn()`, with its interval recorded as `record` records one."""
-        start = time.monotonic()
-        try:
-            return fn()
-        finally:
-            self._note(label, start)
-
-    def _note(self, label, start):
-        with self._lock:
-            self._intervals.append((label, start, time.monotonic(), threading.current_thread().name))
-
-    def intervals(self):
-        """Every recorded interval as `(label, start, end, thread name)`, by value."""
-        with self._lock:
-            return tuple(self._intervals)
-
-    def thread_name(self):
-        return threading.current_thread().name
-
-    def fresh(self, name):
-        """A new object, kept here under `name` with a weak reference beside it."""
-        obj = Fresh(self, name)
-        self._kept[name] = (weakref.ref(obj), obj)
-        return obj
-
-    def again(self, name):
-        """The object `fresh` made under `name`, once more."""
-        return self._kept[name][1]
-
-    def let_go(self, name):
-        """Drop this module's own reference to `name`'s object, so the binding's table alone
-        holds it."""
-        ref, _ = self._kept[name]
-        self._kept[name] = (ref, None)
-
-    def alive(self, name):
-        """Whether `name`'s object still exists, after a collection."""
-        import gc
-
-        gc.collect()
-        return self._kept[name][0]() is not None
-
-    def sleep_child(self, seconds, started=None):
-        """Run `sleep seconds` as a child of this process and wait for it: a call in flight whose
-        grandchild the owner must end with the binding. `started` is a file created once the
-        child runs."""
-        child = subprocess.Popen(["sleep", str(seconds)])
-        if started:
-            open(started, "w").close()
-        return child.wait()
-
-    def event(self, payload):
-        """Publish `payload` as an event line, through the binding program's own primitive."""
-        import __main__
-
-        __main__._event(payload)
-
-    def decide(self, payload):
-        """Hold this call until the owner answers `payload`, through the binding program's own
-        primitive, and return the answer."""
-        import __main__
-
-        return __main__._decide(payload)
-
-    def decide_path(self, raw):
-        """`decide` with a path the host made from the bytes `raw`, as a library reports a file
-        name: not UTF-8 when the bytes are not."""
-        import __main__
-
-        return __main__._decide({"path": os.fsdecode(raw)})
-
-    def env(self, name):
-        return os.environ.get(name)
-
-    def child_env(self, name):
-        """`name` as a program this process starts sees it."""
-        run = subprocess.run(["sh", "-c", f"echo ${name}"], capture_output=True, text=True)
-        return run.stdout.strip()
-
-    def sys_path(self):
-        return tuple(sys.path)
-
-    def pgid(self):
-        return os.getpgrp()
-
-    def method(self, x, y=1):
-        return x + y
-
-    def takes(self, obj):
-        self.taken += 1
-        return obj is self.nested
-
-    def pair(self):
-        return (self.nested, 1)
-
-    def slow(self, seconds=0.2, label="slow"):
-        return self.record(seconds, label)
-
-    def close(self):
-        """A public name a coroutine would own, recorded when it is called."""
-        self.received.append("close")
-        return "closed"
-
-    def send(self, value):
-        """A public name a coroutine would own, recorded when it is called."""
-        self.received.append(("send", value))
-        return value
-
-    def iterable(self):
-        """A generator, as a library returns one."""
-        return (n for n in (1, 2, 3))
-
-    def echo(self, x):
-        """`x` itself, so a callable passed in comes back as a reference to it."""
-        return x
-
-    def types(self, *args):
-        return tuple(type(a).__name__ for a in args)
-
-    def shape(self, obj):
-        """The types of a nested value, as text."""
-        if isinstance(obj, dict):
-            items = sorted(obj.items(), key=repr)
-            return "{" + ", ".join(f"{self.shape(k)}: {self.shape(v)}" for k, v in items) + "}"
-        if isinstance(obj, (list, tuple, set, frozenset)):
-            return type(obj).__name__ + "[" + ", ".join(sorted(self.shape(i) for i in obj)) + "]"
-        return type(obj).__name__
-
-    def noted(self, *args):
-        """Counts its calls, so a test can show a refused request never reached it."""
-        self.calls += 1
-        return self.calls
-
-    def call(self, fn, *args):
-        return fn(*args)
-
-    def call_with_nested(self, fn):
-        """`fn(self.nested)`: a callback given a host object."""
-        return fn(self.nested)
-
-    def call_twice(self, fn, x):
-        return (fn(x), fn(x))
-
-    def returned_type(self, fn):
-        return type(fn()).__name__
-
-    def calling_raised(self, fn):
-        """The exception's type name when calling `fn` raises, else None; kept in
-        `last_raised` too, for a caller whose own execution the exception ended."""
-        try:
-            fn()
-        except BaseException as e:
-            self.last_raised = type(e).__name__
-            return self.last_raised
-        self.last_raised = None
-        return None
-
-    def keep(self, fn):
-        self.kept = fn
-
-    def call_kept(self):
-        return self.kept(1)
-
-    def probe(self, fn):
-        """What a callback allows besides being called, during the call: the exception's type
-        for each attempt, or 'ok'."""
-        import copy
-
-        results = {}
-        for name, attempt in (
-            ("attr", lambda: fn.anything),
-            ("repr", lambda: repr(fn)),
-            ("pickle", lambda: pickle.dumps(fn)),
-            ("copy", lambda: copy.copy(fn)),
-            ("call", lambda: fn(3)),
-        ):
-            try:
-                results[name] = ("ok", repr(attempt()))
-            except Exception as e:
-                results[name] = (type(e).__name__, str(e)[:60])
-        return results
-
-    def big(self, n):
-        return os.urandom(n)
-
-    def gen(self):
-        yield 1
-        yield 2
-
-    def frames(self):
-        return (sys._getframe(),)
-
-    def frames_with_nested(self):
-        return (self.nested, sys._getframe())
-
-    def call_with_bytes(self, fn, n):
-        """Call `fn` with `n` random bytes; the error's text if that raises, else the result."""
-        try:
-            return fn(os.urandom(n))
-        except Exception as e:
-            return f"{type(e).__name__}: {e}"
-
-    def note_raised(self, fn):
-        """What calling `fn` raised, with a note added to it here, as `(type name, notes)`."""
-        try:
-            fn()
-        except Exception as e:
-            e.add_note("noted on the host")
-            return (type(e).__name__, list(e.__notes__))
-        return None
-
-    def raise_fixture(self):
-        raise FixtureError("fixture failed", 3)
-
-    def raise_command(self):
-        raise CommandError(["git", "push"], 128)
-
-    def unpickled(self):
-        return unpickled
-
-
-def make():
-    return Root()
-
-
-def make_stubborn():
-    """A binding that ignores SIGTERM, with a child that ignores it too: what only SIGKILL ends.
-    Set here, on the main thread, where `signal.signal` is allowed."""
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    subprocess.Popen(["sh", "-c", 'trap "" TERM; sleep 1000'])
-    return Root()
-
-
-def make_failing():
-    """A factory that starts a program and then raises, writing its process group to
-    `OUTRIG_FIXTURE_PGID_FILE` first, so a test can look for what it left behind."""
-    subprocess.Popen(["sleep", "1000"])
-    with open(os.environ["OUTRIG_FIXTURE_PGID_FILE"], "w") as f:
-        f.write(str(os.getpgrp()))
-    raise RuntimeError("the factory failed on purpose")
-
-
-def make_slow():
-    """A factory that starts a program, writes its process group to `OUTRIG_FIXTURE_PGID_FILE`,
-    and then takes longer than any owner waits."""
-    subprocess.Popen(["sleep", "1000"])
-    with open(os.environ["OUTRIG_FIXTURE_PGID_FILE"], "w") as f:
-        f.write(str(os.getpgrp()))
-    time.sleep(1000)
-    return Root()
-"#;
+/// The fixture library, `outrig_fixture.py`, as a module: an object with public and private
+/// members, a nested object, a sequence that counts what iterating it asks for, a context
+/// manager, methods that call back, report types, and return a large result, two exception
+/// classes, a counter around `pickle.loads`, a recording method that notes when it ran on the
+/// host and sleeps or waits for a file, objects made on request with a weak reference kept, so a
+/// test can watch the binding's table drop them, and a call whose forked helper leaves the
+/// process's group holding its output.
+pub(crate) const FIXTURE_SOURCE: &str = include_str!("outrig_fixture.py");
 
 /// The service process of the two-session measurement: the fixture's `Records` behind a Unix
 /// socket, a thread per connection, each exchange a `(method, args, kwargs)` tuple answered with
@@ -895,10 +341,15 @@ pub(crate) struct Bind<'a> {
     pub(crate) cwd: Option<&'a Path>,
 }
 
-/// The bindings process the relay started, with the lines of it that only the test reads.
+/// The bindings process the harness started, the session's relay to it, and the lines of it that
+/// only the test reads.
 struct Bound {
     process: Process,
-    events: mpsc::Receiver<Value>,
+    relay: hosted::Relay,
+    /// A sender into the process's stdin, `None` once a test has closed it.
+    stdin: Option<mpsc::Sender<Value>>,
+    /// Event lines the relay does not know.
+    events: mpsc::UnboundedReceiver<Value>,
     decisions: mpsc::Receiver<Decision>,
 }
 
@@ -906,19 +357,31 @@ pub(crate) struct Relay {
     interpreter: Child,
     /// The interpreter's stdin, `None` once a test has closed it.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// What the session's relay sends the interpreter, written by a thread of its own.
+    to_interpreter: hosted::ToInterpreter,
     other: Receiver<Result<Value, String>>,
     /// Messages read while looking for another, kept in order for the next `recv`.
     pending: VecDeque<Value>,
     stderr: Arc<Mutex<String>>,
-    /// The bindings process's stdin, for the pump that forwards the interpreter's `rpc` lines.
-    target: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
+    /// The session's relay to the running bindings process, for the pump that hands it the
+    /// interpreter's lines.
+    hosted: Arc<Mutex<Option<hosted::Relay>>>,
+    /// The agents opened besides the primary, which every new relay is told of.
+    agents: Vec<String>,
     /// The bindings declared so far, in order, each with its package directory, and how their
     /// process starts.
     declared: Vec<(Factory, PathBuf)>,
     env: Option<Vec<(OsString, OsString)>>,
     cwd: Option<PathBuf>,
     process: Option<Bound>,
-    /// Where the bindings process lives: its pipes and its reaping are registered with it.
+    /// The stream the relays record to, and the test's subscription to it.
+    events: Events,
+    subscription: Subscription,
+    /// Every event taken from the subscription so far, and how many it missed.
+    seen: Vec<Arc<Event>>,
+    missed: u64,
+    /// Where the bindings process and its relay live: their pipes and tasks are registered with
+    /// it.
     runtime: Runtime,
     pub(crate) stats: Arc<Stats>,
 }
@@ -935,12 +398,25 @@ fn write_line(stdin: &Mutex<Option<ChildStdin>>, message: &Value) -> usize {
     line.len()
 }
 
+/// Events the test's subscription holds before the oldest is dropped, unless a test asks for
+/// fewer.
+const EVENTS_HELD: usize = 4096;
+
 impl Relay {
     pub(crate) fn start() -> Self {
         Self::start_with(&Start::default())
     }
 
+    /// [`Relay::start`], the test's subscription holding `capacity` events.
+    pub(crate) fn start_with_capacity(capacity: usize) -> Self {
+        Self::start_holding(&Start::default(), capacity)
+    }
+
     pub(crate) fn start_with(start: &Start) -> Self {
+        Self::start_holding(start, EVENTS_HELD)
+    }
+
+    fn start_holding(start: &Start, capacity: usize) -> Self {
         let mut child = interpreter_command(start)
             .arg(rpyc_dir())
             .spawn()
@@ -950,30 +426,47 @@ impl Relay {
         )));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = capture(child.stderr.take().expect("stderr is piped"));
-        let target = Arc::new(Mutex::new(None));
+        let hosted = Arc::new(Mutex::new(None));
         let stats = Arc::new(Stats::default());
         let (tx, other) = channel();
         {
-            let (stdin, target, stats) =
-                (Arc::clone(&stdin), Arc::clone(&target), Arc::clone(&stats));
-            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, target, stats));
+            let (stdin, hosted, stats) =
+                (Arc::clone(&stdin), Arc::clone(&hosted), Arc::clone(&stats));
+            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, hosted, stats));
         }
+        let to_interpreter = {
+            let (lines, queued) = channel::<Value>();
+            let (stdin, stats) = (Arc::clone(&stdin), Arc::clone(&stats));
+            std::thread::spawn(move || write_from_relay(queued, stdin, stats));
+            let lines = Mutex::new(lines);
+            Arc::new(move |line: Value| {
+                let _ = lines.lock().expect("lines lock").send(line);
+            }) as hosted::ToInterpreter
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("a runtime for the bindings");
+        let mut stream = StreamBuilder::default();
+        let subscription = stream.subscribe(capacity);
         let mut relay = Self {
             interpreter: child,
             stdin,
+            to_interpreter,
             other,
             pending: VecDeque::new(),
             stderr,
-            target,
+            hosted,
+            agents: Vec::new(),
             declared: Vec::new(),
             env: None,
             cwd: None,
             process: None,
+            events: stream.build(),
+            subscription,
+            seen: Vec::new(),
+            missed: 0,
             runtime,
             stats,
         };
@@ -1043,7 +536,7 @@ impl Relay {
 
     /// Declare the binding `factory` describes, its package in `packages` -- one a session's own
     /// lowering of a declaration made, say -- and start the bindings process again with every
-    /// binding declared so far, waiting for it to be ready, and relay its lines from then on.
+    /// binding declared so far, waiting for it to be ready, with a new session relay to it.
     pub(crate) fn bind_factory(&mut self, factory: Factory, packages: &Path) {
         self.declared.push((factory, packages.to_path_buf()));
         self.stop_process(Duration::from_millis(200));
@@ -1066,16 +559,24 @@ impl Relay {
             .runtime
             .block_on(supervisor::start(spec))
             .unwrap_or_else(|e| panic!("the bindings did not start: {e}"));
-        let rpc = process.take_rpc();
-        let events = process.take_events();
+        let names = self.declared.iter().map(|(f, _)| f.name.clone()).collect();
         let decisions = process.take_decisions();
-        *self.target.lock().expect("target lock") = Some(process.sender());
-        {
-            let (stdin, stats) = (Arc::clone(&self.stdin), Arc::clone(&self.stats));
-            std::thread::spawn(move || pump_process(rpc, stdin, stats));
+        let relay =
+            hosted::Relay::new(Arc::clone(&self.to_interpreter), self.events.clone(), names);
+        for agent in &self.agents {
+            relay.opened(agent);
         }
+        let (others, events) = mpsc::unbounded_channel();
+        relay.others(others);
+        {
+            let _entered = self.runtime.enter();
+            relay.attach(&mut process);
+        }
+        *self.hosted.lock().expect("hosted lock") = Some(relay.clone());
         self.process = Some(Bound {
+            stdin: Some(process.sender()),
             process,
+            relay,
             events,
             decisions,
         });
@@ -1086,15 +587,113 @@ impl Relay {
         write_line(&self.stdin, &message);
     }
 
-    /// Write one raw line to the bindings process's stdin, as the host would.
+    /// Write one raw line to the bindings process's stdin, past the relay.
     pub(crate) fn inject_to_binding(&mut self, message: Value) {
-        let sender = self
-            .target
-            .lock()
-            .expect("target lock")
-            .clone()
-            .expect("a started bindings process");
+        let bound = self.process.as_ref().expect("a started bindings process");
+        let sender = bound.stdin.clone().expect("the process's stdin is open");
         let _ = sender.blocking_send(message);
+    }
+
+    /// The session's relay to the running bindings process.
+    fn relay(&self) -> &hosted::Relay {
+        &self
+            .process
+            .as_ref()
+            .expect("a started bindings process")
+            .relay
+    }
+
+    /// Close admission at the relay, as the session's close does: with the error a session's
+    /// owner's close gives.
+    pub(crate) fn close_admission(&mut self) {
+        self.relay()
+            .close(&Closed::from(ClosedBy::Owner).to_string());
+    }
+
+    /// How many request frames the relay has forwarded to the process.
+    pub(crate) fn forwarded(&self) -> u64 {
+        self.relay().forwarded()
+    }
+
+    /// Tell the interpreter the declared bindings, as a session does once it has started them:
+    /// every kernel then holds a stub for each, under its name.
+    pub(crate) fn declare_bindings(&mut self) {
+        let bound = self.process.as_ref().expect("a started bindings process");
+        let briefs: Vec<Brief> = self
+            .declared
+            .iter()
+            .map(|(factory, _)| Brief {
+                name: factory.name.clone(),
+                description: format!("the fixture, as {}", factory.factory),
+                type_name: bound.process.type_name(&factory.name).to_string(),
+                serialize: factory.serialize,
+            })
+            .collect();
+        let mut paths: Vec<String> = Vec::new();
+        for (_, dir) in &self.declared {
+            let path = dir.to_string_lossy().into_owned();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        self.send(bindings_message(&briefs, paths));
+    }
+
+    /// Take what the subscription holds into `seen`.
+    fn take_events(&mut self) {
+        loop {
+            match self.subscription.try_recv() {
+                Ok(Received::Event(event)) => self.seen.push(event),
+                Ok(Received::Missed(missed)) => self.missed += missed,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// Every event the relays have recorded, once no request the process was sent is still to
+    /// end.
+    pub(crate) fn hosted_events(&mut self) -> Vec<Arc<Event>> {
+        if let Some(bound) = &self.process {
+            let drained = bound.relay.drained();
+            self.runtime
+                .block_on(async { tokio::time::timeout(TIMEOUT, drained).await })
+                .unwrap_or_else(|_| panic!("hosted requests still running after {TIMEOUT:?}"));
+        }
+        self.take_events();
+        self.seen.clone()
+    }
+
+    /// Every event the relays have recorded, once `done` holds of them, within `within`.
+    pub(crate) fn hosted_events_until(
+        &mut self,
+        within: Duration,
+        done: impl Fn(&[Arc<Event>]) -> bool,
+    ) -> Vec<Arc<Event>> {
+        self.hosted_events_with_gaps(within, done).1
+    }
+
+    /// [`Relay::hosted_events_until`], with how many events the subscription missed.
+    pub(crate) fn hosted_events_with_gaps(
+        &mut self,
+        within: Duration,
+        done: impl Fn(&[Arc<Event>]) -> bool,
+    ) -> (u64, Vec<Arc<Event>>) {
+        let deadline = Instant::now() + within;
+        loop {
+            self.take_events();
+            if done(&self.seen) {
+                return (self.missed, self.seen.clone());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the events did not come within {within:?}: {:?}",
+                self.seen
+                    .iter()
+                    .map(|event| &event.payload)
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The next event line the bindings process writes, within `within`.
@@ -1124,11 +723,17 @@ impl Relay {
     }
 
     /// Stop the bindings process as a session's shutdown would, with `grace` between the
-    /// signals; `None` when none runs.
+    /// signals, and wait for its relay to handle the last of its lines; `None` when none runs.
     pub(crate) fn stop_process(&mut self, grace: Duration) -> Option<Stopped> {
-        self.target.lock().expect("target lock").take();
+        self.hosted.lock().expect("hosted lock").take();
         let bound = self.process.take()?;
-        Some(self.runtime.block_on(bound.process.stop(grace)))
+        bound.relay.stopping();
+        let finished = bound.relay.finished();
+        Some(self.runtime.block_on(async {
+            let stopped = bound.process.stop(grace).await;
+            let _ = tokio::time::timeout(TIMEOUT, finished).await;
+            stopped
+        }))
     }
 
     /// Close the interpreter's stdin, as the host's end does.
@@ -1152,12 +757,10 @@ impl Relay {
 
     /// Close the bindings process's stdin, as the owner's death does.
     pub(crate) fn close_binding_stdin(&mut self) {
-        self.target.lock().expect("target lock").take();
-        self.process
-            .as_mut()
-            .expect("a started bindings process")
-            .process
-            .close_stdin();
+        let bound = self.process.as_mut().expect("a started bindings process");
+        bound.relay.hang_up();
+        bound.stdin = None;
+        bound.process.close_stdin();
     }
 
     /// The next message from the interpreter that is not an `rpc` line: one held back by
@@ -1378,6 +981,10 @@ impl Relay {
 
     /// Open a kernel for `agent` and wait for its greeting.
     pub(crate) fn open(&mut self, agent: &str) {
+        self.agents.push(agent.to_string());
+        if let Some(bound) = &self.process {
+            bound.relay.opened(agent);
+        }
         self.send(json!({"t": "open", "agent": agent}));
         let ready = self.recv();
         assert!(
@@ -1411,12 +1018,13 @@ impl Drop for Relay {
     }
 }
 
-/// Route the interpreter's lines: `rpc` lines to the bindings process, the rest to the test.
+/// Route the interpreter's lines: `rpc` lines and notices to the session's relay, the rest to the
+/// test.
 fn pump_interpreter(
     stdout: impl Read,
     tx: Sender<Result<Value, String>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    target: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
+    hosted: Arc<Mutex<Option<hosted::Relay>>>,
     stats: Arc<Stats>,
 ) {
     for line in BufReader::with_capacity(1 << 20, stdout).lines() {
@@ -1434,6 +1042,19 @@ fn pump_interpreter(
                 continue;
             }
         };
+        let relay = hosted.lock().expect("hosted lock").clone();
+        let agent = message["agent"].as_str().unwrap_or_default().to_string();
+        if message["t"] == "hosted"
+            && let Some(relay) = &relay
+        {
+            match serde_json::from_value::<Notice>(message) {
+                Ok(notice) => relay.noticed(&agent, notice),
+                Err(e) => {
+                    let _ = tx.send(Err(format!("an unreadable notice: {e}: {line}")));
+                }
+            }
+            continue;
+        }
         if message["t"] != "rpc" {
             if tx.send(Ok(message)).is_err() {
                 return;
@@ -1451,11 +1072,13 @@ fn pump_interpreter(
                 .between(agent, name)
                 .record(line.len(), message["id"].as_u64(), true, closed);
         }
-        let target = target.lock().expect("target lock").clone();
-        match target {
-            Some(target) => {
-                let _ = target.blocking_send(message);
-            }
+        match relay {
+            Some(relay) => match serde_json::from_value::<Rpc>(message) {
+                Ok(rpc) => relay.rpc(&agent, rpc),
+                Err(e) => {
+                    let _ = tx.send(Err(format!("an unreadable rpc line: {e}: {line}")));
+                }
+            },
             None => {
                 write_line(
                     &stdin,
@@ -1469,15 +1092,17 @@ fn pump_interpreter(
     }
 }
 
-/// Forward the bindings process's `rpc` lines, as the supervisor hands them over, to the
-/// interpreter: each already names its binding.
-fn pump_process(
-    mut rpc: mpsc::Receiver<Value>,
+/// Write what the session's relay sends the interpreter, counting its `rpc` lines.
+fn write_from_relay(
+    lines: Receiver<Value>,
     interpreter: Arc<Mutex<Option<ChildStdin>>>,
     stats: Arc<Stats>,
 ) {
-    while let Some(message) = rpc.blocking_recv() {
+    for message in lines {
         let len = write_line(&interpreter, &message);
+        if message["t"] != "rpc" {
+            continue;
+        }
         stats.to_interpreter.record(len);
         if let (Some(agent), Some(name)) = (message["agent"].as_str(), message["binding"].as_str())
         {
