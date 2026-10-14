@@ -130,6 +130,21 @@ pub enum OutrigError {
         source: std::io::Error,
     },
 
+    /// The PID the engine reports for a container is not that container's
+    /// init on this machine, so every `/proc/<pid>` read would land on some
+    /// other process. The engine is outside this machine's PID namespace --
+    /// a remote `CONTAINER_HOST` or `podman system connection`, a VM, or
+    /// another container. A same-host socket is fine.
+    #[error(
+        "container {container}: the engine reports pid {pid}, which is not that container's \
+         process on this machine\n\
+         help: outrig needs a podman engine that shares this machine's kernel and PID \
+         namespace; a remote engine (`CONTAINER_HOST`, `podman system connection`, a VM, or \
+         another container) is not supported, though a socket on this host is fine"
+    )]
+    #[non_exhaustive]
+    ContainerPidNotLocal { container: String, pid: u32 },
+
     /// A request on a live MCP session failed. Carries outrig's own
     /// [`McpSessionError`] rather than the MCP SDK's error type -- see that
     /// type for why.

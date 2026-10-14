@@ -129,6 +129,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path holds a `,`, `"` or `:` (podman and conmon split on them), there is no log and nothing
   changes. An exec'd server (`podman exec -i`) is not affected. (#422)
 
+- **A podman engine outside this machine's PID namespace is refused before any namespace is
+  entered.** The container's init PID comes from `podman inspect`, and the user bootstrap, the
+  network interceptor, and `view = "primary"` read it through the local `/proc`. Against a
+  remote engine that is some other process: the bootstrap failed with a bare errno, or, when a
+  same-user rootless container held that PID, wrote the session user into it and reported
+  success. `Container::pid` now requires the process's parent to be the conmon the engine
+  names, and otherwise returns the new `OutrigError::ContainerPidNotLocal { container, pid }`.
+  A socket on this host still works. The bootstrap's step labels now carry the PID. (#254)
+
 - **A build image's name over 237 characters is refused where names are checked.** The name is
   the repository of its `<name>:<hash>` tag, and buildah refuses a repository over 255
   characters once it prepends `docker.io/library/`, so such a name used to pass `Config::validate`

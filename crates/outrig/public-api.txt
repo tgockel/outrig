@@ -929,6 +929,9 @@ pub outrig::error::OutrigError::Config(toml::de::error::Error)
 pub outrig::error::OutrigError::ConfigDottedKey::source: toml::de::error::Error
 pub outrig::error::OutrigError::ConfigValidation(outrig::config::ConfigValidationError)
 pub outrig::error::OutrigError::Configuration(alloc::string::String)
+#[non_exhaustive] pub outrig::error::OutrigError::ContainerPidNotLocal
+pub outrig::error::OutrigError::ContainerPidNotLocal::container: alloc::string::String
+pub outrig::error::OutrigError::ContainerPidNotLocal::pid: u32
 #[non_exhaustive] pub outrig::error::OutrigError::EmbeddedImageConfigParse
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::image: alloc::string::String
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::source: alloc::boxed::Box<outrig::container::embedded::EmbeddedImageConfigError>

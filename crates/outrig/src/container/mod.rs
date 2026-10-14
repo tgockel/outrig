@@ -925,19 +925,46 @@ impl Container {
     }
 
     async fn inspect_pid(&self) -> Result<u32> {
-        let text = self.inspect_format("{{.State.Pid}}").await?;
-        let pid = text.parse::<u32>().map_err(|e| {
+        let text = self
+            .inspect_format("{{.State.Pid}} {{.State.ConmonPid}}")
+            .await?;
+        let invalid = |what: &str, e: std::num::ParseIntError| {
             OutrigError::Configuration(format!(
-                "podman inspect {} returned invalid pid: {e}",
+                "podman inspect {} returned invalid {what}: {e}",
                 self.name
             ))
-        })?;
+        };
+        let mut fields = text.split_whitespace();
+        let pid = fields
+            .next()
+            .unwrap_or("")
+            .parse::<u32>()
+            .map_err(|e| invalid("pid", e))?;
         if pid == 0 {
             return Err(OutrigError::Configuration(format!(
                 "container {:?} has no running namespaces (not running, and not \
                  materialized by `podman init`)",
                 self.name
             )));
+        }
+        let conmon = fields
+            .next()
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|e| invalid("conmon pid", e))?;
+        // The PID is in the engine's namespace; everything downstream reads it
+        // through this machine's `/proc`. Only a container's init is a child of
+        // its conmon, so that parentage -- not `ServiceIsRemote`, which is true
+        // of a working same-host socket too -- says the number means the same
+        // process on both sides.
+        let parent = std::fs::read(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parent_pid_from_stat(&stat));
+        if conmon == 0 || parent != Some(conmon) {
+            return Err(OutrigError::ContainerPidNotLocal {
+                container: self.name.clone(),
+                pid,
+            });
         }
         Ok(pid)
     }
@@ -1048,7 +1075,7 @@ impl Container {
 
         let pid = self.pid().await?;
         let db = namespace::open_user_db(pid)
-            .map_err(|e| self.bootstrap_failed(e.step.label(), e.source))?;
+            .map_err(|e| self.bootstrap_failed(e.step.label_for(pid), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
@@ -1069,8 +1096,9 @@ impl Container {
             ));
         }
         let home = userdb::home_dir(&user_name);
-        namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.source))?;
+        namespace::create_home(pid, Path::new(&home), self.uid, self.gid).map_err(|e| {
+            self.bootstrap_failed(format!("{} ({home})", e.step.label_for(pid)), e.source)
+        })?;
         self.reconcile_home(&db, &home).await?;
 
         self.log_bootstrap(&format!(
@@ -2306,9 +2334,45 @@ async fn selinux_enforcing() -> bool {
     }
 }
 
+/// The parent PID in the bytes of a `/proc/<pid>/stat`. `comm`, the second
+/// field, is the kernel's raw task name -- free bytes that may hold spaces,
+/// `)`, or a multibyte character cut mid-sequence by the 15-byte limit -- so
+/// the fields after it are found from the last `)` without decoding it.
+fn parent_pid_from_stat(stat: &[u8]) -> Option<u32> {
+    let after_comm = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    std::str::from_utf8(after_comm)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_pid_is_read_past_a_comm_with_parens_and_spaces() {
+        assert_eq!(
+            parent_pid_from_stat(b"1775180 (sleep) S 1775165 1 1 0"),
+            Some(1775165)
+        );
+        assert_eq!(parent_pid_from_stat(b"42 (a b) c) S 7 1 1 0"), Some(7));
+        assert_eq!(parent_pid_from_stat(b"42 (x) S"), None);
+        assert_eq!(parent_pid_from_stat(b"no parens"), None);
+    }
+
+    #[test]
+    fn parent_pid_is_read_past_a_comm_that_is_not_utf8() {
+        // A multibyte name truncated to the kernel's 15 bytes ends mid-character.
+        let mut stat = b"42 (".to_vec();
+        stat.extend_from_slice(&[b'a'; 13]);
+        stat.extend_from_slice(&"é".as_bytes()[..1]);
+        stat.extend_from_slice(b") S 7 1 1 0");
+        assert!(std::str::from_utf8(&stat).is_err());
+        assert_eq!(parent_pid_from_stat(&stat), Some(7));
+    }
 
     /// The stop names the container the engine made, not the name it was
     /// asked for. A handle kept for a retry -- which is what a failed stop

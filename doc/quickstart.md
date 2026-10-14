@@ -16,7 +16,9 @@ crates publish from this repository.
 - [podman](https://podman.io) **4.3 or newer**, installed and working in rootless mode.
   Verify with `podman info` -- it should print without errors. The floor is 4.3 because
   outrig's cancellation cleanup removes containers with `podman rm --filter`, which older
-  podman does not accept.
+  podman does not accept. The engine must share this machine's kernel and PID namespace: a
+  socket on this host is fine, but a remote engine (another host, a VM, another container) is not
+  supported, and outrig refuses it.
 - [buildah](https://buildah.io) installed alongside podman. They share image storage by default.
 - An API key for an OpenAI-compatible chat endpoint, exported as `OPENAI_API_KEY`.
 

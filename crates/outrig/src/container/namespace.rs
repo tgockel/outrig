@@ -88,6 +88,12 @@ impl NsStep {
             NsStep::OpenHome => "open the home directory",
         }
     }
+
+    /// [`label`](Self::label) with the container's PID in place of `<pid>`,
+    /// so a failure at `/proc` names the process it looked for.
+    pub(super) fn label_for(self, pid: u32) -> String {
+        self.label().replace("<pid>", &pid.to_string())
+    }
 }
 
 impl From<nsfork::NsFile> for NsStep {

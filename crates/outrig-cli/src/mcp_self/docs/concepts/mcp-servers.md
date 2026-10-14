@@ -203,6 +203,10 @@ which is what a program asking about itself intends. Programs that read it are m
 than they look: rustup's `cargo` shim resolves its own toolchain that way. The trade is that
 the primary's process list is not visible through the view -- it is a filesystem view.
 
+**The engine must be local.** The launcher binds the primary's `/proc/<pid>/ns` from this
+machine, so the podman engine has to share this machine's kernel and PID namespace. A socket on
+this host works; a remote engine (another host, a VM, another container) is refused up front.
+
 **A dynamic payload cannot re-execute itself.** The kernel looks for a binary's loader
 (its `PT_INTERP`) in the process's own root, which after the join is the *primary's* rootfs --
 where the sidecar's loader is absent or is a different one. So the launcher does not exec a
