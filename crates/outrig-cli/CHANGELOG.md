@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local model keeps its reasoning across a tool call.** The in-process `mistralrs` adapter
+  dropped a reasoning step when it replayed history, so a chat template that renders in-progress
+  reasoning (Qwen3's) gave the model each tool result back without the plan that asked for it.
+  The replayed assistant message now carries it as a `reasoning_content` string; whether the
+  template renders it is the template's call.
 - **A subagent whose report stands is no longer told to send an error over it.** When a subagent
   had reported with `outrig__set_result` and then tried a longer report that was cut off at the
   output-token ceiling, the first two retry asks offered, then demanded, a one-sentence

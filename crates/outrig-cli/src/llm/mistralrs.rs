@@ -501,12 +501,14 @@ fn translate_assistant(
     out: &mut Vec<IndexMap<String, MessageContent>>,
 ) {
     let mut text_parts: Vec<String> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<IndexMap<String, Value>> = Vec::new();
 
     for part in content.iter() {
         match part {
             AssistantContent::Text(t) => text_parts.push(t.text.clone()),
-            AssistantContent::Reasoning(_) | AssistantContent::Image(_) => {}
+            AssistantContent::Reasoning(r) => reasoning_parts.push(r.display_text()),
+            AssistantContent::Image(_) => {}
             AssistantContent::ToolCall(call) => {
                 let mut function = IndexMap::new();
                 function.insert(
@@ -538,6 +540,15 @@ fn translate_assistant(
         "content".to_string(),
         MessageContent::Left(text_parts.join("\n")),
     );
+    // Handed to the chat template as-is; whether it renders the key (Qwen3's
+    // does, for a step after the last user message) is the template's call.
+    let reasoning = reasoning_parts.join("\n");
+    if !reasoning.trim().is_empty() {
+        map.insert(
+            "reasoning_content".to_string(),
+            MessageContent::Left(reasoning),
+        );
+    }
     if !tool_calls.is_empty() {
         map.insert("tool_calls".to_string(), MessageContent::Right(tool_calls));
     }
@@ -1051,6 +1062,48 @@ mod tests {
             ),
             "got: {parts:?}",
         );
+    }
+
+    fn replayed_step(parts: Vec<AssistantContent>) -> IndexMap<String, MessageContent> {
+        let history = OneOrMany::many(vec![Message::Assistant {
+            id: None,
+            content: OneOrMany::many(parts).expect("non-empty"),
+        }])
+        .expect("non-empty");
+        translate_messages(None, &history).remove(0)
+    }
+
+    fn tool_call_part() -> AssistantContent {
+        AssistantContent::tool_call("call-1", "shell__exec", serde_json::json!({"cmd": "ls"}))
+    }
+
+    /// Qwen3's template renders `<think>` for a tool-loop step only from a
+    /// string `reasoning_content` key; without it the model gets the tool
+    /// result back minus the plan that asked for it.
+    #[test]
+    fn replayed_reasoning_is_carried_as_reasoning_content() {
+        let map = replayed_step(vec![
+            AssistantContent::reasoning("run cargo test first"),
+            tool_call_part(),
+        ]);
+
+        assert!(matches!(
+            map.get("reasoning_content"),
+            Some(MessageContent::Left(r)) if r == "run cargo test first"
+        ));
+        assert!(map.contains_key("tool_calls"), "the call is still replayed");
+    }
+
+    #[test]
+    fn replayed_step_without_reasoning_has_no_reasoning_content() {
+        let map = replayed_step(vec![tool_call_part()]);
+        assert!(!map.contains_key("reasoning_content"));
+    }
+
+    #[test]
+    fn replayed_blank_reasoning_has_no_reasoning_content() {
+        let map = replayed_step(vec![AssistantContent::reasoning(" \n"), tool_call_part()]);
+        assert!(!map.contains_key("reasoning_content"));
     }
 
     #[test]
