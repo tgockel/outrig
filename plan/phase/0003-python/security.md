@@ -13,11 +13,11 @@ what a binding is, deliberately, until the operator tightens it.
 
 Two Pythons appear on this page, and confusing them inverts the design. The **agent interpreter**
 is the static CPython in the primary container, the one the model submits code to; it holds
-proxies, and OutRig puts no credential in it. A **binding process** runs one hosted library on the
-host, with the same static CPython and whatever environment the binding was given. Unqualified
-"the interpreter" means the agent interpreter.
+proxies, and OutRig puts no credential in it. The **bindings process** runs every hosted library
+of a session on the host, with the same static CPython and whatever environment its bindings were
+given. Unqualified "the interpreter" means the agent interpreter.
 
-`0003-18` proved binding processes and their supervision, and `0003-20` built them into the
+`0003-18` proved the bindings process and its supervision, and `0003-20` built it into the
 session, with the declarations, the approval of repo-declared ones, and same-path mounts;
 `0003-22` builds the interception and its events, and `0003-23` the policy. `SECURITY.md`'s
 "Known boundaries" carries the entry `0003-20` added: a binding acts with the host user's
@@ -60,8 +60,8 @@ container at all.
 
 ## The trusted side runs on the host
 
-**A hosted object runs on the literal host, in a process of its own per binding**, supervised by
-the Rust owner (`hosted-objects.md`). Three reasons:
+**A hosted object runs on the literal host, in one process that holds every binding of the
+session**, supervised by the Rust owner (`hosted-objects.md`). Two reasons:
 
 **What is worth hosting is on the host.** The repository the agent works on, its remotes, and the
 user's credentials -- the ssh-agent, the credential helpers, the git config -- are where the user
@@ -70,17 +70,20 @@ each of them -- the same authority, passed into a container -- and there would b
 build for every trusted library.
 
 **The host has the property the same-container daemon lacks.** The container has its own PID
-namespace, so code in it cannot name a host process: it cannot signal a binding process, read its
+namespace, so code in it cannot name a host process: it cannot signal the bindings process, read its
 `/proc` entries, or attach to it. The only channel is the frames the Rust owner relays, and only
 the interpreter has one. That is the property this page used to prefer a sidecar for, and the host
 has it without another container.
 
-**One process per binding keeps bindings apart.** Each binding process has only the environment
-it was given, so credentials an embedder supplies to one binding (`embedding.md`) are not in
-another's process. A reference from one binding cannot be passed to another, so one binding's
-credentials never act on another binding's objects. The CLI supplies no environment: every binding
-inherits the user's, so under the CLI the bindings hold the same authority, and the separation
-matters when an embedder gives them different environments.
+**One process holds every binding, so the bindings share its authority.** The process has one
+environment, which every binding's library runs with: the user's under the CLI, or the one an
+embedder gives the session's bindings (`embedding.md`). Credentials meant for one binding are
+readable by every other binding's library, and through any library that runs programs, by the
+agent. What stays apart is objects: each binding hands out objects from tables of its own, so a
+reference from one binding cannot be passed to another, and one binding's request never acts on
+another binding's object. Until 2026-10-13 each binding had a process of its own, which kept
+environments apart too; the maintainer chose one process for its simplicity, and an embedder that
+needs two credentials kept apart runs them in two sessions.
 
 This reverses what the page used to say. It weighed two ways to make a trusted side real:
 restricting the container so a daemon in it could not be inspected -- dropping `CAP_SYS_PTRACE`,
@@ -111,7 +114,7 @@ example:
 - **The environment.** The CLI reads provider keys from the environment (`api-key = "${VAR}"`), and
   a binding inherits that environment, so a library that runs programs can print them.
 - **OutRig's own files.** The host user's authority includes the global config, where bindings need
-  no approval; the approval store; and the package cache that binding processes import from. A
+  no approval; the approval store; and the package cache the bindings process imports from. A
   binding through which the agent can run host programs is one through which it can change what
   later sessions are granted.
 
@@ -132,13 +135,13 @@ user's authority with events as the record; renaming a generic method proves not
 library under it still runs whatever the repository names.
 
 **The old guarantee, restated.** OutRig still puts no credential from its config into the sandbox,
-and a binding does not move one there: credentials stay in the binding process's environment, the
+and a binding does not move one there: credentials stay in the bindings process's environment, the
 user's ssh-agent, and the user's credential helpers. What a binding adds is a way to use them from
-the sandbox, and, through a library that runs programs, a way to read whatever the binding process
+the sandbox, and, through a library that runs programs, a way to read whatever the bindings process
 can read. Policy cannot prevent it: an allowed commit runs a hook the agent wrote, with the
-binding's environment. Keeping a credential from the agent means giving the binding process an
-environment without it -- which the embedding API can do per binding and the CLI does not -- or
-the confinement that entry describes.
+bindings' environment. Keeping a credential from the agent means giving the bindings process an
+environment without it -- which the embedding API can do for a session's bindings and the CLI
+does not -- or the confinement that entry describes.
 
 ## Repo-declared bindings need the operator's approval
 
@@ -230,7 +233,7 @@ stated above: it governs what the agent can add, not what a granted binding can 
 
 ## Unverified
 
-- That code in the container cannot address a binding process except through relayed frames
+- That code in the container cannot address the bindings process except through relayed frames
   depends on the container's separate PID namespace: OutRig's launch passes no `--pid` option. It
   has not been tested against a process in the container trying.
 - That an ssh-agent cannot export a key is read from the agent protocol's specification, and that

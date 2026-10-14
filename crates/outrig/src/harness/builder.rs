@@ -1,6 +1,7 @@
 //! Everything a session needs from outside, given before it starts, and the
 //! one call that starts it.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -27,7 +28,7 @@ pub enum Step {
     /// Installing the packages the session's bindings require, each set once
     /// into the user's cache. Reported only when the session has a binding.
     Packages,
-    /// Starting each binding's process on the host and running its factory.
+    /// Starting the bindings' process on the host and running each factory.
     /// Reported only when the session has a binding.
     Bindings,
     /// Launching the container.
@@ -82,6 +83,8 @@ pub struct SessionBuilder {
     progress: Option<Box<dyn FnMut(Progress) + Send>>,
     /// Bindings given through [`SessionBuilder::bind`], as given.
     bound: Vec<(String, BindingSpec)>,
+    /// The bindings process's environment, exactly, when the owner gave one.
+    bindings_env: Option<Vec<(OsString, OsString)>>,
     approver: Option<Arc<dyn Approver>>,
     repo_root: Option<PathBuf>,
     /// Where a test's bindings install and remember approvals, in place of
@@ -116,6 +119,7 @@ impl SessionBuilder {
             record: false,
             progress: None,
             bound: Vec::new(),
+            bindings_env: None,
             approver: None,
             repo_root: None,
             #[cfg(test)]
@@ -162,8 +166,9 @@ impl SessionBuilder {
     /// configuration's `[bindings]`, with no approval asked: the owner is
     /// trusted as the operator is.
     ///
-    /// Its process starts on the host before the interpreter, in the
-    /// workspace's host directory, with `spec`'s environment or else the
+    /// One process on the host holds every binding of the session, started
+    /// before the interpreter in the workspace's host directory, with the
+    /// environment [`SessionBuilder::bindings_env`] gives it or else the
     /// owner's less every variable the configuration names through `${VAR}`.
     /// A name that is not a Python identifier, that is a keyword, `runtime`,
     /// `asyncio` or `outrig`, or that the configuration or another `bind`
@@ -177,6 +182,23 @@ impl SessionBuilder {
     /// start.
     pub fn bind(mut self, name: impl Into<String>, spec: impl Into<BindingSpec>) -> Self {
         self.bound.push((name.into(), spec.into()));
+        self
+    }
+
+    /// Run the process holding the session's bindings with exactly `vars` as
+    /// its environment. The only credentials its libraries then hold are
+    /// those in `vars`, shared by every binding of the session, since one
+    /// process holds them all.
+    pub fn bindings_env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.bindings_env = Some(
+            vars.into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        );
         self
     }
 
@@ -362,6 +384,7 @@ impl SessionBuilder {
             config: &self.config,
             repo_root,
             cwd,
+            env: self.bindings_env.as_deref(),
             approver: self.approver.clone(),
             places,
             events,

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::event::{Payload, Received, Subscription};
 use super::{
-    Approval, ApprovalRequest, BindingSpec, DEFAULT_DRAIN, Session, SessionBuilder, SessionError,
+    Approval, ApprovalRequest, DEFAULT_DRAIN, Session, SessionBuilder, SessionError,
     ShutdownReport, Stopped,
 };
 use crate::agent::mock_http::MODEL;
@@ -468,28 +468,26 @@ async fn a_binding_inherits_no_variable_the_config_names() {
         .expect("the global config")
         .replace(&format!("${{{VAR}}}"), &format!("${{{secret}}}"));
     std::fs::write(&bed.global, text).expect("rewrite it");
-    let cfg = bed.load();
-    // SAFETY: edition 2024 marks `set_var` unsafe for its races with other threads reading the
-    // environment; this variable is this test's alone, as the agent tests' keys are theirs.
-    unsafe { std::env::set_var(secret, "sk-must-not-reach-a-binding") };
-    let session = start(
-        SessionBuilder::new(cfg, Some("coding"), None)
+    let builder = |bed: &Bed| {
+        SessionBuilder::new(bed.load(), Some("coding"), None)
             .secrets(move |var: &str| (var == secret).then(|| "sk-test".to_string()))
             .repo_root(&bed.repo)
             .binding_places(&bed.packages, pip_env(wheels()), &bed.approvals)
-            .bind(
-                "exact",
-                BindingSpec::new(bed.bound("exact", 1)).env([("ONLY", "this")]),
-            ),
-    )
-    .await;
-    unsafe { std::env::remove_var(secret) };
+    };
+    // SAFETY: edition 2024 marks `set_var` unsafe for its races with other threads reading the
+    // environment; this variable is this test's alone, as the agent tests' keys are theirs.
+    unsafe { std::env::set_var(secret, "sk-must-not-reach-a-binding") };
+    let session = start(builder(&bed)).await;
     let env = &bed.recorded("rec")["env"];
     assert!(env.get(secret).is_none(), "{env}");
     assert!(env.get("PATH").is_some(), "the rest is inherited: {env}");
-    // An environment given through `bind` is the whole of it, less what CPython sets for its own
+    stop(session).await;
+
+    // An environment the owner gives is the whole of it, less what CPython sets for its own
     // locale.
-    let exact = &bed.recorded("exact")["env"];
+    let session = start(builder(&bed).bindings_env([("ONLY", "this")])).await;
+    unsafe { std::env::remove_var(secret) };
+    let exact = &bed.recorded("rec")["env"];
     assert_eq!(exact["ONLY"], "this", "{exact}");
     assert!(
         exact.get("PATH").is_none() && exact.get(secret).is_none(),
@@ -525,7 +523,7 @@ async fn runtime_bindings_answers_without_asking_the_binding() {
     let bed = Bed::new();
     bed.write(&bed.recorder("rec", 1, "Records what it is given."), "");
     let session = start(bed.builder(bed.load())).await;
-    let pid = session.bindings().pid("rec").expect("rec runs");
+    let pid = session.bindings().pid().expect("the bindings run");
     kill(pid, Signal::SIGSTOP).expect("stop the binding");
     let said = output(
         &session,
@@ -558,9 +556,10 @@ async fn the_binding_order_decides_the_version_the_interpreter_imports() {
     )
     .await;
     assert_eq!(listed(&session).await, "['z', 'a', 'b', 'c']\n");
-    // Each binding process imports its own.
-    for (name, version) in [("z", "1.0"), ("a", "2.0"), ("b", "3.0"), ("c", "4.0")] {
-        assert_eq!(bed.recorded(name)["verfix"], version, "{name}");
+    // One process holds every binding, and its `sys.path` has the same order: each imports the
+    // global binding's version.
+    for name in ["z", "a", "b", "c"] {
+        assert_eq!(bed.recorded(name)["verfix"], "1.0", "{name}");
     }
     let packages = bed.packages.to_str().expect("UTF-8");
     let said = output(
@@ -599,9 +598,12 @@ kwargs      = {{ out = {:?} }}
     assert!(!group_gone(pid), "the sleep is still in the group");
     let report = stop(session).await;
     assert_eq!(report.stopped, Stopped::Proven, "{report:?}");
-    assert_eq!(report.bindings.len(), 1);
-    assert_eq!(report.bindings[0].name, "spawner");
-    assert!(report.bindings[0].group_empty, "{report:?}");
+    let stop_of = report
+        .bindings
+        .as_ref()
+        .expect("the bindings process stopped");
+    assert_eq!(stop_of.names, ["spawner"]);
+    assert!(stop_of.group_empty, "{report:?}");
     assert!(group_gone(pid), "nothing is left of the group");
     assert_eq!(kill(child, None), Err(Errno::ESRCH), "the sleep is gone");
 }
@@ -681,8 +683,10 @@ mod e2e {
             "[\"VERSION = '1.0'\", \"VERSION = '2.0'\", \"VERSION = '3.0'\", \
              \"VERSION = '4.0'\"]\n1.0\n"
         );
-        for (name, version) in [("z", "1.0"), ("a", "2.0"), ("b", "3.0"), ("c", "4.0")] {
-            assert_eq!(bed.recorded(name)["verfix"], version, "{name}");
+        // One process holds every binding, and imports what the container imports: the first
+        // binding's version.
+        for name in ["z", "a", "b", "c"] {
+            assert_eq!(bed.recorded(name)["verfix"], "1.0", "{name}");
         }
         stop(session).await;
     }
@@ -726,7 +730,13 @@ mod e2e {
         let (pid, child) = (pid_of(&record["pid"]), pid_of(&record["child"]));
         let report = stop(session).await;
         assert_eq!(report.stopped, Stopped::Proven, "{report:?}");
-        assert!(report.bindings[0].group_empty, "{report:?}");
+        assert!(
+            report
+                .bindings
+                .as_ref()
+                .is_some_and(|stop| stop.group_empty),
+            "{report:?}"
+        );
         assert!(group_gone(pid));
         assert_eq!(kill(child, None), Err(Errno::ESRCH));
     }

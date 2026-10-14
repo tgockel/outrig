@@ -2,11 +2,11 @@
 //! repository declared them, installed, started before the interpreter, described to it and to
 //! the agent, and stopped at shutdown (`plan/phase/0003-python/hosted-objects.md`).
 //!
-//! Each binding runs in a process of its own on the host, which `python::supervisor` starts and
-//! stops. Its order -- the global config's, then the repository's, then the owner's, by name
-//! within each -- is the order the agent is told of them in, and the order their package
-//! directories go on the interpreter's `sys.path`, which decides which version of a package two
-//! bindings share the container imports.
+//! One process on the host holds every binding of a session, which `python::supervisor` starts
+//! and stops. Its order -- the global config's, then the repository's, then the owner's, by name
+//! within each -- is the order the agent is told of them in, the order their factories are
+//! called in, and the order their package directories go on `sys.path`, the process's and the
+//! interpreter's alike, which decides which version of a package two bindings share both import.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -23,36 +23,20 @@ use crate::events::Events;
 use crate::python::host::Interpreter;
 use crate::python::install::{self, Install};
 use crate::python::payload::{self, BINDINGS_MOUNT};
-use crate::python::supervisor::{self, STOP_GRACE, Spec};
+use crate::python::supervisor::{self, Factory, STOP_GRACE, Spec};
 
 /// What [`SessionBuilder::bind`](super::SessionBuilder::bind) takes: a binding, as a
-/// `[bindings.<name>]` entry holds one, and optionally the environment its process runs with.
+/// `[bindings.<name>]` entry holds one.
 #[derive(Debug, Clone)]
 pub struct BindingSpec {
     binding: Binding,
-    env: Option<Vec<(OsString, OsString)>>,
 }
 
 impl BindingSpec {
-    /// `binding`, its process inheriting the owner's environment less every variable the
-    /// session's configuration names through `${VAR}`, which are OutRig's own secrets.
+    /// `binding`, held by the session's bindings process with the environment that process has
+    /// (see [`SessionBuilder::bindings_env`](super::SessionBuilder::bindings_env)).
     pub fn new(binding: Binding) -> Self {
-        Self { binding, env: None }
-    }
-
-    /// Run the binding's process with exactly `vars` as its environment. The only credentials it
-    /// then holds are those in `vars`, which keeps them apart from every other binding's.
-    pub fn env<K, V>(mut self, vars: impl IntoIterator<Item = (K, V)>) -> Self
-    where
-        K: Into<OsString>,
-        V: Into<OsString>,
-    {
-        self.env = Some(
-            vars.into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-        );
-        self
+        Self { binding }
     }
 }
 
@@ -138,12 +122,15 @@ impl Places {
 
 /// What starting a session's bindings needs from outside.
 pub(crate) struct Setup<'a> {
-    /// What the session runs on, for the variables a binding's inherited environment loses.
+    /// What the session runs on, for the variables an inherited environment loses.
     pub(crate) config: &'a Config,
     /// What every relative `{ path }` resolves against.
     pub(crate) repo_root: &'a Path,
-    /// Where each binding process starts: the workspace's host directory.
+    /// Where the bindings process starts: the workspace's host directory.
     pub(crate) cwd: &'a Path,
+    /// Exactly the bindings process's environment, as the owner gave it; `None` inherits the
+    /// owner's, less the config's secrets.
+    pub(crate) env: Option<&'a [(OsString, OsString)]>,
     pub(crate) approver: Option<Arc<dyn Approver>>,
     pub(crate) places: Places,
     pub(crate) events: &'a Events,
@@ -236,49 +223,19 @@ pub(crate) async fn install(declared: &[Declared], setup: &Setup<'_>) -> Result<
     futures_util::future::try_join_all(installs).await
 }
 
-/// Where binding processes run from: the payload's interpreter and the vendored RPyC.
-pub(crate) struct Programs {
-    pub(crate) python: PathBuf,
-    pub(crate) rpyc_dir: PathBuf,
-}
-
-impl Programs {
-    pub(crate) async fn find() -> Result<Self> {
-        Ok(Self {
-            python: payload::host_python().await?,
-            rpyc_dir: payload::rpyc_dir().await?,
-        })
-    }
-}
-
-/// How the session starts `declared`'s process: its factory's arguments with every `{ path }`
-/// made an absolute host path, its packages, `serialize`, and its environment -- the owner's
-/// given one exactly, or else `inherited`.
-pub(crate) fn lower<'a>(
-    declared: &'a Declared,
-    packages: &'a Path,
-    programs: &'a Programs,
-    cwd: &'a Path,
-    repo_root: &Path,
-    inherited: Option<&'a [(OsString, OsString)]>,
-) -> Result<Spec<'a>> {
+/// What the process holding `declared` is told of it: its factory, called with every `{ path }`
+/// in its arguments made an absolute host path against `repo_root`.
+pub(crate) fn lower(declared: &Declared, repo_root: &Path) -> Result<Factory> {
     let binding = &declared.spec.binding;
     let (args, kwargs) = binding.arguments(repo_root).map_err(|e| {
         OutrigError::Configuration(format!("the binding `{}`'s arguments: {e}", declared.name))
     })?;
-    Ok(Spec {
-        name: &declared.name,
-        python: &programs.python,
-        rpyc_dir: &programs.rpyc_dir,
-        packages,
-        factory: &binding.factory,
+    Ok(Factory {
+        name: declared.name.clone(),
+        factory: binding.factory.clone(),
         args,
         kwargs,
         serialize: binding.serialize,
-        cwd: Some(cwd),
-        env: declared.spec.env.as_deref().or(inherited),
-        #[cfg(test)]
-        probe: None,
     })
 }
 
@@ -293,9 +250,9 @@ fn inherited_env(config: &Config) -> Option<Vec<(OsString, OsString)>> {
     })
 }
 
-/// Start each of `declared`, whose packages are in `packages`, all at once, and wait for every
-/// factory to return. A factory that raises fails the start, naming the binding and what it
-/// raised, and the bindings that did start are stopped.
+/// Start the process holding `declared`, whose packages are in `packages`, and wait for every
+/// factory to return, in order. A factory that raises fails the start, naming the binding and
+/// what it raised, and nothing of the process is left running.
 pub(crate) async fn start(
     declared: Vec<Declared>,
     packages: Vec<PathBuf>,
@@ -304,57 +261,44 @@ pub(crate) async fn start(
     if declared.is_empty() {
         return Ok(Bindings::default());
     }
-    let programs = Programs::find().await?;
+    let factories = declared
+        .iter()
+        .map(|declared| lower(declared, setup.repo_root))
+        .collect::<Result<Vec<_>>>()?;
+    let mut bindings = Bindings {
+        packages: declared
+            .iter()
+            .zip(packages)
+            .map(|(declared, dir)| (!declared.spec.binding.requires.is_empty()).then_some(dir))
+            .collect(),
+        declared,
+        process: None,
+    };
+    let (python, rpyc_dir) = (payload::host_python().await?, payload::rpyc_dir().await?);
     let inherited = inherited_env(setup.config);
-    let started = futures_util::future::join_all(declared.iter().zip(&packages).map(
-        |(binding, packages)| async {
-            let spec = lower(
-                binding,
-                packages,
-                &programs,
-                setup.cwd,
-                setup.repo_root,
-                inherited.as_deref(),
-            )?;
-            supervisor::start(spec).await
-        },
-    ))
-    .await;
-    let mut bindings = Bindings::default();
-    let mut failed = None;
-    for ((declared, packages), started) in declared.into_iter().zip(packages).zip(started) {
-        match started {
-            Ok(process) => bindings.running.push(Running {
-                packages: (!declared.spec.binding.requires.is_empty()).then_some(packages),
-                declared,
-                process,
-            }),
-            Err(e) => {
-                failed.get_or_insert(e);
-            }
-        }
-    }
-    match failed {
-        Some(e) => {
-            bindings.stop_after_failed_start().await;
-            Err(e)
-        }
-        None => Ok(bindings),
-    }
+    let process = supervisor::start(Spec {
+        python: &python,
+        rpyc_dir: &rpyc_dir,
+        paths: bindings.package_dirs(),
+        bindings: factories,
+        cwd: Some(setup.cwd),
+        env: setup.env.or(inherited.as_deref()),
+        #[cfg(test)]
+        probe: None,
+    })
+    .await?;
+    bindings.process = Some(process);
+    Ok(bindings)
 }
 
-/// A session's running bindings, in the session's order.
+/// A session's bindings, in the session's order, and the process holding them.
 #[derive(Debug, Default)]
 pub(crate) struct Bindings {
-    running: Vec<Running>,
-}
-
-#[derive(Debug)]
-struct Running {
-    declared: Declared,
-    /// Its package directory on the host, or `None` when it requires nothing.
-    packages: Option<PathBuf>,
-    process: supervisor::Binding,
+    declared: Vec<Declared>,
+    /// Each binding's package directory on the host, or `None` when it requires nothing.
+    packages: Vec<Option<PathBuf>>,
+    /// `None` once stopped, and for a session with no binding.
+    process: Option<supervisor::Process>,
 }
 
 /// What the agent is told of one binding.
@@ -369,27 +313,31 @@ pub(crate) struct Brief {
 
 impl Bindings {
     pub(crate) fn is_empty(&self) -> bool {
-        self.running.is_empty()
+        self.declared.is_empty()
     }
 
     /// What the agent is told of each binding, in order.
     pub(crate) fn briefs(&self) -> Vec<Brief> {
-        self.running
+        self.declared
             .iter()
-            .map(|running| Brief {
-                name: running.declared.name.clone(),
-                description: running.declared.spec.binding.description.clone(),
-                type_name: running.process.type_name().to_string(),
-                serialize: running.declared.spec.binding.serialize,
+            .map(|declared| Brief {
+                name: declared.name.clone(),
+                description: declared.spec.binding.description.clone(),
+                type_name: self
+                    .process
+                    .as_ref()
+                    .map_or("", |process| process.type_name(&declared.name))
+                    .to_string(),
+                serialize: declared.spec.binding.serialize,
             })
             .collect()
     }
 
     /// Each distinct package directory on the host, in the bindings' order: the order they go
-    /// on the interpreter's `sys.path`.
+    /// on `sys.path`, the bindings process's and the interpreter's alike.
     pub(crate) fn package_dirs(&self) -> Vec<&Path> {
         let mut dirs: Vec<&Path> = Vec::new();
-        for dir in self.running.iter().filter_map(|r| r.packages.as_deref()) {
+        for dir in self.packages.iter().filter_map(Option::as_deref) {
             if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -414,45 +362,38 @@ impl Bindings {
         ));
     }
 
-    /// Stop every binding at once -- `SIGTERM` to its group, `grace`, `SIGKILL` to the group --
-    /// and say how each stopped.
-    pub(crate) async fn stop(&mut self, grace: Duration) -> Vec<BindingStop> {
-        let running = std::mem::take(&mut self.running);
-        futures_util::future::join_all(running.into_iter().map(|running| async move {
-            let stopped = running.process.stop(grace).await;
-            BindingStop {
-                name: running.declared.name,
-                group_empty: stopped.group_empty,
-                killed: stopped.killed,
-                survivors: stopped.survivors.iter().map(ToString::to_string).collect(),
-            }
-        }))
-        .await
+    /// Stop the bindings process -- `SIGTERM` to its group, `grace`, `SIGKILL` to the group --
+    /// and say how it stopped; `None` when there was none, or it was already stopped.
+    pub(crate) async fn stop(&mut self, grace: Duration) -> Option<BindingStop> {
+        let process = self.process.take()?;
+        let stopped = process.stop(grace).await;
+        Some(BindingStop {
+            names: self.declared.iter().map(|d| d.name.clone()).collect(),
+            group_empty: stopped.group_empty,
+            killed: stopped.killed,
+            survivors: stopped.survivors.iter().map(ToString::to_string).collect(),
+        })
     }
 
-    /// Stop every binding of a session that failed to start, warning of any group that could not
-    /// be proven empty, since no report will.
+    /// Stop the bindings process of a session that failed to start, warning when its group could
+    /// not be proven empty, since no report will.
     pub(crate) async fn stop_after_failed_start(&mut self) {
-        for stopped in self.stop(STOP_GRACE).await {
-            if !stopped.group_empty {
-                tracing::warn!(
-                    target: "outrig::harness",
-                    "stopping a session that failed to start: the binding `{}`'s process group \
-                     is not proven empty: {}",
-                    stopped.name,
-                    stopped.survivors.join(", ")
-                );
-            }
+        if let Some(stopped) = self.stop(STOP_GRACE).await
+            && !stopped.group_empty
+        {
+            tracing::warn!(
+                target: "outrig::harness",
+                "stopping a session that failed to start: the bindings process's group is not \
+                 proven empty: {}",
+                stopped.survivors.join(", ")
+            );
         }
     }
 
-    /// The pid of the binding `name`, which is its process group's id, for a test.
+    /// The bindings process's pid, which is its process group's id, for a test.
     #[cfg(test)]
-    pub(crate) fn pid(&self, name: &str) -> Option<nix::unistd::Pid> {
-        self.running
-            .iter()
-            .find(|r| r.declared.name == name)
-            .map(|r| r.process.pid())
+    pub(crate) fn pid(&self) -> Option<nix::unistd::Pid> {
+        self.process.as_ref().map(supervisor::Process::pid)
     }
 }
 

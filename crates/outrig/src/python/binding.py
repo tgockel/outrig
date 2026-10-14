@@ -1,23 +1,29 @@
-"""The binding program: one hosted library, served over RPyC to the kernels of one session.
+"""The binding program: a session's hosted libraries, served over RPyC to the kernels of one
+session.
 
-Started on the host by the Rust owner with the payload's `python3 -I -c <this program>` and three
-arguments -- the vendored RPyC's directory, the binding's package directory, and the factory as
-`module:callable` -- it reads the factory's arguments from its first line of input, imports the
-factory, calls it once with them, and serves the object it returned as the root of every
-connection. The arguments arrive on stdin rather than the command line, which any user on the host
-can read. A fourth argument, `--serialize`, is for a library that is not
-thread-safe: the binding then runs one request at a time across all its connections, in the order
-they arrived, except that a callback's nested request runs at once on the thread whose turn it is,
-and that `ping` and `close` never wait.
+One process holds every binding of a session. Started on the host by the Rust owner with the
+payload's `python3 -I -c <this program>` and one argument, the vendored RPyC's directory, it reads
+the session's bindings from its first line of input: each one's name, its factory as
+`module:callable` with the arguments to call it with, and whether it serializes; and the package
+directories, in the order they go on `sys.path`. It imports each factory and calls it once, in
+order, and serves the object it returned as the root of every connection to that binding. The
+arguments arrive on stdin rather than the command line, which any user on the host can read.
 
-Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by agent and
-connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `factory`
-line holding the factory's `args` and `kwargs`; a `ready` line once the factory has returned, naming
-the type of what it returned, or a `failed` line naming what it raised; `event` lines, which
-`0003-22` fills with a request's events; `decision` lines, each a request held on its serving thread
-until the owner's answer arrives under the same id, which `0003-23` asks for; and `control` lines
-from the owner, which `0003-22` gives a meaning. Everything else it writes goes to stderr, where the
-owner logs it.
+The bindings share what a process has: its environment, its `sys.path` -- where two bindings'
+packages hold different versions of one library, the first binding's is the one imported, as in the
+container -- and its life. A binding declared to serialize is a library that is not thread-safe: it
+then runs one request at a time across all its connections, in the order they arrived, except that
+a callback's nested request runs at once on the thread whose turn it is, and that `ping` and
+`close` never wait. Each serializing binding has a turn of its own, so it never waits for another.
+
+Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by binding, agent
+and connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `start`
+line holding the bindings and the package directories; a `ready` line once every factory has
+returned, naming the type of what each returned, or a `failed` line naming the binding whose factory
+raised and what it raised; `event` lines, which `0003-22` fills with a request's events; `decision`
+lines, each a request held on its serving thread until the owner's answer arrives under the same
+id, which `0003-23` asks for; and `control` lines from the owner, which `0003-22` gives a meaning.
+Everything else it writes goes to stderr, where the owner logs it.
 
 The process is a supervised child of the owner, in a process group of its own, started with a
 parent-death signal (`SIGHUP`) the owner set before exec and left blocked until `main` has
@@ -26,19 +32,20 @@ death closes the pipe -- the binding ends everything it started: SIGTERM to its 
 grace, SIGKILL to its group, itself included. SIGTERM keeps its default disposition, so while the
 owner lives its stop alone -- SIGTERM to the group, a grace, SIGKILL -- decides when the group ends.
 
-Each connection is served on a thread of its own. The objects handed out to one agent live in one
-table its connections share, so a proxy resolves on whichever of them it arrives on and on no other
-agent's; each connection counts the references it handed out itself, gives back only those when it
-closes, and the table goes once the agent's last connection has ended.
+Each connection is served on a thread of its own. The objects one binding handed out to one agent
+live in one table that agent's connections to the binding share, so a proxy resolves on whichever
+of them it arrives on and on no other agent's or binding's; each connection counts the references
+it handed out itself, gives back only those when it closes, and the table goes once the agent's last
+connection to the binding has ended.
 
 Enforcement lives here, on the host, because the container side cannot be trusted: agent code runs
 in the same process as the other end of this transport and can write frames of its own. So every
 one of RPyC's 20 request handlers is replaced, and each request is checked before anything acts on
 it:
 
-- A request's target must be an object handed out to this agent, on this connection or another of
-  its. A by-value target would let `str.format` read attributes through its format string, past
-  the attribute rule.
+- A request's target must be an object this binding handed out to this agent, on this connection
+  or another of its. A by-value target would let `str.format` read attributes through its format
+  string, past the attribute rule.
 - A member name must be public -- no leading underscore -- or on RPyC's `safe_attrs` list, for
   every handler that names one, `cmp`'s operator included; `cmp` takes comparison operators only.
 - Nothing arrives by reference from the container except a callable, which becomes a proxy that can
@@ -530,7 +537,7 @@ class Objects:
 
 
 class Turn:
-    """One request at a time across every connection of this binding, under `--serialize`: taken
+    """One request at a time across every connection of a binding declared to serialize: taken
     with `with`, granted to waiters in the order they arrived -- which `threading.RLock` does not
     promise -- and re-entrant for the thread whose turn it is, so a callback's nested request,
     served on that thread, runs at once.
@@ -574,9 +581,14 @@ class Turn:
                 self._cond.notify_all()
 
 
-# The turn every request takes once it is checked: a `Turn` under `--serialize`, set by `main`;
-# otherwise nothing, and requests on different connections run at the same time.
-_turn = contextlib.nullcontext()
+class Hosted:
+    """One binding this process holds: the object its factory returned, and the turn every
+    request to it takes once checked -- a `Turn` when it serializes, otherwise nothing, and
+    requests on different connections run at the same time."""
+
+    def __init__(self, root, serialize):
+        self.root = root
+        self.turn = Turn() if serialize else contextlib.nullcontext()
 
 
 def connection_class(rpyc):
@@ -680,15 +692,18 @@ def connection_class(rpyc):
             return self.__reduce__()
 
     class Binding(Connection):
-        """One connection to one kernel, every request checked; what it hands out goes in the
-        agent's table."""
+        """One connection of one kernel to one binding, every request checked; what it hands out
+        goes in the table the agent's connections to the binding share."""
 
-        def __init__(self, channel, *, root_object, objects, on_close):
+        def __init__(self, channel, *, hosted, objects, on_close):
+            # First: cleanup takes it, and a connection that fails to initialize is cleaned up.
+            self._turn = hosted.turn
             # The connection's RPyC root is a service of nothing, whose `on_disconnect` RPyC
             # calls at cleanup; `getroot` answers with the object the factory returned.
             super().__init__(rpyc.core.service.VoidService(), channel, config)
-            self._root_object = root_object
-            # The agent's `Objects`; RPyC's own per-connection `_local_objects` stays empty.
+            self._root_object = hosted.root
+            # The agent's `Objects` for this binding; RPyC's own per-connection `_local_objects`
+            # stays empty.
             self._objects = objects
             self._on_close = on_close
             self._context = _Context()
@@ -784,7 +799,7 @@ def connection_class(rpyc):
                         if handler not in unserialized:
                             # Once the request is checked, so a refused one waits for nobody; held
                             # until its exception, if any, is rendered below.
-                            turn.enter_context(_turn)
+                            turn.enter_context(self._turn)
                         res = method(self, *args)
                         reply = (consts.MSG_REPLY, self._box_tracked(res, handed))
                     except BaseException:
@@ -1061,7 +1076,7 @@ def connection_class(rpyc):
         def _cleanup(self, _anyway=True):
             """RPyC's, and then this connection's references go back to the agent's table -- under
             the turn when the binding serializes, since the last of them may run a destructor."""
-            with _turn:
+            with self._turn:
                 super()._cleanup(_anyway)
                 self._objects.forget(self)
 
@@ -1166,22 +1181,26 @@ def connection_class(rpyc):
 
 
 class Connections:
-    """The connections of this binding, by agent and connection id, shared by the reading thread
-    and the serving threads; and each agent's object table, which its connections share for as
-    long as one of them is serving."""
+    """The connections to this process's bindings, by binding, agent and connection id, shared by
+    the reading thread and the serving threads; and each agent's object table for each binding,
+    which the agent's connections to that binding share for as long as one of them is serving."""
 
-    def __init__(self, Binding, root_object):
+    def __init__(self, Binding, hosted):
         self._Binding = Binding
-        self._root_object = root_object
+        self._hosted = hosted  # binding -> its `Hosted`
         self._lock = threading.Lock()
-        self._open = {}  # (agent, id) -> channel
-        self._closed = set()  # (agent, id) of connections that have closed
-        self._objects = {}  # agent -> its Objects
-        self._serving = collections.Counter()  # agent -> its connections still serving
+        self._open = {}  # (binding, agent, id) -> channel
+        self._closed = set()  # (binding, agent, id) of connections that have closed
+        self._objects = {}  # (binding, agent) -> its Objects
+        self._serving = collections.Counter()  # (binding, agent) -> its connections still serving
 
-    def channel(self, agent, cid):
-        """The channel for `(agent, cid)`, started if new; `None` once it has closed."""
-        key = (agent, cid)
+    def holds(self, binding):
+        return binding in self._hosted
+
+    def channel(self, binding, agent, cid):
+        """The channel for `(binding, agent, cid)`, started if new; `None` once it has closed."""
+        key = (binding, agent, cid)
+        table = (binding, agent)
         with self._lock:
             if key in self._closed:
                 return None
@@ -1192,6 +1211,7 @@ class Connections:
                 lambda part, more: _send(
                     {
                         "t": "rpc",
+                        "binding": binding,
                         "agent": agent,
                         "id": cid,
                         "data": base64.b64encode(part).decode("ascii"),
@@ -1199,18 +1219,21 @@ class Connections:
                     }
                 )
             )
-            self._serving[agent] += 1
-            if self._serving[agent] == 1:
-                self._objects[agent] = Objects()
+            self._serving[table] += 1
+            if self._serving[table] == 1:
+                self._objects[table] = Objects()
             conn = self._Binding(
                 channel,
-                root_object=self._root_object,
-                objects=self._objects[agent],
-                on_close=lambda reason: self.notice(agent, cid, reason),
+                hosted=self._hosted[binding],
+                objects=self._objects[table],
+                on_close=lambda reason: self.notice(binding, agent, cid, reason),
             )
             self._open[key] = channel
         threading.Thread(
-            target=self._serve, args=(key, conn), name=f"serve-{agent}-{cid}", daemon=True
+            target=self._serve,
+            args=(key, conn),
+            name=f"serve-{binding}-{agent}-{cid}",
+            daemon=True,
         ).start()
         return channel
 
@@ -1218,39 +1241,41 @@ class Connections:
         try:
             conn.serve_all()
         except Exception as e:
-            _diag(f"connection {key[0]}#{key[1]}: serving it failed: {e!r}")
+            _diag(f"connection {key[0]}/{key[1]}#{key[2]}: serving it failed: {e!r}")
         finally:
             self.forget(*key)
-            self._ended(key[0])
+            self._ended(key[:2])
 
-    def _ended(self, agent):
-        """One of `agent`'s connections has finished serving, its cleanup run; after the last of
-        them, the agent's table goes."""
+    def _ended(self, table):
+        """One of an agent's connections to a binding has finished serving, its cleanup run;
+        after the last of them, the agent's table for the binding goes."""
         with self._lock:
-            self._serving[agent] -= 1
-            if self._serving[agent]:
+            self._serving[table] -= 1
+            if self._serving[table]:
                 return
-            del self._serving[agent]
-            objects = self._objects.pop(agent)
+            del self._serving[table]
+            objects = self._objects.pop(table)
+        binding, agent = table
         _diag(
-            f"agent {agent!r}: its last connection has ended, and its object table is dropped "
-            f"with {len(objects)} objects"
+            f"binding {binding!r}, agent {agent!r}: its last connection has ended, and its object "
+            f"table is dropped with {len(objects)} objects"
         )
 
-    def forget(self, agent, cid):
+    def forget(self, binding, agent, cid):
         with self._lock:
-            self._open.pop((agent, cid), None)
-            self._closed.add((agent, cid))
+            self._open.pop((binding, agent, cid), None)
+            self._closed.add((binding, agent, cid))
 
-    def notice(self, agent, cid, reason):
-        """Tell the other side that `(agent, cid)` has closed, and why."""
-        self.forget(agent, cid)
-        _send({"t": "rpc", "agent": agent, "id": cid, "closed": reason})
+    def notice(self, binding, agent, cid, reason):
+        """Tell the other side that `(binding, agent, cid)` has closed, and why."""
+        self.forget(binding, agent, cid)
+        _send({"t": "rpc", "binding": binding, "agent": agent, "id": cid, "closed": reason})
 
-    def close(self, agent, cid, reason):
-        """The other side closed `(agent, cid)`: wake its reader, which ends its thread."""
+    def close(self, binding, agent, cid, reason):
+        """The other side closed `(binding, agent, cid)`: wake its reader, which ends its
+        thread."""
         with self._lock:
-            channel = self._open.get((agent, cid))
+            channel = self._open.get((binding, agent, cid))
         if channel is not None:
             channel.close(reason)
 
@@ -1273,17 +1298,22 @@ def _handle(connections, line):
         return
     if kind != "rpc":
         raise ValueError(f"not a protocol message: {line[:200]!r}")
-    agent, cid = message.get("agent"), message.get("id")
-    if not isinstance(agent, str) or type(cid) is not int:
-        raise ValueError("an rpc message without an agent and an integer id")
+    binding, agent, cid = message.get("binding"), message.get("agent"), message.get("id")
+    if not isinstance(binding, str) or not isinstance(agent, str) or type(cid) is not int:
+        raise ValueError("an rpc message without a binding, an agent and an integer id")
     if "closed" in message:
-        connections.close(agent, cid, f"the other side closed this connection: {message['closed']}")
+        connections.close(
+            binding, agent, cid, f"the other side closed this connection: {message['closed']}"
+        )
         return
     part = base64.b64decode(message.get("data", ""), validate=True)
     more = message.get("more") is True
-    channel = connections.channel(agent, cid)
+    if not connections.holds(binding):
+        connections.notice(binding, agent, cid, f"this process holds no binding {binding!r}")
+        return
+    channel = connections.channel(binding, agent, cid)
     if channel is None:
-        connections.notice(agent, cid, "this connection has closed")
+        connections.notice(binding, agent, cid, "this connection has closed")
         return
     try:
         reason = channel.put(part, more)
@@ -1291,7 +1321,7 @@ def _handle(connections, line):
         # Rather than leave the kernel waiting on a frame that will never finish.
         reason = channel.close("no memory to hold a frame from the interpreter")
     if reason is not None:
-        connections.notice(agent, cid, reason)
+        connections.notice(binding, agent, cid, reason)
 
 
 def _read(connections, stream):
@@ -1309,17 +1339,11 @@ def _read(connections, stream):
 
 
 def main():
-    serialize = sys.argv[4:] == ["--serialize"]
-    if len(sys.argv) != 4 and not serialize:
-        _diag(
-            "usage: python3 -I -c <program> <rpyc-dir> <package-dir> <module:callable> "
-            f"[--serialize]; got {sys.argv[1:]!r}"
-        )
+    if len(sys.argv) != 2:
+        _diag(f"usage: python3 -I -c <program> <rpyc-dir>; got {sys.argv[1:]!r}")
         os._exit(2)
-    rpyc_dir, packages, factory = sys.argv[1:4]
-    global _PROTO_IN, _PROTO_OUT, _turn
-    if serialize:
-        _turn = Turn()
+    rpyc_dir = sys.argv[1]
+    global _PROTO_IN, _PROTO_OUT
     # The protocol never shares a descriptor with the library: fd 0 reads nothing, and what the
     # library prints goes to stderr with the diagnostics.
     _PROTO_IN = os.dup(0)
@@ -1330,29 +1354,36 @@ def main():
     os.dup2(2, 1)
     sys.__stdout__.reconfigure(line_buffering=True)
     # The owner set the parent-death signal before exec and left it blocked; with the handler in
-    # place, a death since then is delivered now. Before the factory, which may start programs.
+    # place, a death since then is delivered now. Before the factories, which may start programs.
     signal.signal(DEATH_SIGNAL, lambda *_: _die("the owner is gone"))
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {DEATH_SIGNAL})
-    # After the standard library, so neither directory can replace a module this program imports.
+    # After the standard library, so no directory can replace a module this program imports.
     sys.path.append(rpyc_dir)
-    sys.path.append(packages)
     import rpyc
 
     Binding = connection_class(rpyc)
     stream = os.fdopen(_PROTO_IN, "rb")
-    args, kwargs = _arguments(stream.readline())
-    module, _, name = factory.partition(":")
-    try:
-        root_object = getattr(importlib.import_module(module), name)(*args, **kwargs)
-    except BaseException as e:
-        _diag(f"the factory {factory!r} failed: {''.join(traceback.format_exception(e))}")
-        error = "".join(traceback.format_exception_only(e)).strip()
-        _send({"t": "failed", "error": error[:FAILED_MAX]})
-        os._exit(1)
-    kind = type(root_object)
-    connections = Connections(Binding, root_object)
-    _send({"t": "ready", "type": f"{kind.__module__}.{kind.__qualname__}"})
-    _read(connections, stream)
+    paths, bindings = _arguments(stream.readline())
+    # In the session's order, which decides between two bindings that hold different versions of
+    # one package, as the container's `sys.path` does.
+    sys.path.extend(paths)
+    hosted, types = {}, {}
+    for name, factory, args, kwargs, serialize in bindings:
+        module, _, attr = factory.partition(":")
+        try:
+            root = getattr(importlib.import_module(module), attr)(*args, **kwargs)
+        except BaseException as e:
+            _diag(
+                f"binding {name!r}: the factory {factory!r} failed: "
+                f"{''.join(traceback.format_exception(e))}"
+            )
+            error = "".join(traceback.format_exception_only(e)).strip()
+            _send({"t": "failed", "binding": name, "error": error[:FAILED_MAX]})
+            os._exit(1)
+        hosted[name] = Hosted(root, serialize)
+        types[name] = f"{type(root).__module__}.{type(root).__qualname__}"
+    _send({"t": "ready", "types": types})
+    _read(Connections(Binding, hosted), stream)
     _die("the owner closed the protocol")
 
 
@@ -1362,21 +1393,28 @@ FAILED_MAX = 4096
 
 
 def _arguments(line):
-    """The factory's `args` and `kwargs` from the owner's first line, or end the process saying
-    why there are none: the factory never runs on arguments this program did not understand."""
+    """The package directories, and each binding as `(name, factory, args, kwargs, serialize)`,
+    from the owner's first line; or end the process saying why there are none: no factory runs on
+    a line this program did not understand."""
     if not line:
-        _die("the owner closed the protocol before sending the factory's arguments")
+        _die("the owner closed the protocol before sending the bindings")
     try:
         message = json.loads(line)
-        args, kwargs = message["args"], message["kwargs"]
-        if message.get("t") != "factory" or not isinstance(args, list) or not isinstance(
-            kwargs, dict
+        bindings = [
+            (b["name"], b["factory"], b["args"], b["kwargs"], b["serialize"])
+            for b in message["bindings"]
+        ]
+        paths = message["paths"]
+        if (
+            message.get("t") != "start"
+            or not isinstance(paths, list)
+            or not all(isinstance(b[2], list) and isinstance(b[3], dict) for b in bindings)
         ):
-            raise ValueError("not a factory line")
+            raise ValueError("not a start line")
     except (ValueError, KeyError, TypeError) as e:
-        _diag(f"the first line was not the factory's arguments ({e}): {line[:200]!r}")
+        _diag(f"the first line was not the bindings to start ({e}): {line[:200]!r}")
         os._exit(2)
-    return args, kwargs
+    return paths, bindings
 
 
 if __name__ == "__main__":

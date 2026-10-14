@@ -1066,13 +1066,10 @@ fn a_large_result_is_bounded_in_transit() {
 
     // And toward the binding: a part past the part bound closes that connection, and the kernel
     // learns why.
-    relay.inject_to_binding(
-        "fx",
-        json!({
-            "t": "rpc", "agent": "primary", "id": 2,
-            "data": base64(&vec![b'x'; PART_MAX + 1]), "more": true,
-        }),
-    );
+    relay.inject_to_binding(json!({
+        "t": "rpc", "binding": "fx", "agent": "primary", "id": 2,
+        "data": base64(&vec![b'x'; PART_MAX + 1]), "more": true,
+    }));
     let out = relay.output(
         4,
         &py(r#"
@@ -1530,7 +1527,7 @@ fn two_kernels_calls_overlap_on_the_host() {
     assert!(a.overlaps(b), "{recorded:?}");
     assert_eq!(
         (a.thread.as_str(), b.thread.as_str()),
-        ("serve-primary-1", "serve-b-1")
+        ("serve-fx-primary-1", "serve-fx-b-1")
     );
 }
 
@@ -1577,7 +1574,7 @@ fn two_workers_calls_from_one_kernel_overlap_and_use_two_connections() {
     assert!(w1.overlaps(w2), "{recorded:?}");
     let mut threads = vec![w1.thread.clone(), w2.thread.clone()];
     threads.sort();
-    assert_eq!(threads, ["serve-primary-1", "serve-primary-2"]);
+    assert_eq!(threads, ["serve-fx-primary-1", "serve-fx-primary-2"]);
     assert_eq!(ids_used(&relay, "primary"), [1, 2]);
 }
 
@@ -2192,7 +2189,7 @@ fn a_closed_connection_takes_only_its_own_entries_from_the_kernels_table() {
         || "connection 1's references to be dropped".to_string(),
     );
     let recorded = intervals(&mut relay, "primary", 3);
-    assert_eq!(interval(&recorded, "w2").thread, "serve-primary-2");
+    assert_eq!(interval(&recorded, "w2").thread, "serve-fx-primary-2");
 }
 
 #[test]
@@ -2720,7 +2717,7 @@ mod measurements {
         relay.open("b");
         relay.output(1, &with_root("root.public"));
         relay.output_in("b", 1, &with_root_in("b", "root.public"));
-        let rss_before = relay.binding_rss_kib("fx");
+        let rss_before = relay.binding_rss_kib();
         let release = Flag::new();
         // A waits for minutes through a worker, so its loop keeps answering `inv`.
         relay.submit_in(
@@ -2747,7 +2744,7 @@ mod measurements {
             |relay| {
                 inv_id += 1;
                 assert!(relay.inv("primary", inv_id)["globals"].is_array());
-                rss_during.push(relay.binding_rss_kib("fx"));
+                rss_during.push(relay.binding_rss_kib());
                 if !released && started.elapsed() >= Duration::from_secs(secs) {
                     release.raise();
                     released = true;
@@ -2766,7 +2763,7 @@ mod measurements {
             3,
             &with_root_in("b", "import gc\ngc.collect()\nroot.public"),
         );
-        let rss_after = relay.binding_rss_kib("fx");
+        let rss_after = relay.binding_rss_kib();
         println!(
             "MEASUREMENT wait_minutes_holds_one_connection serialize={serialize} secs={secs}: \
              {}\n  binding RSS KiB before={rss_before} during={rss_during:?} after={rss_after}",
@@ -2803,7 +2800,7 @@ mod measurements {
         // only ones.
         one.output(1, &with_root("root.ask('warm')"));
         two.output(1, &with_root("root.ask('warm')"));
-        let rss_before = (one.binding_rss_kib("fx"), two.binding_rss_kib("fx"));
+        let rss_before = (one.binding_rss_kib(), two.binding_rss_kib());
         // Session 1 waits for an answer the service has not got; session 2 measures against the
         // same service, then answers.
         one.submit_in(
@@ -2825,12 +2822,12 @@ mod measurements {
             "primary",
             2,
             Duration::from_secs(3 * secs + 120),
-            |two| rss_during.push((one.binding_rss_kib("fx"), two.binding_rss_kib("fx"))),
+            |two| rss_during.push((one.binding_rss_kib(), two.binding_rss_kib())),
         );
         assert_eq!(result["status"], "ok", "{result}");
         let waited = one.result_from("primary", 2, TIMEOUT);
         assert_eq!(waited["output"], "done\n", "{waited}");
-        let rss_after = (one.binding_rss_kib("fx"), two.binding_rss_kib("fx"));
+        let rss_after = (one.binding_rss_kib(), two.binding_rss_kib());
         println!(
             "MEASUREMENT two_sessions_are_two_clients serialize={serialize} secs={secs}: {}\n  \
              binding RSS KiB (session 1, session 2) before={rss_before:?} during={rss_during:?} \
@@ -2868,7 +2865,7 @@ fn runtime_bindings_answers_in_a_kernel_opened_later_without_asking_the_binding(
         &[fixture],
         [fixture_dir().to_string_lossy().into_owned()],
     ));
-    let pid = nix::unistd::Pid::from_raw(relay.binding_pid("fx") as i32);
+    let pid = nix::unistd::Pid::from_raw(relay.binding_pid() as i32);
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGSTOP).expect("stop the binding");
     relay.open("b");
     let ask = "print({n: (b.description, b.type) for n, b in runtime.bindings.items()})";
@@ -2884,7 +2881,7 @@ fn runtime_bindings_answers_in_a_kernel_opened_later_without_asking_the_binding(
 /// `serialize = false` and with the key absent.
 #[test]
 fn serialize_reaches_the_binding_from_its_declaration() {
-    use crate::harness::bindings::{Programs, gather, lower};
+    use crate::harness::bindings::{gather, lower};
     for (line, serialized) in [
         ("serialize = true", true),
         ("serialize = false", false),
@@ -2895,15 +2892,10 @@ fn serialize_reaches_the_binding_from_its_declaration() {
         ))
         .expect("the declaration parses");
         let declared = gather(&cfg, &[]).expect("a valid binding");
-        let programs = Programs {
-            python: python().to_path_buf(),
-            rpyc_dir: rpyc_dir().to_path_buf(),
-        };
         let here = std::env::current_dir().expect("a working directory");
-        let spec =
-            lower(&declared[0], fixture_dir(), &programs, &here, &here, None).expect("lowered");
+        let factory = lower(&declared[0], &here).expect("lowered");
         let mut relay = Relay::start();
-        relay.bind_spec("fx", spec);
+        relay.bind_factory(factory, fixture_dir());
         relay.open("b");
         relay.output(1, &with_root("root.public"));
         relay.output_in("b", 1, &with_root_in("b", "root.public"));

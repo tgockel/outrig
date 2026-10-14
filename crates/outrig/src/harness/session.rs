@@ -238,11 +238,11 @@ impl Session {
     /// already running are then left to finish until `deadline` has passed --
     /// [`DEFAULT_DRAIN`](super::DEFAULT_DRAIN) is a few seconds -- and one
     /// still running is interrupted and given a second to end of its own
-    /// accord. Each binding's process group is then sent `SIGTERM`, and
-    /// `SIGKILL` after a grace of five seconds, which ends every program a
-    /// binding's library started; and then the container is stopped, which
-    /// ends the interpreter and whatever an interrupt could not reach. Nothing
-    /// waits on a subscriber.
+    /// accord. The process holding the bindings is then sent `SIGTERM` with
+    /// its process group, and `SIGKILL` after a grace of five seconds, which
+    /// ends every program a binding's library started; and then the container
+    /// is stopped, which ends the interpreter and whatever an interrupt could
+    /// not reach. Nothing waits on a subscriber.
     ///
     /// Returns a bounded time after `deadline`: typically a few seconds, while
     /// the container stops and the event log is finished; at worst the
@@ -277,14 +277,13 @@ impl Session {
         // After the drain, so a hosted call still running had its time, and
         // before the container, as `lifecycle.md`'s terminating step orders
         // them.
-        let binding_stops = bindings.stop(STOP_GRACE).await;
-        let mut failed: Vec<String> = binding_stops
+        let binding_stop = bindings.stop(STOP_GRACE).await;
+        let mut failed: Vec<String> = binding_stop
             .iter()
             .filter(|stop| !stop.group_empty)
             .map(|stop| {
                 format!(
-                    "the binding `{}`'s process group is not proven empty: {}",
-                    stop.name,
+                    "the bindings process's group is not proven empty: {}",
                     stop.survivors.join(", ")
                 )
             })
@@ -327,7 +326,7 @@ impl Session {
             closed_by: closed_by.clone(),
             stopped: stopped.clone(),
             executions: executions.clone(),
-            bindings: binding_stops.clone(),
+            bindings: binding_stop.clone(),
             verdict: report::verdict(&stopped, &executions),
         });
         let log = events
@@ -341,7 +340,7 @@ impl Session {
             closed_by,
             stopped,
             executions,
-            bindings: binding_stops,
+            bindings: binding_stop,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,

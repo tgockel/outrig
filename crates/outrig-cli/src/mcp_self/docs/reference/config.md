@@ -671,9 +671,10 @@ set `access = "read-write"` only for directories the agent should be able to mod
 > `outrig run-new` and the library's `harness` only; `outrig run` ignores bindings.
 
 A binding is an object a process on the host holds for the agent, presented to its Python under
-`<name>`. OutRig installs the binding's packages, starts its process before the agent's
-interpreter, calls its factory there, tells the agent the name and description, and stops the
-process -- with every program it started -- when the session ends. Nothing is bound by default.
+`<name>`. One process holds every binding of a session: OutRig installs each binding's packages,
+starts the process before the agent's interpreter, calls each factory there in order, tells the
+agent each name and description, and stops the process -- with every program it started -- when
+the session ends. Nothing is bound by default.
 
 ```toml
 [bindings.repo]
@@ -698,10 +699,11 @@ serialize   = true
   thread-safe. The binding then runs one call at a time across all its connections, every
   kernel's included.
 
-The binding's process runs on the host, as you, in the workspace's host directory, with your
+The bindings' process runs on the host, as you, in the workspace's host directory, with your
 environment less every variable the config names through `${VAR}` (each `api-key`,
-`build-args` value and MCP `env` value), which are OutRig's own secrets. What its library
-does on the host is part of what the binding grants; see `SECURITY.md`.
+`build-args` value and MCP `env` value), which are OutRig's own secrets. Every binding's
+library runs with that one environment. What a library does on the host is part of what its
+binding grants; see `SECURITY.md`.
 
 **A repository's binding needs your approval.** A factory is code the host runs as you at
 session start, and a repository's config is content a cloned project brings and the agent can
@@ -721,9 +723,10 @@ under `/outrig/bindings/` and put on the interpreter's import path, so `import g
 there too -- as a local copy of the library, which knows nothing of the host's object.
 
 Bindings are ordered: the global config's, then the repo config's, then those the library's
-`bind` adds, by name within each. That is the order the agent is told of them in, and the order
-their packages go on the container's import path, which decides which version of a package two
-bindings share the container imports.
+`bind` adds, by name within each. That is the order the agent is told of them in, the order
+their factories are called in, and the order their packages go on the import path of the
+container and of the bindings' process alike: where two bindings' packages hold different
+versions of one package, both sides import the first binding's.
 
 ## `[images.<name>]`
 

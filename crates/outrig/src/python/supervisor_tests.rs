@@ -20,7 +20,7 @@ use nix::unistd::Pid;
 use serde_json::json;
 
 use super::relay::{Bind, Relay, TIMEOUT, fixture_dir, rpyc_dir};
-use super::supervisor::{self, Probe, STOP_GRACE, Spec, group_members};
+use super::supervisor::{self, Factory, Probe, STOP_GRACE, Spec, group_members};
 use super::testing::{Flag, capture, eventually, group_gone, py, python, wait_group_gone};
 
 const FACTORY: &str = "outrig_fixture:make";
@@ -38,14 +38,16 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn spec<'a>(factory: &'a str, env: Option<&'a [(OsString, OsString)]>) -> Spec<'a> {
     Spec {
-        name: "fx",
         python: python(),
         rpyc_dir: rpyc_dir(),
-        packages: fixture_dir(),
-        factory,
-        args: serde_json::json!([]),
-        kwargs: serde_json::json!({}),
-        serialize: false,
+        paths: vec![fixture_dir()],
+        bindings: vec![Factory {
+            name: "fx".into(),
+            factory: factory.into(),
+            args: serde_json::json!([]),
+            kwargs: serde_json::json!({}),
+            serialize: false,
+        }],
         cwd: None,
         env,
         probe: None,
@@ -103,7 +105,7 @@ fn owner_slow_call(dir: &Path) {
         &with_root(&format!("root.sleep_child(1000, started={})", started.py())),
     );
     started.wait();
-    report(dir, "pgid", &relay.binding_pid("fx").to_string());
+    report(dir, "pgid", &relay.binding_pid().to_string());
     park();
 }
 
@@ -134,7 +136,7 @@ fn owner_ctrl_c(dir: &Path) {
     unsafe { sigaction(Signal::SIGINT, &action) }.expect("install the SIGINT handler");
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    report(dir, "pgid", &relay.binding_pid("fx").to_string());
+    report(dir, "pgid", &relay.binding_pid().to_string());
     let sent = dir.join("sent");
     eventually(
         || sent.exists().then_some(()),
@@ -377,9 +379,9 @@ fn a_well_behaved_binding_stops_within_the_grace_without_sigkill() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     assert_eq!(relay.output(1, &with_root("print(root.method(1))")), "2\n");
-    let pgid = Pid::from_raw(relay.binding_pid("fx") as i32);
+    let pgid = Pid::from_raw(relay.binding_pid() as i32);
     let started = Instant::now();
-    let stopped = relay.stop_binding("fx", STOP_GRACE);
+    let stopped = relay.stop_process(STOP_GRACE).expect("a bindings process");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -431,7 +433,7 @@ fn a_binding_that_ignores_sigterm_is_killed_with_its_group_after_the_grace() {
 fn closing_the_bindings_stdin_ends_its_group() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    let pgid = Pid::from_raw(relay.binding_pid("fx") as i32);
+    let pgid = Pid::from_raw(relay.binding_pid() as i32);
     let started = Flag::new();
     relay.submit_in(
         "primary",
@@ -444,7 +446,7 @@ fn closing_the_bindings_stdin_ends_its_group() {
             .iter()
             .any(|member| member.comm == "sleep")
     );
-    relay.close_binding_stdin("fx");
+    relay.close_binding_stdin();
     // The binding ends its group, itself included; its own exit is the owner's to reap.
     let deadline = Instant::now() + GONE_WITHIN;
     loop {
@@ -458,7 +460,9 @@ fn closing_the_bindings_stdin_ends_its_group() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let stopped = relay.stop_binding("fx", Duration::from_millis(200));
+    let stopped = relay
+        .stop_process(Duration::from_millis(200))
+        .expect("a bindings process");
     assert!(stopped.group_empty && !stopped.killed, "{stopped:?}");
     assert_eq!(
         stopped.status.and_then(|status| status.signal()),
@@ -598,7 +602,7 @@ fn frames_an_event_and_a_held_decision_interleave_on_one_binding() {
         1,
         &with_root("print('decided', root.decide({'ask': 'push?'}))"),
     );
-    let decision = relay.decision("fx", TIMEOUT);
+    let decision = relay.decision(TIMEOUT);
     assert_eq!(decision.request, json!({"ask": "push?"}));
     // Another agent's frames keep crossing while the request is held.
     assert_eq!(
@@ -611,7 +615,7 @@ fn frames_an_event_and_a_held_decision_interleave_on_one_binding() {
         &with_root_in("child", "root.event({'kind': 'noted', 'n': 3})"),
     );
     assert_eq!(
-        relay.event("fx", TIMEOUT),
+        relay.event(TIMEOUT),
         json!({"t": "event", "kind": "noted", "n": 3})
     );
     assert!(
@@ -620,7 +624,7 @@ fn frames_an_event_and_a_held_decision_interleave_on_one_binding() {
             .is_none(),
         "the request is held until the answer"
     );
-    relay.answer("fx", decision.id, json!({"allow": true}));
+    relay.answer(decision.id, json!({"allow": true}));
     let result = relay.result_from("primary", 1, TIMEOUT);
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(result["output"], "decided {'allow': True}\n");
@@ -673,9 +677,9 @@ fn a_decision_payload_cannot_forge_the_envelope_or_pass_the_line_bound() {
         2,
         &with_root("print(root.decide({'ask': 'next?'}))"),
     );
-    let decision = relay.decision("fx", TIMEOUT);
+    let decision = relay.decision(TIMEOUT);
     assert_eq!(decision.request, json!({"ask": "next?"}));
-    relay.answer("fx", decision.id, json!("yes"));
+    relay.answer(decision.id, json!("yes"));
     assert_eq!(relay.result_from("primary", 2, TIMEOUT)["output"], "yes\n");
 }
 

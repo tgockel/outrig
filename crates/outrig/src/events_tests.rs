@@ -227,12 +227,12 @@ fn each_event_has_exactly_its_data_fields() {
                     id,
                     status: ExecutionStatus::Unknown,
                 }],
-                bindings: vec![BindingStop {
-                    name: text("repo"),
+                bindings: Some(BindingStop {
+                    names: vec![text("repo")],
                     group_empty: true,
                     killed: false,
                     survivors: Vec::new(),
-                }],
+                }),
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
@@ -622,9 +622,7 @@ fn each_event_has_exactly_its_data_fields() {
             "closed_by": {"by": "owner"},
             "stopped": {"state": "proven"},
             "executions": [{"execid": 3, "status": "unknown"}],
-            "bindings": [
-                {"binding": "repo", "group_empty": true, "killed": false, "survivors": []}
-            ],
+            "bindings": {"names": ["repo"], "group_empty": true, "killed": false, "survivors": []},
             "verdict": "stopped_with_unknown",
         })
     );

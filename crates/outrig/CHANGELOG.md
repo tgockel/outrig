@@ -230,15 +230,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   literal `args` and `kwargs` in which `{ path = "..." }` is an absolute host path resolved
   against the repository's root (`SessionBuilder::repo_root`, made absolute when the session
   starts), its `..` left for the host to resolve, and `serialize` for a library that is not
-  thread-safe. A session installs each requirement set once, starts each binding's
-  process on the host before the interpreter -- in the workspace's host directory, with the
-  owner's environment less every variable the config names through `${VAR}`, or exactly the one
-  a `BindingSpec` gives -- tells the agent each name and description in its orientation and in
-  `runtime.bindings`, and stops each process group after the drain, reported in
-  `ShutdownReport::bindings` and `session.report` as `BindingStop`s; a group not proven empty,
-  or a binding not reaped within two seconds of `SIGKILL`, means not proven stopped, and the
-  shutdown goes on to the container. A factory that raises fails the start, naming the binding and the
-  exception, and leaves no binding running. A binding a repository's config declares starts only
+  thread-safe. A session installs each requirement set once and starts one process on the host,
+  before the interpreter, that holds every binding -- in the workspace's host directory, with
+  the owner's environment less every variable the config names through `${VAR}`, or exactly the
+  one `SessionBuilder::bindings_env` gives, shared by every binding, and with the bindings'
+  packages on its import path in the bindings' order, so where two hold different versions of
+  one package each imports the first one's, as the container does. It tells the agent each name
+  and description in its orientation and in `runtime.bindings`, and stops the process's group
+  after the drain, reported in `ShutdownReport::bindings` and `session.report` as a
+  `BindingStop` naming the bindings it held; a group not proven empty, or a process not reaped
+  within two seconds of `SIGKILL`, means not proven stopped, and the shutdown goes on to the
+  container. A factory that raises fails the start, naming the binding and the exception, and
+  leaves nothing of the process running. A binding a repository's config declares starts only
   once an `Approver` (`SessionBuilder::approver`, given an `ApprovalRequest`, answering an
   `Approval`) approves that exact declaration in that repository; the approval is remembered
   under the user's state directory by a digest of both, and any edit asks again. Without one, or

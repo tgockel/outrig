@@ -98,7 +98,7 @@ draining     forwarded hosted calls and running executions continue, until they 
                or the deadline passes; a binding that reads its control line refuses what
                it reads after it and cancels what it had read but not started
 terminating  every kernel interrupted
-             each binding's process group sent SIGTERM, then SIGKILL
+             the bindings process's group sent SIGTERM, then SIGKILL
              the container stopped
 reported     the ShutdownReport returned to the owner
 ```
@@ -134,7 +134,7 @@ The deadline is the owner's argument to `shutdown`; its default is `0003-19`'s d
 
 **Terminating** stops what is left, starting with the step agent code can respond to. Kernels are
 interrupted first, so code still running can run its `finally` blocks and an execution can end
-with `error` rather than `unknown`. Then each binding's process group gets SIGTERM, and SIGKILL
+with `error` rather than `unknown`. Then the bindings process's group gets SIGTERM, and SIGKILL
 after a grace period, which ends a call still running on the host and every program it started --
 a git process, a hook, a credential helper. Last the container is stopped, which ends the
 interpreter and whatever an interrupt could not reach: native code holding the GIL, which
@@ -168,10 +168,10 @@ the session.
   interpreter with it; a failed stop makes the report say not proven stopped. Invoked: not a
   boundary request. Effects: what the session's processes wrote to the workspace stands.
 
-**Binding processes** (`0003-20`)
+**The bindings process** (`0003-20`)
 
 - *Idle, or serving a call.* Outcome: after the drain the process group gets SIGTERM, then SIGKILL
-  after a grace period; the binding counts as stopped once its process has been reaped and no
+  after a grace period; the bindings count as stopped once the process has been reaped and no
   process is left in its group. One not reaped soon after SIGKILL -- a thread stuck in I/O that
   SIGKILL cannot interrupt -- is not proven stopped, and the shutdown goes on to the container.
   Invoked: not itself a call; a call it was serving is a row below. Effects: whatever its calls
@@ -261,7 +261,7 @@ A release closes one child's subtree the same way while the rest of the session 
 own task. It holds:
 
 - that admission closed;
-- whether owned execution is proven stopped: every binding's process reaped with its group empty,
+- whether owned execution is proven stopped: the bindings process reaped with its group empty,
   and the container stopped, which takes the interpreter and its kernels with it;
 - an outcome for each execution, each hosted call, each child work item and each request on a
   child's request channel that was live at the close;
@@ -328,7 +328,7 @@ launched -- the way a session close does, while the rest of the session runs on:
   answer is recorded and ignored;
 - its running execution is interrupted;
 - its forwarded hosted calls finish, or are reported `unknown`. A release kills no binding, since
-  a binding's process serves every kernel in the session, and nothing stops a call on the host: a
+  the bindings process serves every kernel in the session, and nothing stops a call on the host: a
   call whose wait an interrupt or a release ended runs on, and its reply records its outcome; one
   still running when the session's shutdown kills its binding is `unknown`.
 
@@ -343,21 +343,21 @@ default. So what a session starts on the host is tied to the owner by the operat
 than by Rust. `0003-18` proved the arrangement and built its supervisor
 (`crates/outrig/src/python/supervisor.rs`); `0003-20` connects it to the session:
 
-- **Each binding runs in its own process group**, so one signal to the group reaches the binding
-  and everything it started -- a git process, a hook, a credential helper.
-- **The owner sets a parent-death signal on the binding**, `SIGHUP`, between fork and exec, and
-  starts every binding from one thread that lives as long as the process. Linux sends that signal
-  when the *thread* that started the process exits, not when the whole owner does, so a binding
-  started from a pool thread would be signaled as soon as that thread exited. The signal stays
-  blocked until the binding program has installed its handler, so a death in between is pending
-  rather than lost; and after setting it the child checks that its parent is still the owner,
-  and exits if not, since the signal is never sent to a process whose parent was already gone.
-- **The binding kills its own group when the signal arrives**: SIGTERM to the group, a second,
+- **The bindings process runs in its own process group**, so one signal to the group reaches it
+  and everything its libraries started -- a git process, a hook, a credential helper.
+- **The owner sets a parent-death signal on the process**, `SIGHUP`, between fork and exec, and
+  starts it from one thread that lives as long as the owner. Linux sends that signal when the
+  *thread* that started the process exits, not when the whole owner does, so a process started
+  from a pool thread would be signaled as soon as that thread exited. The signal stays blocked
+  until the binding program has installed its handler, so a death in between is pending rather
+  than lost; and after setting it the child checks that its parent is still the owner, and exits
+  if not, since the signal is never sent to a process whose parent was already gone.
+- **The process kills its own group when the signal arrives**: SIGTERM to the group, a second,
   SIGKILL to the group, itself included. The parent-death setting is cleared in a forked child,
-  so nothing the binding starts inherits it; the binding acts for all of them by killing the
-  group it leads. End of input on its stdin -- the owner's death closes the pipe -- does the
-  same, as a second detector. SIGTERM keeps its default disposition in the binding, so while the
-  owner lives only the owner's own stop decides when the group ends.
+  so nothing the process starts inherits it; it acts for all of them by killing the group it
+  leads. End of input on its stdin -- the owner's death closes the pipe -- does the same, as a
+  second detector. SIGTERM keeps its default disposition in the process, so while the owner lives
+  only the owner's own stop decides when the group ends.
 - **Containers keep the existing cleanup** (`crates/outrig/src/container/mod.rs`): an explicit stop
   on the normal path, a detached `podman rm -f` from `Drop` when the future that was to run the
   stop is dropped, and a sweep from the panic hook.
@@ -447,7 +447,7 @@ The agent's code is running a workflow in execution E12, in round R5. The sessio
 `repo`, a GitPython `Repo` -- the phase's example of a hosted library. Earlier in E12 the code
 started a push as a background task,
 `asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")` -- call C40, in the
-binding's process. It also started a child to review a section, work item W3, and now awaits
+bindings process. It also started a child to review a section, work item W3, and now awaits
 both in `asyncio.gather(push, review)`. The child, in its own kernel with its own connection to
 the binding, awaited `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting
 for an answer. Then the operator stops the session.

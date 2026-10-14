@@ -1119,7 +1119,7 @@ pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::St
 #[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
 pub outrig::harness::event::Payload::RoundStarted::round: u32
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionReport
-pub outrig::harness::event::Payload::SessionReport::bindings: alloc::vec::Vec<outrig::harness::BindingStop>
+pub outrig::harness::event::Payload::SessionReport::bindings: core::option::Option<outrig::harness::BindingStop>
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::event::Payload::SessionReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>
 pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::Stopped
@@ -1330,14 +1330,13 @@ impl outrig::harness::ApprovalRequest
 pub fn outrig::harness::ApprovalRequest::new(impl core::convert::Into<alloc::string::String>, core::option::Option<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>) -> Self
 pub struct outrig::harness::BindingSpec
 impl outrig::harness::BindingSpec
-pub fn outrig::harness::BindingSpec::env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>
 pub fn outrig::harness::BindingSpec::new(outrig::config::Binding) -> Self
 impl core::convert::From<outrig::config::Binding> for outrig::harness::BindingSpec
 pub fn outrig::harness::BindingSpec::from(outrig::config::Binding) -> Self
 #[non_exhaustive] pub struct outrig::harness::BindingStop
 pub outrig::harness::BindingStop::group_empty: bool
 pub outrig::harness::BindingStop::killed: bool
-pub outrig::harness::BindingStop::name: alloc::string::String
+pub outrig::harness::BindingStop::names: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::BindingStop::survivors: alloc::vec::Vec<alloc::string::String>
 pub struct outrig::harness::Closed
 impl outrig::harness::Closed
@@ -1393,6 +1392,7 @@ pub struct outrig::harness::SessionBuilder
 impl outrig::harness::SessionBuilder
 pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::Approver + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::bind(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<outrig::harness::BindingSpec>) -> Self
+pub fn outrig::harness::SessionBuilder::bindings_env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
@@ -1404,7 +1404,7 @@ pub async fn outrig::harness::SessionBuilder::start(self) -> core::result::Resul
 pub fn outrig::harness::SessionBuilder::subscribe(&mut self) -> outrig::harness::event::Subscription
 pub fn outrig::harness::SessionBuilder::subscribe_with_capacity(&mut self, usize) -> outrig::harness::event::Subscription
 #[non_exhaustive] pub struct outrig::harness::ShutdownReport
-pub outrig::harness::ShutdownReport::bindings: alloc::vec::Vec<outrig::harness::BindingStop>
+pub outrig::harness::ShutdownReport::bindings: core::option::Option<outrig::harness::BindingStop>
 pub outrig::harness::ShutdownReport::closed_by: outrig::harness::ClosedBy
 pub outrig::harness::ShutdownReport::events: outrig::harness::EventDelivery
 pub outrig::harness::ShutdownReport::executions: alloc::vec::Vec<outrig::harness::ExecutionOutcome>

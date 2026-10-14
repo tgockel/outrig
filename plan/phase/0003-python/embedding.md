@@ -3,7 +3,7 @@
 How a Rust program owns an OutRig session. The program may be OutRig's own CLI or an application
 that runs agents for its own tasks -- CocoClaw is the first. Either way it holds one value, the
 session, and everything the session starts is stopped through it: the container, the interpreter,
-each binding's host process, and the agent's rounds.
+the host process holding its bindings, and the agent's rounds.
 
 **Decided in planning (2026-09-30): the loop gets a public session API in this phase.**
 `outrig run-new` is rebuilt on it and uses nothing else, and it replaces the provisional entry
@@ -55,10 +55,11 @@ CocoClaw and any other embedder start a system the same way.
   passes a resolver that reads the process environment, which keeps today's behavior. An
   embedder running many sessions in one process, each with its own key, passes a resolver per
   session and changes no environment at all.
-- **Bindings** (`hosted-objects.md`), each with its name, description, factory and arguments, and
-  optionally the environment and credentials its host process runs with. The CLI supplies none, so
-  a binding inherits the user's environment: their ssh-agent, credential helpers and config. A
-  binding given through this API needs no operator approval, because the embedder is the owner.
+- **Bindings** (`hosted-objects.md`), each with its name, description, factory and arguments; and
+  optionally the environment and credentials the one host process holding them all runs with,
+  which every binding of the session shares. The CLI supplies none, so the bindings inherit the
+  user's environment: their ssh-agent, credential helpers and config. A binding given through this
+  API needs no operator approval, because the embedder is the owner.
   Only one declared in a repository's config does, because that file is content a cloned project
   brings and the agent can write.
 - **An approver for repo-declared bindings** (`0003-20`): called at session start, before anything
@@ -236,12 +237,12 @@ already has.
 
 Two consequences follow from that, and both are the embedder's to design around:
 
-- **Identity comes from the environment, not from arguments.** The binding's environment, which
+- **Identity comes from the environment, not from arguments.** The bindings' environment, which
   the embedder sets, is where the client finds its endpoint and the identity it acts as. A task
   id the agent passes as an argument is data the client may check, not authority it acts on.
 - **Waits are awaited.** A hosted call is awaited, so a method that waits on a person holds no
   kernel; it holds one worker thread and one connection of the kernel's pool for the binding
-  (`execution-and-rounds.md`). A binding process serves each connection on its own thread, and a
+  (`execution-and-rounds.md`). The bindings process serves each connection on its own thread, and a
   kernel keeps a pool of connections per binding (`0003-17`), so such a wait delays no other call.
   Only a binding declared `serialize = true`, because its library is not thread-safe, takes one
   call at a time, and there the wait delays every other call to that binding until it returns. At
@@ -318,5 +319,5 @@ thread that reads the environment, and every process started meanwhile inherits 
 - CocoClaw's report of retries hidden below its service methods was not checked against its code
   in this design work.
 - That one process can hold several sessions at once. Each session's container, interpreter and
-  binding processes are its own, but process-wide state -- the container panic hook, the cleanup
+  bindings process are its own, but process-wide state -- the container panic hook, the cleanup
   reaper thread -- has only run with one session in a process.

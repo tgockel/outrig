@@ -23,8 +23,9 @@ pub struct ShutdownReport {
     pub stopped: Stopped,
     /// Each execution running when admission closed, and how it ended.
     pub executions: Vec<ExecutionOutcome>,
-    /// How each of the session's bindings stopped.
-    pub bindings: Vec<BindingStop>,
+    /// How the process holding the session's bindings stopped, or `None` when the session had
+    /// none.
+    pub bindings: Option<BindingStop>,
     pub events: EventDelivery,
 }
 
@@ -55,7 +56,7 @@ pub(crate) fn verdict(stopped: &Stopped, executions: &[ExecutionOutcome]) -> Ver
 #[non_exhaustive]
 pub enum Stopped {
     /// Its container was stopped, which took the interpreter and every kernel
-    /// with it, and every binding's process group is empty.
+    /// with it, and the bindings process's group is empty.
     Proven,
     /// Something could not be confirmed stopped, for `reason`: something the
     /// session started may still be acting.
@@ -63,27 +64,24 @@ pub enum Stopped {
     NotProven { reason: String },
 }
 
-/// How one binding's process stopped at shutdown: `SIGTERM` to its process
-/// group, a grace, `SIGKILL` to the group if anything was left, and then
-/// whether the group is proven empty. A binding whose process had already
-/// exited is stopped the same way, since what it started can still be running
-/// in its group.
+/// How the process holding a session's bindings stopped at shutdown: `SIGTERM` to its process
+/// group, a grace, `SIGKILL` to the group if anything was left, and then whether the group is
+/// proven empty. A process that had already exited is stopped the same way, since what its
+/// libraries started can still be running in its group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct BindingStop {
-    /// The binding's name.
-    #[serde(rename = "binding")]
-    pub name: String,
-    /// Whether no process is left in the binding's group. Only the kernel's
-    /// answer that the group has no member proves it; a descendant that left
-    /// the group with `setsid` is outside what it proves.
+    /// The bindings it held, in the session's order.
+    pub names: Vec<String>,
+    /// Whether no process is left in its group. Only the kernel's answer that the group has no
+    /// member proves it; a descendant that left the group with `setsid` is outside what it
+    /// proves.
     pub group_empty: bool,
-    /// Whether `SIGKILL` was needed: something in the group outlasted the
-    /// grace after `SIGTERM`.
+    /// Whether `SIGKILL` was needed: something in the group outlasted the grace after `SIGTERM`.
     pub killed: bool,
     /// What was still in the group when it could not be proven empty, each as
-    /// `<pid> <command> <state>`: a state of `Z` is a zombie not yet reaped,
-    /// and `D` an uninterruptible sleep.
+    /// `<pid> <command> <state>`: a state of `Z` is a zombie not yet reaped, and `D` an
+    /// uninterruptible sleep.
     pub survivors: Vec<String>,
 }
 

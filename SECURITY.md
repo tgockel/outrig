@@ -79,7 +79,8 @@ Issues that bear on **host integrity** are in scope, for example:
 - A **binding** (`[bindings.<name>]`, 0.3) runs a library in a process **on the host, outside
   the container**, with the host user's authority: their files, their `ssh-agent`, their
   credential helpers, and every variable of their environment but the ones OutRig's config
-  names through `${VAR}`. Whatever the library does on the host is part of what the binding
+  names through `${VAR}`. One process holds every binding of a session, so every binding's
+  library runs with that one environment. Whatever the library does on the host is part of what the binding
   grants -- GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names,
   and the agent can write `.git/` through the workspace mount. With no policy configured,
   every request the agent's code makes of a binding runs, and is published as events. Binding

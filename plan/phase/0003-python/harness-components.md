@@ -114,16 +114,16 @@ paid once per error variant rather than at every call site.
 does not reach `outrig`'s copy unless someone carries it across. `crate-split-tradeoffs.md`
 records what was weighed against that.
 
-## The host side gains a process per binding
+## The host side gains a process for the bindings
 
-Hosted objects (`hosted-objects.md`) add processes on the host side of the picture. Each binding
-a session declares is the same embedded static CPython the container mounts, run on the host as
-a child of the owner -- one process per binding, in its own process group -- with the binding's
-packages on its path. Agent code reaches it only through the interpreter: RPyC frames travel the
-existing NDJSON protocol, and `python/host.rs` relays them between the interpreter and each
-binding process. Nothing in the container listens. The new mounts are the binding's package
-directory, read-only, and -- when any binding exists -- the workspace and every
-`[[workspace.mounts]]` entry at their host paths.
+Hosted objects (`hosted-objects.md`) add a process on the host side of the picture. Every binding
+a session declares is held by one process: the same embedded static CPython the container mounts,
+run on the host as a child of the owner, in its own process group, with every binding's packages
+on its path. Agent code reaches it only through the interpreter: RPyC frames travel the existing
+NDJSON protocol, and `python/host.rs` relays them between the interpreter and that process.
+Nothing in the container listens. The new mounts are each binding's package directory, read-only,
+and -- when any binding exists -- the workspace and every `[[workspace.mounts]]` entry at their
+host paths.
 
 ## The container side
 

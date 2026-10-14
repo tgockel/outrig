@@ -166,7 +166,7 @@ pub enum Payload {
         closed_by: super::ClosedBy,
         stopped: super::Stopped,
         executions: Vec<super::ExecutionOutcome>,
-        bindings: Vec<super::BindingStop>,
+        bindings: Option<super::BindingStop>,
         verdict: super::Verdict,
     },
     #[non_exhaustive]

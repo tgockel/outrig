@@ -169,9 +169,10 @@ the same call, and records no new `model.call`.
     `{"state": "not_proven", "reason": ...}` when something could not be confirmed stopped.
   - `executions`: each execution running at the close, as `{execid, status}`; `status` is `ok`
     or `error` if its result arrived, and `unknown` if it was cut off.
-  - `bindings`: how each binding's process stopped, as `{binding, group_empty, killed,
-    survivors}`: whether no process is left in its process group, whether `SIGKILL` was needed
-    after the grace, and what was still in the group when it could not be proven empty, each as
+  - `bindings`: how the process holding the session's bindings stopped, as `{names,
+    group_empty, killed, survivors}`, or `null` when the session had none: the bindings it held,
+    whether no process is left in its process group, whether `SIGKILL` was needed after the
+    grace, and what was still in the group when it could not be proven empty, each as
     `<pid> <command> <state>`. A group not proven empty makes `stopped` `not_proven`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session

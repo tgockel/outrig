@@ -29,19 +29,21 @@ does not have.
   +--------------------------------------+      +----------------------------------+
   | Rust owner                           |  (1) | interpreter process              |
   |   relays frames, one bounded queue   |<---->|   reader thread routes `rpc`     |
-  |   per binding; escalation; events    |      |   frames to their kernel         |
-  +--------------------------------------+      |   kernel `root`:  facade `repo`  |
-         ^                                      |   kernel `child`: facade `repo`  |
-         | (2)                                  +----------------------------------+
+  |   to the bindings; escalation;       |      |   frames to their kernel         |
+  |   events                             |      |   kernel `root`:  facade `repo`  |
+  +--------------------------------------+      |   kernel `child`: facade `repo`  |
+         ^                                      +----------------------------------+
+         | (2)
          v
   +--------------------------------------+
-  | binding process `repo`               |      (1) the interpreter protocol, with
+  | bindings process                     |      (1) the interpreter protocol, with
   |   payload CPython, started with -I   |          RPyC frames as `rpc` messages
-  |   a thread per Connection, up to 4   |      (2) the binding's stdin and stdout
-  |   per kernel, each intercepting      |
-  |   every request                      |      The workspace is mounted at its
-  |   git.Repo("/home/alice/project")    |      host path; the package cache is
-  +--------------------------------------+      mounted read-only.
+  |   a thread per Connection, up to 4   |      (2) the process's stdin and stdout
+  |   per kernel and binding, each       |
+  |   intercepting every request         |      The workspace is mounted at its
+  |   repo = git.Repo("/home/alice/...") |      host path; the package cache is
+  |   every other binding's object       |      mounted read-only.
+  +--------------------------------------+
 ```
 
 ## A binding
@@ -73,7 +75,7 @@ serialize   = true
 The tag exists for the reason path translation was rejected (below): OutRig cannot tell which
 strings are paths, so the operator says. `"."` might be a directory, a branch, or a message.
 
-**Nothing is bound by default.** A session with no bindings starts no binding process, installs no
+**Nothing is bound by default.** A session with no bindings starts no bindings process, installs no
 package, and mounts its directories where it always did.
 
 Bindings come from three places, ordered as listed and by name within each: the global config, the
@@ -92,30 +94,39 @@ session runs without it, saying so.
 
 ## Where it runs
 
-Each binding runs in its own process on the host -- the literal host, not a container -- using the
-same embedded static CPython the container's interpreter uses. It is a supervised child of the Rust
-owner: started before the interpreter, in a process group of its own, with a parent-death signal on
-which it kills that group, so the owner's death ends it and every program it started. At shutdown
-the owner kills the group itself. `lifecycle.md` describes the close sequence, `0003-18` proved the
-supervision and built it as a crate-private module, and `0003-20` connects it to the session. The
-process starts with `-I`, so neither its working directory nor the user site is on its import
-path: it imports the standard library, the vendored RPyC ("Transport"), and its package directory,
-and nothing the agent can write from the container.
+One process on the host -- the literal host, not a container -- holds every binding of a session,
+using the same embedded static CPython the container's interpreter uses. It is a supervised child of
+the Rust owner: started before the interpreter, in a process group of its own, with a parent-death
+signal on which it kills that group, so the owner's death ends it and every program its libraries
+started. At shutdown the owner kills the group itself. `lifecycle.md` describes the close sequence,
+`0003-18` proved the supervision and built it as a crate-private module, and `0003-20` connects it
+to the session. The process starts with `-I`, so neither its working directory nor the user site is
+on its import path: it imports the standard library, the vendored RPyC ("Transport"), and the
+bindings' package directories, and nothing the agent can write from the container. It calls each
+binding's factory once, in the bindings' order, and serves each object under its binding's name.
 
-One process per binding, rather than one for all of them:
+One process for every binding, rather than one per binding, is the maintainer's call of 2026-10-13,
+in planning `0003-22`: one process is simpler to start, relay to, account for and stop than one per
+binding. What it gives up, to be fixed in pure Python inside the one process should any of it come
+to matter:
 
-- **Credentials stay per binding.** An embedder supplies an environment for each binding
-  (`embedding.md`), and that environment is the only one its process has. The CLI supplies none,
-  so under the CLI every binding inherits the user's environment -- the ssh-agent, the credential
-  helpers, the git config.
-- **Cross-binding references cannot exist.** A proxy from one binding names an object in another
-  process, so `repo_b.index.add([blob_from_repo_a])` cannot pass one binding's object to another's
-  credentials: it is refused like any other container object ("What crosses"). No rule about
-  which binding may use which binding's objects is needed, because none can.
-- **A library's resources end with its session.** GitPython's README says it is "not suited for
-  long-running processes", because it relies on destructors to release system resources, and
-  suggests running it in "a separate process which can be dropped periodically". A process per
-  binding, ended with its session, is that.
+- **One environment.** Every binding's library runs with the process's environment: under the CLI
+  the user's -- the ssh-agent, the credential helpers, the git config -- and under an embedder the
+  one it gives the session's bindings (`embedding.md`). An embedder cannot give two bindings
+  different credentials.
+- **One version of each package.** The process's `sys.path` holds the bindings' package
+  directories in the bindings' order, as the container's does ("Packages"), so where two
+  requirement sets hold different versions of one package, every binding imports the first one's.
+- **One life.** A library that crashes the process, hangs it, or exhausts its memory ends every
+  binding at once.
+
+What stays apart without a process per binding: a binding's objects live in tables of their own, one
+per binding and kernel, so a proxy from one binding is refused by every other binding's request
+("What crosses") as it was when they were separate processes. A serializing binding takes a turn of
+its own, so it never waits behind another. A library's resources still end with its session:
+GitPython's README says it is "not suited for long-running processes", because it relies on
+destructors to release system resources, and suggests running it in "a separate process which can
+be dropped periodically", which the process ended with its session is.
 
 Two consequences follow from running the payload on the host:
 
@@ -142,7 +153,7 @@ complete (`0003-18`). Two rules limit what the install does on the host:
   such a dependency fails with the reason instead (`0003-18`).
 - **Every wheel is pure Python**: its platform tag is `any`, its ABI tag `none`, and its Python tag
   includes Python 3, as in `py3-none-any` or `py2.py3-none-any`. A wheel with any other tags is
-  refused with the reason: one with compiled parts could be loaded by neither the binding process
+  refused with the reason: one with compiled parts could be loaded by neither the bindings process
   nor the container's interpreter. So is a wheel tagged pure Python that carries an extension
   module among its files, since a tag is the publisher's claim.
 
@@ -165,13 +176,13 @@ payload rather than at its host path -- podman would make a host path's missing 
 `except git.GitCommandError` catches the host's exception, and `isinstance(c, git.Commit)` holds
 for a proxy `c` of a host commit, because RPyC gives a proxy the local class of the same module and
 name when that module has been imported in the container. The mount is read-only because the
-binding process imports from the same directory: a writable mount would let the agent edit code
+bindings process imports from the same directory: a writable mount would let the agent edit code
 the host runs.
 
 With several bindings, their directories go on the agent's `sys.path` in the order the bindings
 have under "A binding". Where two requirement sets hold different versions of one package, the
-container imports the earlier binding's version, while each binding process imports its own.
-`0003-20` tests the order.
+container imports the earlier binding's version, and so does the bindings process, whose
+`sys.path` has the same order. `0003-20` tests the order.
 
 The local import is a second copy of the library, and using it is ordinary container computation.
 `git.Repo("/some/path")` in agent code builds a `Repo` in the container, which runs the image's
@@ -230,7 +241,7 @@ bounded queue per binding, and replies return the same way. A frame travels in p
 and one declaring more is refused rather than buffered, in either direction, by closing the
 connection it arrived on with the reason (`0003-16`). RPyC's own compression is off on both
 sides, and a frame flagged compressed is refused the same way: a small frame could otherwise
-inflate without limit inside the binding process. Only the interpreter can reach a binding: a
+inflate without limit inside the bindings process. Only the interpreter can reach a binding: a
 program the agent starts inherits neither protocol descriptor, and a forked child closes both, so
 a subprocess -- and everything else in the container -- has no channel to a binding at all. Code
 inside the interpreter does, which is why enforcement does not trust the container side.
@@ -242,14 +253,14 @@ wrong execution slot. RPyC's own documentation recommends a connection per threa
 and its thread-binding mode, `bind_threads`, is marked experimental. So no connection is shared
 between kernels (`agent-placement.md`), one call is in flight on a connection at a time, and a
 kernel opens more than one so that one awaited call delays no other ("Calls are awaited"). On
-the host, the binding process serves each connection on a thread of its own, which is RPyC's
+the host, the bindings process serves each connection on a thread of its own, which is RPyC's
 ordinary server model, so requests from different connections run in the library at the same time
 unless the binding is declared `serialize = true`. `0003-17` proved the arrangement holds, with
 both programs started on the host by its tests; its `## Decisions` record what held.
 
 ## Interception
 
-Enforcement is on the host. The binding process installs a subclass of RPyC's `Connection`
+Enforcement is on the host. The bindings process installs a subclass of RPyC's `Connection`
 through `Service._protocol`, and the subclass intercepts all 20 request handlers in RPyC's dispatch
 table. Every request a kernel sends passes through it before RPyC acts on it, and it enforces
 `boundary-policy.md`'s decisions. The rules it applies on its own:
@@ -487,11 +498,11 @@ host at the same time, and a call that waits for an hour holds its connection an
 no other call. A fifth awaited call waits in the executor's queue, with no thread, until a worker
 is free, and one woken there was never sent. An RPyC proxy sends its requests on the connection
 that produced it, and the object ids it names are that connection's; the pool works around both.
-The binding process keeps one object table per kernel, shared by that kernel's connections, so a
-proxy resolves on any of them, and the container side sends a proxy's request on whichever
-connection its call took ("What crosses"). Every connection is opened by the worker whose call
-needs it, never by the reader thread, and a worker waiting for a free connection waits where the
-reader thread can wake it, as a worker waiting for its reply does.
+The bindings process keeps one object table per kernel and binding, shared by that kernel's
+connections to the binding, so a proxy resolves on any of them, and the container side sends a
+proxy's request on whichever connection its call took ("What crosses"). Every connection is opened
+by the worker whose call needs it, never by the reader thread, and a worker waiting for a free
+connection waits where the reader thread can wake it, as a worker waiting for its reply does.
 
 **Callbacks run where the call is served.** A plain-function callback runs on the worker thread
 holding the call's connection and reads the proxies it is given with `_sync()`, which resolves on
@@ -510,7 +521,7 @@ up. Wherever an awaited call runs, its callbacks run under a copy of the context
 awaited it, and the proxies the host passes them arrive as hosted objects, a callback inside a
 `_sync()` call's included.
 
-**The binding process serves each connection on a thread of its own.** That is RPyC's ordinary
+**The bindings process serves each connection on a thread of its own.** That is RPyC's ordinary
 server model -- its `ThreadedServer` starts a thread per connection -- so calls from different
 kernels, and from one kernel's workers, run in the hosted library at the same time. A library that
 is not thread-safe is declared so, and GitPython is one: its `cmd.py` says that "GitPython isn't
@@ -601,7 +612,7 @@ result, while the call's outcome event records `returned` or `raised` when the r
 bounded it at four in flight, is gone with the kernel; `children-max` stops counting the child
 once its kernel is gone; and the agent that released the child is charged nothing. A child that
 is spawned, awaits in a background task a call that never returns, and is released, repeated,
-accumulates threads and calls in the binding process for as long as the session lives: the
+accumulates threads and calls in the bindings process for as long as the session lives: the
 container's worker ends when `close_hosted` wakes it, and the host's thread runs on. The
 maintainer documents this as unbounded for now; bounding it is
 `plan/next/bound-surviving-binding-calls.md`.
@@ -706,8 +717,8 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
 
 ## Open questions
 
-- What a binding process dying mid-session does. Its calls in flight are `unknown`; whether the
-  session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-22`'s.
+- What the bindings process dying mid-session does. Its calls in flight are `unknown`; whether the
+  session continues without its bindings, and how later uses fail, is `0003-22`'s.
 - Whether the facade's `async for` fetches a returned container in batches with RPyC's
   `buffiter`, which would make one request per batch rather than per item.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of

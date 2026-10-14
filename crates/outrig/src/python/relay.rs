@@ -1,13 +1,13 @@
-//! A relay between one interpreter and the binding processes of its session, all started on
-//! the host, standing in for the one `0003-22` puts in `host.rs`.
+//! A relay between one interpreter and the process holding its session's bindings, both started
+//! on the host, standing in for the one `0003-22` puts in `host.rs`.
 //!
 //! The interpreter is started as `interpreter_tests.rs` starts it, with the vendored RPyC's
-//! directory as its second argument; each binding is started through `supervisor.rs`, as a
-//! session will start it, over the fixture package with a factory. `rpc` lines from the
-//! interpreter go to the binding they name, lines from a binding go back with the binding's name
-//! added, and everything else the interpreter says is handed to the test, as are a binding's
-//! event lines and decision requests. The relay counts the lines each way and remembers the
-//! longest, which is how a test checks the frame bound held in transit.
+//! directory as its second argument; the bindings process is started through `supervisor.rs`, as
+//! a session starts it, over the fixture package with a factory per binding. `rpc` lines go
+//! between the two as they are, each naming its binding, and everything else the interpreter says
+//! is handed to the test, as are the process's event lines and decision requests. The relay
+//! counts the lines each way and remembers the longest, which is how a test checks the frame
+//! bound held in transit.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use super::host::PRIMARY;
 use super::payload;
-use super::supervisor::{self, Binding, Decision, Spec, Stopped};
+use super::supervisor::{self, Decision, Factory, Process, Spec, Stopped};
 use super::testing::{Start, capture, host_home, interpreter_command, python, python_command};
 
 /// How long any one reply may take. A 64 MiB result crosses in a few seconds on a loaded runner.
@@ -876,27 +876,28 @@ impl Traffic {
     }
 }
 
-/// How [`Relay::bind_opts`] starts a binding process.
+/// How [`Relay::bind_opts`] declares a binding, and what it changes about the process that
+/// holds them all.
 #[derive(Default)]
 pub(crate) struct Bind<'a> {
     /// The factory, as `module:callable`, in the fixture package.
     pub(crate) factory: &'a str,
     /// Extra environment variables for the process, on top of this process's own. With none,
-    /// the binding inherits the environment, as one under the CLI does.
+    /// the process inherits the environment, as one under the CLI does.
     pub(crate) env: &'a [(&'a str, &'a str)],
     /// Exactly the process's environment, as an embedder gives one; in place of `env`.
     pub(crate) exact_env: Option<&'a [(&'a str, &'a str)]>,
-    /// `--serialize`: one call at a time across the binding's connections.
+    /// One call at a time across the binding's connections.
     pub(crate) serialize: bool,
-    /// The package directory, the fixture's when `None`.
+    /// The binding's package directory, the fixture's when `None`.
     pub(crate) packages: Option<&'a Path>,
     /// The process's working directory.
     pub(crate) cwd: Option<&'a Path>,
 }
 
-/// A binding the relay started, with the lines of it that only the test reads.
+/// The bindings process the relay started, with the lines of it that only the test reads.
 struct Bound {
-    binding: Binding,
+    process: Process,
     events: mpsc::Receiver<Value>,
     decisions: mpsc::Receiver<Decision>,
 }
@@ -909,10 +910,15 @@ pub(crate) struct Relay {
     /// Messages read while looking for another, kept in order for the next `recv`.
     pending: VecDeque<Value>,
     stderr: Arc<Mutex<String>>,
-    /// Each binding's stdin, for the pump that forwards the interpreter's `rpc` lines.
-    targets: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
-    bindings: HashMap<String, Bound>,
-    /// Where the bindings live: their pipes and their reaping are registered with it.
+    /// The bindings process's stdin, for the pump that forwards the interpreter's `rpc` lines.
+    target: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
+    /// The bindings declared so far, in order, each with its package directory, and how their
+    /// process starts.
+    declared: Vec<(Factory, PathBuf)>,
+    env: Option<Vec<(OsString, OsString)>>,
+    cwd: Option<PathBuf>,
+    process: Option<Bound>,
+    /// Where the bindings process lives: its pipes and its reaping are registered with it.
     runtime: Runtime,
     pub(crate) stats: Arc<Stats>,
 }
@@ -944,13 +950,13 @@ impl Relay {
         )));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = capture(child.stderr.take().expect("stderr is piped"));
-        let targets = Arc::new(Mutex::new(HashMap::new()));
+        let target = Arc::new(Mutex::new(None));
         let stats = Arc::new(Stats::default());
         let (tx, other) = channel();
         {
-            let (stdin, targets, stats) =
-                (Arc::clone(&stdin), Arc::clone(&targets), Arc::clone(&stats));
-            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, targets, stats));
+            let (stdin, target, stats) =
+                (Arc::clone(&stdin), Arc::clone(&target), Arc::clone(&stats));
+            std::thread::spawn(move || pump_interpreter(stdout, tx, stdin, target, stats));
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -963,8 +969,11 @@ impl Relay {
             other,
             pending: VecDeque::new(),
             stderr,
-            targets,
-            bindings: HashMap::new(),
+            target,
+            declared: Vec::new(),
+            env: None,
+            cwd: None,
+            process: None,
             runtime,
             stats,
         };
@@ -974,13 +983,13 @@ impl Relay {
         relay
     }
 
-    /// Start binding `name`'s process over the fixture, with `factory` as `module:callable`,
-    /// and wait for it to be ready.
+    /// Declare binding `name` over the fixture, with `factory` as `module:callable`, and start
+    /// the bindings process again with it, waiting for it to be ready.
     pub(crate) fn bind(&mut self, name: &str, factory: &str) {
         self.bind_with(name, factory, &[]);
     }
 
-    /// [`Relay::bind`] with extra environment variables for the binding's process.
+    /// [`Relay::bind`], adding `env` to the process's environment.
     pub(crate) fn bind_with(&mut self, name: &str, factory: &str, env: &[(&str, &str)]) {
         self.bind_opts(
             name,
@@ -992,7 +1001,7 @@ impl Relay {
         );
     }
 
-    /// [`Relay::bind`] with `--serialize`: the binding runs one call at a time.
+    /// [`Relay::bind`], the binding running one call at a time.
     pub(crate) fn bind_serialized(&mut self, name: &str, factory: &str) {
         self.bind_opts(
             name,
@@ -1004,8 +1013,9 @@ impl Relay {
         );
     }
 
-    /// Start binding `name`'s process as `bind` says, through the supervisor, and wait for it to
-    /// be ready.
+    /// Declare binding `name` as `bind` says, and start the bindings process again, through the
+    /// supervisor, with every binding declared so far, waiting for it to be ready. The process
+    /// is stopped first if it runs: a test declares its bindings before it uses any.
     pub(crate) fn bind_opts(&mut self, name: &str, bind: &Bind) {
         let owned = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
             pairs
@@ -1013,60 +1023,62 @@ impl Relay {
                 .map(|(k, v)| (OsString::from(k), OsString::from(v)))
                 .collect()
         };
-        let exact = match bind.exact_env {
-            Some(given) => Some(owned(given)),
-            None if bind.env.is_empty() => None,
-            None => Some(std::env::vars_os().chain(owned(bind.env)).collect()),
-        };
-        let spec = Spec {
-            name,
-            python: python(),
-            rpyc_dir: rpyc_dir(),
-            packages: match bind.packages {
-                Some(packages) => packages,
-                None => fixture_dir(),
-            },
-            factory: bind.factory,
+        match bind.exact_env {
+            Some(given) => self.env = Some(owned(given)),
+            None if bind.env.is_empty() => {}
+            None => self.env = Some(std::env::vars_os().chain(owned(bind.env)).collect()),
+        }
+        if let Some(cwd) = bind.cwd {
+            self.cwd = Some(cwd.to_path_buf());
+        }
+        let factory = Factory {
+            name: name.to_string(),
+            factory: bind.factory.to_string(),
             args: json!([]),
             kwargs: json!({}),
             serialize: bind.serialize,
-            cwd: bind.cwd,
-            env: exact.as_deref(),
-            probe: None,
         };
-        self.bind_spec(name, spec);
+        self.bind_factory(factory, bind.packages.unwrap_or_else(|| fixture_dir()));
     }
 
-    /// Start binding `name`'s process from `spec` exactly, through the supervisor, and wait for
-    /// it to be ready: how a test runs what a session's own lowering of a declaration produced.
-    pub(crate) fn bind_spec(&mut self, name: &str, spec: Spec<'_>) {
-        let mut binding = self
+    /// Declare the binding `factory` describes, its package in `packages` -- one a session's own
+    /// lowering of a declaration made, say -- and start the bindings process again with every
+    /// binding declared so far, waiting for it to be ready, and relay its lines from then on.
+    pub(crate) fn bind_factory(&mut self, factory: Factory, packages: &Path) {
+        self.declared.push((factory, packages.to_path_buf()));
+        self.stop_process(Duration::from_millis(200));
+        let mut paths: Vec<&Path> = Vec::new();
+        for (_, dir) in &self.declared {
+            if !paths.contains(&dir.as_path()) {
+                paths.push(dir);
+            }
+        }
+        let spec = Spec {
+            python: python(),
+            rpyc_dir: rpyc_dir(),
+            paths,
+            bindings: self.declared.iter().map(|(f, _)| f.clone()).collect(),
+            cwd: self.cwd.as_deref(),
+            env: self.env.as_deref(),
+            probe: None,
+        };
+        let mut process = self
             .runtime
             .block_on(supervisor::start(spec))
-            .unwrap_or_else(|e| panic!("binding {name:?} did not start: {e}"));
-        let rpc = binding.take_rpc();
-        let events = binding.take_events();
-        let decisions = binding.take_decisions();
-        self.targets
-            .lock()
-            .expect("targets lock")
-            .insert(name.to_string(), binding.sender());
+            .unwrap_or_else(|e| panic!("the bindings did not start: {e}"));
+        let rpc = process.take_rpc();
+        let events = process.take_events();
+        let decisions = process.take_decisions();
+        *self.target.lock().expect("target lock") = Some(process.sender());
         {
-            let (name, stdin, stats) = (
-                name.to_string(),
-                Arc::clone(&self.stdin),
-                Arc::clone(&self.stats),
-            );
-            std::thread::spawn(move || pump_binding(name, rpc, stdin, stats));
+            let (stdin, stats) = (Arc::clone(&self.stdin), Arc::clone(&self.stats));
+            std::thread::spawn(move || pump_process(rpc, stdin, stats));
         }
-        self.bindings.insert(
-            name.to_string(),
-            Bound {
-                binding,
-                events,
-                decisions,
-            },
-        );
+        self.process = Some(Bound {
+            process,
+            events,
+            decisions,
+        });
     }
 
     /// Write `message` as one line to the interpreter's stdin, as the host would.
@@ -1074,49 +1086,49 @@ impl Relay {
         write_line(&self.stdin, &message);
     }
 
-    /// Write one raw line to binding `name`'s stdin, as the host would.
-    pub(crate) fn inject_to_binding(&mut self, name: &str, message: Value) {
+    /// Write one raw line to the bindings process's stdin, as the host would.
+    pub(crate) fn inject_to_binding(&mut self, message: Value) {
         let sender = self
-            .targets
+            .target
             .lock()
-            .expect("targets lock")
-            .get(name)
-            .cloned()
-            .expect("a started binding");
+            .expect("target lock")
+            .clone()
+            .expect("a started bindings process");
         let _ = sender.blocking_send(message);
     }
 
-    /// The next event line binding `name` writes, within `within`.
-    pub(crate) fn event(&mut self, name: &str, within: Duration) -> Value {
-        let bound = self.bindings.get_mut(name).expect("a started binding");
+    /// The next event line the bindings process writes, within `within`.
+    pub(crate) fn event(&mut self, within: Duration) -> Value {
+        let bound = self.process.as_mut().expect("a started bindings process");
         self.runtime
             .block_on(async { tokio::time::timeout(within, bound.events.recv()).await })
-            .unwrap_or_else(|_| panic!("no event from binding {name:?} within {within:?}"))
-            .expect("the binding's event lines")
+            .unwrap_or_else(|_| panic!("no event from the bindings within {within:?}"))
+            .expect("the process's event lines")
     }
 
-    /// The next decision request binding `name` writes, within `within`.
-    pub(crate) fn decision(&mut self, name: &str, within: Duration) -> Decision {
-        let bound = self.bindings.get_mut(name).expect("a started binding");
+    /// The next decision request the bindings process writes, within `within`.
+    pub(crate) fn decision(&mut self, within: Duration) -> Decision {
+        let bound = self.process.as_mut().expect("a started bindings process");
         self.runtime
             .block_on(async { tokio::time::timeout(within, bound.decisions.recv()).await })
-            .unwrap_or_else(|_| panic!("no decision request from {name:?} within {within:?}"))
-            .expect("the binding's decision requests")
+            .unwrap_or_else(|_| panic!("no decision request within {within:?}"))
+            .expect("the process's decision requests")
     }
 
-    /// Answer binding `name`'s decision `id`.
-    pub(crate) fn answer(&mut self, name: &str, id: u64, answer: Value) {
-        let bound = self.bindings.get(name).expect("a started binding");
+    /// Answer the bindings process's decision `id`.
+    pub(crate) fn answer(&mut self, id: u64, answer: Value) {
+        let bound = self.process.as_ref().expect("a started bindings process");
         self.runtime
-            .block_on(bound.binding.answer(id, answer))
-            .expect("the binding takes the answer");
+            .block_on(bound.process.answer(id, answer))
+            .expect("the process takes the answer");
     }
 
-    /// Stop binding `name` as a session's shutdown would, with `grace` between the signals.
-    pub(crate) fn stop_binding(&mut self, name: &str, grace: Duration) -> Stopped {
-        self.targets.lock().expect("targets lock").remove(name);
-        let bound = self.bindings.remove(name).expect("a started binding");
-        self.runtime.block_on(bound.binding.stop(grace))
+    /// Stop the bindings process as a session's shutdown would, with `grace` between the
+    /// signals; `None` when none runs.
+    pub(crate) fn stop_process(&mut self, grace: Duration) -> Option<Stopped> {
+        self.target.lock().expect("target lock").take();
+        let bound = self.process.take()?;
+        Some(self.runtime.block_on(bound.process.stop(grace)))
     }
 
     /// Close the interpreter's stdin, as the host's end does.
@@ -1138,13 +1150,13 @@ impl Relay {
         }
     }
 
-    /// Close binding `name`'s stdin, as the owner's death does.
-    pub(crate) fn close_binding_stdin(&mut self, name: &str) {
-        self.targets.lock().expect("targets lock").remove(name);
-        self.bindings
-            .get_mut(name)
-            .expect("a started binding")
-            .binding
+    /// Close the bindings process's stdin, as the owner's death does.
+    pub(crate) fn close_binding_stdin(&mut self) {
+        self.target.lock().expect("target lock").take();
+        self.process
+            .as_mut()
+            .expect("a started bindings process")
+            .process
             .close_stdin();
     }
 
@@ -1346,15 +1358,16 @@ impl Relay {
         })
     }
 
-    pub(crate) fn binding_pid(&self, name: &str) -> u32 {
-        let bound = self.bindings.get(name).expect("a started binding");
-        bound.binding.pid().as_raw() as u32
+    /// The bindings process's pid, which is also its process group's id.
+    pub(crate) fn binding_pid(&self) -> u32 {
+        let bound = self.process.as_ref().expect("a started bindings process");
+        bound.process.pid().as_raw() as u32
     }
 
-    /// The binding process's resident set, in KiB, as `/proc` reports it.
-    pub(crate) fn binding_rss_kib(&self, name: &str) -> usize {
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.binding_pid(name)))
-            .expect("the binding's /proc status");
+    /// The bindings process's resident set, in KiB, as `/proc` reports it.
+    pub(crate) fn binding_rss_kib(&self) -> usize {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", self.binding_pid()))
+            .expect("the process's /proc status");
         status
             .lines()
             .find_map(|line| line.strip_prefix("VmRSS:"))
@@ -1377,16 +1390,12 @@ impl Relay {
         self.stderr.lock().expect("stderr lock").clone()
     }
 
-    /// The last of every binding's stderr, labeled.
+    /// The last of the bindings process's stderr.
     pub(crate) fn binding_stderr(&self) -> String {
-        let mut text = String::new();
-        for (name, bound) in &self.bindings {
-            let said = bound.binding.stderr();
-            if !said.is_empty() {
-                text.push_str(&format!("[{name}] {said}\n"));
-            }
-        }
-        text
+        self.process
+            .as_ref()
+            .map(|bound| bound.process.stderr())
+            .unwrap_or_default()
     }
 }
 
@@ -1394,12 +1403,7 @@ impl Drop for Relay {
     fn drop(&mut self) {
         // The bindings first, stopped on the runtime that reaps them; the runtime itself goes
         // last, with the struct, so nothing is left unreaped.
-        self.targets.lock().expect("targets lock").clear();
-        for (_, bound) in self.bindings.drain() {
-            let _ = self
-                .runtime
-                .block_on(bound.binding.stop(Duration::from_millis(200)));
-        }
+        self.stop_process(Duration::from_millis(200));
         if let Ok(pid) = i32::try_from(self.interpreter.id()) {
             let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
         }
@@ -1407,12 +1411,12 @@ impl Drop for Relay {
     }
 }
 
-/// Route the interpreter's lines: `rpc` lines to the binding they name, the rest to the test.
+/// Route the interpreter's lines: `rpc` lines to the bindings process, the rest to the test.
 fn pump_interpreter(
     stdout: impl Read,
     tx: Sender<Result<Value, String>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    targets: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>,
+    target: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
     stats: Arc<Stats>,
 ) {
     for line in BufReader::with_capacity(1 << 20, stdout).lines() {
@@ -1423,7 +1427,7 @@ fn pump_interpreter(
                 return;
             }
         };
-        let mut message = match serde_json::from_str::<Value>(&line) {
+        let message = match serde_json::from_str::<Value>(&line) {
             Ok(message) if message.is_object() => message,
             _ => {
                 let _ = tx.send(Err(format!("not a protocol message: {line:?}")));
@@ -1441,19 +1445,13 @@ fn pump_interpreter(
         if closed {
             stats.closed_to_binding.fetch_add(1, Ordering::SeqCst);
         }
-        let binding = message
-            .as_object_mut()
-            .expect("an object")
-            .remove("binding")
-            .unwrap_or(Value::Null);
-        if let (Some(agent), Some(name)) = (message["agent"].as_str(), binding.as_str()) {
+        if let (Some(agent), Some(name)) = (message["agent"].as_str(), message["binding"].as_str())
+        {
             stats
                 .between(agent, name)
                 .record(line.len(), message["id"].as_u64(), true, closed);
         }
-        let target = binding
-            .as_str()
-            .and_then(|name| targets.lock().expect("targets lock").get(name).cloned());
+        let target = target.lock().expect("target lock").clone();
         match target {
             Some(target) => {
                 let _ = target.blocking_send(message);
@@ -1462,8 +1460,8 @@ fn pump_interpreter(
                 write_line(
                     &stdin,
                     &json!({
-                        "t": "rpc", "agent": message["agent"], "binding": binding,
-                        "id": message["id"], "closed": "no such binding",
+                        "t": "rpc", "agent": message["agent"], "binding": message["binding"],
+                        "id": message["id"], "closed": "no bindings process runs",
                     }),
                 );
             }
@@ -1471,21 +1469,20 @@ fn pump_interpreter(
     }
 }
 
-/// Forward a binding's `rpc` lines, as the supervisor hands them over, to the interpreter with
-/// the binding's name added.
-fn pump_binding(
-    name: String,
+/// Forward the bindings process's `rpc` lines, as the supervisor hands them over, to the
+/// interpreter: each already names its binding.
+fn pump_process(
     mut rpc: mpsc::Receiver<Value>,
     interpreter: Arc<Mutex<Option<ChildStdin>>>,
     stats: Arc<Stats>,
 ) {
-    while let Some(mut message) = rpc.blocking_recv() {
-        message["binding"] = json!(name);
+    while let Some(message) = rpc.blocking_recv() {
         let len = write_line(&interpreter, &message);
         stats.to_interpreter.record(len);
-        if let Some(agent) = message["agent"].as_str() {
+        if let (Some(agent), Some(name)) = (message["agent"].as_str(), message["binding"].as_str())
+        {
             stats
-                .between(agent, &name)
+                .between(agent, name)
                 .record(len, message["id"].as_u64(), false, false);
         }
     }
