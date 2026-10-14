@@ -91,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A build image's name over 237 characters is refused where names are checked.** The name is
+  the repository of its `<name>:<hash>` tag, and buildah refuses a repository over 255
+  characters once it prepends `docker.io/library/`, so such a name used to pass `Config::validate`
+  and `outrig image add`, then fail at `outrig build`. `check_build_image_name` now returns the
+  new `BuildImageNameError::TooLong { len, max }`, and `image add`'s suggested default falls back
+  to `standard` rather than cross the limit. (#242)
+
 - **`LaunchSpec::from_config` now pulls or builds the primary image.** It used to hand `launch` a
   bare source: an `image-name` that was not already local failed with podman's `image not known`
   (the create runs `--pull=never`), and a Dockerfile image-config was built under `outrig-cache`

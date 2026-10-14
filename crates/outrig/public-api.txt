@@ -22,6 +22,9 @@ pub outrig::config::BuildImageNameError::InvalidSeparator
 pub outrig::config::BuildImageNameError::InvalidSeparator::separator: alloc::string::String
 pub outrig::config::BuildImageNameError::SeparatorAtEdge
 pub outrig::config::BuildImageNameError::SeparatorAtEdge::separator: char
+pub outrig::config::BuildImageNameError::TooLong
+pub outrig::config::BuildImageNameError::TooLong::len: usize
+pub outrig::config::BuildImageNameError::TooLong::max: usize
 #[non_exhaustive] pub enum outrig::config::CapabilityProfile
 pub outrig::config::CapabilityProfile::Default
 pub outrig::config::CapabilityProfile::DropAll

@@ -476,4 +476,20 @@ mod tests {
             assert_eq!(default_image_name(Path::new(folder)), want, "{folder:?}");
         }
     }
+
+    /// `-standard` is 9 characters, so a folder of 228 is the longest that
+    /// keeps its name, and one of 229 falls back.
+    #[test]
+    fn the_default_image_name_stays_within_the_length_limit() {
+        let keeps = format!("/src/{}", "a".repeat(228));
+        assert_eq!(default_image_name(Path::new(&keeps)).len(), 237);
+        let falls_back = format!("/src/{}", "a".repeat(229));
+        assert_eq!(default_image_name(Path::new(&falls_back)), "standard");
+    }
+
+    #[test]
+    fn check_name_refuses_a_name_over_the_length_limit() {
+        assert!(check_name(&"a".repeat(237)).is_ok());
+        assert!(check_name(&"a".repeat(238)).is_err());
+    }
 }

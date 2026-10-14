@@ -1643,7 +1643,8 @@ pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
 /// The name becomes the repository of the image's tag (`<name>:<hash>`), so it
 /// is held to the path-component grammar of podman's image references:
 /// lowercase letters and digits, separated by one `.`, one or two `_`, or a
-/// run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`).
+/// run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), and to at most 237
+/// characters.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum BuildImageNameError {
@@ -1673,7 +1674,21 @@ pub enum BuildImageNameError {
          with {separator:?}: only one `.`, one or two `_`, or a run of `-`"
     )]
     InvalidSeparator { separator: String },
+
+    /// The name is `len` characters, over the `max` its tag's repository can
+    /// be. Buildah normalizes a short name to `docker.io/library/<name>` and
+    /// refuses a repository over 255 characters.
+    #[error(
+        "a build image's name becomes its repository, which can't be longer than {max} \
+         characters, and this one is {len}"
+    )]
+    TooLong { len: usize, max: usize },
 }
+
+/// The longest a build image's name can be: the 255 characters buildah allows
+/// a repository, less the 18 of the `docker.io/library/` it prepends to a
+/// short name.
+const BUILD_IMAGE_NAME_MAX_LEN: usize = 255 - "docker.io/library/".len();
 
 /// Checks that `name` can key a build image's `[images.<name>]` block, the one
 /// that sets `dockerfile` and `context`, and says what's wrong when it can't.
@@ -1691,6 +1706,13 @@ pub fn check_build_image_name(name: &str) -> Result<(), BuildImageNameError> {
         .find(|&c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || is_separator(c)))
     {
         return Err(BuildImageNameError::InvalidCharacter { character });
+    }
+    // Only ASCII is left, so bytes are characters.
+    if name.len() > BUILD_IMAGE_NAME_MAX_LEN {
+        return Err(BuildImageNameError::TooLong {
+            len: name.len(),
+            max: BUILD_IMAGE_NAME_MAX_LEN,
+        });
     }
     if let Some(separator) = [name.chars().next(), name.chars().next_back()]
         .into_iter()

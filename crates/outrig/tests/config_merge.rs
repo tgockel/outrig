@@ -429,6 +429,36 @@ context    = "ctx"
         }
     }
 
+    /// A name's tag is `docker.io/library/<name>` to buildah, which refuses a
+    /// repository over 255 characters, so 237 is the longest a name can be.
+    #[test]
+    fn a_build_image_name_over_237_characters_is_refused() {
+        let at_limit = "a".repeat(237);
+        assert_eq!(check_build_image_name(&at_limit), Ok(()));
+        let over = "a".repeat(238);
+        assert_eq!(
+            check_build_image_name(&over),
+            Err(BuildImageNameError::TooLong { len: 238, max: 237 })
+        );
+
+        let block = |name: &str| {
+            parse(&format!(
+                "[images.{name}]\ndockerfile = \"D\"\ncontext    = \"ctx\"\n"
+            ))
+        };
+        block(&at_limit)
+            .validate(None)
+            .expect("237 characters validates");
+        let err = expect_validation_err(&block(&over), None);
+        assert!(
+            err.to_string().contains("can't be longer than 237"),
+            "{err}"
+        );
+        assert!(
+            matches!(err, ConfigValidationError::BuildImageNameInvalid { image } if image == over)
+        );
+    }
+
     /// The check is written out so it can say what's wrong, and accepts
     /// exactly the grammar its docs give: every name of up to five characters
     /// from an alphabet that reaches each way to fail.
