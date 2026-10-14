@@ -163,8 +163,8 @@ const BASES: &[(&str, &str)] = &[
         BaseImage::AlpineLatest.description(),
     ),
     (
-        BaseImage::Node20BookwormSlim.as_str(),
-        BaseImage::Node20BookwormSlim.description(),
+        BaseImage::Node24BookwormSlim.as_str(),
+        BaseImage::Node24BookwormSlim.description(),
     ),
     (
         BaseImage::Python3_12Slim.as_str(),
@@ -184,7 +184,7 @@ const TOOLCHAINS: &[(&str, &str)] = &[
         "rust",
         "rustup + stable toolchain (cargo, rustfmt, clippy).",
     ),
-    ("node", "Node 20 LTS via the base image's package manager."),
+    ("node", "Node 24 LTS via NodeSource (apk on Alpine)."),
     ("python", "CPython 3 with pip and venv."),
     ("go", "Go 1.27."),
     ("none", "Just the base image -- nothing extra installed."),

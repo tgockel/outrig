@@ -283,7 +283,7 @@ output is shown as it happens:
 
 ```
 [outrig] ensuring image coding:8c2a4f7e91d6b5a3
-[buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
+[buildah] STEP 1/6: FROM docker.io/library/node:24-bookworm-slim
 [buildah] STEP 2/6: RUN apt-get update && apt-get install -y git
 ...
 [outrig] image ready: coding:8c2a4f7e91d6b5a3 (built) (4m12s)

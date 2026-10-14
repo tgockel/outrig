@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig image add` installs Node 24, not Node 20.** The `node` toolchain on a Debian-family
+  base ran NodeSource's `setup_20.x`, and the curated `node` base was `node:20-bookworm-slim`;
+  Node 20 reached end-of-life on 2026-04-30. Both are now Node 24, the active LTS, and the base
+  variant is `Node24BookwormSlim`. The help text said the toolchain came from "the base image's
+  package manager" in one place and "NodeSource" in another; it now says NodeSource, with `apk`
+  on Alpine. `outrig design prompt`'s Node example uses `node:24-bookworm-slim`. A Dockerfile
+  generated earlier keeps its old lines; replace its `# node toolchain` section (or a
+  `FROM node:20-bookworm-slim` line) with what `image add` writes now.
 - **A local model keeps its reasoning across a tool call.** The in-process `mistralrs` adapter
   dropped a reasoning step when it replayed history, so a chat template that renders in-progress
   reasoning (Qwen3's) gave the model each tool result back without the plan that asked for it.

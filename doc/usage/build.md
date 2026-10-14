@@ -73,7 +73,7 @@ $ outrig build
 [outrig] dockerfile:       .agents/outrig/images/coding/Dockerfile
 [outrig] context:          .agents/outrig/images/coding
 [outrig] image tag:        coding:8c2a4f7e91d6b5a3
-[buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
+[buildah] STEP 1/6: FROM docker.io/library/node:24-bookworm-slim
 ...
 [outrig] image ready: coding:8c2a4f7e91d6b5a3
 ```

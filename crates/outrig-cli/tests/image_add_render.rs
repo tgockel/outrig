@@ -219,9 +219,9 @@ fn fs_on_debian_base_installs_node_runtime() {
 
 #[test]
 fn fs_on_node_base_skips_runtime_install() {
-    // node:20-bookworm-slim ships node + npm already; the MCP block must
+    // node:24-bookworm-slim ships node + npm already; the MCP block must
     // not redundantly install them.
-    let out = render::render(BaseImage::Node20BookwormSlim, &[], &[McpServer::Fs]);
+    let out = render::render(BaseImage::Node24BookwormSlim, &[], &[McpServer::Fs]);
     assert!(
         !out.contains("apt-get install -y --no-install-recommends nodejs"),
         "should not redundantly install nodejs on node-base:\n{out}",

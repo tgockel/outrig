@@ -24,7 +24,7 @@ pub enum BaseImage {
     DebianBookwormSlim,
     Ubuntu24_04,
     AlpineLatest,
-    Node20BookwormSlim,
+    Node24BookwormSlim,
     Python3_12Slim,
 }
 
@@ -33,7 +33,7 @@ impl BaseImage {
         Self::DebianBookwormSlim,
         Self::Ubuntu24_04,
         Self::AlpineLatest,
-        Self::Node20BookwormSlim,
+        Self::Node24BookwormSlim,
         Self::Python3_12Slim,
     ];
 
@@ -42,7 +42,7 @@ impl BaseImage {
             Self::DebianBookwormSlim => "debian:bookworm-slim",
             Self::Ubuntu24_04 => "ubuntu:24.04",
             Self::AlpineLatest => "alpine:latest",
-            Self::Node20BookwormSlim => "node:20-bookworm-slim",
+            Self::Node24BookwormSlim => "node:24-bookworm-slim",
             Self::Python3_12Slim => "python:3.12-slim",
         }
     }
@@ -52,7 +52,7 @@ impl BaseImage {
             Self::DebianBookwormSlim => "Debian 12 slim. Apt-based; small but full-featured.",
             Self::Ubuntu24_04 => "Ubuntu 24.04 LTS. Apt-based; superset of Debian.",
             Self::AlpineLatest => "Alpine. Apk + musl; smallest footprint.",
-            Self::Node20BookwormSlim => "Debian-slim with Node 20 LTS preinstalled.",
+            Self::Node24BookwormSlim => "Debian-slim with Node 24 LTS preinstalled.",
             Self::Python3_12Slim => "Debian-slim with CPython 3.12 + pip preinstalled.",
         }
     }
@@ -67,7 +67,7 @@ impl BaseImage {
     /// `true` if the base image already ships a working `node + npm`. Used
     /// by the MCP install block to skip a redundant runtime-install step.
     fn has_node(self) -> bool {
-        matches!(self, Self::Node20BookwormSlim)
+        matches!(self, Self::Node24BookwormSlim)
     }
 
     /// `true` if the base image already ships a working `python3 + pip`.
@@ -238,8 +238,9 @@ fn mcp_block(
     let mut lines: Vec<String> = Vec::new();
     if need_node {
         // Bookworm and Alpine both ship a usable `nodejs npm` in the
-        // default repos -- older than NodeSource's setup_20.x but enough
-        // to run `npm install -g`. Saves the curl-and-pipe-bash dance.
+        // default repos -- older than NodeSource's setup_24.x (bookworm
+        // ships 18) but enough to run `npm install -g`. Saves the
+        // curl-and-pipe-bash dance.
         lines.push(ensure_pkgs(family, "nodejs npm"));
     }
     if need_python {

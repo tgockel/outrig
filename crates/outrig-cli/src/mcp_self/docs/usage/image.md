@@ -90,7 +90,7 @@ by hand, not an exhaustive Dockerfile generator.
   template adds the corresponding install steps; you can edit the file afterwards.
 
   rust    rustup + stable toolchain (cargo, rustfmt, clippy).
-  node    Node 20 LTS via NodeSource.
+  node    Node 24 LTS via NodeSource (apk on Alpine).
   python  CPython 3.12 with pip and venv.
   go      Go 1.27.
   none    Just the base image -- nothing extra installed.
@@ -107,7 +107,7 @@ The toolchain prompt offers curated options that cover the common cases:
 | Choice   | What gets installed                                               |
 |----------|-------------------------------------------------------------------|
 | `rust`   | `rustup` + the stable toolchain, `cargo`, `rustfmt`, `clippy`.    |
-| `node`   | Node 20 LTS via the base image's package manager (or NodeSource). |
+| `node`   | Node 24 LTS via NodeSource; `apk` on Alpine.                      |
 | `python` | CPython 3.12 with `pip` and `venv`.                               |
 | `go`     | Go 1.27.                                                          |
 | `none`   | Just the base image.                                              |
@@ -160,7 +160,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # node toolchain
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
