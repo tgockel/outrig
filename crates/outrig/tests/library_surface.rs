@@ -11,7 +11,7 @@
 
 #![cfg(feature = "e2e")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -1127,6 +1127,217 @@ workspace = "ro"
     assert!(
         result.render_text().contains("MARKER.txt"),
         "sidecar list_directory should see the workspace, got: {}",
+        result.render_text(),
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// A primary image whose `org.outrig.mcp` label declares `fs` -- the server the
+/// config below moves into a sidecar -- and `docs`, which it leaves alone. The
+/// label's `fs` serves `/tmp` and the sidecar's serves `/workspace`, so which of
+/// the two answered a call shows in what it can list.
+fn build_primary_image_embedding_fs_and_docs(tag: &str) {
+    let embedded_mcp = BTreeMap::from([
+        ("fs".to_string(), fs_spec("/tmp")),
+        ("docs".to_string(), fs_spec("/workspace")),
+    ]);
+    build_fixture_image_with_mcp_label(tag, &embedded_mcp);
+}
+
+/// The config both placement tests lower: the primary's `fs` is placed in
+/// `[sidecars.tools]`, whose `start` is the one thing they differ in.
+fn placed_fs_config(host_ws: &Path, primary_tag: &str, tools_tag: &str, start: &str) -> Config {
+    let config_toml = format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.primary]
+image-name = "{primary_tag}"
+
+[images.toolsimg]
+image-name = "{tools_tag}"
+
+[images.primary.mcp]
+fs = {{ command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }}
+
+[sidecars.tools]
+image = "toolsimg"
+workspace = "ro"
+start = "{start}"
+"#,
+        host_ws = host_ws.display(),
+    );
+    let config: Config = toml::from_str(&config_toml).expect("parse config");
+    config
+        .validate(None)
+        .expect("the placement config is valid");
+    config
+}
+
+/// A server the config places in a sidecar is served from that sidecar alone:
+/// the primary image's own `org.outrig.mcp` entry of the same name is not
+/// imported beside it, which used to abort the launch at `add_sidecar` with
+/// "already connected". The image's unrelated entries still merge.
+#[tokio::test]
+async fn from_config_placement_wins_over_the_primary_images_embedded_server() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let pid = std::process::id();
+    let primary_tag = format!("localhost/outrig-library-surface-placed-primary-{pid}:latest");
+    let tools_tag = format!("localhost/outrig-library-surface-placed-tools-{pid}:latest");
+    build_primary_image_embedding_fs_and_docs(&primary_tag);
+    build_fixture_image(&tools_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+    let config = placed_fs_config(host_ws.path(), &primary_tag, &tools_tag, "auto");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config");
+    // The premise: the config moved `fs` out of the primary, into a sidecar the
+    // spec carries.
+    assert!(
+        !spec.mcp.contains_key("fs"),
+        "`fs` is sidecar-placed, so not in the primary map: {:?}",
+        spec.mcp.keys().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        spec.sidecars
+            .iter()
+            .filter(|sidecar| sidecar.servers.contains_key("fs"))
+            .count(),
+        1,
+        "exactly one sidecar hosts `fs`",
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect(
+        "launch must not import the image's own `fs` when the config placed `fs` in a sidecar",
+    );
+    let servers: BTreeSet<&str> = outrig
+        .tools()
+        .iter()
+        .map(|tool| tool.server.as_str())
+        .collect();
+    assert_eq!(
+        servers,
+        BTreeSet::from(["docs", "fs"]),
+        "the sidecar's `fs` and the image's unrelated `docs`",
+    );
+
+    // `fs` can list `/workspace` only if the one connected is the sidecar's: the
+    // image's own entry serves `/tmp`. `docs` is the primary's and serves it too.
+    for server in ["fs", "docs"] {
+        let result = outrig
+            .call_tool(
+                server,
+                "list_directory",
+                serde_json::json!({ "path": "/workspace" }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("call_tool {server}: {e}"));
+        assert!(
+            result.render_text().contains("MARKER.txt"),
+            "{server} list_directory should see the workspace, got: {}",
+            result.render_text(),
+        );
+    }
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// A `start = "manual"` placement is not imported into the primary either.
+/// `from_config` neither starts nor carries that sidecar, but its server still
+/// belongs to it: the primary image's entry of the same name stays out, and the
+/// name is free when `add_sidecar` starts the sidecar later.
+#[tokio::test]
+async fn from_config_manual_placement_is_not_imported_into_the_primary() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let pid = std::process::id();
+    let primary_tag = format!("localhost/outrig-library-surface-manual-primary-{pid}:latest");
+    let tools_tag = format!("localhost/outrig-library-surface-manual-tools-{pid}:latest");
+    build_primary_image_embedding_fs_and_docs(&primary_tag);
+    build_fixture_image(&tools_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+    let config = placed_fs_config(host_ws.path(), &primary_tag, &tools_tag, "manual");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config");
+    assert!(spec.sidecars.is_empty(), "a manual sidecar is not carried");
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let servers: BTreeSet<&str> = outrig
+        .tools()
+        .iter()
+        .map(|tool| tool.server.as_str())
+        .collect();
+    assert_eq!(
+        servers,
+        BTreeSet::from(["docs"]),
+        "the image's `fs` belongs to the manual sidecar, so only `docs` is in the primary",
+    );
+    outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("nothing serves `fs` until the manual sidecar is added");
+
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("tools", tools_tag.as_str())
+                .with_workspace_access(SidecarWorkspaceAccess::Ro)
+                .with_server("fs", fs_command("/workspace")),
+        )
+        .await
+        .expect("add_sidecar: the name `fs` is still free");
+    let result = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via the added sidecar");
+    assert!(
+        result.render_text().contains("MARKER.txt"),
+        "the added sidecar's `fs` should see the workspace, got: {}",
         result.render_text(),
     );
 

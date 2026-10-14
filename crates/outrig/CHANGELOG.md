@@ -91,6 +91,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Outrig::launch` no longer re-imports an embedded server the config moved into a sidecar.**
+  When the primary image's `org.outrig.mcp` label declared a server and the config placed a server
+  of that name in a sidecar (`sidecar = "tools"`), `LaunchSpec::from_config` rightly left it out of
+  `LaunchSpec::mcp`, but `launch` then merged the label into the primary's map and could not tell
+  a name the config never mentioned from one it had moved elsewhere. The primary connected the
+  image's own entry, `add_sidecar` refused the sidecar's server of that name as already connected,
+  and the launch aborted. A server in a `start = "manual"` sidecar, which `from_config` neither
+  starts nor carries, was imported into the primary the same way, and the `add_sidecar` that later
+  started that sidecar failed likewise. `from_config` now records the names the config placed
+  outside the primary, and `launch` skips a label entry under any of them, so the config's
+  placement wins as it does for `outrig run`, which was not affected. Label servers the config
+  does not mention still merge. A `LaunchSpec` built by hand records no names and merges as
+  before. (#557)
+
 - **A sidecar whose entrypoint exits at once no longer reports an empty stderr.** The launcher's
   `outrig-enter: open <program>: ... (not found in PATH=...)`, or any server that prints a line and
   exits within milliseconds, arrived as `stderr (...): (empty)` beside `exit: code 1`. outrig starts

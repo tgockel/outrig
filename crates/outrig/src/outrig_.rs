@@ -3,7 +3,7 @@
 //! `launch -> tools/call_tool -> shutdown` flow that doesn't expose
 //! internals like rig, the REPL, or session storage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
@@ -399,7 +399,10 @@ impl SidecarSpec {
 #[non_exhaustive]
 pub enum EmbeddedMcpPolicy {
     /// Merge image-embedded declarations with the launch spec's MCP map.
-    /// Launch-spec entries replace image entries with the same server name.
+    /// Launch-spec entries replace image entries with the same server name,
+    /// and a spec built by [`LaunchSpec::from_config`] also keeps an image
+    /// entry out of the primary when the config placed a server of that name
+    /// in a sidecar.
     #[default]
     Merge,
     /// Ignore image-embedded declarations and use only the launch spec's MCP map.
@@ -482,6 +485,15 @@ pub struct LaunchSpec {
     pub network: NetworkSpec,
     pub embedded_mcp_policy: EmbeddedMcpPolicy,
     pub mcp: BTreeMap<String, McpServerSpec>,
+    /// Names of the servers the config placed outside the primary: in a
+    /// sidecar, including a `start = "manual"` one that `from_config` does not
+    /// carry. They are absent from `mcp` either way, so without this a name the
+    /// config moved looks like one it never mentioned, and `launch` would
+    /// import the primary image's label entry of that name. Set by
+    /// `from_config` and empty otherwise. It is derived once: a caller who later
+    /// removes the sidecar from `sidecars` loses the server rather than
+    /// falling back to the label's.
+    placed_elsewhere: BTreeSet<String>,
     pub sidecars: Vec<SidecarSpec>,
     pub log_dir: PathBuf,
     /// The `tools/call` deadline in seconds for every server, primary or
@@ -521,6 +533,7 @@ impl LaunchSpec {
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
+            placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
             log_dir,
             mcp_call_timeout_secs: None,
@@ -542,6 +555,7 @@ impl LaunchSpec {
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
+            placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
             log_dir,
             mcp_call_timeout_secs: None,
@@ -575,6 +589,11 @@ impl LaunchSpec {
     /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
     ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
     ///   mid-session.
+    /// - A server the config places in a sidecar, a `start = "manual"` one
+    ///   included, is not also imported from the primary image's
+    ///   `org.outrig.mcp` label. Under [`EmbeddedMcpPolicy::Merge`],
+    ///   [`Outrig::launch`] skips a label entry of that name, as `outrig run`
+    ///   does, and merges the label's other entries as usual.
     /// - `on-failure = "warn"` is not honored: launch-time sidecars are
     ///   abort-only here, per [`LaunchSpec::with_sidecar`].
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
@@ -639,6 +658,14 @@ impl LaunchSpec {
             network: NetworkSpec::from(&config.network),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
+            // Every sidecar-placed name, a manual sidecar's included: the
+            // primary map and `sidecars` above leave all of them out.
+            placed_elsewhere: plan
+                .servers
+                .iter()
+                .filter(|(_, placed)| placed.placement != Placement::Primary)
+                .map(|(name, _)| name.clone())
+                .collect(),
             sidecars,
             log_dir,
             mcp_call_timeout_secs: config.mcp_call_timeout_secs,
@@ -714,7 +741,8 @@ impl LaunchSpec {
 /// sidecars. Pure -- no image resolution, so each `SidecarSpec.image` still
 /// holds the unresolved config ref for [`LaunchSpec::from_config`] to rewrite.
 /// `start = "manual"` sidecars are dropped (their servers, being sidecar-placed,
-/// are already absent from the primary map); every other placement lowers,
+/// are already absent from the primary map, and nothing here carries them on --
+/// `from_config` records their names separately); every other placement lowers,
 /// entrypoint-stdio included.
 fn plan_to_launch_parts(
     plan: &SessionMcpPlan,
@@ -957,12 +985,21 @@ impl Outrig {
 
         let mcp = match spec.embedded_mcp_policy {
             EmbeddedMcpPolicy::Merge => {
-                embedded::merged_mcp_with_source(
+                let mut merged = embedded::merged_mcp_with_source(
                     &container,
                     &spec.mcp,
                     McpDeclarationSource::LaunchSpec,
                 )
-                .await?
+                .await?;
+                // The config's placement replaces the image's entry of the
+                // same name, so an entry the config put in a sidecar is not
+                // the primary's. Only the image's entries go: one in
+                // `spec.mcp` is the caller's own.
+                merged.retain(|name, server| {
+                    server.source != McpDeclarationSource::ImageLabel
+                        || !spec.placed_elsewhere.contains(name)
+                });
+                merged
             }
             EmbeddedMcpPolicy::Ignore => {
                 embedded::mcp_with_source(&spec.mcp, McpDeclarationSource::LaunchSpec)
