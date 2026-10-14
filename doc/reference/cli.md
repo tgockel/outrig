@@ -366,7 +366,8 @@ it accepts two replies in a row. Both adapters are exercised against a mock, not
 endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-backed Claude
 behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
 call carried one, the error says where, and what to set: `role-alternation = "strict"` on the
-provider's row (see [`role-alternation`](config.md#style--openai)). With that set, each call is
+provider's row (see [`role-alternation`](config.md#style--openai)). For an alias of several
+models, that holds when the first one refused it. With that set, each call is
 sent a conversation that alternates by construction, at the cost of the turns that would not. A
 turn brought back without the rest of its round is left out where it would follow the model's
 own reply, so promote whole rounds on such a provider. A round that ended on results -- the
@@ -383,9 +384,13 @@ several, a call that still fails moves to the next, as in `run`, and each call s
 the first. The call that moves is sent a conversation chosen for the window of the model it moves
 to, which may leave out more than the first model's did. When every model has failed, the round
 ends with each one's reason and keeps any Python it ran. Unlike `run`, no failure ends the
-session, even one a resend cannot fix, such as a key every provider refuses; `/quit` does. With
-`[events] mode = "record"`, the event log records each retry and each move, and names the model
-that answered each call.
+session; `/quit` does. The error says whether another message could help. If any model failed in
+a way that may clear -- a rate limit that outlasted the budget, an unreachable host, a response
+that could not be decoded, an error a gateway sent with a success status, a turn too large for a
+later model's window, which the next call leaves out -- it says to send another. If none did,
+such as a key every model refuses, it says that sending another fails the same way, and to
+correct the cause and start a new session. With `[events] mode = "record"`, the event log
+records each retry and each move, and names the model that answered each call.
 
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent

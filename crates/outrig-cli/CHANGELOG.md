@@ -42,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaving out what does not fit; a turn too large to send on its own ends its round, naming it,
   and later rounds go on without it. A failing provider is retried and an alias fails over as in
   `run`, a call that moves being sent what fits the next model's window; when every model has
-  failed, the round ends with each one's reason, and the session goes on. Python that spins without yielding is interrupted
+  failed, the round ends with each one's reason, and the session goes on. Its error says to send
+  another message when a failure could clear, such as a rate limit that outlasted the retry
+  budget, and says that doing so fails the same way when none could, such as a key every model
+  refuses. Python that spins without yielding is interrupted
   after about half a minute on its own. Python that allocates past its memory ceiling, half of
   what the container can see, gets a `MemoryError` the model reads rather than ending the session;
   programs it starts inherit the ceiling, and can raise their own. The agent's Python imports

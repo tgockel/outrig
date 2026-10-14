@@ -62,6 +62,7 @@
 //! [`retry`]: super::retry
 //! [`Wire`]: super::budget::Wire
 
+use std::fmt;
 use std::sync::Arc;
 
 use rig::OneOrMany;
@@ -213,6 +214,7 @@ pub(crate) struct Answered {
 
 /// Why one candidate was abandoned, kept so exhaustion can report every reason
 /// rather than only the last one's.
+#[derive(Debug)]
 struct Abandoned {
     model_name: String,
     error: CompletionError,
@@ -316,7 +318,9 @@ impl FailoverModel {
     }
 }
 
-/// The failure a chain returns when every candidate has been abandoned.
+/// The failure a chain returns when every candidate has been abandoned, boxed
+/// into [`CompletionError::RequestError`] the way [`TooLarge`] is, so the round
+/// can [read it back](Self::of) instead of parsing its text.
 ///
 /// Rendered as one line per candidate, mirroring the shape resolution uses for
 /// an alias with no selectable candidate: three candidates failing for three
@@ -324,21 +328,113 @@ impl FailoverModel {
 /// afternoon on. It says whether any reason could clear without a change to the
 /// config -- one vendor rate-limiting while another's key is revoked is still
 /// worth waiting out, because the rate limit is the one that can lift.
-fn exhausted(abandoned: Vec<Abandoned>) -> CompletionError {
-    let recoverable = abandoned
-        .iter()
-        .any(|a| super::retry::is_recoverable(&a.error));
-    let rows: Vec<_> = abandoned
-        .iter()
-        .map(|a| (a.model_name.as_str(), a.error.to_string()))
-        .collect();
-    let tried = super::resolve::render_candidate_reasons(&rows);
-    let failed = if recoverable {
-        "every model candidate failed"
-    } else {
-        "every model candidate failed terminally"
-    };
-    CompletionError::ProviderError(format!("{failed}; tried:\n{tried}"))
+#[derive(Debug)]
+pub(crate) struct Exhausted {
+    /// Every candidate, in the chain's order: the head's reason first.
+    abandoned: Vec<Abandoned>,
+}
+
+impl Exhausted {
+    fn into_error(abandoned: Vec<Abandoned>) -> CompletionError {
+        CompletionError::RequestError(Box::new(Self { abandoned }))
+    }
+
+    /// The exhaustion `err` is, if it is one.
+    pub(crate) fn of(err: &CompletionError) -> Option<&Self> {
+        match err {
+            CompletionError::RequestError(inner) => inner.downcast_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether at least one candidate failed for a reason a later round could get past.
+    fn may_clear(&self) -> bool {
+        self.abandoned.iter().any(|a| candidate_may_clear(&a.error))
+    }
+}
+
+impl fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows: Vec<_> = self
+            .abandoned
+            .iter()
+            .map(|a| (a.model_name.as_str(), a.error.to_string()))
+            .collect();
+        let failed = if self.may_clear() {
+            "every model candidate failed"
+        } else {
+            "every model candidate failed terminally"
+        };
+        write!(
+            f,
+            "{failed}; tried:\n{}",
+            super::resolve::render_candidate_reasons(&rows)
+        )
+    }
+}
+
+impl std::error::Error for Exhausted {}
+
+/// Whether sending another message after `err` could end differently, for a
+/// chain's exhaustion and a lone model's failure alike.
+///
+/// Asked of every candidate when `err` is a chain's, and a chain's is worth
+/// another round when any one is: a rate limit that outlasted the budget may
+/// lift, and a key every provider refuses will not.
+pub(crate) fn may_clear(err: &CompletionError) -> bool {
+    match Exhausted::of(err) {
+        Some(chain) => chain.may_clear(),
+        None => candidate_may_clear(err),
+    }
+}
+
+/// [`may_clear`] for one candidate's error.
+///
+/// This is not [`is_recoverable`](super::retry::is_recoverable), which names
+/// what a retry loop resends: the *same* request. The next round sends a
+/// different one, so what a loop resends clears, and so do two failures no
+/// loop would repeat:
+///
+/// - A call not sent because its latest turn did not fit the candidate's
+///   window ([`TooLarge`]). Resending it fails again, but the turn stays in
+///   `runtime.history` and the next round's view leaves it out.
+/// - A `200` that was not a completion. rig raises
+///   [`CompletionError::JsonError`] for a body that is not JSON, or, for an
+///   Anthropic-style provider, not a message; and
+///   [`CompletionError::ProviderResponse`] with a success status for an
+///   OpenAI-style provider's body that is not a completion, such as the error
+///   envelope a gateway answers with when it accepted a request that then
+///   failed from an overload or a timeout. Nothing in a `200` says it cannot
+///   clear, and a later call may not come back that way. A body that names a
+///   permanent cause, or a wrong `base-url` that answers `200` with something
+///   else, reads the same; the reason carries the error or the body, and the
+///   advice is what every failed round gave.
+///
+/// Anything else -- a `401`, a model that does not exist, a provider-reported
+/// fault -- stays terminal.
+fn candidate_may_clear(err: &CompletionError) -> bool {
+    match err {
+        CompletionError::JsonError(_) => true,
+        CompletionError::ProviderResponse(response) => {
+            response.status.is_some_and(|status| status.is_success())
+        }
+        CompletionError::RequestError(inner) => inner.is::<TooLarge>(),
+        other => super::retry::is_recoverable(other),
+    }
+}
+
+/// The HTTP status of the refusal that ended the call at the head of the chain,
+/// when it carried one.
+///
+/// A chain of one returns its candidate's error as it stands, so its status
+/// reads straight off it. For a real chain it is the head's reason, which is
+/// the first: every call starts at the head, and the head is sent the view the
+/// round assembled for it, which is the one the round's hint speaks of.
+pub(crate) fn head_status(err: &CompletionError) -> Option<reqwest::StatusCode> {
+    match Exhausted::of(err) {
+        Some(chain) => chain.abandoned.first()?.error.provider_response_status(),
+        None => err.provider_response_status(),
+    }
 }
 
 /// `history`, with the messages after the system prompt replaced by `view`.
@@ -431,9 +527,10 @@ impl CompletionModel for FailoverModel {
             attempt.max_tokens = candidate.budget().max_tokens.map(u64::from);
 
             let error = match outcome {
-                // Not made: a call that cannot fit is terminal for this
-                // candidate, which is what a `RequestError` is to
-                // `is_recoverable`.
+                // Not made: the call cannot fit this candidate. Sending it
+                // again fails the same way, which is what a `RequestError` is
+                // to `is_recoverable`; the next round's view leaves the turn
+                // out, which `candidate_may_clear` counts.
                 Err(too_large) => CompletionError::RequestError(Box::new(too_large)),
                 Ok(()) => match candidate.completion(attempt).await {
                     Ok(response) => {
@@ -463,7 +560,7 @@ impl CompletionModel for FailoverModel {
         // gets the aggregate.
         match <[Abandoned; 1]>::try_from(abandoned) {
             Ok([only]) => Err(only.error),
-            Err(many) => Err(exhausted(many)),
+            Err(many) => Err(Exhausted::into_error(many)),
         }
     }
 
@@ -601,8 +698,17 @@ mod tests {
             CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(status)) => {
                 CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(*status))
             }
+            CompletionError::JsonError(_) => undecodable(),
+            CompletionError::ProviderResponse(response) => {
+                CompletionError::ProviderResponse(response.clone())
+            }
             other => CompletionError::ProviderError(other.to_string()),
         }
+    }
+
+    /// A response that did not decode, as rig raises one.
+    fn undecodable() -> CompletionError {
+        CompletionError::JsonError(serde_json::from_str::<()>("{").unwrap_err())
     }
 
     fn http_status(code: u16) -> CompletionError {
@@ -668,12 +774,26 @@ mod tests {
         FailoverModel::new(candidates, RetryPolicy::default(), slot, view)
     }
 
-    /// The text of the `ProviderError` a chain's exhaustion is.
+    /// The text of the exhaustion a chain's failure is.
     fn exhaustion(err: CompletionError) -> String {
-        match err {
-            CompletionError::ProviderError(text) => text,
-            other => panic!("not a chain's exhaustion: {other:?}"),
+        match Exhausted::of(&err) {
+            Some(chain) => chain.to_string(),
+            None => panic!("not a chain's exhaustion: {err:?}"),
         }
+    }
+
+    /// What a chain of `candidates`, each failing as given, returns.
+    async fn failed_with(
+        failures: impl IntoIterator<Item = (&'static str, CompletionError)>,
+    ) -> CompletionError {
+        let candidates = failures
+            .into_iter()
+            .map(|(name, error)| Box::new(Scripted::failing(name, error)) as Box<dyn Candidate>)
+            .collect();
+        chain(candidates)
+            .completion(request())
+            .await
+            .expect_err("every candidate failed")
     }
 
     /// The headline case: candidate one is down past its own retries, and the
@@ -758,6 +878,135 @@ mod tests {
             text.starts_with("every model candidate failed; tried:\n"),
             "one transient candidate is enough to make waiting worth it: {text}",
         );
+    }
+
+    /// What the round reads of a failure is the typed exhaustion, never its
+    /// text: only a chain of more than one returns it, and a lone candidate's
+    /// error reaches the round as it stands.
+    #[tokio::test]
+    async fn only_a_real_chain_returns_an_exhaustion() {
+        let chained = failed_with([
+            ("bedrock", http_status(401)),
+            ("anthropic", http_status(401)),
+        ])
+        .await;
+        assert!(Exhausted::of(&chained).is_some());
+
+        let lone = failed_with([("bedrock", http_status(401))]).await;
+        assert!(Exhausted::of(&lone).is_none());
+        assert!(matches!(lone, CompletionError::HttpError(_)), "{lone:?}");
+        assert!(Exhausted::of(&CompletionError::RequestError("other".into())).is_none());
+    }
+
+    /// Whether a resend could help is the chain's verdict for a chain and the
+    /// candidate's own for a lone model: a rate limit may lift, a refused key
+    /// will not, and one that may is enough for a chain.
+    #[tokio::test]
+    async fn a_resend_is_worth_it_when_any_failure_could_clear() {
+        let cases = [
+            (vec![401, 401], false),
+            (vec![401, 403], false),
+            (vec![401, 503], true),
+            (vec![429, 401], true),
+            (vec![401], false),
+            (vec![429], true),
+            (vec![503], true),
+        ];
+        for (statuses, clears) in cases {
+            let names = ["bedrock", "anthropic", "vertex"];
+            let err = failed_with(
+                statuses
+                    .iter()
+                    .zip(names)
+                    .map(|(status, name)| (name, http_status(*status))),
+            )
+            .await;
+            assert_eq!(may_clear(&err), clears, "{statuses:?}: {err}");
+        }
+    }
+
+    /// The next round sends a different request, so a failure no loop retries
+    /// can still be worth a message: a response that did not decode, an error
+    /// envelope a gateway sent with a `200`, and a call a fallback's window
+    /// could not hold, whose turn the next view leaves out. A reason with
+    /// nothing to get past it stays terminal.
+    #[tokio::test]
+    async fn a_failure_the_next_round_gets_past_is_worth_a_resend() {
+        let lone = failed_with([("bedrock", undecodable())]).await;
+        assert!(
+            may_clear(&lone),
+            "a lone model's undecodable response: {lone}"
+        );
+        let chained =
+            failed_with([("bedrock", http_status(401)), ("anthropic", undecodable())]).await;
+        assert!(may_clear(&chained), "{chained}");
+
+        let envelope = || {
+            CompletionError::from_http_response(
+                reqwest::StatusCode::OK,
+                r#"{"error":{"code":502,"message":"Provider returned error"}}"#,
+            )
+        };
+        let accepted = failed_with([("bedrock", envelope())]).await;
+        assert!(may_clear(&accepted), "a 200 error envelope: {accepted}");
+        let accepted_later =
+            failed_with([("bedrock", http_status(401)), ("anthropic", envelope())]).await;
+        assert!(may_clear(&accepted_later), "{accepted_later}");
+
+        let views = Arc::new(Views {
+            too_large_for: Some("anthropic"),
+            ..Views::default()
+        });
+        let oversized = chain_over(
+            vec![
+                Box::new(Scripted::failing("bedrock", http_status(401))),
+                Box::new(Scripted::ok("anthropic")),
+            ],
+            views,
+            CallSlot::default(),
+        )
+        .completion(request())
+        .await
+        .expect_err("the head refused and the tail could not hold the call");
+        assert!(may_clear(&oversized), "{oversized}");
+        let label = exhaustion(oversized);
+        assert!(
+            label.contains("401") && !label.contains("terminally"),
+            "{label}"
+        );
+
+        let fault = failed_with([(
+            "bedrock",
+            CompletionError::ProviderError("no such model".into()),
+        )])
+        .await;
+        assert!(!may_clear(&fault), "a provider-reported fault: {fault}");
+    }
+
+    /// The status a refusal carried is the head's, for a chain as for a lone
+    /// model: every call starts at the head, and the hint a refusal earns is
+    /// about the view the head was sent. A later model's status is not it.
+    #[tokio::test]
+    async fn a_chains_refusal_status_is_the_heads() {
+        let status = |statuses: [u16; 2]| async move {
+            let err = failed_with([
+                ("bedrock", http_status(statuses[0])),
+                ("anthropic", http_status(statuses[1])),
+            ])
+            .await;
+            head_status(&err).map(|status| status.as_u16())
+        };
+        assert_eq!(status([400, 401]).await, Some(400));
+        assert_eq!(status([503, 400]).await, Some(503));
+
+        let lone = failed_with([("bedrock", http_status(422))]).await;
+        assert_eq!(head_status(&lone).map(|s| s.as_u16()), Some(422));
+        let no_status = failed_with([
+            ("bedrock", CompletionError::ResponseError("empty".into())),
+            ("anthropic", http_status(400)),
+        ])
+        .await;
+        assert_eq!(head_status(&no_status), None);
     }
 
     /// Exhaustion names every candidate with its *own* reason, not just the last

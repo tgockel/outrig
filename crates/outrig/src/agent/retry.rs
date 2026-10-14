@@ -63,7 +63,8 @@
 //!   learns whether the body was usable.
 //! - The predicates the CLI's REPL classifies a failed turn with are not here.
 //!   A round's failure ends the round whatever it was, so nothing reads them;
-//!   [`is_recoverable`] remains, for what a chain says of its exhaustion.
+//!   [`is_recoverable`] remains: what a loop resends, which a chain's verdict
+//!   on whether another round could help starts from.
 //!
 //! [`CompletionModel`]: rig::completion::CompletionModel
 
@@ -999,10 +1000,10 @@ fn is_transient(err: &HttpError) -> bool {
 /// exist, a provider-reported fault -- is terminal: no number of resends
 /// satisfies it.
 ///
-/// A failover chain asks this of each candidate's error before aggregating
-/// them, so its report can say whether waiting is worth anything. Defined here,
-/// beside the loops whose classes it unions, so the chain's verdict on an error
-/// cannot drift from what was retried.
+/// Defined here, beside the loops whose classes it unions, so it cannot drift
+/// from what was retried. It answers for the *same* request only: a failover
+/// chain's `may_clear` starts from it and adds what the next round, which sends
+/// a different request, can get past.
 ///
 /// A wrong `base-url` fails with a connection error, which is transient by
 /// this predicate. The wait before it is bounded by [`CONNECT_BUDGET`], so a
@@ -1063,7 +1064,8 @@ mod tests {
 
     /// What either loop retried is recoverable, and nothing else is: a
     /// provider-reported fault may well be a misconfiguration no retry and no
-    /// resend can fix.
+    /// resend can fix. A response that did not decode is not retried either,
+    /// though a later round may get past it (`failover::may_clear`).
     #[test]
     fn only_what_a_loop_retries_is_recoverable() {
         assert!(is_recoverable(&CompletionError::ResponseError(
@@ -1072,6 +1074,9 @@ mod tests {
         assert!(is_recoverable(&http_status(503)));
         assert!(!is_recoverable(&CompletionError::ProviderError(
             "nope".into()
+        )));
+        assert!(!is_recoverable(&CompletionError::JsonError(
+            serde_json::from_str::<()>("{").unwrap_err()
         )));
     }
 

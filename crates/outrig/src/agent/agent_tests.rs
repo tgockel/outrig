@@ -19,7 +19,7 @@ use super::channel::Announcer;
 use super::history::{LeftOut, Manifest, Why, Window, as_sent};
 use super::mock_http::{
     self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, strict_refusal,
-    submit, text_reply,
+    submit, text_reply, undecodable,
 };
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::retry::RetryingHttpClient;
@@ -3977,6 +3977,350 @@ async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
         tool_result(&recorded[2], "toolu_1"),
         "ran\n",
         "the next round carries what the failed one ran"
+    );
+}
+
+/// The round's failure, with whether the round had run Python.
+fn failed_round(err: SessionError) -> (String, bool) {
+    match err {
+        SessionError::Round(failure) => (failure.to_string(), failure.ran_python()),
+        other => panic!("not a failed round: {other}"),
+    }
+}
+
+/// What every failed round said of resending before a failure could be told to
+/// repeat itself.
+const RESEND_WORKS: &str = "send another";
+
+/// What a failure that does not clear says in its place.
+const RESEND_FAILS: &str = "does not clear on its own";
+
+/// A key every model of an alias refuses is not an outage to wait out, and the
+/// round says so rather than advising a resend that fails the same way. The
+/// reasons stay: they are how the person finds which key.
+#[tokio::test]
+async fn a_key_every_model_refuses_is_not_worth_resending() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REFUSED_EVERYWHERE";
+    let (head, _head_requests) = mock_http::start(vec![failure(401)]).await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    post(&agent, "hello").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("every model refused"),
+    );
+    assert!(
+        err.contains("every model candidate failed terminally; tried:"),
+        "{err}"
+    );
+    for reason in ["head", "tail", "401"] {
+        assert!(err.contains(reason), "{reason}: {err}");
+    }
+    assert!(
+        err.contains(RESEND_FAILS) && err.contains("start a new session"),
+        "{err}"
+    );
+    assert!(!err.contains(RESEND_WORKS), "{err}");
+    assert!(!ran, "no Python ran: {err}");
+    shut_down(agent).await;
+}
+
+/// ...and when the round had already run Python, it still says what that
+/// kept, and no longer says to continue.
+#[tokio::test]
+async fn a_refusal_after_python_ran_keeps_it_and_says_resending_will_not_help() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REFUSED_AFTER_WORK";
+    let (head, _head_requests) =
+        mock_http::start(vec![submit("toolu_1", "x = 41"), failure(401)]).await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(403)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let (events, mut submitted) = watched(None).await;
+    let mut agent = chained_agent(vars, events, &cfg).await;
+
+    post(&agent, "set x").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("every model refused"),
+    );
+    assert!(ran, "{err}");
+    assert_eq!(submissions(&mut submitted), ["x = 41"]);
+    assert!(
+        err.contains("already run Python") && err.contains("kept in the conversation"),
+        "{err}"
+    );
+    assert!(
+        err.contains(RESEND_FAILS) && err.contains("start a new session"),
+        "{err}"
+    );
+    assert!(
+        !err.contains(RESEND_WORKS) && !err.contains("rather than repeating one"),
+        "{err}"
+    );
+    shut_down(agent).await;
+}
+
+/// A lone model's refusal is the same failure with one reason, and the same
+/// advice. Nothing about it needed a chain.
+#[tokio::test]
+async fn a_lone_model_that_is_refused_says_resending_will_not_help() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_REFUSED_ALONE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![failure(401)],
+    )
+    .await;
+
+    post(&agent, "hello").await;
+    let (err, ran) = failed_round(within(agent.round()).await.expect_err("the model refused"));
+    assert!(err.contains("401"), "{err}");
+    assert!(
+        err.contains(RESEND_FAILS) && !err.contains(RESEND_WORKS),
+        "{err}"
+    );
+    assert!(!ran, "{err}");
+    shut_down(agent).await;
+}
+
+/// A failure that can lift still says to send another message: a rate limit
+/// that outlasted the budget, alone or as the one reason in a chain that could.
+/// The chain's other model being refused does not change that.
+#[tokio::test]
+async fn a_rate_limit_that_outlasted_the_budget_still_says_to_send_another() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_RATE_LIMITED_ALONE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![failure(429)],
+    )
+    .await;
+    post(&agent, "hello").await;
+    let (err, _) = failed_round(within(agent.round()).await.expect_err("rate limited"));
+    assert!(
+        err.contains("429") && err.contains("send another to try again"),
+        "{err}"
+    );
+    assert!(!err.contains(RESEND_FAILS), "{err}");
+    shut_down(agent).await;
+
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_RATE_LIMITED_TAIL";
+    let (head, _head_requests) = mock_http::start(vec![failure(401)]).await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(429)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+    post(&agent, "hello").await;
+    let (err, _) = failed_round(within(agent.round()).await.expect_err("every model failed"));
+    assert!(
+        err.contains("every model candidate failed; tried:")
+            && err.contains("send another to try again"),
+        "{err}"
+    );
+    assert!(!err.contains(RESEND_FAILS), "{err}");
+    shut_down(agent).await;
+}
+
+/// A response that did not decode is not retried, but a later call may not come
+/// back that way, so the round still says to send another -- and the next
+/// round, sent, goes on.
+#[tokio::test]
+async fn a_response_that_did_not_decode_still_says_to_send_another() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_UNDECODABLE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![undecodable(), text_reply("recovered")],
+    )
+    .await;
+
+    post(&agent, "hello").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("the response did not decode"),
+    );
+    assert!(err.contains("JsonError"), "{err}");
+    assert!(
+        err.contains("send another to try again") && !err.contains(RESEND_FAILS),
+        "{err}"
+    );
+    assert!(!ran, "{err}");
+
+    assert_eq!(round(&mut agent, "again").await, "recovered");
+    shut_down(agent).await;
+}
+
+/// A gateway that accepted a request which then failed -- an overload, a
+/// timeout -- answers `200` with the provider's error envelope. rig reads that as
+/// a provider response with a success status, and nothing in the status says it
+/// cannot clear: the next request can succeed in the same session, so the round
+/// says to send another.
+#[tokio::test]
+async fn an_error_sent_with_a_success_status_still_says_to_send_another() {
+    for style in Style::ALL {
+        let (mut agent, _requests) = agent_in(
+            style,
+            "OUTRIG_TEST_AGENT_ERROR_IN_A_200",
+            MODEL,
+            "",
+            "max-tokens = 4096",
+            vec![style.failed_after_accepting(), style.text("recovered")],
+        )
+        .await;
+
+        post(&agent, "hello").await;
+        let (err, ran) = failed_round(
+            within(agent.round())
+                .await
+                .expect_err("the provider reported a failure"),
+        );
+        assert!(err.contains("ProviderResponseError"), "{style:?}: {err}");
+        assert!(
+            err.contains("send another to try again") && !err.contains(RESEND_FAILS),
+            "{style:?}: {err}"
+        );
+        assert!(!ran, "{style:?}: {err}");
+
+        assert_eq!(round(&mut agent, "again").await, "recovered", "{style:?}");
+        shut_down(agent).await;
+    }
+}
+
+/// A fallback whose window cannot hold the round's latest turn is not sent the
+/// call, and with a head that refuses every call that exhausts the chain. The
+/// turn stays in the conversation and the next round's view leaves it out, so
+/// the fallback answers it: the round says to send another rather than to start
+/// a new session.
+#[tokio::test]
+async fn a_turn_a_fallback_cannot_hold_does_not_end_the_session() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_TAIL_TOO_SMALL";
+    let (head, _head_requests) =
+        mock_http::start(vec![failure(401), failure(401), failure(401)]).await;
+    let (tail, mut tail_requests) = mock_http::start(vec![
+        submit("toolu_big", "print('x' * 60000)"),
+        text_reply("recovered"),
+    ])
+    .await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (
+            Style::Anthropic,
+            &format!("http://{tail}"),
+            "context-window = 7000\nmax-tokens = 1024",
+        ),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    post(&agent, "print a lot").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("the head refused and the tail could not hold the turn"),
+    );
+    assert!(ran, "the tail ran the call before it was too large: {err}");
+    assert!(
+        err.contains("401") && err.contains("7000-token context window"),
+        "{err}"
+    );
+    assert!(
+        err.contains("send another to continue") && !err.contains(RESEND_FAILS),
+        "{err}"
+    );
+    assert!(!err.contains("failed terminally"), "{err}");
+    assert_eq!(
+        mock_http::drain(&mut tail_requests).len(),
+        1,
+        "the tail was never sent the call it could not hold"
+    );
+
+    assert_eq!(round(&mut agent, "go on").await, "recovered");
+    let second = mock_http::drain(&mut tail_requests)
+        .pop()
+        .expect("the tail's second request");
+    assert_eq!(count(&second, "xxxxxxxxxx"), 0, "{:#}", second.body);
+    shut_down(agent).await;
+}
+
+/// The fourth round's replies [`a_refused_call_that_carried_a_same_role_pair_says_so`]
+/// scripts, ending in `last`.
+fn refused_pair_script(last: CannedResponse) -> Vec<CannedResponse> {
+    vec![
+        text_reply("first"),
+        submit("call_a", "a = 1"),
+        submit("call_b", "b = 2"),
+        text_reply("second"),
+        text_reply("third"),
+        submit("call_p", "runtime.context.promote(2)"),
+        last,
+    ]
+}
+
+/// A refusal at the head of a chain says where it came from, as it does for a
+/// model with no alias, though the chain's own error carries no status of its
+/// own: it is the head's reason that does.
+#[tokio::test]
+async fn a_refused_call_through_a_chain_says_where_it_was_refused() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REFUSED_PAIR";
+    let (head, _head_requests) = mock_http::start(refused_pair_script(failure(400))).await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    let err = refused_fourth_round(&mut agent).await;
+    assert!(
+        err.contains(
+            "The conversation it was sent left turns out, which put two of the model's \
+             replies in a row, where turn 2 begins"
+        ) && err.contains(r#"set [providers.first].role-alternation = "strict""#)
+            && err.contains("doc/reference/cli.md"),
+        "{err}"
+    );
+    assert!(
+        err.contains("tail") && err.contains("401"),
+        "the chain's reasons stay: {err}"
+    );
+}
+
+/// The hint names the head's row and speaks of the view the head was sent, so
+/// a refusal by a later model, when the head failed some other way, earns none:
+/// it would name a provider that did not refuse.
+#[tokio::test]
+async fn a_later_models_refusal_earns_no_hint_naming_the_head() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REFUSED_LATER";
+    let (head, _head_requests) = mock_http::start(refused_pair_script(failure(503))).await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(400)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    let err = refused_fourth_round(&mut agent).await;
+    assert!(err.contains("503") && err.contains("400"), "{err}");
+    assert!(
+        !err.contains("role-alternation"),
+        "the head was not refused: {err}"
     );
 }
 

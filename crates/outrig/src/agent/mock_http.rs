@@ -116,6 +116,11 @@ pub(super) fn failure(status: u16) -> CannedResponse {
     )
 }
 
+/// A `200` whose body is not a message, so rig's decode of it fails.
+pub(super) fn undecodable() -> CannedResponse {
+    CannedResponse::new(200, json!({ "not": "a message" }))
+}
+
 /// An Anthropic message envelope in the shape rig's `ApiResponse`
 /// deserializes.
 pub(super) fn message(content: Value, stop_reason: &str) -> CannedResponse {
@@ -238,6 +243,21 @@ impl Style {
                         "message": "the mock failed on purpose",
                     },
                 }),
+            ),
+        }
+    }
+
+    /// A `200` carrying the provider's error envelope, as a gateway answers a
+    /// request it accepted and that then failed from an overload or a timeout.
+    /// rig reads it as a provider response with a success status.
+    pub(super) fn failed_after_accepting(self) -> CannedResponse {
+        match self {
+            Style::Anthropic => {
+                CannedResponse::new(200, json!({ "type": "error", "message": "Overloaded" }))
+            }
+            Style::OpenAi => CannedResponse::new(
+                200,
+                json!({ "error": { "code": 502, "message": "Provider returned error" } }),
             ),
         }
     }

@@ -29,7 +29,7 @@ use rig::completion::{Message, Prompt, PromptError};
 use super::AgentError;
 use super::budget::Budget;
 use super::build::RigAgent;
-use super::failover::FailoverModel;
+use super::failover::{self, FailoverModel};
 use super::history::{self, Adjacent, History};
 use super::ledger::CallSlot;
 use super::tool::{self, Interrupts};
@@ -218,10 +218,12 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
         ) => (cap_reason(max_turns), *chat_history),
         (other, _) => {
             let text = format!("{other}{}", hook.refusal_hint(&other));
-            return Err(if hook.keep_what_ran() {
-                AgentError::PromptAfterWork(text)
-            } else {
-                AgentError::Prompt(text)
+            let ran = hook.keep_what_ran();
+            return Err(match (ran, may_clear(&other)) {
+                (false, true) => AgentError::Prompt(text),
+                (true, true) => AgentError::PromptAfterWork(text),
+                (false, false) => AgentError::PromptTerminal(text),
+                (true, false) => AgentError::PromptAfterWorkTerminal(text),
             });
         }
     };
@@ -231,6 +233,20 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
         stopped: Some(reason),
         reasoning: None,
     })
+}
+
+/// Whether sending again after `err` could end differently.
+///
+/// A failed model call answers by its kind: a rate limit that outlasted the
+/// budget may lift, a fallback that could not hold the round's latest turn
+/// will be sent a view without it next round, and a key every model refuses
+/// will not clear. Any other error keeps the advice every failed round has
+/// had.
+fn may_clear(err: &PromptError) -> bool {
+    match err {
+        PromptError::CompletionError(failed) => failover::may_clear(failed),
+        _ => true,
+    }
 }
 
 fn cap_reason(max: usize) -> String {
@@ -486,9 +502,14 @@ impl RoundHook {
     /// rather than what the wire carried, which differs by provider
     /// ([`Adjacent`]).
     fn refusal_hint(&self, err: &PromptError) -> String {
-        let refused = err
-            .provider_response_status()
-            .is_some_and(|status| matches!(status.as_u16(), 400 | 422));
+        // The head's refusal: this hint names the head's row and speaks of the
+        // view assembled for it. A chain's exhaustion carries no status of
+        // its own, so it is read off the head's reason.
+        let refused = match err {
+            PromptError::CompletionError(failed) => failover::head_status(failed),
+            _ => None,
+        }
+        .is_some_and(|status| matches!(status.as_u16(), 400 | 422));
         let Some(adjacent) = self.journal().adjacent.filter(|_| refused) else {
             return String::new();
         };

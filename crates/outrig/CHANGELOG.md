@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than repeat one. So does a round whose future is dropped, such as by a Ctrl-C,
   at the moment it is dropped -- including the calls of an unfinished batch that had returned.
   Every other call in that batch is answered with a note that it had not returned or had not
-  started, since a provider refuses a call without its result.
+  started, since a provider refuses a call without its result. A failure that cannot clear, such
+  as a key every model of an alias refuses, says so in place of advising a message that would
+  fail the same way, and names a new session as the remedy; one that may, such as a rate limit
+  that outlasted the retry budget, still says to send another.
 
   The user reaches the agent through its `user` channel, not through the prompt.
   `Session::user_channel` returns a `UserChannel`, whose `send` queues text for the agent and

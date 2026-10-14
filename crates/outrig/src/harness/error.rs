@@ -39,7 +39,10 @@ impl Failure {
     /// is kept in the conversation, so a message repeating an earlier one
     /// would ask for it again.
     pub fn ran_python(&self) -> bool {
-        matches!(self.0, AgentError::PromptAfterWork(_))
+        matches!(
+            self.0,
+            AgentError::PromptAfterWork(_) | AgentError::PromptAfterWorkTerminal(_)
+        )
     }
 }
 

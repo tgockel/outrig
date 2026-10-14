@@ -316,6 +316,25 @@ pub(crate) enum AgentError {
          continue rather than repeating one"
     )]
     PromptAfterWork(String),
+
+    /// [`Prompt`](Self::Prompt) for a failure that does not clear on its own: a
+    /// key every model refuses, a model that does not exist. The same call
+    /// fails the same way until the configuration changes, which takes a new
+    /// session.
+    #[error(
+        "agent round failed: {0}. That failure does not clear on its own, so sending another \
+         message fails the same way; correct what it names and start a new session"
+    )]
+    PromptTerminal(String),
+
+    /// [`PromptAfterWork`](Self::PromptAfterWork) for a failure that does not
+    /// clear on its own.
+    #[error(
+        "agent round failed after it had already run Python: {0}. What it ran is kept in the \
+         conversation, but that failure does not clear on its own, so sending another message \
+         fails the same way; correct what it names and start a new session"
+    )]
+    PromptAfterWorkTerminal(String),
 }
 
 /// Rendered rather than carried: a `PromptError` holds rig's types and, on some
