@@ -85,97 +85,37 @@ Killing a **subprocess** is a signal to something with its own opinion about dyi
 **accepted remote operation** may be impossible, and its effect may already have happened. A
 design that says only "cancel" has not said anything.
 
-### A hosted call is awaited
+### A hosted call blocks its caller
 
-A call on a hosted object (`hosted-objects.md`, "Calls are awaited") is awaited. The name bound
-for a binding is a lazy proxy: `repo.remotes.origin.push()` builds a path and makes no round
-trip, and `await` resolves the path on a worker thread through the kernel's pool of connections
-and settles the awaiting code. While the host works, that kernel's event loop keeps turning:
-messages are delivered to it, a `runtime.wait` in one of its tasks wakes, and its background
-tasks run. The attribute lookups are steps of the same path, sent when it is awaited. A bare
-`await` still does not watch the channels, so the pattern for staying reachable during a long
-call keeps its shape, a retained task plus `runtime.wait`, written over the awaitable. A proxy
-is awaitable and not a coroutine, so `create_task` takes its `_resolve()`:
+A call on a hosted object (`hosted-objects.md`, "Calls are synchronous") is synchronous, as the
+library's own users write it: `repo.remotes.origin.push()` makes its requests when it runs and
+returns the result or raises. The calling thread waits for the host, so a call made on the
+kernel's own thread holds that kernel's event loop for as long as the host takes: no message is
+delivered to it, a `runtime.wait` in another of its tasks returns on nothing, and its timers
+wait. Other kernels run on. That is the cost the library's convention carries, stated rather than
+hidden, and the orientation says so. A call that may take long, and must leave the agent
+reachable, goes in a worker through ordinary Python, with the whole expression inside it; the
+pattern for staying reachable keeps its shape, a retained task plus `runtime.wait`, written over
+`asyncio.to_thread`:
 
 ```python
-push = asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")
+push = asyncio.create_task(asyncio.to_thread(repo.remotes.origin.push), name="push")
 done, pending = await runtime.wait({push})
 ```
 
 A kernel keeps a pool of up to four connections per binding, with one call in flight per
-connection, so one call waiting on the host does not, by default, delay the binding's other
-calls: several awaited calls run at once, up to four, and a fifth waits for a free connection;
-only a binding declared `serialize = true` runs its calls one after another
-(`hosted-objects.md`, `0003-17`).
+connection, so a worker's call waiting on the host does not, by default, delay the binding's
+other calls: several run at once, up to four, and a fifth waits for a free connection; only a
+binding declared `serialize = true` runs its calls one after another (`hosted-objects.md`,
+`0003-17`).
 
-An interrupt reaches an awaited hosted call and raises where it is awaited (`0003-17`). What it
-does to the call depends on where the call is. A call waiting for approval is cancelled and never
-runs later (`boundary-policy.md`). A call already running on the host is the fourth cancellation
+An interrupt reaches a hosted call and raises where the call was made (`0003-17`). What it does
+to the call depends on where the call is. A call waiting for approval is cancelled and never runs
+later (`boundary-policy.md`). A call already running on the host is the fourth cancellation
 above, made concrete: RPyC has no cancel message, so the host call continues until it returns,
 and its reply is recorded as `returned` or `raised` with the note that the caller was
-interrupted.
-
-## A round
-
-One prompt or message, the agent working, and yielding control back. It yields when the model
-stops emitting or when a limit fires.
-
-What opens a host-initiated round -- one no prompt started -- is one rule for every kernel, the
-primary's and a child's alike. A round the host opens on queue state is a nudge, and the host keeps
-the summary the nudge opened on as its baseline: on each plain channel its delivered and unread
-counts, so that an arrival and a receive each change it even when they leave the unread count where
-it was, and on a request channel the ids of the requests unread and of those received and not yet
-answered. At the end of every round it computes the same summary from live queue state and compares
-it with the baseline, the state at the last nudge. Any difference -- an arrival, a receive, a reply,
-a cancellation -- opens the next round, and the new round's opening line is rendered from the live
-summary; an unchanged summary opens nothing; and a summary with nothing in it, nothing unread and
-nothing unanswered, opens nothing. An announcement made during a round, the prefix on a result,
-tells the model what has arrived and moves the baseline nowhere; the comparison at the round's end
-is still with the summary the round opened on. Today's `Announcer`
-(`crates/outrig/src/agent/channel.rs`) is the unread-count case of this rule: it keeps its baseline,
-`Told::kept`, at the last round that ended well -- so an announcement a failed or dropped round made
-is made again -- and opens on what is unread, by channel and count, when deliveries have passed it.
-Two things change in the generalization: `keep` today copies what the round announced, a mid-round
-announcement included, where the baseline is the summary the round opened on; and the comparison is
-of live state rather than of deliveries, so a receive that leaves something unread is a change too.
-So a round the model ends with nothing changed is followed by nothing; a new arrival changes the
-summary and opens a round; a request received in one round and still unanswered when it ends is a
-change once, and earns one round; a kernel that answered or read anything in a round gets the next
-round, whatever arrived meanwhile, unless nothing is left open; and a round opened this way counts
-no attempt against any request. `agent-classes.md` carries the request side in full, with the traces
-the rule and its baseline were decided on, and `messages.md` the announcement's text.
-
-A round has no fixed duration, and this is the point most easily misread. An execution may await
-something slow -- a build, a deployment, CI, a human review -- and the round simply lasts that
-long. The model is not called during the wait. Nothing is burned. When the operation completes the
-agent's own code resumes and the round continues, and when the agent finally stops writing, the
-round ends.
-
-**A round is a label, not a state transition.** It is a boundary this design drew for accounting --
-what a stretch of work cost, what to show in a record, where a history window can cut -- and
-drawing it discards nothing. The conversation does not restart at one. A round that resumes after
-a twenty-minute wait opens on the tool call that waited and the result it returned, sitting in the
-transcript where every other tool result sits:
-
-```text
-assistant  submit_python("done, pending = await runtime.wait({ci_run})\n"
-                         "[t.get_name() for t in done]")
-tool       ['ci_run']
-```
-
-The trailing expression is doing work there and is not decoration. An assignment echoes nothing,
-so a submission that only assigns comes back with an empty result -- correct, and useless as an
-observation. The agent says what it wants to see.
-
-That is enough to carry on from, so nothing has to be handed across the boundary and no mechanism
-is needed to hand it. An agent is not told which condition woke it, because the tool result already
-says. This is why there is no terminal act, no wake payload, and no registration call in this
-design: they would all be machinery for reconstructing something that was never lost.
-
-It does put one requirement on `history.md`, and it is already there: the trailing tool call and
-its result are not ordinary eviction candidates. Evicting them is the one way to make a round
-boundary lose information, and the budget section protects the current turn and its protocol data
-for exactly this reason.
+interrupted. A worker's call is not woken; cancelling the task that awaits it ends that wait, and
+the call runs on (`0003-23`).
 
 ### What a completion does, precisely
 

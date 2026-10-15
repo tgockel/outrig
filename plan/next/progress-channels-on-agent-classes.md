@@ -20,6 +20,9 @@ reporting on.
   request closes with its handle.
 - Declared, not derived: a progress channel needs a message type of its own, which no method
   signature supplies.
+- Readable from a host program too (`0003-35`), on its own loop, as the host-program
+  requirements' R8 asks; nothing there selects the shape, and `task.report_progress` on a live
+  object covers the prototype meanwhile.
 
 ## Open questions
 

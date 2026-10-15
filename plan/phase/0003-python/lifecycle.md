@@ -1,9 +1,11 @@
 # Lifecycle
 
 How a session ends, and what its owner can rely on when it stops one. The owner is the Rust
-program holding the session through the API in `embedding.md` -- `run-new`, or an embedder. This
-page is the sequence that runs when the owner stops, what it does to each thing still running at
-that moment, and the report the owner reads afterwards.
+program holding the session through the API in `embedding.md` -- `run-new`, an embedder, or the
+engine acting for a host program that `outrig run <script.py>` supervises (`0003-29`), whose
+agents are a third party: model-driven work in the container that is not the program's own code.
+This page is the sequence that runs when the owner stops, what it does to each thing still
+running at that moment, and the report the owner reads afterwards.
 
 **Decided in planning (2026-09-30).** The owner stops a session with two calls,
 `close_admission()` and `shutdown(deadline)`, and neither needs anything from the agent. `0003-19`
@@ -19,13 +21,16 @@ ran is run again.
 | a round            | the model yields, or a limit stops it           | Python stopped; work done |
 | an execution       | it has an outcome: `ok`, `error`, or `unknown`  | the round is over         |
 | an embedder's task | the embedder says so, after the shutdown report | an execution succeeded    |
+| a host program     | its process exits                               | its sessions stopped      |
 
 A round ending means only that the model yielded, by itself or because a limit stopped it. Python
 it started may still be running -- a background task the agent kept a reference to keeps going
 after the round (`execution-and-rounds.md`) -- and an embedder's task is not finished because a
 round was. An embedder that took a reply as completion would release its task while its agent's
 code still ran. The shutdown report is the first point at which the owner knows that nothing the
-session started is still running, so that is where an embedder decides its task is done.
+session started is still running, so that is where an embedder decides its task is done. A host
+program's exit ends its process and nothing else: the engine shuts down the sessions it left open
+and prints their reports, since the program can no longer read them (`0003-29`).
 
 ## Admission
 
@@ -41,25 +46,26 @@ is admitted by one and not the other. The bindings learn of the close afterward:
 - **Rust's gate**, one per session, decides executions, child launches, and the boundary requests
   held for a decision -- those a rule escalated or sent to the evaluator. `0003-24` builds it for
   three races: an interrupt, a close, and an approval that arrives late. Whichever reaches the gate
-  first decides. "Closed" and "allowed" cannot both win, so an allow that arrives after the close
-  is recorded and changes nothing.
+  first decides. "Closed" and "allowed" cannot both win, so an allow that arrives after the close is
+  recorded and changes nothing.
 - **The relay** orders the requests a rule allows against the close. Rules run in the binding
-  process (`0003-24`'s fork 1), so such a request never passes through Rust's gate, and the relay
-  is the last point the owner holds it. A request the relay had not forwarded when it stopped --
-  one in its queue, or one that arrives later -- is refused in Rust and reaches no binding. One it
-  had forwarded belongs to the drain: the owner cannot take it back, its binding may read it and
-  invoke its target after `close_admission()` has returned, the drain waits for it, and its
-  outcome is the one the binding reports (`0003-22`).
-- **Each binding process's closed flag** is installed asynchronously. The relay enqueues a control
-  line behind the frames it had forwarded, without waiting -- a binding that has stopped reading,
-  with a full pipe, does not delay the close -- and the binding sets its flag when it reads the
-  line. From then on it refuses a request a rule allows, with admission closed as the reason, and
-  cancels one it had read but not started, waiting for the serialize lock. Until the binding
+  process (`0003-24`'s fork 1), so such a request never passes through Rust's gate, and the relay is
+  the last point the owner holds it. A request the relay had not forwarded when it stopped -- one in
+  its queue, or one that arrives later -- is refused in Rust and reaches no binding. One it had
+  forwarded belongs to the drain: the owner cannot take it back, its binding may read it and invoke
+  its target after `close_admission()` has returned, the drain waits for it, and its outcome is the
+  one the binding reports (`0003-22`).
+- **Each serving process's closed flag** -- the bindings process's, and a live object's serving
+  module's in the host program (`0003-36`) -- is installed asynchronously. The relay enqueues a
+  control line behind the frames it had forwarded, without waiting -- a binding that has stopped
+  reading, with a full pipe, does not delay the close -- and the binding sets its flag when it reads
+  the line. From then on it refuses a request a rule allows, with admission closed as the reason,
+  and cancels one it had read but not started, waiting for the serialize lock. Until the binding
   observes the flag a forwarded request may start, and then it drains; so the cancellation of a
-  waiting call is relative to the binding observing its flag, not to the close returning. The
-  flag only makes a refusal faster than running the call would be, and nothing the owner relies
-  on depends on when a binding reads the line. A binding still honors an allow the gate issued
-  before the close.
+  waiting call is relative to the binding observing its flag, not to the close returning. The flag
+  only makes a refusal faster than running the call would be, and nothing the owner relies on
+  depends on when a binding reads the line. A binding still honors an allow the gate issued before
+  the close.
 
 A call waiting at the close for a free connection -- every connection in its kernel's pool for the
 binding has a call in flight (`0003-17`) -- has not been sent. It is woken with the closing error
@@ -99,9 +105,18 @@ draining     forwarded hosted calls and running executions continue, until they 
                it reads after it and cancels what it had read but not started
 terminating  every kernel interrupted
              the bindings process's group sent SIGTERM, then SIGKILL
+             a live call still running in a host program left to it, sealed `unknown`
              the container stopped
 reported     the ShutdownReport returned to the owner
 ```
+
+For a host program the same sequence is R6's cooperative-then-forced shutdown: closing and
+draining are the cooperative window, bounded by the drain deadline the program chose, and
+terminating is the forced step for everything the engine owns. What the engine does not own is
+the program's own threads: a live object's call still running at terminating is sealed `unknown`
+with the reason that it was still running, the report reads not proven stopped, and the program's
+session exit raises `ShutdownException` (`0003-36`). The program itself is signaled only through
+R6's escalation of one that does not respond ("The host program", below).
 
 The session's state, as its events report it (`embedding.md`), is *closing* from
 `close_admission()` through terminating, and *reported* once the report exists.
@@ -264,6 +279,36 @@ the session.
   done what the release would, and the collection is still recorded as `agent.instance.collected`
   when the finalizer's notice reaches the host. Invoked: no. Effects: none beyond the rows above.
 
+**Live-object calls** (`0003-36`)
+
+- *Running in the host program.* Outcome: it drains like a factory binding's call, `returned` or
+  `raised` if it returns in time; one still running at terminating cannot be ended -- nothing the
+  engine owns runs it -- so its record is sealed `unknown`, still running, `stopped` is not proven
+  with a reason naming the binding and the call, and the program's session exit raises
+  `ShutdownException`; an outcome the program writes afterward is discarded. If the program is
+  gone, the call died with it and is `unknown`, killed. Invoked: yes. Effects: known only if it
+  returned or raised.
+- *Held, queued, or waiting for the serialize turn.* As a factory binding's rows above: refused or
+  `cancelled`, never invoked, through the same relay and the same flag in the serving module.
+
+**Root agents** (`0003-35`)
+
+- *Launching, idle, working, or collected.* As the agent-instance rows above; the owner is the
+  parent, and the program's handles settle with the closing error.
+
+**The host program** (`0003-29`)
+
+- *Alive, with the session open.* Outcome: the program's session exit runs this sequence and
+  reads the report; `ShutdownException` is raised in its task when stop is not proven.
+- *Exited, or killed, with the session open.* Outcome: the engine observes the exit, closes
+  admission, runs this sequence with the default drain, and prints the report, since nothing is
+  left to read it; the exit status is the program's unless a report is not proven stopped.
+  Invoked: not a boundary request. Effects: whatever its sessions' calls did stands.
+- *Alive and not responding after a forwarded signal.* Outcome: the cooperative grace passes,
+  then SIGTERM to its process group, a termination grace, then SIGKILL, then the row above.
+  Cleanup covers the program's group, each session's bindings group and each container -- what
+  the engine started -- and no unrelated process.
+
 A release closes one child's subtree the same way while the rest of the session runs on
 ("Releasing a child", below).
 
@@ -292,8 +337,9 @@ is one of five, the same outcomes its events record:
   closed, or interception refusing the request;
 - `cancelled` -- never invoked, because it was interrupted, or the session closed, while it was
   held for a decision, waiting for a free connection, or waiting for the serialize lock;
-- `unknown` -- forwarded, with no reply, because its binding was killed at shutdown or its
-  binding process died; whether its target was invoked is open.
+- `unknown` -- forwarded, with no reply: its binding was killed at shutdown, its binding process
+  died, or, for a live object, its call was still running in the host program when the report was
+  sealed (`0003-36`); whether its target was invoked, or finished, is open.
 
 An interrupted call that the binding had already invoked is none of these: it runs on, and its
 reply records `returned` or `raised` with the note that the caller had been interrupted.
@@ -320,6 +366,11 @@ Three rules hold for every report:
 - **A local stop says nothing about the remote outcome.** Killing the local process that was
   pushing does not mean the remote refused the push. Such a call is `unknown`, never reported as
   having failed: the session knows that it stopped waiting, and nothing more.
+
+A host program reads the same report as `session.shutdown_report`, a mirror of the Rust type, and
+reads the third verdict as an exception: `ShutdownException` in its own task, with the report
+attached (`0003-29`). A program that is gone reads nothing, and the engine prints the report for
+whoever is watching stderr.
 
 ## Releasing a child
 
@@ -372,6 +423,9 @@ than by Rust. `0003-18` proved the arrangement and built its supervisor
   leads. End of input on its stdin -- the owner's death closes the pipe -- does the same, as a
   second detector. SIGTERM keeps its default disposition in the process, so while the owner lives
   only the owner's own stop decides when the group ends.
+- **A host program is a supervised child too** (`0003-27`): its own process group, the
+  parent-death signal, and SIGINT and SIGTERM forwarded to it; the engine's death ends it as it
+  ends the bindings process, and its sessions' containers remain, as below.
 - **Containers keep the existing cleanup** (`crates/outrig/src/container/mod.rs`): an explicit stop
   on the normal path, a detached `podman rm -f` from `Drop` when the future that was to run the
   stop is dropped, and a sweep from the panic hook.
@@ -443,8 +497,8 @@ interrupting an execution.
   on an asyncio task is one, `h.cancel()` on a child's work item or request another, and closing
   cancels every child's work.
 - **Interrupt an execution.** Raise `CancelledError` or `KeyboardInterrupt` in agent Python,
-  through the interrupter (`runtime-protection.md`). A hosted call the execution awaits raises
-  where it is awaited; one not yet invoked is `cancelled`, and one already invoked runs on in
+  through the interrupter (`runtime-protection.md`). A hosted call the execution is blocked in
+  raises there; one not yet invoked is `cancelled`, and one already invoked runs on in
   its binding, its reply recording `returned` or `raised` with the note that the caller was
   interrupted. Terminating interrupts every kernel.
 - **Kill a process.** Send a signal, which a process may handle or ignore unless it is SIGKILL --
@@ -460,10 +514,10 @@ A cancelled wait never cancels work, and none of the five replays anything.
 The agent's code is running a workflow in execution E12, in round R5. The session has one binding,
 `repo`, a GitPython `Repo` -- the phase's example of a hosted library. Earlier in E12 the code
 started a push as a background task,
-`asyncio.create_task(repo.remotes.origin.push()._resolve(), name="push")` -- call C40, in the
-bindings process. It also started a child to review a section, work item W3, and now awaits
+`asyncio.create_task(asyncio.to_thread(repo.remotes.origin.push), name="push")` -- call C40, in
+the bindings process. It also started a child to review a section, work item W3, and now awaits
 both in `asyncio.gather(push, review)`. The child, in its own kernel with its own connection to
-the binding, awaited `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting
+the binding, called `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting
 for an answer. Then the operator stops the session.
 
 ```text
@@ -538,6 +592,8 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - Whether anything but the owner's argument may change the grace between SIGTERM and SIGKILL for
   a binding's group. `0003-18` made it 5 s, counted after the drain deadline rather than against
   it, which `0003-19` and `0003-22` do the counting for.
+- The `[host]` key for a host program's cooperative grace, its default, and whether the grace
+  between SIGTERM and SIGKILL for the program's group is the bindings process's 5 s (`0003-29`).
 - ~~Whether a round still being driven at the close ends at once.~~ Settled by `0003-19`: it runs
   on, each submission refused with the closing reason as its result, until the model yields or
   the owner drops it.
@@ -565,4 +621,5 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - The rows for executions, the interpreter and the container run, in `0003-19`'s tests; the rest
   of the close table has not, and neither has a release. Each row's behavior is acceptance for the
   task that adds it; a release's is `0003-30`'s, and an instance's release, the finalizer path
-  included, is `0003-34`'s.
+  included, is `0003-34`'s. The host-program rows are `0003-29`'s and the live-call rows
+  `0003-36`'s.

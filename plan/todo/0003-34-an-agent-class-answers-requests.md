@@ -44,6 +44,11 @@ on the named endpoint with the message built from its arguments, and `release()`
 release. Nothing about how a request is carried, checked, repaired, limited or evented is new
 here; what is new is the declaration, the instance's lifetime, and the readiness between them.
 
+The host program as a caller is `0003-35`'s: it reuses the declaration checks, the type
+derivation and the request machinery over the owner connection, with the instance's child a root
+child of a session that has no primary. Nothing here assumes the caller is a kernel beyond where
+the constructor schedules the spawn, and `__init_subclass__` runs the same on the host.
+
 ## Goal
 
 An agent class declares a long-lived child whose methods marked `@outrig.agent` are typed request

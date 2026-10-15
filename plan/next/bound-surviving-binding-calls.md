@@ -10,7 +10,9 @@ counting the child once its kernel is gone, and the releasing agent is charged n
 (`plan/phase/0003-python/hosted-objects.md`, "Lifetime"). So spawn a child, await, in a
 background task, a call that never returns, release, repeat: each cycle leaves a thread and a
 call in the binding, and neither `children-max` nor `requests-max` bounds it. The maintainer
-documents it as unbounded for now and notes that it needs addressing later.
+documents it as unbounded for now and notes that it needs addressing later. A live object's calls
+(`0003-36`) survive the same way in the host program's threads, where no restart of the process is
+available to the engine.
 
 ## Candidate bounds, none chosen
 

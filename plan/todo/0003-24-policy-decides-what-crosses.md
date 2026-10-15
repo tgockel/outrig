@@ -43,6 +43,10 @@ decides executions (`0003-19`), child launches (`0003-30`), and, from this task,
 held for a decision. Each binding process's closed flag (`0003-22`) decides the requests a rule
 allowed: rules run in the binding (fork 1), so such a request never waits on Rust.
 
+The rule table a binding process receives at start also reaches a live object's serving module
+when a host program injects one (`0003-36`): the same rules, evaluated in the program's process,
+with the same escalations going to Rust. Nothing here assumes one serving process.
+
 ## Goal
 
 Rules an operator writes, and a human when a rule asks for one, decide whether each hosted request
@@ -218,6 +222,8 @@ runs, and a request that is not allowed never reaches its target.
 - **Hard: `0003-22`.** Policy decides on the requests that task decodes and records, and its
   closed flag is what refuses a rule-allowed request after the close. Through it, `0003-19`, whose
   builder takes the handler and whose admission gate this task adds held requests to.
+- **Hard: `0003-23`.** The acceptance's agent code, and the orientation this task's deny
+  exception joins, use the synchronous spelling; a held call blocks its caller's thread.
 
 ## See also
 

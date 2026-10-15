@@ -51,8 +51,15 @@ MCP now sits, and what a binding lets an agent do on the host.
 - A concepts page for the Python runtime -- what an execution is, what a round is, that names
   persist, and that waiting watches channels. New page rather than an addition, since it is the
   phase's subject.
-- `doc/reference/cli.md` and `doc/usage/run.md`: `run-new`, `run-legacy`, and what `run` still
-  means, with the retarget named as later work so nobody plans around it.
+- `doc/reference/cli.md` and `doc/usage/run.md`: `run-new`, `run-legacy`, what `run` still
+  means, and `run <script.py>` as the host-program form (`0003-27`), with the retarget named as
+  later work so nobody plans around it.
+- **A usage page for host programs**, `doc/usage/host-programs.md`: `outrig run <script.py>`, the
+  program's argv, cwd and streams, `async with outrig.Session(...)`, `session.inject`,
+  `session.events()`, `session.shutdown_report`, `outrig.ShutdownException`, `outrig.config()`,
+  `outrig.Agent` declared and driven from the program, and what the engine does when the program
+  exits, dies or ignores a signal (`0003-27`, `0003-29`, `0003-35`, `0003-36`); and the Python
+  owner API's reference beside the Rust one, every public name with its `help()` text.
 - **Vocabulary, once.** A round contains turns; the interpreter is the process and a kernel is one
   agent's environment. The docs currently use "turn" in the 0.2.x sense throughout, which is
   correct for `run` and wrong for `run-new`, so the pages must say which system they describe.
@@ -69,13 +76,18 @@ MCP now sits, and what a binding lets an agent do on the host.
   loops; `children-max` (default 64), which counts resident children, wedged ones included until
   they are reclaimed, and `model-concurrency-max` (default 8), which bounds model requests in
   flight -- the session-wide limits `0003-30` adds, neither of which bounds CPU or memory inside an
-  admitted kernel; and the per-tree token budget.
+  admitted kernel; the per-tree token budget; the `[host]` table with the cooperative grace a host
+  program gets before the engine escalates (`0003-29`); and a table of which settings apply to a
+  host program's session and which do not (R7): `default-image`, `[workspace]`, `[models]`,
+  `[providers]`, `default-model`, `[policy]` and `[events]` apply; a primary `preamble`,
+  `[agents.<name>]` and `default-agent` do not, and never select a host-declared class's model,
+  image or instructions.
 - **`doc/reference/events.md` extended with every event type the phase added after `0003-13`**:
   the session states and the in-memory stream's gap reporting (`0003-19`), a hosted request's
   receipt, decision, dispatch and outcome (`0003-22`, `0003-24`), the evaluator's verdicts and
   usage (`0003-25`), `agent.request.*` (`0003-30`), `agent.call.*` (`0003-31`),
-  `agent.instance.*` (`0003-34`), and `skill.directive.received` and `skill.invocation.*`
-  (`0003-33`), each with its category.
+  `agent.instance.*` (`0003-34`), `skill.directive.received` and `skill.invocation.*`
+  (`0003-33`), and `binding.injected` (`0003-36`), each with its category.
 - **`doc/reference/cli.md` lists `/approve <id>`, `/deny <id>` and `/name text`** among
   `run-new`'s commands, with what each does, that a pending request waits until it is answered,
   interrupted or the session closes, and that built-in commands win over a skill's name. For
@@ -84,9 +96,11 @@ MCP now sits, and what a binding lets an agent do on the host.
   `<Skill>Params`, and an agent that understood the text itself calls `invoke(name, params=...)`,
   which makes no model call. Either way the instance is on the invocation's event.
 - **A concepts page on hosted objects and the boundary**: what a binding is, that a hosted object
-  acts with the host user's authority, the same paths on both sides, that a hosted object is
-  awaited, how iteration, assignment and the host's `repr` are spelled, what raises instead of
-  crossing, what crosses and what is refused, the default of allow with every request published
+  acts with the host user's authority, the same paths on both sides, that a hosted object is used
+  as its library documents and a call on it blocks the agent's loop until the host answers while
+  `asyncio.to_thread` keeps the loop turning, `outrig.bindings[name]` as the authoritative lookup
+  beside the convenience global, a live object a host program injects beside a factory binding,
+  what crosses and what is refused, the default of allow with every request published
   as events, rules and escalation, and the evaluator.
 - **Skills and typed agents in the Python-runtime concepts page**: the two skill roots and the
   shadowing rule, `/name`, `outrig.skills` -- `invoke(name, text)` deriving `<Skill>Params` from
@@ -96,11 +110,13 @@ MCP now sits, and what a binding lets an agent do on the host.
   child's spend is added to its call, the skill invocation and the round, and that a child has no
   user channel.
 - **The embedding API documented**: `crates/outrig/README.md` shows a session built, driven and
-  shut down, and every public item of the API has rustdoc.
+  shut down, and one started with no primary agent (`0003-28`); every public item of the API has
+  rustdoc.
 - **A `SECURITY.md` consistency check**: its in-scope and known-boundaries lists against what
   shipped -- a repo `[policy]` that loosens a global one is in scope, as a repo `[network]` that
   widens the egress policy is; a hosted object's host authority and the allow-and-publish
-  default are known boundaries.
+  default are known boundaries; a host program is trusted host code with the user's authority,
+  not a sandbox, and a live object it injects acts with that authority (`0003-27`, `0003-36`).
 - Any `TODO: Incomplete` marker whose behavior is now real, dropped -- and any that is still
   honest, kept.
 
@@ -147,6 +163,8 @@ MCP now sits, and what a binding lets an agent do on the host.
 - **Hard: `0003-33`.** `/name` and the skills half of the concepts page need the directive.
 - **Hard: `0003-34`.** The concepts page describes `outrig.Agent`, request channels and release,
   and the events reference gains the `agent.instance.*` family.
+- **Hard: `0003-35`, `0003-36`.** The host-program usage page describes driving a class and
+  injecting a live object, and the config reference the `[host]` grace key `0003-29` adds.
 - **Soft: every earlier task**, each of which drops its own markers. This one is done last.
 
 ## See also

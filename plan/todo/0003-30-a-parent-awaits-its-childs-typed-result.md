@@ -134,7 +134,12 @@ including when the session closes.
   is released this way once its call settles (`0003-31`), and an agent class's child when its
   instance is released or collected (`0003-34`).
 - **A Rust runner per child**, running its rounds through the session's round loop, with the
-  child's own history store and its own events.
+  child's own history store and its own events. The runner, the child registry and the request
+  machinery hang off the session, which may have no primary agent (`0003-28`).
+- **A parent is an endpoint, not necessarily a kernel.** The parent's end of a submission or a
+  request channel is an endpoint the runtime holds; in this task every parent is a kernel, and
+  `0003-35` adds the owner as a parent over the owner connection, with its handles in a host
+  program. Nothing here may assume a parent has a kernel, a loop in the interpreter, or a round.
 - **The attempt limit, per request, counting invalid answers only.** `await
   runtime.complete(value)` in a work child and `await d.reply(value)` in a request child decode
   with `0003-26`; problems are raised in the child's execution with their JSON paths, so the child
@@ -488,10 +493,10 @@ including when the session closes.
    launching children for an agent that no longer exists, with no one to collect what it does. A
    task that never yields cannot be cancelled on a child's thread, so the thread runs on until the
    session ends, and the child's status says wedged (fork 7). Cancelling the child's tasks goes
-   with `Kernel.close_hosted`, which wakes the facade's workers so their threads end while the
-   host call runs on. A hosted call still running in a binding process when the kernel is
-   released cannot be stopped -- RPyC has no cancel, and the release kills no binding
-   (`lifecycle.md`) -- and once the kernel has left the count it is held by neither
+   with `Kernel.close_hosted`, which wakes every wait on the kernel's pools, so each call's caller
+   is told `unknown` while the host call runs on. A hosted call still running in a binding
+   process when the kernel is released cannot be stopped -- RPyC has no cancel, and the release
+   kills no binding (`lifecycle.md`) -- and once the kernel has left the count it is held by neither
    `children-max` nor `requests-max`, so a program that spawns, awaits, in a background task, a
    call that never returns, releases and reuses the place can accumulate such calls without
    bound; the maintainer chose to document that as unbounded for now, and
@@ -560,9 +565,11 @@ including when the session closes.
 - **Hard: `0003-19`.** The runner is the session's round loop run for a child, and close and
   shutdown are the session's.
 - **Hard: `0003-24`.** Releasing a child cancels its held requests through that task's gate and
-  the handler's signal. Through it, `0003-22`, whose facades in every kernel give a child its
+  the handler's signal. Through it, `0003-22`, whose proxies in every kernel give a child its
   parent's bindings, and whose forwarded calls a release lets run on, reporting `unknown` only if
   their binding dies.
+- **Hard: `0003-28`.** The runner is built on a session that may have no primary agent; the
+  registry, the ledger and the gate are the session's.
 - **Hard: `0003-25`.** The evaluator whose call takes a permit, which the acceptance item on
   `model-concurrency-max = 1` exercises.
 - **Hard: `0003-26`.** Completions and replies decode with `outrig.schema`, and a submission's or

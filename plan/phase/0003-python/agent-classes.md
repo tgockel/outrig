@@ -9,6 +9,7 @@ distinction `work.md` opens with: an agent and a piece of work do not live equal
 
 It is built on `work.md`'s explicit child API. `0003-26` provides `outrig.schema`; `0003-30` the
 request child, its handles, release and limits; `0003-31` the decorator; and `0003-34` the class.
+`0003-35` adds the host program as a caller ("From the host program").
 The design was settled in planning on 2026-10-01, and revised on 2026-10-02 after the design
 critique: a request method is marked with `@outrig.agent` rather than by its body, a trailing
 round counts no attempt, and an instance counts against `children-max`. On 2026-10-05, after the
@@ -141,7 +142,10 @@ model=model, inputs=inputs, requests=<the channels>)` as a task on the construct
 loop and returns the instance. The spawn is `0003-30`'s, with the channels derived from the
 declaration ("Explicit plumbing"). A subclass with an `__init__` of its own calls
 `super().__init__(**inputs, model=...)`; one without passes its keywords through. `model` is the
-one keyword the base keeps for itself, so no input is named `model`.
+one keyword the base keeps for itself, so no input is named `model`. From a host program the
+constructor is the same call with `session=` optional: it uses the current session when none is
+given, raises when there is neither, and schedules the launch on the program's running loop,
+which sends it over the owner connection ("From the host program").
 
 **Inputs reach the child as variables.** Each is bound under its name in the child's namespace,
 and the instructions carry a manifest -- name, type, bounded preview -- as a submission's do
@@ -208,7 +212,9 @@ exception, and re-awaiting gives the same answer; `cancel()`, `done()`, `result(
 `future`, a shielded view for `asyncio.wait`. `runtime.wait` accepts handles directly, which is
 what the example's last line relies on, and `asyncio.gather` takes them as awaitables. A request
 has no progress endpoint in 0.3 (`plan/next/progress-channels-on-agent-classes.md`). Cancelling a
-waiter leaves the request standing; `h.cancel()` cancels the request.
+waiter leaves the request standing; `h.cancel()` cancels the request. In a host program the
+handle's `future` is a future of the program's loop, settled from the connection thread, and
+`asyncio.wait` takes it as R5's example does.
 
 **What the child sees:**
 
@@ -442,7 +448,9 @@ outstanding requests.
 An instance's child is a kernel in the same interpreter as its parent (`agent-placement.md`): a
 thread, a session module, an event loop and an execution slot, with the same bindings and the same
 skill catalog, and no user channel. While idle it costs that thread and its memory, about 16 MiB
-measured, and no model calls.
+measured, and no model calls. A root child -- an instance a host program constructed -- has no
+parent kernel: it is at depth 1, and its spend is attributed to the instance and the session,
+there being no round above it.
 
 - **Depth.** The child is one level below the agent that constructed it, and an instance
   constructed by an agent at `subagent-depth-max` fails at `ready()` and the first handle.
@@ -493,8 +501,8 @@ and its reply are values between agents that the parent's model may never see, s
 recorded as messages between agents are, never as model view.
 
 - `agent.instance.started` -- the instance's id, the class's `__module__` and `__qualname__` and
-  its module's digest, the child's id, the input manifest, and the channels declared with their
-  types;
+  its module's digest, the child's id, the parent -- a kernel's execution, or the owner -- the
+  input manifest, and the channels declared with their types;
 - `agent.instance.ready` -- the orienting round ended, or the launch failed and why;
 - `agent.instance.released` -- how: explicit, `async with`, collected, or the session closing; the
   requests settled by it; and the instance's usage total;
@@ -507,6 +515,34 @@ recorded as messages between agents are, never as model view.
 
 A method call produces no `agent.call.*` event: those are the decorated-call wrapper's, and a call
 on an instance is a request.
+
+## From the host program
+
+A program `outrig run` started (`embedding.md`, "A Python program as owner") declares the same
+class and drives it from its own asyncio loop (`0003-35`). The declaration checks, the type
+derivation, the request machinery, the child's rounds and release are the ones above; what the
+host caller changes is where the two ends are.
+
+- **The session.** `session=` when given, else the current session that `outrig.Session`'s
+  context sets, else an error; a kernel caller's session is its own.
+- **The launch.** A task on the program's running loop, sent over the owner connection, where a
+  kernel caller schedules it on its own loop; a constructor with no running loop raises.
+- **The child.** A root child: its parent is the owner, it is at depth 1, and `children-max`,
+  `requests-max`, the permits and the token budget count it as any child.
+- **The handle.** `.future` is a future of the program's loop, settled from the connection
+  thread, so `asyncio.wait` and `asyncio.gather` in the program take it as any future.
+- **The reply.** Decoded in the program, into the program's own class, with the problems returned
+  to the child's `reply`; the types reach the child as descriptions and are rebuilt with
+  `make_dataclass`, since no code of the program's ever crosses (`typed-agents.md`, "Declared on
+  the host").
+- **The model.** `model=` names a configured model or alias; omitted, `default-model` applies;
+  `[agents.<name>]`, `default-agent`, a profile's image and its preamble never apply (R7).
+- **Spend.** Attributed to the instance and the session; there is no round above a root child.
+- **Release.** As above, and at the session's exit for an instance still alive; agent contexts
+  belong inside the session context.
+
+The explicit API -- `runtime.spawn`, `submit`, request channels by hand -- has no host
+counterpart in this phase.
 
 ## Explicit plumbing
 
