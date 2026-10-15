@@ -699,11 +699,12 @@ serialize   = true
   thread-safe. The binding then runs one call at a time across all its connections, every
   kernel's included.
 
-The agent's Python reaches a binding under its name, as an object it awaits: `await
-repo.head.commit` asks the host for `repo.head`, then for its `commit`, and gives back a value or
-another such object. Each request is checked on the host, where a private name -- one that starts
-with `_` -- is refused, and, with [`[events] mode = "record"`](#events), recorded with what it
-asked and how it ended (see `doc/reference/events.md`).
+The agent's Python reaches a binding under its name and uses it as its library documents:
+`repo.head.commit` asks the host for `repo.head`, then for its `commit`, and gives back a value or
+another such object, waiting for each answer. Each request is checked on the host, where a
+private name -- one that starts with `_` -- is refused, and, with
+[`[events] mode = "record"`](#events), recorded with what it asked and how it ended (see
+`doc/reference/events.md`).
 
 The bindings' process runs on the host, as you, in the workspace's host directory, with your
 environment less every variable the config names through `${VAR}` (each `api-key`,

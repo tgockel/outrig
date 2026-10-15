@@ -2090,6 +2090,719 @@ fn a_cancelled_call_leaves_its_connection_usable() {
     an_interrupted_call_leaves_its_connection_usable("b", true);
 }
 
+/// An interrupt that finds `agent`'s thread decoding a reply -- the frame taken from the channel,
+/// its request not yet answered -- is not raised there, which would leave the connection waiting
+/// for a reply already read. The call raises it as it ends, and the connection serves the next
+/// call. On the primary the signal leaves it for the call, and on a child the reader thread does.
+/// The decoding is held in RPyC's own `load`, wrapped in code compiled under a name of its own,
+/// until the interrupt is left for the call.
+fn an_interrupt_while_a_reply_is_decoded_is_raised_as_the_call_ends(agent: &str) {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    if agent != "primary" {
+        relay.open(agent);
+    }
+    let decoding = Flag::new();
+    relay.submit_in(
+        agent,
+        1,
+        &with_pool_in(
+            agent,
+            &format!(
+                r#"
+                import __main__, rpyc
+                brine = rpyc.core.brine
+                scope = dict(brine=brine, load=brine.load, threading=threading, time=time,
+                             touch=touch, waits=__main__._waits, DECODING={decoding})
+                exec(compile(
+                    'def slow(data):\n'
+                    '    brine.load = load\n'
+                    '    touch(DECODING)\n'
+                    '    deadline = time.monotonic() + 20\n'
+                    '    while waits[threading.get_ident()].exc is None:\n'
+                    '        if time.monotonic() > deadline:\n'
+                    '            raise TimeoutError("the interrupt never came")\n'
+                    '        time.sleep(0.01)\n'
+                    '    return load(data)\n',
+                    '<decoder>', 'exec'), scope)
+                brine.load = scope['slow']
+                try:
+                    root.method(1)
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt:', e)
+                print(pending(), numbers())
+                print(root.method(1), pending(), numbers())
+                "#,
+                decoding = decoding.py()
+            ),
+        ),
+    );
+    decoding.wait();
+    relay.interrupt(agent, 1, false);
+    let result = relay.result_from(agent, 1, TIMEOUT);
+    assert_eq!(
+        result["output"],
+        "KeyboardInterrupt: interrupted by outrig after the call to binding 'fx' ended\n[] [1]\n\
+         2 [] [1]\n",
+        "{result}"
+    );
+}
+
+#[test]
+fn an_interrupt_while_a_reply_is_decoded_on_the_primary_is_raised_as_the_call_ends() {
+    an_interrupt_while_a_reply_is_decoded_is_raised_as_the_call_ends("primary");
+}
+
+#[test]
+fn an_interrupt_while_a_reply_is_decoded_on_a_child_is_raised_as_the_call_ends() {
+    an_interrupt_while_a_reply_is_decoded_is_raised_as_the_call_ends("b");
+}
+
+/// An interrupt that finds the primary's thread in a callback's code raises there at once -- in
+/// code an imported module defines too -- and only there: a callback that catches it and returns
+/// lets its call finish, with no second `KeyboardInterrupt` when the call next waits.
+#[test]
+fn an_interrupt_raises_in_a_callbacks_code_once() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let spinning = Flag::new();
+    relay.submit_in(
+        "primary",
+        1,
+        &with_pool_in(
+            "primary",
+            &format!(
+                r#"
+                scope = dict(touch=touch, SPINNING={spinning})
+                exec(compile(
+                    'def spin():\n'
+                    '    touch(SPINNING)\n'
+                    '    try:\n'
+                    '        while True:\n'
+                    '            pass\n'
+                    '    except KeyboardInterrupt as e:\n'
+                    '        return f"caught: {{e}}"\n',
+                    '<module>', 'exec'), scope)
+                print(root.call(scope['spin']))
+                print(pending(), numbers())
+                "#,
+                spinning = spinning.py()
+            ),
+        ),
+    );
+    spinning.wait();
+    relay.interrupt("primary", 1, false);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"], "caught: interrupted by outrig\n[] [1]\n",
+        "{result}"
+    );
+}
+
+/// An interrupt that finds the primary's thread in an object's own code as a call boxes it -- a
+/// path's `__fspath__` that never returns, of a class a module defines -- raises there. Boxing an
+/// argument, it raises before anything of the request is written, and the connection serves the
+/// next call; boxing a callback's result, it is the callback's answer as well as the call's error.
+#[test]
+fn an_interrupt_raises_in_an_objects_own_code_as_a_call_boxes_it() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let (argument, result) = (Flag::new(), Flag::new());
+    relay.submit_in(
+        "primary",
+        1,
+        &with_pool_in(
+            "primary",
+            &format!(
+                r#"
+                scope = dict(touch=touch)
+                exec(compile(
+                    'class Looping:\n'
+                    '    def __init__(self, flag):\n'
+                    '        self.flag = flag\n'
+                    '    def __fspath__(self):\n'
+                    '        touch(self.flag)\n'
+                    '        while True:\n'
+                    '            pass\n',
+                    '<module>', 'exec'), scope)
+                Looping = scope['Looping']
+                try:
+                    root.method(Looping({argument}))
+                except KeyboardInterrupt as e:
+                    print('argument:', e)
+                print(pending(), numbers(), root.method(1), pending(), numbers())
+                try:
+                    root.call(lambda: Looping({result}))
+                except KeyboardInterrupt as e:
+                    print('result:', e)
+                "#,
+                argument = argument.py(),
+                result = result.py()
+            ),
+        ),
+    );
+    argument.wait();
+    relay.interrupt("primary", 1, false);
+    result.wait();
+    relay.interrupt("primary", 1, false);
+    let out = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(out["status"], "ok", "{out}");
+    assert_eq!(
+        out["output"],
+        "argument: interrupted by outrig\n[] [1] 2 [] [1]\nresult: interrupted by outrig\n",
+        "{out}"
+    );
+}
+
+/// An interrupt that lands as a callback's own hosted call takes the pool's lock -- acquired, the
+/// call not yet entered -- is not raised there, which would leave the lock held for good and the
+/// reader thread stopped at the next frame for the pool. It is left on the call the callback
+/// belongs to, and the callback's call, which has not begun, is not sent: it raises the interrupt
+/// as that call, once. The signal is aimed and armed here, from the lock's `__enter__`, as the
+/// reader thread aims and arms one.
+#[test]
+fn an_interrupt_as_a_callbacks_call_takes_the_pools_lock_leaves_the_lock_free() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let written = Flag::new();
+    let out = relay.output(
+        1,
+        &with_pool_in(
+            "primary",
+            &format!(
+                r#"
+            import __main__, signal
+            scope = dict(threading=threading, signal=signal, kernel=__main__._primary)
+            exec(compile(
+                'class Slow(threading.Condition):\n'
+                '    armed = False\n'
+                '    def __enter__(self):\n'
+                '        held = super().__enter__()\n'
+                '        if Slow.armed and threading.current_thread() is threading.main_thread():\n'
+                '            Slow.armed = False\n'
+                '            kernel._interrupting = (1, False)\n'
+                '            signal.pthread_kill(threading.get_ident(), signal.SIGINT)\n'
+                '        return held\n',
+                '<lock>', 'exec'), scope)
+            Slow = scope['Slow']
+            pool.cond = Slow(pool.cond._lock)
+            for conn in pool.connections:
+                conn._channel._cond = pool.cond
+            def cb():
+                Slow.armed = True
+                return root.touch({written})
+            try:
+                root.call(cb)
+            except KeyboardInterrupt as e:
+                print('KeyboardInterrupt:', e)
+            def probe():
+                got = pool.cond.acquire(timeout=1)
+                if got:
+                    pool.cond.release()
+                return got
+            print(await worker(probe), root.method(1))
+            "#,
+                written = written.py()
+            ),
+        ),
+    );
+    assert_eq!(
+        out,
+        "KeyboardInterrupt: interrupted by outrig while waiting for binding 'fx' to answer: the \
+         call's outcome on the host is unknown\nTrue 2\n"
+    );
+    assert!(
+        !written.exists(),
+        "the callback's write ran after the interrupt"
+    );
+}
+
+/// An interrupt that finds the primary's thread in the code that rebuilds a host exception -- a
+/// module's import, a class's `__new__` or `__init_subclass__`, an attribute's setter, which RPyC
+/// runs under `vinegar.load` -- raises there, so a hook that never returns does not hold the
+/// thread. The reply was taken and its request answered before the hook ran, so the connection
+/// serves the next call.
+#[test]
+fn an_interrupt_raises_in_the_code_that_rebuilds_a_hosted_exception() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let hooked = Flag::new();
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                import sys, types
+                scope = dict(touch=touch, HOOKED={hooked})
+                exec(compile(
+                    'class FixtureError(Exception):\n'
+                    '    def __init_subclass__(cls, **kwargs):\n'
+                    '        touch(HOOKED)\n'
+                    '        while True:\n'
+                    '            pass\n',
+                    '<module>', 'exec'), scope)
+                module = types.ModuleType('outrig_fixture')
+                module.FixtureError = scope['FixtureError']
+                sys.modules['outrig_fixture'] = module
+                try:
+                    stub.raise_fixture()
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt:', e)
+                print(pending(), numbers(), stub.method(1), pending(), numbers())
+                "#,
+                hooked = hooked.py()
+            ),
+        ),
+    );
+    hooked.wait();
+    relay.interrupt("primary", 1, false);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"], "KeyboardInterrupt: interrupted by outrig\n[] [1] 2 [] [1]\n",
+        "{result}"
+    );
+}
+
+/// A cancel that finds the primary's thread running a callback's code is left on the call the
+/// callback belongs to, which raises it once the callback has returned. A hosted call the callback
+/// makes before then -- a write, here -- is not sent: it raises the cancel, as that call and once,
+/// and the host never hears of it.
+#[test]
+fn a_callbacks_call_after_a_cancel_landed_in_its_code_is_never_sent() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let (waiting, written) = (Flag::new(), Flag::new());
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                import __main__
+                scope = dict(touch=touch, stub=stub, threading=threading, time=time,
+                             waits=__main__._waits, WAITING={waiting}, WRITTEN={written})
+                exec(compile(
+                    'def cb():\n'
+                    '    touch(WAITING)\n'
+                    '    deadline = time.monotonic() + 20\n'
+                    '    while waits[threading.get_ident()].exc is None:\n'
+                    '        if time.monotonic() > deadline:\n'
+                    '            raise TimeoutError("the cancel never came")\n'
+                    '        time.sleep(0.01)\n'
+                    '    return stub.touch(WRITTEN)\n',
+                    '<module>', 'exec'), scope)
+                try:
+                    stub.call(scope['cb'])
+                except asyncio.CancelledError as e:
+                    print('CancelledError:', e)
+                "#,
+                waiting = waiting.py(),
+                written = written.py()
+            ),
+        ),
+    );
+    waiting.wait();
+    relay.cancel("primary", 1);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"],
+        "CancelledError: cancelled by outrig while waiting for binding 'fx' to answer: the \
+         call's outcome on the host is unknown\n",
+        "{result}"
+    );
+    assert!(
+        !written.exists(),
+        "the callback's write ran after the cancel"
+    );
+}
+
+/// A callback raises an exception whose public property makes a hosted call, which RPyC reads to
+/// box the exception for the host, after a cancel landed in the callback's code. That call is not
+/// sent, as no call of a callback's is once a cancel waits for it; the host still gets an answer
+/// to its call of the callback, an error that says what could not be sent, and the cancel is
+/// raised once, as the call's. Without the answer the host's call stays in the callback holding
+/// the binding's turn, which a call on another connection waits for.
+#[test]
+fn a_cancel_landing_as_a_callbacks_error_is_boxed_still_answers_the_host() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    relay.open("b");
+    relay.output(1, &with_root("root.public"));
+    relay.output_in("b", 1, &with_root_in("b", "root.public"));
+    let waiting = Flag::new();
+    relay.submit_in(
+        "primary",
+        2,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                import __main__
+                scope = dict(stub=stub, touch=touch, threading=threading, time=time,
+                             waits=__main__._waits, WAITING={waiting})
+                exec(compile(
+                    'class Diagnosed(Exception):\n'
+                    '    @property\n'
+                    '    def detail(self):\n'
+                    '        return stub.public\n'
+                    'def cb():\n'
+                    '    touch(WAITING)\n'
+                    '    deadline = time.monotonic() + 20\n'
+                    '    while waits[threading.get_ident()].exc is None:\n'
+                    '        if time.monotonic() > deadline:\n'
+                    '            raise TimeoutError("the cancel never came")\n'
+                    '        time.sleep(0.01)\n'
+                    '    raise Diagnosed("failed")\n',
+                    '<module>', 'exec'), scope)
+                try:
+                    stub.call(scope['cb'])
+                except asyncio.CancelledError as e:
+                    print('CancelledError:', e)
+                "#,
+                waiting = waiting.py()
+            ),
+        ),
+    );
+    waiting.wait();
+    relay.cancel("primary", 2);
+    let result = relay.result_from("primary", 2, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"],
+        "CancelledError: cancelled by outrig while waiting for binding 'fx' to answer: the \
+         call's outcome on the host is unknown\n",
+        "{result}"
+    );
+    assert_eq!(
+        relay.output_in("b", 2, &with_root_in("b", "print(root.record(0, 'b'))")),
+        "b\n"
+    );
+}
+
+/// An interrupt that finds the primary's thread in a property RPyC reads to box a callback's
+/// error -- a getter that loops, say -- raises there, as one that finds the code a callback runs
+/// does. The host's call of the callback is answered with an error that says what could not be
+/// sent, and the interrupt is the result of the call it belongs to.
+#[test]
+fn an_interrupt_raises_in_a_property_read_to_box_a_callbacks_error() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    let reading = Flag::new();
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                scope = dict(touch=touch, READING={reading})
+                exec(compile(
+                    'class Diagnosed(Exception):\n'
+                    '    @property\n'
+                    '    def detail(self):\n'
+                    '        touch(READING)\n'
+                    '        while True:\n'
+                    '            pass\n'
+                    'def cb():\n'
+                    '    raise Diagnosed("failed")\n',
+                    '<module>', 'exec'), scope)
+                try:
+                    stub.call(scope['cb'])
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt:', e)
+                print(stub.method(1))
+                "#,
+                reading = reading.py()
+            ),
+        ),
+    );
+    reading.wait();
+    relay.interrupt("primary", 1, false);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"], "KeyboardInterrupt: interrupted by outrig\n2\n",
+        "{result}"
+    );
+}
+
+/// The same property, read to send the exception a `with` block leaves a hosted context manager
+/// by, is interrupted as well: before the `__exit__` request is written, so the exception the
+/// interrupt raises is the block's and the connection has nothing outstanding.
+#[test]
+fn an_interrupt_raises_in_a_property_read_to_send_an_exception_to_exit() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let reading = Flag::new();
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                scope = dict(touch=touch, READING={reading})
+                exec(compile(
+                    'class Diagnosed(Exception):\n'
+                    '    @property\n'
+                    '    def detail(self):\n'
+                    '        touch(READING)\n'
+                    '        while True:\n'
+                    '            pass\n',
+                    '<module>', 'exec'), scope)
+                try:
+                    with stub.manager:
+                        raise scope['Diagnosed']('failed')
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt:', e)
+                print(pending(), numbers(), stub.method(1), len(stub.manager.exits))
+                "#,
+                reading = reading.py()
+            ),
+        ),
+    );
+    reading.wait();
+    relay.interrupt("primary", 1, false);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        result["output"], "KeyboardInterrupt: interrupted by outrig\n[] [1] 2 0\n",
+        "{result}"
+    );
+}
+
+/// The host calls a callback after the caller of its call gave up -- the cancel notice, held back
+/// here, was still on its way -- and the request is refused when the next call tidies the
+/// connection. A SIGINT that lands as the refusal is built, aimed at the first call of RPyC's
+/// `vinegar.dump` the way a real one could land in it, cannot lose the answer: the host's call of
+/// the callback ends and the binding's turn passes to the other kernel's call.
+#[test]
+fn an_interrupt_cannot_lose_the_refusal_of_a_callback_the_host_calls_late() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    relay.open("b");
+    relay.output(1, &with_root("root.public"));
+    relay.output_in("b", 1, &with_root_in("b", "root.public"));
+    let started = Flag::new();
+    relay.submit_in(
+        "primary",
+        2,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                import __main__, signal, sys
+                from rpyc.core import vinegar
+                main = threading.get_ident()
+                __main__._Hosted.cancel = lambda self: None
+                ran = []
+                try:
+                    stub.call_after(1, lambda: ran.append(1), {started})
+                except asyncio.CancelledError:
+                    print('CancelledError')
+                deadline = time.monotonic() + 20
+                while not any(c._channel.ready for c in pool.connections):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('the late callback never came')
+                    time.sleep(0.01)
+                def aim(frame, event, arg):
+                    if event == 'call' and frame.f_code is vinegar.dump.__code__:
+                        __main__._primary._interrupting = (2, False)
+                        signal.pthread_kill(main, signal.SIGINT)
+                sys.setprofile(aim)
+                try:
+                    print(ran, stub.method(1))
+                except KeyboardInterrupt:
+                    print('KeyboardInterrupt')
+                finally:
+                    sys.setprofile(None)
+                "#,
+                started = started.py()
+            ),
+        ),
+    );
+    started.wait();
+    relay.cancel("primary", 2);
+    let result = relay.result_from("primary", 2, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["output"], "CancelledError\n[] 2\n", "{result}");
+    assert_eq!(
+        relay.output_in("b", 2, &with_root_in("b", "print(root.record(0, 'b'))")),
+        "b\n"
+    );
+}
+
+/// A callback raises an interrupt whose class -- the `__class__` RPyC reads, and `isinstance`
+/// with it -- loops. An interrupt lands in the getter, wherever the container asks for it, and the
+/// host's call of the callback is answered. Told apart by type, the interrupt the callback
+/// raised is not asked about before it is boxed, where nothing would end the getter.
+#[test]
+fn an_interrupt_raises_in_the_class_of_an_interrupt_a_callback_raised() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    let reading = Flag::new();
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                scope = dict(touch=touch, READING={reading})
+                exec(compile(
+                    'class Odd(KeyboardInterrupt):\n'
+                    '    @property\n'
+                    '    def __class__(self):\n'
+                    '        touch(READING)\n'
+                    '        while True:\n'
+                    '            pass\n'
+                    'def cb():\n'
+                    '    raise Odd()\n',
+                    '<module>', 'exec'), scope)
+                try:
+                    stub.call(scope['cb'])
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt', type(e).__name__)
+                print(stub.method(1))
+                "#,
+                reading = reading.py()
+            ),
+        ),
+    );
+    reading.wait();
+    relay.interrupt("primary", 1, false);
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["output"], "KeyboardInterrupt Odd\n2\n", "{result}");
+}
+
+/// A callback raises a cancel whose `__class__` raises another: nothing asks the instance what it
+/// is before it is boxed, so the host's call of the callback is answered, and the cancel the
+/// callback raised is the call's result.
+#[test]
+fn a_class_hook_that_raises_on_a_control_error_a_callback_raised_is_answered() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    relay.open("b");
+    relay.output(1, &with_root("root.public"));
+    relay.output_in("b", 1, &with_root_in("b", "root.public"));
+    let out = relay.output(
+        2,
+        &with_stub_pool_in(
+            "primary",
+            r#"
+            scope = dict(asyncio=asyncio)
+            exec(compile(
+                'class Odd(asyncio.CancelledError):\n'
+                '    @property\n'
+                '    def __class__(self):\n'
+                '        raise KeyboardInterrupt("class hook")\n'
+                'def cb():\n'
+                '    raise Odd()\n',
+                '<module>', 'exec'), scope)
+            try:
+                stub.call(scope['cb'])
+            except asyncio.CancelledError as e:
+                print('CancelledError', type(e).__name__)
+            "#,
+        ),
+    );
+    assert_eq!(out, "CancelledError Odd\n");
+    assert_eq!(
+        relay.output_in("b", 2, &with_root_in("b", "print(root.record(0, 'b'))")),
+        "b\n"
+    );
+}
+
+/// A callback's error that cannot be boxed -- a property RPyC reads that raises -- is answered
+/// with an error that says what could not be sent, as the callback's error, and the connection
+/// carries on rather than closing as for a frame it cannot decode.
+#[test]
+fn a_callbacks_error_that_cannot_be_boxed_is_answered_with_what_failed() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub_pool_in(
+            "primary",
+            r#"
+            scope = {}
+            exec(compile(
+                'class Diagnosed(Exception):\n'
+                '    @property\n'
+                '    def detail(self):\n'
+                '        raise ValueError("no detail")\n'
+                'def cb():\n'
+                '    raise Diagnosed("failed")\n',
+                '<module>', 'exec'), scope)
+            try:
+                stub.call(scope['cb'])
+            except Exception as e:
+                print(type(e).__name__, e.args)
+            print(numbers(), stub.method(1))
+            "#,
+        ),
+    );
+    assert_eq!(
+        out,
+        "RuntimeError ('a callback raised Diagnosed, which could not be sent to the host: \
+         ValueError',)\n[1] 2\n"
+    );
+}
+
+/// An interrupt whose signal lands once the primary's call waits for its reply -- after the reader
+/// thread found the call busy and left the interrupt to the signal -- is raised from the wait,
+/// which the handler leaves it on without waking: the wait looks again within `SIGNAL_CHECK`,
+/// while the binding is still in the call. The signal is aimed and armed here, from a thread of
+/// the execution's own, as the reader thread aims and arms one.
+#[test]
+fn an_interrupt_the_signal_leaves_on_a_waiting_call_is_raised_from_the_wait() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let release = Flag::new();
+    let out = relay.output(
+        1,
+        &with_pool_in(
+            "primary",
+            &format!(
+                r#"
+                import __main__, signal
+                main = threading.get_ident()
+                def aim():
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        wait = __main__._waits.get(main)
+                        if wait is not None and wait.conn is not None and wait.waiting:
+                            __main__._primary._interrupting = (1, False)
+                            signal.pthread_kill(main, signal.SIGINT)
+                            return
+                        time.sleep(0.01)
+                threading.Thread(target=aim, daemon=True).start()
+                began = time.monotonic()
+                try:
+                    root.record(120, 'slow', until={release})
+                except KeyboardInterrupt as e:
+                    print('KeyboardInterrupt:', e)
+                print(time.monotonic() - began < 10, pending(), numbers())
+                "#,
+                release = release.py()
+            ),
+        ),
+    );
+    assert_eq!(
+        out,
+        "KeyboardInterrupt: interrupted by outrig while waiting for binding 'fx' to answer: the \
+         call's outcome on the host is unknown\nTrue [1] [1]\n"
+    );
+    release.raise();
+}
+
 #[test]
 fn a_call_woken_from_the_connection_wait_was_never_sent() {
     let mut relay = Relay::start();
@@ -2963,11 +3676,11 @@ fn serialize_reaches_the_binding_from_its_declaration() {
     }
 }
 
-// ---------------------------------------------------------------------------- the facade
+// ---------------------------------------------------------------------------- the name is the proxy
 
-/// Python that binds `K` to `agent`'s kernel and `stub` to its hosted object for binding `fx`,
-/// as the session binds one under the binding's name, then runs `body`. Making it opens no
-/// connection and sends nothing.
+/// Python that binds `K` to `agent`'s kernel and `stub` to its stub for binding `fx`, as the
+/// session binds one under the binding's name, then runs `body`. Making it opens no connection
+/// and sends nothing.
 fn with_stub_in(agent: &str, body: &str) -> String {
     format!(
         "import __main__\nAGENT = {agent:?}\nK = __main__._kernels[AGENT]\nstub = K.stub('fx')\n{}",
@@ -2980,18 +3693,27 @@ fn with_stub(body: &str) -> String {
     with_stub_in("primary", body)
 }
 
-/// [`with_stub_in`], then [`POOL`] -- over the pool the hosted object made -- then `body`.
+/// [`with_stub_in`], then [`POOL`] -- over the pool the stub made -- then `body`.
 fn with_stub_pool_in(agent: &str, body: &str) -> String {
     with_stub_in(agent, &format!("{}\n{}", py(POOL), py(body)))
 }
 
+/// [`with_stub`], with the fixture's module importable here.
+fn with_stub_and_fixture(body: &str) -> String {
+    with_stub(&format!(
+        "import sys\nsys.path.append({dir:?})\nimport outrig_fixture\n{body}",
+        dir = fixture_dir().to_str().expect("a UTF-8 path"),
+        body = py(body),
+    ))
+}
+
 /// Python that counts the requests every connection sends, by handler, as [`COUNTING`] does, and
-/// binds `measure(label, awaitable)`: it awaits `awaitable` with the connection quiet before, and
-/// reports the requests made meanwhile and every release of what it left, as
+/// binds `measure(label, fn)`: it calls `fn` with the connection quiet before, and reports the
+/// requests made meanwhile and every release of what it left, as
 /// `{"requests": {handler: count}, "dels": count}`. The requests leave out releases and the
-/// `inspect` RPyC sends to build a proxy's class for a type it has not seen: bookkeeping, which
-/// the inventory does not count as an operation.
-const AWAITED_COUNTING: &str = r#"
+/// `inspect` RPyC sends to build a new proxy's class: bookkeeping, which the inventory does not
+/// count as an operation.
+const STUB_COUNTING: &str = r#"
     import collections, gc, json
     from rpyc.core import consts
     names = {v: n for n, v in vars(consts).items() if n.startswith('HANDLE_')}
@@ -3003,11 +3725,11 @@ const AWAITED_COUNTING: &str = r#"
         return original(self, msg, seq, args, label)
     __main__._Hosted._send = counting
     report = {}
-    async def measure(label, awaitable):
+    def measure(label, fn):
         gc.collect()
-        await stub.public  # nothing from before is pending
+        stub.public  # nothing from before is pending
         counts.clear()
-        result = await awaitable
+        result = fn()
         ops = {
             name: n for name, n in counts.items() if name not in ('HANDLE_DEL', 'HANDLE_INSPECT')
         }
@@ -3015,7 +3737,7 @@ const AWAITED_COUNTING: &str = r#"
         counts.clear()
         del result
         gc.collect()
-        await stub.public  # what the operation left is released before this request
+        stub.public  # what the operation left is released before this request
         report[label] = {"requests": ops, "dels": dels + counts.get('HANDLE_DEL', 0)}
 "#;
 
@@ -3024,531 +3746,187 @@ fn sent(relay: &Relay, agent: &str) -> usize {
     relay.stats.between(agent, "fx").to_binding.lines()
 }
 
-/// Reading, calling or indexing a hosted object builds a path and sends nothing, and the path
-/// prints a local repr, as an execution's trailing expression too; `help` sends nothing. `await`
-/// then gives the fixture's values.
+/// Making a stub sends nothing; its first use opens the kernel's first connection and fetches the
+/// root there, on the thread using it, and the name is a `HostedRoot`.
 #[test]
-fn a_path_crosses_nothing_until_it_is_awaited() {
+fn the_stub_fetches_nothing_until_it_is_used() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
         1,
-        &with_stub(
-            r#"
-            value = stub.nested.value
-            call = stub.method(2, y=3)
-            item = stub.sequence[1]
-            print(repr(value))
-            print(repr(call))
-            print(repr(item), type(stub).__name__, stub._binding, stub._netref)
-            help(call)
-            "#,
-        ),
+        &with_stub("print(type(stub).__name__, type(stub).__module__, K._hosted['fx']._root)"),
     );
-    assert_eq!(sent(&relay, "primary"), 0, "{out}");
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines[0], "<hosted fx.nested.value: unresolved, await it>");
-    assert_eq!(lines[1], "<hosted fx.method(...): unresolved, await it>");
-    assert_eq!(
-        lines[2],
-        "<hosted fx.sequence[1]: unresolved, await it> HostedObject fx None"
-    );
-    assert!(out.contains("Help on HostedObject"), "{out}");
-    assert!(
-        out.contains("This is a path: nothing has been asked of the host yet."),
-        "{out}"
-    );
-    assert_eq!(
-        relay.output(2, "stub.nested"),
-        "<hosted fx.nested: unresolved, await it>\n"
-    );
+    assert_eq!(out, "HostedRoot outrig None\n");
     assert_eq!(sent(&relay, "primary"), 0);
-    assert_eq!(
-        relay.output(3, "print(await value, await call, await item)"),
-        "7 5 20\n"
-    );
+    assert_eq!(relay.output(2, "print(stub.nested.value)"), "7\n");
+    assert_eq!(ids_used(&relay, "primary"), [1]);
 }
 
-/// Awaiting a path sends a request per step, as RPyC's own proxies send them: three `getattr` for
-/// `a.b.c`, and for a method call a `getattr`, a `call`, and the bound method's release after.
-/// The host's own forms of the local answers go as RPyC's dedicated requests.
+/// Each operation is the request RPyC's proxy sends, made when it runs: three `getattr` for
+/// `a.b.c`; a `getattr`, a `call` and the bound method's release for a method call; `__iter__`
+/// and a `__next__` per item, and one for the end, for `for`; and one request each for `len`,
+/// truthiness, `in`, `==`, assignment, deletion, `repr`, `str`, `dir` and `hash`. A read that
+/// fails -- missing, or refused -- is one request too. The host sees each effect.
 #[test]
-fn an_awaited_path_makes_a_request_per_step() {
+fn each_operation_is_the_request_rpycs_proxy_sends() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
         1,
         &with_stub(&format!(
             "{}\n{}",
-            py(AWAITED_COUNTING),
+            py(STUB_COUNTING),
             py(r#"
-                await measure('chain', stub.a.b.c)
-                await measure('method', stub.method(1))
-                await measure('repr', stub.__repr__())
-                await measure('len', stub.sequence.__len__())
-                await measure('close', stub.close())
-                await measure('send', stub.send(1))
-                print(await stub.__repr__())
-                print(await stub.sequence.__len__(), [x async for x in stub.received])
+                def with_block():
+                    with stub.manager:
+                        pass
+                def for_loop():
+                    items = []
+                    for x in stub.sequence:
+                        items.append(x)
+                    return items
+                measure('chain', lambda: stub.a.b.c)
+                measure('method', lambda: stub.method(2, y=3))
+                measure('for', for_loop)
+                measure('len', lambda: len(stub.sequence))
+                measure('bool', lambda: bool(stub))
+                measure('in', lambda: 10 in stub.sequence)
+                measure('eq', lambda: stub.a == 1)
+                measure('set', lambda: setattr(stub, 'writable', 'after'))
+                print(stub.writable)
+                measure('delete', lambda: delattr(stub, 'writable'))
+                measure('with', with_block)
+                measure('repr', lambda: repr(stub))
+                measure('str', lambda: str(stub))
+                measure('dir', lambda: dir(stub))
+                measure('hash', lambda: hash(stub))
+                measure('missing', lambda: hasattr(stub, 'missing'))
+                measure('private', lambda: hasattr(stub, '_private'))
+                measure('class', lambda: isinstance(stub.nested, int))
+                measure('close', lambda: stub.close())
+                print(stub.method(2, y=3), [x for x in stub.sequence], len(stub.sequence),
+                      10 in stub.sequence, stub.a == 1, hasattr(stub, 'writable'),
+                      hasattr(stub, 'missing'), hasattr(stub, '_private'))
+                print(stub.truth_tested, stub.sequence.iters, stub.sequence.nexts,
+                      stub.manager.entered, stub.received)
                 print(json.dumps(report))
             "#)
         )),
     );
     let lines: Vec<&str> = out.lines().collect();
-    assert!(
-        lines[0].starts_with("<outrig_fixture.Root object at "),
+    assert_eq!(lines[0], "after", "{out}");
+    assert_eq!(
+        lines[1], "5 [10, 20, 30] 3 True False False False False",
         "{out}"
     );
-    assert_eq!(lines[1], "3 ['close', ('send', 1)]");
-    let report: Value = serde_json::from_str(lines[2]).expect("a JSON report");
-    assert_eq!(
-        report["chain"]["requests"],
-        json!({"HANDLE_GETATTR": 3}),
-        "{report}"
-    );
-    let method = json!({"HANDLE_GETATTR": 1, "HANDLE_CALL": 1});
-    for op in ["method", "close", "send"] {
-        assert_eq!(report[op]["requests"], method, "{op}: {report}");
-        assert_eq!(report[op]["dels"], 1, "{op}: {report}");
+    assert_eq!(lines[2], "1 2 8 1 ['close']", "{out}");
+    let report: Value = serde_json::from_str(lines[3]).expect("a JSON report");
+    let expected = [
+        ("chain", json!({"HANDLE_GETATTR": 3})),
+        ("method", json!({"HANDLE_GETATTR": 1, "HANDLE_CALL": 1})),
+        ("for", json!({"HANDLE_GETATTR": 1, "HANDLE_CALLATTR": 5})),
+        ("len", json!({"HANDLE_GETATTR": 1, "HANDLE_CALLATTR": 1})),
+        ("bool", json!({"HANDLE_CALLATTR": 1})),
+        ("in", json!({"HANDLE_GETATTR": 1, "HANDLE_CALLATTR": 1})),
+        ("eq", json!({"HANDLE_GETATTR": 1, "HANDLE_CMP": 1})),
+        ("set", json!({"HANDLE_SETATTR": 1})),
+        ("delete", json!({"HANDLE_DELATTR": 1})),
+        (
+            "with",
+            json!({"HANDLE_GETATTR": 1, "HANDLE_CALLATTR": 1, "HANDLE_CTXEXIT": 1}),
+        ),
+        ("repr", json!({"HANDLE_REPR": 1})),
+        ("str", json!({"HANDLE_STR": 1})),
+        ("dir", json!({"HANDLE_DIR": 1})),
+        ("hash", json!({"HANDLE_HASH": 1})),
+        ("missing", json!({"HANDLE_GETATTR": 1})),
+        ("private", json!({"HANDLE_GETATTR": 1})),
+        // `nested`, then its `__class__`: no local class names the host's here, so it is asked,
+        // and refused, once.
+        ("class", json!({"HANDLE_GETATTR": 2})),
+        ("close", json!({"HANDLE_GETATTR": 1, "HANDLE_CALL": 1})),
+    ];
+    for (op, requests) in expected {
+        assert_eq!(report[op]["requests"], requests, "{op}: {report}");
     }
-    assert_eq!(
-        report["repr"]["requests"],
-        json!({"HANDLE_REPR": 1}),
-        "{report}"
-    );
-    assert_eq!(
-        report["len"]["requests"],
-        json!({"HANDLE_GETATTR": 2, "HANDLE_CALL": 1}),
-        "{report}"
-    );
+    assert_eq!(report["method"]["dels"], 1, "{report}");
 }
 
-/// What `await` gives for an object: a hosted object, which chains and awaits the same way and
-/// awaits as itself with no request; a tuple with hosted objects in it, the same object for the
-/// same proxy; and, with its library imported here before it first arrives, its own class for
-/// `isinstance`. The inventory names the host's type.
+/// What a call gives back is a proxy used the same way, or a value; a tuple comes back as a
+/// tuple. `==` asks the host. With its library imported here before it first arrives, a proxy's
+/// class is the library's for `isinstance`. Nothing is awaitable, and the inventory names the
+/// host's type; `help` of the stub describes the root, not the stub's class.
 #[test]
-fn a_resolved_proxy_chains_and_awaits_as_itself() {
+fn a_result_is_a_proxy_used_the_same_way() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
         1,
-        &with_stub(&format!(
-            "import sys\nsys.path.append({dir:?})\nimport outrig_fixture\n{counting}\n{body}",
-            dir = fixture_dir().to_str().expect("a UTF-8 path"),
-            counting = py(AWAITED_COUNTING),
-            body = py(r#"
-                nested = await stub.nested
-                print(repr(nested), type(nested).__name__)
-                counts.clear()
-                again = await nested
-                print(again is nested, dict(counts))
-                print(await nested.value, await nested.method())
-                pair = await stub.pair()
-                print(type(pair).__name__, len(pair), pair[0] is nested, pair[1])
+        &with_stub_and_fixture(&format!(
+            "{}\n{}",
+            py(STUB_COUNTING),
+            py(r#"
+                nested = stub.nested
+                print(type(nested).__name__, nested.value, nested.method())
+                pair = stub.pair()
+                print(type(pair).__name__, len(pair), type(pair[0]).__name__, pair[1])
+                measure('eq', lambda: stub.nested == stub.nested)
+                print(stub.nested == stub.nested, report['eq']['requests'].get('HANDLE_CMP'))
                 print(isinstance(nested, outrig_fixture.Nested), nested.__class__.__name__)
-                print([n for n in ('_resolve', '_set', 'method') if n in dir(nested)])
-                print(runtime.names()['nested'], runtime.names()['stub'])
-            "#),
-        )),
-    );
-    assert_eq!(
-        out,
-        "<hosted outrig_fixture.Nested from fx> HostedObject\n\
-         True {}\n\
-         7 nested method\n\
-         tuple 2 True 1\n\
-         True Nested\n\
-         ['_resolve', '_set', 'method']\n\
-         HostedObject[outrig_fixture.Nested] HostedObject\n"
-    );
-}
-
-/// A hosted exception is raised where the call is awaited, as the library's own class once its
-/// module imports here, with its public attributes, and not as the worker's frames.
-#[test]
-fn a_hosted_exception_is_raised_typed_where_the_call_is_awaited() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(&format!(
-            "import sys\nsys.path.append({dir:?})\nimport outrig_fixture\n{body}",
-            dir = fixture_dir().to_str().expect("a UTF-8 path"),
-            body = py(r#"
-                try:
-                    await stub.raise_fixture()
-                except outrig_fixture.FixtureError as e:
-                    names, tb = [], e.__traceback__
-                    while tb is not None:
-                        names.append(tb.tb_frame.f_code.co_name)
-                        tb = tb.tb_next
-                    print(e.args, e.status, [n for n in ('_replay', 'syncreq') if n in names])
-            "#),
-        )),
-    );
-    assert_eq!(out, "('fixture failed',) 3 []\n");
-}
-
-/// A hosted object passes as an argument whether it is resolved or a path, which the worker
-/// resolves first -- inside a list or as a dict key too -- and the host's method runs once for
-/// each call. A resolved one whose host type is `list` passes as itself, not as a list to copy.
-#[test]
-fn a_hosted_object_passes_as_an_argument_resolved_or_not() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            before = await stub.taken
-            print(await stub.takes(await stub.nested), await stub.takes(stub.nested))
-            print(await stub.taken - before)
-            print(await stub.shape([stub.nested, {'k': stub.nested}]))
-            print(await stub.shape({stub.nested: 1}))
-            records = await stub.list_records(2)
-            print(await stub.takes(records), await stub.taken - before)
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "True True\n2\nlist[Nested, {str: Nested}]\n{Nested: int}\nFalse 3\n"
-    );
-}
-
-/// `async for` makes `__iter__` and then a `__next__` per item -- and one more for the end --
-/// as the host counts them. What would need the host's answer without an `await` raises, naming
-/// the spelling that asks for it; `hash` is the object's identity.
-#[test]
-fn iteration_is_async_and_what_needs_the_host_raises() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            print([x async for x in stub.sequence])
-            print(await stub.sequence.iters, await stub.sequence.nexts)
-            def attempt(label, fn):
-                try:
-                    fn()
-                except TypeError as e:
-                    print(label, '->', e)
-            def with_block():
-                with stub.manager:
-                    pass
-            attempt('for', lambda: [x for x in stub.sequence])
-            attempt('len', lambda: len(stub.sequence))
-            attempt('if', lambda: bool(stub.sequence))
-            attempt('in', lambda: 10 in stub.sequence)
-            attempt('==', lambda: stub.sequence == [10, 20, 30])
-            attempt('with', with_block)
-            attempt('+', lambda: stub.sequence + [1])
-            print(hash(stub) == object.__hash__(stub), {stub: 1}[stub], callable(stub.public))
-            "#,
-        ),
-    );
-    let needs = "of a hosted object needs the host's answer";
-    assert_eq!(
-        out,
-        format!(
-            "[10, 20, 30]\n\
-             1 4\n\
-             for -> __iter__ {needs}: iterate it with `async for item in x`\n\
-             len -> __len__ {needs}: `await x.__len__()`\n\
-             if -> __bool__ {needs}: `await x.__bool__()`, or `await x.__len__()` for a container\n\
-             in -> __contains__ {needs}: `await x.__contains__(item)`\n\
-             == -> __eq__ {needs}: `await x.__eq__(other)`; `is` compares the proxies here\n\
-             with -> __enter__ {needs}: enter it with `async with x:`\n\
-             + -> __add__ {needs}: `await x.__add__(other)`\n\
-             True 1 True\n"
-        )
-    );
-}
-
-/// Assignment and deletion are explicit and awaited, each one request; the statements raise
-/// with the spelling.
-#[test]
-fn assignment_and_deletion_are_explicit() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(&format!(
-            "{}\n{}",
-            py(AWAITED_COUNTING),
-            py(r#"
-                await measure('set', stub._set('writable', 'after'))
-                print(await stub.writable)
-                for label, fn in (('assign', lambda: setattr(stub, 'writable', 1)),
-                                  ('delete', lambda: delattr(stub, 'writable'))):
+                for label, target in (('a proxy', stub.a), ('the stub', stub)):
                     try:
-                        fn()
-                    except TypeError as e:
-                        print(label, '->', e)
-                await measure('delete', stub._delete('writable'))
-                try:
-                    await stub.writable
-                except AttributeError as e:
-                    print('deleted:', type(e).__name__)
-                print(json.dumps(report))
-            "#)
-        )),
-    );
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(
-        lines[..4],
-        [
-            "after",
-            "assign -> an assignment cannot be awaited: `await x._set('writable', value)` \
-             assigns on the host",
-            "delete -> a deletion cannot be awaited: `await x._delete('writable')` deletes on \
-             the host",
-            "deleted: AttributeError",
-        ]
-    );
-    let report: Value = serde_json::from_str(lines[4]).expect("a JSON report");
-    assert_eq!(
-        report["set"]["requests"],
-        json!({"HANDLE_SETATTR": 1}),
-        "{report}"
-    );
-    assert_eq!(
-        report["delete"]["requests"],
-        json!({"HANDLE_DELATTR": 1}),
-        "{report}"
-    );
-}
-
-/// A path is awaitable and not a coroutine: `create_task` takes its `_resolve()` with a name and
-/// refuses the path itself, as asyncio does, while `gather` and `wait_for` take it as it is. The
-/// facade's type owns no public name, so `close()` and `send()` are the host's.
-#[test]
-fn a_path_is_awaitable_and_not_a_coroutine() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            task = asyncio.create_task(stub.slow()._resolve(), name='slow')
-            print(await task, task.get_name())
-            try:
-                asyncio.create_task(stub.slow())
-            except TypeError as e:
-                print('create_task:', e)
-            print(await asyncio.gather(stub.a.b.c, stub.b))
-            print(await asyncio.wait_for(stub.public, 30))
-            print([n for n in ('send', 'throw', 'close') if hasattr(type(stub), n)])
-            print(await stub.close(), await stub.send(1))
-            try:
-                await runtime.wait({stub.public})
-            except TypeError as e:
-                print('wait:', e)
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "slow slow\n\
-         create_task: a coroutine was expected, got <hosted fx.slow(...): unresolved, await it>\n\
-         ['c', 'b']\n\
-         public value\n\
-         []\n\
-         closed 1\n\
-         wait: <hosted fx.public: unresolved, await it> is awaitable, not a future: wait on a \
-         task, as `asyncio.create_task(x._resolve(), name=...)`\n"
-    );
-}
-
-/// `hasattr` cannot see the host and `getattr` with a default never takes it, since a lookup
-/// builds a path; the error arrives at the `await`, an `AttributeError` for a missing name and
-/// for the binding's refusal of a private one alike.
-#[test]
-fn a_missing_or_refused_attribute_raises_attribute_error_where_awaited() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            print(hasattr(stub, 'missing'), repr(getattr(stub, 'missing', None)))
-            for label, path in (('missing', stub.missing), ('private', stub._private)):
-                try:
-                    await path
-                except AttributeError as e:
-                    print(label, type(e).__name__, str(e).splitlines()[0])
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "True <hosted fx.missing: unresolved, await it>\n\
-         missing AttributeError 'Root' object has no attribute 'missing'\n\
-         private outrig.Refused '_private' is not a public name, and it is not on RPyC's safe \
-         list\n"
-    );
-}
-
-/// `async with` enters the host's object, and an exception raised inside reaches its
-/// `__exit__` by value, type and text, as a `with` on RPyC's proxy sends it.
-#[test]
-fn async_with_exits_with_the_exception_by_value() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            async with stub.manager as m:
-                print(await m.entered)
-            try:
-                async with stub.manager:
-                    raise ValueError('inside', 5)
-            except ValueError as e:
-                exits = [x async for x in stub.manager.exits]
-                print('raised', e.args, exits[-1])
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "1\nraised ('inside', 5) ('ValueError', \"ValueError('inside', 5)\", True)\n"
-    );
-}
-
-/// Whether an exception raised inside `async with` is suppressed is the truth of what the host's
-/// `__exit__` gives back, read on the host: a list, which crosses by reference, too.
-#[test]
-fn async_with_suppresses_by_the_truth_of_what_exit_gives_back() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            for name in ('suppressing', 'propagating'):
-                try:
-                    async with getattr(stub, name):
-                        raise ValueError(name)
-                    print(name, 'suppressed')
-                except ValueError as e:
-                    print(name, 'raised', e)
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "suppressing suppressed\npropagating raised propagating\n"
-    );
-}
-
-/// What the host's `__exit__` gives back is truth-tested only when the body raised, as `with` does
-/// it: a clean body ends cleanly even when testing that value raises.
-#[test]
-fn async_with_tests_what_exit_gives_back_only_for_an_exception() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            async with stub.untestable:
-                pass
-            print('clean')
-            try:
-                async with stub.untestable:
-                    raise KeyError('body')
-            except Exception as e:
-                print('raised', type(e).__name__)
-            "#,
-        ),
-    );
-    assert_eq!(out, "clean\nraised ValueError\n");
-}
-
-/// A resolved method, generator or class claims no type Python's machinery treats specially,
-/// so `inspect` and asyncio take it for an ordinary object; `help` of each answers here and
-/// sends nothing.
-#[test]
-fn a_resolved_proxy_claims_no_machinery_type() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            import inspect
-            f = await stub.method
-            g = await stub.iterable()
-            c = await stub.nested_type
-            for x in (f, g, c):
-                special = (inspect.isroutine(x) or inspect.isgenerator(x) or inspect.isclass(x)
-                           or asyncio.iscoroutine(x) or inspect.ismodule(x))
-                print(repr(x), x.__class__ is type(x), special)
-            print((await asyncio.gather(g))[0] is g)
-            print([x async for x in g])
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "<hosted builtins.method from fx> True False\n\
-         <hosted builtins.generator from fx> True False\n\
-         <hosted class outrig_fixture.Nested from fx> True False\n\
-         True\n\
-         [1, 2, 3]\n"
-    );
-    let before = sent(&relay, "primary");
-    let help = relay.output(2, "help(f)\nhelp(g)\nhelp(c)\nc");
-    assert_eq!(sent(&relay, "primary"), before, "{help}");
-    assert_eq!(help.matches("Help on HostedObject").count(), 3, "{help}");
-    assert!(
-        help.contains("The methods the host listed for builtins.method:"),
-        "{help}"
-    );
-    assert!(
-        help.ends_with("<hosted class outrig_fixture.Nested from fx>\n"),
-        "{help}"
-    );
-}
-
-/// `isinstance` against a hosted class answers here for an instance of exactly that class and
-/// for an object of this process; anything else is the host's to say, which `_isinstance` asks.
-#[test]
-fn isinstance_of_a_hosted_class_answers_here_or_points_at_the_host() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(&format!(
-            "{}\n{}",
-            py(AWAITED_COUNTING),
-            py(r#"
-                c = await stub.nested_type
-                nested, manager = await stub.nested, await stub.manager
-                counts.clear()
-                print(isinstance(nested, c), isinstance(5, c), dict(counts))
-                try:
-                    isinstance(manager, c)
-                except TypeError as e:
-                    print(e)
-                print(await c._isinstance(manager), await c._isinstance(stub.nested))
+                        await target
+                    except TypeError:
+                        print(label, 'is not awaitable')
+                names = runtime.names()
+                print(names['nested'], names['pair'], names['stub'])
             "#)
         )),
     );
     assert_eq!(
         out,
-        "True False {}\n\
-         whether <hosted outrig_fixture.Manager from fx> is an instance of <hosted class \
-         outrig_fixture.Nested from fx> is the host's to say: `await x._isinstance(obj)` asks it\n\
-         False True\n"
+        "outrig_fixture.Nested 7 nested method\n\
+         tuple 2 outrig_fixture.Nested 1\n\
+         True 1\n\
+         True Nested\n\
+         a proxy is not awaitable\n\
+         the stub is not awaitable\n\
+         outrig_fixture.Nested tuple HostedRoot\n"
+    );
+    let help = relay.output(2, "help(stub)");
+    assert!(help.contains("outrig_fixture.Root"), "{help}");
+    assert!(!help.contains("HostedRoot"), "{help}");
+}
+
+/// The stub and its proxies pass as arguments, as themselves: the stub as the root it stands for,
+/// a proxy inside a list or as a dict key too, and a proxied list as a reference, not a list to
+/// copy. The host's method runs once for each call.
+#[test]
+fn the_stub_and_its_proxies_pass_as_arguments() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            r#"
+            before = stub.taken
+            print(stub.takes(stub.nested), stub.takes(stub), stub.taken - before)
+            print(stub.echo(stub) == stub)
+            print(stub.shape([stub.nested, {'k': stub.nested}]))
+            print(stub.shape({stub.nested: 1}))
+            records = stub.list_records(2)
+            print(stub.takes(records), stub.taken - before)
+            "#,
+        ),
+    );
+    assert_eq!(
+        out,
+        "True False 2\nTrue\nlist[Nested, {str: Nested}]\n{Nested: int}\nFalse 3\n"
     );
 }
 
-/// A hosted object belongs to the kernel whose pool made it: another kernel can neither await
-/// it nor pass it to the binding, and the host's method is not called.
+/// A hosted object belongs to the kernel whose pool made it: another kernel can neither use it
+/// nor pass it to the binding, and the host's method is not called.
 #[test]
 fn another_kernels_hosted_object_is_refused() {
     let mut relay = Relay::start();
@@ -3561,18 +3939,19 @@ fn another_kernels_hosted_object_is_refused() {
         &with_stub_in(
             "b",
             r#"
-            for label, path in (('await', __main__.shared), ('pass', stub.takes(__main__.shared))):
+            for label, fn in (('use', lambda: __main__.shared.value),
+                              ('pass', lambda: stub.takes(__main__.shared))):
                 try:
-                    await path
+                    fn()
                 except TypeError as e:
                     print(label, '->', e)
-            print(await stub.taken)
+            print(stub.taken)
             "#,
         ),
     );
     assert_eq!(
         out,
-        "await -> a hosted object of agent 'primary' cannot be used by agent 'b': each agent \
+        "use -> a hosted object of agent 'primary' cannot be used by agent 'b': each agent \
          reaches a binding through its own\n\
          pass -> a proxy of binding 'fx' on agent 'primary' cannot be passed to binding 'fx' on \
          agent 'b': a hosted object crosses only to its own binding, from the kernel that holds \
@@ -3581,64 +3960,338 @@ fn another_kernels_hosted_object_is_refused() {
     );
 }
 
-/// A 10 s awaited call in a task leaves its kernel's loop turning: `inv` is answered, a timer in
-/// another task fires, and `runtime.wait` returns on a message the user sends meanwhile. One
-/// worker thread serves the pool, and no thread is made for the call.
+/// A hosted exception is raised where the call is made, as the library's own class once its
+/// module imports here, with its public attributes. The traceback an execution reports shows the
+/// agent's code and none of RPyC's frames or this program's, for the exception, for one chained to
+/// it and for one in a group -- and the exception agent code keeps still has them all.
 #[test]
-fn a_long_awaited_call_leaves_the_loop_running() {
+fn a_hosted_exception_is_raised_typed_where_the_call_is_made() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub_and_fixture(
+            r#"
+            try:
+                stub.raise_fixture()
+            except outrig_fixture.FixtureError as e:
+                print(e.args, e.status)
+            "#,
+        ),
+    );
+    assert_eq!(out, "('fixture failed',) 3\n");
+    for (id, source, raised) in [
+        (2, "stub.raise_fixture()", "FixtureError"),
+        (
+            3,
+            "try:\n    stub.missing\nexcept AttributeError:\n    raise ValueError('chained')",
+            "ValueError",
+        ),
+        (4, "len(stub)", "TypeError"),
+        (
+            5,
+            "import builtins\ntry:\n    stub.raise_fixture()\nexcept Exception as e:\n    \
+             builtins.kept = e\n    raise ExceptionGroup('grouped', [e])",
+            "ExceptionGroup",
+        ),
+    ] {
+        let result = relay.exec(id, source);
+        assert_eq!(result["raised"], raised, "{result}");
+        let error = result["error"].as_str().expect("an error");
+        assert!(error.contains("File \"<execution>\""), "{error}");
+        for machinery in ["rpyc", "netref", "File \"<string>\"", "sync_request"] {
+            assert!(!error.contains(machinery), "{machinery} in {error}");
+        }
+    }
+    let frames = relay.output(
+        6,
+        "import builtins, traceback\n\
+         print(any('rpyc' in f.filename for f in traceback.extract_tb(builtins.kept.__traceback__)))",
+    );
+    assert_eq!(frames, "True\n");
+}
+
+/// A binding's name is an instance of the class its root's `root_type` names, as the root's own
+/// proxy is, and of no other, though the module that defines the class is not one this process
+/// imports.
+#[test]
+fn a_binding_is_an_instance_of_the_class_its_member_names() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            r#"
+            print(isinstance(stub, stub.root_type), isinstance(stub, stub.nested_type),
+                  isinstance(stub, (int, stub.root_type)), isinstance(stub.nested, stub.nested_type))
+            "#,
+        ),
+    );
+    assert_eq!(out, "True False True True\n");
+}
+
+/// A hosted exception whose class refuses to have its traceback set -- here a read-only
+/// `__traceback__` -- is still reported, without RPyC's frames or this program's: they are left
+/// out through `BaseException`'s own descriptor, and put back the same way.
+#[test]
+fn a_hosted_exception_that_refuses_a_traceback_is_still_reported_without_hosted_frames() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let result = relay.exec(
+        1,
+        &with_stub(
+            r#"
+            import sys, types
+            scope = {}
+            exec(compile(
+                'class FixtureError(Exception):\n'
+                '    @property\n'
+                '    def __traceback__(self):\n'
+                '        return None\n',
+                '<module>', 'exec'), scope)
+            module = types.ModuleType('outrig_fixture')
+            module.FixtureError = scope['FixtureError']
+            sys.modules['outrig_fixture'] = module
+            stub.raise_fixture()
+            "#,
+        ),
+    );
+    assert_eq!(result["raised"], "FixtureError", "{result}");
+    let error = result["error"].as_str().expect("an error");
+    assert!(error.contains("File \"<execution>\""), "{error}");
+    assert!(!error.contains("could not be formatted"), "{error}");
+    for machinery in ["rpyc", "netref", "sync_request"] {
+        assert!(!error.contains(machinery), "{machinery} in {error}");
+    }
+}
+
+/// `hasattr` asks the host, and `getattr` with a default takes it when the host says no: a missing
+/// attribute raises the library's `AttributeError`, and the binding's refusal of a private one an
+/// error of OutRig's that is an `AttributeError` too, which the library's own classes do not
+/// catch. A refused assignment, and a read refused for what it would return, stay OutRig's plain
+/// refusal.
+#[test]
+fn a_missing_or_refused_attribute_is_an_attribute_error() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub_and_fixture(
+            r#"
+            print(hasattr(stub, 'missing'), hasattr(stub, '_private'),
+                  getattr(stub, '_private', 'default'))
+            for name in ('missing', '_private'):
+                try:
+                    getattr(stub, name)
+                except (outrig_fixture.FixtureError, outrig_fixture.CommandError):
+                    print('the library caught it')
+                except AttributeError as e:
+                    print(name, type(e).__name__, e.name, str(e).splitlines()[0])
+            def refused(label, fn):
+                try:
+                    fn()
+                except AttributeError:
+                    print(label, 'an AttributeError')
+                except Exception as e:
+                    print(label, type(e).__name__)
+            refused('set', lambda: setattr(stub, '_private', 1))
+            g = stub.gen()
+            refused('result', lambda: g.gi_frame)
+            "#,
+        ),
+    );
+    assert_eq!(
+        out,
+        "False False default\n\
+         missing AttributeError missing 'Root' object has no attribute 'missing'\n\
+         _private outrig.Refused _private '_private' is not a public name, and it is not on \
+         RPyC's safe list\n\
+         set outrig.Refused\n\
+         result outrig.Refused\n"
+    );
+}
+
+/// RPyC rebuilds the binding's refusal as `outrig.Refused` where a module `outrig` with a class
+/// `Refused` imports in the container -- one of the workspace's, say -- rather than as its own
+/// class of that name: the refusal of a name is an `AttributeError` either way.
+#[test]
+fn a_refusal_rebuilt_from_a_local_outrig_module_is_an_attribute_error_too() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            r#"
+            import sys, types
+            module = sys.modules['outrig'] = types.ModuleType('outrig')
+            exec('class Refused(Exception):\n    pass\n', module.__dict__)
+            try:
+                print(hasattr(stub, '_private'), getattr(stub, '_private', 'default'))
+                try:
+                    stub._private
+                except AttributeError as e:
+                    print(type(e).__name__, isinstance(e, module.Refused), e.name)
+                try:
+                    stub._private = 1
+                except module.Refused as e:
+                    print('set', isinstance(e, AttributeError))
+            finally:
+                del sys.modules['outrig']
+            "#,
+        ),
+    );
+    assert_eq!(out, "False default\nRefused True _private\nset False\n");
+}
+
+/// `with` enters the host's object, and an exception raised inside reaches its `__exit__` by
+/// value; whether it is suppressed is the truth of what `__exit__` gives back -- a list, which
+/// crosses by reference, asks the host -- tested only when the body raised, as `with` does.
+#[test]
+fn with_exits_and_suppresses_as_on_the_host() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            r#"
+            with stub.manager as m:
+                print(m.entered)
+            try:
+                with stub.manager:
+                    raise ValueError('inside', 5)
+            except ValueError as e:
+                print('raised', e.args, stub.manager.exits[-1])
+            for name in ('suppressing', 'propagating'):
+                try:
+                    with getattr(stub, name):
+                        raise ValueError(name)
+                    print(name, 'suppressed')
+                except ValueError as e:
+                    print(name, 'raised', e)
+            with stub.untestable:
+                pass
+            print('clean')
+            try:
+                with stub.untestable:
+                    raise KeyError('body')
+            except Exception as e:
+                print('raised', type(e).__name__)
+            "#,
+        ),
+    );
+    assert_eq!(
+        out,
+        "1\n\
+         raised ('inside', 5) ('ValueError', \"ValueError('inside', 5)\", True)\n\
+         suppressing suppressed\n\
+         propagating raised propagating\n\
+         clean\n\
+         raised ValueError\n"
+    );
+}
+
+/// A 10 s call on the kernel's thread holds that kernel's loop: a timer task does not fire and a
+/// `runtime.wait` in another task does not return on the user's message until the call returns,
+/// while a second kernel runs executions and answers `inv` throughout.
+#[test]
+fn a_call_on_the_kernels_thread_holds_its_loop() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    relay.open("b");
+    let (started, release) = (Flag::new(), Flag::new());
+    relay.submit_in(
+        "primary",
+        1,
+        &with_stub(&format!(
+            r#"
+            import time
+            marks = {{}}
+            async def timer():
+                await asyncio.sleep(0.1)
+                marks['timer'] = time.monotonic()
+            async def waiter():
+                try:
+                    await runtime.wait({{asyncio.get_running_loop().create_future()}})
+                except runtime.MessageAvailable:
+                    marks['message'] = time.monotonic()
+            tasks = [asyncio.create_task(timer()), asyncio.create_task(waiter())]
+            await asyncio.sleep(0)
+            print(stub.record(10, 'held', started={started}, until={release}))
+            returned = time.monotonic()
+            await asyncio.gather(*tasks)
+            print(marks['timer'] > returned, marks['message'] > returned,
+                  (await runtime.channels['user'].receive()).body)
+            "#,
+            started = started.py(),
+            release = release.py(),
+        )),
+    );
+    started.wait();
+    assert_eq!(
+        relay.output_in("b", 1, &with_stub_in("b", "print(stub.method(1))")),
+        "2\n"
+    );
+    assert!(relay.inv("b", 2)["globals"].is_array());
+    assert_eq!(relay.msg("primary", 3, "user", "hello")["pending"], 1);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        relay.output_in("b", 4, &with_stub_in("b", "print(stub.public)")),
+        "public value\n"
+    );
+    release.raise();
+    let result = relay.result_from("primary", 1, TIMEOUT);
+    assert_eq!(result["output"], "held\nTrue True hello\n", "{result}");
+}
+
+/// The same call made with `asyncio.to_thread` leaves the loop turning: a timer fires and
+/// `runtime.wait` returns on the user's message while the call runs, and a call the loop's own
+/// thread makes meanwhile takes a second connection.
+#[test]
+fn a_call_in_a_worker_leaves_the_loop_turning() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let (started, heard, release) = (Flag::new(), Flag::new(), Flag::new());
     relay.submit_in(
         "primary",
         1,
-        &with_stub(&format!(
-            r#"
-            import threading
-            call = asyncio.create_task(
-                stub.record(10, 'long', started={started}, until={release})._resolve(), name='long'
-            )
-            timer = asyncio.create_task(asyncio.sleep(0.1, result='fired'), name='timer')
-            {awaited}
-            print(await timer)
-            try:
-                await runtime.wait({{call}})
-            except runtime.MessageAvailable:
-                print('message', (await runtime.channels['user'].receive()).body)
-            open({heard}, 'w').close()
-            print([t.name for t in threading.enumerate() if t.name.startswith('hosted-')])
-            print(await call)
-            "#,
-            started = started.py(),
-            release = release.py(),
-            heard = heard.py(),
-            awaited = started.awaited().replace('\n', "\n            "),
-        )),
+        &with_stub_pool_in(
+            "primary",
+            &format!(
+                r#"
+                call = asyncio.create_task(asyncio.to_thread(
+                    lambda: stub.record(10, 'held', started={started}, until={release})
+                ))
+                await appears({started})
+                print(await asyncio.sleep(0.1, result='fired'), call.done())
+                try:
+                    await runtime.wait({{call}})
+                except runtime.MessageAvailable:
+                    print('message', (await runtime.channels['user'].receive()).body, call.done())
+                print(stub.public, numbers())
+                touch({heard})
+                print(await call)
+                "#,
+                started = started.py(),
+                release = release.py(),
+                heard = heard.py(),
+            ),
+        ),
     );
     started.wait();
-    let inventory = relay.inv("primary", 7);
-    assert!(
-        inventory["globals"]
-            .as_array()
-            .expect("rows")
-            .iter()
-            .any(|row| row[0] == "stub" && row[1] == "HostedObject"),
-        "{inventory}"
-    );
-    relay.msg("primary", 8, "user", "hello");
+    relay.msg("primary", 2, "user", "hello");
     heard.wait();
     release.raise();
     let result = relay.result_from("primary", 1, TIMEOUT);
     assert_eq!(
-        result["output"], "fired\nmessage hello\n['hosted-primary-fx_0']\nlong\n",
+        result["output"], "fired False\nmessage hello False\npublic value [1, 2]\nheld\n",
         "{result}"
     );
 }
 
-/// Four awaited calls from one kernel take four connections, and a fifth waits in the executor's
-/// queue with no thread and no connection, running when one of the four returns.
+/// Four calls from one kernel, each in a worker, take four connections, and a fifth waits for
+/// one, opening none, and runs when one of the four returns.
 #[test]
-fn a_fifth_awaited_call_waits_for_a_worker() {
+fn four_calls_take_four_connections_and_a_fifth_waits() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
@@ -3646,22 +4299,18 @@ fn a_fifth_awaited_call_waits_for_a_worker() {
         &with_stub_pool_in(
             "primary",
             r#"
-            import tempfile, threading
+            import tempfile
             d = tempfile.mkdtemp()
             starts = [os.path.join(d, f's{i}') for i in range(5)]
             ends = [os.path.join(d, f'e{i}') for i in range(4)]
-            calls = [
-                asyncio.create_task(
-                    stub.record(0, f'c{i}', started=starts[i], until=ends[i])._resolve()
-                )
-                for i in range(4)
-            ]
+            def record(i, until=None):
+                return lambda: stub.record(0, f'c{i}', started=starts[i], until=until)
+            calls = [asyncio.create_task(asyncio.to_thread(record(i, ends[i]))) for i in range(4)]
             for path in starts[:4]:
                 await appears(path)
-            fifth = asyncio.create_task(stub.record(0, 'c4', started=starts[4])._resolve())
+            fifth = asyncio.create_task(asyncio.to_thread(record(4)))
             await asyncio.sleep(0.5)
-            workers = [t.name for t in threading.enumerate() if t.name.startswith('hosted-')]
-            print(os.path.exists(starts[4]), len(workers), numbers())
+            print(os.path.exists(starts[4]), numbers())
             touch(ends[0])
             print(await calls[0], await fifth, numbers())
             for path in ends[1:]:
@@ -3672,255 +4321,88 @@ fn a_fifth_awaited_call_waits_for_a_worker() {
     );
     assert_eq!(
         out,
-        "False 4 [1, 2, 3, 4]\nc0 c4 [1, 2, 3, 4]\n['c1', 'c2', 'c3']\n"
+        "False [1, 2, 3, 4]\nc0 c4 [1, 2, 3, 4]\n['c1', 'c2', 'c3']\n"
     );
     assert_eq!(ids_used(&relay, "primary"), [1, 2, 3, 4]);
 }
 
-/// Interrupt -- or cancel -- `agent`'s execution while it awaits a 10 s hosted call: the call
-/// raises where it is awaited within a second, with 0003-17's text; the next call returns on
-/// another connection, the interrupted one is free again once its late reply has come and gone,
-/// and the host finished the call.
-fn an_awaited_call_is_interrupted_where_it_is_awaited(agent: &str, cancel: bool) {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    if agent != "primary" {
-        relay.open(agent);
-    }
-    let (started, release) = (Flag::new(), Flag::new());
-    relay.submit_in(
-        agent,
-        1,
-        &with_stub_in(
-            agent,
-            &format!(
-                "print(await stub.record(10, 'slow', started={}, until={}))",
-                started.py(),
-                release.py()
-            ),
-        ),
-    );
-    started.wait();
-    let asked = Instant::now();
-    if cancel {
-        relay.cancel(agent, 1);
-    } else {
-        relay.interrupt(agent, 1, false);
-    }
-    let result = relay.result_from(agent, 1, TIMEOUT);
-    assert!(
-        asked.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        asked.elapsed()
-    );
-    let (raised, verb) = if cancel {
-        ("CancelledError", "cancelled")
-    } else {
-        ("KeyboardInterrupt", "interrupted")
-    };
-    assert_eq!(result["raised"], raised, "{result}");
-    let error = result["error"].as_str().expect("an error");
-    assert!(
-        error.contains(&format!(
-            "{verb} by outrig while waiting for binding 'fx' to answer: the call's outcome on \
-             the host is unknown"
-        )),
-        "{error}"
-    );
-    assert!(!release.exists());
-    let out = relay.output_in(
-        agent,
-        2,
-        &with_stub_pool_in(agent, "print(await stub.public, pending(), numbers())"),
-    );
-    assert_eq!(out, "public value [1] [1, 2]\n");
-    release.raise();
-    let out = relay.output_in(
-        agent,
-        3,
-        &with_stub_pool_in(
-            agent,
-            r#"
-            stale = next(c for c in pool.connections if c._request_callbacks)
-            deadline = time.monotonic() + 20
-            while not stale._channel.poll(0):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('the late reply never came')
-                await asyncio.sleep(0.01)
-            print(await stub.method(1), pending(), numbers())
-            "#,
-        ),
-    );
-    assert_eq!(out, "2 [] [1, 2]\n");
-    assert_eq!(ids_used(&relay, agent), [1, 2]);
-    let recorded = intervals(&mut relay, agent, 4);
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].label, "slow");
-}
-
+/// A coroutine function is refused as a callback before the call is sent, whether the call is
+/// made on the kernel's thread or in a worker: the host calls a callback as a plain function and
+/// never awaits it. The fixture's method is never called.
 #[test]
-fn an_awaited_call_is_interrupted_on_the_primary() {
-    an_awaited_call_is_interrupted_where_it_is_awaited("primary", false);
-}
-
-#[test]
-fn an_awaited_call_is_interrupted_on_a_child() {
-    an_awaited_call_is_interrupted_where_it_is_awaited("b", false);
-}
-
-#[test]
-fn an_awaited_call_is_cancelled_where_it_is_awaited() {
-    an_awaited_call_is_interrupted_where_it_is_awaited("b", true);
-}
-
-/// An interrupt while the execution's call waits in the executor's queue -- four calls of an
-/// earlier execution hold every worker -- says the call was never sent, and the host never
-/// counts it; the earlier execution's calls run on.
-#[test]
-fn an_interrupted_queued_call_was_never_sent() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let release = Flag::new();
-    let starts: Vec<Flag> = (0..4).map(|_| Flag::new()).collect();
-    let tasks: String = starts
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            format!(
-                "blockers.append(asyncio.create_task(stub.record(0, 'b{i}', started={}, \
-                 until={})._resolve()))\n",
-                s.py(),
-                release.py()
-            )
-        })
-        .collect();
-    relay.output(1, &with_stub(&format!("blockers = []\n{tasks}")));
-    for s in &starts {
-        s.wait();
-    }
-    let queued = Flag::new();
-    relay.submit_in(
-        "primary",
-        2,
-        &format!(
-            "open({}, 'w').close()\nprint(await stub.noted())",
-            queued.py()
-        ),
-    );
-    queued.wait();
-    std::thread::sleep(Duration::from_millis(200));
-    relay.interrupt("primary", 2, false);
-    let result = relay.result_from("primary", 2, TIMEOUT);
-    assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
-    let error = result["error"].as_str().expect("an error");
-    assert!(
-        error.contains(
-            "interrupted by outrig while waiting for a free connection to binding 'fx': the call \
-             was never sent"
-        ),
-        "{error}"
-    );
-    release.raise();
-    assert_eq!(
-        relay.output(
-            3,
-            "print(await asyncio.gather(*blockers), await stub.calls)"
-        ),
-        "['b0', 'b1', 'b2', 'b3'] 0\n"
-    );
-}
-
-/// Cancelling the task that awaits a hosted call, from agent code, raises asyncio's own
-/// `CancelledError` and cancels the wait alone: the host's call runs on, and the next call tidies
-/// its late reply away.
-#[test]
-fn cancelling_the_awaiting_task_cancels_the_wait_alone() {
+fn a_coroutine_callback_is_refused_before_the_call_is_sent() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
         1,
-        &with_stub_pool_in(
-            "primary",
+        &with_stub(
             r#"
-            import tempfile
-            d = tempfile.mkdtemp()
-            started, release = os.path.join(d, 's'), os.path.join(d, 'r')
-            t = asyncio.create_task(
-                stub.record(10, 'abandoned', started=started, until=release)._resolve()
-            )
-            await appears(started)
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError as e:
-                print('cancelled', e.args)
-            print(await stub.public, pending(), numbers())
-            touch(release)
-            stale = next(c for c in pool.connections if c._request_callbacks)
-            deadline = time.monotonic() + 20
-            while not stale._channel.poll(0):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('the late reply never came')
-                await asyncio.sleep(0.01)
-            print(await stub.method(1), pending(), numbers())
-            "#,
-        ),
-    );
-    assert_eq!(out, "cancelled ()\npublic value [1] [1, 2]\n2 [] [1, 2]\n");
-    let recorded = intervals(&mut relay, "primary", 2);
-    assert_eq!(recorded[0].label, "abandoned");
-}
-
-/// Cancelling the task that awaits a call ends the calls its worker makes inside it, while the
-/// host's run on: one a coroutine callback awaits, nested on the outer call's connection, and one
-/// a plain callback makes with `_sync()` on another binding. The worker lets go of every
-/// connection at once rather than when those calls return.
-#[test]
-fn cancelling_an_awaited_call_ends_the_calls_made_inside_it() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.bind("fx2", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub_pool_in(
-            "primary",
-            r#"
-            import tempfile
-            d = tempfile.mkdtemp()
-            other = K.stub('fx2')
-            async def let_go(label, call):
-                started, release = os.path.join(d, label), os.path.join(d, label + '.r')
-                t = asyncio.create_task(call(started, release)._resolve())
-                await appears(started)
-                t.cancel()
+            import functools
+            async def coroutine():
+                return 1
+            class Holder:
+                async def method(self):
+                    return 1
+            for label, call in (
+                ('thread', lambda: stub.noted(coroutine)),
+                ('partial', lambda: stub.noted(functools.partial(coroutine))),
+                ('method', lambda: stub.noted(Holder().method)),
+            ):
                 try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-                deadline = time.monotonic() + 5
-                while any(c.owner is not None for p in K._hosted.values() for c in p.connections):
-                    if time.monotonic() > deadline:
-                        raise TimeoutError(f'{label}: the worker stayed in the call inside')
-                    await asyncio.sleep(0.01)
-                print(label, 'let go')
-                touch(release)
-            async def awaiting(started, release):
-                return await stub.record(10, 'nested', started=started, until=release)
-            def syncing(started, release):
-                return other.record(10, 'other', started=started, until=release)._sync()
-            await let_go('coroutine', lambda s, r: stub.call(awaiting, s, r))
-            await let_go('plain', lambda s, r: stub.call(syncing, s, r))
+                    call()
+                except TypeError as e:
+                    print(label, '->', e)
+            try:
+                await asyncio.to_thread(lambda: stub.noted(coroutine))
+            except TypeError as e:
+                print('worker ->', e)
+            print(stub.calls)
             "#,
         ),
     );
-    assert_eq!(out, "coroutine let go\nplain let go\n");
+    let refusal = "a coroutine function cannot be a hosted object's callback: the host calls a \
+                   callback as a plain function and never awaits what it returns. Pass a plain \
+                   function.";
+    assert_eq!(
+        out,
+        format!(
+            "thread -> {refusal}\npartial -> {refusal}\nmethod -> {refusal}\n\
+             worker -> {refusal}\n0\n"
+        )
+    );
 }
 
-/// A plain-function callback runs on the worker serving its call, in the awaiting execution's
-/// context -- its output is that execution's, and a context variable set there reads the same --
-/// and reads a host object it is given with `_sync()`. `_sync()` is refused on the loop.
+/// A plain callback that returns a coroutine is refused when the host calls it: the coroutine is
+/// closed, never left unawaited, and the host's call of it raises.
 #[test]
-fn a_plain_callback_runs_on_the_worker_in_the_awaiting_context() {
+fn a_callback_returning_a_coroutine_is_refused_when_called() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            r#"
+            import gc
+            async def coroutine():
+                return 1
+            print(stub.calling_raised(lambda: coroutine()))
+            collected = gc.collect()
+            "#,
+        ),
+    );
+    assert_eq!(out, "TypeError\n");
+    assert!(
+        !relay.stderr().contains("never awaited"),
+        "{}",
+        relay.stderr()
+    );
+}
+
+/// A plain callback runs on the thread serving its call, in the calling execution's context --
+/// the kernel's thread for a call made there, the worker for one made in `asyncio.to_thread` --
+/// and its output is that execution's.
+#[test]
+fn a_plain_callback_runs_on_the_thread_serving_its_call() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
@@ -3929,479 +4411,34 @@ fn a_plain_callback_runs_on_the_worker_in_the_awaiting_context() {
             r#"
             import contextvars, threading
             cv = contextvars.ContextVar('cv')
-            cv.set('the awaiting task')
-            def callback(x):
-                print('in the callback', x)
-                return threading.current_thread().name, cv.get()
-            print(await stub.call(callback, 3))
-            print(await stub.call_with_nested(lambda nested: (repr(nested), nested.value._sync())))
-            try:
-                stub.public._sync()
-            except TypeError as e:
-                print('refused:', str(e).split('answered: ')[1])
+            cv.set('the calling execution')
+            def callback(nested):
+                print('in the callback')
+                return threading.current_thread().name, cv.get(), nested.value
+            print(stub.call_with_nested(callback))
+            def in_worker():
+                me = threading.current_thread()
+                return stub.call(lambda: (threading.current_thread() is me, cv.get()))
+            print(await asyncio.to_thread(in_worker))
             "#,
         ),
     );
     assert_eq!(
         out,
-        "in the callback 3\n\
-         ('hosted-primary-fx_0', 'the awaiting task')\n\
-         ('<hosted outrig_fixture.Nested from fx>', 7)\n\
-         refused: `await` it instead. `_sync()` is for a plain-function callback, which runs on \
-         a worker and cannot await\n"
+        "in the callback\n('MainThread', 'the calling execution', 7)\n\
+         (True, 'the calling execution')\n"
     );
 }
 
-/// Four callbacks in flight at once, each in a call of its own, read the host object they were
-/// given with `_sync()`, each on its own call's connection: nothing waits for a fifth.
+/// The release of a kernel -- `close_hosted`, from another thread -- while a call on its thread
+/// and a call in a worker are in flight: each raises `EOFError` saying its outcome is unknown,
+/// and the binding finishes both.
 #[test]
-fn sync_reads_complete_with_every_connection_occupied() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            import threading
-            barrier = threading.Barrier(4, timeout=30)
-            def read(nested):
-                barrier.wait()
-                return nested.value._sync()
-            print(await asyncio.gather(*(stub.call_with_nested(read) for _ in range(4))))
-            "#,
-        ),
-    );
-    assert_eq!(out, "[7, 7, 7, 7]\n");
-    assert_eq!(ids_used(&relay, "primary"), [1, 2, 3, 4]);
-}
-
-/// A callback the host makes inside a call that a plain callback of an awaited call makes with
-/// `_sync()` -- here on another binding, serialized -- is given hosted objects too: a plain one
-/// reads them with `_sync()`, and a coroutine awaits them inside the call that passed them.
-#[test]
-fn a_callback_inside_a_sync_call_is_given_hosted_objects() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.bind_serialized("fx2", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            other = K.stub('fx2')
-            def plain(nested):
-                return repr(nested), nested.value._sync()
-            async def coroutine(nested):
-                return repr(nested), await nested.value
-            def inside():
-                return tuple(other.call_with_nested(fn)._sync() for fn in (plain, coroutine))
-            print(await stub.call(inside))
-            "#,
-        ),
-    );
-    let read = "('<hosted outrig_fixture.Nested from fx2>', 7)";
-    assert_eq!(out, format!("({read}, {read})\n"));
-}
-
-/// A coroutine callback runs on the kernel's loop, and a hosted call it awaits travels on the
-/// outer call's connection.
-#[test]
-fn a_coroutine_callback_runs_on_the_loop_and_calls_on_its_callers_connection() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            import threading
-            async def on_loop(x):
-                return threading.current_thread().name, await stub.method(x)
-            print(await stub.call(on_loop, 1))
-            print(await stub.call_twice(on_loop, 2))
-            "#,
-        ),
-    );
-    assert_eq!(
-        out,
-        "('MainThread', 2)\n(('MainThread', 3), ('MainThread', 3))\n"
-    );
-    assert_eq!(ids_used(&relay, "primary"), [1]);
-}
-
-/// Under `serialize = true` a coroutine callback's own call goes through the turn the outer call
-/// holds, and returns while the outer call is still in progress on the host.
-#[test]
-fn a_coroutine_callbacks_call_runs_inside_a_serialized_outer_call() {
-    let mut relay = Relay::start();
-    relay.bind_serialized("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            async def inner():
-                return await stub.record(0, 'inner')
-            print(await stub.call_recorded(inner, 'outer'))
-            "#,
-        ),
-    );
-    assert_eq!(out, "inner\n");
-    assert_eq!(ids_used(&relay, "primary"), [1]);
-    let recorded = intervals(&mut relay, "primary", 2);
-    let (outer, inner) = (interval(&recorded, "outer"), interval(&recorded, "inner"));
-    assert!(
-        outer.start <= inner.start && inner.end <= outer.end,
-        "{recorded:?}"
-    );
-}
-
-/// A plain callback of a call that a coroutine callback awaits runs in the coroutine's context,
-/// as any awaiting task's: on the thread serving the coroutine, and on a worker for a call queued
-/// too late for that thread to serve it.
-#[test]
-fn a_call_awaited_in_a_coroutine_callback_runs_in_its_context() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub_pool_in(
-            "primary",
-            r#"
-            import contextvars, tempfile
-            d = tempfile.mkdtemp()
-            cv = contextvars.ContextVar('cv')
-            cv.set('outer')
-            def plain():
-                return cv.get()
-            async def served():
-                cv.set('served')
-                return await stub.call(plain)
-            print(await stub.call(served))
-            tasks = []
-            async def late():
-                cv.set('late')
-                started, release = os.path.join(d, 's'), os.path.join(d, 'r')
-                # The serving thread is still in the first call when this returns -- the release
-                # follows the return -- so the second, queued behind it, goes to a worker.
-                tasks.append(asyncio.create_task(
-                    stub.record(0, 'first', started=started, until=release)._resolve()
-                ))
-                tasks.append(asyncio.create_task(stub.call(plain)._resolve()))
-                await appears(started)
-                asyncio.current_task().add_done_callback(lambda _: touch(release))
-                return 'returned'
-            print(await stub.call(late), await tasks[0], await tasks[1])
-            "#,
-        ),
-    );
-    assert_eq!(out, "served\nreturned first late\n");
-}
-
-/// A coroutine callback served inside a call that another coroutine callback awaits does not
-/// hold up that callback's other tasks: a hosted call one of them awaits runs on the serving
-/// thread meanwhile, on the same connection. It ends with the outer callback's call, not the
-/// inner one's, so cancelling the inner one's call leaves it to finish.
-#[test]
-fn a_nested_coroutine_callback_does_not_hold_up_its_callers_other_tasks() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub_pool_in(
-            "primary",
-            r#"
-            import tempfile
-            d = tempfile.mkdtemp()
-            async def setting():
-                ready = asyncio.Event()
-                async def waiter():
-                    await asyncio.wait_for(ready.wait(), 10)
-                    return 'waited'
-                async def setter():
-                    value = await stub.method(1)
-                    ready.set()
-                    return value
-                return tuple(await asyncio.gather(stub.call(waiter), setter()))
-            print(await stub.call(setting))
-            async def cancelling():
-                started, release = os.path.join(d, 's'), os.path.join(d, 'r')
-                async def waiter():
-                    await asyncio.sleep(30)
-                inner = asyncio.create_task(stub.call(waiter)._resolve())
-                sibling = asyncio.create_task(
-                    stub.record(0, 'sibling', started=started, until=release)._resolve()
-                )
-                await appears(started)
-                inner.cancel()
-                await asyncio.sleep(0.2)
-                touch(release)
-                results = await asyncio.gather(inner, sibling, return_exceptions=True)
-                return tuple(
-                    type(r).__name__ if isinstance(r, BaseException) else r for r in results
-                )
-            print(await stub.call(cancelling))
-            "#,
-        ),
-    );
-    assert_eq!(out, "('waited', 2)\n('CancelledError', 'sibling')\n");
-    assert_eq!(ids_used(&relay, "primary"), [1]);
-}
-
-/// The same with the inner coroutine callback served on another binding, inside a `_sync()` call
-/// of a plain callback: a call the outer callback's other task awaits once the inner callback is
-/// waiting still runs on the serving thread, which is waiting on the other binding's connection.
-#[test]
-fn a_coroutine_callback_on_another_binding_does_not_hold_up_its_callers_other_tasks() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.bind("fx2", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            other = K.stub('fx2')
-            async def setting():
-                entered, ready = asyncio.Event(), asyncio.Event()
-                async def waiter():
-                    entered.set()
-                    await asyncio.wait_for(ready.wait(), 10)
-                    return 'waited'
-                def plain():
-                    return other.call(waiter)._sync()
-                async def setter():
-                    await entered.wait()
-                    value = await stub.method(1)
-                    ready.set()
-                    return value
-                return tuple(await asyncio.gather(stub.call(plain), setter()))
-            print(await stub.call(setting))
-            "#,
-        ),
-    );
-    assert_eq!(out, "('waited', 2)\n");
-}
-
-/// A plain callback of a call that a coroutine callback awaits may start a coroutine on the loop
-/// and wait for it: what that coroutine awaits goes to a worker, not to the thread the callback
-/// holds.
-#[test]
-fn a_plain_callback_may_wait_for_a_coroutine_it_starts() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            loop = asyncio.get_running_loop()
-            async def started():
-                return await stub.method(1)
-            def plain():
-                return asyncio.run_coroutine_threadsafe(started(), loop).result(timeout=10)
-            async def served():
-                return await stub.call(plain)
-            print(await stub.call(served))
-            "#,
-        ),
-    );
-    assert_eq!(out, "2\n");
-}
-
-/// With both bindings serialized, a coroutine callback's call to another binding, whose own
-/// coroutine callback calls back into the first, completes, as its synchronous spelling does: the
-/// thread serving the outer callback runs the call to the other binding, so the call back goes on
-/// the outer call's connection, through the turn it holds. The same from a plain callback's
-/// `_sync()` call.
-#[test]
-fn a_call_back_through_another_serialized_binding_completes() {
-    let mut relay = Relay::start();
-    relay.bind_serialized("fx", FACTORY);
-    relay.bind_serialized("fx2", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            other = K.stub('fx2')
-            async def leaf():
-                return await stub.method(1)
-            async def outer():
-                return await other.call(leaf)
-            print(await asyncio.wait_for(stub.call(outer), 10))
-            def plain():
-                return other.call(leaf)._sync()
-            print(await asyncio.wait_for(stub.call(plain), 10))
-            "#,
-        ),
-    );
-    assert_eq!(out, "2\n2\n");
-    assert_eq!(ids_used(&relay, "primary"), [1]);
-}
-
-/// A call to another binding that a coroutine callback awaits runs on the thread serving it, and
-/// one queued too late for that thread goes to a worker of its own binding.
-#[test]
-fn a_call_to_another_binding_queued_too_late_goes_to_its_own_workers() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.bind("fx2", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub_pool_in(
-            "primary",
-            r#"
-            import tempfile
-            d = tempfile.mkdtemp()
-            other = K.stub('fx2')
-            def name():
-                return threading.current_thread().name
-            tasks = []
-            async def late():
-                started, release = os.path.join(d, 's'), os.path.join(d, 'r')
-                served = await other.call(name)
-                # The serving thread is still in the first call when this returns -- the release
-                # follows the return -- so the second, queued behind it, goes to a worker.
-                tasks.append(asyncio.create_task(
-                    stub.record(0, 'first', started=started, until=release)._resolve()
-                ))
-                tasks.append(asyncio.create_task(other.call(name)._resolve()))
-                await appears(started)
-                asyncio.current_task().add_done_callback(lambda _: touch(release))
-                return served
-            print(await stub.call(late), await tasks[0], await tasks[1])
-            "#,
-        ),
-    );
-    assert_eq!(out, "hosted-primary-fx_0 first hosted-primary-fx2_0\n");
-}
-
-/// An interrupt while a coroutine callback awaits a hosted call of its own ends the execution
-/// with the interrupt.
-#[test]
-fn an_interrupt_inside_a_coroutine_callback_ends_the_execution() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let (started, release) = (Flag::new(), Flag::new());
-    relay.submit_in(
-        "primary",
-        1,
-        &with_stub(&format!(
-            r#"
-            async def stuck():
-                await stub.record(10, 'inner', started={}, until={})
-            await stub.call(stuck)
-            "#,
-            started.py(),
-            release.py()
-        )),
-    );
-    started.wait();
-    relay.interrupt("primary", 1, false);
-    let result = relay.result_from("primary", 1, TIMEOUT);
-    assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
-    release.raise();
-    assert_eq!(relay.output(2, "print(await stub.method(1))"), "2\n");
-}
-
-/// An interrupt of an execution awaiting two calls through `gather` ends both. Each task `gather`
-/// made lets its interrupt out of the loop, as asyncio does with one, and each is reported to the
-/// execution as a task awaiting a hosted call -- none escapes unclaimed.
-#[test]
-fn an_interrupt_ends_every_call_a_gather_awaits() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let (a, b, release) = (Flag::new(), Flag::new(), Flag::new());
-    relay.submit_in(
-        "primary",
-        1,
-        &with_stub(&format!(
-            "print(await asyncio.gather(stub.record(10, 'a', started={a}, until={r}), \
-             stub.record(10, 'b', started={b}, until={r})))",
-            a = a.py(),
-            b = b.py(),
-            r = release.py()
-        )),
-    );
-    a.wait();
-    b.wait();
-    relay.interrupt("primary", 1, false);
-    let result = relay.result_from("primary", 1, TIMEOUT);
-    assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
-    release.raise();
-    let next = relay.exec(2, "pass");
-    let reported = format!("{}{}", result["output"], next["background"]);
-    assert_eq!(
-        reported
-            .matches("[outrig interrupted a task awaiting a hosted call]")
-            .count(),
-        2,
-        "{result}\n{next}"
-    );
-    assert!(
-        !relay.stderr().contains("escaped its event loop"),
-        "{}",
-        relay.stderr()
-    );
-}
-
-/// Closing the pool while a coroutine callback runs on the loop -- asleep, awaiting no hosted
-/// call -- ends the awaited call with the closing error at once, and the thread serving the
-/// callback cancels it and lets go.
-#[test]
-fn closing_the_pool_ends_a_coroutine_callback_it_was_serving() {
+fn closing_the_pool_ends_both_calls_unknown() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     relay.open("c");
-    let ready = Flag::new();
-    relay.submit_in(
-        "c",
-        1,
-        &with_stub_pool_in(
-            "c",
-            &format!(
-                r#"
-                async def napping():
-                    await asyncio.sleep(30)
-                call = asyncio.create_task(stub.call(napping)._resolve())
-                def serving():
-                    return [t for t in asyncio.all_tasks() if t.get_coro().__name__ == 'napping']
-                deadline = time.monotonic() + 20
-                while not serving():
-                    if time.monotonic() > deadline:
-                        raise TimeoutError('the callback never started')
-                    await asyncio.sleep(0.01)
-                touch({ready})
-                try:
-                    await call
-                except EOFError as e:
-                    print(e)
-                while serving() and not all(t.done() for t in serving()):
-                    if time.monotonic() > deadline:
-                        raise TimeoutError('the callback was never cancelled')
-                    await asyncio.sleep(0.01)
-                print('the callback ended')
-                "#,
-                ready = ready.py()
-            ),
-        ),
-    );
-    ready.wait();
-    relay.output(2, "import __main__\n__main__._kernels['c'].close_hosted()");
-    let result = relay.result_from("c", 1, TIMEOUT);
-    assert_eq!(
-        result["output"],
-        "the kernel's connections are closing: the call's outcome on the host is unknown\n\
-         the callback ended\n",
-        "{result}"
-    );
-}
-
-/// The release of a kernel -- `close_hosted`, from another thread -- while two awaited calls are
-/// in flight and the engine holds the pool's other two connections: each awaited call raises
-/// `EOFError` saying its outcome is unknown, a third waiting for a connection was never sent,
-/// and the binding finishes the calls.
-#[test]
-fn closing_the_pool_settles_awaited_calls_in_flight_and_waiting() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.open("c");
-    let ready = Flag::new();
+    let (in_worker, on_thread) = (Flag::new(), Flag::new());
     relay.submit_in(
         "c",
         1,
@@ -4410,161 +4447,72 @@ fn closing_the_pool_settles_awaited_calls_in_flight_and_waiting() {
             &format!(
                 r#"
                 import tempfile
-                d = tempfile.mkdtemp()
-                release = os.path.join(d, 'release')
-                starts = [os.path.join(d, f's{{i}}') for i in range(4)]
-                root = K.hosted('fx')
-                fill = [
-                    worker(lambda i=i: root.record(0, f'fill{{i}}', started=starts[i],
-                                                   until=release))
-                    for i in range(2)
-                ]
-                calls = [
-                    asyncio.create_task(
-                        stub.record(0, f'call{{i}}', started=starts[2 + i], until=release)._resolve()
-                    )
-                    for i in range(2)
-                ]
-                for path in starts:
-                    await appears(path)
-                third = asyncio.create_task(stub.noted()._resolve())
-                deadline = time.monotonic() + 20
-                while not any(job.waiting and job.conn is None for job in list(pool.jobs)):
-                    if time.monotonic() > deadline:
-                        raise TimeoutError('the third call never waited for a connection')
-                    await asyncio.sleep(0.01)
-                touch({ready})
-                results = await asyncio.gather(*calls, third, *fill, return_exceptions=True)
-                for r in results:
-                    print(f'{{type(r).__name__}}: {{r}}')
+                release = os.path.join(tempfile.mkdtemp(), 'release')
+                worker = asyncio.create_task(asyncio.to_thread(
+                    lambda: stub.record(0, 'worker', started={in_worker}, until=release)
+                ))
+                await appears({in_worker})
+                ended = []
+                try:
+                    stub.record(0, 'thread', started={on_thread}, until=release)
+                except EOFError as e:
+                    ended.append(f'thread: {{e}}')
+                try:
+                    await worker
+                except EOFError as e:
+                    ended.append(f'worker: {{e}}')
+                print('\n'.join(ended))
                 touch(release)
                 "#,
-                ready = ready.py()
+                in_worker = in_worker.py(),
+                on_thread = on_thread.py(),
             ),
         ),
     );
-    ready.wait();
+    on_thread.wait();
     relay.output(2, "import __main__\n__main__._kernels['c'].close_hosted()");
     let result = relay.result_from("c", 1, TIMEOUT);
-    let unknown =
-        "EOFError: the kernel's connections are closing: the call's outcome on the host is unknown";
-    let never = "EOFError: the kernel's connections are closing: the call was never sent";
+    let unknown = "the kernel's connections are closing: the call's outcome on the host is unknown";
     assert_eq!(
         result["output"],
-        format!("{unknown}\n{unknown}\n{never}\n{unknown}\n{unknown}\n"),
+        format!("thread: {unknown}\nworker: {unknown}\n"),
         "{result}"
     );
     eventually(
         || {
             let recorded = intervals(&mut relay, "primary", 3);
-            (["call0", "call1", "fill0", "fill1"]
+            (["thread", "worker"]
                 .iter()
                 .all(|label| recorded.iter().any(|i| &i.label == label)))
             .then_some(())
         },
-        || "the four calls to finish on the host".to_string(),
+        || "the two calls to finish on the host".to_string(),
     );
-    assert_eq!(relay.output(4, &with_root("print(root.calls)")), "0\n");
 }
 
-/// The same close with every worker busy: four awaited calls in flight raise that their outcome
-/// is unknown, and a fifth still in the executor's queue that it was never sent.
+/// No name a kernel boots resolves a hosted object through an awaitable: the stub bound for each
+/// binding is no awaitable, nor any public attribute of a name bound at boot, and the awaited
+/// facade is gone. Checked on the types, so nothing asks the host.
 #[test]
-fn closing_the_pool_settles_a_call_still_queued_for_a_worker() {
+fn no_name_a_kernel_boots_resolves_a_hosted_object_through_an_awaitable() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.open("c");
-    let ready = Flag::new();
-    relay.submit_in(
-        "c",
-        1,
-        &with_stub_pool_in(
-            "c",
-            &format!(
-                r#"
-                import tempfile
-                d = tempfile.mkdtemp()
-                release = os.path.join(d, 'release')
-                starts = [os.path.join(d, f's{{i}}') for i in range(4)]
-                calls = [
-                    asyncio.create_task(
-                        stub.record(0, f'call{{i}}', started=starts[i], until=release)._resolve()
-                    )
-                    for i in range(4)
-                ]
-                for path in starts:
-                    await appears(path)
-                fifth = asyncio.create_task(stub.noted()._resolve())
-                await asyncio.sleep(0.2)
-                touch({ready})
-                results = await asyncio.gather(*calls, fifth, return_exceptions=True)
-                for r in results:
-                    print(f'{{type(r).__name__}}: {{r}}')
-                touch(release)
-                "#,
-                ready = ready.py()
-            ),
-        ),
-    );
-    ready.wait();
-    relay.output(2, "import __main__\n__main__._kernels['c'].close_hosted()");
-    let result = relay.result_from("c", 1, TIMEOUT);
-    let unknown =
-        "EOFError: the kernel's connections are closing: the call's outcome on the host is unknown";
-    let never = "EOFError: the kernel's connections are closing: the call was never sent";
-    assert_eq!(
-        result["output"],
-        format!("{unknown}\n{unknown}\n{unknown}\n{unknown}\n{never}\n"),
-        "{result}"
-    );
-    assert_eq!(relay.output(3, &with_root("print(root.calls)")), "0\n");
-}
-
-/// A kernel whose pool has idle workers -- which are not daemon threads -- still exits when its
-/// stdin closes.
-#[test]
-fn an_interpreter_with_idle_workers_exits_when_its_stdin_closes() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let out = relay.output(
-        1,
-        &with_stub(
-            r#"
-            import threading
-            print(await asyncio.gather(stub.public, stub.b, stub.a.b.c))
-            print(sum(t.name.startswith('hosted-') and not t.daemon for t in threading.enumerate()))
-            "#,
-        ),
-    );
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines[0], "['public value', 'b', 'c']");
-    assert!(lines[1].parse::<usize>().expect("a count") >= 1, "{out}");
-    relay.close_stdin();
-    let status = relay
-        .exit_within(Duration::from_secs(10))
-        .expect("the interpreter exits");
-    assert!(status.success(), "{status:?}");
-}
-
-/// Nothing the kernel boots resolves a hosted object synchronously: no name bound at boot, nor a
-/// public attribute of one, is a kernel, a pool, a connection, RPyC's proxy, or a method of one.
-#[test]
-fn no_name_a_kernel_boots_resolves_a_hosted_object_synchronously() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
+    relay.declare_bindings();
     relay.open("b");
     let probe = r#"
         import __main__, inspect
         K = __main__._kernels[AGENT]
-        engine = (__main__.Kernel, __main__._Pool, __main__._Hosted, __main__._Job,
-                  __main__._rpyc.core.netref.BaseNetref)
-        def engine_of(value):
-            owner = getattr(value, '__self__', None) if inspect.ismethod(value) else None
-            return any(isinstance(v, engine) or v in engine for v in (value, owner))
-        found = []
+        hosted = (__main__.HostedRoot, __main__._rpyc.core.netref.BaseNetref)
+        def awaitable(t):
+            return any(hasattr(t, name) for name in ('__await__', '__aiter__', '__aenter__'))
+        stubs, found = [], []
         for name, value in K._boot.items():
-            if engine_of(value):
-                found.append(name)
+            if type(value) is __main__.HostedRoot:
+                stubs.append(name)
+            if issubclass(type(value), hosted):
+                if awaitable(type(value)):
+                    found.append(name)
+                continue
             if name == '__builtins__' or inspect.ismodule(value):
                 continue
             for attr in dir(value):
@@ -4574,15 +4522,16 @@ fn no_name_a_kernel_boots_resolves_a_hosted_object_synchronously() {
                     member = getattr(value, attr)
                 except Exception:
                     continue
-                if engine_of(member):
+                if issubclass(type(member), hosted):
                     found.append(f'{name}.{attr}')
-        print(found)
+        print(stubs, found, hasattr(__main__, 'HostedObject'))
     "#;
     for agent in ["primary", "b"] {
         assert_eq!(
             relay.output_in(agent, 1, &format!("AGENT = {agent:?}\n{}", py(probe))),
-            "[]\n",
+            "['fx'] [] False\n",
             "{agent}"
         );
     }
+    assert_eq!(sent(&relay, "primary"), 0);
 }

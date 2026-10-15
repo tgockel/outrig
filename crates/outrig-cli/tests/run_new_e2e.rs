@@ -1656,9 +1656,12 @@ fn hosted_requests(log: &[Value]) -> Vec<(u64, Vec<(String, Value)>)> {
 }
 
 /// Every hosted request agent code makes through `run-new` is recorded,
-/// receipt first: a read through two attributes is two requests, iteration a
-/// request per item, a method call two, and a call that raises names the
-/// fixture's exception while the agent catches it by its own class.
+/// receipt first, as RPyC's proxy sends it, the binding's name used as plain
+/// Python: a read through two attributes is two requests, a method call two,
+/// `for` a request for the iterator and one per item and for the end, and `len`,
+/// truthiness, `in`, `==`, assignment, deletion, `with` and `repr` one each --
+/// an execution that ends in the name one `repr` too. A call that raises names
+/// the fixture's exception while the agent catches it by its own class.
 #[tokio::test]
 async fn every_hosted_request_is_recorded_through_run_new() {
     let wheels = tempfile::tempdir().expect("a wheels directory");
@@ -1667,11 +1670,21 @@ async fn every_hosted_request_is_recorded_through_run_new() {
         submit(
             "toolu_1",
             "from outrig_fixture import FixtureError\n\
-             print(await fx.a.b)\n\
-             print([x async for x in fx.sequence])\n\
-             print(await fx.method(1))\n\
-             try:\n    await fx.raise_fixture()\n\
-             except FixtureError as e:\n    print('caught', e.status)",
+             chain = fx.a.b\n\
+             print(fx.method(2, y=3))\n\
+             items = []\n\
+             for x in fx.sequence:\n    items.append(x)\n\
+             print(items)\n\
+             print(len(fx.sequence), bool(fx), 1 in fx.sequence, fx.a == 1)\n\
+             fx.writable = 'v'\n\
+             print(fx.writable)\n\
+             del fx.writable\n\
+             with fx.manager:\n    pass\n\
+             print(repr(fx).startswith('<outrig_fixture.Root object'))\n\
+             try:\n    fx.raise_fixture()\n\
+             except FixtureError as e:\n    print('caught', e.status)\n\
+             print(fx.truth_tested, fx.manager.entered, hasattr(fx, 'writable'))\n\
+             fx",
         ),
         text_reply("recorded"),
     ])
@@ -1700,9 +1713,24 @@ async fn every_hosted_request_is_recorded_through_run_new() {
     let (status, _, stderr) = session.exit(false).await;
     assert_eq!(status.code(), Some(0), "{stderr}");
     let recorded = drain_recorded(&mut requests);
+    let printed = tool_result(&recorded[1], "toolu_1");
+    let lines: Vec<&str> = printed.lines().collect();
     assert_eq!(
-        tool_result(&recorded[1], "toolu_1"),
-        "<hosted types.SimpleNamespace from fx>\n[10, 20, 30]\n2\ncaught 3\n"
+        lines[..7],
+        [
+            "5",
+            "[10, 20, 30]",
+            "3 True False False",
+            "v",
+            "True",
+            "caught 3",
+            "1 1 False",
+        ],
+        "{printed}"
+    );
+    assert!(
+        lines[7].starts_with("<outrig_fixture.Root object at "),
+        "{printed}"
     );
     let log = the_log(sessions.path());
     let requests = hosted_requests(&log);
@@ -1723,16 +1751,35 @@ async fn every_hosted_request_is_recorded_through_run_new() {
         [
             ("getattr", Some("a")),
             ("getattr", Some("b")),
+            ("getattr", Some("method")),
+            ("call", None),
             ("getattr", Some("sequence")),
             ("callattr", Some("__iter__")),
             ("callattr", Some("__next__")),
             ("callattr", Some("__next__")),
             ("callattr", Some("__next__")),
             ("callattr", Some("__next__")),
-            ("getattr", Some("method")),
-            ("call", None),
+            ("getattr", Some("sequence")),
+            ("callattr", Some("__len__")),
+            ("callattr", Some("__bool__")),
+            ("getattr", Some("sequence")),
+            ("callattr", Some("__contains__")),
+            ("getattr", Some("a")),
+            ("cmp", Some("__eq__")),
+            ("setattr", Some("writable")),
+            ("getattr", Some("writable")),
+            ("delattr", Some("writable")),
+            ("getattr", Some("manager")),
+            ("callattr", Some("__enter__")),
+            ("ctxexit", None),
+            ("repr", None),
             ("getattr", Some("raise_fixture")),
             ("call", None),
+            ("getattr", Some("truth_tested")),
+            ("getattr", Some("manager")),
+            ("getattr", Some("entered")),
+            ("getattr", Some("writable")),
+            ("repr", None),
         ]
     );
     let raised: Vec<&str> = requests
@@ -1744,17 +1791,23 @@ async fn every_hosted_request_is_recorded_through_run_new() {
         .collect();
     assert_eq!(
         raised,
-        ["builtins.StopIteration", "outrig_fixture.FixtureError"]
+        [
+            "builtins.StopIteration",
+            "outrig_fixture.FixtureError",
+            "builtins.AttributeError"
+        ]
     );
 }
 
-/// GitPython, as a binding over the repository the session works in: agent
-/// code commits a change and pushes it to a bare repository over `file://`,
-/// which then holds the commit, and the stream holds every request the commit
-/// and the push made, each to its end. Installs GitPython from the index, so it
+/// GitPython, as a binding over the repository the session works in, used as
+/// GitPython documents it: agent code reads the head commit, commits a change,
+/// pushes it to a bare repository over `file://`, walks the history, checks a
+/// commit against the library's own class and catches the library's own
+/// exception. The bare repository then holds the commit, and the stream holds
+/// every request, each to its end. Installs GitPython from the index, so it
 /// needs the network.
 #[tokio::test]
-async fn a_gitpython_binding_commits_and_pushes() {
+async fn a_gitpython_binding_is_used_as_plain_code() {
     let bare = tempfile::tempdir().expect("a bare repository");
     let git = |dir: &Path, args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -1774,11 +1827,21 @@ async fn a_gitpython_binding_commits_and_pushes() {
     let (addr, mut requests) = start_mock_http(vec![
         submit(
             "toolu_1",
-            "open('change.txt', 'w').write('a change\\n')\n\
-             await repo.index.add(['change.txt'])\n\
-             commit = await repo.index.commit('add a change')\n\
-             await repo.remote('origin').push('HEAD:refs/heads/main')\n\
-             print(await commit.hexsha)",
+            "import os\n\
+             os.environ['GIT_PYTHON_REFRESH'] = 'quiet'\n\
+             import git\n\
+             start = repo.head.commit.hexsha\n\
+             open('change.txt', 'w').write('a change\\n')\n\
+             repo.index.add(['change.txt'])\n\
+             commit = repo.index.commit('add a change')\n\
+             repo.remotes.origin.push('HEAD:refs/heads/main')\n\
+             shas = []\n\
+             for c in repo.iter_commits():\n    shas.append(c.hexsha)\n\
+             print(commit.hexsha)\n\
+             print(shas == [commit.hexsha, start], len(commit.parents),\n\
+             \x20     isinstance(commit, git.Commit))\n\
+             try:\n    repo.git.rev_parse('no-such-ref')\n\
+             except git.GitCommandError as e:\n    print('GitCommandError', e.status)",
         ),
         text_reply("pushed"),
     ])
@@ -1810,11 +1873,16 @@ async fn a_gitpython_binding_commits_and_pushes() {
     let (status, _, stderr) = session.exit(false).await;
     assert_eq!(status.code(), Some(0), "{stderr}");
     let recorded = drain_recorded(&mut requests);
-    let sha = tool_result(&recorded[1], "toolu_1");
-    assert_eq!(sha.trim().len(), 40, "{sha}");
+    let printed = tool_result(&recorded[1], "toolu_1");
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 3, "{printed}");
+    let sha = lines[0];
+    assert_eq!(sha.len(), 40, "{printed}");
+    assert_eq!(lines[1], "True 1 True", "{printed}");
+    assert_eq!(lines[2], "GitCommandError 128", "{printed}");
     assert_eq!(
         git(bare.path(), &["rev-parse", "refs/heads/main"]).trim(),
-        sha.trim(),
+        sha,
         "the bare repository holds the commit"
     );
     let requests = hosted_requests(&the_log(sessions.path()));
@@ -1822,15 +1890,40 @@ async fn a_gitpython_binding_commits_and_pushes() {
         .iter()
         .filter_map(|(_, events)| events[0].1["member"].as_str())
         .collect();
-    for member in ["index", "add", "commit", "remote", "push", "hexsha"] {
+    for member in [
+        "head",
+        "commit",
+        "hexsha",
+        "index",
+        "add",
+        "remotes",
+        "origin",
+        "push",
+        "iter_commits",
+        "__iter__",
+        "__next__",
+        "parents",
+        "git",
+        "rev_parse",
+    ] {
         assert!(
             members.contains(&member),
             "no request for {member}: {members:?}"
         );
     }
+    let mut raised = Vec::new();
     for (id, events) in &requests {
         let end = &events.last().expect("an end");
         assert_eq!(end.0, "ended", "request {id} did not end: {events:?}");
-        assert_eq!(end.1["outcome"], "returned", "request {id}: {events:?}");
+        match end.1["outcome"].as_str() {
+            Some("returned") => {}
+            Some("raised") => raised.push(end.1["exception"].as_str().expect("a type")),
+            _ => panic!("request {id}: {events:?}"),
+        }
     }
+    assert_eq!(
+        raised,
+        ["builtins.StopIteration", "git.exc.GitCommandError"],
+        "{requests:?}"
+    );
 }

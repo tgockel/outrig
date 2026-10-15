@@ -217,6 +217,38 @@ thread may be anywhere, and it raises `KeyboardInterrupt` only when all three of
   loop a runaway, which justifies ending whatever agent code spins on it. Without one of these, a
   user's interrupt for a suspended execution could end another's healthy task.
 
+**Nor into a hosted call's own work** (`0003-23`). On the primary, a hosted call boxes its
+arguments, sends, waits and reads its answer on the kernel's own thread, where the signal lands. An
+exception raised while a frame is read -- taken from the channel, its request not yet answered --
+would leave the connection waiting for a reply that has already come, and the pool would never
+hand that connection out again; four such interrupts would leave the binding's calls waiting for
+good. One raised just after the pool's lock is taken, in `Condition.__enter__`, would leave the
+lock held, and the reader thread would stop at the pool's next frame. So the handler declines
+wherever, walking out from where the signal landed, a frame of a hosted call's own work comes
+first -- this program's or RPyC's -- short of where the call runs an object's own code. That is a
+callback's, beneath RPyC's request handler, interrupted at once in a module's code too; what
+boxing an argument or a callback's result calls, such as a path's `__fspath__` that never returns,
+which an exception leaves before anything of the request is written, or as the callback's answer;
+and what rebuilding the exception a reply carries calls -- a module's import, the class's
+`__new__`, `__init_subclass__` and setters -- where the interrupt takes the reply's place, the
+reply already taken and its request no longer outstanding; and what boxing an exception for the
+host reads, its public properties. For the exception a callback raised, the host's call waits for
+the answer, so one that cannot be boxed -- a property that raises, an interrupt, a cancel that
+refuses the call a property makes -- is answered as a `RuntimeError` naming the exception and what
+failed, built without running the agent's code, and an interrupt or cancel is then raised here as
+the callback's. So is the refusal of a callback the host calls after its caller gave up, which no
+interrupt can land in. The frames that decode a reply stay declined.
+Declining inside a call, the handler leaves the interrupt on the call, which raises it at its next
+check: before it waits, as its wait looks again, or as it ends, the last saying that the call
+ended first. A hosted call a callback makes meanwhile is a check too: it is not sent, and raises
+what was left, once. The handler takes no lock, so it cannot wake a call that has begun to wait:
+a call waiting on the main thread looks again every 0.1 seconds, and one that was waiting for a
+free connection tells the host it was never sent, which the handler cannot write. Outside a call
+-- one taking the pool's lock before it has begun, a proxy's finalizer -- the interrupt is
+dropped, and the host's next one reaches the code. The reader thread leaves a busy primary thread
+to the signal, so an interrupt is raised once: a callback that catches it and returns gets no
+second one when its call next waits.
+
 So the third row of the SIGINT table neither exits nor escapes the loop any more: an interrupt
 aimed at an execution suspended on an await declines, and a cancel is the remedy.
 
@@ -333,19 +365,20 @@ that catches both keeps the slot; what a further press means is the front end's 
   the wait; `run` kills its direct child, and what that child started keeps running, which the
   result says. The killed child stays a zombie until the next spawn. A bare `Popen(...).wait()`
   does not kill even the child.
-- **A hosted call** (`hosted-objects.md`). The kernel's thread is in the call, waiting for a
-  binding on the host to answer where the reader thread can wake it, so the host's check sees an
-  idle thread, as in `time.sleep`, and leaves it. Ctrl-C cancels, then interrupts, and either one
-  wakes the wait -- not by the signal, but through the pool's condition variable, which the
-  reader thread can signal -- and raises where the call was made, on any kernel. The call raises
-  a `CancelledError` or a `KeyboardInterrupt` that names the binding and says the call's outcome
-  on the host is unknown -- or, when the call was still waiting for a free connection to the
-  binding, that it was never sent. The host-side call keeps running, since RPyC has no cancel,
-  and its reply is dropped when it comes. A call made in a `to_thread` worker is not woken:
-  cancelling the task that awaits the worker cancels that wait only, and the call goes on. The
-  rule for whose code an interrupt may end is the handler's, applied when the call is made; the
-  interpreter's own hosted calls -- the echo of a proxy as a trailing expression, a traceback
-  holding one -- follow the same rule, decided from the frames when the call is made
+- **A hosted call** (`hosted-objects.md`). The kernel's thread is in the call, waiting for a binding
+  on the host to answer where the reader thread can wake it, so the host's check sees an idle
+  thread, as in `time.sleep`, and leaves it. Ctrl-C cancels, then interrupts, and either one wakes
+  the wait -- not by the signal, but through the pool's condition variable, which the reader thread
+  can signal -- and raises where the call was made, on any kernel; a call found sending or reading
+  its answer raises at its next check, and one found in an argument's own code as it boxes it raises
+  there, as above. The call raises a `CancelledError` or a `KeyboardInterrupt` that names the
+  binding and says the call's outcome on the host is unknown -- or, when the call was still waiting
+  for a free connection to the binding, that it was never sent. The host-side call keeps running,
+  since RPyC has no cancel, and its reply is dropped when it comes. A call made in a `to_thread`
+  worker is not woken: cancelling the task that awaits the worker cancels that wait only, and the
+  call goes on. The rule for whose code an interrupt may end is the handler's, applied when the call
+  is made; the interpreter's own hosted calls -- the echo of a proxy as a trailing expression, a
+  traceback holding one -- follow the same rule, decided from the frames when the call is made
   (`0003-23`).
 - **`os.system`.** libc's `system()` ignores SIGINT process-wide for as long as it waits, so an
   interrupt sent then would be discarded -- for every agent, not only the one that called it. The

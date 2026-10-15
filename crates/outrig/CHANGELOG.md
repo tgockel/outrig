@@ -251,26 +251,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/outrig/bindings/`. `Step::Packages` and `Step::Bindings` report the two new start steps.
 
 - **Agent code calls its bindings, and every call is recorded.** Each binding is bound under its
-  name in every kernel -- the primary and every one opened later -- as a `HostedObject` the agent's
-  code awaits, and the inventory lists none of them; the runtime keeps its own reference, so
-  rebinding the name changes nothing it uses. Requests cross through a relay in the session, one
-  queue bounded in bytes to the process holding the bindings: a request that does not fit is refused
-  whole, raising in its caller. The queue counts what each line holds, not what a frame's label
-  claims; a frame declared past 128 MiB or whose parts outrun its label closes its connection, and
-  an agent holds at most 64 connections to a binding and 1,024 requests that have not ended. The
-  process is sent the number each request is held under, and a frame it reads as anything but that
-  request closes its connection and ends the request `refused`; one left unread when its connection
-  closes ends `cancelled`, `disconnected`; and it refuses a boundary request that carries no such
-  number. Every request the process's checks see is recorded in the stream, under a `RequestId`:
-  `hosted.received` before anything is decided about it, with its `Operation`, member, host-side
-  type and a bounded preview of each argument -- an object named by its type and a reference number,
-  never by its `repr`; `hosted.dispatched` before its target runs, which the process waits for; and
-  `hosted.ended` with a `HostedOutcome` -- `returned`, `raised` with the type and the host's
-  traceback text, `refused`, `cancelled`, or `unknown` -- and a `HostedReason`. Bookkeeping is
-  recorded only when refused. A callback a library makes is `hosted.callback`, and a request made
-  inside one names its parent. An interrupt ends the caller's wait; a call already running runs on,
-  and its outcome notes the interrupt, while one still waiting for its binding's turn or for a
-  connection is `cancelled`.
+  name in every kernel -- the primary and every one opened later -- as RPyC's proxy of its root,
+  fetched at the first use, and agent code uses it as the library documents: each read, call or
+  iteration step is a request that holds the calling thread, and with it the kernel's event loop,
+  until the host answers; `asyncio.to_thread` keeps the loop turning. A read the binding refuses is
+  an `AttributeError`, a missing or refused read is one request, and a coroutine function is refused
+  as a callback before anything is sent. The inventory lists no binding; the runtime keeps its own
+  reference, so rebinding the name changes nothing it uses. Requests cross through a relay in the
+  session, one queue bounded in bytes to the process holding the bindings: a request that does not
+  fit is refused whole, raising in its caller. The queue counts what each line holds, not what a
+  frame's label claims; a frame declared past 128 MiB or whose parts outrun its label closes its
+  connection, and an agent holds at most 64 connections to a binding and 1,024 requests that have
+  not ended. The process is sent the number each request is held under, and a frame it reads as
+  anything but that request closes its connection and ends the request `refused`; one left unread
+  when its connection closes ends `cancelled`, `disconnected`; and it refuses a boundary request
+  that carries no such number. Every request the process's checks see is recorded in the stream,
+  under a `RequestId`: `hosted.received` before anything is decided about it, with its `Operation`,
+  member, host-side type and a bounded preview of each argument -- an object named by its type and a
+  reference number, never by its `repr`; `hosted.dispatched` before its target runs, which the
+  process waits for; and `hosted.ended` with a `HostedOutcome` -- `returned`, `raised` with the type
+  and the host's traceback text, `refused`, `cancelled`, or `unknown` -- and a `HostedReason`.
+  Bookkeeping is recorded only when refused. A callback a library makes is `hosted.callback`, and a
+  request made inside one names its parent. An interrupt ends the caller's wait; a call already
+  running runs on, and its outcome notes the interrupt, while one still waiting for its binding's
+  turn or for a connection is `cancelled`. One that arrives while the answer is being read is raised
+  as the call ends, and one that finds an argument's own code running as the request is built -- a
+  path's `__fspath__` -- or the code that rebuilds a host exception -- a class's
+  `__init_subclass__` -- or that boxes the exception a callback raised -- a property it reads -- is
+  raised there. One left for a call whose callback then makes a hosted call is raised as that call,
+  which is not sent. An exception a callback raised that cannot be boxed that way is answered to the
+  host as a `RuntimeError` saying which exception it was and what failed, so the host's call of the
+  callback ends and its binding's turn goes on, and the connection stays open.
 
   `close_admission` closes the relay in the same state change as the gate, and returns at once: a
   request not yet forwarded is refused, admission closed, and its caller gets an `outrig.Closed`;

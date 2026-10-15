@@ -736,25 +736,6 @@ impl Relay {
         }))
     }
 
-    /// Close the interpreter's stdin, as the host's end does.
-    pub(crate) fn close_stdin(&mut self) {
-        self.stdin.lock().expect("stdin lock").take();
-    }
-
-    /// The interpreter's exit status, once it has exited within `within`.
-    pub(crate) fn exit_within(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = self.interpreter.try_wait().expect("try_wait") {
-                return Some(status);
-            }
-            if Instant::now() > deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Close the bindings process's stdin, as the owner's death does.
     pub(crate) fn close_binding_stdin(&mut self) {
         let bound = self.process.as_mut().expect("a started bindings process");

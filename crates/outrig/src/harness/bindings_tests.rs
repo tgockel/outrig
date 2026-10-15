@@ -699,10 +699,7 @@ kwargs      = {{ out = {:?} }}
 async fn agent_code_reaches_its_binding_by_name() {
     let bed = Bed::new();
     let (session, mut events, _) = with_fixture(&bed).await;
-    assert_eq!(
-        output(&session, "print(await fx.public)").await,
-        "public value\n"
-    );
+    assert_eq!(output(&session, "print(fx.public)").await, "public value\n");
     let report = stop(session).await;
     assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
     let kinds: Vec<&str> = taken(&mut events)
@@ -726,10 +723,7 @@ async fn shutdown_during_a_slow_call_kills_it_and_reports_it_unknown() {
     let started = Flag::new();
     let _slow = session
         .interpreter()
-        .submit(&format!(
-            "await fx.record(60, 'slow', started={})",
-            started.py()
-        ))
+        .submit(&format!("fx.record(60, 'slow', started={})", started.py()))
         .unwrap_or_else(|e| panic!("{e}"));
     raised(&started).await;
     let report = within(session.shutdown(Duration::from_millis(300))).await;
@@ -774,7 +768,7 @@ async fn an_output_held_past_the_stop_leaves_the_call_unknown() {
     let _call = session
         .interpreter()
         .submit(&format!(
-            "await fx.escape({:?}, 60)",
+            "fx.escape({:?}, 60)",
             pidfile.to_str().expect("a UTF-8 path")
         ))
         .unwrap_or_else(|e| panic!("{e}"));
@@ -828,8 +822,8 @@ async fn a_draining_calls_callback_runs() {
     let _call = session
         .interpreter()
         .submit(&format!(
-            "async def back():\n    open({}, 'w').close()\n    return 'back'\n\
-             print(await fx.call_after(1, back, started={}))",
+            "def back():\n    open({}, 'w').close()\n    return 'back'\n\
+             print(fx.call_after(1, back, started={}))",
             called.py(),
             started.py()
         ))
@@ -849,12 +843,12 @@ async fn a_draining_calls_callback_runs() {
     assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
 }
 
-/// Callbacks that never return -- a coroutine that catches every cancel, and a plain function that
-/// loops on its worker -- made by calls draining at the close leave shutdown bounded. The interrupt
-/// the shutdown sends wakes the thread serving the coroutine, which answers its call with it, so
-/// that call ends `raised` while the coroutine runs on; nothing can answer the plain function's
-/// call, which ends `unknown`, its binding killed. Nothing is left of the bindings process's
-/// group.
+/// Callbacks that never return -- a function looping on the primary's thread, in a call made
+/// there, and one looping on a worker, in a call made with `asyncio.to_thread` -- made by calls
+/// draining at the close leave shutdown bounded. The interrupt the shutdown sends lands in the one
+/// on the primary's thread, which answers its call with it, so that call ends `raised`; nothing
+/// interrupts a worker, so the other call ends `unknown`, its binding killed. Nothing is left of
+/// the bindings process's group.
 #[tokio::test]
 async fn a_callback_that_never_returns_leaves_shutdown_bounded() {
     let bed = Bed::new();
@@ -863,20 +857,17 @@ async fn a_callback_that_never_returns_leaves_shutdown_bounded() {
     let _calls = session
         .interpreter()
         .submit(&format!(
-            "import asyncio, time\n\
-             async def stubborn():\n\
-             \x20   while True:\n\
-             \x20       try:\n\
-             \x20           await asyncio.sleep(3600)\n\
-             \x20       except asyncio.CancelledError:\n\
-             \x20           pass\n\
+            "import asyncio, os, time\n\
              def spin():\n\
              \x20   while True:\n\
              \x20       time.sleep(0.01)\n\
-             await asyncio.gather(fx.call_after(0.2, stubborn, started={})._resolve(),\n\
-             \x20                    fx.call_after(0.2, spin, started={})._resolve())",
-            a.py(),
-            b.py()
+             worker = asyncio.create_task(asyncio.to_thread(\n\
+             \x20   lambda: fx.call_after(0.2, spin, started={worker})))\n\
+             while not os.path.exists({worker}):\n\
+             \x20   await asyncio.sleep(0.01)\n\
+             fx.call_after(0.2, spin, started={primary})",
+            worker = a.py(),
+            primary = b.py()
         ))
         .unwrap_or_else(|e| panic!("{e}"));
     raised(&a).await;
@@ -913,12 +904,12 @@ async fn a_callback_that_never_returns_leaves_shutdown_bounded() {
     };
     assert_eq!(
         passed(&a),
-        Some((HostedOutcome::Raised, None)),
+        Some((HostedOutcome::Unknown, Some(HostedReason::Killed))),
         "{report:?}"
     );
     assert_eq!(
         passed(&b),
-        Some((HostedOutcome::Unknown, Some(HostedReason::Killed))),
+        Some((HostedOutcome::Raised, None)),
         "{report:?}"
     );
     assert!(

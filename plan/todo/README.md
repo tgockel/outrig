@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-23` | A hosted call is synchronous, with the library's own convention    |
 | `0003-24` | Policy decides what crosses, and the user can be asked             |
 | `0003-25` | An evaluator judges what no rule settled                           |
 

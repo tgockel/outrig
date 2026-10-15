@@ -860,13 +860,20 @@ def connection_class(rpyc):
         )
 
     def check_attr(obj, name):
+        """The rule for the attribute `name` of `obj`. A refusal by it carries the name as its
+        `name`, as no other refusal does, so the container can raise a refused read as the
+        `AttributeError` a missing attribute is."""
         if not allowed(name):
-            raise Refused(f"{name!r} is not a public name, and it is not on RPyC's safe list")
-        if name in ("format", "format_map") and (
+            reason = f"{name!r} is not a public name, and it is not on RPyC's safe list"
+        elif name in ("format", "format_map") and (
             isinstance(obj, str) or (isinstance(obj, type) and issubclass(obj, str))
         ):
-            raise Refused(f"str.{name} reads attributes through its format string; it is refused")
-        return name
+            reason = f"str.{name} reads attributes through its format string; it is refused"
+        else:
+            return name
+        refused = Refused(reason)
+        refused.name = name
+        raise refused
 
     def check_member(handler, args):
         """The checks on the member a request names, made before its dispatch: the attribute

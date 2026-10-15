@@ -51,8 +51,8 @@ def cancel(*seqs):
                     "cancel": list(seqs)})
 "#;
 
-/// Python that binds `K` to `agent`'s kernel and `stub` to its hosted object for binding `fx`,
-/// with the fixture importable, then runs `body`.
+/// Python that binds `K` to `agent`'s kernel and `stub` to its stub for binding `fx`, with the
+/// fixture importable, then runs `body`.
 fn with_stub_in(agent: &str, body: &str) -> String {
     format!(
         "import __main__, asyncio, os, sys, time\nsys.path.append({:?})\n\
@@ -62,15 +62,16 @@ fn with_stub_in(agent: &str, body: &str) -> String {
     )
 }
 
-/// Python for `asyncio` tasks, one per flag in `starts`, each holding a call to the fixture until
-/// `release` is raised, kept alive in `builtins.held`.
+/// Python for `asyncio` tasks, one per flag in `starts`, each holding a call to the fixture in a
+/// worker until `release` is raised, kept alive in `builtins.held`.
 fn held_calls(starts: &[Flag], release: &Flag) -> String {
     let tasks: String = starts
         .iter()
         .enumerate()
         .map(|(i, start)| {
             format!(
-                "    asyncio.create_task(stub.record(0, 'c{i}', started={}, until={})._resolve()),\n",
+                "    asyncio.create_task(asyncio.to_thread(\n        \
+                 lambda: stub.record(0, 'c{i}', started={}, until={}))),\n",
                 start.py(),
                 release.py()
             )
@@ -162,23 +163,21 @@ fn every_request_is_recorded_receipt_first() {
         &with_stub(
             r#"
             from outrig_fixture import FixtureError
-            print(await stub.a.b)
-            print([x async for x in stub.sequence])
-            print(await stub.method(1))
+            chain = stub.a.b
+            items = []
+            for x in stub.sequence:
+                items.append(x)
+            print(items)
+            print(stub.method(1))
             try:
-                await stub.raise_fixture()
+                stub.raise_fixture()
             except FixtureError as e:
                 print('caught', e.status)
-            print(await stub.stamp())
+            print(stub.stamp())
             "#,
         ),
     );
     let mut lines = out.lines();
-    assert_eq!(
-        lines.next(),
-        Some("<hosted types.SimpleNamespace from fx>"),
-        "{out}"
-    );
     assert_eq!(lines.next(), Some("[10, 20, 30]"), "{out}");
     assert_eq!(lines.next(), Some("2"), "{out}");
     assert_eq!(lines.next(), Some("caught 3"), "{out}");
@@ -264,7 +263,7 @@ fn arguments_are_previewed_as_they_crossed() {
     relay.bind("fx", FACTORY);
     relay.output(
         1,
-        &with_stub("await stub.types(1, 'two', (3, 4.5), list(range(20)), flag=True, name=None)"),
+        &with_stub("stub.types(1, 'two', (3, 4.5), list(range(20)), flag=True, name=None)"),
     );
     let events = relay.hosted_events();
     let (arguments, keywords) = events
@@ -297,7 +296,8 @@ fn arguments_are_previewed_as_they_crossed() {
     );
 }
 
-/// A callback's invocation and the hosted call it makes carry the outer call's id as parent.
+/// A callback's invocation and the hosted call it makes carry the outer call's id as parent: the
+/// callback runs on the thread waiting for the outer call, and its call goes on that connection.
 #[test]
 fn a_callback_is_recorded_under_its_call() {
     let mut relay = Relay::start();
@@ -306,9 +306,9 @@ fn a_callback_is_recorded_under_its_call() {
         1,
         &with_stub(
             r#"
-            async def back():
-                return await stub.public
-            print(await stub.call(back))
+            def back():
+                return stub.public
+            print(stub.call(back))
             "#,
         ),
     );
@@ -376,7 +376,7 @@ fn a_refusal_by_the_interception_is_recorded() {
                 except Exception as e:
                     print(label, type(e).__name__)
             try:
-                await stub._private
+                stub._private
             except (FixtureError, CommandError):
                 print('the library caught it')
             except AttributeError as e:
@@ -411,27 +411,63 @@ fn a_refusal_by_the_interception_is_recorded() {
     );
 }
 
-/// An interrupt ends the caller's wait; the binding finishes the call, which ends `returned`,
-/// noted interrupted; the next call returns its own result.
-#[test]
-fn an_interrupt_ends_the_wait_and_the_call_runs_on() {
+/// Interrupt -- or cancel -- `agent`'s execution while its thread waits 10 s in a hosted call: the
+/// call raises there within a second, with `0003-17`'s text, and the binding finishes it, which
+/// ends `returned` with the note that its caller was interrupted. The next call returns its own
+/// result, and is what lets the first finish: the binding reads it after the cancel line the
+/// interrupted call sent ahead of its result, so the note is made before the first can end, where
+/// a release from the test could overtake that line.
+fn a_woken_call_runs_on(agent: &str, cancel: bool) {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
+    if agent != PRIMARY {
+        relay.open(agent);
+    }
     let (started, release) = (Flag::new(), Flag::new());
     relay.submit_in(
-        "primary",
+        agent,
         1,
-        &with_stub(&format!(
-            "print(await stub.record(10, 'slow', started={}, until={}))",
-            started.py(),
-            release.py()
-        )),
+        &with_stub_in(
+            agent,
+            &format!(
+                "print(stub.record(10, 'slow', started={}, until={}))",
+                started.py(),
+                release.py()
+            ),
+        ),
     );
     started.wait();
-    relay.interrupt("primary", 1, false);
-    let result = relay.result_from("primary", 1, TIMEOUT);
-    assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
-    release.raise();
+    let asked_at = Instant::now();
+    if cancel {
+        relay.cancel(agent, 1);
+    } else {
+        relay.interrupt(agent, 1, false);
+    }
+    let result = relay.result_from(agent, 1, TIMEOUT);
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked_at.elapsed()
+    );
+    let (raised, verb) = if cancel {
+        ("CancelledError", "cancelled")
+    } else {
+        ("KeyboardInterrupt", "interrupted")
+    };
+    assert_eq!(result["raised"], raised, "{result}");
+    let error = result["error"].as_str().expect("an error");
+    assert!(
+        error.contains(&format!(
+            "{verb} by outrig while waiting for binding 'fx' to answer: the call's outcome on \
+             the host is unknown"
+        )),
+        "{error}"
+    );
+    let releasing = format!("print(stub.record(0, 'release', started={}))", release.py());
+    assert_eq!(
+        relay.output_in(agent, 2, &with_stub_in(agent, &releasing)),
+        "release\n"
+    );
     let events = relay.hosted_events_until(TIMEOUT, |events| {
         by_request(events).values().any(|events| {
             matches!(
@@ -444,11 +480,82 @@ fn an_interrupt_ends_the_wait_and_the_call_runs_on() {
             )
         })
     });
-    assert!(!events.is_empty());
-    assert_eq!(
-        relay.output(2, &with_stub("print(await stub.method(1))")),
-        "2\n"
+    let call = by_request(&events)
+        .into_values()
+        .find(|events| asked(events).0 == Operation::Call)
+        .expect("the slow call");
+    assert_eq!(ended(&call).0, HostedOutcome::Returned, "{call:?}");
+}
+
+#[test]
+fn an_interrupt_ends_the_wait_on_the_primary_and_the_call_runs_on() {
+    a_woken_call_runs_on(PRIMARY, false);
+}
+
+#[test]
+fn an_interrupt_ends_the_wait_on_a_child_and_the_call_runs_on() {
+    a_woken_call_runs_on("b", false);
+}
+
+#[test]
+fn a_cancel_ends_the_wait_and_the_call_runs_on() {
+    a_woken_call_runs_on("b", true);
+}
+
+/// A call made in a worker is not woken by an interrupt: the worker's frames hold no agent code.
+/// A cancel ends the code awaiting it at once, and the call runs on until the host answers; it is
+/// recorded `returned`, not interrupted, since nothing gave up on it.
+#[test]
+fn a_worker_call_is_not_woken_by_an_interrupt() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let (started, release) = (Flag::new(), Flag::new());
+    relay.submit_in(
+        PRIMARY,
+        1,
+        &with_stub(&format!(
+            "print(await asyncio.to_thread(\
+             lambda: stub.record(10, 'slow', started={}, until={})))",
+            started.py(),
+            release.py()
+        )),
     );
+    started.wait();
+    relay.interrupt(PRIMARY, 1, false);
+    assert!(
+        relay
+            .try_result_from(PRIMARY, 1, Duration::from_secs(1))
+            .is_none(),
+        "the interrupt ended an execution awaiting a worker's call"
+    );
+    let asked_at = Instant::now();
+    relay.cancel(PRIMARY, 1);
+    let result = relay.result_from(PRIMARY, 1, TIMEOUT);
+    assert!(asked_at.elapsed() < Duration::from_secs(1));
+    assert_eq!(result["raised"], "CancelledError", "{result}");
+    release.raise();
+    let events = relay.hosted_events_until(TIMEOUT, |events| {
+        by_request(events).values().any(|events| {
+            asked(events).0 == Operation::Call
+                && outcome(events).map(|end| end.0) == Some(HostedOutcome::Returned)
+        })
+    });
+    let call = by_request(&events)
+        .into_values()
+        .find(|events| asked(events).0 == Operation::Call)
+        .expect("the slow call");
+    assert!(
+        matches!(
+            &call.last().expect("an end").payload,
+            Payload::HostedEnded {
+                outcome: HostedOutcome::Returned,
+                interrupted: false,
+                ..
+            }
+        ),
+        "{call:?}"
+    );
+    assert_eq!(relay.output(2, &with_stub("print(stub.method(1))")), "2\n");
 }
 
 /// A serialize-lock waiter whose caller is interrupted is cancelled, never invoked.
@@ -458,18 +565,18 @@ fn an_interrupted_serialize_waiter_is_cancelled() {
     relay.bind_serialized("fx", FACTORY);
     relay.open("b");
     let (started, release) = (Flag::new(), Flag::new());
-    relay.output_in("b", 1, &with_stub_in("b", "await stub.public"));
+    relay.output_in("b", 1, &with_stub_in("b", "stub.public"));
     relay.submit_in(
         "primary",
         1,
         &with_stub(&format!(
-            "print(await stub.record(0, 'a', started={}, until={}))",
+            "print(stub.record(0, 'a', started={}, until={}))",
             started.py(),
             release.py()
         )),
     );
     started.wait();
-    relay.submit_in("b", 2, &with_stub_in("b", "print(await stub.noted())"));
+    relay.submit_in("b", 2, &with_stub_in("b", "print(stub.noted())"));
     // Its receipt says it reached the binding, where it waits for the turn.
     relay.hosted_events_until(TIMEOUT, |events| {
         events.iter().any(|event| {
@@ -502,16 +609,16 @@ fn an_interrupted_serialize_waiter_is_cancelled() {
     assert_eq!(shape(&cancelled), ["hosted.received", "hosted.ended"]);
     release.raise();
     assert_eq!(relay.result_from("primary", 1, TIMEOUT)["output"], "a\n");
-    assert_eq!(
-        relay.output(2, &with_stub("print(await stub.calls)")),
-        "0\n"
-    );
+    assert_eq!(relay.output(2, &with_stub("print(stub.calls)")), "0\n");
 }
 
 /// A call interrupted while it waits for a free connection never reaches the binding, and is
-/// recorded `cancelled` from the interpreter's notice.
-#[test]
-fn a_call_interrupted_waiting_for_a_connection_is_cancelled() {
+/// recorded `cancelled` from the interpreter's notice: the reader thread's, which wakes the call,
+/// or, with `aimed`, the call's own. Then the interrupt is a signal that lands once the call waits,
+/// as when the reader thread found the call busy and left the interrupt to the signal, whose
+/// handler writes no line and wakes nothing; the wait finds it as it looks again. The signal is
+/// aimed and armed from a thread of the execution's own, as the reader thread aims and arms one.
+fn a_call_interrupted_waiting_for_a_connection_is_cancelled_by(aimed: bool) {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let release = Flag::new();
@@ -520,9 +627,28 @@ fn a_call_interrupted_waiting_for_a_connection_is_cancelled() {
     for start in &starts {
         start.wait();
     }
-    relay.submit_in("primary", 2, &with_stub("print(await stub.noted())"));
-    std::thread::sleep(Duration::from_millis(300));
-    relay.interrupt("primary", 2, false);
+    if aimed {
+        let aim = r#"
+            import signal, threading
+            main = threading.get_ident()
+            def aim():
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    wait = __main__._waits.get(main)
+                    if wait is not None and wait.conn is None and wait.waiting:
+                        __main__._primary._interrupting = (2, False)
+                        signal.pthread_kill(main, signal.SIGINT)
+                        return
+                    time.sleep(0.01)
+            threading.Thread(target=aim, daemon=True).start()
+            print(stub.noted())
+            "#;
+        relay.submit_in("primary", 2, &with_stub(aim));
+    } else {
+        relay.submit_in("primary", 2, &with_stub("print(stub.noted())"));
+        std::thread::sleep(Duration::from_millis(300));
+        relay.interrupt("primary", 2, false);
+    }
     let result = relay.result_from("primary", 2, TIMEOUT);
     assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
     let events = relay.hosted_events_until(TIMEOUT, |events| {
@@ -557,10 +683,17 @@ fn a_call_interrupted_waiting_for_a_connection_is_cancelled() {
         (HostedOutcome::Cancelled, Some(HostedReason::Interrupted))
     );
     release.raise();
-    assert_eq!(
-        relay.output(3, &with_stub("print(await stub.calls)")),
-        "0\n"
-    );
+    assert_eq!(relay.output(3, &with_stub("print(stub.calls)")), "0\n");
+}
+
+#[test]
+fn a_call_interrupted_waiting_for_a_connection_is_cancelled() {
+    a_call_interrupted_waiting_for_a_connection_is_cancelled_by(false);
+}
+
+#[test]
+fn a_call_a_signal_interrupts_waiting_for_a_connection_is_cancelled() {
+    a_call_interrupted_waiting_for_a_connection_is_cancelled_by(true);
 }
 
 /// A connection to a binding the session does not hold is closed by the relay, saying so; nothing
@@ -572,7 +705,7 @@ fn a_binding_the_session_does_not_hold_is_refused_by_the_relay() {
     let out = relay.output(
         1,
         "import __main__\nghost = __main__._kernels['primary'].stub('ghost')\n\
-         try:\n    await ghost.public\nexcept EOFError as e:\n    print(e)",
+         try:\n    ghost.public\nexcept EOFError as e:\n    print(e)",
     );
     assert!(
         out.contains("this session holds no binding \"ghost\""),
@@ -590,8 +723,8 @@ fn a_stub_is_bound_in_a_later_kernel_and_listed_nowhere() {
     relay.declare_bindings();
     relay.open("b");
     assert_eq!(
-        relay.output_in("b", 1, "print(type(fx).__name__, await fx.public)"),
-        "HostedObject public value\n"
+        relay.output_in("b", 1, "print(type(fx).__name__, fx.public)"),
+        "HostedRoot public value\n"
     );
     for agent in ["primary", "b"] {
         let inv = relay.inv(agent, 99);
@@ -605,7 +738,7 @@ fn a_stub_is_bound_in_a_later_kernel_and_listed_nowhere() {
     }
     assert_eq!(
         relay.output(1, "fx = None\nprint(type(__import__('__main__')._kernels['primary'].stubs['fx']).__name__)"),
-        "HostedObject\n"
+        "HostedRoot\n"
     );
 }
 
@@ -621,7 +754,7 @@ fn what_the_owner_still_holds_at_the_close_invokes_nothing() {
     for start in &starts {
         start.wait();
     }
-    relay.submit_in("primary", 2, &with_stub("print(await stub.noted())"));
+    relay.submit_in("primary", 2, &with_stub("print(stub.noted())"));
     std::thread::sleep(Duration::from_millis(300));
     let closed = Instant::now();
     relay.close_admission();
@@ -641,7 +774,7 @@ fn what_the_owner_still_holds_at_the_close_invokes_nothing() {
     let out = relay.output(
         3,
         &with_stub(&format!(
-            "try:\n    await stub.touch({})\nexcept Exception as e:\n    print(type(e).__name__)",
+            "try:\n    stub.touch({})\nexcept Exception as e:\n    print(type(e).__name__)",
             marker.py()
         )),
     );
@@ -683,30 +816,6 @@ fn what_the_owner_still_holds_at_the_close_invokes_nothing() {
             ),
         ]
     );
-}
-
-/// A value iterated with `async for` is iterated in the container, so the close, which refuses
-/// what would cross, leaves it iterating.
-#[test]
-fn a_value_iterated_here_keeps_iterating_after_the_close() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    let (first, go_on) = (Flag::new(), Flag::new());
-    relay.submit_in(
-        "primary",
-        1,
-        &with_stub(&format!(
-            "it = aiter(stub.types(1, 2.0, 'three'))\nhead = await anext(it)\n\
-             open({}, 'w').close()\n{}\nprint(head, [x async for x in it])",
-            first.py(),
-            go_on.awaited()
-        )),
-    );
-    first.wait();
-    relay.close_admission();
-    go_on.raise();
-    let result = relay.result_from("primary", 1, TIMEOUT);
-    assert_eq!(result["output"], "int ['float', 'str']\n", "{result}");
 }
 
 /// After the close the relay forwards bookkeeping, as its label says; a frame whose label claims
@@ -773,18 +882,18 @@ fn a_serialize_waiter_is_cancelled_when_the_binding_observes_the_close() {
     relay.bind_serialized("fx", FACTORY);
     relay.open("b");
     let (started, release) = (Flag::new(), Flag::new());
-    relay.output_in("b", 1, &with_stub_in("b", "await stub.public"));
+    relay.output_in("b", 1, &with_stub_in("b", "stub.public"));
     relay.submit_in(
         "primary",
         1,
         &with_stub(&format!(
-            "print(await stub.record(10, 'a', started={}, until={}))",
+            "print(stub.record(10, 'a', started={}, until={}))",
             started.py(),
             release.py()
         )),
     );
     started.wait();
-    relay.submit_in("b", 2, &with_stub_in("b", "print(await stub.noted())"));
+    relay.submit_in("b", 2, &with_stub_in("b", "print(stub.noted())"));
     relay.hosted_events_until(TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(&event.payload, Payload::HostedReceived { agent, member, .. }
@@ -852,7 +961,7 @@ fn recording_runs_no_code() {
     let out = relay.output(
         1,
         &with_stub(&format!(
-            "m = await stub.marked({})\nprint(await stub.takes_marked(m))",
+            "m = stub.marked({})\nprint(stub.takes_marked(m))",
             base.py()
         )),
     );
@@ -889,10 +998,10 @@ fn recording_runs_no_code() {
 fn a_stopped_process_stops_only_its_callers() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     let pid = Pid::from_raw(relay.binding_pid() as i32);
     kill(pid, Signal::SIGSTOP).expect("stop the process");
-    relay.submit_in("primary", 2, &with_stub("print(await stub.public)"));
+    relay.submit_in("primary", 2, &with_stub("print(stub.public)"));
     relay.open("b");
     assert_eq!(relay.output_in("b", 1, "print(6 * 7)"), "42\n");
     assert_eq!(relay.msg("b", 2, "user", "hello")["pending"], 1);
@@ -914,7 +1023,7 @@ fn a_process_that_dies_leaves_its_call_unknown_and_the_session_going() {
         "primary",
         1,
         &with_stub(&format!(
-            "print(await stub.record(60, 'slow', started={}))",
+            "print(stub.record(60, 'slow', started={}))",
             started.py()
         )),
     );
@@ -949,7 +1058,7 @@ fn a_process_that_dies_leaves_its_call_unknown_and_the_session_going() {
     );
     let out = relay.output(
         2,
-        &with_stub("try:\n    await stub.public\nexcept EOFError as e:\n    print(e)"),
+        &with_stub("try:\n    stub.public\nexcept EOFError as e:\n    print(e)"),
     );
     assert!(out.contains("SIGKILL"), "{out}");
     assert_eq!(relay.output(3, "print(6 * 7)"), "42\n");
@@ -963,7 +1072,7 @@ fn a_process_that_dies_leaves_its_call_unknown_and_the_session_going() {
 fn a_forwarded_request_is_the_bindings_to_finish() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("noted = await stub.noted"));
+    relay.output(1, &with_stub("noted = stub.noted"));
     let pid = Pid::from_raw(relay.binding_pid() as i32);
     let before = relay.forwarded();
     kill(pid, Signal::SIGSTOP).expect("stop the process");
@@ -973,7 +1082,7 @@ fn a_forwarded_request_is_the_bindings_to_finish() {
         &with_stub(
             r#"
             big = b'x' * 300_000
-            calls = [asyncio.create_task(noted(big)._resolve()) for _ in range(4)]
+            calls = [asyncio.create_task(asyncio.to_thread(noted, big)) for _ in range(4)]
             done = await asyncio.gather(*calls, return_exceptions=True)
             print(sorted(type(r).__name__ for r in done))
             "#,
@@ -1032,16 +1141,12 @@ fn a_forwarded_request_is_the_bindings_to_finish() {
 fn a_forwarded_request_may_start_after_the_close_returns() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("touch = await stub.touch"));
+    relay.output(1, &with_stub("touch = stub.touch"));
     let pid = Pid::from_raw(relay.binding_pid() as i32);
     let marker = Flag::new();
     kill(pid, Signal::SIGSTOP).expect("stop the process");
     let before = relay.forwarded();
-    relay.submit_in(
-        "primary",
-        2,
-        &with_stub(&format!("await touch({})", marker.py())),
-    );
+    relay.submit_in("primary", 2, &with_stub(&format!("touch({})", marker.py())));
     eventually(
         || (relay.forwarded() > before).then_some(()),
         || "the call forwarded".to_string(),
@@ -1076,14 +1181,14 @@ fn a_stalled_subscriber_loses_the_dispatch_and_sees_returned() {
     relay.output(
         1,
         &with_stub(&format!(
-            "import builtins\nbuiltins.slow = asyncio.create_task(\
-             stub.record(10, 'slow', started={}, until={})._resolve())",
+            "import builtins\nbuiltins.slow = asyncio.create_task(asyncio.to_thread(\
+             lambda: stub.record(10, 'slow', started={}, until={})))",
             started.py(),
             release.py()
         )),
     );
     started.wait();
-    relay.output(2, &with_stub("for _ in range(10):\n    await stub.public"));
+    relay.output(2, &with_stub("for _ in range(10):\n    stub.public"));
     release.raise();
     let (missed, events) = relay.hosted_events_with_gaps(TIMEOUT, |events| {
         events.iter().any(|event| {
@@ -1111,7 +1216,7 @@ fn a_stalled_subscriber_loses_the_dispatch_and_sees_returned() {
 fn a_request_numbered_past_64_bits_closes_its_connection_unrecorded() {
     let mut relay = Relay::start();
     relay.bind_serialized("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     for (id, seq) in [(2, "-1"), (4, "2 ** 64")] {
         let out = relay.output(
             id,
@@ -1133,7 +1238,7 @@ fn a_request_numbered_past_64_bits_closes_its_connection_unrecorded() {
             )
         );
         assert_eq!(
-            relay.output(id + 1, &with_stub("print(await stub.public)")),
+            relay.output(id + 1, &with_stub("print(stub.public)")),
             "public value\n"
         );
     }
@@ -1152,7 +1257,7 @@ fn a_request_numbered_past_64_bits_closes_its_connection_unrecorded() {
 fn a_request_numbered_as_one_in_flight_closes_its_connection() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     let out = relay.output(
         2,
         &with_stub(&format!(
@@ -1165,7 +1270,7 @@ fn a_request_numbered_as_one_in_flight_closes_its_connection() {
                     time.sleep(0.01)
                 return 1
             try:
-                await stub.call(again)
+                stub.call(again)
             except EOFError as e:
                 print(e)
             "#,
@@ -1198,8 +1303,8 @@ fn a_cancel_read_ahead_of_its_request_cancels_it() {
     relay.output(
         1,
         &with_stub(&format!(
-            "import builtins\nbuiltins.held = asyncio.create_task(\
-             stub.record(0, 'hold', started={}, until={})._resolve())",
+            "import builtins\nbuiltins.held = asyncio.create_task(asyncio.to_thread(\
+             lambda: stub.record(0, 'hold', started={}, until={})))",
             started.py(),
             release.py()
         )),
@@ -1246,8 +1351,8 @@ fn cancels_kept_past_the_bound_close_their_connection() {
     relay.output(
         1,
         &with_stub(&format!(
-            "import builtins\nbuiltins.held = asyncio.create_task(\
-             stub.record(0, 'hold', started={}, until={})._resolve())",
+            "import builtins\nbuiltins.held = asyncio.create_task(asyncio.to_thread(\
+             lambda: stub.record(0, 'hold', started={}, until={})))",
             started.py(),
             release.py()
         )),
@@ -1274,12 +1379,12 @@ fn cancels_kept_past_the_bound_close_their_connection() {
 fn cancels_of_requests_that_ended_are_kept_nowhere() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     let out = relay.output(
         2,
         &with_stub(&format!(
             "{FORGE}\nfor seq in range(40):\n    cancel(seq, seq + 1000)\n\
-             print(await stub.public, len(pool.connections), conn._channel.closed)"
+             print(stub.public, len(pool.connections), conn._channel.closed)"
         )),
     );
     assert_eq!(out, "public value 1 False\n");
@@ -1293,7 +1398,7 @@ fn cancels_of_requests_that_ended_are_kept_nowhere() {
 fn a_frame_unlike_its_label_ends_its_request_refused() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     let reply = r#"
 def reply(label):
     tag = {"request": label, "op": "getattr", "member": "public"}
@@ -1326,7 +1431,7 @@ def reply(label):
         );
         assert_eq!(out, format!("the host closed this connection: {reason}\n"));
         assert_eq!(
-            relay.output(id + 1, &with_stub("print(await stub.public)")),
+            relay.output(id + 1, &with_stub("print(stub.public)")),
             "public value\n"
         );
     }
@@ -1368,8 +1473,8 @@ fn labeled_frames_dropped_unread_end_their_requests_cancelled() {
     relay.output(
         1,
         &with_stub(&format!(
-            "import builtins\nbuiltins.held = asyncio.create_task(\
-             stub.record(0, 'hold', started={}, until={})._resolve())",
+            "import builtins\nbuiltins.held = asyncio.create_task(asyncio.to_thread(\
+             lambda: stub.record(0, 'hold', started={}, until={})))",
             started.py(),
             release.py()
         )),
@@ -1432,7 +1537,7 @@ fn labeled_frames_dropped_unread_end_their_requests_cancelled() {
 fn a_boundary_request_without_the_relays_label_is_refused() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
-    relay.output(1, &with_stub("await stub.public"));
+    relay.output(1, &with_stub("stub.public"));
     let out = relay.output(
         2,
         &with_stub(&format!(

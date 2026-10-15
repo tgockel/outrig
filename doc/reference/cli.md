@@ -492,10 +492,11 @@ repository's config declares is shown whole before anything is installed, with a
 question; a yes is remembered for that exact declaration in that repository, and an edit asks
 again. With no terminal on stdin -- a script, CI -- `run-new` says which binding it skipped and
 how to approve it, and the session runs without it. The agent is told each binding's name and
-description, and its Python reaches each under that name, as an object it awaits: `await
-repo.head.commit`. Every call it makes is checked on the host and, with `[events] mode = "record"`,
-recorded. If the bindings process dies, the session goes on without its bindings, and a call to
-one raises an error saying how the process ended.
+description, and its Python uses each under that name as its library documents:
+`repo.head.commit.hexsha`. Each read or call waits for the host's answer, and holds the agent's
+event loop until it comes. Every call it makes is checked on the host and, with
+`[events] mode = "record"`, recorded. If the bindings process dies, the session goes on without
+its bindings, and a call to one raises an error saying how the process ended.
 
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each

@@ -19,8 +19,9 @@
 //!
 //! A session's bindings are here too, each by name and description: names an
 //! agent cannot learn by looking, and any round may need one. So is the one
-//! rule about them that looking cannot teach -- a hosted object is awaited --
-//! since `repo.head.commit.hexsha` reads like a plain attribute chain
+//! rule about them that looking cannot teach -- a call on one blocks the
+//! agent's event loop until the host answers -- since
+//! `repo.head.commit.hexsha` reads like a plain attribute chain
 //! (`plan/phase/0003-python/discovery.md`).
 
 use std::fmt::Write as _;
@@ -102,8 +103,9 @@ fn hosted(bindings: &[Brief]) -> String {
     let example = &bindings[0].name;
     let mut text = String::from(
         "\n\nThese names are objects held by processes on the host, outside this container, \
-         with the user's own authority there. Importing the same library here gives a local copy \
-         that knows nothing of them.\n",
+         with the user's own authority there; use each as its library documents. Importing the \
+         same library here gives a local copy that knows nothing of them, and `help()` on that \
+         copy's classes describes the library without asking the host.\n",
     );
     for binding in bindings {
         let _ = write!(
@@ -118,15 +120,11 @@ fn hosted(bindings: &[Brief]) -> String {
     }
     let _ = write!(
         text,
-        "\n\nNothing happens on a hosted object until it is awaited: `await {example}.a.b` reads \
-         a chain of attributes, `await {example}.f(x)` calls a method, `async for item in \
-         {example}.items:` iterates, and `await {example}._set(\"name\", value)` and `await \
-         {example}._delete(\"name\")` assign and delete, since an assignment cannot be awaited. \
-         `if {example}:`, `len({example})` and a plain `for` over one raise, and say what to \
-         write instead. `repr`, `str` and `dir` answer here without asking the host, and \
-         `help()` on the imported library's own classes describes it. Your event loop keeps \
-         running while the host works, so `runtime.wait` still sees messages; never put a \
-         hosted object in `asyncio.to_thread`. `runtime.bindings` lists them."
+        "\n\nEvery attribute read, call, iteration step, `len`, `repr` and comparison on one \
+         is a request to the host, and it blocks your event loop until the host answers: no \
+         message arrives and no timer fires meanwhile. For a long call, `await \
+         asyncio.to_thread(lambda: {example}.f(x))` runs the whole expression on a worker thread \
+         and keeps the loop turning. `runtime.bindings` lists them."
     );
     text
 }

@@ -1949,6 +1949,44 @@ fn a_failure_that_cannot_be_formatted_is_still_reported() {
     assert_eq!(k.output(2, "2"), "2\n");
 }
 
+/// Formatting a failure leaves out the frames of a hosted call by replacing an exception's
+/// traceback, which a class may refuse: a frozen dataclass's `__setattr__` raises, and a
+/// read-only property has no setter. An exception with no such frame is not changed, so one that
+/// refuses is reported as it is, alone or as the cause of another, and so is the report of the
+/// exception it was raised from.
+#[test]
+fn a_failure_whose_class_refuses_a_traceback_is_still_reported() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        import dataclasses
+        @dataclasses.dataclass(frozen=True)
+        class Frozen(Exception):
+            reason: str
+        class ReadOnly(Exception):
+            @property
+            def __traceback__(self):
+                return None
+        try:
+            raise Frozen('inner')
+        except Frozen as inner:
+            try:
+                raise ReadOnly('middle') from inner
+            except ReadOnly as middle:
+                raise ValueError('outer') from middle
+        "#);
+    let error = error_of(&k.exec(1, &source));
+    assert!(!error.contains("could not be formatted"), "{error}");
+    for shown in [
+        "Frozen",
+        "ReadOnly: middle",
+        "ValueError: outer",
+        "File \"<execution>\"",
+    ] {
+        assert!(error.contains(shown), "{shown} missing from {error}");
+    }
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
 /// An exception's type is named from the type itself, never through its
 /// metaclass: one whose metaclass refuses `__name__` would otherwise escape
 /// the wrapper while naming what was raised, and the execution would end with

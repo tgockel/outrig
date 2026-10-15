@@ -396,11 +396,10 @@ Arguments, from the container:
 - **A callable** becomes an opaque proxy that can only be called. It is valid only during the call
   it was passed to, and is revoked when that call returns. When the host library calls it, it runs
   in the container on the thread serving the call's connection -- the kernel's thread, blocked in
-  the call, or the worker a `to_thread` call runs on. A coroutine function needs the kernel's
-  loop, which a call on the kernel's own thread is holding, so one passed from such a call is
-  refused before the call is sent; passed from a call made in a worker, it runs on the kernel's
-  loop, scheduled from the worker, which waits for it and meanwhile serves the connection ("Calls
-  are synchronous"). Each invocation is a reverse interaction, evented with the id of the call it
+  the call, or the worker a `to_thread` call runs on. A coroutine function is refused before the
+  call is sent, on any thread: the host calls a callback as a plain function and never awaits
+  what it returns ("Calls are synchronous"). Each invocation is a reverse interaction, evented with
+  the id of the call it
   ran inside. A hosted call made from inside a callback is an ordinary request on the callback's
   connection, and goes through policy (`boundary-policy.md`). What it returns crosses back to the
   host by the same rules as an argument -- by value, or as the shim's copy -- and any other
@@ -531,7 +530,8 @@ performance. `0003-17` proved the mechanism, and `0003-23` binds it under the bi
   `AttributeError` -- the library's own, or OutRig's refusal of a private name, which arrives as
   an `AttributeError` too ("Interception"; `0003-23`).
 - **`isinstance` holds** against the library's local class, through the proxy's class descriptor,
-  when that module has been imported in the container ("Packages").
+  when that module was imported in the container before the proxy arrived ("Packages"): RPyC
+  fixes a proxy's class as it unboxes the proxy (`0003-23`'s `## Decisions`).
 - **RPyC's request timeout is off.** Its default is 30 seconds, after which the caller stops
   waiting while the host carries on -- an `unknown` outcome chosen by a constant rather than by
   anyone. A push, a clone, or a call waiting for approval can legitimately take longer.
@@ -566,13 +566,11 @@ where the reader thread can wake it, as a thread waiting for its reply does.
 **Callbacks run where the call is served.** A plain-function callback runs on the thread serving
 the call's connection -- the kernel's thread, blocked in the call, or the worker a `to_thread`
 call runs on -- in that call's context, so its output is the calling execution's
-(`agent-placement.md`). A coroutine callback needs the kernel's loop, which a call on the kernel's
-own thread is holding: such a callback is refused before the call is sent, with an error that
-names `asyncio.to_thread`; passed from a call made in a worker, it runs on the kernel's loop,
-scheduled from the worker, which waits for it and meanwhile serves the hosted calls the coroutine
-makes on the outer call's connection (`0003-23`, fork 2). Under `serialize = true` that is what
-lets a nested call through the re-entrant turn below, and it is what gives the nested call its
-parent id.
+(`agent-placement.md`). A hosted call a callback makes goes on the callback's own connection,
+which under `serialize = true` is what lets it through the re-entrant turn below, and what gives
+it its parent id. A coroutine function is refused as a callback, on every thread, before the
+call is sent: the host calls a callback as a plain function, as its library calls any, and a
+coroutine it returned would never run (`0003-23`, fork 2).
 
 **The bindings process serves each connection on a thread of its own.** That is RPyC's ordinary
 server model -- its `ThreadedServer` starts a thread per connection -- so calls from different
@@ -758,6 +756,18 @@ responsiveness it bought is available to the caller through `asyncio.to_thread`,
 per in-flight call it paid is the one `to_thread` pays. `0003-23` removes it whole; nothing of it
 survives as a second spelling.
 
+**Rejected (2026-10-15): coroutine callbacks from a worker's call.** `0003-23` was to keep one
+case of the facade's callback serving: a coroutine function passed from a call made in a
+`to_thread` worker would run on the kernel's loop, and the hosted calls it made would go on the
+worker's connection, for their parent id and the `serialize` turn. That meant the worker and the
+loop's thread sharing one connection, and a review of the design against the code found a race
+at its start -- the coroutine's first call reaching the pool before the worker had offered the
+connection -- calls that took another connection while the worker served a frame, each a
+deadlock under `serialize = true`, and a cycle through two serialized bindings that deadlocked
+even with those fixed. A synchronous library never awaits a callback, so refusing one is the
+library's own convention; used locally, an `async def` callback returns a coroutine that never
+runs. The maintainer chose the refusal.
+
 **Rejected: replacing RPyC with an asyncio-native transport.** The survey of 2026-10-09 found no
 maintained pure-Python library that is asyncio-native and hosts a transparent object graph: every
 transparent-proxy library (RPyC, rpyc-ng, Pyro5, Py4J, `multiprocessing.managers`) is synchronous,
@@ -772,7 +782,8 @@ the reply. A protocol of OutRig's own, which would remove the pool and keep the 
 calling convention, is `potential/custom-hosted-object-protocol.md`.
 
 **Rejected: a thread that both delivers frames and waits for a reply.** The sketch
-`plan/next/awaitable-hosted-calls.md` held, and the facade's design revisited: the interpreter's
+`plan/next/awaitable-hosted-calls.md` held, since removed, and the facade's design revisited: the
+interpreter's
 reader thread, which delivers every frame, processing replies itself. Unboxing a reply can issue a
 nested synchronous `inspect` to build a proxy's class (`0003-16`), so a thread that both delivers
 frames and waits for one deadlocks; the reader thread must never wait for a reply (`0003-17`). A
@@ -787,8 +798,9 @@ call waits on the thread that made it, and the reader thread wakes it.
 - Whether `for` over a returned container fetches in batches with RPyC's `buffiter`, which would
   make one request per batch rather than per item, and what bounds a raw client's choice of batch
   size (`plan/next/hosted-reference-and-payload-bounds.md`).
-- Whether a binding's root is fetched at the first operation on its name or before the kernel's
-  first execution (`0003-23`, fork 1).
+- ~~Whether a binding's root is fetched at the first operation on its name or before the kernel's
+  first execution.~~ Settled by `0003-23`, fork 1: at the first operation, on the thread making
+  it, through a stub that forwards every operation to the proxy.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of
   two kernels against one binding, and of two sessions against one service, are the first
   evidence.
@@ -832,12 +844,14 @@ call waits on the thread that made it, and the reader thread wakes it.
   both programs on the host: a call blocks only its caller, a callback runs on the calling
   thread, an interrupt or a cancel wakes a call on any kernel and leaves the connection usable, a
   call woken while waiting for a connection was never sent, and nested callbacks complete with
-  every connection occupied. `0003-23` must confirm, with the fixture and then with GitPython: a
-  refused private name arriving as an `AttributeError`; `hasattr` and `getattr` with a default
-  answering as the host does; `repr`, `str`, `dir` and `help` each a request, and the
-  trailing-expression echo of a proxy made inside its execution; a coroutine callback refused
-  from a call on the kernel's thread and run from a worker's; and the orientation's description of
-  blocking against a timer and a `runtime.wait` in the blocked kernel.
+  every connection occupied. `0003-23` confirmed, with the fixture and then with GitPython through
+  `run-new`: a refused private name arriving as an `AttributeError`, one request; `hasattr` and
+  `getattr` with a default answering as the host does; `repr`, `str`, `dir` and `hash` each a
+  request, `help` a run of them, and the trailing-expression echo of a proxy one `repr` made inside
+  its execution; a coroutine callback refused from a call on the kernel's thread and from a
+  worker's; and the orientation's description of blocking, against a timer and a `runtime.wait`
+  in the blocked kernel, with a second kernel running throughout. Its `## Decisions` list where a
+  proxy still behaves unlike the local object.
 - What the spikes must confirm before anything is built on this page. A spike that cannot confirm
   its part stops and reports to the maintainer, who decides what follows:
   - `0003-16` -- confirmed: every handler is intercepted, the conformance test fails on a changed

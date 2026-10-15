@@ -199,9 +199,9 @@ the session.
 **Hosted calls and callbacks** (`0003-22`)
 
 - *Waiting for a free connection* -- in the container, because every connection in its kernel's
-  pool for the binding has a call in flight (`0003-17`). Its job is queued in the pool's executor
-  with no worker thread yet, and the code that awaits it waits on it. It was never sent, so the
-  host has no record of it and the interpreter reports it. Outcome: woken with the closing error
+  pool for the binding has a call in flight (`0003-17`). Its calling thread waits on the pool's
+  condition variable, where the interpreter's reader thread can wake it. It was never sent, so
+  the host has no record of it and the interpreter reports it. Outcome: woken with the closing error
   and recorded `cancelled`, with the close as the reason. Invoked: no. Effects: none possible.
 - *Queued in the relay, or made after the close* -- not forwarded when the relay stopped, so
   refused in Rust and never seen by its binding; once the close has reached the interpreter, a
@@ -232,14 +232,14 @@ the session.
   Invoked: yes. Effects: known only if it returned or raised. A call cut off may have finished its
   effect somewhere the session cannot see, so it is `unknown`, never reported as having failed.
 - *Making a callback* -- the running call has called back into agent code in the container
-  (`hosted-objects.md`); the callback runs on the worker thread that holds the call's connection,
-  or on the kernel's loop when it is a coroutine. Outcome: the callback is part of a call allowed
-  to finish, so it runs during the drain. At terminating, the interrupt wakes the thread serving a
-  coroutine callback, which answers the outer call with it, so that call ends `raised` within the
-  interrupt's grace while the coroutine, cancelled with its kernel's tasks, may run on; nothing
-  answers a plain callback looping on its worker thread, so its outer call ends with its binding,
-  `unknown`, and the container stop ends the callback. Invoked: yes, the outer call's target.
-  Effects: as for a running call.
+  (`hosted-objects.md`); the callback runs on the thread that made the call -- the kernel's own,
+  or a `to_thread` worker -- and a coroutine function is never one, refused before the call is
+  sent (`0003-23`). Outcome: the callback is part of a call allowed to finish, so it runs during
+  the drain. At terminating, the interrupt lands in a callback looping on the primary's thread,
+  which answers the outer call with it, so that call ends `raised` within the interrupt's grace;
+  nothing interrupts a callback looping on a worker or on a child's kernel, so its outer call ends
+  with its binding, `unknown`, and the container stop ends the callback. Invoked: yes, the outer
+  call's target. Effects: as for a running call.
 
 **Pending approvals and evaluations** (`0003-24`, `0003-25`)
 
@@ -599,10 +599,10 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
   the owner drops it.
 - ~~Whether a callback a draining call makes into the container should be refused after the
   close rather than run.~~ Settled by `0003-22`: it runs, as the row above has it. A callback a
-  draining call made ran and its call returned; and callbacks that never return -- a coroutine
-  that catches every cancel, a plain function that loops on its worker -- left `shutdown` bounded,
-  the coroutine's outer call `raised`, answered by the interrupt, and the plain one's `unknown`,
-  its binding killed. Nothing showed a reason to refuse one.
+  draining call made ran and its call returned; and callbacks that never return left `shutdown`
+  bounded -- as `0003-23` has them, a function looping on the primary's thread, whose outer call
+  ends `raised`, answered by the interrupt, and one looping on a worker, whose outer call ends
+  `unknown`, its binding killed. Nothing showed a reason to refuse one.
 
 ## Unverified
 

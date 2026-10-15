@@ -305,8 +305,8 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   `callattr`, `repr`, `str`, `cmp`, `hash`, `dir`, `instancecheck`, `buffiter`, `oldslicing` or
   `ctxexit`, each recorded every time; `ping`, `close`, `getroot`, `inspect`, `pickle` or `del`,
   bookkeeping, recorded only when refused; or `unknown`, a request type outside the protocol. A
-  method call is two requests, a `getattr` and a `call`; `async for` is a `callattr` of `__iter__`,
-  then one of `__next__` per item, the last of which raises `StopIteration`.
+  method call is two requests, a `getattr` and a `call`; a `for` loop is a `callattr` of
+  `__iter__`, then one of `__next__` per item, the last of which raises `StopIteration`.
 - `hosted.dispatched` -- `request`, `agent`, `binding`: the request's target is about to run,
   published before it does. A request whose target never runs has none.
 - `hosted.ended` -- how a request ended: `request`, `agent`, `binding`; `outcome`; `reason`, for

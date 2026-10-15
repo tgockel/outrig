@@ -277,10 +277,12 @@ class Root(Records):
         self.kept = None
         self.nested_type = Nested
         self.str_type = str
+        self.root_type = Root
         self.a = types.SimpleNamespace(b=types.SimpleNamespace(c="c"))
         self.b = "b"
         self.calls = 0
         self.taken = 0
+        self.truth_tested = 0
         self.received = []
         self.last_raised = None
         self._lock = threading.Lock()
@@ -289,6 +291,11 @@ class Root(Records):
 
     def _private_method(self):
         return "private"
+
+    def __bool__(self):
+        """Counted, so a test sees that `bool()` of the root asked the host."""
+        self.truth_tested += 1
+        return True
 
     def record(self, seconds=0, label="", started=None, until=None):
         """The recording method: notes when it starts and ends here, on the host, and the thread
