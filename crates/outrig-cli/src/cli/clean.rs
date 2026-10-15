@@ -309,13 +309,14 @@ where
 }
 
 pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
-    let raw = value.trim();
-    if raw.len() < 2 {
+    let mut chars = value.trim().chars();
+    let unit = chars.next_back();
+    let amount = chars.as_str();
+    if amount.is_empty() {
         return Err("expected a duration like 30d, 12h, 45m, or 10s".to_string());
     }
 
-    let (amount, unit) = raw.split_at(raw.len() - 1);
-    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+    if !amount.bytes().all(|b| b.is_ascii_digit()) {
         return Err("duration amount must be a positive integer".to_string());
     }
 
@@ -327,10 +328,10 @@ pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     }
 
     let unit_secs = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => DAY,
+        Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 60 * 60,
+        Some('d') => DAY,
         _ => return Err("duration unit must be one of s, m, h, or d".to_string()),
     };
 

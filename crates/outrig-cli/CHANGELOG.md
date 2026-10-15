@@ -81,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig clean --older-than` rejects a non-ASCII unit instead of panicking.** A value ending in
+  a character wider than one byte (`7д`, `7日`, `é`) split the string inside that character and
+  panicked (`end byte index 2 is not a char boundary`), exiting `101`, where every other bad
+  duration is a usage error that exits `2`. It is now that usage error: `7д` and `7日` get
+  `duration unit must be one of s, m, h, or d`, and a lone `é` gets the same too-short message a
+  lone `d` does. (#364)
+
 - **`model-cache-root` is where a `model-id` GGUF is downloaded.** With `--features local-llm`, a
   `style = "mistralrs"` model that named a Hugging Face repo with `model-id` was fetched into
   Hugging Face's own cache -- `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else

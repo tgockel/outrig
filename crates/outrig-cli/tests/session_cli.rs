@@ -943,6 +943,24 @@ fn clean_duration_parser_accepts_units_and_rejects_invalid() {
     assert!(clean::parse_duration("0d").is_err());
     assert!(clean::parse_duration("30x").is_err());
     assert!(clean::parse_duration("days").is_err());
+
+    // A unit that is more than one byte wide is an unknown unit, not a reason to panic.
+    assert!(clean::parse_duration("7д").is_err());
+    assert!(clean::parse_duration("7日").is_err());
+    assert!(clean::parse_duration("é").is_err());
+}
+
+#[test]
+fn clean_older_than_with_a_multibyte_unit_is_a_usage_error() {
+    let err = clean::CleanArgs::try_parse_from(["clean", "--older-than", "7д"])
+        .expect_err("`д` is not a duration unit");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string()
+            .contains("duration unit must be one of s, m, h, or d"),
+        "unexpected message: {err}"
+    );
 }
 
 #[tokio::test]
