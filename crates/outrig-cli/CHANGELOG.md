@@ -112,6 +112,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template and the `model-path` form never had them. A token is read as before, from `HF_TOKEN`,
   `HF_HUB_TOKEN`, or the file that `huggingface-cli login` writes. (#423)
 
+- **A subagent's cut-off-report warning names the ceiling that was sent (#258).** The line
+  quoted the configured `max-tokens`, which on an `anthropic` provider is not always what the
+  request carried: a value above the identifier's published ceiling is lowered to it, an unset
+  one becomes that ceiling or outrig's 32768 fallback, and each candidate of an alias chain sends
+  its own. The warning now names the number sent, drops "raise it" where no setting can, and for
+  a chain lists every candidate's ceiling.
 - **Terminal pickers show each option's description.** On a TTY the `config init` and
   `image add` pickers (provider style, base image, toolchains, MCP servers) listed option
   values only; the help block -- description, one line per option, doc link -- now prints above

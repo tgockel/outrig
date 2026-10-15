@@ -843,14 +843,15 @@ async fn build_subagent_agent(
 
     let mut tools = ctx.mcp_tools.snapshot();
     // The agent name is the parent's -- a subagent has no `[agents.<name>]` table
-    // of its own -- but the ceiling has to be *this* subagent's, which a launch
-    // that named a model resolved from that model. Reporting the parent's would
-    // name a number that was never in effect for the report being truncated.
+    // of its own -- but the ceiling has to be *this* subagent's, and the one
+    // that was sent rather than the one configured. `build_agent` works that out
+    // with this tool as one of its inputs, so the tool gets a cell filled below.
+    let ceilings = Arc::new(std::sync::OnceLock::new());
     tools.push(SessionTool::new(crate::builtin_tool::SetResultTool::new(
         shared.clone(),
         name,
         ctx.resolved.agent_name.as_deref(),
-        resolved.max_tokens(),
+        ceilings.clone(),
     )));
 
     // This subagent lives at `ctx.depth`. If that is under the max, hand it its
@@ -878,7 +879,7 @@ async fn build_subagent_agent(
         None
     };
 
-    let agent = crate::llm::build_agent(
+    let (agent, sent) = crate::llm::build_agent_with_ceilings(
         &resolved,
         tools,
         &ctx.cache_root,
@@ -887,6 +888,7 @@ async fn build_subagent_agent(
     )
     .await
     .map_err(|e| format!("could not build subagent: {e}"))?;
+    let _ = ceilings.set(sent);
     Ok((agent, child))
 }
 

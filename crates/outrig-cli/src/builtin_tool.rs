@@ -14,14 +14,14 @@
 //! recursion is that the launch tools are withheld at the maximum depth,
 //! leaving that subagent with nothing to launch with.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rig::tool::{ToolCallExtensions, ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::llm::TurnUndo;
+use crate::llm::{ANTHROPIC_FALLBACK_MAX_TOKENS, EffectiveCeiling, TurnUndo};
 use crate::rig_tool::truncate_for_llm;
 use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
 use crate::subagent::{Read, SubagentRegistry};
@@ -610,13 +610,99 @@ pub struct SetResultTool {
     /// This subagent's handle, for the trace prefix, matching the shape the
     /// agent loop's own traces use.
     label: Arc<str>,
-    /// The agent whose turns hit the ceiling, and the ceiling in effect for
-    /// it -- which may have come from the agent or from its model. Carried
-    /// only to name the fix in the one operator-facing warning below.
-    /// `None` for an agentless session, which has no `[agents.<name>]` table
-    /// to point the operator at.
+    /// The agent whose turns hit the ceiling. Carried only to name the fix
+    /// in the one operator-facing warning below. `None` for an agentless
+    /// session, which has no `[agents.<name>]` table to point the operator at.
     agent_name: Option<Arc<str>>,
-    max_tokens: Option<u32>,
+    /// The ceilings this subagent's candidates send, which may differ from
+    /// the configured ones. Filled once `build_agent` has computed them; this
+    /// tool is one of its inputs, so it cannot be handed them directly.
+    ceilings: Arc<OnceLock<Vec<EffectiveCeiling>>>,
+}
+
+/// What to tell the operator about a cut-off report, from the ceilings the
+/// subagent's candidates actually send (#258). Empty means the cell was never
+/// filled, which is told as an unset value.
+fn ceiling_remedy(scope: &str, agent_name: Option<&str>, ceilings: &[EffectiveCeiling]) -> String {
+    let ceilings = match ceilings {
+        [] => return single_ceiling_remedy(scope, agent_name, &EffectiveCeiling::default()),
+        [only] => return single_ceiling_remedy(scope, agent_name, only),
+        many => many,
+    };
+    // Which candidate wrote the cut-off report is not knowable from here, so
+    // name every candidate's number rather than the first one's.
+    let sent = ceilings
+        .iter()
+        .map(|c| match c.sent {
+            Some(n) => format!("{} {n}", c.model_name),
+            None => format!("{} (none sent)", c.model_name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // An agent's `max-tokens` overrides every candidate's model row, so where
+    // there is an agent it is the knob that always takes effect; editing a
+    // `[models.<name>]` row would do nothing when the agent sets one.
+    let knob = match agent_name {
+        Some(agent) => format!(
+            "set [agents.{agent}].max-tokens, which overrides each candidate's \
+             [models.<name>].max-tokens"
+        ),
+        None => "raise the answering candidate's [models.<name>].max-tokens".to_string(),
+    };
+    format!(
+        "this alias's candidates send max-tokens {sent}; whichever answered hit its own \
+         -- {knob}, or ask for a shorter or split report"
+    )
+}
+
+fn single_ceiling_remedy(
+    scope: &str,
+    agent_name: Option<&str>,
+    ceiling: &EffectiveCeiling,
+) -> String {
+    match (ceiling.configured, ceiling.sent) {
+        // Lowered to what the identifier serves: raising the setting cannot
+        // help, so do not say to.
+        (Some(configured), Some(sent)) if configured > sent => format!(
+            "max-tokens for {scope} is {configured}, but this model serves at most {sent}, so \
+             {sent} was sent -- raising it cannot help; ask for a shorter or split report"
+        ),
+        (Some(limit), _) => {
+            format!("the max-tokens in effect for {scope} is {limit} -- raise it")
+        }
+        // Nothing set it, but outrig or rig chose a number: name it.
+        (None, Some(sent)) if u64::from(sent) == ANTHROPIC_FALLBACK_MAX_TOKENS => {
+            format!(
+                "max-tokens is unset, so outrig's fallback of {sent} was sent -- set \
+                 max-tokens explicitly{}",
+                where_to_set(agent_name)
+            )
+        }
+        (None, Some(sent)) => format!(
+            "max-tokens is unset, so the model's published maximum of {sent} was sent -- \
+             raising it cannot help; ask for a shorter or split report"
+        ),
+        // Nothing set it anywhere, so there is no ambiguity about which
+        // table to name -- except that an agentless session has no
+        // `[agents.<name>]` table, and its only knob is the model's.
+        (None, None) => match agent_name {
+            Some(agent) => format!(
+                "[agents.{agent}].max-tokens is unset, so the provider's default \
+                 applies -- set it explicitly"
+            ),
+            None => "max-tokens is unset, so the provider's default applies -- set \
+                     [models.<name>].max-tokens explicitly"
+                .to_string(),
+        },
+    }
+}
+
+/// ` in [agents.<name>]` or the model table, for the end of a sentence.
+fn where_to_set(agent_name: Option<&str>) -> String {
+    match agent_name {
+        Some(agent) => format!(" in [agents.{agent}]"),
+        None => " in [models.<name>]".to_string(),
+    }
 }
 
 impl SetResultTool {
@@ -624,13 +710,13 @@ impl SetResultTool {
         shared: Arc<SubagentShared>,
         label: &str,
         agent_name: Option<&str>,
-        max_tokens: Option<u32>,
+        ceilings: Arc<OnceLock<Vec<EffectiveCeiling>>>,
     ) -> Self {
         Self {
             shared,
             label: Arc::from(label),
             agent_name: agent_name.map(Arc::from),
-            max_tokens,
+            ceilings,
         }
     }
 
@@ -647,23 +733,11 @@ impl SetResultTool {
             Some(agent) => format!("agent {agent}"),
             None => "this session".to_string(),
         };
-        let remedy = match self.max_tokens {
-            Some(limit) => {
-                format!("the max-tokens in effect for {scope} is {limit} -- raise it")
-            }
-            // Nothing set it anywhere, so there is no ambiguity about which
-            // table to name -- except that an agentless session has no
-            // `[agents.<name>]` table, and its only knob is the model's.
-            None => match &self.agent_name {
-                Some(agent) => format!(
-                    "[agents.{agent}].max-tokens is unset, so the provider's default \
-                     applies -- set it explicitly"
-                ),
-                None => "max-tokens is unset, so the provider's default applies -- set \
-                         [models.<name>].max-tokens explicitly"
-                    .to_string(),
-            },
-        };
+        let remedy = ceiling_remedy(
+            &scope,
+            self.agent_name.as_deref(),
+            self.ceilings.get().map_or(&[], Vec::as_slice),
+        );
         eprintln!(
             "[outrig]   [{}] set_result was cut off before `body`: the model's \
              output-token ceiling is too low for this report. {remedy}.",
@@ -976,9 +1050,106 @@ mod tests {
         let shared = Arc::new(SubagentShared::new());
         shared.begin_round();
         (
-            SetResultTool::new(shared.clone(), "audit", Some("primary"), None),
+            SetResultTool::new(shared.clone(), "audit", Some("primary"), Arc::default()),
             shared,
         )
+    }
+
+    fn sent(model: &str, configured: Option<u32>, sent: Option<u32>) -> EffectiveCeiling {
+        EffectiveCeiling {
+            model_name: model.to_string(),
+            configured,
+            sent,
+        }
+    }
+
+    /// A configured value above what the model serves is lowered, so the
+    /// remedy names what was sent and does not tell the operator to raise it
+    /// (#258).
+    #[test]
+    fn a_capped_ceiling_names_what_was_sent_and_does_not_say_raise_it() {
+        let remedy = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("sonnet", Some(128_000), Some(64_000))],
+        );
+        assert!(
+            remedy.contains("128000") && remedy.contains("64000"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("raise it "), "{remedy}");
+        assert!(remedy.contains("cannot help"), "{remedy}");
+    }
+
+    /// An unset value that outrig or rig filled in is named, not hidden
+    /// behind "the provider's default".
+    #[test]
+    fn an_unset_ceiling_names_the_number_that_was_chosen() {
+        let published = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("sonnet", None, Some(64_000))],
+        );
+        assert!(published.contains("64000"), "{published}");
+        assert!(!published.contains("provider's default"), "{published}");
+        assert!(published.contains("cannot help"), "{published}");
+
+        let fallback = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("odd", None, Some(32_768))],
+        );
+        assert!(fallback.contains("32768"), "{fallback}");
+        assert!(!fallback.contains("provider's default"), "{fallback}");
+        assert!(fallback.contains("[agents.primary]"), "{fallback}");
+    }
+
+    /// Nothing is sent on the OpenAI arm when nothing is configured, and a
+    /// configured value is sent as is: both keep their wording.
+    #[test]
+    fn an_openai_style_ceiling_keeps_its_wording() {
+        assert_eq!(
+            ceiling_remedy("agent a", Some("a"), &[sent("m", Some(4096), Some(4096))]),
+            "the max-tokens in effect for agent a is 4096 -- raise it",
+        );
+        assert_eq!(
+            ceiling_remedy("agent a", Some("a"), &[sent("m", None, None)]),
+            "[agents.a].max-tokens is unset, so the provider's default applies -- set it \
+             explicitly",
+        );
+        assert_eq!(
+            ceiling_remedy("this session", None, &[sent("m", None, None)]),
+            "max-tokens is unset, so the provider's default applies -- set \
+             [models.<name>].max-tokens explicitly",
+        );
+    }
+
+    /// A chain names every candidate's number: which one wrote the report
+    /// is not known here.
+    #[test]
+    fn a_chain_names_each_candidates_ceiling() {
+        let remedy = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[
+                sent("head-model", Some(4096), Some(4096)),
+                sent("next-model", Some(16_384), Some(16_384)),
+            ],
+        );
+        assert!(remedy.contains("head-model 4096"), "{remedy}");
+        assert!(remedy.contains("next-model 16384"), "{remedy}");
+        assert!(remedy.contains("[agents.primary].max-tokens"), "{remedy}");
+
+        let agentless = ceiling_remedy(
+            "this session",
+            None,
+            &[sent("a", Some(1), Some(1)), sent("b", Some(2), Some(2))],
+        );
+        assert!(
+            agentless.contains("[models.<name>].max-tokens"),
+            "{agentless}"
+        );
+        assert!(!agentless.contains("[agents."), "{agentless}");
     }
 
     /// The truncated shape, as it arrives from the provider: `status` present

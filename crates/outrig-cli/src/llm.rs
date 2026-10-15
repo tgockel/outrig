@@ -961,6 +961,34 @@ fn validate_mistralrs_device(
     }
 }
 
+/// The output-token ceiling one candidate sends, next to the one configured.
+///
+/// Carried out of [`build_agent_with_ceilings`] because the two differ on the
+/// Anthropic arm -- a configured value above the identifier's published
+/// ceiling is lowered, and an unset one becomes rig's ceiling or outrig's
+/// fallback -- and the operator-facing warning for a cut-off report has to
+/// name the number that reached the wire (#258). Elsewhere `sent` is the
+/// configured value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EffectiveCeiling {
+    /// The `[models.<name>]` row, never the alias's name.
+    pub(crate) model_name: String,
+    /// What the agent's or model's `max-tokens` said.
+    pub(crate) configured: Option<u32>,
+    /// What the candidate's requests carry; `None` when no ceiling is sent.
+    pub(crate) sent: Option<u32>,
+}
+
+impl EffectiveCeiling {
+    fn new(candidate: &ResolvedCandidate, sent: Option<u32>) -> Self {
+        Self {
+            model_name: candidate.model_name.clone(),
+            configured: candidate.max_tokens,
+            sent,
+        }
+    }
+}
+
 /// Runtime-dispatched Rig agent. The OpenAi-backed, Anthropic-backed, and
 /// mistralrs-backed `CompletionModel` impls produce concretely different
 /// `Agent<M>` types (Rig's trait carries associated response and client types,
@@ -1068,6 +1096,25 @@ pub async fn build_agent(
     cache_root: &Path,
     #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
 ) -> Result<RigAgent> {
+    build_agent_with_ceilings(
+        resolved,
+        tools,
+        cache_root,
+        #[cfg(feature = "local-llm")]
+        registry,
+    )
+    .await
+    .map(|(agent, _)| agent)
+}
+
+/// [`build_agent`], also returning each candidate's [`EffectiveCeiling`] in
+/// chain order, for a caller that has to describe the ceiling in effect.
+pub(crate) async fn build_agent_with_ceilings(
+    resolved: &ResolvedAgent,
+    tools: Vec<SessionTool>,
+    cache_root: &Path,
+    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
+) -> Result<(RigAgent, Vec<EffectiveCeiling>)> {
     #[cfg(not(feature = "local-llm"))]
     let _ = cache_root;
 
@@ -1077,11 +1124,12 @@ pub async fn build_agent(
     // the same variant, the same retry stack, the same error text -- rather
     // than merely equivalent to it.
     if resolved.candidates.len() == 1 {
-        return build_single(resolved, resolved.primary(), tools, cache_root,
+        let (agent, ceiling) = build_single(resolved, resolved.primary(), tools, cache_root,
             #[cfg(feature = "local-llm")]
             registry,
         )
-        .await;
+        .await?;
+        return Ok((agent, vec![ceiling]));
     }
 
     // One policy for the whole chain, so its `chain_deadline` is the same
@@ -1097,17 +1145,18 @@ pub async fn build_agent(
 
     let mut candidates: Vec<Box<dyn failover::Candidate>> =
         Vec::with_capacity(resolved.candidates.len());
+    let mut ceilings = Vec::with_capacity(resolved.candidates.len());
     for candidate in &resolved.candidates {
-        candidates.push(
-            build_candidate(candidate, &policy, cache_root,
-                #[cfg(feature = "local-llm")]
-                registry,
-            )
-            .await?,
-        );
+        let (built, ceiling) = build_candidate(candidate, &policy, cache_root,
+            #[cfg(feature = "local-llm")]
+            registry,
+        )
+        .await?;
+        candidates.push(built);
+        ceilings.push(ceiling);
     }
 
-    Ok(RigAgent::Failover {
+    let agent = RigAgent::Failover {
         agent: finish_agent(
             failover::FailoverModel::new(candidates, policy),
             resolved,
@@ -1117,7 +1166,8 @@ pub async fn build_agent(
             tools,
         ),
         tool_call_max: resolved.tool_call_max,
-    })
+    };
+    Ok((agent, ceilings))
 }
 
 /// The `retry-budget-secs` governing a whole chain. See [`build_agent`].
@@ -1163,9 +1213,10 @@ async fn build_single(
     tools: Vec<SessionTool>,
     cache_root: &Path,
     #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
-) -> Result<RigAgent> {
+) -> Result<(RigAgent, EffectiveCeiling)> {
     #[cfg(not(feature = "local-llm"))]
     let _ = cache_root;
+    let ceiling = EffectiveCeiling::new(candidate, candidate.max_tokens);
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -1177,7 +1228,7 @@ async fn build_single(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
-            Ok(RigAgent::OpenAi {
+            let agent = RigAgent::OpenAi {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
                     resolved,
@@ -1185,7 +1236,8 @@ async fn build_single(
                     tools,
                 ),
                 tool_call_max: resolved.tool_call_max,
-            })
+            };
+            Ok((agent, ceiling))
         }
         ResolvedProvider::Anthropic {
             base_url,
@@ -1197,7 +1249,7 @@ async fn build_single(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
-            Ok(RigAgent::Anthropic {
+            let agent = RigAgent::Anthropic {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
                     resolved,
@@ -1205,7 +1257,8 @@ async fn build_single(
                     tools,
                 ),
                 tool_call_max: resolved.tool_call_max,
-            })
+            };
+            Ok((agent, EffectiveCeiling::new(candidate, max_tokens)))
         }
         ResolvedProvider::Mistralrs => {
             #[cfg(not(feature = "local-llm"))]
@@ -1218,10 +1271,11 @@ async fn build_single(
             #[cfg(feature = "local-llm")]
             {
                 let model = mistralrs_model(candidate, cache_root, registry).await?;
-                Ok(RigAgent::Mistralrs {
+                let agent = RigAgent::Mistralrs {
                     agent: finish_agent((*model).clone(), resolved, candidate.max_tokens, tools),
                     tool_call_max: resolved.tool_call_max,
-                })
+                };
+                Ok((agent, ceiling))
             }
         }
     }
@@ -1240,9 +1294,10 @@ async fn build_candidate(
     policy: &retry::RetryPolicy,
     cache_root: &Path,
     #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
-) -> Result<Box<dyn failover::Candidate>> {
+) -> Result<(Box<dyn failover::Candidate>, EffectiveCeiling)> {
     #[cfg(not(feature = "local-llm"))]
     let _ = cache_root;
+    let ceiling = EffectiveCeiling::new(candidate, candidate.max_tokens);
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -1253,12 +1308,15 @@ async fn build_candidate(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
-            Ok(Box::new(failover::ModelCandidate::new(
-                retry::RetryingModel::new(model, policy.clone()),
-                &candidate.model_name,
-                &candidate.model_identifier,
-                candidate.max_tokens,
-            )))
+            Ok((
+                Box::new(failover::ModelCandidate::new(
+                    retry::RetryingModel::new(model, policy.clone()),
+                    &candidate.model_name,
+                    &candidate.model_identifier,
+                    candidate.max_tokens,
+                )),
+                ceiling,
+            ))
         }
         ResolvedProvider::Anthropic {
             base_url,
@@ -1269,12 +1327,15 @@ async fn build_candidate(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
-            Ok(Box::new(failover::ModelCandidate::new(
-                retry::RetryingModel::new(model, policy.clone()),
-                &candidate.model_name,
-                &candidate.model_identifier,
-                max_tokens,
-            )))
+            Ok((
+                Box::new(failover::ModelCandidate::new(
+                    retry::RetryingModel::new(model, policy.clone()),
+                    &candidate.model_name,
+                    &candidate.model_identifier,
+                    max_tokens,
+                )),
+                EffectiveCeiling::new(candidate, max_tokens),
+            ))
         }
         ResolvedProvider::Mistralrs => {
             #[cfg(not(feature = "local-llm"))]
@@ -1287,11 +1348,14 @@ async fn build_candidate(
             #[cfg(feature = "local-llm")]
             {
                 // Deliberately *not* loaded here -- see `LazyLocalCandidate`.
-                Ok(Box::new(LazyLocalCandidate {
-                    registry: Arc::clone(registry),
-                    candidate: candidate.clone(),
-                    cache_root: cache_root.to_path_buf(),
-                }))
+                Ok((
+                    Box::new(LazyLocalCandidate {
+                        registry: Arc::clone(registry),
+                        candidate: candidate.clone(),
+                        cache_root: cache_root.to_path_buf(),
+                    }),
+                    ceiling,
+                ))
             }
         }
     }
