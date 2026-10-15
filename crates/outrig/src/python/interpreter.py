@@ -4204,7 +4204,7 @@ class Kernel:
         """Close this kernel's connections to `binding` -- to every binding, by default -- and
         wake every call waiting on them with `EOFError`: one in flight is left to the binding to
         finish, its outcome unknown here, and one waiting for a connection, or queued, was never
-        sent. What a release of the kernel (`0003-26`) and the session's close (`0003-22`) call;
+        sent. What a release of the kernel (`0003-30`) and the session's close (`0003-22`) call;
         runs on any thread."""
         with self._hosted_lock:
             names = list(self._hosted) if binding is None else [binding]

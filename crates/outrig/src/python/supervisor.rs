@@ -160,7 +160,7 @@ pub(crate) struct Probe {
 #[derive(Debug)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the policy `0003-23` builds reads it")
+    expect(dead_code, reason = "the policy `0003-24` builds reads it")
 )]
 pub(crate) struct Decision {
     pub(crate) id: u64,
@@ -214,7 +214,7 @@ pub(crate) struct Process {
     events: Option<mpsc::Receiver<Value>>,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the policy `0003-23` builds reads it")
+        expect(dead_code, reason = "the policy `0003-24` builds reads it")
     )]
     decisions: Option<mpsc::Receiver<Decision>>,
     stderr: Arc<Mutex<VecDeque<String>>>,
@@ -419,7 +419,7 @@ impl Process {
     /// a control line; `BrokenPipe` once stdin is closed or the process is gone.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the policy `0003-23` builds reads it")
+        expect(dead_code, reason = "the policy `0003-24` builds reads it")
     )]
     pub(crate) async fn send(&self, message: Value) -> io::Result<()> {
         let broken = || io::Error::new(ErrorKind::BrokenPipe, "the process's stdin is closed");
@@ -430,7 +430,7 @@ impl Process {
     /// Answer decision `id` with `answer`, which releases the request the process held for it.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the policy `0003-23` builds reads it")
+        expect(dead_code, reason = "the policy `0003-24` builds reads it")
     )]
     pub(crate) async fn answer(&self, id: u64, answer: Value) -> io::Result<()> {
         self.send(json!({"t": "decision", "id": id, "answer": answer}))
@@ -450,7 +450,7 @@ impl Process {
     /// The process's decision requests, taken once.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the policy `0003-23` builds reads it")
+        expect(dead_code, reason = "the policy `0003-24` builds reads it")
     )]
     pub(crate) fn take_decisions(&mut self) -> mpsc::Receiver<Decision> {
         self.decisions.take().expect("the decisions are taken once")

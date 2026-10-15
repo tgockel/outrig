@@ -630,7 +630,7 @@ interpreter's death ends the session, bindings included: it is reported as an ev
 then closes and reports as at shutdown (`plan/next/interpreter-restart-with-a-reset-notice.md`).
 
 **A call that outlives its caller runs to completion.** A call still running in its binding when its
-kernel is released (`0003-26`, through `Kernel.close_hosted`, which closes the kernel's pool and
+kernel is released (`0003-30`, through `Kernel.close_hosted`, which closes the kernel's pool and
 wakes every call waiting on it), or when the connection that carried it closes for another reason --
 the relay closing it after a reply that did not fit its queue (`0003-22`), the interpreter's death
 -- cannot be stopped: RPyC has no cancel, so the binding runs it on its thread until it returns, and
@@ -802,7 +802,7 @@ kernel-side thread per in-flight call; a serving thread per connection instead i
   `dir` and `help` send nothing; and `_resolve()` satisfies `asyncio.create_task`, `gather` and
   `wait_for` take a path, and `runtime.wait` refuses one. Its `## Decisions` record what else it
   settled. Still unverified: that a worker settling a future through a loop closed with its kernel
-  drops the outcome quietly, which waits for the kernel release of `0003-26`; that the thread per
+  drops the outcome quietly, which waits for the kernel release of `0003-30`; that the thread per
   call costs what `to_thread`'s did against the memory ceiling
   (`plan/next/one-drain-thread-for-every-execution.md`); and all of it with GitPython.
 - What the spikes must confirm before anything is built on this page. A spike that cannot confirm

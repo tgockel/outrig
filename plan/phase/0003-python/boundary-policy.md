@@ -4,7 +4,7 @@ What decides whether a request from the container reaches a hosted object, and w
 about it. `hosted-objects.md` carries requests to the host and intercepts every one there; this
 page is what the interception enforces. It replaces `call-inspection.md`. The design was settled in
 the planning round of 2026-09-30. `0003-22` built the default -- every request runs, recorded --
-and admission's two places; `0003-23` builds rules, deny, and escalation, and `0003-24` the
+and admission's two places; `0003-24` builds rules, deny, and escalation, and `0003-25` the
 evaluator.
 
 Three decisions apply throughout:
@@ -59,7 +59,7 @@ type    = "git.cmd.Git"
 action  = "deny"
 ```
 
-The spellings are illustrative and `0003-23` settles the schema. In this sketch a field a rule
+The spellings are illustrative and `0003-24` settles the schema. In this sketch a field a rule
 leaves out matches anything, so the second rule refuses every request on a `Git` object.
 
 A rule matches on four things: the binding, the host-side type of the object, the member name, and
@@ -95,13 +95,13 @@ the container cannot change.
 project brings one, and the agent can edit it through the workspace mount. `SECURITY.md` already
 states the same rule for `[network]`, where a repo may choose the mode and only the operator's
 global config sets `default`, `allow`, and `deny`. How it is enforced -- which actions a repo rule
-may carry, and where repo rules sit in the order -- is `0003-23`'s. The operator's own rules cannot
+may carry, and where repo rules sit in the order -- is `0003-24`'s. The operator's own rules cannot
 be redefined by a repo: OutRig keeps the operator's layer -- the global config, or a `Config` an
 embedder passes to the builder -- beside the merged config, and reads the operator's policy and the
-evaluator's model from it. `0003-23` keeps that layer, and `0003-24` uses it.
+evaluator's model from it. `0003-24` keeps that layer, and `0003-25` uses it.
 
 Rules run in the binding process, from a table the owner sends it at start, so an allow costs no
-round trip to the owner. That is `0003-23`'s fork 1, recommended there, and the admission design
+round trip to the owner. That is `0003-24`'s fork 1, recommended there, and the admission design
 below assumes it. The escalation handler, the evaluator, and the gate that decides held requests
 are the owner's.
 
@@ -147,7 +147,7 @@ call would have done on the host happens, and the request's outcome is
 `refused`, with what denied it as the reason ("Events"). The exception is distinct from the
 library's own, so `except git.GitCommandError` does not catch it, and from a transport failure, so
 the agent can tell a call that did not happen from one whose outcome is unknown. Its name is
-`0003-23`'s.
+`0003-24`'s.
 
 **A rule's deny is final.** A human cannot override it. The rule is the operator's standing
 decision, and an override at the prompt would make every rule advisory -- in an embedding, to
@@ -176,7 +176,7 @@ The format is illustrative. The rules around it are not:
   the awaiting code waits and its kernel's loop keeps turning, as for any hosted call
   (`hosted-objects.md`), and other kernels are unaffected. OutRig sets no expiry. A handler that
   wants a deadline answers deny when its deadline passes, which leaves the deadline to whoever
-  chooses the approvers (`0003-23`).
+  chooses the approvers (`0003-24`).
 - **An approval covers one call.** Nothing is reused or cached -- not by member, not by arguments,
   not for a time -- and the next identical call asks again. Reuse with an explicit scope is
   `plan/next/approval-reuse-with-explicit-scope.md`.
@@ -198,7 +198,7 @@ The format is illustrative. The rules around it are not:
   runs in the embedder's process: nothing it does is a boundary request.
 - **A request whose handler fails, or is dropped, is never invoked.** With no handler installed
   -- an embedder that supplied none -- `escalate` is a deny, whose reason says no approver is
-  installed (`0003-23`).
+  installed (`0003-24`).
 
 ## The evaluator
 
@@ -211,7 +211,7 @@ model = "fast"             # a model alias from the config
 ```
 
 It runs only where policy says `evaluate` -- a rule's action, or `default = "evaluate"` -- and
-never otherwise. Its model is resolved, retried, and failed over like the agent's; `0003-24` makes
+never otherwise. Its model is resolved, retried, and failed over like the agent's; `0003-25` makes
 that serve model calls outside a round.
 
 - **What it reads.** Trusted instructions, and a bounded description of the request, delimited and
@@ -230,13 +230,13 @@ that serve model calls outside a round.
   unable to disclose.
 - **What its verdict does.** `allow` admits the request through the owner's gate. `deny` raises
   the deny exception, with the evaluator's reason, and no person is asked. `escalate` goes to the
-  handler with that reason attached (`0003-24`).
+  handler with that reason attached (`0003-25`).
 - **When it fails** -- malformed output, a timeout, an exhausted budget -- the request escalates if
   a handler exists and is denied otherwise. A failure is never an allow. `evaluate` with no
-  evaluator configured takes the same path (`0003-23`).
+  evaluator configured takes the same path (`0003-24`).
 - **Its usage is its own.** The evaluator's model calls, tokens, and latency are attributed
   separately from the agent's and never added to a round's totals. Each is a model request all
-  the same: it takes a `model-concurrency-max` permit (`0003-26`) like any other, and the hosted
+  the same: it takes a `model-concurrency-max` permit (`0003-30`) like any other, and the hosted
   call held for its verdict holds no permit while it waits, so no deadlock follows.
 
 Its verdict is judgment, not proof. It reads a description of a call and does not see what the
@@ -251,7 +251,7 @@ target is **invoked** when the binding calls it; and `dispatch` names the event 
 publishes just before it invokes the target, and nothing else. A forwarded request can still be
 refused or cancelled by its binding, so forwarded does not mean invoked. The events are: its
 receipt, published before any decision about it; each decision made about it -- the rule's
-action, the evaluator's verdict, the approver's answer (`0003-23`); its dispatch, published before
+action, the evaluator's verdict, the approver's answer (`0003-24`); its dispatch, published before
 its target is invoked; and its outcome. A request whose target is never invoked has no dispatch
 event, and its outcome event says why.
 
@@ -430,16 +430,16 @@ how risky a member is, and per-library tables are rejected above.
   `function`. A rule can govern it only by matching the read, before the arguments exist, and an
   approver asked about the read never sees them. A raw client can split a direct method call the
   same way. Whether a call is described in terms of the read that produced its callable is
-  `0003-23`'s.
-- Whether a rule's type matches subclasses, or only the exact class. `0003-23`'s fork 3 recommends
+  `0003-24`'s.
+- Whether a rule's type matches subclasses, or only the exact class. `0003-24`'s fork 3 recommends
   exact names, which an operator can copy from the event stream.
 - Whether a repo `[policy.evaluator]` is rejected at load. Choosing the judge is not a restriction,
-  and `0003-24`'s fork 1 recommends rejecting it. The other route is closed: a repo
+  and `0003-25`'s fork 1 recommends rejecting it. The other route is closed: a repo
   `[models.<name>]` replaces a global model of the same name when the configs merge, which would let
   a repo point the evaluator at an endpoint it controls, but OutRig reads the evaluator's model from
-  the operator's layer, so a repo cannot redefine it ("Rules"). `0003-23` keeps that layer, and
-  `0003-24` uses it.
-- Whether the operator writes or extends the evaluator's instructions. `0003-24`'s fork 2.
+  the operator's layer, so a repo cannot redefine it ("Rules"). `0003-24` keeps that layer, and
+  `0003-25` uses it.
+- Whether the operator writes or extends the evaluator's instructions. `0003-25`'s fork 2.
 
 ## Unverified
 
@@ -451,7 +451,7 @@ how risky a member is, and per-library tables are rejected above.
 - That the providers' strict modes reject map-valued schemas comes from reading their
   documentation, not from a request made here.
 - That the owner's gate lets exactly one of interrupt, close, and allow win for a held request is
-  a design, not a measurement; `0003-23` tests it. `0003-22` tested the other half: a binding's
+  a design, not a measurement; `0003-24` tests it. `0003-22` tested the other half: a binding's
   closed flag refused a request the binding read after it, one whose frame claimed bookkeeping.
 - That delimiting evidence keeps the evaluator from following instructions inside it is not
   established by any test. Delimiting reduces a model's tendency to act on text it reads; it does

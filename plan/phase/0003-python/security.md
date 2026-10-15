@@ -19,7 +19,7 @@ given. Unqualified "the interpreter" means the agent interpreter.
 
 `0003-18` proved the bindings process and its supervision, and `0003-20` built it into the session,
 with the declarations, the approval of repo-declared ones, and same-path mounts; `0003-22` put the
-interception in every session and records every request it decides, and `0003-23` builds the policy.
+interception in every session and records every request it decides, and `0003-24` builds the policy.
 `SECURITY.md`'s "Known boundaries" carries the entry `0003-20` added: a binding acts with the host
 user's authority, and the default -- allow, published as events -- runs every call and publishes it.
 

@@ -2258,7 +2258,7 @@ fn a_released_pool_leaves_its_worker_calls_unknown_and_its_table_gone() {
         ),
     );
     both.wait();
-    // The release, as `0003-26` will make it, from another thread.
+    // The release, as `0003-30` will make it, from another thread.
     relay.output(2, "import __main__\n__main__._kernels['c'].close_hosted()");
     let result = relay.result_from("c", 1, TIMEOUT);
     let unknown =
