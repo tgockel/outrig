@@ -26,7 +26,8 @@ outrig config init [--force]
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
-Enter at any prompt for an explanation of what's being asked plus the available options.
+Enter at any text or yes/no prompt for an explanation of what's being asked; pickers print
+their options' descriptions before they open, and `?` there is a search character.
 
 ```sh
 $ outrig config init
@@ -87,14 +88,15 @@ instead; see [In-process LLMs](../concepts/in-process-llm.md).
 
 ### Help at any prompt
 
-Type `?` and Enter at any prompt to get a short explanation of the field and its options. The
-prompt is then re-displayed so you can answer:
+Type `?` and Enter at any text or yes/no prompt to get a short explanation of the field and its
+options. On a terminal, pickers print the same block before they open and do not treat `?` as
+help; on piped stdin, `?` works at pickers too, as here. The prompt is then re-displayed so you
+can answer:
 
 ```
 ? Pick a provider style [default: openai]: ?
 
-  Which wire format / runtime this provider speaks. 'mistralrs' is DEPRECATED and will
-  be removed -- prefer 'openai' pointed at a local Ollama/vLLM/llama.cpp server.
+  Which wire format / runtime this provider speaks.
   openai  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.
   anthropic  Anthropic's native Messages wire format. Talks to Claude directly.
   mistralrs  DEPRECATED (will be removed): in-process LLM via the mistralrs crate. Prefer

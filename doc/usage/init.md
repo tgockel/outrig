@@ -31,8 +31,8 @@ $ outrig init
 If `~/.outrig/config.toml` doesn't exist, outrig walks you through providers and models first
 -- the same flow as `outrig config init`, inlined here so first-time users finish in one
 session. Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type
-`?` and Enter at any prompt for an explanation of what's being asked plus the available
-options.
+`?` and Enter at any text or yes/no prompt for an explanation of what's being asked; pickers
+print their options' descriptions before they open.
 
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.

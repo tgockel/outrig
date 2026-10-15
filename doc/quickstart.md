@@ -76,8 +76,8 @@ $ outrig init
 `init` walks you through the global config first (providers and models -- skipped if it
 already exists), then the repo config (workspace, default agent), then offers to call
 `image add` for the first image-config. Every prompt shows its default in
-`[default: ...]`; press Enter to accept. Type `?` and Enter at any prompt for an explanation
-and the available options.
+`[default: ...]`; press Enter to accept. Type `?` and Enter at any text or yes/no prompt for an
+explanation; pickers print their options' descriptions before they open.
 
 If the built-in image prompts do not cover the environment you need, still start with
 `outrig init` for the provider, workspace, and agent scaffolding. Then use

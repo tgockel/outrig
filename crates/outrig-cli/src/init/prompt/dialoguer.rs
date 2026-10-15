@@ -26,21 +26,8 @@ impl DialoguerPrompt {
     }
 }
 
-/// Print the field's `description` to stderr so the user has the same
-/// "what is this question asking?" context the line impl exposes via `?`.
-/// Empty descriptions are skipped: surrounding `[outrig]` log lines and
-/// the prompt name itself are sometimes enough.
-async fn write_description(description: &str) -> Result<()> {
-    if description.is_empty() {
-        return Ok(());
-    }
-    let line = format!("\n  {description}\n");
-    let mut stderr = tokio::io::stderr();
-    stderr.write_all(line.as_bytes()).await?;
-    stderr.flush().await?;
-    Ok(())
-}
-
+/// Print the `?`-help block (description, each option's blurb, doc link) so a
+/// picker, whose rows are values only, still shows what each option means.
 async fn write_field_help(field: &Field) -> Result<()> {
     let buf = prompt::format_field_help(field);
     let mut stderr = tokio::io::stderr();
@@ -125,7 +112,7 @@ impl PromptSource for DialoguerPrompt {
     }
 
     async fn ask_select(&mut self, field: &Field, default_idx: usize) -> Result<usize> {
-        write_description(field.description).await?;
+        write_field_help(field).await?;
         let prompt = field.name.to_owned();
         let items: Vec<&'static str> = field.options.iter().map(|(v, _)| *v).collect();
         task::spawn_blocking(move || {
@@ -152,7 +139,7 @@ impl PromptSource for DialoguerPrompt {
         field: &Field,
         default_indices: &[usize],
     ) -> Result<Vec<usize>> {
-        write_description(field.description).await?;
+        write_field_help(field).await?;
         let mut selected: Vec<bool> = vec![false; field.options.len()];
         for &i in default_indices {
             if let Some(slot) = selected.get_mut(i) {

@@ -237,7 +237,7 @@ where
 /// Render the `?`-help block: indented description (skipped if empty),
 /// then each option's `value  blurb` row, then a public `See: <url>` footer.
 /// Shared between `TerminalPrompt::write_help` and the dialoguer impl.
-pub(super) fn format_field_help(field: &Field) -> String {
+pub(crate) fn format_field_help(field: &Field) -> String {
     let mut buf = String::new();
     buf.push('\n');
     if !field.description.is_empty() {

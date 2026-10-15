@@ -93,15 +93,9 @@ const STYLES: &[(&str, &str)] = &[
     ),
 ];
 
-// The deprecation lives in `description`, not just in the `mistralrs` blurb
-// above: the dialoguer picker renders option values only, so on a TTY -- the
-// path most users take -- the blurb reaches nobody. `description` is written
-// by both prompt backends before the picker opens.
 const STYLE_FIELD: Field = Field {
     name: "Pick a provider style",
-    description: "Which wire format / runtime this provider speaks. 'mistralrs' is \
-                  DEPRECATED and will be removed -- prefer 'openai' pointed at a local \
-                  Ollama/vLLM/llama.cpp server.",
+    description: "Which wire format / runtime this provider speaks.",
     options: STYLES,
     doc_link: "doc/concepts/llm-providers.md",
 };
@@ -831,5 +825,21 @@ async fn ask_unused_name<V>(
             "[outrig] a {kind} named `{answer}` is already defined; defined: {}",
             taken.keys().cloned().collect::<Vec<_>>().join(", ")
         );
+    }
+}
+
+#[cfg(test)]
+mod picker_help_tests {
+    use super::*;
+    use crate::init::prompt::format_field_help;
+
+    #[test]
+    fn style_help_carries_every_blurb_and_the_deprecation() {
+        let help = format_field_help(&STYLE_FIELD);
+        for (_, blurb) in STYLES {
+            assert!(help.contains(blurb), "missing {blurb:?}");
+        }
+        assert!(!STYLE_FIELD.description.contains("mistralrs"));
+        assert!(help.contains("DEPRECATED"));
     }
 }

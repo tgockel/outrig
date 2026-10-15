@@ -354,7 +354,19 @@ fn mcp_value(server: McpServer) -> Item {
 mod tests {
     use outrig::config::Config;
 
+    use crate::init::prompt::format_field_help;
+
     use super::*;
+
+    #[test]
+    fn picker_help_carries_every_blurb() {
+        for field in [&BASE_FIELD, &TOOLCHAIN_FIELD, &MCP_FIELD] {
+            let help = format_field_help(field);
+            for (_, blurb) in field.options {
+                assert!(help.contains(blurb), "missing {blurb:?}");
+            }
+        }
+    }
 
     /// What `run_with` appends for `coding` with the default `fs` server.
     const CODING: &str = "\n[images.coding]\n\

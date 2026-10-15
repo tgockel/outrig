@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Terminal pickers show each option's description.** On a TTY the `config init` and
+  `image add` pickers (provider style, base image, toolchains, MCP servers) listed option
+  values only; the help block -- description, one line per option, doc link -- now prints above
+  the picker, as `?` does on piped stdin. `?` is still not a help command inside a terminal picker.
+
 - **An unreachable LLM endpoint names why.** A refused connection, a failed DNS lookup, and a
   TLS mismatch all printed `connection error: error sending request for url (...)`; the retry
   line, the end-of-turn line, and an alias chain's `trying <next>` and `tried:` lines now end
