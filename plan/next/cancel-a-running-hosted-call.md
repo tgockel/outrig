@@ -10,6 +10,11 @@ process keeps running the call until it returns; its reply is dropped when it co
 (`plan/phase/0003-python/lifecycle.md`). At shutdown a running call is given until the drain
 deadline, and then the binding's process group is killed.
 
+A live object a host program injects (`0003-36`) has the same gap in another process: its call
+runs on a thread of the program's, which the engine cannot end either, so at shutdown such a call
+is reported as still running and the program decides. Option 1 below would apply inside the
+program's serving module; options 2 and 3 would not, since the process is the program's own.
+
 Between an interrupt and shutdown, a call the user stopped can still act: a push still sending, a
 long subprocess still running. What the agent is told -- outcome unknown -- is true, but nothing
 stops the work. A cancel message would also need a thread to read it: RPyC runs a request on the

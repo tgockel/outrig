@@ -11,11 +11,14 @@ that cross it are allowed to do. Getting placement right and mediation wrong yie
 sandbox cannot read but can ask for anything -- and under the default this phase ships, that is
 what a binding is, deliberately, until the operator tightens it.
 
-Two Pythons appear on this page, and confusing them inverts the design. The **agent interpreter**
-is the static CPython in the primary container, the one the model submits code to; it holds
-proxies, and OutRig puts no credential in it. The **bindings process** runs every hosted library
-of a session on the host, with the same static CPython and whatever environment its bindings were
-given. Unqualified "the interpreter" means the agent interpreter.
+Three Pythons appear on this page, and confusing them inverts the design. The **agent
+interpreter** is the static CPython in the primary container, the one the model submits code to;
+it holds proxies, and OutRig puts no credential in it. The **bindings process** runs every factory
+binding's library of a session on the host, with the same static CPython and whatever environment
+its bindings were given. The **host program**, under `outrig run <script.py>`, is the operator's
+own trusted program on the same static CPython, with the user's full environment and authority;
+it is not a sandbox, and the live objects it injects are served from it. Unqualified "the
+interpreter" means the agent interpreter.
 
 `0003-18` proved the bindings process and its supervision, and `0003-20` built it into the session,
 with the declarations, the approval of repo-declared ones, and same-path mounts; `0003-22` put the
@@ -60,8 +63,9 @@ container at all.
 
 ## The trusted side runs on the host
 
-**A hosted object runs on the literal host, in one process that holds every binding of the
-session**, supervised by the Rust owner (`hosted-objects.md`). Two reasons:
+**A hosted object runs on the literal host**: a factory binding's in the one process that holds
+every factory binding of the session, supervised by the Rust owner, and a live object's in the host
+program that injected it (`hosted-objects.md`). Two reasons:
 
 **What is worth hosting is on the host.** The repository the agent works on, its remotes, and the
 user's credentials -- the ssh-agent, the credential helpers, the git config -- are where the user
@@ -70,10 +74,10 @@ each of them -- the same authority, passed into a container -- and there would b
 build for every trusted library.
 
 **The host has the property the same-container daemon lacks.** The container has its own PID
-namespace, so code in it cannot name a host process: it cannot signal the bindings process, read its
-`/proc` entries, or attach to it. The only channel is the frames the Rust owner relays, and only
-the interpreter has one. That is the property this page used to prefer a sidecar for, and the host
-has it without another container.
+namespace, so code in it cannot name a host process: it cannot signal the bindings process or the
+host program, read their `/proc` entries, or attach to them. The only channel is the frames the
+Rust owner relays, and only the interpreter has one. That is the property this page used to
+prefer a sidecar for, and the host has it without another container.
 
 **One process holds every binding, so the bindings share its authority.** The process has one
 environment, which every binding's library runs with: the user's under the CLI, or the one an
@@ -85,6 +89,14 @@ another binding's object. Until 2026-10-13 each binding had a process of its own
 environments apart too; the maintainer chose one process for its simplicity, and an embedder that
 needs two credentials kept apart runs them in two sessions.
 
+**A host program is trusted host code.** `outrig run <script.py>` runs the operator's program with
+the user's authority and environment, outside any sandbox (`0003-27`); OutRig neither confines nor
+audits it, and the owner connection between the engine and the program carries controls, events
+and relayed frames, nothing the container reaches except through the relay. A live object the
+program injects acts with the program's authority, and every operation on it is decided and
+recorded as any binding's is (`0003-36`). What OutRig asks of the program is what it asks of an
+embedder: keep its own imports and credentials outside paths an agent can write.
+
 This reverses what the page used to say. It weighed two ways to make a trusted side real:
 restricting the container so a daemon in it could not be inspected -- dropping `CAP_SYS_PTRACE`,
 mounting `/proc` with `hidepid` -- and putting the trusted side in a sidecar, which it preferred.
@@ -94,8 +106,9 @@ would have to be handed.
 
 ## What a binding grants
 
-A hosted object acts with the host user's authority, and whatever its library does on the host is
-part of the grant -- including what the call expression does not show. With GitPython as the
+A hosted object acts with the host user's authority -- a factory binding's in the bindings
+process's environment, a live object's in its program's -- and whatever its library does on the
+host is part of the grant, including what the call expression does not show. With GitPython as the
 example:
 
 - **Programs the repository names.** Host `git` runs programs from repository config --
@@ -202,7 +215,8 @@ it reads -- a README, an issue, a commit message, a web page. The design claims 
 that assumption and no more:
 
 - **Interception holds against any code in the container.** A steered model can write anything,
-  raw RPyC frames included, so enforcement is on the host and covers every request handler.
+  raw RPyC frames included, so enforcement is on the host, in the bindings process and in a host
+  program's serving module alike, and covers every request handler.
   Admission holds the same way: the owner's gate and each binding's closed flag are on the host,
   so nothing in the container can get a request admitted once the owner has closed admission
   (`boundary-policy.md`).
@@ -235,9 +249,10 @@ that assumption and no more:
 
 ## What this does not change
 
-The agent still cannot grow its own environment. A binding comes from OutRig's configuration or
-from an embedder, the same as every container and sidecar; there is no agent-callable operation
-that creates one, and a session's bindings are fixed when it starts. The agent can write the repo
+The agent still cannot grow its own environment. A binding comes from OutRig's configuration, from
+an embedder, or from a host program's `inject`, the same as every container and sidecar: there is no
+agent-callable operation that creates one. A session's factory bindings are fixed when it starts,
+and a live object is added only by the program that owns the session. The agent can write the repo
 config, which is why a repo-declared binding waits for the operator.
 `doc/concepts/mcp-trust-model.md` depends on that rule, and this phase keeps it, with the limit
 stated above: it governs what the agent can add, not what a granted binding can do.

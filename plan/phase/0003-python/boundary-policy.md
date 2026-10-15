@@ -9,7 +9,8 @@ evaluator.
 
 Three decisions apply throughout:
 
-- **Enforcement is on the host**, in the binding process (`hosted-objects.md`). Nothing on the
+- **Enforcement is on the host**, in the serving process -- the bindings process, or a host
+  program's serving module for a live object it injected (`hosted-objects.md`). Nothing on the
   container side is trusted: agent code runs in the same process as anything installed there, and
   can send raw requests past it.
 - **The default is allow, published as events.** With nothing configured, every request runs and
@@ -20,12 +21,11 @@ Three decisions apply throughout:
 
 One semantic operation on a hosted object: reading, writing, or deleting an attribute; a call;
 item access; iteration; or a relevant special method -- a comparison, `repr`, `len`, entering or
-leaving a `with` block. One expression can produce several, and its requests are sent when it is
-awaited (`hosted-objects.md`, "Calls are awaited"). `await repo.head.commit.tree` is three
-attribute reads, each decided and evented on its own, and `async for r in repo.remotes:` is a
-request to start the iteration and one per item. `repr`, `str` and `dir` are requests only when
-asked for explicitly, as `await x.__repr__()`, since the container answers them locally
-otherwise.
+leaving a `with` block. One expression can produce several, and each request is made as the
+operation runs (`hosted-objects.md`, "Calls are synchronous"). `repo.head.commit.tree` is three
+attribute reads, each decided and evented on its own, and `for r in repo.remotes:` is a request
+to start the iteration and one per item. `repr(x)`, `str(x)` and `dir(x)` are requests when they
+are called, as they would call methods of a local object, and so is whatever `help(x)` reads.
 
 Bookkeeping is not a semantic operation: fetching a binding's root, counting references, and listing
 the methods a proxy class is built from. Interception still checks it -- a reference count cannot be
@@ -100,17 +100,18 @@ be redefined by a repo: OutRig keeps the operator's layer -- the global config, 
 embedder passes to the builder -- beside the merged config, and reads the operator's policy and the
 evaluator's model from it. `0003-24` keeps that layer, and `0003-25` uses it.
 
-Rules run in the binding process, from a table the owner sends it at start, so an allow costs no
-round trip to the owner. That is `0003-24`'s fork 1, recommended there, and the admission design
-below assumes it. The escalation handler, the evaluator, and the gate that decides held requests
-are the owner's.
+Rules run in the serving process -- the bindings process for a factory binding, a host program's
+serving module for a live object (`0003-36`) -- from a table the owner sends it at start or at the
+object's registration, so an allow costs no round trip to the owner. That is `0003-24`'s fork 1,
+recommended there, and the admission design below assumes it. The escalation handler, the
+evaluator, and the gate that decides held requests are the owner's.
 
 **Admission is decided in two places**, and the owner's one `close_admission()` reaches them at
 different times (`lifecycle.md`). The call itself is one state change in Rust, and it returns at
 once: it closes the owner's gate and stops the relay forwarding to every binding, together. The
 relay is what orders a rule-allowed request against the close: a request it had not forwarded is
 refused in Rust and reaches no binding, and one it had forwarded ends with the outcome the binding
-gives it (`0003-22`). Each binding process also has a closed flag, which decides a request a rule
+gives it (`0003-22`). Each serving process also has a closed flag, which decides a request a rule
 allowed: once the flag is set, the binding refuses it, with admission closed as the reason. The
 flag is installed after the close has returned -- the relay enqueues a control line behind the
 frames it had forwarded, without waiting for a binding that has stopped reading, and the binding
@@ -173,9 +174,10 @@ outrig: [7] repo: call push on git.remote.Remote ('main',)
 The format is illustrative. The rules around it are not:
 
 - **The call waits until it is answered, interrupted, or the session closes.** While it waits,
-  the awaiting code waits and its kernel's loop keeps turning, as for any hosted call
-  (`hosted-objects.md`), and other kernels are unaffected. OutRig sets no expiry. A handler that
-  wants a deadline answers deny when its deadline passes, which leaves the deadline to whoever
+  the calling thread waits -- its kernel's loop with it, unless the call was made in a worker --
+  as for any hosted call (`hosted-objects.md`), and other kernels are unaffected. OutRig sets no
+  expiry. A handler that wants a deadline answers deny when its deadline passes, which leaves the
+  deadline to whoever
   chooses the approvers (`0003-24`).
 - **An approval covers one call.** Nothing is reused or cached -- not by member, not by arguments,
   not for a time -- and the next identical call asks again. Reuse with an explicit scope is
@@ -278,9 +280,10 @@ The outcome is one of five:
 - `cancelled` -- never invoked: the caller was interrupted, or the session closed, while the
   request was held for a decision, waiting for a free connection, or waiting for the serialize
   lock.
-- `unknown` -- forwarded, with no reply: the binding was killed at shutdown, or the binding's
-  process died. Whether the target was invoked is open; a dispatch event the binding published
-  before the reply was lost says that it was.
+- `unknown` -- forwarded, with no reply: the binding was killed at shutdown, the binding's
+  process died, or a live object's call was still running in the host program when the report
+  was sealed (`0003-36`). Whether the target was invoked is open; a dispatch event published
+  before the reply was lost says that it was, and leaves whether it finished open.
 
 An interrupted call whose target had been invoked runs on, and its reply records `returned` or
 `raised` with the note that the caller was interrupted. Interrupted is a reason attached to

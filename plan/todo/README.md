@@ -102,17 +102,32 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
+| `0003-23` | A hosted call is synchronous, with the library's own convention    |
 | `0003-24` | Policy decides what crosses, and the user can be asked             |
 | `0003-25` | An evaluator judges what no rule settled                           |
+
+**The `outrig` package**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-26` | `outrig` imports in every kernel and on the host, decodes strictly |
+
+**A host program**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-27` | `outrig run <script.py>` runs a Python program on the host         |
+| `0003-28` | A session runs with no primary agent                               |
+| `0003-29` | A host program owns a session, and the engine survives it          |
 
 **Children**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-26` | `outrig` imports in every kernel, and decodes results strictly     |
 | `0003-30` | A parent awaits its child's typed result                           |
 | `0003-31` | A decorated function is typed agent work                           |
 | `0003-34` | An agent class answers requests                                    |
+| `0003-35` | A host program drives an agent class                               |
 
 **Skills**
 
@@ -120,6 +135,12 @@ phase.
 | --------- | ------------------------------------------------------------------ |
 | `0003-32` | Skills import as modules from pluggable sources                    |
 | `0003-33` | `/name` reaches the main agent as a call it makes                  |
+
+**Live objects**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-36` | A host program injects a live object                               |
 
 **Last**
 
@@ -144,8 +165,16 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - `0003-21`, the awaitable facade from the planning round of 2026-10-09, comes before the relay
   task because every later task's agent code is written against its spelling, and it depends on
   the spikes alone. Pulling it in shifted the tasks then numbered `0003-21` through `0003-30` by
-  one. The planning round of 2026-10-15 moved `0003-23` through `0003-31` again, to make room
-  for the host-program tasks.
+  one.
+- The planning round of 2026-10-15 folded in the host-program requirements (R1-R9, reviewed
+  2026-10-14): a Python program on the host owns a session with no primary agent, injects live
+  objects, declares agent classes and typed results, and reads the report. Six tasks were placed
+  by dependency rather than appended -- `0003-23` directly after the relay, `0003-27` through
+  `0003-29` after the `outrig` package, `0003-35` and `0003-36` after the agent class -- and
+  `0003-23` through `0003-31` moved to make room. The same round withdrew `0003-21`'s awaited
+  facade, for the reason the requirements' R9 gives: a hosted library keeps its own calling
+  convention, and a model learns no OutRig-specific rewrite of it. `0003-23` removes the facade
+  and binds the synchronous proxy `0003-17` proved; `hosted-objects.md` records the decision.
 - Close behavior lands with each resource: the task that adds a resource adds its row to
   `lifecycle.md`'s close table, so no single shutdown task has to reopen the others.
 - Credential isolation became hosted objects (`0003-16` through `0003-25`), and subagents became

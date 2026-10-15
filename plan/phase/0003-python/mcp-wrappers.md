@@ -103,12 +103,11 @@ reason it is not used is the compiled dependency above, not its maintenance reco
 The choice above is about where the client lives. These are true however the object is
 presented, and they are the part an agent actually experiences.
 
-**Awaitable, and not merely wrapped.** A call waits on something remote. If that blocks the
-agent's event loop it stops channel delivery, which is what lets a user redirect an agent
-mid-wait -- most of what makes long-running work tolerable here. Hosted Python objects are
-awaited through the facade over RPyC (`hosted-objects.md`, "Calls are awaited"), so a
-Rust-presented object should be awaitable with the same spelling, and the two kinds of object
-read alike.
+**Synchronous, as a hosted object is.** A call waits on something remote, and hosted Python
+objects are called synchronously, with their library's own convention, blocking the calling
+thread until the host answers (`hosted-objects.md`, "Calls are synchronous"); a caller that must
+stay reachable puts the call in `asyncio.to_thread`. A Rust-presented object should read the same
+way, so the two kinds of object are used alike and the model learns one rule for both.
 
 **Results stay data.** A tool that returns a structured result must arrive as a structure the
 agent can filter in Python, not as prose it has to parse back. This is the whole economic argument

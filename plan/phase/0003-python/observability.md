@@ -236,7 +236,9 @@ each:
   `default`, or the approver's answer -- with the effective policy's version; and each escalation
   with its answer, its cancellation, or the late answer that changed nothing;
 - `0003-25`: each evaluator verdict, as a request's decision, and each evaluation's usage,
-  attributed apart from the agent's, so a judge's tokens never appear in a round's total.
+  attributed apart from the agent's, so a judge's tokens never appear in a round's total;
+- `0003-36`: each live object a host program injects, `binding.injected`, with its name and
+  host-side type; its calls produce the same `hosted.*` events as a factory binding's.
 
 Three more tasks add events beside them that are execution diagnostics, not integration audit:
 
@@ -264,7 +266,10 @@ designs a public session API (`embedding.md`), and an embedder driving a session
 its events as values, not as a file to read back.
 
 So **event subscription is public through the session API** (`outrig::harness::event`), and is
-fixed with the rest of it at the 0.3.0 release. `0003-13` built the file writer and the event
+fixed with the rest of it at the 0.3.0 release. A host program subscribes through the same
+stream: `session.events()` is one subscription, registered when its session is built and read as
+an async iterator with the same counted gaps (`0003-29`), and the shutdown report never depends
+on it. `0003-13` built the file writer and the event
 types without publishing either, and no in-memory stream: its `emit` numbered each event and
 queued it to the file's sink. `0003-19` put the stream in front of that sink, made the file one
 subscriber of it, and made subscription public. For the file, the revisit
@@ -372,7 +377,9 @@ conversation.
 
 The mode governs the file, not the stream. An embedder's subscribers receive events whatever the
 mode says, because what an embedder keeps is its own decision; the mode is the CLI's decision about
-what it writes to disk.
+what it writes to disk. A host program's sessions follow the CLI's reading: `0003-29` turns
+`[events] mode` into the recording option as `run-new` does, and the program's own subscription
+receives events whatever the mode says.
 
 **Boundary events follow the same opt-in (the maintainer's call).** They reach `events.jsonl` only
 when the mode is on. The consequence is worth stating, because the default policy is allow,

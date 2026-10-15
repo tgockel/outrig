@@ -3,7 +3,10 @@
 How a Rust program owns an OutRig session. The program may be OutRig's own CLI or an application
 that runs agents for its own tasks -- CocoClaw is the first. Either way it holds one value, the
 session, and everything the session starts is stopped through it: the container, the interpreter,
-the host process holding its bindings, and the agent's rounds.
+the host process holding its bindings, and the agent's rounds. A Python program on the host owns
+one the same way, through the engine: `outrig run <script.py>` runs it, and its `outrig.Session`
+is a client of the engine's session over a private connection ("A Python program as owner");
+nothing of the engine moves into Python.
 
 **Decided in planning (2026-09-30): the loop gets a public session API in this phase.**
 `outrig run-new` is rebuilt on it and uses nothing else, and it replaces the provisional entry
@@ -61,7 +64,8 @@ CocoClaw and any other embedder start a system the same way.
   user's environment: their ssh-agent, credential helpers and config. A binding given through this
   API needs no operator approval, because the embedder is the owner.
   Only one declared in a repository's config does, because that file is content a cloned project
-  brings and the agent can write.
+  brings and the agent can write. A host program adds live objects at run time with
+  `session.inject` (`0003-36`, `hosted-objects.md`).
 - **An approver for repo-declared bindings** (`0003-20`): called at session start, before anything
   is installed, with each binding declared in a repository's config that the operator has not
   approved in exactly that form. `run-new`'s approver prompts on the terminal; an embedder
@@ -92,6 +96,13 @@ leaves (`0003-19`):
 | quit            | `/quit` or EOF: `close_admission()`, `shutdown(deadline)`, a report     |
 | exit status     | 0 clean; 2 stopped, with unknown outcomes; 3 not proven stopped         |
 
+A host program supplies less, through the engine (`0003-29`): the configuration the launcher
+loaded; the environment's secrets through the same resolver; a workspace and mounts as
+`Session`'s arguments; live objects through `inject`; a subscription made when its session is
+built; and its own control flow in place of rounds. It supplies no approver, so a repo-declared
+binding is refused, and no escalation handler, so `escalate` denies
+(`plan/next/host-program-approves-repo-bindings.md`, `plan/next/python-escalation-handler.md`).
+
 **Why a resolver rather than the environment.** The environment is one table for the whole
 process, shared by every session and every thread in it. An embedder that set a key, started a
 session and unset the key again would race every other session reading its own, and every process
@@ -111,6 +122,13 @@ spawned meanwhile would inherit the key. Edition 2024, which this workspace uses
   today -- send a message, receive what the agent sent, take what is waiting at exit.
 - **An interrupter**, as `PythonAgent::interrupter` is today: it stops the Python a round waits on,
   and it is what a Ctrl-C reaches (`runtime-protection.md`).
+
+**A session may have no primary agent** (`0003-28`). A host program's session has none: the
+program constructs the agents it wants (`agent-classes.md`, "From the host program") and owns its
+control flow, so there are no rounds to drive, no user channel and no interrupter; `round()` and
+its companions answer with a documented error, and the session's state is `idle` from `starting`
+until `closing`. Everything else -- bindings, admission, events, the ledger, children, the report
+-- is the session's and works the same. No hidden primary is made to satisfy the API.
 
 **The session's state is an event, not text to parse.** An embedder that shows "model working",
 "Python running", "waiting for input" and "stopped" reads them from events
@@ -167,6 +185,54 @@ loop {
 session.close_admission();          // returns at once
 let report = session.shutdown(deadline).await;
 ```
+
+## A Python program as owner
+
+`outrig run <script.py> [args...]` (`0003-27`) runs a trusted Python program on the host under the
+bundled CPython: its `__main__`, its argv, its cwd, its streams and its exit status are its own,
+`import outrig` is available, and the configuration is loaded from the invocation's directory
+before it runs. Starting the program starts no container and calls no model. The program decides
+when to enter a session (`0003-29`):
+
+```python
+async with outrig.Session(workspace=workspace) as session:
+    async with ProjectReader() as agent:
+        result = await agent.explain("What does this project do?")
+
+print(session.shutdown_report)
+```
+
+- **No start method.** Construction records inputs; async entry starts a session with no primary
+  agent through the engine; async exit shuts it down, on exceptions too. A failed entry cleans up
+  what it started.
+- **The current session.** Entry sets a `ContextVar`; exit restores it. An agent class
+  constructed without `session=` uses it, an explicit `session=` overrides it, and neither is an
+  error.
+- **Inputs.** `workspace` overrides the configured one; omitted, it falls back to `[workspace]`;
+  with neither, nothing is mounted. `mounts` add to the configured ones. Factory bindings come from
+  the configuration, repo-declared ones refused for want of an approver. Live objects come through
+  `session.inject(name, obj)`, synchronous, returning once every agent can reach the object
+  (`0003-36`).
+- **Events.** `session.events()` is one subscription, registered when the session is built and
+  read as an async iterator, with the stream's counted gaps as `Missed` records
+  (`observability.md`). The report never depends on it.
+- **Controls.** `await session.close_admission()`, acknowledged after the engine applied it.
+- **The report.** `session.shutdown_report` after exit, a mirror of `ShutdownReport`; when the
+  engine cannot prove the session stopped, exit raises `outrig.ShutdownException` in the
+  program's task, with the report attached and a body exception preserved as its `__context__`.
+- **Configuration.** `outrig.config()`, a read-only view of the models, aliases, providers and
+  defaults the launcher loaded, with no credential in it (R7); the engine resolves names, and the
+  program never parses TOML.
+- **Agents.** `outrig.Agent` subclasses declared in the program and driven from it
+  (`agent-classes.md`, "From the host program"; `0003-35`).
+
+The engine survives the program (`0003-29`): a program that exits or dies with a session open
+has its sessions shut down and their reports printed; one that does not respond to a forwarded
+SIGINT or SIGTERM gets a configurable cooperative grace, then SIGTERM and SIGKILL to its group
+(`lifecycle.md`, "The host program"). What a program does not have in this phase: rounds and a
+user channel, since it has no primary; an escalation handler and an approver, which are
+`plan/next/` entries; skill sources of its own; and the explicit child API. The Python API is
+fixed at the 0.3.0 release with the Rust one.
 
 ## Stopping
 
@@ -240,10 +306,12 @@ Two consequences follow from that, and both are the embedder's to design around:
 - **Identity comes from the environment, not from arguments.** The bindings' environment, which
   the embedder sets, is where the client finds its endpoint and the identity it acts as. A task
   id the agent passes as an argument is data the client may check, not authority it acts on.
-- **Waits are awaited.** A hosted call is awaited, so a method that waits on a person holds no
-  kernel; it holds one worker thread and one connection of the kernel's pool for the binding
-  (`execution-and-rounds.md`). The bindings process serves each connection on its own thread, and a
-  kernel keeps a pool of connections per binding (`0003-17`), so such a wait delays no other call.
+- **A wait blocks its caller and nothing else.** A hosted call is synchronous, so a method that
+  waits on a person holds the thread that called it -- the kernel's own, or a `to_thread`
+  worker's -- and one connection of the kernel's pool for the binding
+  (`execution-and-rounds.md`); an agent that must stay reachable makes the call in a worker. The
+  bindings process serves each connection on its own thread, and a kernel keeps a pool of
+  connections per binding (`0003-17`), so such a wait delays no other call.
   Only a binding declared `serialize = true`, because its library is not thread-safe, takes one
   call at a time, and there the wait delays every other call to that binding until it returns. At
   close such a call is a running call: it drains, and if it is still waiting at the deadline it is
@@ -273,9 +341,11 @@ shows up as a CLI that cannot be written. That proves one foreground application
 service: not concurrent sessions, not a caller cancelled while its execution survives, not cleanup
 after an owner dies. There is no separate service fixture for those in 0.3. CocoClaw integrates as
 soon as the API exists, through a `{ git = "..." }` dependency on `version/0.3.x`, so what a
-service needs that the API does not give shows up there while the API can still change. No
-acceptance criterion in this phase names an embedder, and CocoClaw's integration is its own to
-prove; what it finds comes back as `plan/next/` entries, or as tasks `/groom-plan` numbers.
+service needs that the API does not give shows up there while the API can still change. The
+host-program path is the second proof: `0003-27` through `0003-29`, `0003-35` and `0003-36` each
+run a real program against the engine, and R1-R9's examples are their acceptance. No acceptance
+criterion in this phase names an embedder, and CocoClaw's integration is its own to prove; what
+it finds comes back as `plan/next/` entries, or as tasks `/groom-plan` numbers.
 
 ## Rejected alternatives
 
@@ -306,7 +376,8 @@ thread that reads the environment, and every process started meanwhile inherits 
 - Whether starting a session ensures its image. `run-new` does that itself today, before
   `Outrig::launch`, because `launch` neither pulls nor builds under the image-config's name
   (#456). If this API is all `run-new` uses, either the session takes that step or the API
-  offers it.
+  offers it. For a host program's session the engine ensures the image (`0003-29`); whether the
+  Rust builder gains the same step stays open.
 - Which of `run`'s flags `run-new` gains (`plan/next/run-new-flag-parity.md`) becomes a question
   about the builder: a flag with no builder input has no way in.
 - Whether a subscriber can join a session that has already started, and what it is told about the
@@ -320,4 +391,5 @@ thread that reads the environment, and every process started meanwhile inherits 
   in this design work.
 - That one process can hold several sessions at once. Each session's container, interpreter and
   bindings process are its own, but process-wide state -- the container panic hook, the cleanup
-  reaper thread -- has only run with one session in a process.
+  reaper thread -- has only run with one session in a process. `0003-29`'s acceptance runs two
+  at once for a host program.

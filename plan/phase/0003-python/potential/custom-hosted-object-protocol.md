@@ -2,24 +2,24 @@
 
 ## Shipped
 
-A hosted object is awaited through a facade over RPyC 6.0.2 (`hosted-objects.md`, "Calls are
-awaited"). The facade is a lazy proxy on the container side: attribute access, item access and
-calls build a path with no round trip, and `await` resolves the path on a worker thread through
-the kernel's pool of connections, one RPyC request per step and two per method call. RPyC frames
-ride the interpreter pipe as `rpc` lines, the binding process serves each connection on a thread
-of its own and intercepts all 20 of RPyC's request handlers, the pool bounds a kernel at four
-calls in flight per binding, and a worker thread per in-flight call is the cost. The maintainer
-chose this in the planning round of 2026-10-09 as the way to get hosted objects rolling, and said
-it is not the ideal long-term shape.
+A hosted object is RPyC 6.0.2's proxy, used synchronously (`hosted-objects.md`, "Calls are
+synchronous"): each operation makes its request on the thread that runs it and blocks that thread
+until the host answers, a caller that must stay responsive puts the call in `asyncio.to_thread`,
+RPyC frames ride the interpreter pipe as `rpc` lines, the bindings process serves each connection
+on a thread of its own and intercepts all 20 of RPyC's request handlers, and a kernel's pool
+bounds it at four calls in flight per binding. The maintainer chose RPyC in the planning round of
+2026-09-30 to get hosted objects rolling, took an awaited facade over it on 2026-10-09, and
+withdrew the facade on 2026-10-14 for the library's own calling convention (R9); the review that
+did so said a protocol of OutRig's own must keep that convention.
 
 ## Alternative
 
 A hosted-object protocol of OutRig's own, asyncio-native on both sides, with RPyC gone.
 
-- **The surface is the facade's**, as Cap'n Web does it: a proxy's attribute access yields a
-  promise, `await` is the pull, and a chain such as `repo.head.commit.hexsha` crosses as one
-  request carrying the path, so a step costs no round trip of its own. `async for` iterates in
-  batches the host chooses.
+- **The surface is the library's.** A proxy's attribute access, call and iteration block in
+  `__getattr__`, `__call__` and `__next__` as RPyC's do, so agent code is unchanged; what changes
+  is underneath: replies matched by id on one connection, and `for` fetching in batches the host
+  chooses.
 - **The wire is JSON on the existing NDJSON lines**, as jsii's kernel API does it over a child's
   stdin and stdout: by-reference object ids, `get`, `set`, `delete`, `invoke`, `iter`, `release`,
   and callbacks as requests the host sends in place of a response. Every request carries a call
@@ -55,18 +55,18 @@ Cap'n Web's protocol page and jsii's kernel specification.
 
 ## Evaluation
 
-What would decide it, once the facade and the relay task's events are in use:
+What would decide it, once the synchronous proxies and the relay's events are in use:
 
-- **Threads and memory.** Worker threads and resident memory under concurrent awaited calls across
-  kernels and bindings, against the memory ceiling (`runtime-protection.md`), compared with one
-  connection and no worker per call. If blocked workers dominate a session's memory, the
-  alternative removes them.
+- **Connections and threads.** The pool's four connections per kernel and binding, and the
+  `to_thread` workers agents start for long calls, against the memory ceiling
+  (`runtime-protection.md`), compared with one multiplexed connection. The alternative removes the
+  pool; it removes no worker an agent chose to start.
 - **Chain latency.** A multi-step chain at one request per step, against the 0.6 to 1.0 ms round
   trip `0003-17` measured, compared with one request per chain. If agents write long chains and
   the per-step cost shows in rounds, pipelining pays.
-- **Nested callbacks.** Whether coroutine callbacks that await hosted calls hit the pool bound or
-  the serve-a-queue path in practice. If they do, the parent id the alternative carries is the
-  simpler mechanism.
+- **Nested callbacks.** Whether callbacks that make hosted calls from worker-thread calls hit the
+  pool bound in practice. If they do, the parent id the alternative carries is the simpler
+  mechanism.
 - **RPyC upstream.** Its release cadence (one release a year, last 6.0.2 on 2025-04-18), its open
   asyncio issue, and any new advisory at the trust boundary. A second CVE in the handlers OutRig
   intercepts is a reason to stop vendoring them.
@@ -77,7 +77,7 @@ What would decide it, once the facade and the relay task's events are in use:
 
 ## When
 
-After the facade ships and the relay task's outcome events give real call counts and latencies,
-or when the Rust service adapter is scheduled, whichever comes first. Until then the facade's
-surface is the contract agent code is written against, and the alternative keeps that surface,
-so adopting it later changes the wire and the binding process and not what agents write.
+After `0003-23`'s synchronous proxies and the relay's outcome events give real call counts and
+latencies, or when the Rust service adapter is scheduled, whichever comes first. The surface agent
+code is written against is the library's own, and the alternative keeps it, so adopting it later
+changes the wire and the serving processes and not what agents write.

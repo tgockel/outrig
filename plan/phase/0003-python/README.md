@@ -2,9 +2,9 @@
 
 Open. A prototype on `prototype/python-exec` established that the architecture runs; this page
 and its siblings are the design derived from it. That branch is never merged -- its code is
-ported onto `version/0.3.x`, the long-running line for this phase's work. Tasks `0003-01` through
-`0003-13` are merged there; everything else on these pages is design until its task is merged. The
-sibling documents carry the detail: `harness-components.md`, `messages.md`,
+ported onto `version/0.3.x`, the long-running line for this phase's work. The tasks under
+`plan/done/` have landed there; everything else on these pages is design until its task is
+merged. The sibling documents carry the detail: `harness-components.md`, `messages.md`,
 `crate-split-tradeoffs.md`, `agent-placement.md`, `execution-and-rounds.md`,
 `runtime-protection.md`, `security.md`, `history.md`, `discovery.md`, `observability.md`,
 `work.md`, `hosted-objects.md`, `boundary-policy.md`, `embedding.md`, `lifecycle.md`,
@@ -36,6 +36,14 @@ a hosted object: an attribute read, a call, one step of an iteration. One expres
 several. **Admission** is the host-side gate for all new work -- a boundary request, an
 execution, a child's launch -- and the owner can close it at any time.
 
+Three more came with the host-program requirements of 2026-10-14. The **owner** is the Rust
+program holding a session: the CLI, a Rust embedder, or the engine acting for a **host program**
+-- a Python script `outrig run <script.py>` supervises, which owns its session through
+`outrig.Session` and has no primary agent. A **live object** is a binding whose object the host
+program holds, served from its process, where a **factory binding** is built in the bindings
+process from a declaration. A **root agent** is a child whose parent is the owner rather than a
+kernel, in a session with no primary.
+
 Only the new loop and these documents adopt any of this; `outrig-cli` keeps its own.
 
 ## Goal
@@ -55,6 +63,13 @@ typed requests, and combine their results with ordinary Python. The loop is driv
 public session API that `run-new` uses like any other embedder. This is a breaking change and the
 line targets 0.3.0, but the release itself belongs to a later phase: what this one is judged on is
 whether the thing can be used.
+
+A program can own a session too. `outrig run <script.py>` runs a trusted Python program on the
+host that enters a session with no primary agent, injects objects it already holds for the agents
+to use with their libraries' own calling conventions, declares agent classes and typed results in
+its own module, drives them from its own asyncio loop, and reads the shutdown report; the engine
+survives the program and cleans up whatever it leaves open. Fleet is the first such program, and
+the mechanism is general.
 
 ## User-visible deliverables
 
@@ -104,10 +119,12 @@ whether the thing can be used.
   page. `observability.md` designs it, and its governing decision is that nothing is captured richer
   than its category allows -- the model's view, execution diagnostics, and integration audit each
   carry their own rule.
-- Host objects the agent uses as ordinary Python, awaiting what it reads, calls or iterates on
-  them while its event loop keeps running. An operator declares a binding -- a factory from a
-  pure-Python package, run on the host in a process of its own -- and agent code gets the object
-  under a name: a GitPython `Repo` as `repo`, say. When a session has bindings, host directories
+- Host objects the agent uses as ordinary Python, with the library's own calling convention: a
+  call blocks the agent's loop while the host works, and `asyncio.to_thread` keeps it turning. An
+  operator declares a binding -- a factory from a pure-Python package, run on the host in the
+  session's bindings process -- or a host program injects an object it already holds, and agent
+  code gets the object under a name: a GitPython `Repo` as `repo`, say. When a session has
+  bindings, host directories
   are mounted at their host paths, so a path means the same thing on both sides. The object acts
   with the user's authority on the host, which `security.md` states plainly. `hosted-objects.md`
   designs it.
@@ -127,6 +144,20 @@ whether the thing can be used.
   the entry's parameters, a dataclass derived from its signature, so no rule parses the line.
   Skills come from the project, the user, or an embedder, and are fetched only when used.
   `skills.md` designs them.
+- `outrig run <script.py> [args...]`: a trusted Python program on the host under the bundled
+  CPython, with its own argv, cwd, streams and exit status, `import outrig`, and the
+  configuration loaded; it starts no container until it asks (`0003-27`). A bare `outrig run`
+  stays the legacy loop until the retarget.
+- `outrig.Session`, an async context manager over a session with no primary agent (`0003-28`):
+  entry starts, exit shuts down, `session.events()` observes, `session.shutdown_report` is read
+  after, and `outrig.ShutdownException` is raised in the program when stop is not proven; the
+  engine cleans up after a program that exits, dies or ignores a signal (`0003-29`).
+- `session.inject(name, obj)`: an object the program holds, served from its process and used by
+  every agent as its library documents, with `outrig.bindings[name]` as the authoritative lookup
+  (`0003-36`).
+- `outrig.Agent` declared and driven from the program, with typed results decoded into the
+  program's own classes and repaired without rerunning work (`0003-35`), and `outrig.config()`,
+  a credential-free view of the configuration (`0003-27`).
 
 ## Exit criteria
 
@@ -164,6 +195,15 @@ written against.
   by a typed agent call, visible in its history.
 - A skill that uses a binding, runs typed children in parallel with one repaired, and meets an
   escalated call works end to end through `run-new` (`0003-33`).
+- A hosted library keeps its calling convention: `repo.head.commit.hexsha` is plain code, and a
+  call blocks its caller and nothing else (`0003-23`).
+- `outrig run <script.py>` runs a program that enters a session with no primary agent, drives a
+  host-declared agent class, has a host-declared result repaired and decoded into its own class,
+  and reads the report (`0003-35`).
+- A live object the program injects mid-session is used synchronously by an agent that already
+  existed and by one created later (`0003-36`).
+- `kill -9` of a program with a session open leaves no container running, and the engine prints
+  the report (`0003-29`).
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` all exit 0.
 
 ## Linked subsystems
@@ -172,13 +212,16 @@ written against.
 `doc/concepts/subagents.md`, `doc/reference/config.md`, `doc/reference/cli.md`, and
 `SECURITY.md` -- the MCP pages most of all, since this phase demotes MCP from the way an agent
 acts to one integration surface among others. Hosted objects, policy, skills and the session API
-have no `doc/` page yet; `0003-37` writes them.
+and the host-program mode have no `doc/` page yet; `0003-37` writes them, and `doc/usage/run.md`
+and `doc/reference/cli.md` gain the script form.
 
 ## Tasks
 
 `0003-01` through `0003-37`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
 the per-step index. They cover the deliverables above; the subjects listed as out of scope below
-have design pages or `plan/next/` entries and no tasks.
+have design pages or `plan/next/` entries and no tasks. The planning round of 2026-10-15 folded in
+the host-program requirements (R1-R9): six tasks placed by dependency, and `0003-23` through
+`0003-31` moved to make room.
 
 The ordering puts a usable command early. `0003-01` through `0003-05` are the shortest path to an
 interactive `run-new`, and everything after is additive. One consequence is worth knowing before
@@ -235,3 +278,10 @@ each resource: the task that adds a resource adds its row to `lifecycle.md`'s cl
   events in memory through the session API; nothing listens.
 - The 0.3.0 release itself -- version, migration guide, public surface freeze, the `run`
   retarget, and the documentation contracts that go with them.
+- A Python escalation handler and an approver for a host program, and installing a program's
+  PEP 723 dependencies. Each has a `plan/next/` entry; a program's session refuses repo-declared
+  bindings meanwhile, and `escalate` denies with no handler.
+- Cleanup after the engine itself is killed. `lifecycle.md` records the limitation for every
+  owner, and a host program changes nothing about it.
+- A Rust embedder injecting a live object. Its objects are bindings through `bind`;
+  `plan/next/rust-object-as-python-object.md` is the adapter.

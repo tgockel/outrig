@@ -15,7 +15,8 @@ critique, the body check was dropped in favor of ignoring the body, the trailing
 counting an attempt, and two session-wide limits were added ("Placement and limits"). On
 2026-10-05, after the follow-up review, a call whose child ends two rounds without completing
 settles `CompletionRejected` instead of staying open ("Validation and repair"). This page is the
-function form, one fresh child per call.
+function form, one fresh child per call; a host program as the declaring side -- types declared
+in a script, replies decoded there -- is "Declared on the host" (`0003-35`).
 
 ## The declaration
 
@@ -219,6 +220,9 @@ between hyphens and underscores in either direction.
 an object with `additionalProperties: false` and every field without a default in `required`;
 `dict[str, Note]` an object whose `additionalProperties` is `Note`'s schema; and a `doc` text the
 field's `description`.
+
+The same source serves a host program: `outrig.schema` imports on the host as in a kernel
+(`0003-26`), and a type declared in a script is checked and rendered by the same rules.
 
 ## Completion is a Python call
 
@@ -443,7 +447,7 @@ async def main(repo, base: str = "origin/main", *paths: str,
                timeout: float | None = 1800.0) -> ReviewOutcome:
     if max_parallel <= 0:
         raise ValueError("max_parallel must be >= 1")   # Semaphore(0) never releases
-    diff = await repo.git.diff(base, "--", *paths)    # hosted, awaited call
+    diff = repo.git.diff(base, "--", *paths)          # a hosted call; blocks until git answers
     sections = split_sections(diff)
     if not sections:
         return ReviewOutcome(kind="no-changes", sections=0)
@@ -509,16 +513,37 @@ What it guarantees:
 - **An interruption stops the children.** Cancelling `main` cancels the gather's waiters, which
   cancels no child; the `finally` cancels every handle not yet settled, and each cancelled call
   releases its child.
-- **The hosted call is awaited.** `repo.git.diff(base, "--", *paths)` builds a path and sends
-  nothing; `repo.git` and `.diff` are steps of it, sent with the call when the expression is
-  awaited (`hosted-objects.md`, "Calls are awaited"). The call runs on a worker thread through
-  the kernel's pool of connections, so the agent's event loop keeps turning during a long diff.
+- **The hosted call blocks.** `repo.git.diff(base, "--", *paths)` is two attribute reads and a
+  call, each a request made as it runs (`hosted-objects.md`, "Calls are synchronous"), and the
+  workflow's loop waits for `git` to answer. A diff is quick and nothing else in `main` has
+  started yet, so the plain call is the right spelling; a long hosted call made where other tasks
+  must keep running goes through `asyncio.to_thread`.
 - **Nothing replays.** Aggregation is pure Python, so running `merge` again is safe. Running `main`
   again makes new model calls, and nothing runs it again on its own.
 
 `return_exceptions=True` keeps one failed child from discarding the others' accepted results. Each
 failure is a typed exception: `CompletionRejected`, the budget exhausted, the call cancelled, or
 the session closing.
+
+## Declared on the host
+
+A host program (`embedding.md`, "A Python program as owner") declares types in its own module
+and reads replies into them (R4, `0003-35`). The declaration is the one above: dataclasses with
+`Annotated` field documentation, `Literal`, `alias`, nested dataclasses and maps, checked by the
+same rules the kernel's declarations are, through the same `outrig.schema` source (`0003-26`). An
+agent class's method on the host names the request and reply types as it does in a kernel
+(`agent-classes.md`, "From the host program").
+
+What differs is where the two sides are. The program's types never cross as code: each crosses
+as a description -- fields, types, `doc` and `alias` markers, defaults as values -- and the
+child's kernel rebuilds the classes under their names with `make_dataclass`, as a child of a
+kernel caller has them bound (`0003-30`, fork 6). The reply crosses back as JSON and is decoded in
+the program into the program's own class, so `result` is an instance of the class the script
+defined, never a proxy and never a dictionary; the decoder's problems return to the child's
+`reply`, which raises them, and the repair, the attempt limit and `CompletionRejected` are the
+ones above. A validator runs where the decoder runs; `validate=` from the host is deferred with
+the kernel's (`agent-classes.md`). Shape validation is not task success, a path's existence, or
+evidence that the session stopped; the program reads the shutdown report for the last of those.
 
 ## States and events
 

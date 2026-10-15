@@ -27,6 +27,13 @@ A provider's strict mode cannot stand in for the decoder. Anthropic's and OpenAI
 map-valued schemas, and `ReviewResult` has three maps. The schema reaches a child as text in its
 instructions, and the decoder is what enforces it.
 
+Two more callers arrived with the host-program requirements (R1-R4), and both decide where the
+package's source lives. A host program `outrig run` starts (`0003-27`) imports the same `outrig`:
+its `schema` and the declaration checks of `outrig.Agent` must be one source on both sides, while
+`runtime` exists only in a kernel and `Session` only on the host. And `0003-23`'s proxies need an
+authoritative lookup beside the convenience global: `outrig.bindings[name]` is how agent code
+reaches a binding whose name is taken, and how a module's code reaches one at all (R3).
+
 ## Goal
 
 Module code reaches the calling execution's runtime through `import outrig`, and a JSON value
@@ -42,6 +49,12 @@ becomes a declared dataclass only when it has exactly the declared shape.
   `_thread.start_new_thread`, a pool's `initializer` -- it raises an error saying why and naming
   `threading.Thread`, `asyncio.to_thread` and `contextvars.copy_context().run` as the ways to
   carry the context.
+- **`outrig.bindings`**, a read-only mapping from a binding's name to the calling kernel's proxy
+  of it (`0003-23`), resolved from `_CURRENT` as `outrig.runtime` is, so a module imported once
+  gives each kernel its own proxy; `KeyError` for a name the session has not bound, and the
+  documented error outside every execution's context. `runtime.bindings` stays the metadata
+  mapping. A kernel built after the first has the same mapping, and `0003-36` adds live objects
+  to it at injection.
 - **`outrig.schema`**, with `doc(text)` and `alias(name)` markers for `typing.Annotated`. A `doc`
   text is the field's description, and an `alias` is the field's JSON key. Nothing else renames a
   field: there is no hyphen-to-underscore conversion in either direction.
@@ -68,6 +81,12 @@ becomes a declared dataclass only when it has exactly the declared shape.
 
 ## Acceptance
 
+- `import outrig.schema` works under the host interpreter outside any kernel, and `outrig.runtime`
+  imported there raises the documented error rather than an `AttributeError`.
+- **`outrig.bindings` is per kernel.** A function in a module imported once, called from two
+  kernels, gets from `outrig.bindings["fx"]` each caller's own proxy of one host object -- the two
+  are not `is`-identical and a call through each reaches the same fixture instance -- and
+  `outrig.bindings["missing"]` raises `KeyError`.
 - `import outrig` works in the first kernel and in one opened later, and `outrig.runtime` is that
   kernel's runtime in each.
 - A function in a module imported once, called from two kernels, reaches each caller's runtime
@@ -110,12 +129,16 @@ becomes a declared dataclass only when it has exactly the declared shape.
 
 ## Design forks
 
-1. **Where the package source lives -- Recommended: synthesized by `interpreter.py`**, so the
-   payload stays one versioned program and the `outrig` module cannot be a different version from
-   the runtime it reads. Files on the payload mount, imported normally, would give tracebacks with
-   source lines and source for `inspect`, at the cost of a second artifact whose version must
-   match. Either way the name `outrig` shadows any package of that name an agent installs; whether
-   to register it on PyPI, so no other package takes it, is a separate call for the maintainer.
+1. **Where the package source lives -- Settled by the host-program requirements: files beside the
+   payload, one source for the kernel and the host.** The container imports them from the
+   read-only mount, the host program from the cache directory `0003-27`'s bootstrap puts on
+   `sys.path`, and both are versioned with the payload so neither side can run another version
+   than the runtime it reads. Kernel-only parts (`runtime`) and host-only parts (`Session`,
+   `config`, `ShutdownException`) are adapters that import only where they apply; `schema`, the
+   declaration checks and `bindings`' shape are shared. Synthesizing the module inside
+   `interpreter.py`, the earlier recommendation, would have left the host with nothing to import.
+   The name `outrig` shadows any package of that name an agent installs; whether to register it on
+   PyPI, so no other package takes it, is a separate call for the maintainer.
 2. **What `outrig.runtime` is -- Recommended: an object that resolves the current execution's
    runtime on each attribute access.** `from outrig import runtime` at a module's top level runs
    once, in whichever kernel imported the module first, so with the object it still reaches each
@@ -133,8 +156,9 @@ becomes a declared dataclass only when it has exactly the declared shape.
 
 ## Dependencies
 
-- **Hard: none outstanding.** It extends `0003-08`'s subset check and reads the per-execution
-  context the interpreter has had since `0003-02`, both done.
+- **Hard: `0003-22`, `0003-23`.** `outrig.bindings` returns the proxies `0003-23` binds through
+  `0003-22`'s relay. The rest extends `0003-08`'s subset check and reads the per-execution context
+  the interpreter has had since `0003-02`, both done.
 
 ## See also
 

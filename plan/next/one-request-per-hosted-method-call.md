@@ -16,16 +16,16 @@ service client: every `ask`, `poll` or `update_records` is two requests on the p
 
 ## Options
 
-- **The facade sends `callattr`.** The container-side stub is now the facade (`0003-21`): a
-  proxy builds a path of steps, and a worker
-  replays them when the path is awaited, `getattr` for an attribute step and `getattr` then
-  `call` for a call step, as RPyC's proxies send them. A call step that follows an attribute
-  step carries the name and the arguments together, so the worker can send one `callattr` in
-  place of the pair, making a method call one request with no bound-method proxy and no `del`
-  after. It is ergonomics, not enforcement (`hosted-objects.md`, "Client-side wrappers are
-  ergonomics only"): the host's `callattr` handler checks the name as `getattr` does and then
-  the call (`0003-16`). A call that follows no attribute step -- `await stub(...)`, or a call on
-  an item step's result -- is a `call` on its target as today.
+- **A proxy subclass sends `callattr`.** The name bound for a binding is RPyC's proxy
+  (`0003-23`), whose `__getattribute__` sends `getattr` for every name outside its local set and
+  returns the bound method as a proxy of its own. A subclass that sent one `callattr` carrying
+  the name and the arguments together, for a name whose value is then called, would make a
+  method call one request with no bound-method proxy and no `del` after. It cannot know at the
+  `getattr` whether a call follows, so it would have to defer that one lookup until the returned
+  object is called or otherwise used -- a lazy step of exactly one attribute, which must stay
+  invisible: `repo.head` read and never called still has to be the attribute's value. It is
+  ergonomics, not enforcement (`hosted-objects.md`, "Client-side wrappers are ergonomics only"):
+  the host's `callattr` handler checks the name as `getattr` does and then the call (`0003-16`).
 - **Leave it.** Two requests on a local pipe are a few hundred microseconds; the measurements say
   whether the halving matters for a service.
 

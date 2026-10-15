@@ -67,6 +67,11 @@ review = await analyze_code(section)
 # Declared, a request child per instance: released with it (agent-classes.md).
 async with FooAgent() as foo:
     thing = await foo.fizz("Hello")
+
+# Declared, from a host program: the same class in a script `outrig run` started, whose
+# handles are the program's own futures (agent-classes.md, "From the host program").
+async with ProjectReader() as agent:
+    answer = await agent.explain("What does this project do?")
 ```
 
 `submit` takes the work's inputs as a dict of named values and binds each one as a variable of
@@ -97,7 +102,8 @@ built on.
 A child is an ordinary Python object, and work on it is awaitable, because everything else here
 is. `child.submit(...)` returns a handle; so do `child.channels["fizz"].request(...)`, a decorated
 call, and a request method on an agent class. Each sends at once and there is no separate start:
-the handle is what a caller holds from the moment the request exists.
+the handle is what a caller holds from the moment the request exists. The same rules hold for a
+handle in a host program, where `.future` is a future of the program's loop (`0003-35`).
 
 What a handle has to expose, and why each one is on the list rather than inferred:
 

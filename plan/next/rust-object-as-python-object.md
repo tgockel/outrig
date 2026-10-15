@@ -8,7 +8,9 @@ CPython, and agent Python reaches the object through RPyC frames on the interpre
 host. The phase 0003 design brief (now in `plan/phase/0003-python/embedding.md`) listed ways to give
 it one and chose none, and the maintainer deferred all of them past 0.3: a Rust service ships a
 pure-Python client, and a binding hosts that client like any library. That costs a second client per
-service and one more process between the agent and the service.
+service and one more process between the agent and the service. A Rust embedder that wants to
+expose an object it already holds -- what a host program does with `session.inject` (`0003-36`) --
+would do it through this adapter too.
 
 This is also how an MCP server would become a Python object. The Python MCP SDK requires
 `pydantic-core`, which is compiled and cannot load in the embedded CPython on either side of the
@@ -48,9 +50,10 @@ builder.bind("task", Arc::new(TaskService::new(..)));
   described type, the method and the operation; `evaluate` sends the call to the evaluator
   (`0003-25`); each call is evented as in `0003-22`; admission and the shutdown report cover it
   (`plan/phase/0003-python/lifecycle.md`).
-- Calls are awaitable with the same spelling as a hosted object's, so the two read alike
-  (`mcp-wrappers.md`). `CallContext` carries the call id, the binding and a cancellation signal,
-  so unlike an RPyC call this one can be told to stop.
+- Calls are synchronous, with the same spelling as a hosted object's, so the two read alike
+  (`mcp-wrappers.md`); a caller that must stay reachable uses `asyncio.to_thread` as it would for
+  any hosted call. `CallContext` carries the call id, the binding and a cancellation signal, so
+  unlike an RPyC call this one can be told to stop.
 
 Open: whether a result may contain further service objects or only values; whether `describe` is
 fixed at start or may change, as an MCP server's tool list can; the error kinds `mcp-wrappers.md`

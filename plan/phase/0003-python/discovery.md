@@ -68,9 +68,10 @@ Two later subjects pass the same test, and it decides how much of each the pream
 Supplied bindings (`hosted-objects.md`) are names an agent cannot learn by looking -- the
 inventory hides boot names, and a binding is presented at boot -- and any round may need one, so
 the preamble lists each binding's name and description, from a local manifest, and one rule,
-that a hosted object is awaited, and nothing else. The rule passes this page's own test:
-`repo.head.commit.hexsha` looks like a plain attribute chain, nothing in it says it must be
-awaited, and pydoc cannot mark a facade `async` as it marks a coroutine function. Skills
+that a call on a hosted object blocks this agent's loop until the host answers, with
+`asyncio.to_thread` as the way to keep it turning, and nothing else. The rule passes this page's
+own test: `repo.head.commit.hexsha` looks like a plain attribute chain, and nothing in it says
+each step is a round trip to the host. Skills
 (`skills.md`) follow the Agent Skills standard: each skill's name and description in the
 preamble, the body only when a skill is used. Neither adds a signature, a method list, or a
 docstring to the preamble; those stay `help()`.
@@ -139,11 +140,12 @@ reason processing data larger than the context window is possible at all.
 
 Whether `help()` is enough, or whether proxies need a description path of their own, was the
 open question here while the transport was Pyro, whose proxies carry no signatures.
-`hosted-objects.md` settles it: `help()` on a proxy answers locally and says how to await it,
-and the binding's package is importable in the container, so signatures and docstrings come
-from the local import -- `help(git.Repo.index)` -- which runs the same version the host runs,
-and `isinstance` holds against it. Automatic observation -- the inventory and the preamble --
-never touches a proxy.
+`hosted-objects.md` settles it: a proxy is RPyC's, so `help()` on one is a run of requests to
+the host, allowed and recorded but slow, and the orientation points at the local import instead.
+The binding's package is importable in the container, so signatures and docstrings come from
+`help(git.Repo.index)`, which runs the same version the host runs, and `isinstance` holds against
+it; `outrig.bindings[name]` reaches a binding whose name a kernel's own code took. Automatic
+observation -- the inventory and the preamble -- never touches a proxy.
 
 ## Open questions
 

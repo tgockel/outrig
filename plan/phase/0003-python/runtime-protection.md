@@ -309,8 +309,9 @@ that catches both keeps the slot; what a further press means is the front end's 
   error result with a traceback; the slot is freed, and the next submission runs.
 - **An await that never resolves.** The host never acts, since the loop answers. Ctrl-C cancels
   it: `CancelledError`, and the slot is freed. Code that catches that and waits again keeps the
-  slot once a second Ctrl-C gives up on it; a Ctrl-C at the prompt cancels it again. An awaited
-  hosted call that never returns is this shape, and the cancel also wakes its worker (below).
+  slot once a second Ctrl-C gives up on it; a Ctrl-C at the prompt cancels it again. A hosted
+  call made in a `to_thread` worker that never returns is this shape for the task awaiting the
+  worker: the cancel ends that wait, and the worker's call runs on (below).
 - **A spin in code an imported module defines.** Awaited from a submission, it is found through
   the submission's frames. Run as a task -- `create_task`, `gather` -- it is found as a task agent
   code started. Either way it is interrupted like any other.
@@ -332,18 +333,20 @@ that catches both keeps the slot; what a further press means is the front end's 
   the wait; `run` kills its direct child, and what that child started keeps running, which the
   result says. The killed child stays a zombie until the next spawn. A bare `Popen(...).wait()`
   does not kill even the child.
-- **A hosted call** (`hosted-objects.md`). The kernel's thread is not in the call: a worker
-  thread waits for a binding on the host to answer, so the host's check sees a loop that
-  answers, not an idle thread. Ctrl-C cancels, then interrupts, and either one wakes the
-  worker's wait -- not by the signal, but through the pool's condition variable, which the
-  reader thread can signal -- and raises where the call is awaited, on any kernel. The call
-  raises a `CancelledError` or a `KeyboardInterrupt` that names the binding and says the call's
-  outcome on the host is unknown -- or, when the call was still waiting for a free connection to
-  the binding, that it was never sent. The host-side call keeps running, since RPyC has no
-  cancel, and its reply is dropped when it comes. Cancelling the awaiting task alone, from agent
-  code, cancels the wait only, and the call goes on. The rule for whose code an interrupt may
-  end is the handler's, applied when the call is awaited; the interpreter makes no hosted call
-  for itself once `repr` is answered locally.
+- **A hosted call** (`hosted-objects.md`). The kernel's thread is in the call, waiting for a
+  binding on the host to answer where the reader thread can wake it, so the host's check sees an
+  idle thread, as in `time.sleep`, and leaves it. Ctrl-C cancels, then interrupts, and either one
+  wakes the wait -- not by the signal, but through the pool's condition variable, which the
+  reader thread can signal -- and raises where the call was made, on any kernel. The call raises
+  a `CancelledError` or a `KeyboardInterrupt` that names the binding and says the call's outcome
+  on the host is unknown -- or, when the call was still waiting for a free connection to the
+  binding, that it was never sent. The host-side call keeps running, since RPyC has no cancel,
+  and its reply is dropped when it comes. A call made in a `to_thread` worker is not woken:
+  cancelling the task that awaits the worker cancels that wait only, and the call goes on. The
+  rule for whose code an interrupt may end is the handler's, applied when the call is made; the
+  interpreter's own hosted calls -- the echo of a proxy as a trailing expression, a traceback
+  holding one -- follow the same rule, decided from the frames when the call is made
+  (`0003-23`).
 - **`os.system`.** libc's `system()` ignores SIGINT process-wide for as long as it waits, so an
   interrupt sent then would be discarded -- for every agent, not only the one that called it. The
   interpreter replaces `os.system` with `subprocess.run(cmd, shell=True)`, which is the case
@@ -480,12 +483,13 @@ What the ceiling does not do:
 primary's `time.sleep` or blocking read can be interrupted. What remains is native code that holds
 the GIL, a libc `system()` reached other than through `os.system`, and any call on another
 thread: Python takes an asynchronous exception at a bytecode boundary, and there is none coming.
-The exception is a hosted call, whose wait is on a worker thread the reader thread can wake
-(above). Nothing short of stopping the container frees the rest, and the host learns of them only
-by the absence of a result. This is the documented final containment action and it stays that way.
+The exception is a hosted call, whose wait the reader thread can wake through the pool's
+condition variable (above). Nothing short of stopping the container frees the rest, and the host
+learns of them only by the absence of a result. This is the documented final containment action
+and it stays that way.
 
 **A wedged subagent, which is contained but not recoverable.** The interrupt above reaches the
-main thread, and subagents are not on it -- so a subagent awaiting a hosted call can be
+main thread, and subagents are not on it -- so a subagent blocked in a hosted call can be
 interrupted, since the wake does not use the signal, and one wedged in anything else cannot. A
 subagent that wedges is gone: the host learns of it from the absence of a result, the application
 marks its endpoints failed, and its parent is told.
