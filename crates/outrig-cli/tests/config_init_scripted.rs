@@ -685,6 +685,31 @@ async fn an_api_key_answer_that_is_not_a_var_name_is_asked_again() {
     }
 }
 
+/// #259: `0` at the `max-tokens` prompt is refused and asked for again, so the
+/// scaffolder cannot write a value validation rejects.
+#[tokio::test]
+async fn a_zero_max_tokens_answer_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n0\n32000\n\n\n";
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    assert!(text.contains("max-tokens = 32000"), "got:\n{text}");
+    assert_eq!(
+        shown
+            .matches("? max-tokens for this model [default: 64000]: ")
+            .count(),
+        2,
+        "the refused 0 must be asked for again:\n{shown}"
+    );
+}
+
 /// #347: a `max-tokens` answer that is not a number is asked for again,
 /// rather than ending the wizard with every earlier answer lost.
 #[tokio::test]

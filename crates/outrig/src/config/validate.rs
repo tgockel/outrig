@@ -362,6 +362,12 @@ pub enum ConfigValidationError {
     )]
     RequestTimeoutSecsZero { path: String, max: u64 },
 
+    #[error(
+        "{path} must be at least 1; got 0, which leaves the model no room to \
+         answer -- leave the key unset for the default"
+    )]
+    MaxTokensZero { path: String },
+
     // `detail` says what is wrong without quoting the value, which can carry
     // credentials in its userinfo.
     #[error("{path} must be an http:// or https:// URL; {detail}")]
@@ -842,6 +848,9 @@ pub(super) fn validate_with_options(
         }
 
         for (agent_name, agent) in &cfg.agents {
+            if let Some(value) = agent.max_tokens {
+                validate_max_tokens(&format!("agents.{agent_name}.max-tokens"), value)?;
+            }
             if let Some(value) = agent.tool_call_max {
                 validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
             }
@@ -872,6 +881,9 @@ pub(super) fn validate_with_options(
             else {
                 continue;
             };
+            if let Some(value) = model.max_tokens {
+                validate_max_tokens(&format!("models.{model_name}.max-tokens"), value)?;
+            }
             let provider = cfg.providers.get(provider_name).ok_or_else(|| {
                 ConfigValidationError::UnknownModelProvider {
                     model: model_name.clone(),
@@ -1842,6 +1854,19 @@ fn validate_request_timeout_secs(path: &str, value: u64) -> Result<(), ConfigVal
             path: path.to_string(),
             value,
             max: REQUEST_TIMEOUT_SECS_CEILING,
+        });
+    }
+    Ok(())
+}
+
+/// A zero output ceiling leaves the model no room to answer, and the Anthropic
+/// arm's cap against the published ceiling only lowers a value, so a `0` would
+/// reach the wire as written. There is no upper bound here: the ceiling a model
+/// allows is the provider's to state.
+fn validate_max_tokens(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if value == 0 {
+        return Err(ConfigValidationError::MaxTokensZero {
+            path: path.to_string(),
         });
     }
     Ok(())

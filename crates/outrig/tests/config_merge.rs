@@ -1698,6 +1698,52 @@ identifier = "gpt-4o-mini"
         }
     }
 
+    /// #259: a zero output ceiling leaves no room to answer, so it is refused
+    /// at load on a model and on an agent, naming the key; 1 is accepted.
+    #[test]
+    fn max_tokens_zero_errors_on_a_model_and_an_agent() {
+        let fixture = |model: &str, agent: &str| {
+            parse(&format!(
+                r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${{OPENAI_API_KEY}}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+{model}
+
+[agents.coder]
+{agent}
+"#
+            ))
+        };
+        for (model, agent, expected) in [
+            ("max-tokens = 0", "", "models.fast.max-tokens"),
+            ("", "max-tokens = 0", "agents.coder.max-tokens"),
+        ] {
+            let err = expect_validation_err(&fixture(model, agent), None);
+            let rendered = err.to_string();
+            match err {
+                ConfigValidationError::MaxTokensZero { path } => {
+                    assert_eq!(path, expected);
+                    assert!(
+                        rendered.contains("leave the key unset"),
+                        "message should say what to do instead, got: {rendered}"
+                    );
+                }
+                other => panic!("expected MaxTokensZero, got: {other:?}"),
+            }
+        }
+        fixture("max-tokens = 1", "max-tokens = 1")
+            .validate(None)
+            .expect("1 is a legal output ceiling");
+    }
+
     /// The bound is inclusive at both ends: exactly the ceiling, and the
     /// smallest legal value, both validate.
     #[test]

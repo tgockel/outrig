@@ -91,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`max-tokens = 0` is refused at load.** On a model or an agent it used to validate, and every
+  request then carried an output ceiling of zero, which surfaced only at the first prompt.
+  `ConfigValidationError::MaxTokensZero` names the key and says to leave it unset for the default;
+  `outrig config init` refuses 0 at its `max-tokens` prompt the same way.
 - **A container path spelled with `..` is checked as podman will see it.** `/workspace/../workspace`
   collided with `/workspace` and `/a/..` was `/`, but validation compared the path as written, so
   podman refused the launch after the image was acquired, naming a path the config never held. The

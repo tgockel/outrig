@@ -627,7 +627,8 @@ identifier = "gpt-4o"
 `max-tokens` on a model is the fallback for every agent that uses it;
 `[agents.<name>].max-tokens` wins where it is set. Leaving both unset lets the provider
 decide -- which is fine for OpenAI-compatible endpoints, and is what the next section is
-about for Anthropic.
+about for Anthropic. A value must be at least 1: `0` leaves no room to answer and is refused at
+load, on a model and on an agent alike.
 
 Note the spelling. In config it is `max-tokens`, like every other key; `max_tokens` is an
 unknown key, ignored with a warning. The underscored form is what the provider API calls it, so
@@ -777,8 +778,8 @@ preamble = "You are a meticulous code reviewer..."
 - `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
-- `max-tokens` (integer, optional, default: the model's `max-tokens`, else the provider
-  default): output token max per turn. Worth setting in one place or the other for an
+- `max-tokens` (integer, at least 1, optional, default: the model's `max-tokens`, else the
+  provider default): output token max per turn. Worth setting in one place or the other for an
   Anthropic model whose identifier outrig does not recognize, which otherwise runs on a
   fallback ceiling -- see [anthropic models](#anthropic-models).
 - `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.

@@ -98,6 +98,8 @@ pub outrig::config::ConfigValidationError::ImageSourceMissing::image: alloc::str
 pub outrig::config::ConfigValidationError::InvalidMcpServerName
 pub outrig::config::ConfigValidationError::InvalidMcpServerName::image: alloc::string::String
 pub outrig::config::ConfigValidationError::InvalidMcpServerName::server: alloc::string::String
+pub outrig::config::ConfigValidationError::MaxTokensZero
+pub outrig::config::ConfigValidationError::MaxTokensZero::path: alloc::string::String
 pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice
 pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice::server: alloc::string::String

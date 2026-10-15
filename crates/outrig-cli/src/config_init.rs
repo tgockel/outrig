@@ -537,7 +537,8 @@ async fn prompt_anthropic_model(
     let identifier = prompt
         .ask_string(&MODEL_IDENTIFIER_FIELD, "claude-sonnet-4-6")
         .await?;
-    let max_tokens = ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens").await?;
+    let max_tokens =
+        ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens", 1).await?;
     let mut model = Model::new(provider_name);
     model.identifier = Some(identifier);
     model.max_tokens = max_tokens;
@@ -551,14 +552,18 @@ async fn ask_optional_u32(
     field: &Field,
     default: &str,
     knob: &str,
+    min: u32,
 ) -> Result<Option<u32>> {
     loop {
         let Some(answer) = blank_to_none(prompt.ask_string(field, default).await?) else {
             return Ok(None);
         };
         match answer.parse::<u32>() {
-            Ok(n) => return Ok(Some(n)),
-            Err(_) => eprintln!("[outrig] {knob} must be a non-negative integer; got `{answer}`"),
+            Ok(n) if n >= min => return Ok(Some(n)),
+            _ if min > 0 => {
+                eprintln!("[outrig] {knob} must be an integer of at least {min}; got `{answer}`")
+            }
+            _ => eprintln!("[outrig] {knob} must be a non-negative integer; got `{answer}`"),
         }
     }
 }
@@ -579,7 +584,7 @@ async fn prompt_mistralrs_model(
         (None, None, Some(PathBuf::from(path)), None)
     };
     let context_length =
-        ask_optional_u32(prompt, &CONTEXT_LENGTH_FIELD, "", "context-length").await?;
+        ask_optional_u32(prompt, &CONTEXT_LENGTH_FIELD, "", "context-length", 0).await?;
     let mut model = Model::new(provider_name);
     model.model_id = model_id;
     model.model_path = model_path;
