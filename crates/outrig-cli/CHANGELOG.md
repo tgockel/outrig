@@ -81,6 +81,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`model-cache-root` is where a `model-id` GGUF is downloaded.** With `--features local-llm`, a
+  `style = "mistralrs"` model that named a Hugging Face repo with `model-id` was fetched into
+  Hugging Face's own cache -- `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else
+  `~/.cache/huggingface/hub` -- whatever `model-cache-root` said. mistralrs-core 0.8.1 replaces the
+  cache it is handed with that one whenever a home directory resolves, so the key never worked:
+  pointing it at a large volume still filled the home directory, and clearing
+  `~/.cache/outrig/models` freed nothing. outrig now downloads the `model-file` entries itself, into
+  `model-cache-root`, and hands mistralrs the directory they landed in, as it does for a
+  `model-path`. The repo's `generation_config.json`, which names stop tokens a GGUF may not (Llama
+  3's `<|eom_id|>`), comes with them when the repo has one. All of it comes from the commit the
+  revision is at when the download starts, so a branch that advances mid-download cannot split a
+  model between two snapshots.
+
+  Three things change with it. A model already in the Hugging Face cache is downloaded again, once,
+  into `model-cache-root`; the old copy is neither read nor removed, unless the key points at that
+  cache (`model-cache-root = "~/.cache/huggingface/hub"`). The directory needs a filesystem that
+  supports symbolic links, which the Hugging Face cache layout uses. And a model already in the
+  cache is used as it is: `generation_config.json` is fetched only along with a download, so a model
+  that another tool cached without it stays without it, and a cached model loads with no network.
+  mistralrs also pulled a repo's `chat_template.json`, `preprocessor_config.json` and
+  `processor_config.json` when it had them; they are not fetched, as a GGUF carries its own chat
+  template and the `model-path` form never had them. A token is read as before, from `HF_TOKEN`,
+  `HF_HUB_TOKEN`, or the file that `huggingface-cli login` writes. (#423)
+
 - **Terminal pickers show each option's description.** On a TTY the `config init` and
   `image add` pickers (provider style, base image, toolchains, MCP servers) listed option
   values only; the help block -- description, one line per option, doc link -- now prints above
@@ -91,6 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line, the end-of-turn line, and an alias chain's `trying <next>` and `tried:` lines now end
   with the underlying cause (`Connection refused`, `failed to lookup address information`, ...).
   A transport failure inside a chain reads as it does outside one.
+
 - **A `node` toolchain whose NodeSource setup failed no longer builds.** On a Debian-family
   base the toolchain ran NodeSource's `setup_24.x` and then `apt-get install nodejs`, and that
   script exits 0 whatever goes wrong in it: it reports each error it handles through

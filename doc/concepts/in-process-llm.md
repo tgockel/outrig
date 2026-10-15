@@ -194,6 +194,15 @@ and caches it under `<XDG_CACHE_HOME>/outrig/models/` (override with the top-lev
 `model-cache-root` key in the global config; see [Reference -> Config](../reference/config.md)).
 Subsequent runs reuse the cached file.
 
+The cache uses Hugging Face's layout, `models--<org>--<repo>/snapshots/<commit>/<file>`, where
+the file is a symbolic link into `blobs/`, so `model-cache-root` must be on a filesystem that
+supports them. Pointing the key at `~/.cache/huggingface/hub` reuses what the Hugging Face tools
+have already downloaded. Alongside the GGUF, outrig downloads the repo's `generation_config.json`
+when it has one, because it can name stop tokens that the GGUF does not, such as Llama 3's
+`<|eom_id|>`. It does so only when it downloads the model, so a model that is already in the cache
+loads as it is, with or without that file. A private or gated repo needs a token: set `HF_TOKEN`,
+or run `huggingface-cli login`.
+
 `model-file` is required with `model-id`, even when the repo ships a single `.gguf`; most
 publish several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) to pick from. It is the file's
 path inside the repo, so a quantization kept in a directory of its own names the directory

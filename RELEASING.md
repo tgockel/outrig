@@ -39,11 +39,11 @@ OUTRIG_MISTRALRS_TEST_MODEL_FILE=qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
 
 `--release` is not optional: built unoptimized, that model did not answer within the test's
 three-minute timeout even on a 32-thread CPU. A test whose variable is unset prints `skip:` and
-passes, so a green run that printed one proved nothing about that form. Until #423 is fixed,
-`download_path_smoke` fails after its first prompt, where it looks for the GGUF in its own cache
-directory; a failure anywhere earlier is a regression. Left unrun, these let #223 ship: a model
-loaded from a local file could not answer a single prompt. The step goes when the deprecated
-`local-llm` feature does.
+passes, so a green run that printed one proved nothing about that form. After its first prompt,
+`download_path_smoke` looks for the GGUF under its own `model-cache-root` and loads it from there a
+second time, so a failure after that prompt means the download did not land where the key says
+(#423). Left unrun, these let #223 ship: a model loaded from a local file could not answer a
+single prompt. The step goes when the deprecated `local-llm` feature does.
 
 ### Bump the version
 

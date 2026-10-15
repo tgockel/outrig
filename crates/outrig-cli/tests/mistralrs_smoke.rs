@@ -140,12 +140,16 @@ async fn download_path_smoke() {
     let first_reply = one_shot(&agent, "Say hi.").await;
     assert!(!first_reply.trim().is_empty());
     drop(agent);
+    drop(registry);
 
     let blob_mtime_before = locate_gguf(cache.path(), &model_file)
         .map(file_mtime)
         .expect("downloaded GGUF should be discoverable in cache dir");
 
-    // Second load: must not re-download.
+    // Second load: must not re-download. From a registry of its own: the first
+    // would hand back the engine it already holds without reading the disk, and
+    // this is the load that reads the cached GGUF back.
+    let registry = std::sync::Arc::new(LlmRegistry::new());
     let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("second agent build (cache reuse)");
@@ -161,12 +165,17 @@ async fn download_path_smoke() {
     );
 }
 
-fn locate_gguf(cache_root: &Path, basename: &str) -> Option<std::path::PathBuf> {
+/// The GGUF `model_file` names, as hf-hub stores it under `cache_root`: a
+/// snapshot entry that is a symlink to a blob. `WalkDir` does not follow links,
+/// so it calls that entry a symlink and never a file; the path's own `is_file`
+/// follows it. `model_file` may name a subdirectory (`Q4_K_M/m.gguf`), so it is
+/// matched as the end of the path, not as a file name.
+fn locate_gguf(cache_root: &Path, model_file: &str) -> Option<std::path::PathBuf> {
     WalkDir::new(cache_root)
         .into_iter()
         .filter_map(|e| e.ok())
-        .find(|e| e.file_type().is_file() && e.path().file_name().is_some_and(|n| n == basename))
         .map(|e| e.into_path())
+        .find(|path| path.ends_with(model_file) && path.is_file())
 }
 
 fn file_mtime(p: std::path::PathBuf) -> std::time::SystemTime {

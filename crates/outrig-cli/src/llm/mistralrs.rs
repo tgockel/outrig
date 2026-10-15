@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use hf_hub::api::sync::{Api, ApiBuilder, ApiError, ApiRepo};
 use indexmap::IndexMap;
 use mistralrs_core::{
     AutoDeviceMapParams, DefaultSchedulerMethod, DeviceMapSetting, GGUFLoaderBuilder,
@@ -77,9 +78,10 @@ impl GetTokenUsage for MistralrsStreamResponse {
 /// be set; `validate.rs` enforces this at config-load time so reaching the
 /// "neither" or "both" branch here is an internal bug.
 ///
-/// `cache_root` directs HF downloads via a process-global `OnceLock<Cache>`
-/// in mistralrs-core. The first call wins; later calls with a different
-/// root are silently ignored.
+/// A `model_id`'s files are downloaded into `cache_root` by [`fetch_snapshot`],
+/// and mistralrs is then handed the directory they landed in, as it is for a
+/// `model_path`. Given the repo id itself, mistralrs-core 0.8.1 downloads into
+/// Hugging Face's own cache whatever cache it was configured with (#423).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn load(
     model_name: &str,
@@ -91,6 +93,9 @@ pub(crate) async fn load(
     device_spec: MistralrsDeviceSpec,
     cache_root: &Path,
 ) -> Result<MistralrsModel> {
+    // mistralrs builds a hub client before it looks at the directory it was
+    // handed, and with no cache set it uses `Cache::default()`, which panics
+    // where no home directory resolves. Nothing is downloaded through it.
     let _ = GLOBAL_HF_CACHE.set(hf_hub::Cache::new(cache_root.to_path_buf()));
 
     let load_err = |source: anyhow::Error| LlmResolveError::MistralrsLoad {
@@ -149,15 +154,38 @@ pub(crate) async fn load(
 
     let started = Instant::now();
     let device = candle_device(model_name, device_spec)?;
+    // `Some` for a `model-id`, whose files are fetched into it.
+    let fetch_root = model_id.is_some().then(|| cache_root.to_path_buf());
     // The download and the load are synchronous and can take minutes. On the
     // blocking pool they leave the runtime free to hear a signal: the session
     // then ends around a load still running, and whatever it produces is
-    // dropped with the task that nothing is waiting on anymore.
+    // dropped with the task that nothing is waiting on anymore. The download
+    // starts only after the device check above, so a device this build cannot
+    // drive fails before gigabytes are fetched.
     let pipeline = tokio::task::spawn_blocking(move || {
+        // A `model-id` is still a repo id here; mistralrs needs the directory
+        // holding its files, as a `model-path` already gives it.
+        let model_dir = match fetch_root {
+            Some(root) => {
+                let api = ApiBuilder::from_cache(hf_hub::Cache::new(root.clone()))
+                    // `from_cache` reads a token file beside the cache; this
+                    // replaces it, `None` included.
+                    .with_token(hf_token())
+                    .build()?;
+                fetch_snapshot(
+                    &api,
+                    &quantized_model_id,
+                    &quantized_filenames,
+                    hf_revision.as_deref(),
+                    &root,
+                )?
+            }
+            None => quantized_model_id,
+        };
         GGUFLoaderBuilder::new(
             None,
             None,
-            quantized_model_id,
+            model_dir,
             quantized_filenames,
             GGUFSpecificConfig::default(),
             false,
@@ -165,8 +193,8 @@ pub(crate) async fn load(
         )
         .build()
         .load_model_from_hf(
-            hf_revision,
-            TokenSource::CacheToken,
+            None,
+            TokenSource::None,
             &ModelDType::Auto,
             &device,
             false,
@@ -204,6 +232,153 @@ pub(crate) async fn load(
     }
 
     Ok(MistralrsModel { engine })
+}
+
+/// What mistralrs reads from beside the weights for the stop tokens a GGUF's own
+/// metadata does not name, such as Llama 3's `<|eom_id|>`.
+const GENERATION_CONFIG: &str = "generation_config.json";
+
+/// Fetch `files` of the Hugging Face repo `model_id` at `revision` (default
+/// `main`) with `api`, whose cache is `cache_root`, and return the snapshot
+/// directory that holds them all.
+///
+/// outrig fetches, and mistralrs-core 0.8.1 does not, because mistralrs
+/// replaces whatever cache it is given with Hugging Face's own (`$HF_HUB_CACHE`,
+/// else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`) whenever one resolves,
+/// which is on any host with a home directory.
+///
+/// The named files, and the repo's [`GENERATION_CONFIG`] when it has one, which
+/// lands in the same snapshot for mistralrs to find there. mistralrs also
+/// fetched `chat_template.json`, `preprocessor_config.json` and
+/// `processor_config.json`; a GGUF carries its own chat template, and the
+/// `model-path` form never had them either.
+///
+/// Blocking, so `load` runs it on the blocking pool. Cache-first: when every
+/// named file is cached under `revision` the hub is asked about nothing, so a
+/// cached model loads with no network, and one that another tool cached without
+/// the config stays without it. Otherwise the hub is asked which commit
+/// `revision` is at and everything is fetched at that commit, so that a branch
+/// advancing mid-load cannot split the files between two snapshots; `revision`
+/// is then left pointing at it. The config comes before the weights, because
+/// once they are cached the next load counts as cached: a failure after them
+/// would leave the model without the config for good. `api` is a parameter so
+/// that a test can run this against a hub and a cache of its own. `files` must
+/// not be empty.
+fn fetch_snapshot(
+    api: &Api,
+    model_id: &str,
+    files: &[String],
+    revision: Option<&str>,
+    cache_root: &Path,
+) -> anyhow::Result<String> {
+    // hf-hub joins a file name onto the snapshot directory as given, so a root
+    // or a `..` would write outside it.
+    for file in files {
+        anyhow::ensure!(
+            !file.split('/').any(|part| matches!(part, "" | "." | "..")),
+            "model-file {file:?} must be a relative path without empty, `.` or `..` components"
+        );
+    }
+    let revision = revision.unwrap_or("main");
+    let repo_at = |rev: &str| {
+        hf_hub::Repo::with_revision(model_id.into(), hf_hub::RepoType::Model, rev.into())
+    };
+    let cache = hf_hub::Cache::new(cache_root.to_path_buf());
+    let cached = cache.repo(repo_at(revision));
+    let get = |repo: &ApiRepo, file: &str| {
+        repo.get(file).map_err(|err| {
+            let what = format!(
+                "fetch {file:?} from Hugging Face repo {model_id:?} at revision {revision:?} \
+                 into {cache_root:?}"
+            );
+            hub_error(what, err)
+        })
+    };
+
+    if files.iter().any(|file| cached.get(file).is_none()) {
+        let info = api.repo(repo_at(revision)).info().map_err(|err| {
+            let what = format!(
+                "look up the commit of revision {revision:?} of Hugging Face repo {model_id:?}"
+            );
+            hub_error(what, err)
+        })?;
+        let commit = info.sha;
+        let record = |target: &hf_hub::CacheRepo| {
+            target.create_ref(&commit).map_err(|err| {
+                let what = format!(
+                    "record the commit of revision {revision:?} of Hugging Face repo \
+                     {model_id:?} in {cache_root:?}"
+                );
+                hub_error(what, err.into())
+            })
+        };
+        // hf-hub finds a cached file through the ref of the revision it is asked
+        // for, and a handle at the commit has none until it downloads something:
+        // without one, a file cached by an interrupted load would be fetched
+        // again.
+        record(&cache.repo(repo_at(&commit)))?;
+        let pinned = api.repo(repo_at(&commit));
+        if info
+            .siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == GENERATION_CONFIG)
+        {
+            get(&pinned, GENERATION_CONFIG)?;
+        }
+        for file in files {
+            get(&pinned, file)?;
+        }
+        record(&cached)?;
+    }
+
+    // `get` returns `<snapshot>/<file>`, and the file has one component per
+    // `/`-separated part.
+    let mut dir = cached.get(&files[0]).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{:?} is not in {cache_root:?} after it was fetched\nhelp: another process may \
+             have moved revision {revision:?} meanwhile; run again",
+            files[0]
+        )
+    })?;
+    for _ in files[0].split('/') {
+        dir.pop();
+    }
+    // A lossy conversion would name a directory that does not exist, which
+    // mistralrs reads as a repo id and downloads into the Hugging Face cache.
+    dir.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("model-cache-root {cache_root:?} is not valid UTF-8"))
+}
+
+/// The error for a failed hub request or cache write: `what` is what failed,
+/// after "failed to", and a `help:` line follows for the failures that have a
+/// usual cause.
+fn hub_error(what: String, err: ApiError) -> anyhow::Error {
+    let text = err.to_string();
+    let mut msg = format!("failed to {what}: {text}");
+    if ["status code 401", "status code 403", "status code 404"]
+        .iter()
+        .any(|status| text.contains(status))
+    {
+        msg += "\nhelp: check model-id, model-file and revision; a private or gated \
+                repo needs a token (set HF_TOKEN or run `huggingface-cli login`)";
+    }
+    if matches!(err, ApiError::IoError(_)) {
+        msg += "\nhelp: model-cache-root must be writable and on a filesystem that \
+                supports symbolic links";
+    }
+    anyhow::anyhow!(msg)
+}
+
+/// The Hugging Face token mistralrs's `TokenSource::CacheToken` used:
+/// `HF_TOKEN`, then `HF_HUB_TOKEN`, then the file `huggingface-cli login`
+/// writes. A blank value counts as unset; no token means an anonymous download.
+fn hf_token() -> Option<String> {
+    let usable = |raw: String| Some(raw.trim().to_string()).filter(|token| !token.is_empty());
+    ["HF_TOKEN", "HF_HUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| usable(std::env::var(name).ok()?))
+        .or_else(|| usable(std::fs::read_to_string(mistralrs_core::hf_token_path()?).ok()?))
 }
 
 fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_core::Device> {
@@ -882,6 +1057,10 @@ mod tests {
     use futures_util::StreamExt;
     use mistralrs_core::{Choice, ChunkChoice, Delta, ResponseMessage, ToolCallType};
     use rig::streaming::StreamedAssistantContent;
+    use std::io::{BufRead, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
 
     fn chat_done(content: Option<&str>, calls: Option<Vec<ToolCallResponse>>) -> Response {
         Response::Done(mistralrs_core::ChatCompletionResponse {
@@ -1489,5 +1668,516 @@ mod tests {
             String::from_utf8_lossy(&stdout),
         );
         assert!(end.is_silent(), "no text and no stop reason: {end:?}");
+    }
+
+    fn files(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// A client for the hub at `endpoint` whose cache is `root`, with no token
+    /// and no progress bar.
+    fn api_at(endpoint: &str, root: &Path) -> Api {
+        ApiBuilder::from_cache(hf_hub::Cache::new(root.to_path_buf()))
+            .with_endpoint(endpoint.to_string())
+            .with_token(None)
+            .with_progress(false)
+            .build()
+            .expect("a client")
+    }
+
+    /// A client for a cache that holds everything asked of it: its endpoint
+    /// refuses connections, so a request fails at once.
+    fn offline_api(root: &Path) -> Api {
+        let refused = TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let endpoint = format!("http://{}", refused.local_addr().expect("a bound address"));
+        drop(refused);
+        api_at(&endpoint, root)
+    }
+
+    /// What the fake hub is doing, which a test can change while it runs.
+    #[cfg(unix)]
+    struct HubState {
+        /// The commit `main` is at: what `info` reports, and what a request for
+        /// a file at `main` is stamped with.
+        main: String,
+        /// The commit `main` moves to once a response has told a client where
+        /// `main` is.
+        then: Option<String>,
+        /// Files a request for which is answered with a 500.
+        broken: Vec<String>,
+    }
+
+    /// The hub on a local port. It serves `files` of `org/repo`, with `main` at
+    /// commit `abc123`: `info` for `main` lists the files and gives the commit,
+    /// and a file asked for at `main` or at a commit is answered stamped with
+    /// that commit. Anything else is a 404. It records the paths it is asked for.
+    /// hf-hub asks for each file twice: for its first byte, the response to which
+    /// carries the commit and the etag, and then for the file. Its client, ureq,
+    /// sends a request to 127.0.0.1 through a proxy variable if one is set, so
+    /// these tests need none.
+    #[cfg(unix)]
+    struct FakeHub {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        state: Arc<Mutex<HubState>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeHub {
+        fn serving(files: &[(&str, &str)]) -> FakeHub {
+            for var in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ] {
+                assert!(
+                    std::env::var_os(var).is_none(),
+                    "{var} is set, and hf-hub would send its requests to the fake hub through it",
+                );
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+            let endpoint = format!("http://{}", listener.local_addr().expect("a bound address"));
+            let served: HashMap<String, (String, String)> = files
+                .iter()
+                .enumerate()
+                .map(|(i, (name, body))| (name.to_string(), (format!("hub-{i}"), body.to_string())))
+                .collect();
+            let listing = files
+                .iter()
+                .map(|(name, _)| format!(r#"{{"rfilename":"{name}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let state = Arc::new(Mutex::new(HubState {
+                main: "abc123".to_string(),
+                then: None,
+                broken: Vec::new(),
+            }));
+            let (log, shared) = (Arc::clone(&requests), Arc::clone(&state));
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut head = std::io::BufReader::new(&stream)
+                        .lines()
+                        .map_while(|line| line.ok())
+                        .take_while(|line| !line.is_empty());
+                    let request_line = head.next().unwrap_or_default();
+                    let path = request_line
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let first_byte_only =
+                        head.any(|line| line.eq_ignore_ascii_case("range: bytes=0-0"));
+                    log.lock().expect("the request log").push(path.clone());
+
+                    let mut hub = shared.lock().expect("the hub state");
+                    let tells_main = path == "/api/models/org/repo/revision/main"
+                        || (first_byte_only && path.starts_with("/org/repo/resolve/main/"));
+                    let not_found = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
+                                     connection: close\r\n\r\n";
+                    let reply = if path == "/api/models/org/repo/revision/main" {
+                        let body = format!(r#"{{"sha":"{}","siblings":[{listing}]}}"#, hub.main);
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    } else if let Some((revision, name)) = path
+                        .strip_prefix("/org/repo/resolve/")
+                        .and_then(|rest| rest.split_once('/'))
+                    {
+                        let commit = if revision == "main" {
+                            hub.main.clone()
+                        } else {
+                            revision.to_string()
+                        };
+                        match served.get(name) {
+                            None => not_found.to_string(),
+                            Some(_) if hub.broken.iter().any(|broken| broken == name) => {
+                                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\
+                                 connection: close\r\n\r\n"
+                                    .to_string()
+                            }
+                            Some((etag, body)) if first_byte_only => format!(
+                                "HTTP/1.1 206 Partial Content\r\nx-repo-commit: {commit}\r\n\
+                                 etag: \"{etag}\"\r\ncontent-range: bytes 0-0/{}\r\n\
+                                 content-length: 1\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                &body[..1],
+                            ),
+                            Some((_, body)) => format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\
+                                 connection: close\r\n\r\n{body}",
+                                body.len(),
+                            ),
+                        }
+                    } else {
+                        not_found.to_string()
+                    };
+                    if tells_main && let Some(next) = hub.then.take() {
+                        hub.main = next;
+                    }
+                    drop(hub);
+                    let _ = (&stream).write_all(reply.as_bytes());
+                }
+            });
+            FakeHub {
+                endpoint,
+                requests,
+                state,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("the request log").clone()
+        }
+
+        /// `main` moves to `commit` once a response has told a client where it is.
+        fn advance_main_after_first_answer(&self, commit: &str) {
+            self.state.lock().expect("the hub state").then = Some(commit.to_string());
+        }
+
+        /// A request for `file` is answered with a 500.
+        fn break_file(&self, file: &str) {
+            self.state
+                .lock()
+                .expect("the hub state")
+                .broken
+                .push(file.to_string());
+        }
+    }
+
+    /// What hf-hub leaves in `root` after downloading `names` from `org/repo` at
+    /// `commit`, on `revision`: the ref -- with no trailing newline, which hf-hub
+    /// does not trim -- and per file a blob, with the snapshot entry a symlink to
+    /// it. An implementation that canonicalizes the path it is given returns the
+    /// blob's, not the snapshot's.
+    #[cfg(unix)]
+    fn seeded_hub_cache(root: &Path, revision: &str, commit: &str, names: &[&str]) {
+        let repo = root.join("models--org--repo");
+        let ref_path = repo.join("refs").join(revision);
+        std::fs::create_dir_all(ref_path.parent().expect("a parent")).expect("refs dir");
+        std::fs::write(ref_path, commit).expect("ref");
+        std::fs::create_dir_all(repo.join("blobs")).expect("blobs dir");
+        for (i, name) in names.iter().enumerate() {
+            let blob = repo.join("blobs").join(format!("etag-{i}"));
+            std::fs::write(&blob, b"GGUF").expect("blob");
+            let entry = repo.join("snapshots").join(commit).join(name);
+            std::fs::create_dir_all(entry.parent().expect("a parent")).expect("snapshot dir");
+            std::os::unix::fs::symlink(&blob, &entry).expect("snapshot entry");
+        }
+    }
+
+    /// #423: a `model-id` download went to Hugging Face's cache whatever
+    /// `model-cache-root` said. The loader is now handed the snapshot directory
+    /// under `cache_root`, which hf-hub finds here with no network: it answers
+    /// from a cache that already holds the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_model_id_resolves_to_a_snapshot_under_the_cache_root() {
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "abc123", &["m.gguf"]);
+
+        let api = offline_api(root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("a cached file resolves");
+
+        let snapshot = root.path().join("models--org--repo/snapshots/abc123");
+        assert_eq!(Path::new(&dir), snapshot);
+        assert!(
+            snapshot.join("m.gguf").is_file(),
+            "the loader opens it from here by name",
+        );
+    }
+
+    /// The directory is the snapshot's, not that of the subdirectory a
+    /// quantization kept in a directory of its own is in: the loader joins each
+    /// `model-file` entry, subdirectory and all, onto the directory it is given.
+    #[cfg(unix)]
+    #[test]
+    fn a_model_file_in_a_subdirectory_resolves_to_the_snapshot_not_the_subdirectory() {
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "abc123", &["Q4_K_M/m.gguf"]);
+
+        let api = offline_api(root.path());
+
+        let dir = fetch_snapshot(
+            &api,
+            "org/repo",
+            &files(&["Q4_K_M/m.gguf"]),
+            None,
+            root.path(),
+        )
+        .expect("a cached file resolves");
+
+        assert_eq!(
+            Path::new(&dir),
+            root.path().join("models--org--repo/snapshots/abc123"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_shards_of_a_split_model_share_one_snapshot_directory() {
+        let root = TempDir::new().expect("tempdir");
+        let shards = ["Q4/m-00001-of-00002.gguf", "Q4/m-00002-of-00002.gguf"];
+        seeded_hub_cache(root.path(), "main", "abc123", &shards);
+
+        let api = offline_api(root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&shards), None, root.path())
+            .expect("cached shards resolve");
+
+        assert_eq!(
+            Path::new(&dir),
+            root.path().join("models--org--repo/snapshots/abc123"),
+        );
+    }
+
+    /// A pinned revision is looked up under its own ref, and one with a `/` in
+    /// it (a pull request's) only nests that ref: the snapshot directory is the
+    /// commit's either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_revision_resolves_through_its_own_ref() {
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "abc123", &["m.gguf"]);
+        seeded_hub_cache(root.path(), "refs/pr/1", "def456", &["m.gguf"]);
+
+        let api = offline_api(root.path());
+
+        let dir = fetch_snapshot(
+            &api,
+            "org/repo",
+            &files(&["m.gguf"]),
+            Some("refs/pr/1"),
+            root.path(),
+        )
+        .expect("a cached file resolves");
+
+        assert_eq!(
+            Path::new(&dir),
+            root.path().join("models--org--repo/snapshots/def456"),
+        );
+    }
+
+    /// hf-hub writes a file wherever its name points, so a name that does not
+    /// stay inside the snapshot is refused before anything is looked up, or
+    /// created.
+    #[test]
+    fn a_model_file_that_is_not_a_plain_relative_path_is_refused_first() {
+        for bad in [
+            "./m.gguf",
+            "../m.gguf",
+            "/m.gguf",
+            "a/../m.gguf",
+            "a//m.gguf",
+            "a/",
+            "",
+        ] {
+            let root = TempDir::new().expect("tempdir");
+            let api = offline_api(root.path());
+
+            let err =
+                fetch_snapshot(&api, "org/repo", &files(&[bad]), None, root.path()).expect_err(bad);
+
+            assert!(err.to_string().contains("relative path"), "{bad:?}: {err}");
+            assert_eq!(
+                std::fs::read_dir(root.path()).expect("readable").count(),
+                0,
+                "{bad:?}: nothing is created",
+            );
+        }
+    }
+
+    /// mistralrs reads a repo's `generation_config.json` from beside the weights
+    /// for the stop tokens a GGUF's metadata does not name, such as Llama 3's
+    /// `<|eom_id|>`, and it is handed the snapshot directory to look in. A
+    /// download brings the file into the snapshot the weights are in.
+    #[cfg(unix)]
+    #[test]
+    fn a_download_brings_generation_config_into_the_snapshot_beside_the_weights() {
+        let config = r#"{"eos_token_id": [128001, 128008, 128009]}"#;
+        let hub = FakeHub::serving(&[("m.gguf", "GGUF"), ("generation_config.json", config)]);
+        let root = TempDir::new().expect("tempdir");
+        let api = api_at(&hub.endpoint, root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("a download");
+
+        let snapshot = root.path().join("models--org--repo/snapshots/abc123");
+        assert_eq!(Path::new(&dir), snapshot);
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("m.gguf")).expect("the weights"),
+            "GGUF",
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshot.join("generation_config.json")).expect("the config"),
+            config,
+        );
+    }
+
+    /// Most GGUF repos have no `generation_config.json`. The hub's listing of the
+    /// repo says so, so it is not asked for, and that is not a failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_without_generation_config_loads_without_it() {
+        let hub = FakeHub::serving(&[("m.gguf", "GGUF")]);
+        let root = TempDir::new().expect("tempdir");
+        let api = api_at(&hub.endpoint, root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("a repo without one is not an error");
+
+        let snapshot = Path::new(&dir);
+        assert!(snapshot.join("m.gguf").is_file());
+        assert!(!snapshot.join("generation_config.json").exists());
+        assert!(
+            !hub.requests()
+                .iter()
+                .any(|path| path.ends_with("/generation_config.json")),
+            "the listing says it is absent, so it is not asked for: {:?}",
+            hub.requests(),
+        );
+    }
+
+    /// A model whose named files are all cached loads with no network, so the
+    /// hub is not asked for `generation_config.json` either, though this one
+    /// serves it: the cache loads as it is, as one that a Hugging Face tool
+    /// filled with the weights alone does.
+    #[cfg(unix)]
+    #[test]
+    fn a_cached_model_makes_no_request_to_the_hub() {
+        let hub = FakeHub::serving(&[("generation_config.json", "{}")]);
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "abc123", &["m.gguf"]);
+        let api = api_at(&hub.endpoint, root.path());
+
+        fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("a cached file resolves");
+
+        assert_eq!(hub.requests(), Vec::<String>::new());
+    }
+
+    /// A branch that advances while a load is under way must not split it. The
+    /// config at one commit and the weights at the next fail the load, and the
+    /// retry, finding every weight cached, would load the model without the
+    /// config for good. Everything comes from the commit `main` was at when the
+    /// load began, and `main` is left pointing at it, so the next load is cached.
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_that_advances_mid_load_does_not_split_the_snapshot() {
+        let hub = FakeHub::serving(&[("m.gguf", "GGUF"), ("generation_config.json", "{}")]);
+        hub.advance_main_after_first_answer("def456");
+        let root = TempDir::new().expect("tempdir");
+        let api = api_at(&hub.endpoint, root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("one commit throughout");
+
+        let snapshot = root.path().join("models--org--repo/snapshots/abc123");
+        assert_eq!(Path::new(&dir), snapshot);
+        assert!(snapshot.join("m.gguf").is_file());
+        assert!(snapshot.join("generation_config.json").is_file());
+
+        let asked = hub.requests().len();
+        fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("cached by now");
+        assert_eq!(
+            hub.requests().len(),
+            asked,
+            "the next load makes no request"
+        );
+    }
+
+    /// A `generation_config.json` cached at an older commit than the one the hub
+    /// serves now, for another `model-file` of the repo, must not be taken for
+    /// the one that belongs with the weights fetched next: they would be in
+    /// different snapshots, and the load would fail, and the next one would find
+    /// the weights cached and never fetch it.
+    #[cfg(unix)]
+    #[test]
+    fn a_generation_config_cached_at_an_older_commit_is_fetched_again() {
+        let hub = FakeHub::serving(&[("m.gguf", "GGUF"), ("generation_config.json", "{}")]);
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "old000", &["generation_config.json"]);
+        let api = api_at(&hub.endpoint, root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect("both come from the commit the hub serves");
+
+        let snapshot = root.path().join("models--org--repo/snapshots/abc123");
+        assert_eq!(Path::new(&dir), snapshot);
+        assert!(snapshot.join("m.gguf").is_file());
+        assert!(snapshot.join("generation_config.json").is_file());
+    }
+
+    /// A hub that cannot answer fails the load at the first question, which
+    /// commit `revision` is at, before anything is downloaded.
+    #[test]
+    fn a_hub_that_cannot_answer_fails_the_load_before_anything_is_fetched() {
+        let root = TempDir::new().expect("tempdir");
+        let api = offline_api(root.path());
+
+        let err = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect_err("no hub to ask");
+
+        let text = err.to_string();
+        assert!(text.contains("look up the commit"), "asked first: {text}");
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            0,
+            "nothing is cached",
+        );
+    }
+
+    /// `generation_config.json` is fetched before the weights, so that a hub that
+    /// fails it fails the load first: once the weights are cached the next load
+    /// counts as cached, and would never fetch it.
+    #[test]
+    fn a_config_that_cannot_be_fetched_fails_the_load_before_the_weights_are_fetched() {
+        let hub = FakeHub::serving(&[("m.gguf", "GGUF"), ("generation_config.json", "{}")]);
+        hub.break_file("generation_config.json");
+        let root = TempDir::new().expect("tempdir");
+        let api = api_at(&hub.endpoint, root.path());
+
+        let err = fetch_snapshot(&api, "org/repo", &files(&["m.gguf"]), None, root.path())
+            .expect_err("the config cannot be fetched");
+
+        let text = err.to_string();
+        assert!(text.contains("generation_config.json"), "{text}");
+        assert!(
+            !hub.requests().iter().any(|path| path.ends_with("/m.gguf")),
+            "the weights were not asked for: {:?}",
+            hub.requests(),
+        );
+    }
+
+    /// A download that was interrupted resumes: a shard already cached at the
+    /// commit is not fetched again, though the commit's own ref is not there.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_download_is_resumed_not_repeated() {
+        let shards = ["m-00001.gguf", "m-00002.gguf"];
+        let hub = FakeHub::serving(&[(shards[0], "GGUF"), (shards[1], "GGUF")]);
+        let root = TempDir::new().expect("tempdir");
+        seeded_hub_cache(root.path(), "main", "abc123", &shards[..1]);
+        let api = api_at(&hub.endpoint, root.path());
+
+        let dir = fetch_snapshot(&api, "org/repo", &files(&shards), None, root.path())
+            .expect("the second shard is fetched");
+
+        let snapshot = root.path().join("models--org--repo/snapshots/abc123");
+        assert_eq!(Path::new(&dir), snapshot);
+        assert!(snapshot.join(shards[1]).is_file());
+        assert!(
+            !hub.requests().iter().any(|path| path.ends_with(shards[0])),
+            "the shard already cached is not fetched again: {:?}",
+            hub.requests(),
+        );
     }
 }
