@@ -354,7 +354,9 @@ too large for what is left is passed over and smaller ones still go. The turn a 
 the model's latest code and its results -- is never left out. When that alone does not fit, the
 call is not made: the round ends with `(round ended: turn N of round R ... is about X tokens, and
 a call to M has room for about Y ...)`, and keeps the turn. The next round leaves it out like any
-other, so the session goes on.
+other, so the session goes on. For an alias of several models, each is held to its own window, the
+first one's included: a turn too large for the first model goes to the next one whose window holds
+it, and the round ends this way only when none does, naming each model and the room it had.
 
 **What a shortened conversation looks like to a provider.** Every call keeps each tool call
 beside its result, which every provider requires. What a cut can do is put two of the user's
@@ -367,24 +369,25 @@ endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-ba
 behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
 call carried one, the error says where, and what to set: `role-alternation = "strict"` on the
 provider's row (see [`role-alternation`](config.md#style--openai)). For an alias of several
-models, that holds when the first one refused it. With that set, each call is
-sent a conversation that alternates by construction, at the cost of the turns that would not. A
-turn brought back without the rest of its round is left out where it would follow the model's
-own reply, so promote whole rounds on such a provider. A round that ended on results -- the
-tool-call cap, a turn too large to send, Ctrl-C -- is left out whole once the next round opens,
-since each of its turns ends on results. What is left out stays in `runtime.history`, the line
-that opens the round counts it, and the call's manifest names it. One shape is still refused: a
-call whose own round's opening did not fit, so that the turn it answers opens on the model's
-reply with nothing before it that ends on the user's side; only a larger window mends that.
+models, that holds for the first model that refused such a call, and names its provider's row.
+With that set, each call is sent a conversation that alternates by construction, at the cost of
+the turns that would not. A turn brought back without the rest of its round is left out where it
+would follow the model's own reply, so promote whole rounds on such a provider. A round that
+ended on results -- the tool-call cap, a turn too large to send, Ctrl-C -- is left out whole once
+the next round opens, since each of its turns ends on results. What is left out stays in
+`runtime.history`, the line that opens the round counts it, and the call's manifest names it. One
+shape is still refused: a call whose own round's opening did not fit, so that the turn it answers
+opens on the model's reply with nothing before it that ends on the user's side; only a larger
+window mends that.
 
 **A failing provider is retried, then left for the next model.** A call that fails in a way that
 may clear -- a rate limit, a 5xx, a dropped connection, a response OutRig cannot use -- is made
 again within `retry-budget-secs`, as in `run`, and stderr says so. When the model is an alias of
 several, a call that still fails moves to the next, as in `run`, and each call starts again at
-the first. The call that moves is sent a conversation chosen for the window of the model it moves
-to, which may leave out more than the first model's did. When every model has failed, the round
-ends with each one's reason and keeps any Python it ran. Unlike `run`, no failure ends the
-session; `/quit` does. The error says whether another message could help. If any model failed in
+the first. Each model a call goes to is sent a conversation chosen for its own window, which may
+leave out more than another's did. When every model has failed, the round ends with each one's
+reason and keeps any Python it ran. Unlike `run`, no failure ends the session; `/quit` does.
+The error says whether another message could help. If any model failed in
 a way that may clear -- a rate limit that outlasted the budget, an unreachable host, a response
 that could not be decoded, an error a gateway sent with a success status, a turn too large for a
 later model's window, which the next call leaves out -- it says to send another. If none did,

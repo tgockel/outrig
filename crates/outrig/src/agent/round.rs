@@ -11,10 +11,10 @@
 //! handed nothing from before the round, so everything it holds, and hands
 //! back on success or in an error, is the round's own messages. The round's
 //! turns are committed as they complete, so a round that fails or is dropped
-//! has already kept every turn it finished; and on every model call the hook
+//! has already kept every turn it finished; and on every model call the chain
 //! replaces what rig would send with the view the store assembles from them,
-//! held to the model's [`Budget`]. Nothing rig returns is compared against the
-//! store.
+//! held to the budget of the model the call goes to. Nothing rig returns is
+//! compared against the store.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,8 +30,8 @@ use super::AgentError;
 use super::budget::Budget;
 use super::build::RigAgent;
 use super::failover::{self, FailoverModel};
-use super::history::{self, Adjacent, History};
-use super::ledger::CallSlot;
+use super::history::{self, History};
+use super::ledger::{CallSlot, Refusal};
 use super::tool::{self, Interrupts};
 use crate::config::RoleAlternation;
 use crate::harness::event::{AttemptId, CallUsage, Payload, Usage};
@@ -62,11 +62,10 @@ pub(crate) struct Finished {
 /// before it returns -- Ctrl-C at the REPL while no Python runs -- keeps them
 /// the same way, as it is dropped.
 ///
-/// Each model call is sent what `history` assembles for it within `budget`,
-/// the head's allowance. A call whose latest turn would not fit on its own is
-/// not made: the round ends there, keeping its turns, and says which turn it
-/// was. A call the chain moves to another model is assembled again for that
-/// model's allowance.
+/// Each model call is sent what the chain assembles from `history` within the
+/// allowance of the model it goes to. A call whose latest turn fits no model's
+/// on its own is not made: the round ends there, keeping its turns, and says
+/// which turn it was.
 ///
 /// An interrupt relayed through `interrupts` while a call waits on Python
 /// stops that execution, and the round goes on: the model reads how it ended.
@@ -75,19 +74,12 @@ pub(crate) async fn round(
     agent: &RigAgent,
     opening: Message,
     history: &History,
-    budget: &Arc<Budget>,
     tool_call_max: usize,
     interrupts: &Interrupts,
 ) -> Result<Finished, AgentError> {
     let slot = agent.model.slot().clone();
     slot.open_round();
-    let hook = RoundHook::new(
-        tool_call_max,
-        interrupts.clone(),
-        history.clone(),
-        Arc::clone(budget),
-        slot,
-    );
+    let hook = RoundHook::new(tool_call_max, interrupts.clone(), history.clone(), slot);
     // rig's own budget is a backstop set above the hook's, so the hook -- with
     // its message the model can read -- is the limiter that fires first. As of
     // rig 0.40 it counts every model call, the first included.
@@ -100,7 +92,7 @@ pub(crate) async fn round(
     };
     let result = agent
         .prompt(opening)
-        // Nothing from before the round: the hook sends that, on every call.
+        // Nothing from before the round: the chain sends that, on every call.
         .history(Vec::<Message>::new())
         .max_turns(max_turns)
         .add_hook(hook)
@@ -194,10 +186,13 @@ impl Drop for KeptIfDropped {
 /// `hook` is the round's own hook, consulted to tell OutRig's deliberate stops
 /// from a cancellation rig raised for itself. Both arrive as
 /// `PromptError::PromptCancelled`, and only a stop the hook recorded is one
-/// OutRig chose; anything else is a fault and stays an error. A provider's
-/// refusal of a request whose view put one role after itself says so, since
-/// that is the one shape of request this loop sends that a strict provider can
-/// refuse.
+/// OutRig chose; anything else is a fault and stays an error. The exception is
+/// a call the chain did not make because no model's window could hold its
+/// latest turn ([`failover::unfit`]), which ends the round as the cap does,
+/// keeping the turn: the hook committed every turn the call answers before the
+/// chain was asked. A provider's refusal of a request whose view put one role
+/// after itself says so, since that is the one shape of request this loop sends
+/// that a strict provider can refuse.
 ///
 /// An error after the round has run Python keeps what it ran. Most errors
 /// carry no history -- a failed model call is `CompletionError`, which has
@@ -217,14 +212,20 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
             _,
         ) => (cap_reason(max_turns), *chat_history),
         (other, _) => {
-            let text = format!("{other}{}", hook.refusal_hint(&other));
-            let ran = hook.keep_what_ran();
-            return Err(match (ran, may_clear(&other)) {
-                (false, true) => AgentError::Prompt(text),
-                (true, true) => AgentError::PromptAfterWork(text),
-                (false, false) => AgentError::PromptTerminal(text),
-                (true, false) => AgentError::PromptAfterWorkTerminal(text),
-            });
+            let Some(reason) = unfit(&other) else {
+                let text = format!("{other}{}", hook.refusal_hint(&other));
+                let ran = hook.keep_what_ran();
+                return Err(match (ran, may_clear(&other)) {
+                    (false, true) => AgentError::Prompt(text),
+                    (true, true) => AgentError::PromptAfterWork(text),
+                    (false, false) => AgentError::PromptTerminal(text),
+                    (true, false) => AgentError::PromptAfterWorkTerminal(text),
+                });
+            };
+            // Nothing is left to flush: every turn the call answers is in the
+            // store, and the round's opening, if no turn has begun with it,
+            // becomes a turn of its own as the round finishes.
+            (reason, Vec::new())
         }
     };
     hook.flush(&chat_history);
@@ -233,6 +234,15 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
         stopped: Some(reason),
         reasoning: None,
     })
+}
+
+/// Why the chain did not make the call that failed with `err`, when it was
+/// because no model's window could hold the call's latest turn.
+fn unfit(err: &PromptError) -> Option<String> {
+    match err {
+        PromptError::CompletionError(failed) => failover::unfit(failed),
+        _ => None,
+    }
 }
 
 /// Whether sending again after `err` could end differently.
@@ -269,9 +279,9 @@ const CALL_STOPPED_TURN: &str = "[outrig] not run: the user interrupted an earli
 
 /// Per-round hook: counts tool calls against the cap, stops the loop once it is
 /// spent, hands the tool's output to the model as the text it is, commits the
-/// round's turns as they complete, sends each model call the view the store
-/// assembles within the budget, and journals what the round has done that is
-/// not a turn yet.
+/// round's turns as they complete -- so the chain finds in the store everything
+/// each model call answers -- and journals what the round has done that is not
+/// a turn yet.
 ///
 /// Cloned by rig per request; the shared state keeps one round's calls
 /// counting against the same cap.
@@ -287,8 +297,6 @@ struct RoundHook {
     interrupts: Interrupts,
     /// Where the round's turns are committed.
     history: History,
-    /// What each model call may carry.
-    budget: Arc<Budget>,
     /// The round's number in the conversation.
     round: u32,
     /// Where the round's calls are named and its attempts recorded.
@@ -308,8 +316,6 @@ struct Journal {
     ran: bool,
     /// The latest model call. Taken when what it ran is kept.
     latest: Latest,
-    /// Where the latest model call's view first put one role after itself.
-    adjacent: Option<Adjacent>,
     /// Each of the round's model calls rig accepted: its place, the model that
     /// answered it, and what it used, as the provider reported it.
     calls: Vec<CallUsage>,
@@ -344,13 +350,7 @@ impl Journal {
 }
 
 impl RoundHook {
-    fn new(
-        max: usize,
-        interrupts: Interrupts,
-        history: History,
-        budget: Arc<Budget>,
-        slot: CallSlot,
-    ) -> Self {
+    fn new(max: usize, interrupts: Interrupts, history: History, slot: CallSlot) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::default(),
@@ -359,13 +359,11 @@ impl RoundHook {
                 committed: 1,
                 ran: false,
                 latest: Latest::default(),
-                adjacent: None,
                 calls: Vec::new(),
             })),
             interrupts,
             round: history.round(),
             history,
-            budget,
             slot,
         }
     }
@@ -482,8 +480,7 @@ impl RoundHook {
         Flow::terminate(reason)
     }
 
-    /// Why this hook stopped the loop, if it did: the tool-call cap, or a
-    /// latest turn too large for the budget.
+    /// Why this hook stopped the loop, if it did: the tool-call cap.
     fn stop_reason(&self) -> Option<String> {
         self.stopped
             .lock()
@@ -491,8 +488,8 @@ impl RoundHook {
             .clone()
     }
 
-    /// What to add to `err`, when a provider refused the latest call and that
-    /// call's view put one role after itself in the conversation. For a
+    /// What to add to `err`, when a provider refused the latest call and the
+    /// view it was sent put one role after itself in the conversation. For a
     /// provider whose row does not say its turns must alternate, the pair may
     /// be why, and the row's `role-alternation` is the remedy. For one whose
     /// row does, the view withheld what it could, and the pair that stands is
@@ -500,23 +497,24 @@ impl RoundHook {
     /// it that ends on the user's side: its round's opening did not fit, and
     /// only a larger window mends that. Either says what the conversation held
     /// rather than what the wire carried, which differs by provider
-    /// ([`Adjacent`]).
+    /// ([`history::Adjacent`]).
+    ///
+    /// It names the row of the first model that refused such a view, which for
+    /// an alias is the head's unless the head failed some other way: the chain
+    /// assembled each model's view for it, and keeps that one's.
     fn refusal_hint(&self, err: &PromptError) -> String {
-        // The head's refusal: this hint names the head's row and speaks of the
-        // view assembled for it. A chain's exhaustion carries no status of
-        // its own, so it is read off the head's reason.
-        let refused = match err {
-            PromptError::CompletionError(failed) => failover::head_status(failed),
-            _ => None,
-        }
-        .is_some_and(|status| matches!(status.as_u16(), 400 | 422));
-        let Some(adjacent) = self.journal().adjacent.filter(|_| refused) else {
+        // Only a failed call has a refusal to speak of; the slot holds the
+        // latest call's, which an error from anywhere else is not about.
+        let PromptError::CompletionError(_) = err else {
+            return String::new();
+        };
+        let Some(Refusal { budget, adjacent }) = self.slot.refusal() else {
             return String::new();
         };
         let Budget {
             model, provider, ..
-        } = &*self.budget;
-        match self.budget.alternation {
+        } = &budget;
+        match budget.alternation {
             RoleAlternation::Relaxed => format!(
                 ". The conversation it was sent left turns out, which put {adjacent}; a provider \
                  or gateway that requires the user's and the model's turns to alternate may \
@@ -560,27 +558,18 @@ impl AgentHook<FailoverModel> for RoundHook {
                 ..
             } => {
                 self.interrupts.clear_turn();
-                let call = self.slot.reserve_call();
                 // What rig holds is whole turns by now, since a call is made
                 // only once the last one's tool calls have returned. Once they
-                // are committed, the store holds everything this call answers.
+                // are committed, the store holds everything this call answers,
+                // and the chain assembles each model's view from it. rig is
+                // told to send none of the round's history, which the chain
+                // replaces: left alone, it copies the whole round into the
+                // request, and the chain copies that again for every
+                // candidate it may move to.
                 let mut journal = self.journal();
                 journal.commit(round.iter().chain([prompt]), &self.history);
                 journal.latest = Latest::default();
-                match self.history.assemble(&self.budget, call) {
-                    Ok((mut sent, manifest)) => {
-                        // rig sends the prompt itself, after the history.
-                        let last = sent.pop();
-                        debug_assert_eq!(
-                            last.as_ref(),
-                            Some(prompt),
-                            "the view ends on rig's prompt"
-                        );
-                        journal.adjacent = manifest.adjacent.first().copied();
-                        Flow::patch_request(RequestPatch::new().history(sent))
-                    }
-                    Err(too_large) => self.stop(too_large.to_string()),
-                }
+                Flow::patch_request(RequestPatch::new().history(Vec::<Message>::new()))
             }
             // A call rig accepted. rig fires this and `ModelTurnFinished`
             // back to back, under the same rules, and only this one carries

@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use bytes::Bytes;
 use rig::completion::{CompletionError, CompletionResponse};
 
+use super::budget::Budget;
+use super::history::Adjacent;
 use crate::events::Events;
 use crate::harness::event::{AttemptId, CallId, ModelAttempt, Payload, Usage, UsageRefusal};
 
@@ -293,8 +295,6 @@ pub(crate) struct CallSlot {
 
 #[derive(Default)]
 struct SlotState {
-    /// The id the round's hook named the next call by, for the chain to take.
-    reserved: Option<CallId>,
     call: Option<InFlight>,
     /// The attempts the round in progress has made, failed ones included: its
     /// members, which its total is the sum over.
@@ -308,6 +308,21 @@ struct InFlight {
     answered: Option<AnsweredAttempt>,
     /// The latest attempt the current candidate was sent.
     last: Option<AttemptId>,
+    /// The first request a candidate refused, of those whose conversation put
+    /// one role after itself.
+    refusal: Option<Refusal>,
+}
+
+/// A candidate's refusal of a request whose conversation put one role after
+/// itself: what the round has to explain it, which only the chain, having
+/// assembled that view, holds.
+#[derive(Clone)]
+pub(crate) struct Refusal {
+    /// What a call to the candidate was held to, whose `model` and `provider`
+    /// name the rows that refused.
+    pub(crate) budget: Budget,
+    /// Where the conversation it was sent put one role after itself.
+    pub(crate) adjacent: Adjacent,
 }
 
 /// A `2xx` the model layer has yet to settle.
@@ -364,27 +379,15 @@ impl CallSlot {
         Some((call.call, call.last?))
     }
 
-    /// Name the next call now, before the chain is asked to make it, so what
-    /// is recorded before the call -- its manifest -- names it too.
-    pub(crate) fn reserve_call(&self) -> CallId {
-        let call = self.ledger.mint_call();
-        self.state().reserved = Some(call);
-        call
-    }
-
-    /// A call begins: the reserved id, or a fresh one for a call the round's
-    /// hook never saw.
+    /// A call begins, and is named.
     pub(crate) fn begin_call(&self) -> CallId {
-        let mut state = self.state();
-        let call = state
-            .reserved
-            .take()
-            .unwrap_or_else(|| self.ledger.mint_call());
-        state.call = Some(InFlight {
+        let call = self.ledger.mint_call();
+        self.state().call = Some(InFlight {
             call,
             settings: Arc::default(),
             answered: None,
             last: None,
+            refusal: None,
         });
         call
     }
@@ -405,6 +408,23 @@ impl CallSlot {
     /// The latest request the current candidate was sent, if any was.
     pub(crate) fn last_attempt(&self) -> Option<AttemptId> {
         self.state().call.as_ref().and_then(|call| call.last)
+    }
+
+    /// The current candidate refused a request whose conversation put one role
+    /// after itself, at `adjacent`. Only the call's first such refusal is
+    /// kept, which is the one the round speaks of.
+    pub(crate) fn refused(&self, budget: &Budget, adjacent: Adjacent) {
+        if let Some(call) = &mut self.state().call {
+            call.refusal.get_or_insert_with(|| Refusal {
+                budget: budget.clone(),
+                adjacent,
+            });
+        }
+    }
+
+    /// The latest call's first refusal of that kind, if it met one.
+    pub(crate) fn refusal(&self) -> Option<Refusal> {
+        self.state().call.as_ref()?.refusal.clone()
     }
 
     /// A request is about to be sent: its attempt, which records itself when

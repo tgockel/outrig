@@ -117,7 +117,7 @@ category says what it may hold.
 - `model.call` -- a model call, as it is made: its manifest.
   - `call`: the session's manifests counted from 0.
   - `call_id`: the model call it was assembled for, from 1, which names the call in every model
-    event: a call moved to another model is assembled again under the same `call_id`.
+    event: a call that goes to more than one model is assembled for each under the same `call_id`.
   - `round`: its round.
   - `budget`: what it was held to: `model`; in tokens, `window`, `window_assumed`, `reserve`,
     `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`; and
@@ -146,10 +146,12 @@ order, less each part its `left_out` names and any message all of whose parts it
 rather than proof of what was sent; the call's `carried` is the answer. The turns themselves keep
 everything each model wrote.
 
-A call that moves to another of an alias's models is assembled again for that model's window, and
-recorded as a `model.call` of its own, right after the `model.failover` that moved it. Its
-`budget` names the model it went to. A retry resends the same call, and records no new
-`model.call`.
+A call is assembled for the window of each of an alias's models it goes to, the first one's
+included, and recorded as a `model.call` of its own, whose `budget` names that model. One that
+moves is recorded again right after the `model.failover` that moved it. A model whose window
+cannot hold the call's latest turn is passed over, with the reason in the `model.failover` that
+moves the call on, and no `model.call` is recorded for it, since nothing was sent. A retry resends
+the same call, and records no new `model.call`.
 
 ## Execution diagnostics
 

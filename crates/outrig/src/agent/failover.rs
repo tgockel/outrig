@@ -37,10 +37,12 @@
 //!   `retry-budget-secs` against a total outage is a worst case worse than no
 //!   failover at all, so the chain arms one [`ChainDeadline`] per call and
 //!   every candidate's retry loop below it observes the same bound.
-//! * **Each candidate has its own window.** The round's hook assembles a call's
-//!   view for the head of the list. A move to another candidate assembles it
-//!   again, from the store, against that candidate's [`Budget`] -- a smaller
-//!   model is a smaller window, and what fit the head may not fit it.
+//! * **Each candidate has its own window.** The chain is the only place a
+//!   call's view is assembled. It asks the store for one against each
+//!   candidate's [`Budget`], the head's included -- a smaller model is a
+//!   smaller window, and what fit one may not fit another. A candidate whose
+//!   window cannot hold the call's latest turn is passed over for the next,
+//!   and only when none can does the call end ([`unfit`]).
 //! * **Each candidate reads what the others wrote.** One model's reply joins
 //!   the conversation every model is sent, so each candidate's view is
 //!   assembled for its provider's protocol as well as its window: reasoning
@@ -73,7 +75,7 @@ use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 
 use super::budget::Budget;
-use super::history::{History, TooLarge};
+use super::history::{Adjacent, History, TooLarge};
 use super::ledger::CallSlot;
 use super::retry::RetryPolicy;
 use crate::harness::event::{CallId, Payload};
@@ -105,6 +107,11 @@ pub(crate) trait Candidate: Send + Sync {
     /// head's. Without the rewrite the identifier would move on a failover and
     /// the ceiling would not.
     fn budget(&self) -> &Budget;
+
+    /// [`Self::budget`], to change, for a test that holds a chain it built to
+    /// a window it could not know to configure.
+    #[cfg(test)]
+    fn budget_mut(&mut self) -> &mut Budget;
 
     /// The concrete `[models.<name>]` row, for the per-candidate report and the
     /// move announcement. Never the alias's name.
@@ -157,6 +164,11 @@ where
         &self.budget
     }
 
+    #[cfg(test)]
+    fn budget_mut(&mut self) -> &mut Budget {
+        &mut self.budget
+    }
+
     fn composes_native_output_with_tools(&self) -> bool {
         self.model.composes_native_output_with_tools()
     }
@@ -181,22 +193,32 @@ where
     }
 }
 
-/// How a chain rebuilds a call's conversation for the candidate it moves to.
+/// How a chain assembles a call's conversation for each candidate it sends the
+/// call to.
 ///
 /// [`History`] is the one there is. The trait is what lets the chain's own
 /// tests stand in for the store.
 pub(crate) trait View: Send + Sync {
     /// The messages call `call` to a candidate held to `budget` is sent,
-    /// oldest first, ending with the call's prompt -- or why its prompt does
-    /// not fit.
-    fn view(&self, budget: &Budget, call: CallId) -> Result<Vec<Message>, TooLarge>;
+    /// oldest first, ending with the call's prompt, and the first place they
+    /// put one role after itself, if any -- or why the prompt does not fit.
+    fn view(
+        &self,
+        budget: &Budget,
+        call: CallId,
+    ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge>;
 }
 
-/// Assembled as the round's hook assembles the head's view, and recorded the
-/// same way: a `model.call` manifest naming the candidate's budget.
+/// Recorded as a `model.call` manifest naming the candidate's budget, one for
+/// each candidate the call's view is assembled for.
 impl View for History {
-    fn view(&self, budget: &Budget, call: CallId) -> Result<Vec<Message>, TooLarge> {
-        self.assemble(budget, call).map(|(sent, _)| sent)
+    fn view(
+        &self,
+        budget: &Budget,
+        call: CallId,
+    ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge> {
+        self.assemble(budget, call)
+            .map(|(sent, manifest)| (sent, manifest.adjacent.first().copied()))
     }
 }
 
@@ -226,9 +248,11 @@ struct Abandoned {
 /// The move rule is **any `Err`**, including ones that are terminal for that
 /// candidate. A `401` is not retryable -- but in a chain it is a reason to try
 /// the next candidate, whose key may be fine. So is a call whose latest turn
-/// does not fit the next candidate's window: that candidate is passed over for
-/// the call, with the reason. What must not happen is a failure disappearing,
-/// so every reason is kept and reported together on exhaustion.
+/// does not fit a candidate's window: that candidate is passed over for the
+/// call, with the reason. What must not happen is a failure disappearing, so
+/// every reason is kept and reported together on exhaustion -- unless every
+/// one is a window too small, which is no failure of any model's but the call
+/// not being made ([`unfit`]).
 ///
 /// Every agent's model is one of these. A chain of one returns its candidate's
 /// error as it stands, and arms a deadline whose bound reproduces what the
@@ -250,13 +274,13 @@ pub(crate) struct FailoverModel {
     /// Where the chain's calls and attempts are named, and each move
     /// recorded.
     slot: CallSlot,
-    /// Where a moved call's view comes from.
+    /// Where each call's view comes from.
     view: Arc<dyn View>,
 }
 
 impl FailoverModel {
     /// Build a chain over `candidates`, in preference order, naming its calls
-    /// and recording each move through `slot`, and taking a moved call's view
+    /// and recording each move through `slot`, and taking each call's view
     /// from `view`.
     ///
     /// `policy` is the one whose [`chain_deadline`] every candidate below
@@ -297,6 +321,14 @@ impl FailoverModel {
     /// head's first.
     pub(crate) fn budgets(&self) -> impl Iterator<Item = &Budget> {
         self.candidates.iter().map(|candidate| candidate.budget())
+    }
+
+    /// Hold calls to the head to a `window` of tokens in place of the one it
+    /// was built with. Only while no call is in flight.
+    #[cfg(test)]
+    pub(crate) fn narrow_head(&mut self, window: u32) {
+        let candidates = Arc::get_mut(&mut self.candidates).expect("no call is in flight");
+        candidates[0].budget_mut().window = window;
     }
 
     /// Say that `from` was abandoned for `error` and the call moves to `to`.
@@ -350,6 +382,20 @@ impl Exhausted {
     /// Whether at least one candidate failed for a reason a later round could get past.
     fn may_clear(&self) -> bool {
         self.abandoned.iter().any(|a| candidate_may_clear(&a.error))
+    }
+
+    /// The reason the call was not made, when every candidate was passed over
+    /// for the size of its latest turn: see [`unfit`].
+    fn unfit(&self) -> Option<String> {
+        let rows = self
+            .abandoned
+            .iter()
+            .map(|a| Some((a.model_name.as_str(), too_large(&a.error)?.to_string())))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!(
+            "no model candidate has room for the call; tried:\n{}",
+            super::resolve::render_candidate_reasons(&rows)
+        ))
     }
 }
 
@@ -423,18 +469,35 @@ fn candidate_may_clear(err: &CompletionError) -> bool {
     }
 }
 
-/// The HTTP status of the refusal that ended the call at the head of the chain,
-/// when it carried one.
+/// Why a call was not made, when it was not because no candidate's window could
+/// hold its latest turn: the reason the round ends there, keeping the turn,
+/// where any other failure of a call is an error.
 ///
-/// A chain of one returns its candidate's error as it stands, so its status
-/// reads straight off it. For a real chain it is the head's reason, which is
-/// the first: every call starts at the head, and the head is sent the view the
-/// round assembled for it, which is the one the round's hint speaks of.
-pub(crate) fn head_status(err: &CompletionError) -> Option<reqwest::StatusCode> {
+/// A lone model's reason is its own, as [`TooLarge`] words it. A chain's is
+/// every candidate's, in the chain's order, when each was passed over for the
+/// size of the turn. A chain that sent the call to one candidate, and had it
+/// fail, is not this: that is a failure, whatever the others' windows held.
+pub(crate) fn unfit(err: &CompletionError) -> Option<String> {
     match Exhausted::of(err) {
-        Some(chain) => chain.abandoned.first()?.error.provider_response_status(),
-        None => err.provider_response_status(),
+        Some(chain) => chain.unfit(),
+        None => too_large(err).map(ToString::to_string),
     }
+}
+
+/// The call that was not sent to a candidate because its latest turn did not
+/// fit, when `err` is that.
+fn too_large(err: &CompletionError) -> Option<&TooLarge> {
+    match err {
+        CompletionError::RequestError(inner) => inner.downcast_ref(),
+        _ => None,
+    }
+}
+
+/// Whether `err` is a provider's refusal of the request itself, of the kind a
+/// conversation that put one role after itself earns.
+fn refused(err: &CompletionError) -> bool {
+    err.provider_response_status()
+        .is_some_and(|status| matches!(status.as_u16(), 400 | 422))
 }
 
 /// `history`, with the messages after the system prompt replaced by `view`.
@@ -507,16 +570,18 @@ impl CompletionModel for FailoverModel {
                 candidate.model_identifier(),
                 candidate.budget().max_tokens,
             );
-            // The head is sent the view the round assembled for it. Any other
-            // candidate is sent one assembled for its own window, which may
-            // leave out more -- or cannot hold the call's latest turn at all.
-            let outcome = if index == 0 {
-                Ok(())
-            } else {
-                self.view.view(candidate.budget(), call).map(|view| {
+            // Every candidate is sent a view assembled for its own window, the
+            // head's too, which may leave out more -- or cannot hold the
+            // call's latest turn at all. What rig put after the system prompt
+            // is the prompt alone, the round's hook having patched the rest
+            // out, and the view replaces it.
+            let viewed = self
+                .view
+                .view(candidate.budget(), call)
+                .map(|(view, adjacent)| {
                     attempt.chat_history = after_system(&attempt.chat_history, view);
-                })
-            };
+                    adjacent
+                });
             // Both rewrites are per candidate. `max_tokens` is the load-bearing
             // one: the agent carries none of its own, so without this no
             // ceiling would be sent. `model` arrives `None` on the agent path
@@ -526,13 +591,13 @@ impl CompletionModel for FailoverModel {
             attempt.model = Some(candidate.model_identifier().to_string());
             attempt.max_tokens = candidate.budget().max_tokens.map(u64::from);
 
-            let error = match outcome {
+            let error = match viewed {
                 // Not made: the call cannot fit this candidate. Sending it
                 // again fails the same way, which is what a `RequestError` is
                 // to `is_recoverable`; the next round's view leaves the turn
                 // out, which `candidate_may_clear` counts.
                 Err(too_large) => CompletionError::RequestError(Box::new(too_large)),
-                Ok(()) => match candidate.completion(attempt).await {
+                Ok(adjacent) => match candidate.completion(attempt).await {
                     Ok(response) => {
                         return Ok(CompletionResponse {
                             choice: response.choice,
@@ -543,7 +608,16 @@ impl CompletionModel for FailoverModel {
                             message_id: response.message_id,
                         });
                     }
-                    Err(error) => error,
+                    Err(error) => {
+                        // What the round says of a refusal is about the view
+                        // that was refused, which only this loop has.
+                        if let Some(adjacent) = adjacent
+                            && refused(&error)
+                        {
+                            self.slot.refused(candidate.budget(), adjacent);
+                        }
+                        error
+                    }
                 },
             };
             if let Some(next) = self.candidates.get(index + 1) {
@@ -596,7 +670,8 @@ mod tests {
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
-    use crate::agent::ledger::Ledger;
+    use crate::agent::history::Role;
+    use crate::agent::ledger::{Ledger, Refusal};
 
     /// What a call to a test's candidate may carry: a window of no consequence,
     /// and `max_tokens`.
@@ -659,6 +734,10 @@ mod tests {
 
         fn budget(&self) -> &Budget {
             &self.budget
+        }
+
+        fn budget_mut(&mut self) -> &mut Budget {
+            &mut self.budget
         }
 
         fn composes_native_output_with_tools(&self) -> bool {
@@ -736,18 +815,41 @@ mod tests {
     }
 
     /// A store stand-in: the view for a budget names its model, and the
-    /// budgets it was asked for are kept. `too_large_for` names a candidate
-    /// whose window the call's latest turn does not fit.
+    /// budgets it was asked for are kept. `too_large_for` names the candidates
+    /// whose window the call's latest turn does not fit, and `adjacent_for`
+    /// one whose view puts the model's reply after its own.
     #[derive(Default)]
     struct Views {
         asked: Mutex<Vec<String>>,
-        too_large_for: Option<&'static str>,
+        too_large_for: Vec<&'static str>,
+        adjacent_for: Vec<&'static str>,
+    }
+
+    impl Views {
+        fn too_large_for(names: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                too_large_for: names.into_iter().collect(),
+                ..Self::default()
+            }
+        }
+
+        fn adjacent_for(names: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                adjacent_for: names.into_iter().collect(),
+                ..Self::default()
+            }
+        }
     }
 
     impl View for Views {
-        fn view(&self, budget: &Budget, _call: CallId) -> Result<Vec<Message>, TooLarge> {
+        fn view(
+            &self,
+            budget: &Budget,
+            _call: CallId,
+        ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge> {
             self.asked.lock().expect("asked").push(budget.model.clone());
-            if self.too_large_for == Some(budget.model.as_str()) {
+            let named = |names: &[&str]| names.contains(&budget.model.as_str());
+            if named(&self.too_large_for) {
                 return Err(TooLarge {
                     turn: Some(3),
                     round: 1,
@@ -755,10 +857,14 @@ mod tests {
                     budget: budget.clone(),
                 });
             }
-            Ok(vec![Message::user(format!(
-                "the view for {}",
-                budget.model
-            ))])
+            let adjacent = named(&self.adjacent_for).then_some(Adjacent {
+                turn: Some(2),
+                role: Role::Assistant,
+            });
+            Ok((
+                vec![Message::user(format!("the view for {}", budget.model))],
+                adjacent,
+            ))
         }
     }
 
@@ -953,10 +1059,7 @@ mod tests {
             failed_with([("bedrock", http_status(401)), ("anthropic", envelope())]).await;
         assert!(may_clear(&accepted_later), "{accepted_later}");
 
-        let views = Arc::new(Views {
-            too_large_for: Some("anthropic"),
-            ..Views::default()
-        });
+        let views = Arc::new(Views::too_large_for(["anthropic"]));
         let oversized = chain_over(
             vec![
                 Box::new(Scripted::failing("bedrock", http_status(401))),
@@ -983,30 +1086,67 @@ mod tests {
         assert!(!may_clear(&fault), "a provider-reported fault: {fault}");
     }
 
-    /// The status a refusal carried is the head's, for a chain as for a lone
-    /// model: every call starts at the head, and the hint a refusal earns is
-    /// about the view the head was sent. A later model's status is not it.
+    /// What the round says of a refusal is about the view that was refused: the
+    /// first model that refused one that put a role after itself, for a chain as
+    /// for a lone model. A model that failed some other way, or was refused a
+    /// view that did not, is not it.
     #[tokio::test]
-    async fn a_chains_refusal_status_is_the_heads() {
-        let status = |statuses: [u16; 2]| async move {
-            let err = failed_with([
-                ("bedrock", http_status(statuses[0])),
-                ("anthropic", http_status(statuses[1])),
-            ])
-            .await;
-            head_status(&err).map(|status| status.as_u16())
+    async fn a_refusal_is_kept_with_the_view_that_was_refused() {
+        let refusal = |views: Views, statuses: &[(&'static str, u16)]| {
+            let slot = CallSlot::default();
+            let candidates: Vec<Box<dyn Candidate>> = statuses
+                .iter()
+                .map(|&(name, status)| {
+                    Box::new(Scripted::failing(name, http_status(status))) as Box<dyn Candidate>
+                })
+                .collect();
+            let chain = chain_over(candidates, Arc::new(views), slot.clone());
+            async move {
+                chain
+                    .completion(request())
+                    .await
+                    .expect_err("every one failed");
+                slot.refusal()
+                    .map(|Refusal { budget, adjacent }| (budget.model, adjacent.turn))
+            }
         };
-        assert_eq!(status([400, 401]).await, Some(400));
-        assert_eq!(status([503, 400]).await, Some(503));
-
-        let lone = failed_with([("bedrock", http_status(422))]).await;
-        assert_eq!(head_status(&lone).map(|s| s.as_u16()), Some(422));
-        let no_status = failed_with([
-            ("bedrock", CompletionError::ResponseError("empty".into())),
-            ("anthropic", http_status(400)),
-        ])
-        .await;
-        assert_eq!(head_status(&no_status), None);
+        let both = Views::adjacent_for(["bedrock", "anthropic"]);
+        assert_eq!(
+            refusal(both, &[("bedrock", 400), ("anthropic", 401)]).await,
+            Some(("bedrock".to_string(), Some(2))),
+            "the head's, when the head was refused"
+        );
+        let both = Views::adjacent_for(["bedrock", "anthropic"]);
+        assert_eq!(
+            refusal(both, &[("bedrock", 503), ("anthropic", 422)]).await,
+            Some(("anthropic".to_string(), Some(2))),
+            "a later model's, when the head failed some other way"
+        );
+        let both = Views::adjacent_for(["bedrock", "anthropic"]);
+        assert_eq!(
+            refusal(both, &[("bedrock", 400), ("anthropic", 400)]).await,
+            Some(("bedrock".to_string(), Some(2))),
+            "the first of two"
+        );
+        assert_eq!(
+            refusal(
+                Views::adjacent_for(["anthropic"]),
+                &[("bedrock", 400), ("anthropic", 401)]
+            )
+            .await,
+            None,
+            "a refusal of a view that put no role after itself has nothing to say"
+        );
+        assert_eq!(
+            refusal(Views::adjacent_for(["bedrock"]), &[("bedrock", 503)]).await,
+            None,
+            "nor does any other failure"
+        );
+        assert_eq!(
+            refusal(Views::adjacent_for(["bedrock"]), &[("bedrock", 400)]).await,
+            Some(("bedrock".to_string(), Some(2))),
+            "a lone model's refusal, whose error the chain returns as it stands"
+        );
     }
 
     /// Exhaustion names every candidate with its *own* reason, not just the last
@@ -1080,11 +1220,10 @@ mod tests {
         );
     }
 
-    /// The head is sent the view the round assembled for it. A move assembles
-    /// the call's view again for the next candidate's window, after the system
-    /// prompt rig put first.
+    /// Every candidate is sent a view assembled for its own window, the head's
+    /// included, after the system prompt rig put first.
     #[tokio::test]
-    async fn a_move_sends_the_view_assembled_for_the_new_candidate() {
+    async fn each_candidate_is_sent_the_view_assembled_for_it() {
         let first = Scripted::failing("bedrock", http_status(503));
         let second = Scripted::ok("anthropic");
         let (first_seen, second_seen) = (Arc::clone(&first.seen), Arc::clone(&second.seen));
@@ -1108,7 +1247,10 @@ mod tests {
         };
         assert_eq!(
             history(&first_seen),
-            request().chat_history.into_iter().collect::<Vec<_>>()
+            [
+                Message::system("preamble"),
+                Message::user("the view for bedrock")
+            ]
         );
         assert_eq!(
             history(&second_seen),
@@ -1117,7 +1259,10 @@ mod tests {
                 Message::user("the view for anthropic")
             ]
         );
-        assert_eq!(*views.asked.lock().expect("asked"), ["anthropic"]);
+        assert_eq!(
+            *views.asked.lock().expect("asked"),
+            ["bedrock", "anthropic"]
+        );
     }
 
     /// A candidate whose window the call's latest turn does not fit is passed
@@ -1126,10 +1271,7 @@ mod tests {
     async fn a_candidate_too_small_for_the_call_is_passed_over() {
         let small = Scripted::ok("small");
         let small_calls = Arc::clone(&small.calls);
-        let views = Arc::new(Views {
-            too_large_for: Some("small"),
-            ..Views::default()
-        });
+        let views = Arc::new(Views::too_large_for(["small"]));
 
         let reply = chain_over(
             vec![
@@ -1152,10 +1294,7 @@ mod tests {
                 Box::new(Scripted::failing("head", http_status(503))),
                 Box::new(Scripted::ok("small")),
             ],
-            Arc::new(Views {
-                too_large_for: Some("small"),
-                ..Views::default()
-            }),
+            Arc::new(Views::too_large_for(["small"])),
             CallSlot::default(),
         )
         .completion(request())
@@ -1166,6 +1305,83 @@ mod tests {
             text.contains("small") && text.contains("turn 3 of round 1"),
             "{text}"
         );
+    }
+
+    /// The head is passed over like any other candidate: a call whose latest
+    /// turn is too large for its window goes to the next, rather than ending
+    /// where the head's window did.
+    #[tokio::test]
+    async fn a_head_too_small_for_the_call_is_passed_over() {
+        let head = Scripted::ok("small");
+        let head_calls = Arc::clone(&head.calls);
+        let reply = chain_over(
+            vec![Box::new(head), Box::new(Scripted::ok("large"))],
+            Arc::new(Views::too_large_for(["small"])),
+            CallSlot::default(),
+        )
+        .completion(request())
+        .await
+        .expect("the second candidate's window holds it");
+
+        assert_eq!(head_calls.load(Ordering::SeqCst), 0, "it was not called");
+        assert_eq!(reply.raw_response.model, "large");
+    }
+
+    /// A call is not made, and says why, when every candidate's window is too
+    /// small for it -- each one's reason, or the lone model's own. One that
+    /// was sent the call and failed is a failure instead, whatever the others'
+    /// windows held.
+    #[tokio::test]
+    async fn a_call_no_window_holds_is_unfit_and_any_other_failure_is_not() {
+        let oversized = |names: &'static [&'static str], views: Views| {
+            let candidates: Vec<Box<dyn Candidate>> = names
+                .iter()
+                .map(|name| Box::new(Scripted::ok(name)) as Box<dyn Candidate>)
+                .collect();
+            chain_over(candidates, Arc::new(views), CallSlot::default())
+        };
+
+        let err = oversized(
+            &["small", "smaller"],
+            Views::too_large_for(["small", "smaller"]),
+        )
+        .completion(request())
+        .await
+        .expect_err("no window holds the turn");
+        let reason = unfit(&err).expect("every candidate was passed over");
+        assert!(
+            reason.starts_with("no model candidate has room for the call; tried:\n  small   -- ")
+                && reason.contains("\n  smaller -- turn 3 of round 1"),
+            "{reason}"
+        );
+        assert!(
+            may_clear(&err),
+            "the turn stays in the conversation, and the next view leaves it out"
+        );
+
+        let lone = oversized(&["small"], Views::too_large_for(["small"]))
+            .completion(request())
+            .await
+            .expect_err("the one window is too small");
+        let reason = unfit(&lone).expect("the lone candidate was passed over");
+        assert!(
+            reason.starts_with("turn 3 of round 1 -- the model's last call and what it returned"),
+            "a lone model's reason is its own: {reason}"
+        );
+
+        let failed = chain_over(
+            vec![
+                Box::new(Scripted::ok("small")),
+                Box::new(Scripted::failing("down", http_status(503))),
+            ],
+            Arc::new(Views::too_large_for(["small"])),
+            CallSlot::default(),
+        )
+        .completion(request())
+        .await
+        .expect_err("the only candidate that could hold it failed");
+        assert_eq!(unfit(&failed), None, "{failed}");
+        assert_eq!(unfit(&http_status(503)), None);
     }
 
     /// Each move is recorded as it happens, with the reason -- not only

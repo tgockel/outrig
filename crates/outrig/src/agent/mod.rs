@@ -11,9 +11,10 @@
 //! what the agent promoted.
 //!
 //! Each call retries a provider's transient failures ([`retry`]), and one that
-//! still fails moves to the next model an alias names ([`failover`]), sent a
-//! view assembled for that model's own window. Every request either sends is
-//! an attempt the session's [`ledger`] records.
+//! still fails moves to the next model an alias names ([`failover`]). Each
+//! model a call goes to is sent a view assembled for its own window, and one
+//! whose window cannot hold the call's latest turn is passed over. Every
+//! request any sends is an attempt the session's [`ledger`] records.
 //!
 //! A copy of `outrig-cli`'s loop rather than a move of it, so the 0.2.x line
 //! keeps editing its own without conflict; `plan/phase/0003-python/` records
@@ -87,9 +88,10 @@ pub(crate) struct Agent {
     pub(crate) agent: RigAgent,
     /// The whole conversation, which rounds commit to as they go.
     pub(crate) history: History,
-    /// What each model call may carry of it: the head's allowance, whose
-    /// `model` is the row every call is tried against first. A call moved to
-    /// another model is held to that model's, which the chain holds.
+    /// The head's allowance, whose `model` is the row every call is tried
+    /// against first, and which the line that opens a round is costed
+    /// against. Each call is held to the allowance of the model it goes to,
+    /// which the chain holds.
     pub(crate) budget: Arc<Budget>,
     tool_call_max: usize,
     python_version: String,
@@ -167,7 +169,6 @@ impl Agent {
             &self.agent,
             opening,
             &self.history,
-            &self.budget,
             self.tool_call_max,
             &self.interrupts,
         )

@@ -2052,6 +2052,9 @@ async fn every_cut_driven(
     let real = (*agent.agent.budget).clone();
     let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
     agent.agent.budget = Arc::new(Budget { window, ..real });
+    Arc::get_mut(&mut agent.agent.agent.model)
+        .expect("no call is in flight")
+        .narrow_head(window);
     let seen = manifests(&agent);
     for message in ["one", "two", "three", "four", "five"] {
         round(&mut agent, message).await;
@@ -4301,11 +4304,11 @@ async fn a_refused_call_through_a_chain_says_where_it_was_refused() {
     );
 }
 
-/// The hint names the head's row and speaks of the view the head was sent, so
-/// a refusal by a later model, when the head failed some other way, earns none:
-/// it would name a provider that did not refuse.
+/// The hint names the row of the model that refused and speaks of the view it
+/// was sent, so a refusal by a later model, when the head failed some other
+/// way, earns one that names the later model's provider and not the head's.
 #[tokio::test]
-async fn a_later_models_refusal_earns_no_hint_naming_the_head() {
+async fn a_later_models_refusal_earns_a_hint_naming_its_own_row() {
     let vars = "OUTRIG_TEST_AGENT_FAILOVER_REFUSED_LATER";
     let (head, _head_requests) = mock_http::start(refused_pair_script(failure(503))).await;
     let (tail, _tail_requests) = mock_http::start(vec![failure(400)]).await;
@@ -4319,7 +4322,12 @@ async fn a_later_models_refusal_earns_no_hint_naming_the_head() {
     let err = refused_fourth_round(&mut agent).await;
     assert!(err.contains("503") && err.contains("400"), "{err}");
     assert!(
-        !err.contains("role-alternation"),
+        err.contains("where turn 2 begins")
+            && err.contains(r#"set [providers.second].role-alternation = "strict""#),
+        "{err}"
+    );
+    assert!(
+        !err.contains("[providers.first]"),
         "the head was not refused: {err}"
     );
 }
@@ -4539,6 +4547,135 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
             conversation(Style::Anthropic, request)
         );
     }
+}
+
+/// A turn too large for the head's window, whose fallback's window holds it,
+/// is sent to the fallback: the chain is what assembles each model's view, and
+/// the head's window is no more the call's last word than any other's. The
+/// head was sent the call before it, whose view fit. Its manifest is not
+/// recorded, since no view was sent, and the fallback's is, naming its own
+/// allowance; the log rebuilds what each received.
+#[tokio::test]
+async fn a_turn_too_large_for_the_head_is_sent_to_a_fallback_that_holds_it() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_HEAD_TOO_SMALL";
+    let (head, mut head_requests) =
+        mock_http::start(vec![submit("toolu_big", "print('x' * 60000)")]).await;
+    let (tail, mut tail_requests) = mock_http::start(vec![text_reply("done")]).await;
+    let cfg = chain_config(
+        vars,
+        (
+            Style::Anthropic,
+            &format!("http://{head}"),
+            "context-window = 7000\nmax-tokens = 1024",
+        ),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+
+    assert_eq!(round(&mut agent, "print a lot").await, "done");
+    shut_down(agent).await;
+
+    let at_head = mock_http::drain(&mut head_requests);
+    let at_tail = mock_http::drain(&mut tail_requests);
+    assert_eq!((at_head.len(), at_tail.len()), (1, 1));
+    assert!(
+        count(&at_tail[0], "xxxxxxxxxx") > 0,
+        "the fallback carried the turn: {:#}",
+        at_tail[0].body
+    );
+
+    let records = events::recorded(dir.path());
+    let kinds = events::kinds(&records);
+    let failover = &records[at(&kinds, "model.failover", 0)]["data"];
+    assert_eq!(
+        (&failover["from"], &failover["to"]),
+        (&json!("head"), &json!("tail"))
+    );
+    assert!(
+        failover["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("7000-token context window")),
+        "{failover:#}"
+    );
+    let models: Vec<_> = events::of_kind(&records, "model.call")
+        .iter()
+        .map(|call| call["budget"]["model"].as_str().expect("a model"))
+        .collect();
+    assert_eq!(
+        models,
+        ["head", "tail"],
+        "the head's second call was not assembled, so none is recorded for it"
+    );
+    each_call_rebuilds(
+        &records,
+        &[
+            ("head", Style::Anthropic, &at_head),
+            ("tail", Style::Anthropic, &at_tail),
+        ],
+    );
+}
+
+/// A turn no model of the chain can hold ends the round as a lone model's
+/// does, keeping the turn and saying which one it was and what each model had
+/// room for; the call is made to none, and the next round, whose view leaves
+/// the turn out, goes on.
+#[tokio::test]
+async fn a_turn_no_model_of_the_chain_can_hold_ends_its_round_and_later_rounds_go_on() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_NONE_HOLDS";
+    let (head, mut head_requests) = mock_http::start(vec![
+        submit("toolu_big", "print('x' * 60000)"),
+        text_reply("two"),
+    ])
+    .await;
+    let (tail, mut tail_requests) = mock_http::start(vec![text_reply("unused")]).await;
+    let cfg = chain_config(
+        vars,
+        (
+            Style::Anthropic,
+            &format!("http://{head}"),
+            "context-window = 7000\nmax-tokens = 1024",
+        ),
+        (
+            Style::Anthropic,
+            &format!("http://{tail}"),
+            "context-window = 8000\nmax-tokens = 1024",
+        ),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+
+    let reply = round(&mut agent, "print a lot").await;
+    assert!(
+        reply.starts_with("(round ended: no model candidate has room for the call; tried:\n"),
+        "{reply}"
+    );
+    for needle in [
+        "  head -- turn 0 of round 1",
+        "  tail -- turn 0 of round 1",
+        "a call to head has room for",
+        "a call to tail has room for",
+        "7000-token context window",
+        "8000-token context window",
+    ] {
+        assert!(reply.contains(needle), "{needle:?} in {reply}");
+    }
+    assert_eq!(agent.agent.history.len(), 1, "the turn is kept");
+    assert_eq!(
+        mock_http::drain(&mut head_requests).len(),
+        1,
+        "the head was sent the call before the turn existed, and none after"
+    );
+    assert!(
+        mock_http::drain(&mut tail_requests).is_empty(),
+        "no call was made to the fallback"
+    );
+
+    assert_eq!(round(&mut agent, "two").await, "two");
+    let second = mock_http::drain(&mut head_requests)
+        .pop()
+        .expect("round two");
+    assert_eq!(count(&second, "xxxxxxxxxx"), 0, "{:#}", second.body);
+    shut_down(agent).await;
 }
 
 /// The blocks of `kind` in the messages `request` carried, as the Anthropic
