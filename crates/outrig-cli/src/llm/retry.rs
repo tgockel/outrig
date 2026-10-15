@@ -784,7 +784,39 @@ fn failure_label(err: &HttpError) -> String {
                 None => format!("HTTP {}", code.as_u16()),
             }
         }
-        HttpError::Instance(inner) => format!("connection error: {inner}"),
+        HttpError::Instance(inner) => {
+            format!("connection error: {}", with_innermost_cause(inner.as_ref()))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// An error's `Display` followed by the innermost link of its `source()` chain.
+///
+/// reqwest's own text is the kind of failure and the URL; whether the connect
+/// was refused, the lookup failed, or TLS did not match is only in the chain.
+/// One link rather than all of them, since this is a status line. Left alone
+/// when there is no source or the outer text already says it.
+fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let outer = err.to_string();
+    let mut innermost = None;
+    let mut link = err.source();
+    while let Some(cause) = link {
+        innermost = Some(cause);
+        link = cause.source();
+    }
+    match innermost.map(ToString::to_string) {
+        Some(cause) if !outer.contains(&cause) => format!("{outer}: {cause}"),
+        _ => outer,
+    }
+}
+
+/// The label for a failed candidate in a failover chain's move line and
+/// `tried` rows: a transport failure reads as it does outside a chain, and
+/// anything else keeps rig's own text.
+pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
+    match err {
+        CompletionError::HttpError(http @ HttpError::Instance(_)) => failure_label(http),
         other => other.to_string(),
     }
 }
@@ -1554,6 +1586,21 @@ mod tests {
         (started.elapsed(), failure_label(&err))
     }
 
+    /// The innermost `source()` text of a refused connect to [`REFUSED_PORT`],
+    /// taken from the error itself because the OS wording varies.
+    async fn refused_cause() -> String {
+        let err = test_client()
+            .get(format!("http://127.0.0.1:{REFUSED_PORT}/"))
+            .send()
+            .await
+            .expect_err("nothing listens");
+        let mut cause: &(dyn std::error::Error + 'static) = &err;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        cause.to_string()
+    }
+
     /// Confirm nothing answers on [`REFUSED_PORT`], so a test that reads a
     /// failure as "connect refused" is reading the truth.
     ///
@@ -1585,6 +1632,10 @@ mod tests {
         assert!(
             label.starts_with("connection error"),
             "the loop must have failed connecting, not on {label}",
+        );
+        assert!(
+            label.ends_with(&refused_cause().await),
+            "the label must carry the connect failure's own cause: {label}",
         );
         assert!(
             elapsed <= policy.connect_budget,
@@ -1689,6 +1740,53 @@ mod tests {
             label_of(err).is_none(),
             "the REPL must not call it transient"
         );
+    }
+
+    /// A chain of `depth` links: each one's `Display` is its own name.
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn the_innermost_cause_is_appended_once() {
+        let err = Link("outer", Some(Box::new(Link("middle", Some(Box::new(Link("root", None)))))));
+        assert_eq!(with_innermost_cause(&err), "outer: root");
+    }
+
+    #[test]
+    fn a_cause_the_outer_message_already_has_is_not_repeated() {
+        let err = Link("failed: root", Some(Box::new(Link("root", None))));
+        assert_eq!(with_innermost_cause(&err), "failed: root");
+    }
+
+    #[test]
+    fn an_error_with_no_source_renders_as_it_always_did() {
+        assert_eq!(with_innermost_cause(&Link("alone", None)), "alone");
+    }
+
+    #[test]
+    fn a_candidate_transport_failure_carries_the_cause_without_rigs_prefix() {
+        let err = CompletionError::HttpError(HttpError::Instance(Box::new(Link(
+            "error sending request",
+            Some(Box::new(Link("Connection refused", None))),
+        ))));
+        assert_eq!(
+            candidate_failure_label(&err),
+            "connection error: error sending request: Connection refused"
+        );
+        let status = http_status(503);
+        assert_eq!(candidate_failure_label(&status), status.to_string());
     }
 
     #[test]

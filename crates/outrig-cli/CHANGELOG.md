@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An unreachable LLM endpoint names why.** A refused connection, a failed DNS lookup, and a
+  TLS mismatch all printed `connection error: error sending request for url (...)`; the retry
+  line, the end-of-turn line, and an alias chain's `trying <next>` and `tried:` lines now end
+  with the underlying cause (`Connection refused`, `failed to lookup address information`, ...).
+  A transport failure inside a chain reads as it does outside one.
 - **A `node` toolchain whose NodeSource setup failed no longer builds.** On a Debian-family
   base the toolchain ran NodeSource's `setup_24.x` and then `apt-get install nodejs`, and that
   script exits 0 whatever goes wrong in it: it reports each error it handles through

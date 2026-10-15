@@ -278,7 +278,10 @@ fn exhausted(abandoned: Vec<Abandoned>) -> CompletionError {
         .any(|a| super::retry::is_recoverable(&a.error));
     let rows: Vec<_> = abandoned
         .iter()
-        .map(|a| (a.model_name.as_str(), a.error.to_string()))
+        .map(|a| (
+                a.model_name.as_str(),
+                super::retry::candidate_failure_label(&a.error),
+            ))
         .collect();
     let tried = super::render_candidate_reasons(&rows);
     let prefix = if recoverable {
@@ -349,8 +352,9 @@ impl CompletionModel for FailoverModel {
                     // version of the same hazard and wants the same mitigation.
                     if let Some(next) = self.candidates.get(index + 1) {
                         eprintln!(
-                            "[outrig] model {} failed ({error}); trying {}",
+                            "[outrig] model {} failed ({}); trying {}",
                             candidate.model_name(),
+                            super::retry::candidate_failure_label(&error),
                             next.model_name(),
                         );
                     }
@@ -530,8 +534,37 @@ mod tests {
             CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(status)) => {
                 CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(*status))
             }
+            CompletionError::HttpError(rig::http_client::Error::Instance(_)) => {
+                transport_failure()
+            }
             other => CompletionError::ProviderError(other.to_string()),
         }
+    }
+
+    /// A transport error with a cause only in its `source()`, as reqwest's.
+    #[derive(Debug)]
+    struct Transport;
+    impl std::fmt::Display for Transport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("error sending request")
+        }
+    }
+    impl std::error::Error for Transport {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&Refused)
+        }
+    }
+    #[derive(Debug)]
+    struct Refused;
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Connection refused")
+        }
+    }
+    impl std::error::Error for Refused {}
+
+    fn transport_failure() -> CompletionError {
+        CompletionError::HttpError(rig::http_client::Error::Instance(Box::new(Transport)))
     }
 
     fn http_status(code: u16) -> CompletionError {
@@ -658,6 +691,27 @@ mod tests {
             label.contains("anthropic") && label.contains("empty body"),
             "{label}"
         );
+    }
+
+    /// A transport failure in a `tried` row names its cause, as it does on the
+    /// retry line, rather than rig's `Http client error:` wrapper.
+    #[tokio::test]
+    async fn a_transport_failure_is_reported_with_its_cause() {
+        let transport = transport_failure();
+        let err = chain(vec![
+            Box::new(Scripted::failing("head", transport)),
+            Box::new(Scripted::failing("next", http_status(503))),
+        ])
+        .completion(request())
+        .await
+        .expect_err("every candidate failed");
+
+        let label = chain_exhausted_label(&PromptError::CompletionError(err))
+            .expect("reported as a chain failure")
+            .tried
+            .to_string();
+        assert!(label.contains("error sending request: Connection refused"), "{label}");
+        assert!(!label.contains("Http client error"), "{label}");
     }
 
     /// A chain of one hands back its candidate's error *as it stands*, so
