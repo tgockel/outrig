@@ -61,6 +61,35 @@ pub enum CliError {
          or [agents.<name>] in outrig.toml (the provider's API calls it `max_tokens`)"
     )]
     PromptMissingMaxTokens,
+
+    /// An error the process exits with `status` for, not the 1 every other
+    /// error gets. It prints as the error it wraps, so `error: ...` reads as
+    /// it would have; only the status differs. The field is not named
+    /// `source`, so a walk of the error chain meets the wrapped error's text
+    /// once, not twice. A `match` on a variant does not see through it. See
+    /// [`CliError::with_status`].
+    #[error("{inner}")]
+    WithStatus { status: i32, inner: Box<CliError> },
+}
+
+impl CliError {
+    /// This error, with the process to exit with `status` for it instead of 1.
+    pub fn with_status(self, status: i32) -> Self {
+        CliError::WithStatus {
+            status,
+            inner: Box::new(self),
+        }
+    }
+
+    /// The status the process exits with after printing this error, and the
+    /// one a command records for the session: 1, unless
+    /// [`CliError::with_status`] said otherwise.
+    pub fn exit_status(&self) -> i32 {
+        match self {
+            CliError::WithStatus { status, .. } => *status,
+            _ => 1,
+        }
+    }
 }
 
 /// Rig's wording for the missing ceiling, matched to replace it. Pinned by the
@@ -134,5 +163,18 @@ mod tests {
             rendered,
             "agent prompt failed: CompletionError: RequestError: something else entirely",
         );
+    }
+
+    /// The status rides along without changing what `app.rs` prints: the text
+    /// is the wrapped error's own, not a prefix over it.
+    #[test]
+    fn a_status_changes_the_exit_and_not_the_text() {
+        let plain = CliError::from(std::io::Error::other("stdout went away"));
+        assert_eq!(plain.exit_status(), 1, "an error without a status exits 1");
+        let text = plain.to_string();
+
+        let carried = plain.with_status(3);
+        assert_eq!(carried.exit_status(), 3);
+        assert_eq!(carried.to_string(), text);
     }
 }

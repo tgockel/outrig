@@ -444,7 +444,9 @@ the close ended -- and exits with the status it decides:
 
 If the interpreter exits -- Python that calls `os._exit`, say -- nothing typed could reach the
 agent any more, and the session ends, through the same report, with exit status 1, or 3 if the
-stop could not be confirmed.
+stop could not be confirmed. A conversation that fails -- a write to a stdout whose reader went
+away, say -- or a session record that cannot be written ends the same way, and its error is
+printed after the report.
 
 Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
 cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping

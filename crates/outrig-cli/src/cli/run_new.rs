@@ -23,7 +23,9 @@
 //!
 //! It leaves through the session's report: `/quit`, end of input, or a second
 //! Ctrl-C at the prompt close the session to new work, stop it, print what the
-//! report found, and exit with the status the report decides.
+//! report found, and exit with the status the report decides. A conversation
+//! that fails, or a record that cannot be written, closes the session the same
+//! way, and its error is printed after the report.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ use outrig::LaunchSpec;
 
 use crate::builtin_image;
 use crate::cli::session_setup::ProgressSpan;
-use crate::error::{OutrigError, Result};
+use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
 use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
@@ -162,13 +164,14 @@ pub async fn execute(
     // session that failed to start is recorded too, and at once finalized, so
     // it is never a live record without a container.
     if let Err(e) = store.create(&sid, args.session_dir.as_deref(), &mut session) {
-        if let Ok(running) = started {
-            let report = running.shutdown(DEFAULT_DRAIN).await;
-            if report.verdict() != Verdict::Clean {
-                print_report(&report);
-            }
+        let Ok(running) = started else {
+            return Err(e.into());
+        };
+        let summary = summarize(&running.shutdown(DEFAULT_DRAIN).await);
+        if summary.verdict != Verdict::Clean {
+            eprint!("{}", render_report(&summary));
         }
-        return Err(e.into());
+        return outcome_of(Err(e.into()), &summary);
     }
     let mut running = match started {
         Ok(running) => running,
@@ -201,12 +204,27 @@ pub async fn execute(
     let report = running.shutdown(DEFAULT_DRAIN).await;
     let summary = summarize(&report);
     eprint!("{}", render_report(&summary));
-    let outcome = conversed.map(|()| exit_status(&summary));
-    let exit = outcome.as_ref().copied().unwrap_or(1);
+    let outcome = outcome_of(conversed, &summary);
+    // The status the process exits with, so the record never says otherwise.
+    let exit = outcome.as_ref().copied().unwrap_or_else(CliError::exit_status);
     if let Err(e) = store.finalize(&sid, SystemTime::now(), exit) {
         tracing::warn!(target: "outrig::cli::run_new", "finalizing session {sid}: {e}");
     }
     outcome
+}
+
+/// What [`execute`] returns once the session is stopped: the status its report
+/// decides, or the error that cut the session short -- the conversation's, or a
+/// record that could not be written. The error keeps its text and its status 1,
+/// except that a stop not proven outranks it, as it does everything in
+/// [`exit_status`] -- a script reading the status must still be told that
+/// something may be running.
+fn outcome_of(ended: Result<()>, summary: &Summary) -> Result<i32> {
+    let status = exit_status(summary);
+    match ended {
+        Err(e) if status == 3 => Err(e.with_status(status)),
+        other => other.map(|()| status),
+    }
 }
 
 /// The exit status a session's report decides: 0 for a clean stop, 2 for a
@@ -222,11 +240,6 @@ fn exit_status(summary: &Summary) -> i32 {
         // A verdict this build does not know is not one it can call clean.
         _ => 3,
     }
-}
-
-/// The report, on stderr.
-fn print_report(report: &ShutdownReport) {
-    eprint!("{}", render_report(&summarize(report)));
 }
 
 /// What the terminal says of a report.
@@ -645,6 +658,15 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         }
     }
 
+    /// A summary of a report that `verdict` reads as, for a session the
+    /// interpreter's exit closed.
+    fn died(verdict: Verdict) -> Summary {
+        Summary {
+            closed: Some("the Python interpreter exited (exit status: 1)".to_string()),
+            ..summary(verdict)
+        }
+    }
+
     /// What a stop found decides the status, and one not proven stopped
     /// outranks everything. A report that reads not proven stopped cannot be
     /// had from podman on demand, so this is where 3 is forced.
@@ -653,13 +675,37 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         assert_eq!(exit_status(&summary(Verdict::Clean)), 0);
         assert_eq!(exit_status(&summary(Verdict::StoppedWithUnknown)), 2);
         assert_eq!(exit_status(&summary(Verdict::NotProvenStopped)), 3);
-        let died = |verdict| Summary {
-            closed: Some("the Python interpreter exited (exit status: 1)".to_string()),
-            ..summary(verdict)
-        };
         assert_eq!(exit_status(&died(Verdict::Clean)), 1);
         assert_eq!(exit_status(&died(Verdict::StoppedWithUnknown)), 1);
         assert_eq!(exit_status(&died(Verdict::NotProvenStopped)), 3);
+    }
+
+    /// A session cut short by an error, as a write to a stdout whose reader
+    /// went away does to the conversation.
+    fn failed() -> Result<()> {
+        Err(std::io::Error::other("stdout went away").into())
+    }
+
+    /// An error that cuts the session short keeps its text; only a stop not
+    /// proven moves its status from 1 to 3.
+    #[test]
+    fn an_error_exits_3_only_when_the_stop_is_not_proven() {
+        let text = failed().expect_err("it failed").to_string();
+
+        let stuck = outcome_of(failed(), &summary(Verdict::NotProvenStopped))
+            .expect_err("the conversation's error is returned");
+        assert_eq!(stuck.exit_status(), 3);
+        assert_eq!(stuck.to_string(), text, "the error is printed as it was");
+
+        for other in [
+            summary(Verdict::Clean),
+            summary(Verdict::StoppedWithUnknown),
+            died(Verdict::Clean),
+        ] {
+            let err = outcome_of(failed(), &other).expect_err("the error is returned");
+            assert_eq!(err.exit_status(), 1, "{other:?}");
+            assert_eq!(err.to_string(), text);
+        }
     }
 
     /// What the terminal says of each kind of report.

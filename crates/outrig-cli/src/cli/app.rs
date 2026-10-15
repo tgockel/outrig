@@ -163,14 +163,14 @@ pub fn run() -> ExitCode {
     outrig::container::install_panic_hook();
 
     tracing::debug!("outrig starting");
-    match dispatch(&cli) {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+    let code = match dispatch(&cli) {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::from(1)
+            e.exit_status()
         }
-    }
+    };
+    ExitCode::from(code.clamp(0, 255) as u8)
 }
 
 fn dispatch(cli: &Cli) -> Result<i32> {
