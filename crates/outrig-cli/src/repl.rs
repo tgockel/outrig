@@ -227,7 +227,7 @@ async fn ctrl_c_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-pub(crate) async fn write_stderr_line<E>(stderr: &mut E, text: &str) -> Result<()>
+async fn write_stderr_line<E>(stderr: &mut E, text: &str) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {

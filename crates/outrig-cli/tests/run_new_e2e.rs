@@ -129,6 +129,18 @@ image-name = "docker.io/library/alpine:latest"
     repo
 }
 
+/// How a test reads the binary's stdout.
+enum Reader {
+    /// As it arrives.
+    Live,
+    /// A line at a time with this pause after each: a terminal slower than the
+    /// agent writing to it.
+    Slow(Duration),
+    /// Never, with the pipe held open: a terminal that has stopped, as a
+    /// paused pager or Ctrl-S leaves it.
+    Stalled,
+}
+
 /// A running `outrig run-new`, its output mirrored into sinks as it arrives,
 /// so a hang or an early exit shows why.
 struct Session {
@@ -137,17 +149,17 @@ struct Session {
     stdin: ChildStdin,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
-    streams: [JoinHandle<()>; 2],
+    streams: Vec<JoinHandle<()>>,
+    /// The read end of a [`Reader::Stalled`] stdout, kept open and unread.
+    stalled: Option<ChildStdout>,
 }
 
 impl Session {
     fn start(repo: &Path, sessions: &Path) -> Self {
-        Self::spawn(repo, sessions, None)
+        Self::spawn(repo, sessions, Reader::Live)
     }
 
-    /// With `stdout_pause`, stdout is read a line at a time with that pause
-    /// after each: a terminal slower than the agent writing to it.
-    fn spawn(repo: &Path, sessions: &Path, stdout_pause: Option<Duration>) -> Self {
+    fn spawn(repo: &Path, sessions: &Path, reader: Reader) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
             .args(["--global-config"])
             .arg(repo.join("no-such-global.toml"))
@@ -173,17 +185,26 @@ impl Session {
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
         let child_stdout = child.stdout.take().expect("stdout");
-        let streams = [
-            match stdout_pause {
-                None => tokio::spawn(stream_lines(child_stdout, Arc::clone(&stdout), "stdout")),
-                Some(pause) => tokio::spawn(read_slowly(child_stdout, Arc::clone(&stdout), pause)),
-            },
-            tokio::spawn(stream_lines(
-                child.stderr.take().expect("stderr"),
-                Arc::clone(&stderr),
-                "stderr",
-            )),
-        ];
+        let mut streams = Vec::new();
+        let mut stalled = None;
+        match reader {
+            Reader::Live => streams.push(tokio::spawn(stream_lines(
+                child_stdout,
+                Arc::clone(&stdout),
+                "stdout",
+            ))),
+            Reader::Slow(pause) => streams.push(tokio::spawn(read_slowly(
+                child_stdout,
+                Arc::clone(&stdout),
+                pause,
+            ))),
+            Reader::Stalled => stalled = Some(child_stdout),
+        }
+        streams.push(tokio::spawn(stream_lines(
+            child.stderr.take().expect("stderr"),
+            Arc::clone(&stderr),
+            "stderr",
+        )));
         Self {
             child,
             pid,
@@ -191,6 +212,7 @@ impl Session {
             stdout,
             stderr,
             streams,
+            stalled,
         }
     }
 
@@ -211,6 +233,7 @@ impl Session {
             stdout,
             stderr,
             streams,
+            stalled,
             ..
         } = self;
         let open = (!close_input).then_some(stdin);
@@ -218,7 +241,7 @@ impl Session {
             .await
             .expect("exits")
             .expect("wait");
-        drop(open);
+        drop((open, stalled));
         for stream in streams {
             stream.await.expect("drained");
         }
@@ -682,9 +705,14 @@ async fn the_session_ends_when_the_interpreter_exits() {
         stderr.contains("it is gone"),
         "the round finished first: {stderr}"
     );
+    let exited = stderr
+        .find("[outrig] the Python interpreter exited; the session is over")
+        .unwrap_or_else(|| panic!("{stderr}"));
     assert!(
-        stderr.contains("[outrig] the Python interpreter exited; the session is over"),
-        "{stderr}"
+        stderr
+            .find("it is gone")
+            .is_some_and(|reply| reply < exited),
+        "the reply came before the note: {stderr}"
     );
     // The report says so, and that the execution it took with it is unknown.
     assert!(
@@ -717,7 +745,11 @@ async fn a_flood_of_sends_does_not_starve_the_round_or_input() {
     .await;
     let repo = repo(addr);
     let sessions = tempfile::tempdir().expect("a session root");
-    let mut session = Session::spawn(repo.path(), sessions.path(), Some(Duration::from_millis(1)));
+    let mut session = Session::spawn(
+        repo.path(),
+        sessions.path(),
+        Reader::Slow(Duration::from_millis(1)),
+    );
 
     session.type_line("go").await;
     wait_for(&session.stdout, "tick ", TEST_TIMEOUT).await;
@@ -725,6 +757,85 @@ async fn a_flood_of_sends_does_not_starve_the_round_or_input() {
     session.type_line("/quit").await;
     let (status, _, stderr) = session.exit(false).await;
     assert!(status.success(), "{status}: {stderr}");
+}
+
+/// A session whose stdout has stalled -- a pager paused, Ctrl-S -- and whose
+/// agent is flooding it (#471). The pipe fills within a few messages, and the
+/// round's code then waits half a second, so the terminal is blocked well
+/// before the round has anything to report. The round still reports on
+/// stderr, since a stalled stdout delays output and not the round, and the
+/// session can still be left, by `leave`; the status it left with is returned,
+/// with stderr.
+async fn leave_a_session_whose_stdout_stalled(leave: Leave) -> (std::process::ExitStatus, String) {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_stalled",
+            "async def flood():\n    while True:\n        \
+             await runtime.channels['user'].send('tick ' + 'x' * 16000)\n\
+             flooding = asyncio.create_task(flood())\nawait asyncio.sleep(0.5)",
+        ),
+        text_reply("the flood is running"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::spawn(repo.path(), sessions.path(), Reader::Stalled);
+
+    session.type_line("go").await;
+    // Not "flooding", which the submission shown on stderr already says.
+    wait_for(&session.stderr, "the flood is running", STEP_TIMEOUT).await;
+    let close_input = matches!(leave, Leave::InputEndsThenReaderGoes);
+    match leave {
+        Leave::Quit => session.type_line("/quit").await,
+        Leave::CtrlC => {
+            ctrl_c(&session.pid);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ctrl_c(&session.pid);
+        }
+        Leave::InputEndsThenReaderGoes => {
+            // Ending input waits on the stopped stdout; a second later its
+            // reader is gone, and the write that was waiting fails.
+            let reader = session.stalled.take();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                drop(reader);
+            });
+        }
+    }
+    let (status, _, stderr) = session.exit(close_input).await;
+    (status, stderr)
+}
+
+/// How the session is left.
+enum Leave {
+    /// `/quit` is typed at the prompt.
+    Quit,
+    /// Ctrl-C is pressed twice at the prompt.
+    CtrlC,
+    /// Input ends, and stdout's reader then goes away.
+    InputEndsThenReaderGoes,
+}
+
+#[tokio::test]
+async fn a_stalled_stdout_does_not_stop_the_round_or_quit() {
+    let (status, stderr) = leave_a_session_whose_stdout_stalled(Leave::Quit).await;
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+#[tokio::test]
+async fn a_stalled_stdout_does_not_stop_ctrl_c() {
+    let (status, stderr) = leave_a_session_whose_stdout_stalled(Leave::CtrlC).await;
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+/// What the agent sent never reached anyone, so a session that ends this way
+/// did not end cleanly: it exits 1, as one whose stdout fails while it runs
+/// does, and not 0.
+#[tokio::test]
+async fn output_lost_as_input_ends_is_not_a_clean_exit() {
+    let (status, stderr) =
+        leave_a_session_whose_stdout_stalled(Leave::InputEndsThenReaderGoes).await;
+    assert_eq!(status.code(), Some(1), "{status}: {stderr}");
 }
 
 /// Input ending is a graceful exit, and a graceful exit shows everything the
@@ -753,7 +864,7 @@ async fn end_of_input_shows_everything_already_sent() {
     let mut session = Session::spawn(
         repo.path(),
         sessions.path(),
-        Some(Duration::from_millis(10)),
+        Reader::Slow(Duration::from_millis(10)),
     );
 
     session.type_line("go").await;
@@ -876,6 +987,15 @@ async fn lines_refused_as_input_ends_are_still_reported() {
         REFUSED,
         "{stderr}"
     );
+    // Written before `run-new` goes on to close the session, not queued
+    // behind it.
+    let last_refusal = stderr
+        .rfind("[outrig] error: not delivered")
+        .expect("a refusal");
+    let closing = stderr
+        .find("[outrig] closing the session")
+        .expect("a closing line");
+    assert!(last_refusal < closing, "{stderr}");
     let mut requests = requests;
     assert!(
         drain_recorded(&mut requests).is_empty(),

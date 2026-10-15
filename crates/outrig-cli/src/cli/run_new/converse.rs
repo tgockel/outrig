@@ -20,15 +20,19 @@
 //! reply is written only once everything published before it has been, so a
 //! submission is never shown after what the model said of it.
 //!
-//! Two writers, one terminal. The rounds and the agent's sends -- one of them
-//! from a task still running after its round ended -- are written by this one
-//! task, in whole lines, so neither cuts into the other. The terminal also
-//! paces the agent: this loop takes its messages one at a time, writing each
-//! before taking the next, and the agent's code waits once it is a few messages
-//! ahead of what has been taken. A send arriving at the
-//! prompt ends the prompt's line and draws the prompt again after it. A line
-//! the user has half typed stays in the terminal's buffer and is still read
-//! whole, though its echo is split around the message.
+//! Two sources, one terminal. The rounds and the agent's sends -- one of them
+//! from a task still running after its round ended -- are written in whole
+//! lines, so neither cuts into the other. This loop writes nothing itself: it
+//! queues, and [`Output`]'s threads write, so a terminal that is slow or has
+//! stopped delays what is shown, and not the round, a Ctrl-C or what the user
+//! types. stdout and stderr have a thread each, and stderr is not held up
+//! behind messages stdout has yet to show. The terminal still paces the agent:
+//! the loop takes a message only once stdout's queue has room for it, and the
+//! agent's code waits once it is a few messages ahead of what has been taken.
+//! A send arriving at the prompt ends the prompt's line and draws the prompt
+//! again after it. A line the user has half typed stays in the terminal's
+//! buffer and is still read whole, though its echo is split around the
+//! message.
 //!
 //! Stdin is read on a thread of its own rather than through tokio. A read is
 //! always in flight, and tokio's blocking read would hold the runtime open at
@@ -43,12 +47,12 @@ use futures_util::FutureExt;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use outrig::harness::event::{Payload, Received, Subscription};
 use outrig::harness::{RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks};
-use tokio::io::{AsyncWriteExt, Stderr, Stdout};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
 
+use super::output::{Failures, Output, PROMPT};
 use crate::error::Result;
-use crate::repl::{INTERRUPT_NOTICE, compose_help, write_stderr_line};
+use crate::repl::{INTERRUPT_NOTICE, compose_help};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -84,37 +88,70 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// a fresh `ctrl_c()` per wait, which would miss a press landing between two
 /// of them -- and a quick second press is the one that stops waiting.
 ///
+/// Nothing is left queued for stderr when this returns, since the caller
+/// writes to it next. End of input and the interpreter's exit show everything
+/// the agent sent first, for as long as the terminal takes. `/quit` and a
+/// second Ctrl-C do not wait for a stdout that may have stopped, so the few
+/// messages taken but not yet written are dropped; so are they when the loop
+/// fails. A Ctrl-C ends a wait for the terminal. A write that fails while
+/// the session ends, as input does with stdout stopped and its reader gone,
+/// fails the session as one made while it runs does.
+///
 /// `shown` is the terminal's subscription to the session's events, which is
 /// where the Python each round runs is shown from.
 pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let (out, mut failures) = Output::stdio()?;
+    let mut term = Terminal { out, reading: true };
+    let mut left = drive(session, shown, &mut term, &mut sigint, &mut failures).await;
+    if left.is_err() {
+        // A failure does not wait on a stdout that may have stopped either.
+        term.out.abandon();
+    }
+    term.out.finish(sigint.recv()).await;
+    if left.is_ok() {
+        // A write that failed while this waited on it left output short of
+        // what the session was told, so the session did not end cleanly.
+        if let Ok(failed) = failures.try_recv() {
+            left = Err(failed.into());
+        }
+    }
+    left
+}
+
+/// The loop [`converse`] runs. It returns with everything it showed queued,
+/// and stdout abandoned if the user asked to go; writing the rest is
+/// [`converse`]'s to wait for.
+async fn drive(
+    session: &mut Session,
+    shown: &mut Subscription,
+    term: &mut Terminal,
+    sigint: &mut Signal,
+    failures: &mut Failures,
+) -> Result<()> {
     let user = session.user_channel();
     let interrupt = session.interrupter();
     let closer = session.closer();
-    let mut sigint = signal(SignalKind::interrupt())?;
     let mut lines = read_lines()?;
     let session = Mutex::new(session);
     let help = compose_help(&[]);
-    let mut term = Terminal {
-        stdout: tokio::io::stdout(),
-        stderr: tokio::io::stderr(),
-        reading: true,
-    };
 
     let mut round: Option<Round<'_>> = None;
     // Each posted line's answer, and whether it was typed while a round ran.
     let mut acks = FuturesOrdered::new();
-    // Set once the interpreter has exited and everything it sent is shown.
+    // Set once the interpreter has exited and everything it sent is taken.
     let mut gone = false;
     let mut last_was_interrupt = false;
     // Set once the session's events have all been shown.
     let mut shown_all = false;
 
-    term.prompt().await?;
+    term.prompt();
     loop {
         if round.is_none() {
             if gone {
-                term.note("[outrig] the Python interpreter exited; the session is over")
-                    .await?;
+                // What the interpreter sent is shown before this.
+                term.out.settle(sigint.recv()).await;
+                term.note("[outrig] the Python interpreter exited; the session is over");
                 return Ok(());
             }
             if !term.reading {
@@ -126,10 +163,15 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                 while let Ok(Some((queued, mid_round))) =
                     tokio::time::timeout_at(deadline, acks.next()).await
                 {
-                    term.answered(queued, mid_round).await?;
+                    term.answered(queued, mid_round);
                 }
-                for text in user.receive_waiting() {
-                    term.message(&text, false).await?;
+                tokio::select! {
+                    () = show(&term.out, user.receive_waiting()) => {}
+                    _ = sigint.recv() => {
+                        closer.close_admission();
+                        term.out.abandon();
+                        return Ok(());
+                    }
                 }
                 closer.close_admission();
                 return Ok(());
@@ -142,30 +184,38 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
             Some(()) = sigint.recv() => {
                 if round.is_some() {
                     if let Some(said) = interrupt() {
-                        term.note(&format!("\n[outrig] {said}")).await?;
+                        term.note(&format!("\n[outrig] {said}"));
                         continue;
                     }
                     round = None;
-                    term.stderr.write_all(INTERRUPT_NOTICE).await?;
+                    term.out.text(INTERRUPT_NOTICE);
                 } else if last_was_interrupt {
-                    term.stderr.write_all(b"\n").await?;
+                    term.out.text("\n");
                     closer.close_admission();
+                    term.out.abandon();
                     return Ok(());
                 } else if let Some(said) = session.lock().await.stop_held() {
                     // No round holds the lock.
-                    term.note(&format!("\n[outrig] {said} (Ctrl-C again exits)")).await?;
+                    term.note(&format!("\n[outrig] {said} (Ctrl-C again exits)"));
                 } else {
-                    term.stderr.write_all(b"\n").await?;
+                    term.out.text("\n");
                 }
                 last_was_interrupt = true;
-                term.prompt().await?;
+                term.prompt();
             }
-            sent = user.receive(), if !gone => match sent {
-                Some(text) => term.message(&text, round.is_none()).await?,
+            Some(failed) = failures.recv() => return Err(failed.into()),
+            // A message is taken only with room made for it, so a terminal
+            // slower than the agent leaves the rest with the agent, whose code
+            // waits, and leaves this loop free.
+            Some((room, sent)) = async {
+                let room = term.out.room().await?;
+                Some((room, user.receive().await))
+            }, if !gone => match sent {
+                Some(text) => room.send(text, round.is_none() && term.reading),
                 None => gone = true,
             },
             received = shown.recv(), if !shown_all => match received {
-                Some(received) => term.event(received).await?,
+                Some(received) => term.event(received),
                 None => shown_all = true,
             },
             ended = async { round.as_mut().expect("polled only with a round").await },
@@ -175,11 +225,11 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                 // Everything the round published is in the subscription by
                 // now: its submissions go before what the model said of them.
                 while let Ok(received) = shown.try_recv() {
-                    term.event(received).await?;
+                    term.event(received);
                 }
                 match ended {
                     Ok(RoundOutcome::Ended(end)) => {
-                        term.ended(&end).await?;
+                        term.ended(&end);
                         // Anything that arrived after the round's last tool
                         // result is told in a round of its own.
                         round = Some(start(&session));
@@ -187,20 +237,19 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                     // The interpreter's exit closed the session: the user's
                     // channel ending says so in a moment.
                     Err(SessionError::Closed(_)) => {}
-                    Ok(_) => term.prompt().await?,
+                    Ok(_) => term.prompt(),
                     Err(e) => {
                         // Not retried: a failure that persists would loop.
-                        term.note(&format!("[outrig] error: {e}")).await?;
-                        term.prompt().await?;
+                        term.note(&format!("[outrig] error: {e}"));
+                        term.prompt();
                     }
                 }
             }
-            Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round).await?,
+            Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round),
             line = lines.recv(), if term.reading => {
                 let Some(line) = line else {
                     if round.is_none() {
-                        term.stderr.write_all(b"\n").await?;
-                        term.stderr.flush().await?;
+                        term.out.text("\n");
                     }
                     term.reading = false;
                     continue;
@@ -209,7 +258,7 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                 let line = line.trim_end_matches('\r');
                 if line.is_empty() {
                     if round.is_none() {
-                        term.prompt().await?;
+                        term.prompt();
                     }
                     continue;
                 }
@@ -220,15 +269,16 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                             // Closed first, so a round dropped here publishes
                             // nothing more of its own.
                             closer.close_admission();
+                            term.out.abandon();
                             drop(round.take());
                             return Ok(());
                         }
-                        ["help"] => term.note(&help).await?,
+                        ["help"] => term.note(&help),
                         // `raw`, as typed.
-                        _ => term.note(&format!("[outrig] unknown command: /{raw}")).await?,
+                        _ => term.note(&format!("[outrig] unknown command: /{raw}")),
                     }
                     if round.is_none() {
-                        term.prompt().await?;
+                        term.prompt();
                     }
                     continue;
                 }
@@ -241,6 +291,16 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
                 }
             }
         }
+    }
+}
+
+/// Queue `messages` for stdout, each as room is made for it.
+async fn show(out: &Output, messages: Vec<String>) {
+    for text in messages {
+        let Some(room) = out.room().await else {
+            return;
+        };
+        room.send(text, false);
     }
 }
 
@@ -308,58 +368,51 @@ fn read_lines() -> std::io::Result<mpsc::UnboundedReceiver<std::io::Result<Strin
     Ok(lines)
 }
 
-/// The session's two output streams. Only [`converse`] writes to them.
+/// What the session shows, rendered and queued on [`Output`], which writes it.
+/// Nothing here waits on the terminal.
 struct Terminal {
-    stdout: Stdout,
-    stderr: Stderr,
+    out: Output,
     /// Whether input is still being read. Once it is not, there is no prompt
     /// to draw.
     reading: bool,
 }
 
 impl Terminal {
-    async fn prompt(&mut self) -> Result<()> {
+    fn prompt(&self) {
         if self.reading {
-            self.stderr.write_all(b"> ").await?;
-            self.stderr.flush().await?;
+            self.out.text(PROMPT);
         }
-        Ok(())
     }
 
     /// A line on stderr.
-    async fn note(&mut self, text: &str) -> Result<()> {
-        write_stderr_line(&mut self.stderr, text).await
+    fn note(&self, text: &str) {
+        self.out.line(text);
     }
 
     /// What the terminal shows of one of the session's events: each
     /// submission as it starts, and a note when some were not shown.
-    async fn event(&mut self, received: Received) -> Result<()> {
+    fn event(&self, received: Received) {
         match received {
             Received::Event(event) => {
                 if let Payload::ExecSubmitted { source, .. } = &event.payload {
-                    self.stderr
-                        .write_all(render_submission(source).as_bytes())
-                        .await?;
-                    self.stderr.flush().await?;
+                    self.out.text(render_submission(source));
                 }
             }
             Received::Missed(missed) => {
                 self.note(&format!(
                     "[outrig] {missed} of the session's events were not shown here; Python that \
                      ran among them is missing above"
-                ))
-                .await?;
+                ));
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// How a round ended: the model's reply, the reasoning of a turn that held
     /// only that, and the line it closes on.
-    async fn ended(&mut self, end: &RoundEnd) -> Result<()> {
+    fn ended(&self, end: &RoundEnd) {
         if !end.reply.trim().is_empty() {
-            self.note(&end.reply).await?;
+            self.note(&end.reply);
         }
         if let Some(reasoning) = &end.reasoning {
             // Said as `run` says it, so the two describe the same outcome alike.
@@ -368,45 +421,23 @@ impl Terminal {
                 stopped: None,
                 recovered: Some(reasoning.clone()),
             };
-            self.note(&silent.silent_report()).await?;
+            self.note(&silent.silent_report());
         }
         if let Some(line) = closing_line(end.stopped.as_deref(), tasks(&end.still_running)) {
-            self.note(&line).await?;
+            self.note(&line);
         }
-        Ok(())
     }
 
     /// What became of a typed line: whether the agent's channel took it, and
     /// if it was typed while a round ran, that it waits there.
-    async fn answered(
-        &mut self,
-        queued: std::result::Result<usize, BoxError>,
-        mid_round: bool,
-    ) -> Result<()> {
+    fn answered(&self, queued: std::result::Result<usize, BoxError>, mid_round: bool) {
         match queued {
             Ok(waiting) if mid_round => {
-                self.note(&format!("[outrig] queued for the agent ({waiting} waiting)"))
-                    .await
+                self.note(&format!("[outrig] queued for the agent ({waiting} waiting)"));
             }
-            Ok(_) => Ok(()),
-            Err(e) => self.note(&format!("[outrig] error: {e}")).await,
+            Ok(_) => {}
+            Err(e) => self.note(&format!("[outrig] error: {e}")),
         }
-    }
-
-    /// A message the agent sent, on stdout. At the prompt it gets a line of its
-    /// own, and the prompt is drawn again after it.
-    async fn message(&mut self, text: &str, at_prompt: bool) -> Result<()> {
-        let at_prompt = at_prompt && self.reading;
-        if at_prompt {
-            self.stderr.write_all(b"\n").await?;
-            self.stderr.flush().await?;
-        }
-        // The helper takes any stream; it writes whole lines.
-        write_stderr_line(&mut self.stdout, text).await?;
-        if at_prompt {
-            self.prompt().await?;
-        }
-        Ok(())
     }
 }
 

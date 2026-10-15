@@ -48,6 +48,7 @@ use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
 mod approve;
 mod converse;
+mod output;
 
 #[derive(Debug, Parser)]
 pub struct RunNewArgs {

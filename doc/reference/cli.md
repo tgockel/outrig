@@ -394,12 +394,14 @@ records each retry and each move, and names the model that answered each call.
 
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent
-is held to the terminal's pace: its code waits once it is 16 messages ahead of what has been
-printed. When input ends -- the end of piped input, or Ctrl-D -- the lines typed before it that
-were refused are reported and what the agent had already sent is printed, then `run-new` exits; a
-task still sending is not waited for. The
-model's own text is commentary and goes to stderr with everything else, so `outrig run-new >
-out.txt` keeps exactly the messages the agent meant you to have.
+is held to the terminal's pace: its code waits once it is 21 messages ahead of what has been
+printed. A stdout that is slow or has stopped, such as a paused pager, delays what is printed and
+nothing else: the round, stderr, and Ctrl-C carry on. When input ends -- the end of piped input,
+or Ctrl-D -- the lines typed before it that were refused are reported and what the agent had
+already sent is printed, then `run-new` exits; a task still sending is not waited for. `/quit` and
+a second Ctrl-C do not wait for a stdout that has stopped, so the few messages queued for it are
+dropped. The model's own text is commentary and goes to stderr with everything else, so `outrig
+run-new > out.txt` keeps exactly the messages the agent meant you to have.
 
 **No MCP server and no sidecar starts**, including servers an image declares in its
 `org.outrig.mcp` label; startup names the configured ones it left out. The model could not call
