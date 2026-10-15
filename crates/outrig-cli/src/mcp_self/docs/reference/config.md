@@ -1628,7 +1628,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `workspace.container-path` and every `workspace.mounts[*].container-path` must be absolute and
   must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
-  primary workspace `container-path`.
+  primary workspace `container-path`. Container paths are compared after folding `.` and `..`,
+  so `/workspace/../workspace` duplicates `/workspace` and `/a/..` is `/`.
 - Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.
 - An unknown key, at any level, is ignored with a warning rather than rejected, except in
   `[network]` and the `security` tables; see [What a load sets aside](#what-a-load-sets-aside).

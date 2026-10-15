@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A container path spelled with `..` is checked as podman will see it.** `/workspace/../workspace`
+  collided with `/workspace` and `/a/..` was `/`, but validation compared the path as written, so
+  podman refused the launch after the image was acquired, naming a path the config never held. The
+  root and duplicate checks for `[workspace]`, its mounts, sidecar mounts, and `--volume` now fold
+  `.` and `..` first; diagnostics still print the path as written. `/resources/../res` still
+  validates. (#262)
 - **Stopping a primary or exec-stdio sidecar no longer waits out its grace.** Their PID 1 is
   `sleep infinity`, which installs no SIGTERM handler, so every `podman stop -t 2` ran its full 2 s
   and every detached `podman rm -f` podman's default 10 s before the SIGKILL that ended it anyway.

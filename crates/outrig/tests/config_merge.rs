@@ -788,6 +788,92 @@ container-path = "/"
         );
     }
 
+    /// `..` folds before podman compares destinations, so these are `/`.
+    #[test]
+    fn workspace_container_path_folding_to_root_errors() {
+        for path in ["/..", "/workspace/..", "/a/../.."] {
+            let cfg = parse(&format!("[workspace]\ncontainer-path = \"{path}\"\n"));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(err, ConfigValidationError::WorkspaceContainerRoot { .. }),
+                "{path}: expected WorkspaceContainerRoot, got: {err:?}",
+            );
+        }
+        let cfg = parse("[workspace]\ncontainer-path = \"/workspace/../src\"\n");
+        cfg.validate(None).expect("folds to /src");
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_folds_onto_primary_workspace() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/workspace/../workspace"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/workspace/../workspace"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn primary_workspace_dotdot_folds_onto_mount() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/workspace/../workspace"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/workspace"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/workspace"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_folding_to_root_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/a/.."
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::WorkspaceMountContainerRoot { .. }
+            ),
+            "expected WorkspaceMountContainerRoot, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_that_collides_with_nothing_validates() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/../res"
+"#,
+        );
+        cfg.validate(None).expect("folds to /res");
+    }
+
     #[test]
     fn workspace_mount_duplicate_container_path_errors() {
         let cfg = parse(
@@ -3946,6 +4032,32 @@ context    = "ctx"
   [[sidecars.tools.mounts]]
   host-path      = "b"
   container-path = "/cache"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerDuplicate { .. },
+                    ..
+                }
+            ),
+            "expected a duplicate-container-path SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_dotdot_collides_with_enabled_workspace() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image     = "mcp-tools"
+  workspace = "ro"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/workspace/../workspace"
 "#,
         );
         let err = expect_validation_err(&cfg, None);

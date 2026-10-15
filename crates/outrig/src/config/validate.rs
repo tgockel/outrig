@@ -13,7 +13,7 @@
 //! config-declared paths.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -1403,7 +1403,7 @@ fn validate_sidecar(
     // so extra mounts must not collide with it.
     let mut reserved = BTreeSet::new();
     if sidecar.workspace != super::SidecarWorkspaceAccess::None {
-        reserved.insert(cfg.workspace.container_path().to_path_buf());
+        reserved.insert(fold_container_path(cfg.workspace.container_path()));
     }
     check_mount_list(&sidecar.mounts, reserved, repo_root).map_err(|violation| {
         ConfigValidationError::SidecarMount {
@@ -1482,7 +1482,7 @@ fn validate_workspace_container_path(cfg: &Config) -> Result<(), ConfigValidatio
             path: path.to_path_buf(),
         });
     }
-    if path == Path::new("/") {
+    if fold_container_path(path) == Path::new("/") {
         return Err(ConfigValidationError::WorkspaceContainerRoot {});
     }
     Ok(())
@@ -1493,7 +1493,7 @@ pub(super) fn validate_workspace_mounts(
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
     let mut reserved = BTreeSet::new();
-    reserved.insert(cfg.workspace.container_path().to_path_buf());
+    reserved.insert(fold_container_path(cfg.workspace.container_path()));
 
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {
@@ -1584,6 +1584,24 @@ pub enum MountRuleViolation {
     },
 }
 
+/// An absolute in-container path with `.` and `..` folded by component, the way
+/// podman cleans a destination before it compares them. `..` at the root stays
+/// at the root. Lexical: there is no filesystem to resolve against, and
+/// `Path` equality alone never folds `..`.
+fn fold_container_path(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::Normal(part) => folded.push(part),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    folded
+}
+
 /// Shared rules for any bind-mount list: absolute container paths, never `/`,
 /// no duplicates (including against `reserved` paths already claimed by the
 /// owning block), and -- when a repo root is known -- host paths that exist
@@ -1603,10 +1621,11 @@ fn check_mount_list(
                 declared_in,
             });
         }
-        if mount.container_path() == Path::new("/") {
+        let folded = fold_container_path(mount.container_path());
+        if folded == Path::new("/") {
             return Err(MountRuleViolation::ContainerRoot { declared_in });
         }
-        if !reserved.insert(mount.container_path().to_path_buf()) {
+        if !reserved.insert(folded) {
             return Err(MountRuleViolation::ContainerDuplicate {
                 path: mount.container_path().to_path_buf(),
                 declared_in,
