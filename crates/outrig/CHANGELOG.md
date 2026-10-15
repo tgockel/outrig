@@ -91,6 +91,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A build-arg value holding a newline no longer shares an image's cache key with separate build
+  args.** The key hashed each build arg as a `KEY=value` line with nothing escaped, so
+  `{ A = "1\nB=2" }` and `{ A = "1", B = "2" }` fed it the same bytes while buildah got
+  `--build-arg A=1\nB=2` in one case and `--build-arg A=1 --build-arg B=2` in the other. Whichever
+  built second reported a cache hit on the image built with the other set, and since a tag is
+  `<name>:<key>` and host-wide, so did another checkout. A newline reaches a value through a TOML
+  escape or through `${VAR}`, as a multi-line certificate would. The key now writes a backslash
+  and a newline in a build-arg key or value as `\\` and `\n`, and does the same for the labels it
+  covers, so a line holds one pair. An image whose build args and labels hold neither character
+  keeps its key and its tags. One that holds either gets a new key and rebuilds once. That key
+  cannot equal one an earlier release wrote, so a `${VAR}` that gains a newline does not reuse the
+  image built for a literal `\n`. (#322)
 - **`max-tokens = 0` is refused at load.** On a model or an agent it used to validate, and every
   request then carried an output ceiling of zero, which surfaced only at the first prompt.
   `ConfigValidationError::MaxTokensZero` names the key and says to leave it unset for the default;

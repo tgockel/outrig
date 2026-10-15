@@ -200,11 +200,7 @@ impl CacheKey {
             .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
-        let mut block = String::new();
-        for (k, v) in build_args {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
+        hash_pairs(build_args, &mut hasher);
 
         hash_context(context, &mut hasher).await?;
 
@@ -232,24 +228,47 @@ impl CacheKey {
             .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
-        let mut block = String::new();
-        for (k, v) in build_args {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
-
-        let mut block = String::new();
-        block.push_str("\n[outrig-labels]\n");
-        for (k, v) in labels {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
+        hash_pairs(build_args, &mut hasher);
+        hasher.update(b"\n[outrig-labels]\n");
+        hash_pairs(labels, &mut hasher);
 
         hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
     }
+}
+
+/// `pairs` as the lines a cache key hashes: `key=value` and a newline each, in key order.
+///
+/// A backslash or newline in a key or value is written `\\` or `\n`, so a line holds one pair
+/// and a value cannot spell the next. A pair with neither is written as it always was. A key
+/// holding `=` needs no escape: buildah splits `--build-arg` at the first one, so `A=1`/`x` and
+/// `A`/`1=x` reach it as the same argument.
+fn pairs_block(pairs: &BTreeMap<String, String>) -> String {
+    let escape = |s: &str| s.replace('\\', r"\\").replace('\n', r"\n");
+    let mut block = String::new();
+    for (k, v) in pairs {
+        let _ = writeln!(block, "{}={}", escape(k), escape(v));
+    }
+    block
+}
+
+/// Hash `pairs` as [`pairs_block`] writes them, after a `0xFF` byte if it escaped anything.
+///
+/// Escaping writes a newline as a backslash and an `n`, and a backslash as two. Those are the
+/// bytes a release before the escaping hashed for a backslash and an `n`, and for two backslashes.
+/// The image store outlives an upgrade and a cache probe asks only whether a tag exists, so a key
+/// computed from them would reuse the image built for the other value. That release hashed only
+/// UTF-8 text here, which never holds `0xFF`, so the byte keeps an escaped block from matching
+/// anything it hashed. A backslash gets into the block only as an escape, so a block without one
+/// is hashed as it always was, and an image whose pairs hold neither character keeps its tag.
+fn hash_pairs(pairs: &BTreeMap<String, String>, hasher: &mut blake3::Hasher) {
+    let block = pairs_block(pairs);
+    if block.contains('\\') {
+        hasher.update(b"\xff");
+    }
+    hasher.update(block.as_bytes());
 }
 
 /// Resolve `build-args` for an image-config. Literal values pass through;
