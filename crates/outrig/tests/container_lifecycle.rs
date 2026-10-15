@@ -111,7 +111,15 @@ async fn start_then_stop_leaves_no_container() {
     );
     assert!(container::is_tracked(&name), "name should be tracked");
 
-    container.stop(Duration::from_secs(2)).await.expect("stop");
+    // The grace is a floor for a PID 1 that ignores SIGTERM, which is what
+    // `sleep infinity` would be without `--stop-signal=SIGKILL`.
+    let started = Instant::now();
+    container.stop(Duration::from_secs(10)).await.expect("stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stop waited out its grace: {:?}",
+        started.elapsed()
+    );
 
     assert!(
         !podman_ps_lists(&name, true).await,
@@ -232,16 +240,16 @@ async fn drop_without_stop_cleans_up() {
         // container drops here; Drop spawns detached `podman rm -f`.
     }
 
-    // Poll up to 30s for the detached cleanup to finish. Rootless podman
-    // with `--userns=keep-id` can be sluggish on busy hosts, and this test
-    // is checking *eventual* cleanup, not latency.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Poll for the detached cleanup to finish. Under podman's 10 s default
+    // stop timeout, which `rm -f` waits out for a PID 1 that ignores SIGTERM,
+    // so a regression of `--stop-signal=SIGKILL` cannot pass.
+    let deadline = Instant::now() + Duration::from_secs(9);
     loop {
         if !podman_ps_lists(&name, true).await {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("container {name} not cleaned up after Drop within 30s");
+            panic!("container {name} not cleaned up after Drop within 9s");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

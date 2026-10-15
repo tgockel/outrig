@@ -1298,6 +1298,12 @@ impl Container {
         process::try_capture(self.build_exec_argv(cmd, options)).await
     }
 
+    /// Stops the container, waiting up to `grace` for its PID 1 to exit on
+    /// SIGTERM before podman kills it.
+    ///
+    /// A container from [`Self::start`] runs `sleep infinity` as PID 1 and
+    /// is created with `--stop-signal=SIGKILL`, so it is killed at once and
+    /// `grace` is never spent on it.
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
         self.stop_inner(grace).await
     }
@@ -1866,7 +1872,13 @@ fn build_podman_run_cmd(
     attempt_label: &str,
 ) -> Cmd {
     let cmd = Cmd::new("podman")
-        .args(["run", "-d", "--rm", "--name"])
+        .args(["run", "-d", "--rm"])
+        // PID 1 is `sleep infinity`, which installs no SIGTERM handler, so the
+        // kernel discards the default stop signal and every stop would wait
+        // out its whole grace (and `rm -f` podman's 10 s) before the SIGKILL
+        // that ends it regardless.
+        .arg("--stop-signal=SIGKILL")
+        .args(["--name"])
         .arg(name);
     // After the caller's labels, so podman's last-wins parsing cannot let one
     // of theirs displace the value cleanup removes by.
@@ -2986,6 +2998,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "-v",
@@ -3045,6 +3058,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-20260711T000000-abcd-tools",
                 "--label",
@@ -3098,6 +3112,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "-v",
@@ -3487,6 +3502,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3732,6 +3748,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3773,6 +3790,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3815,6 +3833,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3865,6 +3884,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3910,6 +3930,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
@@ -3953,6 +3974,7 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",

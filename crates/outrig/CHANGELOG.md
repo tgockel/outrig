@@ -91,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stopping a primary or exec-stdio sidecar no longer waits out its grace.** Their PID 1 is
+  `sleep infinity`, which installs no SIGTERM handler, so every `podman stop -t 2` ran its full 2 s
+  and every detached `podman rm -f` podman's default 10 s before the SIGKILL that ended it anyway.
+  `podman run` now passes `--stop-signal=SIGKILL`, so both return in about 0.3 s. Entrypoint-stdio
+  sidecars are unchanged: their server is PID 1 and may handle SIGTERM.
 - **`Outrig::launch` no longer re-imports an embedded server the config moved into a sidecar.**
   When the primary image's `org.outrig.mcp` label declared a server and the config placed a server
   of that name in a sidecar (`sidecar = "tools"`), `LaunchSpec::from_config` rightly left it out of
