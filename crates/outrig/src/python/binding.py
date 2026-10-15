@@ -23,7 +23,7 @@ returned, naming the type of what each returned, or a `failed` line naming the b
 raised and what it raised; `event` lines -- a library's own, and each request's record: its
 receipt, its dispatch, which holds the request until the owner answers whether the event is
 `published`, refused if it is not, and its end; `decision` lines, each a request held on its
-serving thread until the owner's answer arrives under the same id, which `0003-23` asks for;
+serving thread until the owner's answer arrives under the same id, which `0003-24` asks for;
 `cancel` notices of requests whose callers were interrupted; and the `control` line that says the
 session has closed. Everything else it writes goes to stderr, where the owner logs it.
 

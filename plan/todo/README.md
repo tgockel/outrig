@@ -91,7 +91,7 @@ tasks is an invariant this file holds.
 
 ### Phase 0003 -- python
 
-`0003-01` through `0003-31` cover the phase's user-visible deliverables. The ordering is
+`0003-01` through `0003-37` cover the phase's user-visible deliverables. The ordering is
 chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
 an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
 was built from the phase's exit criteria instead and silently omitted discovery, history, and
@@ -102,30 +102,30 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-23` | Policy decides what crosses, and the user can be asked             |
-| `0003-24` | An evaluator judges what no rule settled                           |
+| `0003-24` | Policy decides what crosses, and the user can be asked             |
+| `0003-25` | An evaluator judges what no rule settled                           |
 
 **Children**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-25` | `outrig` imports in every kernel, and decodes results strictly     |
-| `0003-26` | A parent awaits its child's typed result                           |
-| `0003-27` | A decorated function is typed agent work                           |
-| `0003-30` | An agent class answers requests                                    |
+| `0003-26` | `outrig` imports in every kernel, and decodes results strictly     |
+| `0003-30` | A parent awaits its child's typed result                           |
+| `0003-31` | A decorated function is typed agent work                           |
+| `0003-34` | An agent class answers requests                                    |
 
 **Skills**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-28` | Skills import as modules from pluggable sources                    |
-| `0003-29` | `/name` reaches the main agent as a call it makes                  |
+| `0003-32` | Skills import as modules from pluggable sources                    |
+| `0003-33` | `/name` reaches the main agent as a call it makes                  |
 
 **Last**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-31` | The docs describe the system that now exists                       |
+| `0003-37` | The docs describe the system that now exists                       |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -144,11 +144,12 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - `0003-21`, the awaitable facade from the planning round of 2026-10-09, comes before the relay
   task because every later task's agent code is written against its spelling, and it depends on
   the spikes alone. Pulling it in shifted the tasks then numbered `0003-21` through `0003-30` by
-  one.
+  one. The planning round of 2026-10-15 moved `0003-23` through `0003-31` again, to make room
+  for the host-program tasks.
 - Close behavior lands with each resource: the task that adds a resource adds its row to
   `lifecycle.md`'s close table, so no single shutdown task has to reopen the others.
-- Credential isolation became hosted objects (`0003-16` through `0003-24`), and subagents became
-  `0003-25` through `0003-27` and `0003-30`. MCP as Python objects, interpreter restart,
+- Credential isolation became hosted objects (`0003-16` through `0003-25`), and subagents became
+  `0003-26`, `0003-30`, `0003-31` and `0003-34`. MCP as Python objects, interpreter restart,
   confining what a hosted library does on the host, and the other deferred subjects have design
   pages or `plan/next/` entries and no tasks. They are out of scope by the phase README's own
   list, not forgotten.

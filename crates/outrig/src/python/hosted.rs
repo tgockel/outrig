@@ -332,7 +332,7 @@ impl Relay {
         not(test),
         expect(
             dead_code,
-            reason = "the host opens no agent but the primary until `0003-26`"
+            reason = "the host opens no agent but the primary until `0003-30`"
         )
     )]
     pub(crate) fn opened(&self, agent: &str) {

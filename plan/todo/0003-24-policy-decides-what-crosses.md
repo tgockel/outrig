@@ -1,4 +1,4 @@
-# 0003-23 -- Policy decides what crosses, and the user can be asked
+# 0003-24 -- Policy decides what crosses, and the user can be asked
 
 ## Context
 
@@ -24,7 +24,7 @@ The first rule needs the operator's layer of config, and today nothing keeps it.
 merges the global file and the repo file into one flattened `Config`
 (`crates/outrig/src/config/merge.rs`), a repo entry replacing a global one of the same name, and a
 `Model` row records nothing of which file declared it. Read after the merge, a rule, a `default`
-or a `[models.<name>]` row could be the repository's. `0003-24` needs the same layer, since the
+or a `[models.<name>]` row could be the repository's. `0003-25` needs the same layer, since the
 evaluator's model has to be the operator's choice and not a name a repository redefined. So does
 `[events] mode`: `0003-13` merged it as `[network].mode` merges, a repository's value replacing
 the global one, and the maintainer has since decided that the global value stands
@@ -39,7 +39,7 @@ wins, so that an allow arriving late runs nothing.
 
 Admission is decided in two places, and `close_admission()` closes Rust's gate and stops the relay
 at once; each binding's flag is set when it reads the control line (`lifecycle.md`). Rust's gate
-decides executions (`0003-19`), child launches (`0003-26`), and, from this task, every request
+decides executions (`0003-19`), child launches (`0003-30`), and, from this task, every request
 held for a decision. Each binding process's closed flag (`0003-22`) decides the requests a rule
 allowed: rules run in the binding (fork 1), so such a request never waits on Rust.
 
@@ -59,7 +59,7 @@ runs, and a request that is not allowed never reaches its target.
   a callable obtained by an attribute read per fork 4.
 - **The operator's layer, kept beside the merged config.** Loading keeps the global config as it
   was read -- its `[policy]`, `[models]` and `[providers]` included -- next to the merged `Config`
-  the rest of OutRig reads. The operator's `[policy]` is read from that layer, and `0003-24` reads
+  the rest of OutRig reads. The operator's `[policy]` is read from that layer, and `0003-25` reads
   the evaluator's model from it, so no repo entry can replace either. A `Config` given to
   `0003-19`'s builder with no layer kept -- one an embedder built -- is the operator's layer as a
   whole, since a program and not a repository wrote it; `run-new` passes the config it loaded,
@@ -72,7 +72,7 @@ runs, and a request that is not allowed never reaches its target.
   `Config` is the operator's layer as a whole, so for it nothing changes.
 - **A repo's `[policy]` only restricts**, per fork 2. A repo `allow`, as a rule or as `default`,
   is rejected at load with a message naming it, as `RepoNetworkPolicy` does for `[network]`.
-- **`evaluate` is legal before there is an evaluator.** `0003-24` adds the model that judges it.
+- **`evaluate` is legal before there is an evaluator.** `0003-25` adds the model that judges it.
   Until one is enabled, `evaluate` takes the path an evaluator's failure takes: escalate when a
   handler is installed, otherwise deny. It never allows.
 - **A deny raises in the caller before dispatch**, as an exception of OutRig's own class,
@@ -94,7 +94,7 @@ runs, and a request that is not allowed never reaches its target.
   deadline of its own. A handler that wants one answers deny when it passes, with a reason saying
   so, which leaves the deadline with the embedder, who also chooses the approvers.
 - **Held requests in Rust's admission gate.** A request held for a decision -- a human's, or from
-  `0003-24` an evaluator's -- has one state there: waiting, then allowed, denied, or cancelled.
+  `0003-25` an evaluator's -- has one state there: waiting, then allowed, denied, or cancelled.
   The first transition wins, and a later one is recorded and ignored. A handler's answer, an
   interrupt and a close all go through it, so a close and an allow cannot both win, and an allow
   that arrives after a cancel runs nothing. A request a rule allowed does not pass through the
@@ -106,7 +106,7 @@ runs, and a request that is not allowed never reaches its target.
 - **The policy version**: a digest of the rules in force -- each layer's rules, in order, and its
   `default` -- computed when the session starts and sent to each binding with its rule table.
   Every decision event and every escalation request carries it, so a record says which rules
-  decided it, and `0003-24` puts it in the evaluator's input.
+  decided it, and `0003-25` puts it in the evaluator's input.
 - **The CLI's handler.** `run-new` prints each pending request on stderr with its id, binding,
   member and operation. `crates/outrig-cli/src/cli/run_new/converse.rs` takes `/approve <id>` and
   `/deny <id>`, and `compose_help` in `crates/outrig-cli/src/repl.rs` gets their help lines. An id
@@ -156,7 +156,7 @@ runs, and a request that is not allowed never reaches its target.
   rule evaluates is escalated.
 - **A repo cannot redefine the operator's model names.** A repo config that replaces the global
   `[models.fast]` alias, and the `[providers.<name>]` it reaches, leaves the operator's layer
-  resolving `fast` to the global rows and the global provider's endpoint, which is what `0003-24`'s
+  resolving `fast` to the global rows and the global provider's endpoint, which is what `0003-25`'s
   evaluator reads; the merged config resolves it to the repo's, as today. A `Config` given to the
   builder with no layer kept is read as the operator's: its `[policy]` decides as a global one
   does.
