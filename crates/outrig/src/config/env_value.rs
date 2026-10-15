@@ -92,6 +92,17 @@ impl ResolvedEnvValue {
         Ok(Self { value, source })
     }
 
+    /// `value` as a literal, which is its own source. Nothing is looked up, so
+    /// a string shaped like `${VAR}` stays that text, and no value made here
+    /// can claim a reference.
+    pub fn literal(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            source: EnvValue::Literal(value.clone()),
+            value,
+        }
+    }
+
     /// The resolved value: the literal, or the referenced variable's value.
     pub fn value(&self) -> &str {
         &self.value

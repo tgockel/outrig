@@ -38,7 +38,9 @@
 //! transport, test tooling. Redo that sweep when a new engine release is
 //! supported.
 
-use crate::config::EnvValue;
+use std::collections::BTreeMap;
+
+use crate::config::{EnvValue, ResolvedEnvValue};
 use crate::process::Cmd;
 
 /// Variables podman, buildah, or the processes they run read from their own
@@ -145,6 +147,14 @@ pub(crate) fn push_keyed(
     } else {
         cmd.arg_shown_as(format!("{key}={value}"), shown)
     }
+}
+
+/// Push `flag` and each entry of `env` onto `cmd`, in key order, each in the
+/// form [`push_keyed`] picks for it.
+pub(crate) fn push_resolved(cmd: Cmd, flag: &str, env: &BTreeMap<String, ResolvedEnvValue>) -> Cmd {
+    env.iter().fold(cmd, |cmd, (key, value)| {
+        push_keyed(cmd, flag, key, value.value(), Some(value.source()))
+    })
 }
 
 /// How a diagnostic shows `value`, resolved from `source`: a reference as the

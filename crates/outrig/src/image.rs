@@ -1104,9 +1104,7 @@ fn buildah_build_cmd(
     if no_cache {
         cmd = cmd.arg("--no-cache");
     }
-    for (k, v) in build_args {
-        cmd = engine_env::push_keyed(cmd, "--build-arg", k, v.value(), Some(v.source()));
-    }
+    cmd = engine_env::push_resolved(cmd, "--build-arg", build_args);
     for (k, v) in labels {
         cmd = cmd.arg("--label").arg(format!("{k}={v}"));
     }

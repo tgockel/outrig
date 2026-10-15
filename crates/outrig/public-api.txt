@@ -613,6 +613,7 @@ pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
 pub struct outrig::config::ResolvedEnvValue
 impl outrig::config::ResolvedEnvValue
+pub fn outrig::config::ResolvedEnvValue::literal(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::ResolvedEnvValue::resolve(outrig::config::EnvValue) -> core::result::Result<Self, outrig::config::EnvValueError>
 pub fn outrig::config::ResolvedEnvValue::source(&self) -> &outrig::config::EnvValue
 pub fn outrig::config::ResolvedEnvValue::value(&self) -> &str
@@ -809,7 +810,7 @@ impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::contain
 pub fn outrig::container::ContainerCapabilities::from(&outrig::config::ContainerSecurity) -> Self
 #[non_exhaustive] pub struct outrig::container::ContainerCreateOptions
 pub outrig::container::ContainerCreateOptions::args: alloc::vec::Vec<alloc::string::String>
-pub outrig::container::ContainerCreateOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::container::ContainerCreateOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>
 pub outrig::container::ContainerCreateOptions::image: outrig::image::ImageTag
 pub outrig::container::ContainerCreateOptions::intercept_dns: bool
 pub outrig::container::ContainerCreateOptions::launch: outrig::container::ContainerLaunchSpec
@@ -853,7 +854,7 @@ pub outrig::container::ContainerWorkspace::host: std::path::PathBuf
 impl outrig::container::ContainerWorkspace
 pub fn outrig::container::ContainerWorkspace::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
 #[non_exhaustive] pub struct outrig::container::ExecOptions
-pub outrig::container::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::container::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>
 pub outrig::container::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self
@@ -1594,7 +1595,7 @@ pub fn outrig::CapabilitySpec::new(outrig::config::CapabilityProfile) -> Self
 impl core::convert::From<&outrig::CapabilitySpec> for outrig::container::ContainerCapabilities
 pub fn outrig::container::ContainerCapabilities::from(&outrig::CapabilitySpec) -> Self
 #[non_exhaustive] pub struct outrig::ExecOptions
-pub outrig::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>
 pub outrig::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self

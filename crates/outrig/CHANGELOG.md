@@ -302,6 +302,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_env` still takes plain strings, passed and shown as written, for values the caller
   chose. Nothing outrig runs itself changes: its own paths have kept each reference since 0.2.1.
 
+- **Breaking: `env` on `ExecOptions` and `ContainerCreateOptions` holds `ResolvedEnvValue`s.** The
+  field was a `BTreeMap<String, String>` with the references `with_resolved_env` had resolved kept
+  in a table beside it, so a caller who copied `options.env` into `with_env` -- to exec in a
+  sidecar with the environment it was created with, say -- left the table behind. The value then
+  went on podman's command line, readable through `/proc/<pid>/cmdline`, and into the `Process`,
+  `Canceled`, and `Spawn` errors, the `-v` transcript, and the `outrig::process` debug trace.
+  The entry now carries its reference, so a copy keeps it and the table is gone.
+
+  To migrate, a read of `options.env["K"]` becomes `options.env["K"].value()`, and
+  `env.insert(k, v)` becomes `env.insert(k, ResolvedEnvValue::literal(v))`. A
+  `with_env(options.env.clone())` no longer compiles; it becomes
+  `with_resolved_env(options.env.clone())`, the form that keeps a reference passed by name and
+  shown as `KEY=${VAR}`. `ResolvedEnvValue::literal` is new: it never claims a reference, so a
+  string shaped like `${VAR}` stays text. `with_env` still takes plain strings and passes and
+  shows each as written.
+  An entry a caller replaces in `env` is whatever its new `ResolvedEnvValue` says.
+
 - **`ConfigValidationError::BuildImageNameInvalid` carries the `BuildImageNameError` it reports,
   and is `#[non_exhaustive]`.** The variant gained a `reason` field, so 0.2.1's one-field shape
   no longer matches or constructs. Match it with `BuildImageNameInvalid { image, reason, .. }`

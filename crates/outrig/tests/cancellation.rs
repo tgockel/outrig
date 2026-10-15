@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use outrig::container::{Container, ContainerCreateOptions, ContainerLaunchSpec};
+use outrig::container::{Container, ContainerCreateOptions, ContainerLaunchSpec, ExecOptions};
 use outrig::error::OutrigError;
 use outrig::image::ImageTag;
 
@@ -1479,21 +1479,20 @@ async fn a_failed_build_reports_a_referenced_build_arg_by_name() {
     assert!(!argv.contains(secret), "{argv}");
 }
 
-/// Issue #417: an MCP `env` value that `resolve_mcp_env` resolved from a
-/// `${VAR}` reference reaches podman by name, and a failed create reports it
-/// as the reference.
-///
-/// This is the composition a library caller writes. Before 0.3 the resolver
-/// returned plain strings, which only fit `with_env`, and that passes and
-/// shows each value as written. The journal holds the argv the fake was given,
-/// which is what `/proc/<pid>/cmdline` shows every local user while a real
-/// create runs.
-#[tokio::test]
-async fn a_failed_create_reports_a_referenced_mcp_env_by_name() {
+/// A create the fake podman refuses, for `TOKEN = "${var}"` resolved by
+/// `resolve_mcp_env` and turned into options by `options`, which also gets the
+/// container's name. The error `outrig` reports names the reference and not
+/// the value, and so does the argv the fake was given -- the journal, which is
+/// what `/proc/<pid>/cmdline` shows every local user while a real create runs.
+async fn a_refused_create_names_a_referenced_env_not_its_value(
+    var: &str,
+    secret: &str,
+    options: impl FnOnce(
+        std::collections::BTreeMap<String, outrig::config::ResolvedEnvValue>,
+        &str,
+    ) -> ContainerCreateOptions,
+) {
     let journal = fake_runtime();
-
-    let var = "OUTRIG_TEST_CANCELLATION_MCP_ENV_REF";
-    let secret = "s3cret-probe-value-417";
     // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
     // races; no other test reads or writes this name.
     unsafe { std::env::set_var(var, secret) };
@@ -1510,9 +1509,7 @@ async fn a_failed_create_reports_a_referenced_mcp_env_by_name() {
         &std::collections::BTreeMap::new(),
     )
     .expect("the variable is set");
-    let options = ContainerCreateOptions::new(image(), ContainerLaunchSpec::default(), &name)
-        .with_resolved_env(env);
-    let err = Container::create_initialized(options)
+    let err = Container::create_initialized(options(env, &name))
         .await
         .expect_err("the fake refuses the create");
 
@@ -1524,4 +1521,45 @@ async fn a_failed_create_reports_a_referenced_mcp_env_by_name() {
     let (_, argv) = invocation(journal, "create", &[name.as_str()]).await;
     assert!(argv.contains(" --env TOKEN "), "{argv}");
     assert!(!argv.contains(secret), "{argv}");
+}
+
+/// Issue #417: an MCP `env` value that `resolve_mcp_env` resolved from a
+/// `${VAR}` reference reaches podman by name, and a failed create reports it
+/// as the reference.
+///
+/// This is the composition a library caller writes. Before 0.3 the resolver
+/// returned plain strings, which only fit `with_env`, and that passes and
+/// shows each value as written.
+#[tokio::test]
+async fn a_failed_create_reports_a_referenced_mcp_env_by_name() {
+    a_refused_create_names_a_referenced_env_not_its_value(
+        "OUTRIG_TEST_CANCELLATION_MCP_ENV_REF",
+        "s3cret-probe-value-417",
+        |env, name| {
+            ContainerCreateOptions::new(image(), ContainerLaunchSpec::default(), name)
+                .with_resolved_env(env)
+        },
+    )
+    .await;
+}
+
+/// Issue #476: an `env` copied from one options object into another keeps
+/// the `${VAR}` reference its value was resolved from.
+///
+/// This is the composition a library caller writes to run a sidecar with the
+/// environment an exec was built with. Held as plain strings, `env` copied
+/// into `with_env` was passed on podman's command line and shown in the
+/// error.
+#[tokio::test]
+async fn a_failed_create_reports_a_referenced_env_copied_from_exec_options_by_name() {
+    a_refused_create_names_a_referenced_env_not_its_value(
+        "OUTRIG_TEST_CANCELLATION_COPIED_ENV_REF",
+        "s3cret-field-probe-476",
+        |env, name| {
+            let exec = ExecOptions::new().with_resolved_env(env);
+            ContainerCreateOptions::new(image(), ContainerLaunchSpec::default(), name)
+                .with_resolved_env(exec.env.clone())
+        },
+    )
+    .await;
 }
