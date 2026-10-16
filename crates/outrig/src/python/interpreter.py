@@ -1072,9 +1072,9 @@ os.execve(sys.executable, [sys.executable, "-I", *sys.argv[1:]], env)
 # evidence. Reading a source distribution's metadata and building its wheel, where pip starts its
 # build backend and the two places a build can fail, remember that one did; a failure before them,
 # such as a hash that does not match, is not a failed build. The error pip raises when nothing
-# fits says why for a package whose compiled wheels are all there is of the versions asked for,
-# where nothing could be built. The note for the rest is written after pip has exited with an
-# error, as the last of its output.
+# fits says why for a package whose compiled wheels are all there is of the versions asked for, by
+# the requirement and by a `-c` constraint, where nothing could be built. The note for the rest is
+# written after pip has exited with an error, as the last of its output.
 #
 # The supported tags are left alone: widening them would make pip prefer a compiled wheel to a pure
 # fallback wheel of the same version, as `charset-normalizer` publishes. The rule for a pure
@@ -1160,12 +1160,15 @@ def guard():
     def fits(specifier, versions):
         return any(specifier.contains(Version(version), prereleases=True) for version in versions)
 
-    def stuck(cause):
-        """The project of a requirement whose versions that fit are all compiled, if it is one."""
+    def stuck(cause, constraints):
+        """The project of a requirement whose versions that fit are all compiled, if it is one.
+        The versions that fit are those the requirement and the project's `-c` constraint allow."""
         try:
             requirement = cause.requirement
             specifier = requirement.get_candidate_lookup()[1].req.specifier
             name = requirement.project_name
+            if name in constraints:
+                specifier &= constraints[name].specifier
             if fits(specifier, compiled.get(name, ())):
                 if not fits(specifier, usable.get(name, ())):
                     return name
@@ -1175,7 +1178,8 @@ def guard():
     def installation_error(self, e, *args, **kwargs):
         error = get_installation_error(self, e, *args, **kwargs)
         try:
-            names = sorted(filter(None, map(stuck, e.causes)))
+            constraints = kwargs["constraints"] if "constraints" in kwargs else args[0]
+            names = sorted(filter(None, (stuck(cause, constraints) for cause in e.causes)))
             if names and isinstance(error, DistributionNotFound):
                 rest = (
                     "the versions asked for are published only as wheels for platforms this "

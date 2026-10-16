@@ -3945,6 +3945,9 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
          wheel(index, 'mixed', tag=COMPILED, version='2.0')\n\
          # A hash that does not match, which pip finds before it builds anything.\n\
          open(os.path.join(index, 'bad.txt'), 'w').write('ext==1.0 --hash=sha256:' + '0' * 64)\n\
+         # Pins in a constraints file, which ask for the same versions as the command line does.\n\
+         open(os.path.join(index, 'pin-extonly.txt'), 'w').write('extonly==2.0\\n')\n\
+         open(os.path.join(index, 'pin-mixed.txt'), 'w').write('mixed==2.0\\n')\n\
          def said(*args, python=None):\n\
          \x20   run = pip('install', '--no-index', '--find-links', index, *args, python=python, \
                           check=False)\n\
@@ -3990,16 +3993,23 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
     );
     // The note is for a build that failed, and for versions that are not there to use. A hash that
     // does not match is found before any build, a version that does not exist is not compiled,
-    // and a project with a pure 1.0 and a compiled 2.0 is missing 2.0 for that reason.
+    // and a project with a pure 1.0 and a compiled 2.0 is missing 2.0 for that reason. A pin in a
+    // constraints file is the same version asked for as one on the command line, so it gets the
+    // same answer: none for a 2.0 that is not published at all, and the reason for one that is
+    // published only compiled, though the requirement's own specifier is met by the pure 1.0.
     let versions = "code, text = said('-r', os.path.join(index, 'bad.txt'))\n\
                     code2, text2 = said('extonly==2.0')\n\
                     code3, text3 = said('mixed==2.0')\n\
+                    code4, text4 = said('extonly', '-c', os.path.join(index, 'pin-extonly.txt'))\n\
+                    code5, text5 = said('mixed', '-c', os.path.join(index, 'pin-mixed.txt'))\n\
                     (code != 0, 'DO NOT MATCH THE HASHES' in text, 'compiled parts' in text, \
                      (code2 != 0, 'compiled parts' in text2), \
-                     (code3 != 0, 'mixed has compiled parts' in text3))";
+                     (code3 != 0, 'mixed has compiled parts' in text3), \
+                     (code4 != 0, 'compiled parts' in text4), \
+                     (code5 != 0, 'mixed has compiled parts' in text5))";
     assert_eq!(
         k.output(7, versions),
-        "(True, True, False, (True, False), (True, True))\n"
+        "(True, True, False, (True, False), (True, True), (True, False), (True, True))\n"
     );
     // The same pip run as `sys.executable -m pip` fails the same way, with no note.
     let unwrapped = "code, text = said('ext', python=sys.executable)\n\
