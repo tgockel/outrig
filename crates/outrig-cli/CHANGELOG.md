@@ -85,6 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local model's cut-off turn names its finish reason and ceiling.** With `local-llm`, a turn
+  that produced no text and no tool call -- in practice a reasoning model cut off at `max-tokens`
+  inside its `<think>` block -- was reported without the line a remote turn gets, so it was told
+  only that such a cut-off "usually" means the output-token ceiling, not which one. It now gets
+  that line first: `[outrig] the model produced no text and no tool call this turn (provider
+  finish reason: "length"); the request carried max-tokens = 256.`, or "the request carried no
+  max-tokens, so the provider's own default applied" when none was set. A local row in a model
+  alias chain is reported the same way (#459).
 - **A session record that does not parse can be removed, and no longer blames the configuration.**
   `outrig discard <sid>` and `discard --session-dir` remove it after the usual confirmation,
   which says why it is unreadable, and the refusal elsewhere reads `session record <path> is

@@ -327,7 +327,10 @@ completion. Tool-call traces stay on stderr and the prompt on the terminal, so
 A reasoning model's reasoning -- the `<think>` block `mistralrs` separates from the reply when
 the GGUF's chat template uses one -- is not streamed. A turn that produces nothing but
 reasoning, usually because it hit `max-tokens` before finishing the thought, is reported on
-stderr along with the reasoning it produced.
+stderr along with the reasoning it produced. Unless the last chunk is lost (below), the report
+opens with the finish reason `mistralrs` gave -- `length` when `max-tokens` or the model's
+context length ended the turn -- and the `max-tokens` the request carried, or says it carried
+none, in the words a remote model's report uses.
 
 A reply that stops partway through a multi-byte character, such as an emoji cut off at
 `max-tokens`, never gets its last chunk from `mistralrs` 0.8.1. That chunk would carry the reason

@@ -70,6 +70,8 @@ use rig::http_client::{
 use rig::streaming::StreamingCompletionResponse;
 use rig::wasm_compat::WasmCompatSend;
 
+use super::is_blank;
+
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
 const BASE_DELAY: Duration = Duration::from_secs(1);
 /// Ceiling on a single *backoff* delay, before jitter is applied.
@@ -499,8 +501,10 @@ impl<M: CompletionModel> RetryingModel<M> {
 /// A response carrying no text and no tool call is a turn the user paid for and
 /// cannot see. Rig treats it as an ordinary success -- `output` is the text
 /// parts concatenated, so a reasoning-only turn is simply the empty string --
-/// and every layer above here has already lost the provider's own account of
-/// what happened. This is the last point that still holds it.
+/// and every layer above the model has already lost the provider's own account
+/// of what happened. The model layer is the last point that still holds it, so
+/// that is where this runs. The in-process model reports from its own layer
+/// too, in the same words ([`textless_line`]).
 ///
 /// Deliberately keyed on the *decoded* content rather than on the finish
 /// reason: that check is free on every turn, and the raw response is only
@@ -509,32 +513,42 @@ fn report_textless_completion<R: serde::Serialize>(
     response: &CompletionResponse<R>,
     max_tokens: Option<u64>,
 ) {
-    // An empty text part is not content: it is the sentinel rig normalizes an
-    // empty provider turn into, so treating it as "the model spoke" is exactly
-    // the mistake this function exists to catch.
-    let showed_something = response.choice.iter().any(|part| match part {
-        rig::message::AssistantContent::Text(text) => !text.text.trim().is_empty(),
-        rig::message::AssistantContent::ToolCall(_) => true,
-        _ => false,
-    });
-    if showed_something {
+    if showed_something(&response.choice) {
         return;
     }
 
+    let finish_reason = provider_finish_reason(&response.raw_response);
+    eprintln!("{}", textless_line(finish_reason.as_deref(), max_tokens));
+}
+
+/// Whether a completion showed the user anything: non-blank text, or a tool
+/// call. Reasoning is not shown.
+///
+/// An empty text part is not content: it is the sentinel rig normalizes an
+/// empty provider turn into, so treating it as "the model spoke" is exactly
+/// the mistake [`report_textless_completion`] exists to catch. Blankness is
+/// [`is_blank`]'s, the question `TurnEnd::is_silent` asks of the reply.
+pub(super) fn showed_something(choice: &rig::OneOrMany<rig::message::AssistantContent>) -> bool {
+    choice.iter().any(|part| match part {
+        rig::message::AssistantContent::Text(text) => !is_blank(&text.text),
+        rig::message::AssistantContent::ToolCall(_) => true,
+        _ => false,
+    })
+}
+
+/// The line printed for a model call that showed the user nothing.
+///
+/// The one place the words live: the in-process model prints this line too, and
+/// sharing it keeps the two reports from drifting apart.
+pub(super) fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>) -> String {
+    let reason = finish_reason
+        .map(|reason| format!(" (provider finish reason: {reason:?})"))
+        .unwrap_or_default();
     let ceiling = match max_tokens {
         Some(limit) => format!("the request carried max-tokens = {limit}"),
-        None => "the request carried no max-tokens, so the provider's own default applied"
-            .to_string(),
+        None => "the request carried no max-tokens, so the provider's own default applied".into(),
     };
-    match provider_finish_reason(&response.raw_response) {
-        Some(reason) => eprintln!(
-            "[outrig] the model produced no text and no tool call this turn \
-             (provider finish reason: {reason:?}); {ceiling}."
-        ),
-        None => eprintln!(
-            "[outrig] the model produced no text and no tool call this turn; {ceiling}."
-        ),
-    }
+    format!("[outrig] the model produced no text and no tool call this turn{reason}; {ceiling}.")
 }
 
 /// The provider's own word for why generation stopped.
@@ -1807,5 +1821,59 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// The words of the report a user reads for a model call that showed them
+    /// nothing, pinned because remote and in-process models both print them.
+    /// Neither half has to have an answer: a missing finish reason costs one
+    /// clause, and a missing ceiling says so in place of a number.
+    #[test]
+    fn the_textless_line_names_the_finish_reason_and_the_ceiling() {
+        assert_eq!(
+            textless_line(Some("length"), Some(2048)),
+            "[outrig] the model produced no text and no tool call this turn \
+             (provider finish reason: \"length\"); the request carried max-tokens = 2048."
+        );
+        assert_eq!(
+            textless_line(Some("stop"), None),
+            "[outrig] the model produced no text and no tool call this turn \
+             (provider finish reason: \"stop\"); the request carried no max-tokens, so the \
+             provider's own default applied."
+        );
+        assert_eq!(
+            textless_line(None, Some(512)),
+            "[outrig] the model produced no text and no tool call this turn; \
+             the request carried max-tokens = 512."
+        );
+        assert_eq!(
+            textless_line(None, None),
+            "[outrig] the model produced no text and no tool call this turn; the request \
+             carried no max-tokens, so the provider's own default applied."
+        );
+    }
+
+    /// Only non-blank text or a tool call is something shown. Reasoning is not,
+    /// and neither is the empty text part rig turns an empty provider turn into.
+    #[test]
+    fn only_non_blank_text_or_a_tool_call_is_something_shown() {
+        use rig::message::AssistantContent;
+
+        let shown = |parts: Vec<AssistantContent>| {
+            showed_something(&rig::OneOrMany::many(parts).expect("a completion has content"))
+        };
+
+        assert!(shown(vec![AssistantContent::text("done")]));
+        assert!(shown(vec![AssistantContent::tool_call(
+            "call-1",
+            "shell__exec",
+            serde_json::json!({}),
+        )]));
+        assert!(shown(vec![
+            AssistantContent::reasoning("weighing it"),
+            AssistantContent::text("done"),
+        ]));
+        assert!(!shown(vec![AssistantContent::text("")]));
+        assert!(!shown(vec![AssistantContent::text(" \n")]));
+        assert!(!shown(vec![AssistantContent::reasoning("weighing it")]));
     }
 }

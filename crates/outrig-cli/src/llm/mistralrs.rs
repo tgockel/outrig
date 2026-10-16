@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::error::Result;
-use crate::llm::LlmResolveError;
+use crate::llm::{LlmResolveError, is_blank, retry};
 use outrig::config::MistralrsDeviceSpec;
 
 /// Thin handle around a loaded mistralrs engine. Required by Rig's
@@ -473,6 +473,10 @@ impl CompletionModel for MistralrsModel {
         &self,
         request: CompletionRequest,
     ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
+        // Read off the request before it is consumed, as `RetryingModel` does
+        // for a remote turn: a reply that showed nothing is reported with the
+        // ceiling that was in force.
+        let max_tokens = request.max_tokens;
         let (tx, mut rx) = mpsc::channel::<Response>(1);
         let normal = build_normal_request(request, tx, false)?;
         let request_for_engine = Request::Normal(Box::new(normal));
@@ -485,7 +489,19 @@ impl CompletionModel for MistralrsModel {
             )
         })?;
 
-        translate_response(response)
+        let finish_reason = finish_reason_of(&response).map(str::to_string);
+        let completion = translate_response(response)?;
+        // The primary agent streams, so this is the path of a local row in a
+        // model alias chain. Nothing wraps that row in `RetryingModel`, and the
+        // chain erases `raw_response` past here, so this is the last place that
+        // can name the finish reason and the ceiling that ended the turn.
+        if !retry::showed_something(&completion.choice) {
+            eprintln!(
+                "{}",
+                retry::textless_line(finish_reason.as_deref(), max_tokens)
+            );
+        }
+        Ok(completion)
     }
 
     async fn stream(
@@ -493,13 +509,16 @@ impl CompletionModel for MistralrsModel {
         request: CompletionRequest,
     ) -> std::result::Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
+        // Read off the request before it is consumed; see `completion`.
+        let max_tokens = request.max_tokens;
         let (tx, rx) = mpsc::channel::<Response>(1);
         let normal = build_normal_request(request, tx, true)?;
         let request_for_engine = Request::Normal(Box::new(normal));
 
         dispatch_request(self.engine.clone(), request_for_engine).await?;
 
-        Ok(StreamingCompletionResponse::stream(response_stream(rx)))
+        let stream = response_stream(rx, max_tokens);
+        Ok(StreamingCompletionResponse::stream(stream))
     }
 }
 
@@ -510,7 +529,13 @@ impl CompletionModel for MistralrsModel {
 /// wrap it in a [`StreamingCompletionResponse`]; it is returned unwrapped
 /// because that wrapper drops every final response after the first, and a test
 /// needs to see whether a second one was sent.
-fn response_stream(mut rx: mpsc::Receiver<Response>) -> StreamingResult<MistralrsStreamResponse> {
+///
+/// `max_tokens` is the ceiling the request carried, which the report on a reply
+/// that showed nothing names.
+fn response_stream(
+    mut rx: mpsc::Receiver<Response>,
+    max_tokens: Option<u64>,
+) -> StreamingResult<MistralrsStreamResponse> {
     Box::pin(async_stream::try_stream! {
         let mut state = MistralrsStreamState::default();
         while let Some(response) = rx.recv().await {
@@ -534,6 +559,16 @@ fn response_stream(mut rx: mpsc::Receiver<Response>) -> StreamingResult<Mistralr
                  multi-byte character, such as an emoji cut off at max-tokens."
             );
             yield RawStreamingChoice::FinalResponse(MistralrsStreamResponse { usage: None });
+        }
+        // The report a remote turn gets from `RetryingModel`, for a reply that
+        // was all reasoning, such as one cut off at `max-tokens` inside its
+        // `<think>` block. It is made here and not by `run_turn_streaming_inner`
+        // because rig forwards a turn's final response to its caller only when
+        // the turn streamed text, so nothing above the model ever sees this
+        // turn's finish reason. Rig reads this stream to its end, so this runs
+        // before the turn does.
+        if let Some(line) = state.textless_report(max_tokens) {
+            eprintln!("{line}");
         }
     })
 }
@@ -855,6 +890,10 @@ fn translate_stream_response(
 struct MistralrsStreamState {
     saw_chunk: bool,
     saw_final_response: bool,
+    /// Non-blank text or a tool call has streamed; reasoning does not count.
+    showed_something: bool,
+    /// The first finish reason mistralrs reported for the reply.
+    finish_reason: Option<String>,
 }
 
 impl MistralrsStreamState {
@@ -863,6 +902,9 @@ impl MistralrsStreamState {
         response: Response,
     ) -> std::result::Result<Vec<RawStreamingChoice<MistralrsStreamResponse>>, CompletionError>
     {
+        if self.finish_reason.is_none() {
+            self.finish_reason = finish_reason_of(&response).map(str::to_string);
+        }
         let items = match response {
             Response::Chunk(chunk) => {
                 self.saw_chunk = true;
@@ -880,6 +922,11 @@ impl MistralrsStreamState {
             other => translate_stream_response(other)?,
         };
 
+        self.showed_something |= items.iter().any(|item| match item {
+            RawStreamingChoice::Message(text) => !is_blank(text),
+            RawStreamingChoice::ToolCall(_) => true,
+            _ => false,
+        });
         if items
             .iter()
             .any(|item| matches!(item, RawStreamingChoice::FinalResponse(_)))
@@ -888,6 +935,26 @@ impl MistralrsStreamState {
         }
 
         Ok(items)
+    }
+
+    /// The report for a reply that ended on a final response and showed the user
+    /// nothing, in the words a remote turn's report uses.
+    ///
+    /// A stream that ended without one had its last chunk dropped, so it may be
+    /// missing some of its reply; [`response_stream`] warns about that instead.
+    fn textless_report(&self, max_tokens: Option<u64>) -> Option<String> {
+        (self.saw_final_response && !self.showed_something)
+            .then(|| retry::textless_line(self.finish_reason.as_deref(), max_tokens))
+    }
+}
+
+/// Why mistralrs says a reply ended: the finish reason on a streamed reply's
+/// last chunk, or on a whole reply.
+fn finish_reason_of(response: &Response) -> Option<&str> {
+    match response {
+        Response::Chunk(chunk) => chunk.choices.first()?.finish_reason.as_deref(),
+        Response::Done(chat) => Some(chat.choices.first()?.finish_reason.as_str()),
+        _ => None,
     }
 }
 
@@ -1508,13 +1575,14 @@ mod tests {
 
         async fn stream(
             &self,
-            _request: CompletionRequest,
+            request: CompletionRequest,
         ) -> std::result::Result<
             StreamingCompletionResponse<Self::StreamingResponse>,
             CompletionError,
         > {
             let rx = scripted_channel((self.0)());
-            Ok(StreamingCompletionResponse::stream(response_stream(rx)))
+            let stream = response_stream(rx, request.max_tokens);
+            Ok(StreamingCompletionResponse::stream(stream))
         }
     }
 
@@ -1589,7 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_closed_before_its_final_chunk_ends_on_a_final_response() {
         let rx = scripted_channel(vec![stream_chunk(Some("Here is a crab: "), None, None, None)]);
-        let mut stream = StreamingCompletionResponse::stream(response_stream(rx));
+        let mut stream = StreamingCompletionResponse::stream(response_stream(rx, None));
 
         let items: Vec<_> = stream.by_ref().collect().await;
 
@@ -1625,7 +1693,7 @@ mod tests {
             Some(usage()),
         )]);
 
-        let items: Vec<_> = response_stream(rx).collect().await;
+        let items: Vec<_> = response_stream(rx, None).collect().await;
 
         assert!(
             matches!(
@@ -1668,6 +1736,163 @@ mod tests {
             String::from_utf8_lossy(&stdout),
         );
         assert!(end.is_silent(), "no text and no stop reason: {end:?}");
+    }
+
+    /// `response`, a whole reply, finished for `reason` rather than `stop`.
+    fn finishing(response: Response, reason: &str) -> Response {
+        let Response::Done(mut chat) = response else {
+            unreachable!("only a whole reply is built by `chat_done`");
+        };
+        chat.choices[0].finish_reason = reason.to_string();
+        Response::Done(chat)
+    }
+
+    /// What `response_stream` prints once it has read `script`, if it prints
+    /// anything for a reply that showed the user nothing.
+    fn streamed_report(script: Vec<Response>, max_tokens: Option<u64>) -> Option<String> {
+        let mut state = MistralrsStreamState::default();
+        for response in script {
+            state.translate(response).expect("the script translates");
+        }
+        state.textless_report(max_tokens)
+    }
+
+    /// A reasoning model cut off at `max-tokens` inside its `<think>` block
+    /// streams reasoning and a `length` finish, and rig forwards nothing of that
+    /// to the turn: this report is the only place either is named.
+    #[test]
+    fn a_stream_cut_off_inside_its_reasoning_names_the_finish_reason_and_the_ceiling() {
+        let report = streamed_report(
+            vec![
+                with_reasoning(stream_chunk(None, None, None, None), "weighing "),
+                with_reasoning(
+                    stream_chunk(None, None, Some("length"), Some(usage())),
+                    "the options",
+                ),
+            ],
+            Some(2048),
+        );
+
+        assert_eq!(
+            report,
+            Some(retry::textless_line(Some("length"), Some(2048)))
+        );
+    }
+
+    /// Text or a tool call on any chunk is something shown, however the chunk
+    /// with the finish reason ends the reply.
+    #[test]
+    fn a_stream_that_showed_text_or_a_tool_call_is_not_reported() {
+        let text_then_reasoning = vec![
+            stream_chunk(Some("hel"), None, None, None),
+            with_reasoning(
+                stream_chunk(None, None, Some("stop"), Some(usage())),
+                "done",
+            ),
+        ];
+        let calls = vec![stream_chunk(
+            None,
+            Some(vec![tool_call("foo", "{}")]),
+            Some("tool_calls"),
+            Some(usage()),
+        )];
+
+        assert_eq!(streamed_report(text_then_reasoning, Some(2048)), None);
+        assert_eq!(streamed_report(calls, Some(2048)), None);
+    }
+
+    #[test]
+    fn a_stream_of_only_whitespace_is_reported() {
+        let chunk = stream_chunk(Some(" \n"), None, Some("stop"), Some(usage()));
+
+        assert_eq!(
+            streamed_report(vec![chunk], None),
+            Some(retry::textless_line(Some("stop"), None)),
+        );
+    }
+
+    /// A reply with no finish reason is reported without one, not with a made-up
+    /// one.
+    #[test]
+    fn a_stream_that_names_no_finish_reason_is_reported_without_one() {
+        let chunk = stream_chunk(None, None, None, Some(usage()));
+
+        assert_eq!(
+            streamed_report(vec![chunk], None),
+            Some(retry::textless_line(None, None)),
+        );
+    }
+
+    /// Rig keeps only the first final response of a stream, and the report
+    /// keeps only the first finish reason: a later response does not replace it.
+    #[test]
+    fn the_first_finish_reason_stands() {
+        let script = vec![
+            stream_chunk(None, None, Some("length"), Some(usage())),
+            chat_done(None, None),
+        ];
+
+        assert_eq!(
+            streamed_report(script, None),
+            Some(retry::textless_line(Some("length"), None)),
+        );
+    }
+
+    /// When mistralrs drops the last chunk the reply may be partly missing, so
+    /// "no text" could be false. The warning for that case is the only report.
+    #[test]
+    fn a_stream_whose_last_chunk_was_dropped_is_not_reported_as_textless() {
+        let chunk = with_reasoning(stream_chunk(None, None, None, None), "weighing");
+
+        assert_eq!(streamed_report(vec![chunk], Some(2048)), None);
+    }
+
+    /// A whole reply sent to a streaming request carries its finish reason on
+    /// the reply, not on a chunk.
+    #[test]
+    fn a_whole_reply_on_the_stream_path_names_its_finish_reason() {
+        let done = finishing(with_reasoning(chat_done(None, None), "weighing"), "length");
+
+        assert_eq!(
+            streamed_report(vec![done], Some(2048)),
+            Some(retry::textless_line(Some("length"), Some(2048))),
+        );
+    }
+
+    /// `completion`, the path of a local row in a model alias chain, reads the
+    /// finish reason from the whole reply before translating it away.
+    #[test]
+    fn the_finish_reason_is_read_off_a_chunk_and_off_a_whole_reply() {
+        let chunk = |reason| stream_chunk(Some("hi"), None, reason, None);
+        let internal_error = Response::InternalError(Box::new(std::io::Error::other("boom")));
+
+        assert_eq!(finish_reason_of(&chunk(Some("length"))), Some("length"));
+        assert_eq!(finish_reason_of(&chunk(None)), None);
+        assert_eq!(
+            finish_reason_of(&finishing(chat_done(Some("hi"), None), "length")),
+            Some("length"),
+        );
+        assert_eq!(finish_reason_of(&internal_error), None);
+    }
+
+    /// What `completion` judges a whole reply by is what `translate_response`
+    /// makes of it: reasoning is not shown, and an empty reply is the
+    /// empty-text sentinel.
+    #[test]
+    fn a_whole_reply_shows_the_user_text_or_a_tool_call_and_not_reasoning() {
+        let shown = |done| {
+            let completion = translate_response(done).expect("response translates");
+            retry::showed_something(&completion.choice)
+        };
+
+        assert!(shown(chat_done(Some("an answer"), None)));
+        assert!(shown(chat_done(None, Some(vec![tool_call("foo", "{}")]))));
+        assert!(!shown(chat_done(None, None)));
+        assert!(!shown(chat_done(Some(" \n"), None)));
+        assert!(!shown(with_reasoning(
+            chat_done(None, None),
+            "weighing the options"
+        )));
     }
 
     fn files(names: &[&str]) -> Vec<String> {
