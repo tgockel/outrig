@@ -443,7 +443,7 @@ async fn logs_reports_unreadable_record_rather_than_not_found() {
         .expect_err("an unreadable record is not a clean miss");
     let msg = err.to_string();
     assert!(
-        msg.contains("could not be read") && msg.contains(bad.as_str()),
+        msg.contains("is unreadable") && msg.contains(bad.as_str()),
         "should name the unreadable entry; got: {msg}"
     );
     assert!(msg.contains("image_tag"), "and the reason; got: {msg}");
@@ -871,6 +871,7 @@ fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
         yes,
         build_containers: false,
         session: None,
+        unreadable: false,
     }
 }
 
@@ -2277,4 +2278,371 @@ async fn discard_session_dir_through_a_symlinked_ancestor_whose_destination_is_g
         .await
         .expect("discard");
     assert!(!link_exists(&store, &sid));
+}
+
+// -------- #261: an unreadable session record --------
+
+/// A session whose `session.json` was cut off mid-write, under an id that
+/// encodes a start time well before `clean_now()`.
+fn unreadable_session(root: &std::path::Path) -> (SessionStore, SessionId, PathBuf) {
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+    let record = dir.join("session.json");
+    let len = std::fs::metadata(&record).expect("stat").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .expect("open")
+        .set_len(len / 2)
+        .expect("truncate");
+    (store, sid, dir)
+}
+
+/// `unreadable_session`, cut just past `container_name`, with that name set
+/// to `container` -- an `outrig mcp --attach` record, which borrows one.
+fn unreadable_session_naming(
+    root: &std::path::Path,
+    container: &str,
+) -> (SessionStore, SessionId, PathBuf) {
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let mut session = sample_session(&sid);
+    session.container_name = container.to_string();
+    let dir = store.create(&sid, None, &mut session).expect("create");
+    let record = dir.join("session.json");
+    let text = std::fs::read_to_string(&record).expect("read");
+    let cut = text.find("\"image_tag\"").expect("image_tag") - 1;
+    std::fs::write(&record, &text[..cut]).expect("truncate");
+    (store, sid, dir)
+}
+
+#[tokio::test]
+async fn discard_by_id_removes_an_unreadable_record_and_says_why() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(&b"y\n"[..]);
+    let args = args_for_id(sid.as_str(), false);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, "outrig-20260501T141907-9b1c");
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+    drop(ew);
+
+    assert!(!dir.exists(), "the unreadable record should be removed");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("session.json is unreadable"), "{err}");
+    assert!(!err.contains("configuration:"), "{err}");
+}
+
+#[tokio::test]
+async fn discard_by_id_refuses_an_unreadable_record_whose_container_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(true) })
+        .await
+        .expect_err("a running container refuses");
+    assert!(err.to_string().contains("still running"), "{err}");
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn discard_session_dir_removes_an_unreadable_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, "outrig-20260501T141907-9b1c");
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn an_unreadable_record_is_not_blamed_on_the_configuration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = unreadable_session(tmp.path());
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, sid.as_str())
+        .expect_err("the record cannot be read");
+    let text = err.to_string();
+    assert!(text.starts_with("session record "), "{text}");
+    assert!(text.contains("is unreadable"), "{text}");
+}
+
+async fn run_clean(
+    store: &SessionStore,
+    args: &clean::CleanArgs,
+    running: BTreeSet<String>,
+    labeled: Vec<clean::LabeledContainer>,
+) -> String {
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        store,
+        args,
+        clean_now(),
+        running,
+        labeled,
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    drain(stderr_r).await
+}
+
+#[tokio::test]
+async fn clean_yes_alone_leaves_an_unreadable_record_and_names_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let err = run_clean(
+        &store,
+        &clean_args(days(30), true),
+        BTreeSet::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(dir.exists(), "-y must not remove what it cannot show");
+    assert!(
+        err.contains(sid.as_str()) && err.contains("--unreadable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_unreadable_removes_the_record_past_the_cutoff() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let err = run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(!dir.exists(), "{err}");
+    assert!(err.contains("unreadable session record"), "{err}");
+    assert!(err.contains(sid.as_str()), "{err}");
+}
+
+#[tokio::test]
+async fn clean_unreadable_keeps_a_recent_record_and_a_running_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    // Younger than the cutoff relative to the encoded start time.
+    let young = clean::CleanArgs {
+        older_than: days(100_000),
+        ..clean_args(days(1), true)
+    };
+    let young = clean::CleanArgs {
+        unreadable: true,
+        ..young
+    };
+    run_clean(&store, &young, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists(), "a record inside the cutoff stays");
+
+    let running = BTreeSet::from(["outrig-20260501T141907-9b1c".to_string()]);
+    let err = run_clean(&store, &args, running, Vec::new()).await;
+    assert!(dir.exists(), "a running session's record stays");
+    assert!(err.contains("skipped running sessions"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_never_removes_an_unreadable_entry_that_is_not_a_session_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let dir = tmp.path().join("sessions").join("not-a-session");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("session.json"), b"{").expect("write");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn clean_does_not_sweep_the_container_of_a_record_it_kept() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = unreadable_session(tmp.path());
+    let stopped = clean::LabeledContainer {
+        name: format!("outrig-{sid}"),
+        session_label: sid.to_string(),
+        sidecar_label: None,
+        running: false,
+        created: clean_now() - days(40),
+    };
+
+    // `no_removals` panics if the container were handed to `podman rm`.
+    run_clean(
+        &store,
+        &clean_args(days(30), true),
+        BTreeSet::new(),
+        vec![stopped],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unreadable_attach_record_is_checked_by_its_borrowed_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session_naming(tmp.path(), "borrowed-db");
+
+    // discard asks about the container the record named, not outrig-<sid>.
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        Ok(name == "borrowed-db")
+    })
+    .await
+    .expect_err("the borrowed container is running");
+    assert!(err.to_string().contains("borrowed-db"), "{err}");
+    assert!(dir.exists());
+
+    // clean sees it among the running containers, too.
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+    let running = BTreeSet::from(["borrowed-db".to_string()]);
+    let err = run_clean(&store, &args, running, Vec::new()).await;
+    assert!(dir.exists(), "{err}");
+    assert!(err.contains("skipped running sessions"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_keeps_an_unreadable_record_that_does_not_name_its_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+    // The issue's repro: cut before `container_name` is reached.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("session.json"))
+        .expect("open")
+        .set_len(60)
+        .expect("truncate");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let err = run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists(), "{err}");
+    assert!(err.contains("does not say which container"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_does_not_take_a_short_timestamp_for_a_session_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let dir = tmp.path().join("sessions").join("20260501T14190-9b1c");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("session.json"), b"{").expect("write");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn clean_unreadable_sweeps_the_removed_records_stopped_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session_naming(tmp.path(), "outrig-20260501T141907-9b1c");
+    let stopped = clean::LabeledContainer {
+        name: format!("outrig-{sid}"),
+        session_label: sid.to_string(),
+        sidecar_label: None,
+        running: false,
+        created: clean_now() - days(40),
+    };
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        clean_now(),
+        BTreeSet::new(),
+        vec![stopped],
+        Vec::new(),
+        |names| async move {
+            assert_eq!(names, vec!["outrig-20260501T141907-9b1c".to_string()]);
+            Ok(Vec::new())
+        },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    assert!(!dir.exists(), "{}", drain(stderr_r).await);
+}
+
+#[tokio::test]
+async fn discard_yes_still_warns_when_an_unreadable_record_names_no_container() {
+    for by_dir in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (store, sid, dir) = unreadable_session(tmp.path());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("session.json"))
+            .expect("open")
+            .set_len(60)
+            .expect("truncate");
+
+        let (mut ew, stderr_r) = duplex(4096);
+        let stdin = tokio::io::BufReader::new(tokio::io::empty());
+        let args = if by_dir {
+            args_for_dir(&dir, true)
+        } else {
+            args_for_id(sid.as_str(), true)
+        };
+        discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+            .await
+            .expect("discard");
+        drop(ew);
+
+        let err = drain(stderr_r).await;
+        assert!(
+            err.contains("does not name its container") && err.contains("outrig-20260501T141907"),
+            "by_dir={by_dir}: {err}"
+        );
+        assert!(!dir.exists());
+    }
 }

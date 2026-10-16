@@ -45,7 +45,7 @@ where
 {
     let listing = store.list()?;
     for skipped in &listing.skipped {
-        let line = format!("[outrig] skipping {}: {}\n", skipped.entry, skipped.reason);
+        let line = format!("[outrig] skipping {}: {}\n", skipped.entry, skipped.reason());
         stderr.write_all(line.as_bytes()).await?;
     }
     for link in &listing.dangling {

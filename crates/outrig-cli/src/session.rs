@@ -24,7 +24,8 @@ use crate::paths::{
     default_session_root, load_global_or_empty, report_config_warnings, resolve_global_config,
 };
 use outrig::config::Config;
-use outrig::error::{IoPathExt, OutrigError, Result};
+use crate::error::{CliError, Result};
+use outrig::error::{IoPathExt, OutrigError};
 
 const SESSION_JSON: &str = "session.json";
 /// The session's log directory. Everything outrig logs for a session -- MCP
@@ -52,6 +53,24 @@ impl SessionId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The start time `name` encodes, when it has the shape [`SessionId::new`]
+    /// gives: `None` for anything else, which is how a directory that is not
+    /// a session's is told from one whose record is lost.
+    pub fn started_at(name: &str) -> Option<SystemTime> {
+        let (ts, rand) = name.split_once('-')?;
+        if rand.len() != 4 || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", ts).ok()?;
+        // `strptime` accepts short fields (`14190` for a second), so only the
+        // exact text `new` writes counts as a session id.
+        if civil.strftime("%Y%m%dT%H%M%S").to_string() != ts {
+            return None;
+        }
+        let zoned = civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+        Some(SystemTime::from(zoned.timestamp()))
     }
 }
 
@@ -130,7 +149,48 @@ pub struct Session {
 pub struct SkippedSession {
     /// The `<sid>` directory name under the session root.
     pub entry: String,
-    pub reason: String,
+    /// The directory holding the record -- the link's target for a link.
+    pub dir: PathBuf,
+    /// Whether `<root>/<entry>` is a symlink to `dir`.
+    pub linked: bool,
+    /// The `container_name` text found in the damaged record, when it got that
+    /// far. An `outrig mcp --attach` session records the borrowed container's
+    /// name, not `outrig-<sid>`, so only this says what to check for running.
+    pub recorded_container: Option<String>,
+    /// Why the record could not be read: a [`CliError::SessionRecord`] for a
+    /// record that does not parse, an I/O error for one that could not be read.
+    pub error: CliError,
+}
+
+impl SkippedSession {
+    pub fn id(&self) -> SessionId {
+        SessionId(self.entry.clone())
+    }
+
+    /// The container the session would have run in. The record that would name
+    /// it is unreadable, so this is the name `outrig run` gives every session
+    /// it creates.
+    pub fn container_name(&self) -> String {
+        self.recorded_container
+            .clone()
+            .unwrap_or_else(|| format!("outrig-{}", self.entry))
+    }
+
+    /// Whether [`SkippedSession::container_name`] is what the record said,
+    /// rather than the name `outrig run` would have given. When it is not, an
+    /// attach session's borrowed container cannot be ruled out.
+    pub fn container_known(&self) -> bool {
+        self.recorded_container.is_some()
+    }
+
+    /// Why the record is unreadable, without the `session record <path> is
+    /// unreadable:` framing that the path-naming errors carry.
+    pub fn reason(&self) -> String {
+        match &self.error {
+            CliError::SessionRecord { source, .. } => source.to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// A `<root>/<sid>` symlink, left by `--session-dir`, whose target directory
@@ -212,7 +272,7 @@ impl SessionStore {
                 return Err(OutrigError::Configuration(format!(
                     "--session-dir {} exists and is not a directory",
                     dir.display()
-                )));
+                )).into());
             }
             fs::create_dir_all(dir).path_ctx("create directory", dir)?;
             if dir.join(SESSION_JSON).exists() {
@@ -220,14 +280,14 @@ impl SessionStore {
                     "--session-dir {} holds an earlier session's record; discard that \
                      session first, or name a new or empty directory",
                     dir.display()
-                )));
+                )).into());
             }
             if let Some(first) = dir_names(dir)?.first() {
                 return Err(OutrigError::Configuration(format!(
                     "--session-dir {} is not empty (it holds {first}); name a new or \
                      empty directory",
                     dir.display()
-                )));
+                )).into());
             }
         }
         fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
@@ -288,7 +348,7 @@ impl SessionStore {
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e).path_ctx("read directory", &self.root),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
         for entry in entries {
             let entry = entry?;
@@ -300,7 +360,7 @@ impl SessionStore {
                     session.link_target = link_target;
                     out.sessions.push(session);
                 }
-                Err(OutrigError::Path { source, .. })
+                Err(CliError::Outrig(OutrigError::Path { source, .. }))
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
                     if link_target.is_some() && !resolved.exists() {
@@ -315,14 +375,14 @@ impl SessionStore {
                     }
                     continue;
                 }
-                Err(e) => out.skipped.push(SkippedSession {
+                Err(error) => out.skipped.push(SkippedSession {
                     entry: entry.file_name().to_string_lossy().into_owned(),
-                    // Unwrap the `configuration:` framing: this is a stale
-                    // record, not something the user misconfigured.
-                    reason: match e {
-                        OutrigError::Configuration(msg) => msg,
-                        other => other.to_string(),
-                    },
+                    linked: link_target.is_some(),
+                    recorded_container: fs::read(resolved.join(SESSION_JSON))
+                        .ok()
+                        .and_then(|bytes| salvage_container_name(&bytes)),
+                    dir: resolved,
+                    error,
                 }),
             }
         }
@@ -411,7 +471,7 @@ impl SessionStore {
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(left),
-            Err(e) => return Err(e).path_ctx("read directory", &self.root),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
         for entry in entries {
             let entry = entry?;
@@ -459,7 +519,7 @@ fn remove_record(dir: &Path) -> Result<Vec<String>> {
         if let Err(e) = removed
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(e).path_ctx("remove", &path);
+            return Err(e).path_ctx("remove", &path).map_err(CliError::from);
         }
     }
     // `remove_dir` is the emptiness check: it fails rather than remove
@@ -469,7 +529,7 @@ fn remove_record(dir: &Path) -> Result<Vec<String>> {
         Err(e) => {
             let left = dir_names(dir)?;
             if left.is_empty() {
-                Err(e).path_ctx("remove", dir)
+                Err(e).path_ctx("remove", dir).map_err(CliError::from)
             } else {
                 Ok(left)
             }
@@ -497,7 +557,7 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).path_ctx("stat", path),
+        Err(e) => return Err(e).path_ctx("stat", path).map_err(CliError::from),
     };
     if meta.file_type().is_symlink() {
         let tgt = fs::read_link(path).path_ctx("read symlink", path)?;
@@ -574,10 +634,31 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// The string value of `"container_name"` in a record that no longer parses --
+/// truncated after it, or broken somewhere else -- or `None` when the text
+/// never gets that far or the value is not closed.
+fn salvage_container_name(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let rest = text.split_once("\"container_name\"")?.1;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let body = rest.strip_prefix('"')?;
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return serde_json::from_str(&rest[..at + 2]).ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn read_session_json(path: &Path) -> Result<Session> {
     let bytes = fs::read(path).path_ctx("read", path)?;
-    serde_json::from_slice::<Session>(&bytes).map_err(|e| {
-        OutrigError::Configuration(format!("session.json at {}: {}", path.display(), e))
+    serde_json::from_slice::<Session>(&bytes).map_err(|source| CliError::SessionRecord {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -596,7 +677,9 @@ fn stage_session_json(dir: &Path, session: &Session) -> Result<tempfile::NamedTe
 /// Atomic write: [`stage_session_json`], then rename over whatever
 /// `session.json` is there.
 fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
-    stage_session_json(dir, session)?.persist(dir.join(SESSION_JSON))?;
+    stage_session_json(dir, session)?
+        .persist(dir.join(SESSION_JSON))
+        .map_err(OutrigError::from)?;
     Ok(())
 }
 
@@ -612,9 +695,10 @@ fn claim_session_json(dir: &Path, session: &Session) -> Result<()> {
                 "--session-dir {} was claimed by another session that started at the \
                  same moment; name a different directory",
                 dir.display()
-            )))
+            ))
+            .into())
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(OutrigError::from(e).into()),
     }
 }
 

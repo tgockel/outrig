@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use clap::{ArgGroup, Parser};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::{OutrigError, Result};
-use crate::session::{self, DanglingLink, Session, SessionStore};
+use crate::error::{CliError, OutrigError, Result};
+use crate::session::{self, DanglingLink, Session, SessionStore, SkippedSession};
 use outrig::container::Container;
 use outrig::error::IoPathExt;
 
@@ -66,6 +66,18 @@ where
 {
     let target = resolve_target(args, store)?;
 
+    // Outside the confirmation, which `--yes` skips: the warning is about what
+    // the check could not see, and it is owed however the removal is approved.
+    if target.container_unverified {
+        let msg = format!(
+            "[outrig] warning: the unreadable record does not name its container, so only {} \
+             was checked; an `outrig mcp --attach` session's borrowed container would not \
+             have been\n",
+            target.container_name
+        );
+        stderr.write_all(msg.as_bytes()).await?;
+    }
+
     if is_running(target.container_name.clone()).await? {
         return Err(OutrigError::Configuration(format!(
             "session {} is still running (container {}); stop it before discarding",
@@ -74,7 +86,9 @@ where
         .into());
     }
 
-    if !args.yes && !confirm(stderr, stdin, &target.dir).await? {
+    if !args.yes
+        && !confirm(stderr, stdin, &target.dir, target.unreadable.as_deref()).await?
+    {
         stderr.write_all(b"[outrig] aborted\n").await?;
         return Ok(0);
     }
@@ -103,12 +117,25 @@ where
     Ok(0)
 }
 
-async fn confirm<E, R>(stderr: &mut E, mut stdin: R, dir: &Path) -> Result<bool>
+async fn confirm<E, R>(
+    stderr: &mut E,
+    mut stdin: R,
+    dir: &Path,
+    unreadable: Option<&str>,
+) -> Result<bool>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    let prompt = format!("Discard {}? [y/N]: ", dir.display());
+    // Say why before asking: this is the one removal whose record the user
+    // has not been shown, and what outrig could not read in it.
+    let prompt = match unreadable {
+        Some(reason) => format!(
+            "Discard {} (its session.json is unreadable: {reason})? [y/N]: ",
+            dir.display()
+        ),
+        None => format!("Discard {}? [y/N]: ", dir.display()),
+    };
     stderr.write_all(prompt.as_bytes()).await?;
     stderr.flush().await?;
     let mut line = String::new();
@@ -130,6 +157,12 @@ struct Target {
     dangling: Vec<DanglingLink>,
     /// The container the discard would pull the record out from under.
     container_name: String,
+    /// Why the record could not be read, when it could not.
+    unreadable: Option<String>,
+    /// The damaged record does not name its container, so `container_name` is
+    /// a guess an `outrig mcp --attach` session's borrowed container would
+    /// not match.
+    container_unverified: bool,
 }
 
 fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
@@ -157,13 +190,31 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
                 linked: true,
                 container_name: first.container_name(),
                 dangling: links,
+                unreadable: None,
+            container_unverified: false,
             });
         }
-        let session = store.get_by_path(dir)?;
         // Given a symlink, the record is in the directory it names, so that is
         // the one the prompt and the report have to name.
-        let dir = std::fs::canonicalize(dir).path_ctx("resolve", dir)?;
-        return Ok(Target::from_session(dir, session));
+        let canon = std::fs::canonicalize(dir).path_ctx("resolve", dir)?;
+        return match store.get_by_path(dir) {
+            Ok(session) => Ok(Target::from_session(canon, session)),
+            Err(err @ CliError::SessionRecord { .. }) => {
+                // With no record to name the container, the entry that links
+                // here is the session id. Nothing linking here leaves nothing
+                // to check a running container against, so it stays.
+                let skipped = store
+                    .list()?
+                    .skipped
+                    .into_iter()
+                    .find(|s| std::fs::canonicalize(&s.dir).is_ok_and(|d| d == canon));
+                let Some(skipped) = skipped else {
+                    return Err(err);
+                };
+                Ok(Target::from_unreadable(canon, skipped))
+            }
+            Err(err) => Err(err),
+        };
     }
     let Some(query) = args.session.as_deref() else {
         return Err(OutrigError::Configuration(
@@ -179,7 +230,10 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
             linked: true,
             container_name: link.container_name(),
             dangling: vec![link],
+            unreadable: None,
+            container_unverified: false,
         },
+        super::Found::Unreadable(skipped) => Target::from_unreadable(skipped.dir.clone(), *skipped),
     })
 }
 
@@ -234,6 +288,20 @@ impl Target {
             dangling: Vec::new(),
             container_name: session.container_name,
             id: session.id,
+            unreadable: None,
+            container_unverified: false,
+        }
+    }
+
+    fn from_unreadable(dir: PathBuf, skipped: SkippedSession) -> Self {
+        Self {
+            dir,
+            linked: skipped.linked,
+            dangling: Vec::new(),
+            container_name: skipped.container_name(),
+            id: skipped.id(),
+            container_unverified: !skipped.container_known(),
+            unreadable: Some(skipped.reason()),
         }
     }
 }

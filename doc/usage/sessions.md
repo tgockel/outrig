@@ -123,7 +123,8 @@ exit status is 0 -- skipping applies to reading and parsing a `session.json`, wh
 reported rather than failed on. A fault reaching the entry at all (an unreadable session
 root, or a directory entry outrig can't stat) is still an error. `outrig clean` treats an
 unreadable record as still owning its container, so the container is not swept up as a
-stray.
+stray. `outrig discard <sid>` removes such a record after the usual confirmation, which says why
+it is unreadable, and `outrig clean --unreadable` removes the ones past the cutoff.
 
 Override the root for a single invocation with `--session-root`:
 
@@ -327,6 +328,12 @@ remove the session directory, while sessions created with `--session-dir` remove
 symlink target and the symlink under the session root. A directory that holds anything besides
 the record stays, and clean says what it kept. Running sessions are skipped so cleanup doesn't
 race a live `outrig run` or `outrig mcp` writer.
+
+A record outrig cannot read is not shown to you, so `--yes` does not remove it: `clean` names
+it and leaves it. Add `--unreadable` to have it previewed and removed with the rest, aged by the
+start time in its directory name; an entry whose name is not a session id is never removed, and
+neither is a record too damaged to say which container it owns -- `outrig discard <sid>` removes
+that one.
 
 Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
 carrying the `org.outrig.session` label whose session record no longer exists (a lost record,

@@ -42,6 +42,17 @@ pub enum CliError {
     #[error("mcp server initialize: {0}")]
     McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
 
+    /// A session's `session.json` exists but does not parse -- a hand edit, a
+    /// corrupted file, or a record from an outrig whose schema renamed a
+    /// required field. Not a configuration fault, so it is not an
+    /// [`OutrigError::Configuration`]: nothing the user configured is wrong.
+    #[error("session record {} is unreadable: {source}", path.display())]
+    SessionRecord {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("agent prompt failed: {0}")]
     Prompt(rig::completion::PromptError),
 

@@ -5,6 +5,7 @@ use std::sync::Barrier;
 use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
+use outrig_cli::error::CliError;
 use outrig_cli::session::{SessionId, SessionStore};
 
 mod common;
@@ -83,7 +84,7 @@ fn explicit_path_with_existing_session_json_errors() {
         .create(&sid, Some(explicit.path()), &mut session)
         .expect_err("create should refuse");
     match err {
-        OutrigError::Configuration(msg) => {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
             assert!(
                 msg.contains("holds an earlier session's record"),
                 "expected 'earlier session' message, got: {msg}"
@@ -113,7 +114,7 @@ fn explicit_path_that_is_not_empty_is_refused_before_anything_is_written() {
         .create(&sid, Some(explicit.path()), &mut session)
         .expect_err("create should refuse");
     match err {
-        OutrigError::Configuration(msg) => {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
             assert!(
                 msg.contains("is not empty (it holds KEEP_ME.txt)"),
                 "expected the entry named, got: {msg}"
@@ -165,7 +166,7 @@ fn explicit_path_that_is_a_file_is_refused() {
         .create(&sid, Some(&file), &mut session)
         .expect_err("create should refuse");
     match err {
-        OutrigError::Configuration(msg) => {
+        CliError::Outrig(OutrigError::Configuration(msg)) => {
             assert!(
                 msg.contains("exists and is not a directory"),
                 "expected 'not a directory' message, got: {msg}"
@@ -207,7 +208,7 @@ fn concurrent_creates_on_one_explicit_dir_claim_it_once() {
         };
 
         assert!(
-            matches!(loser, OutrigError::Configuration(_)),
+            matches!(loser, CliError::Outrig(OutrigError::Configuration(_))),
             "the loser is refused, got: {loser:?}"
         );
         let ids: Vec<_> = store
@@ -748,15 +749,25 @@ fn list_skips_unparseable_session_json() {
     assert_eq!(listed.skipped.len(), 1);
     assert_eq!(listed.skipped[0].entry, bad.as_str());
     assert!(
-        listed.skipped[0].reason.contains("image_tag"),
+        listed.skipped[0].reason().contains("image_tag"),
         "the reason should name the offending field, got: {}",
-        listed.skipped[0].reason
+        listed.skipped[0].reason()
     );
     assert!(
-        !listed.skipped[0].reason.starts_with("configuration:"),
-        "a stale record isn't user misconfiguration; got: {}",
-        listed.skipped[0].reason
+        matches!(listed.skipped[0].error, CliError::SessionRecord { .. }),
+        "a stale record has its own error, got: {:?}",
+        listed.skipped[0].error
     );
+    assert!(
+        !listed.skipped[0]
+            .error
+            .to_string()
+            .starts_with("configuration:"),
+        "a stale record isn't user misconfiguration; got: {}",
+        listed.skipped[0].error
+    );
+    assert_eq!(listed.skipped[0].dir, root.path().join(bad.as_str()));
+    assert!(!listed.skipped[0].linked);
 }
 
 /// Naming a specific broken session must say so rather than report it missing.

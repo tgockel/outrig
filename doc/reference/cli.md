@@ -480,7 +480,11 @@ discard removes the real directory **and** the symlink; `--session-dir` given th
 discards the directory it names. A symlink whose directory is gone is removed by
 `discard <sid>`, or by `--session-dir` given the path the directory had. Discard removes the
 record's three names and nothing else: a directory that also holds anything else stays, and
-discard names what it kept. Refuses if the session's container is still running.
+discard names what it kept. A session whose `session.json` cannot be read is discarded the same
+way after the confirmation, which names why it is unreadable; with no record to name the
+container, the check for a running one uses `outrig-<sid>`, and `discard` warns on stderr, `--yes`
+or not, when the record did not name its container. Refuses if the session's container
+is still running.
 
 ### `outrig clean`
 
@@ -490,6 +494,7 @@ Delete old stopped session records in bulk.
 outrig clean [--older-than <duration>]
              [--yes]
              [--build-containers]
+             [--unreadable]
              [--session <id>]
              [--session-root <path>]
 ```
@@ -499,6 +504,7 @@ outrig clean [--older-than <duration>]
 | `--older-than <duration>` | `30d`   | Remove sessions older than cutoff.      |
 | `--yes`, `-y`             | off     | Skip the interactive confirmation.      |
 | `--build-containers`      | off     | Also remove buildah working containers. |
+| `--unreadable`            | off     | Also remove unreadable session records. |
 | `--session <id>`          | all     | Restrict both sweeps to one session id. |
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
@@ -506,7 +512,13 @@ The command previews matching sessions and asks once before deleting unless `--y
 Running sessions are skipped. Symlinks whose directory is gone, older than the cutoff by the
 link's own modification time, are removed too. Sessions created with `--session-dir` remove both
 the symlink target and the symlink under the session root. As with `discard`, a directory that holds
-anything besides the record stays. Alongside the record walk, `clean` sweeps
+anything besides the record stays. A record that cannot be read is aged by the start time in
+its directory name and is removed only with `--unreadable`: without it, even `--yes` leaves the
+record and names it, since what is in it cannot be shown. An entry whose name is not a session
+id is never removed, and an unreadable record keeps its container from being swept as a stray
+until the record itself is gone. A record cut off before it names its container is kept too,
+since an `outrig mcp --attach` session borrows a container that is not `outrig-<sid>`; `discard`
+removes it. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
 Stopped strays older than the cutoff are removed; running ones are only reported.
 

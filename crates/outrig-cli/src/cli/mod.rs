@@ -24,11 +24,12 @@ use std::path::{Path, PathBuf};
 use crate::error::{OutrigError, Result};
 use crate::session::{DanglingLink, Session, SessionId, SessionStore, SkippedSession};
 
-/// What a `<session>` argument names: a readable session, or a
-/// `--session-dir` link whose directory is gone.
+/// What a `<session>` argument names: a readable session, a `--session-dir`
+/// link whose directory is gone, or an entry whose record cannot be read.
 pub enum Found {
     Session(PathBuf, Box<Session>),
     Dangling(DanglingLink),
+    Unreadable(Box<SkippedSession>),
 }
 
 /// Resolve the user's `<session>` argument (which may be a substring) to a
@@ -37,18 +38,21 @@ pub enum Found {
 /// store's contract stays "exact id or path."
 ///
 /// Tries an exact `get_by_id` first (so the common case is one stat). On miss,
-/// falls back to a `list()` substring match. Zero matches -> not-found error,
-/// unless the query matches an entry that exists but couldn't be parsed, in
-/// which case say *that* rather than claiming nothing matched; multiple ->
-/// [`OutrigError::Configuration`] with the candidate ids one per line.
-/// A match that is a dangling link comes back as [`Found::Dangling`], for
-/// the commands that can act on one.
+/// falls back to a `list()` substring match; an entry named exactly by the
+/// query wins over longer names containing it, as a readable one does.
+/// Zero matches -> not-found error; multiple -> [`OutrigError::Configuration`]
+/// with the candidate ids one per line. A match that is a dangling link or an
+/// unreadable record comes back as [`Found::Dangling`] or [`Found::Unreadable`],
+/// for the commands that can act on one.
 pub fn resolve_found(store: &SessionStore, query: &str) -> Result<Found> {
     let exact = SessionId(query.to_string());
     if let Ok((dir, session)) = store.get_by_id(&exact) {
         return Ok(Found::Session(dir, Box::new(session)));
     }
-    let listing = store.list()?;
+    let mut listing = store.list()?;
+    if let Some(at) = listing.skipped.iter().position(|s| s.entry == query) {
+        return Ok(Found::Unreadable(Box::new(listing.skipped.swap_remove(at))));
+    }
     let mut matches: Vec<Found> = listing
         .sessions
         .into_iter()
@@ -61,28 +65,16 @@ pub fn resolve_found(store: &SessionStore, query: &str) -> Result<Found> {
                 .filter(|d| d.entry.contains(query))
                 .map(Found::Dangling),
         )
+        .chain(
+            listing
+                .skipped
+                .into_iter()
+                .filter(|s| s.entry.contains(query))
+                .map(|s| Found::Unreadable(Box::new(s))),
+        )
         .collect();
     match matches.len() {
-        0 => {
-            let unreadable: Vec<&SkippedSession> = listing
-                .skipped
-                .iter()
-                .filter(|s| s.entry.contains(query))
-                .collect();
-            if unreadable.is_empty() {
-                return Err(
-                    OutrigError::Configuration(format!("no session matching {query:?}")).into(),
-                );
-            }
-            let mut msg = format!("session {query:?} exists but could not be read:");
-            for s in &unreadable {
-                msg.push_str("\n  ");
-                msg.push_str(&s.entry);
-                msg.push_str(": ");
-                msg.push_str(&s.reason);
-            }
-            Err(OutrigError::Configuration(msg).into())
-        }
+        0 => Err(OutrigError::Configuration(format!("no session matching {query:?}")).into()),
         1 => Ok(matches.pop().expect("len == 1")),
         _ => {
             let mut msg = format!("ambiguous session {query:?}; candidates:");
@@ -91,6 +83,7 @@ pub fn resolve_found(store: &SessionStore, query: &str) -> Result<Found> {
                 msg.push_str(match m {
                     Found::Session(_, s) => s.id.as_str(),
                     Found::Dangling(d) => &d.entry,
+                    Found::Unreadable(s) => &s.entry,
                 });
             }
             Err(OutrigError::Configuration(msg).into())
@@ -99,7 +92,8 @@ pub fn resolve_found(store: &SessionStore, query: &str) -> Result<Found> {
 }
 
 /// [`resolve_found`] for the commands that need a session's record. A dangling
-/// link has none, so it is an error that says what is left and what removes it.
+/// link or an unreadable record has none, so it is an error that says what is
+/// left and what removes it.
 pub fn resolve_session_arg(store: &SessionStore, query: &str) -> Result<(PathBuf, Session)> {
     match resolve_found(store, query)? {
         Found::Session(dir, session) => Ok((dir, *session)),
@@ -111,6 +105,7 @@ pub fn resolve_session_arg(store: &SessionStore, query: &str) -> Result<(PathBuf
             d.entry
         ))
         .into()),
+        Found::Unreadable(s) => Err(s.error),
     }
 }
 

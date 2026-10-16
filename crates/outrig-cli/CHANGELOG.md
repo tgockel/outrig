@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`outrig clean --unreadable` removes session records outrig cannot read.** Without it, `clean`
+  (even with `--yes`) leaves such a record and names it. Aged by the start time in the directory
+  name; an entry whose name is not a session id is never removed, nor is a record cut off before
+  it names its container (an attach session borrows one), which `discard` removes.
 - **The `outrig run` banner names the endpoint.** A `[outrig] base-url:` row follows the
   `agent:`/`model:` line for an `openai` or `anthropic` provider, so where the session's key goes
   is on screen before the first turn; the provider *style* on the line above reads the same for
@@ -81,6 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A session record that does not parse can be removed, and no longer blames the configuration.**
+  `outrig discard <sid>` and `discard --session-dir` remove it after the usual confirmation,
+  which says why it is unreadable, and the refusal elsewhere reads `session record <path> is
+  unreadable: ...` instead of `error: configuration: ...` (#261).
 - **A `--session-dir` link whose directory is gone is no longer invisible.** `outrig ls` reports
   it, `outrig discard <sid>` and `discard --session-dir <gone-dir>` remove it, and `outrig clean`
   removes one older than the cutoff. `outrig logs <sid>` says the directory is gone instead of

@@ -697,7 +697,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     if !containers.sidecars.is_empty() {
         let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
-            return Err(abort_containers(containers, &store, &sid, e.into()).await);
+            return Err(abort_containers(containers, &store, &sid, e).await);
         }
         session.sidecar_container_names = names;
     }
