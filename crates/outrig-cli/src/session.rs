@@ -133,12 +133,41 @@ pub struct SkippedSession {
     pub reason: String,
 }
 
+/// A `<root>/<sid>` symlink, left by `--session-dir`, whose target directory
+/// is gone. The link is all that remains of the session: there is no record
+/// to read, so it is kept out of [`SessionListing::sessions`] and
+/// [`SessionListing::skipped`] alike.
+#[derive(Debug, Clone)]
+pub struct DanglingLink {
+    /// The `<sid>` name under the session root.
+    pub entry: String,
+    /// The directory the link names, which no longer exists.
+    pub target: PathBuf,
+    /// When the link was last modified -- written once, at session start, so
+    /// it stands in for the start time the missing record would have given.
+    pub modified: SystemTime,
+}
+
+impl DanglingLink {
+    pub fn id(&self) -> SessionId {
+        SessionId(self.entry.clone())
+    }
+
+    /// The container the session would have run in. A dangling link has no
+    /// record to name it, so this is the name `outrig run` gives every
+    /// session it creates.
+    pub fn container_name(&self) -> String {
+        format!("outrig-{}", self.entry)
+    }
+}
+
 /// The result of [`SessionStore::list`]: the records that parsed, plus the
 /// entries that didn't.
 #[derive(Debug, Default)]
 pub struct SessionListing {
     pub sessions: Vec<Session>,
     pub skipped: Vec<SkippedSession>,
+    pub dangling: Vec<DanglingLink>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,7 +278,8 @@ impl SessionStore {
 
     /// Newest-first. Symlinked entries get `link_target = Some(read_link_result)`.
     /// Entries without a `session.json` are skipped silently (foreign content under
-    /// the root shouldn't crash listings). Entries that have one but can't be parsed
+    /// the root shouldn't crash listings), except a symlink whose target directory
+    /// is gone, which is reported via [`SessionListing::dangling`]. Entries that have one but can't be parsed
     /// are skipped too, but reported via [`SessionListing::skipped`] -- a single
     /// corrupt or schema-drifted record shouldn't cost the user every other session.
     /// Faults reading the root itself are still hard errors.
@@ -273,6 +303,16 @@ impl SessionStore {
                 Err(OutrigError::Path { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
+                    if link_target.is_some() && !resolved.exists() {
+                        let modified = fs::symlink_metadata(entry.path())
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        out.dangling.push(DanglingLink {
+                            entry: entry.file_name().to_string_lossy().into_owned(),
+                            target: resolved,
+                            modified,
+                        });
+                    }
                     continue;
                 }
                 Err(e) => out.skipped.push(SkippedSession {
@@ -288,6 +328,7 @@ impl SessionStore {
         }
         out.sessions.sort_by(|a, b| b.id.0.cmp(&a.id.0));
         out.skipped.sort_by(|a, b| b.entry.cmp(&a.entry));
+        out.dangling.sort_by(|a, b| b.entry.cmp(&a.entry));
         Ok(out)
     }
 
@@ -316,7 +357,10 @@ impl SessionStore {
         let entry = self.root.join(&id.0);
         let meta = fs::symlink_metadata(&entry).path_ctx("stat", &entry)?;
         if meta.file_type().is_symlink() {
-            let target = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
+            // Relative to the link's directory, as `resolve_entry` reads it.
+            let target = self
+                .root
+                .join(fs::read_link(&entry).path_ctx("read symlink", &entry)?);
             let left = if target.exists() {
                 remove_record(&target)?
             } else {
@@ -327,6 +371,27 @@ impl SessionStore {
         } else {
             remove_record(&entry)
         }
+    }
+
+    /// Unlink a dangling `<root>/<entry>` and nothing else. The removal for a
+    /// link that was dangling when it was selected: it never follows the
+    /// link, so a session that recreated the directory since is untouched.
+    /// Returns `false`, leaving the entry, when it is no longer a symlink to
+    /// `target` or `target` exists again.
+    pub fn unlink_dangling(&self, link: &DanglingLink) -> Result<bool> {
+        let entry = self.root.join(&link.entry);
+        let Ok(meta) = fs::symlink_metadata(&entry) else {
+            return Ok(false);
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let current = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
+        if self.root.join(current) != link.target || link.target.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&entry).path_ctx("remove", &entry)?;
+        Ok(true)
     }
 
     /// [`SessionStore::remove_by_id`] for a directory named outright, then
@@ -360,7 +425,7 @@ impl SessionStore {
             let Ok(target) = fs::read_link(&path) else {
                 continue;
             };
-            if target == canon_dir {
+            if self.root.join(target) == canon_dir {
                 fs::remove_file(&path).path_ctx("remove", &path)?;
             }
         }
@@ -436,7 +501,10 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     };
     if meta.file_type().is_symlink() {
         let tgt = fs::read_link(path).path_ctx("read symlink", path)?;
-        Ok(Some((tgt.clone(), Some(tgt))))
+        // A relative target is relative to the link's directory, not to the
+        // cwd; `link_target` keeps the text as written.
+        let resolved = path.parent().map_or_else(|| tgt.clone(), |p| p.join(&tgt));
+        Ok(Some((resolved, Some(tgt))))
     } else if meta.is_dir() {
         Ok(Some((path.to_path_buf(), None)))
     } else {

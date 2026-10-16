@@ -247,6 +247,8 @@ async fn a_missing_global_config_is_refused_only_where_it_is_read() {
         &[
             "--global-config",
             utf8(&typo),
+            "--session-root",
+            utf8(&root),
             "discard",
             "-y",
             "--session-dir",

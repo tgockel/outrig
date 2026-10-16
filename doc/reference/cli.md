@@ -66,7 +66,7 @@ file the flag names, so for them it need not exist yet.
 `--session-root` resolves in this order: this flag, then `session-root` in the global config, then
 `<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
 `clean` read no repo config at all and ignore `--config`: they find the same root from any
-directory. Given `--session-root`, or `--session-dir` for `logs` and `discard`, they read no
+directory. Given `--session-root`, or `--session-dir` for `logs`, they read no
 global config either, so a `--global-config` path is not checked.
 
 `--verbose` adds buildah/podman command transcripts to stderr and to
@@ -432,7 +432,8 @@ outrig ls [--session-root <path>]
 ```
 
 Output columns: `ID`, `STARTED`, `DURATION`, `CONTAINER`, `EXIT`. Symlinked sessions (created
-via `outrig run --session-dir`) display the symlink target as a hint.
+via `outrig run --session-dir`) display the symlink target as a hint. A symlink whose directory
+is gone has no record to list: `ls` reports it on stderr, and `discard` or `clean` removes it.
 
 See [Usage -> Sessions](../usage/sessions.md).
 
@@ -476,9 +477,10 @@ outrig discard [<session>] [--yes]
 `<session>` and `--session-dir` are mutually exclusive. If the session was created via
 `outrig run --session-dir <path>` (i.e. lives at a user-chosen path with a symlink in the root),
 discard removes the real directory **and** the symlink; `--session-dir` given that symlink
-discards the directory it names. Discard removes the record's three names and nothing else: a
-directory that also holds anything else stays, and discard names what it kept. Refuses if the
-session's container is still running.
+discards the directory it names. A symlink whose directory is gone is removed by
+`discard <sid>`, or by `--session-dir` given the path the directory had. Discard removes the
+record's three names and nothing else: a directory that also holds anything else stays, and
+discard names what it kept. Refuses if the session's container is still running.
 
 ### `outrig clean`
 
@@ -501,8 +503,9 @@ outrig clean [--older-than <duration>]
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
-Running sessions are skipped. Sessions created with `--session-dir` remove both the symlink
-target and the symlink under the session root. As with `discard`, a directory that holds
+Running sessions are skipped. Symlinks whose directory is gone, older than the cutoff by the
+link's own modification time, are removed too. Sessions created with `--session-dir` remove both
+the symlink target and the symlink under the session root. As with `discard`, a directory that holds
 anything besides the record stays. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
 Stopped strays older than the cutoff are removed; running ones are only reported.

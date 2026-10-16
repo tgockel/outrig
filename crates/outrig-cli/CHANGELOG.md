@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `--session-dir` link whose directory is gone is no longer invisible.** `outrig ls` reports
+  it, `outrig discard <sid>` and `discard --session-dir <gone-dir>` remove it, and `outrig clean`
+  removes one older than the cutoff. `outrig logs <sid>` says the directory is gone instead of
+  claiming no session matches. `outrig discard --session-dir` also now removes the
+  `<session-root>/<sid>` link it leaves behind, which means it resolves the session root like
+  `discard <sid>` does (#260, #278).
 - **`outrig clean --older-than` rejects a non-ASCII unit instead of panicking.** A value ending in
   a character wider than one byte (`7д`, `7日`, `é`) split the string inside that character and
   panicked (`end byte index 2 is not a char boundary`), exiting `101`, where every other bad

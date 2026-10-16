@@ -550,6 +550,102 @@ fn remove_by_path_cleans_dangling_symlink() {
 }
 
 #[test]
+fn list_reports_a_link_whose_directory_is_gone() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit_parent = tempfile::tempdir().expect("tempdir explicit_parent");
+    let explicit = explicit_parent.path().join("run-x");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&explicit), &mut sample_session(&sid))
+        .expect("create");
+    // Foreign content: a plain directory, and a link to a directory that
+    // exists but holds no record. Neither is a session's leftover.
+    std::fs::create_dir(root.path().join("plain")).expect("plain");
+    let other = explicit_parent.path().join("other");
+    std::fs::create_dir(&other).expect("other");
+    std::os::unix::fs::symlink(&other, root.path().join("to-other")).expect("symlink");
+
+    assert!(store.list().expect("list").dangling.is_empty());
+
+    std::fs::remove_dir_all(&explicit).expect("rm");
+    let listing = store.list().expect("list");
+    assert!(listing.sessions.is_empty() && listing.skipped.is_empty());
+    assert_eq!(listing.dangling.len(), 1);
+    assert_eq!(listing.dangling[0].entry, sid.as_str());
+    assert_eq!(
+        listing.dangling[0].container_name(),
+        format!("outrig-{sid}")
+    );
+}
+
+#[test]
+fn a_valid_relative_link_is_not_dangling() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    std::fs::create_dir(root.path().join("foreign-dir")).expect("foreign");
+    std::os::unix::fs::symlink("foreign-dir", root.path().join("to-other")).expect("symlink");
+    std::os::unix::fs::symlink("gone-dir", root.path().join("to-gone")).expect("symlink");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    let listing = store.list().expect("list");
+    let names: Vec<_> = listing.dangling.iter().map(|d| d.entry.as_str()).collect();
+    assert_eq!(names, ["to-gone"]);
+}
+
+#[test]
+fn unlink_dangling_leaves_a_directory_recreated_since_selection() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let explicit = parent.path().join("run-x");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&explicit), &mut sample_session(&sid))
+        .expect("create");
+    std::fs::remove_dir_all(&explicit).expect("rm");
+    let link = store.list().expect("list").dangling.remove(0);
+
+    // A new session claims the same path before the removal runs.
+    std::fs::create_dir(&explicit).expect("recreate");
+    std::fs::write(explicit.join("session.json"), "{}").expect("record");
+
+    assert!(!store.unlink_dangling(&link).expect("unlink"));
+    assert!(explicit.join("session.json").exists());
+    assert!(std::fs::symlink_metadata(root.path().join(sid.as_str())).is_ok());
+}
+
+#[test]
+fn remove_by_id_follows_a_relative_link_from_the_root_not_the_cwd() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let store = SessionStore::new(root.clone());
+    // A decoy where the raw target lands if it is read against the cwd.
+    let decoy = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("decoy");
+    let name = decoy.path().file_name().expect("name").to_owned();
+    let decoy_run = decoy.path().join("run-x");
+    std::fs::create_dir_all(decoy_run.join("logs")).expect("decoy logs");
+
+    let real = root.join(&name).join("run-x");
+    store
+        .create(&sid, Some(&real), &mut sample_session(&sid))
+        .expect("create");
+    // Replace the absolute link with the relative spelling of the same one.
+    let link = root.join(sid.as_str());
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(std::path::Path::new(&name).join("run-x"), &link)
+        .expect("relative link");
+
+    store.remove_by_id(&sid).expect("remove");
+    assert!(
+        decoy_run.join("logs").exists(),
+        "the cwd decoy is untouched"
+    );
+    assert!(!real.join("session.json").exists(), "the real record went");
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}
+
+#[test]
 fn loads_legacy_agent_name_string() {
     let root = tempfile::tempdir().expect("tempdir root");
     let store = SessionStore::new(root.path().to_path_buf());

@@ -30,7 +30,7 @@ use crate::cli::build_containers::{
 };
 use crate::cli::engine;
 use crate::error::{OutrigError, Result};
-use crate::session::{self, Session, SessionStore};
+use crate::session::{self, DanglingLink, Session, SessionStore};
 use outrig::container::{LABEL_SESSION, LABEL_SIDECAR};
 
 const DAY: u64 = 24 * 60 * 60;
@@ -182,6 +182,28 @@ where
         });
     }
 
+    // A link whose directory is gone has no record to age, so its own mtime --
+    // set when the session started -- stands in for the start time.
+    let mut dangling_targets = Vec::new();
+    let mut dangling_running = Vec::new();
+    for link in &listing.dangling {
+        if args.session.as_deref().is_some_and(|id| id != link.entry) {
+            continue;
+        }
+        let aged = now
+            .duration_since(link.modified)
+            .map(|age| age >= args.older_than)
+            .unwrap_or(false);
+        if !aged {
+            continue;
+        }
+        if running.contains(&link.container_name()) {
+            dangling_running.push(link);
+        } else {
+            dangling_targets.push(link);
+        }
+    }
+
     let target_ids: BTreeSet<&str> = targets.iter().map(|t| t.session.id.as_str()).collect();
     // A record we couldn't parse is still a record: its directory survives this
     // run, so its container is not a stray and must not be force-removed out
@@ -199,12 +221,16 @@ where
     let (build_targets, build_undatable) =
         classify_build_containers(build, args.older_than, now);
 
-    write_skipped_running(stderr, &skipped_running).await?;
+    write_skipped_running(stderr, &skipped_running, &dangling_running).await?;
     write_stray_running(stderr, &stray_running).await?;
     write_build_undatable(stderr, &build_undatable).await?;
 
     let retention = format_retention(args.older_than);
-    if targets.is_empty() && stray_targets.is_empty() && build_targets.is_empty() {
+    if targets.is_empty()
+        && dangling_targets.is_empty()
+        && stray_targets.is_empty()
+        && build_targets.is_empty()
+    {
         // The wording only grows when the sweep was asked for, so a run
         // without the flag reads exactly as it always has.
         let msg = if args.build_containers {
@@ -220,6 +246,7 @@ where
     }
 
     write_preview(stderr, &targets, &retention).await?;
+    write_dangling_preview(stderr, &dangling_targets, &retention).await?;
     write_stray_preview(stderr, &stray_targets, &retention).await?;
     write_build_preview(stderr, &build_targets, &retention).await?;
 
@@ -227,7 +254,7 @@ where
         && !confirm(
             stderr,
             stdin,
-            targets.len(),
+            targets.len() + dangling_targets.len(),
             stray_targets.len(),
             build_targets.len(),
         )
@@ -251,6 +278,12 @@ where
             let link_msg = format!("[outrig] removed {} (symlink)\n", link_path.display());
             stderr.write_all(link_msg.as_bytes()).await?;
         }
+    }
+
+    for link in &dangling_targets {
+        let (gone, msg) = super::unlink_dangling_report(store, link)?;
+        removed += usize::from(gone);
+        stderr.write_all(msg.as_bytes()).await?;
     }
 
     // One `podman rm -f` for every stray. Guard the empty case -- `podman rm
@@ -393,11 +426,15 @@ fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
-async fn write_skipped_running<E>(stderr: &mut E, skipped: &[Session]) -> Result<()>
+async fn write_skipped_running<E>(
+    stderr: &mut E,
+    skipped: &[Session],
+    dangling: &[&DanglingLink],
+) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {
-    if skipped.is_empty() {
+    if skipped.is_empty() && dangling.is_empty() {
         return Ok(());
     }
 
@@ -408,7 +445,41 @@ where
         let line = format!("  {}  {}\n", session.id, session.container_name);
         stderr.write_all(line.as_bytes()).await?;
     }
+    for link in dangling {
+        let line = format!("  {}  {}\n", link.entry, link.container_name());
+        stderr.write_all(line.as_bytes()).await?;
+    }
     Ok(())
+}
+
+async fn write_dangling_preview<E>(
+    stderr: &mut E,
+    links: &[&DanglingLink],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if links.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] will remove {} older than {retention} (directory gone):\n",
+        session_link_count(links.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for link in links {
+        let line = format!("  {}  -> {}\n", link.entry, link.target.display());
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+fn session_link_count(count: usize) -> String {
+    format!(
+        "{count} session {}",
+        crate::cli::session_setup::plural(count, "link", "links")
+    )
 }
 
 async fn write_preview<E>(stderr: &mut E, targets: &[CleanTarget], retention: &str) -> Result<()>

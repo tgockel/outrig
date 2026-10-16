@@ -2044,3 +2044,237 @@ async fn run_creates_a_session_dir_that_does_not_exist() {
     assert_eq!(recorded[0].session_dir, canon);
     assert!(canon.join("session.json").exists());
 }
+
+/// #260: a `--session-dir` session whose directory was removed by hand.
+fn dangling_session(root: &std::path::Path) -> (SessionStore, SessionId, PathBuf) {
+    let parent = root.join("scratch");
+    let dir = parent.join("run-x");
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&dir), &mut sample_session(&sid))
+        .expect("create");
+    let canon = std::fs::canonicalize(&dir).expect("canon");
+    std::fs::remove_dir_all(&canon).expect("rm session dir");
+    (store, sid, canon)
+}
+
+fn link_exists(store: &SessionStore, sid: &SessionId) -> bool {
+    std::fs::symlink_metadata(store.symlink_path(sid)).is_ok()
+}
+
+#[tokio::test]
+async fn ls_reports_a_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+
+    let (mut sw, _stdout_r) = duplex(4096);
+    let (mut ew, stderr_r) = duplex(4096);
+    ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains(&format!(
+            "skipping {sid}: session directory {} no longer exists",
+            dir.display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("no readable sessions (1 skipped)"), "{err}");
+}
+
+#[tokio::test]
+async fn discard_by_id_removes_a_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, format!("outrig-{sid}", sid = "20260501T141907-9b1c"));
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+
+    assert!(!link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_refuses_a_gone_directory_session_that_is_running() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(true) })
+        .await
+        .expect_err("running");
+    assert!(err.to_string().contains("still running"), "{err}");
+    assert!(link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_session_dir_removes_links_to_a_gone_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+
+    assert!(!link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_session_dir_that_never_existed_is_an_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&tmp.path().join("typo"), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect_err("no such dir");
+    assert!(link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn logs_names_a_gone_directory_rather_than_denying_the_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, sid.as_str()).expect_err("no record");
+    let msg = err.to_string();
+    assert!(msg.contains("no longer exists"), "{msg}");
+    assert!(msg.contains("outrig discard"), "{msg}");
+}
+
+async fn clean_dangling(
+    store: &SessionStore,
+    args: &clean::CleanArgs,
+    now: SystemTime,
+    running: BTreeSet<String>,
+) -> (i32, String) {
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        store,
+        args,
+        now,
+        running,
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    (rc, drain(stderr_r).await)
+}
+
+#[tokio::test]
+async fn clean_removes_an_old_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    // The link was just made, so it is old only against a far-future `now`.
+    let (rc, err) = clean_dangling(
+        &store,
+        &clean_args(clean::DEFAULT_OLDER_THAN, true),
+        clean_now() + days(3650),
+        BTreeSet::new(),
+    )
+    .await;
+    assert_eq!(rc, 0);
+    assert!(err.contains("(directory gone)"), "{err}");
+    assert!(!link_exists(&store, &sid), "{err}");
+}
+
+#[tokio::test]
+async fn clean_keeps_a_young_link_and_a_running_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (_, err) = clean_dangling(
+        &store,
+        &clean_args(clean::DEFAULT_OLDER_THAN, true),
+        SystemTime::now(),
+        BTreeSet::new(),
+    )
+    .await;
+    assert!(link_exists(&store, &sid), "{err}");
+
+    let running = BTreeSet::from([format!("outrig-{sid}")]);
+    let (_, err) = clean_dangling(
+        &store,
+        &clean_args(days(1), true),
+        clean_now() + days(3650),
+        running,
+    )
+    .await;
+    assert!(err.contains("skipped running sessions"), "{err}");
+    assert!(link_exists(&store, &sid), "{err}");
+}
+
+#[tokio::test]
+async fn discard_session_dir_accepts_a_relative_path_to_a_gone_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+    let relative = pathdiff(&dir);
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&relative, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    assert!(!link_exists(&store, &sid));
+}
+
+/// `dir` spelled relative to the cwd, with `..` steps -- the form a user types.
+fn pathdiff(dir: &std::path::Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("cwd");
+    let up = cwd.components().count() - 1;
+    let mut out = PathBuf::new();
+    for _ in 0..up {
+        out.push("..");
+    }
+    out.join(dir.strip_prefix("/").expect("absolute"))
+}
+
+#[tokio::test]
+async fn discard_session_dir_through_a_symlinked_ancestor_whose_destination_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let job = tmp.path().join("scratch/job");
+    let alias = tmp.path().join("alias");
+    std::fs::create_dir_all(&job).expect("job");
+    std::os::unix::fs::symlink(&job, &alias).expect("alias");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&alias.join("run")), &mut sample_session(&sid))
+        .expect("create");
+    std::fs::remove_dir_all(tmp.path().join("scratch")).expect("rm tree");
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&alias.join("run"), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    assert!(!link_exists(&store, &sid));
+}

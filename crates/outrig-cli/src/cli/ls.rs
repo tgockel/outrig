@@ -6,6 +6,8 @@
 //! Symlinked entries (created via `outrig run --session-dir`) get a trailing
 //! `-> <target>` so the user can see where the real bytes live.
 //!
+//! A `--session-dir` link whose directory is gone is reported the same way.
+//!
 //! A `session.json` that can't be read or parsed is skipped and reported rather
 //! than failed on, including when that leaves nothing to list -- so an
 //! all-skipped root still exits 0. Faults reaching an entry in the first place
@@ -46,15 +48,23 @@ where
         let line = format!("[outrig] skipping {}: {}\n", skipped.entry, skipped.reason);
         stderr.write_all(line.as_bytes()).await?;
     }
+    for link in &listing.dangling {
+        let line = format!(
+            "[outrig] skipping {}: session directory {} no longer exists\n",
+            link.entry,
+            link.target.display()
+        );
+        stderr.write_all(line.as_bytes()).await?;
+    }
     if listing.sessions.is_empty() {
         // An empty root and a root where nothing parsed are different facts;
         // saying "no sessions" for the latter hides the records entirely.
-        let notice = if listing.skipped.is_empty() {
+        let unlisted = listing.skipped.len() + listing.dangling.len();
+        let notice = if unlisted == 0 {
             "[outrig] no sessions\n".to_string()
         } else {
             format!(
-                "[outrig] no readable sessions ({} skipped)\n",
-                listing.skipped.len()
+                "[outrig] no readable sessions ({unlisted} skipped)\n"
             )
         };
         stderr.write_all(notice.as_bytes()).await?;
