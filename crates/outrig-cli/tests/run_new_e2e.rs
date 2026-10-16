@@ -239,6 +239,17 @@ impl Session {
         }
     }
 
+    /// Stop reading what outrig writes and close the read ends: the reader of
+    /// `outrig run-new 2>&1 | head` exiting. What was read before stays in the
+    /// sinks.
+    async fn hang_up(&mut self) {
+        for stream in self.streams.drain(..) {
+            stream.abort();
+            // Cancelled, which is the point; the read end is closed once it is.
+            let _ = stream.await;
+        }
+    }
+
     async fn type_line(&mut self, line: &str) {
         self.stdin
             .write_all(format!("{line}\n").as_bytes())
@@ -859,6 +870,40 @@ async fn output_lost_as_input_ends_is_not_a_clean_exit() {
     let (status, stderr) =
         leave_a_session_whose_stdout_stalled(Leave::InputEndsThenReaderGoes).await;
     assert_eq!(status.code(), Some(1), "{status}: {stderr}");
+}
+
+/// A session whose readers go away while it runs (#574), as they do when
+/// `outrig run-new 2>&1 | head` is left by `head`. The next write to stderr
+/// fails and ends the conversation; nothing is sent to stdout here, so it is
+/// stderr's write that does. A diagnostic that cannot be delivered is no reason
+/// to skip the teardown, so the session is still stopped and recorded as
+/// finished, and leaves with the conversation's status 1 -- not the 101 of a
+/// panic.
+#[tokio::test]
+async fn a_vanished_stdout_and_stderr_reader_ends_the_session_with_1_and_a_finished_record() {
+    let (addr, _requests) =
+        start_mock_http(vec![submit("toolu_1", "x = 1"), text_reply("set")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    wait_for(&session.stderr, "(Ctrl-D to exit", TEST_TIMEOUT).await;
+    session.hang_up().await;
+    session.type_line("hello").await;
+    let (status, _, stderr) = session.exit(false).await;
+
+    assert_eq!(status.code(), Some(1), "{status}: {stderr}");
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 1, "{record:#}");
+    assert!(!record["ended_at"].is_null(), "{record:#}");
+    // Gone as the process exits, since the stop it waited for ran; left behind
+    // it was still stopping, and removed only as the unwind dropped it.
+    let container = record["container_name"].as_str().expect("a name");
+    let _tidy = RemoveOnDrop(container.to_string());
+    assert!(
+        podman_names(&format!("name={container}")).is_empty(),
+        "{record:#}"
+    );
 }
 
 /// Input ending is a graceful exit, and a graceful exit shows everything the

@@ -166,7 +166,7 @@ pub fn run() -> ExitCode {
     let code = match dispatch(&cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e}");
+            super::eprint_best_effort(&format!("error: {e}\n"));
             e.exit_status()
         }
     };
@@ -326,6 +326,10 @@ fn init_tracing(verbose: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Its default, true, reports an event that could not be written with an
+        // `eprintln!` of its own, which panics when stderr's reader has gone:
+        // one log line would end the command with a 101.
+        .log_internal_errors(false)
         .init();
     if verbose >= 2 {
         tracing::trace!(target: "outrig", "verbose tracing enabled");

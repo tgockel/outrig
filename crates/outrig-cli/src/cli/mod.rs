@@ -20,10 +20,21 @@ pub mod session_setup;
 pub mod volume_arg;
 pub mod watcher;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::error::{OutrigError, Result};
 use crate::session::{Session, SessionId, SessionStore, SkippedSession};
+
+/// Write `text` to stderr, and let it go if the write fails.
+///
+/// For what a command says as it ends, where `eprint!` is wrong: it panics when
+/// stderr's reader has gone, so what comes after it never runs and the process
+/// exits with a panic's 101 instead of the status the command decided. A
+/// diagnostic nobody can read is no reason for either.
+pub(crate) fn eprint_best_effort(text: &str) {
+    let _ = std::io::stderr().write_all(text.as_bytes());
+}
 
 /// Resolve the user's `<session>` argument (which may be a substring) to a
 /// concrete session. CLI policy, not store policy: substring matching is an

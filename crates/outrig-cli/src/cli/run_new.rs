@@ -43,6 +43,7 @@ use outrig::image::{self, ImageTag};
 use outrig::LaunchSpec;
 
 use crate::builtin_image;
+use crate::cli::eprint_best_effort;
 use crate::cli::session_setup::ProgressSpan;
 use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
@@ -169,7 +170,7 @@ pub async fn execute(
         };
         let summary = summarize(&running.shutdown(DEFAULT_DRAIN).await);
         if summary.verdict != Verdict::Clean {
-            eprint!("{}", render_report(&summary));
+            eprint_best_effort(&render_report(&summary));
         }
         return outcome_of(Err(e.into()), &summary);
     }
@@ -181,29 +182,25 @@ pub async fn execute(
         }
     };
 
-    eprint!(
-        "{}",
-        render_banner(&Banner {
-            image_config_row: builtin_image::banner_image_config_row(
-                &image_cfg_name,
-                builtin_default
-            ),
-            image_tag: &session.image_tag,
-            model: running.model(),
-            python_version: running.python_version(),
-            container_name: running.container_name(),
-            session_id: sid.as_str(),
-        })
-    );
+    // What is said from here on is best effort: a stderr whose reader has gone
+    // must not skip the stop and the record that follow.
+    eprint_best_effort(&render_banner(&Banner {
+        image_config_row: builtin_image::banner_image_config_row(&image_cfg_name, builtin_default),
+        image_tag: &session.image_tag,
+        model: running.model(),
+        python_version: running.python_version(),
+        container_name: running.container_name(),
+        session_id: sid.as_str(),
+    }));
 
     let conversed = converse::converse(&mut running, &mut shown).await;
 
     // Said first, since stopping can take a few seconds and a Ctrl-C there
     // does nothing.
-    eprintln!("[outrig] closing the session");
+    eprint_best_effort("[outrig] closing the session\n");
     let report = running.shutdown(DEFAULT_DRAIN).await;
     let summary = summarize(&report);
-    eprint!("{}", render_report(&summary));
+    eprint_best_effort(&render_report(&summary));
     let outcome = outcome_of(conversed, &summary);
     // The status the process exits with, so the record never says otherwise.
     let exit = outcome.as_ref().copied().unwrap_or_else(CliError::exit_status);

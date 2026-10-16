@@ -25,9 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still running five seconds, stop the container, print what the stop found, and exit 0 when
   everything stopped with every outcome known, 2 when some Python was cut off, and 3 when the stop
   could not be confirmed. If the interpreter exits, the conversation fails -- a write to a
-  stdout whose reader went away, say -- or the session's record cannot be written, the session
-  ends with status 1, or 3 if its stop could not be confirmed; a failure's error is printed after
-  the report either way. It starts no MCP server
+  stdout or stderr whose reader went away, say -- or the session's record cannot be written, the
+  session ends with status 1, or 3 if its stop could not be confirmed; a failure's error is
+  printed after the report either way. It starts no MCP server
   and no sidecar, since the model could not call them and a server in the primary container would
   sit beside the interpreter as the same user, holding its resolved secrets. Its session is
   recorded like `run`'s, in a container named
