@@ -211,3 +211,22 @@ async fn unmask_all_lifts_the_read_only_paths_too() {
         "unmask = [\"ALL\"] should make cgroup writable, got: {value:?}",
     );
 }
+
+#[tokio::test]
+async fn remapped_device_appears_under_its_new_name() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let mut spec = ContainerLaunchSpec::default();
+    spec.devices = vec!["/dev/null:/dev/mynull".to_string()];
+    let container = start_alpine(spec).await;
+    let probe = sh(
+        &container,
+        "test -c /dev/mynull && echo present || echo absent",
+    );
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+    assert_eq!(
+        probe, "present",
+        "/dev/null:/dev/mynull should remap the node"
+    );
+}

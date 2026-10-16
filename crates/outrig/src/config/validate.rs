@@ -292,6 +292,16 @@ pub enum ConfigValidationError {
     #[error("image {image:?}: `devices` entry {device:?} must be an absolute path")]
     DevicePathRelative { image: String, device: String },
 
+    #[error(
+        "image {image:?}: `devices` entry {device:?} is malformed: {detail}; expected \
+         `<host-path>[:<container-path>][:<permissions>]`"
+    )]
+    DevicePathMalformed {
+        image: String,
+        device: String,
+        detail: String,
+    },
+
     #[error("image {image:?}: `devices` entry {device:?} is declared more than once")]
     DevicePathDuplicate { image: String, device: String },
 
@@ -989,6 +999,12 @@ fn validate_security(
 /// Shape-check the `devices` list. Whether the node exists is deliberately not
 /// checked: validation runs on machines that are not the launch host, and
 /// podman's own error covers a missing node clearly enough.
+///
+/// An entry is podman's `--device` value, `<host>[:<container>][:<perms>]`,
+/// and the shape check refuses only what podman refuses at launch. This is
+/// the opposite of `validate_unmask_list`'s treatment of `:` on purpose:
+/// podman splits an `unmask` value into several paths, but the colons of a
+/// `--device` value separate the parts of one device.
 fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigValidationError> {
     let mut seen = BTreeSet::new();
 
@@ -998,10 +1014,18 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
                 image: scope.to_string(),
             });
         }
-        if !Path::new(device).is_absolute() {
+        let fields: Vec<&str> = device.split(':').collect();
+        if !Path::new(fields[0]).is_absolute() {
             return Err(ConfigValidationError::DevicePathRelative {
                 image: scope.to_string(),
                 device: device.clone(),
+            });
+        }
+        if let Err(detail) = check_device_suffix(&fields[1..]) {
+            return Err(ConfigValidationError::DevicePathMalformed {
+                image: scope.to_string(),
+                device: device.clone(),
+                detail: detail.to_string(),
             });
         }
         if !seen.insert(device.clone()) {
@@ -1013,6 +1037,39 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
     }
 
     Ok(())
+}
+
+/// Check the fields after the host path the way podman parses them: one
+/// field is a container path or a permission string, two are a container
+/// path then permissions, and more is refused. An empty container path
+/// defaults to the host path, so `/dev/null:` and `/dev/null::rw` are fine.
+/// Empty permissions after a container path are fine too: for a device
+/// directory such as `/dev/dri` podman expands the children with default
+/// `rwm`, and only refuses them for a single node. Which one the source is
+/// depends on the launch host, so that call is left to podman.
+fn check_device_suffix(rest: &[&str]) -> Result<(), &'static str> {
+    // Each of `r`, `w`, `m` at most once: podman refuses `rrw` at launch.
+    let is_perms = |f: &str| {
+        !f.is_empty()
+            && f.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
+            && f.chars().enumerate().all(|(i, c)| !f[..i].contains(c))
+    };
+    let is_dst = |f: &str| f.is_empty() || Path::new(f).is_absolute();
+    match rest {
+        [] => Ok(()),
+        [one] if is_dst(one) || is_perms(one) => Ok(()),
+        [_] => Err("the second field must be an absolute path or permissions (`r`, `w`, `m`)"),
+        [dst, perms] => {
+            if !is_dst(dst) {
+                Err("the container path must be absolute")
+            } else if !perms.is_empty() && !is_perms(perms) {
+                Err("permissions must be some of `r`, `w`, `m`, each at most once")
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("at most three `:`-separated fields are allowed"),
+    }
 }
 
 /// Shape-check the `unmask` list. Entries reach podman verbatim, which is what
@@ -1039,7 +1096,9 @@ fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigVali
                 image: scope.to_string(),
             });
         }
-        // Checked before the absolute-path rule: a colon-joined list is made of
+        // Unlike `devices`, where `:` joins the parts of one device, podman
+        // splits an unmask value on it. Checked before the absolute-path rule:
+        // a colon-joined list is made of
         // absolute paths, so the rule below would wave it through into an
         // argument podman then splits back into several.
         if path.contains(':') {

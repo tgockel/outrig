@@ -211,10 +211,11 @@ config that never mentions it keeps today's protection. And the container is sti
 unprivileged rootless podman container in a user namespace -- clearing the flag grants the
 container's own namespace-local root, not root on the host.
 
-`devices` passes host device nodes through, one `--device=<path>` per entry, in declaration
-order. This is the sharpest of the three in the general case: `/dev/kvm` or a raw block device
-hands out real hardware access. It is explicit per path and per image-config, and outrig does
-not police which paths you may ask for.
+`devices` passes host device nodes through, one `--device=<entry>` per entry, in declaration
+order. An entry is `<host-path>[:<container-path>][:<permissions>]`; the permissions (`r`, `w`,
+`m`) are not enforced by rootless podman. This is the sharpest of the three in the general
+case: `/dev/kvm` or a raw block device hands out real hardware access. It is explicit per path
+and per image-config, and outrig does not police which paths you may ask for.
 
 `unmask` excludes paths from podman's default masking, one `--security-opt=unmask=<path>` per
 entry. Entries are absolute paths, globs allowed, or the literal `ALL` -- and they reach podman
@@ -543,7 +544,7 @@ in place, then becomes that user for the exec, so the *server* runs unprivileged
 container was created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
-into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<path>` flags
+into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<entry>` flags
 only when it declares `devices`, and `--security-opt=unmask=<path>` flags only when it declares
 `unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
 `org.outrig.sidecar`). Every container gets `--image-volume=ignore`, so its image's `VOLUME`s

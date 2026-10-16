@@ -1000,8 +1000,11 @@ unmask   = ["/proc/*"]
   A nested container runtime does **not** need this cleared -- see
   [Nested container runtimes](../concepts/containers.md#nested-container-runtimes).
 - `devices` (array, optional, default: `[]`): host device nodes to pass through, emitted as
-  one `--device=<path>` per entry in declaration order. Entries are plain absolute paths;
-  podman's `<src>:<dst>:<perms>` form is not accepted.
+  one `--device=<entry>` per entry in declaration order. An entry is podman's own form,
+  `<host-path>[:<container-path>][:<permissions>]`: a bare absolute path passes the node
+  through, `<container-path>` (absolute) puts it at another name, and `<permissions>` is some of
+  `r`, `w`, `m`. Rootless podman does not enforce `<permissions>` -- `:r` left the node writable
+  -- so do not rely on it.
 - `unmask` (array, optional, default: `[]`): paths to exclude from podman's default masking,
   emitted as one `--security-opt=unmask=<path>` per entry in declaration order. Entries are
   absolute paths with `filepath.Match` glob syntax, and reach podman verbatim -- asking for
@@ -1601,7 +1604,13 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Capability names must not be duplicated within `cap-drop` or within `cap-add`, after
   optional `CAP_` stripping.
 - The same normalized capability name must not appear in both `cap-drop` and `cap-add`.
-- Every `[images.<name>.security].devices` entry must be non-empty and an absolute path.
+- Every `[images.<name>.security].devices` entry must be non-empty and shaped as podman parses
+  it: `<host-path>[:<container-path>][:<permissions>]`, at most three fields, the host and
+  container path absolute or empty (meaning the host path), `<permissions>` each of `r`, `w`, `m`
+  at most once, or empty (podman allows that for a device directory and refuses it for a single
+  node, so validation leaves it to podman). `:` is accepted here but not in `unmask` because
+  podman splits an `unmask` value into several paths, while the colons of a `--device` value
+  separate the parts of one device.
   Whether the node exists is not checked -- validation may run on a machine that is not the
   launch host, so podman reports a missing node at launch instead.
 - Device paths must not be duplicated within one `devices` list.

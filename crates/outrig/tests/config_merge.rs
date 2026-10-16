@@ -1096,6 +1096,72 @@ devices = ["dev/fuse"]
     }
 
     #[test]
+    fn colon_form_device_entries_validate() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = [
+    "/dev/null:/dev/mynull:r", "/dev/fuse:rw", "/dev/null:/dev/null",
+    "/dev/zero:", "/dev/full::rw", "/dev/dri:/dev/dri:", "/dev/dri::",
+]
+"#,
+        );
+        cfg.validate(None).expect("colon form validates");
+    }
+
+    #[test]
+    fn malformed_colon_device_entries_error() {
+        for bad in [
+            "/dev/null:relative",
+            "/dev/null:/dev/x:bogus",
+            "/dev/null:/dev/a:r:x",
+            "/dev/null:rx",
+            "/dev/null:rrw",
+            "/dev/null:/dev/x:rrw",
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["{bad}"]
+"#
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::DevicePathMalformed { image, device, .. } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(device, bad);
+                }
+                other => panic!("{bad}: expected DevicePathMalformed, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_host_with_colon_form_is_still_relative() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["dev/null:/dev/x"]
+"#,
+        );
+        assert!(matches!(
+            expect_validation_err(&cfg, None),
+            ConfigValidationError::DevicePathRelative { .. }
+        ));
+    }
+
+    #[test]
     fn duplicate_device_path_errors() {
         let cfg = parse(
             r#"

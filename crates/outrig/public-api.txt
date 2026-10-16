@@ -72,6 +72,10 @@ pub outrig::config::ConfigValidationError::DevicePathDuplicate::device: alloc::s
 pub outrig::config::ConfigValidationError::DevicePathDuplicate::image: alloc::string::String
 pub outrig::config::ConfigValidationError::DevicePathEmpty
 pub outrig::config::ConfigValidationError::DevicePathEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathMalformed
+pub outrig::config::ConfigValidationError::DevicePathMalformed::detail: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathMalformed::device: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathMalformed::image: alloc::string::String
 pub outrig::config::ConfigValidationError::DevicePathRelative
 pub outrig::config::ConfigValidationError::DevicePathRelative::device: alloc::string::String
 pub outrig::config::ConfigValidationError::DevicePathRelative::image: alloc::string::String

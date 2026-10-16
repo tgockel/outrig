@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`devices` accepts podman's `<host>[:<container>][:<permissions>]` form, as it always did.** The
+  reference said the colon form was refused while validation passed it to podman. The reference now
+  documents it, and validation refuses a malformed entry -- more than three fields, a relative
+  container path, permissions outside `r`, `w`, `m` (or repeating one) -- with the new
+  `ConfigValidationError::DevicePathMalformed` instead of leaving it to fail at `podman run`. (#263)
+
 ### Added
 
 - **`Config::warnings` reports what a config load set aside rather than failing on.** Each
