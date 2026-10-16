@@ -203,6 +203,24 @@ which is what a program asking about itself intends. Programs that read it are m
 than they look: rustup's `cargo` shim resolves its own toolchain that way. The trade is that
 the primary's process list is not visible through the view -- it is a filesystem view.
 
+**`/etc/ld.so.preload` is empty for the payload.** glibc's loader reads that file on every start,
+by that absolute name, and no loader option turns it off. After the join it is the *primary's*
+file, so a primary that ships one -- for an allocator, say, or a shim -- would have its library
+loaded into the sidecar's server before `main`, with the server's environment and network, and one
+built for a newer glibc than the sidecar's would stop the server from starting, with a loader
+error naming a file the sidecar never had. So when the payload's loader is not musl's, the
+launcher mounts `/dev/null` over the file in the private namespace it already holds, and the
+loader finds it empty. The primary keeps its own file. The mount is in the payload's namespace,
+though, so everything the server starts sees the file empty too, the primary's own binaries
+included: they do not preload what the primary configured. That holds only while the primary
+leaves the file alone. The mount covers the file as it is when the server starts, and the kernel
+drops a mount whose file is renamed over or deleted, so when the primary replaces the file later
+-- with `sed -i`, or by deleting it and writing another -- the server's later children read the
+replacement, and a glibc one preloads what it lists. A write in place keeps the mask. A file the
+primary creates after the server started is never masked. The server itself read the file once,
+at its start, and is not affected. A musl loader has no such file and a static payload has no
+loader, so none of this applies to either.
+
 **The engine must be local.** The launcher binds the primary's `/proc/<pid>/ns` from this
 machine, so the podman engine has to share this machine's kernel and PID namespace. A socket on
 this host works; a remote engine (another host, a VM, another container) is refused up front.

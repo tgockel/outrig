@@ -11,8 +11,9 @@
 // Resolving here, ahead of the setns, is what makes a path mean the same thing
 // in both rootfs views. It settles the paths the launcher hands over, and only
 // those: what the loader goes on to find for itself -- a `DT_NEEDED` library
-// that is an absolute symlink, musl's `/etc/ld-musl-<arch>.path` -- escapes by
-// the identical mechanism and is not fixed here.
+// that is an absolute symlink, its built-in search directories, the entries of
+// musl's `/etc/ld-musl-<arch>.path` -- escapes by the identical mechanism and
+// is not fixed here (#595).
 //
 // The one file in this directory that does I/O -- resolution *is* a sequence of
 // `readlink`s. Like `elf.rs` and `path_search.rs` it is the single source of

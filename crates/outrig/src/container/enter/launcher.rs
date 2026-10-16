@@ -51,15 +51,33 @@
 //! exec permission against the file's own mode, which for an image binary is
 //! `0755`. Reordering the drop earlier breaks the graft; reordering it later
 //! is not possible, because the exec is the last thing this process does.
+//! The mask over `/etc/ld.so.preload` is one more `mount`, so it sits before
+//! the drop as well.
 //!
 //! Every path this file *hands* the dynamic exec -- the program, its
 //! interpreter, and each `--library-path` entry -- is canonicalized in that
 //! same pre-setns phase, and for the same reason rather than as a tidiness
 //! pass: after the setns an absolute symlink resolves in the primary's rootfs
 //! instead of the graft, which `canon.rs` explains in full. That closes the
-//! paths this file names. It does not close the ones ld.so goes on to find for
-//! itself -- a `DT_NEEDED` library that is an absolute symlink escapes by the
-//! identical mechanism, as does musl's `/etc/ld-musl-<arch>.path`; see #268.
+//! paths this file names. It does not close the ones the loader goes on to find
+//! for itself, which also mean the primary's files after the setns: a
+//! `DT_NEEDED` library that is an absolute symlink, the loader's built-in
+//! search directories (a library missing from `--library-path` falls through
+//! to them), and the entries of musl's `/etc/ld-musl-<arch>.path`. The path
+//! file itself is the sidecar's, since musl finds it relative to its own
+//! pathname, which is under the graft; see #595.
+//!
+//! One file the loader reads for itself is handled here (#268), because a mount
+//! can cover it: glibc's loader opens `/etc/ld.so.preload` on every start, and
+//! after the setns that is the primary's. For a payload whose loader is not
+//! musl's, `main` bind-mounts `/dev/null` over it, in the private namespace it
+//! already holds. That namespace is the payload's descendants' too, so the
+//! primary's own binaries the payload starts see the file empty as well. The
+//! mount covers the file as it is when `main` makes it, and only while the
+//! primary leaves it alone: the kernel detaches a mount whose file is renamed
+//! over or deleted (`sed -i`, say), in every namespace, and a file created
+//! later was never covered, so after either a process the payload starts reads
+//! the primary's file. The payload itself read it once, at its start.
 //!
 //! **A dynamic payload cannot re-execute itself, which is a limit of this
 //! design and not a bug in it (#358).** The kernel resolves a binary's
@@ -95,6 +113,7 @@ include!("path_search.rs");
 unsafe extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int;
     fn pread(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize;
     fn chdir(path: *const c_char) -> c_int;
     fn setns(fd: c_int, nstype: c_int) -> c_int;
@@ -114,6 +133,8 @@ unsafe extern "C" {
 }
 
 const O_RDONLY: c_int = 0;
+const F_OK: c_int = 0;
+const AT_FDCWD_INT: c_int = -100;
 const AT_FDCWD: c_long = -100;
 const AT_EMPTY_PATH: c_long = 0x1000;
 const AT_RECURSIVE: c_long = 0x8000;
@@ -123,10 +144,12 @@ const CLONE_NEWNS: c_int = 0x0002_0000;
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
 const MS_NOEXEC: c_ulong = 8;
+const MS_BIND: c_ulong = 0x1000;
 const MS_REC: c_ulong = 0x4000;
 const MS_SLAVE: c_ulong = 1 << 19;
 const EPERM: i32 = 1;
 const EACCES: i32 = 13;
+const ENOTDIR: i32 = 20;
 
 #[cfg(target_arch = "x86_64")]
 const SYS_OPEN_TREE: c_long = 428;
@@ -173,6 +196,27 @@ fn exists(path: &str) -> bool {
     true
 }
 
+/// Whether the kernel says there is nothing at `path`: `ENOENT` (no file, or a
+/// dangling link), `ENOTDIR` or `ELOOP`. Any other failure is *not* absence --
+/// `EACCES` on a directory above it, say -- so a caller that skips work for an
+/// absent path does the work instead.
+///
+/// `exists` cannot answer this: it asks whether *this* process may read the
+/// path, and a launcher without `CAP_DAC_OVERRIDE` may be refused a file the
+/// payload's user can read (#600). `faccessat` with `F_OK` needs only search
+/// permission on the directories and follows a symlink as the loader's own
+/// `access` does. Leaves errno as the failed call set it.
+fn absent(path: &str) -> bool {
+    let path_c = cstr(path.as_bytes());
+    if unsafe { faccessat(AT_FDCWD_INT, path_c.as_ptr(), F_OK, 0) } == 0 {
+        return false;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(ENOENT | ENOTDIR | ELOOP)
+    )
+}
+
 /// The `lib_dirs()` this image actually has, canonicalized and deduplicated --
 /// still graft-relative, and still in the fixed list's order.
 ///
@@ -186,7 +230,7 @@ fn exists(path: &str) -> bool {
 ///
 /// Dropping the absent ones is a separate, deliberate choice -- resolution
 /// keeps a missing component verbatim rather than failing, so this is the
-/// `open` probe's doing, not the walk's. Passing a directory the image does not
+/// `absent` probe's doing, not the walk's. Passing a directory the image does not
 /// have was harmless; not passing it says what was searched.
 ///
 /// Must run before the setns, for the reason `canonicalize_under_root` gives.
@@ -194,7 +238,7 @@ fn present_lib_dirs() -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();
     for dir in lib_dirs() {
         let canon = canonical_or_die("library path", dir.as_bytes());
-        if exists(&canon) && !dirs.contains(&canon) {
+        if !absent(&canon) && !dirs.contains(&canon) {
             dirs.push(canon);
         }
     }
@@ -315,7 +359,8 @@ struct DynamicLaunch {
     loader: String,
     /// [`present_lib_dirs`], for the loader's `--library-path`.
     lib_dirs: Vec<String>,
-    /// Whether that loader is musl's, which takes no `--inhibit-cache`.
+    /// Whether that loader is musl's, which takes no `--inhibit-cache` and reads
+    /// no `/etc/ld.so.preload`, so `main` masks that file for every other one.
     musl: bool,
 }
 
@@ -545,6 +590,41 @@ fn main() {
     } < 0
     {
         die("mount(/proc)", " (does /proc exist in the target image?)");
+    }
+
+    // glibc's loader opens `/etc/ld.so.preload` by that absolute name on every
+    // start and loads each object it lists before `main`; no loader option turns
+    // that off. After the join the file is the primary's, so the libraries the
+    // primary preloads would be loaded into this payload (#268). The loader
+    // skips a zero-length file silently, so bind `/dev/null` over it -- in the
+    // private namespace made above, which leaves the primary its real file.
+    // `absent` and `mount` both follow a symlink at the path as the loader's
+    // `open` does, and a file the primary bind-mounted there is stacked over. No
+    // file is the common case and needs nothing, and only the kernel's "not
+    // there" answers count as no file -- an unreadable one is still the loader's
+    // to read (#600). One that cannot be masked is fatal, because starting the
+    // payload unmasked is what this step exists to prevent. There is no
+    // read-only remount: in a user namespace it has to restate every flag the
+    // source mount carries, and `/dev/null` discards writes anyway. musl's
+    // loader never reads the file, and a static payload has no loader.
+    if dynamic.as_ref().is_some_and(|d| !d.musl) && !absent("/etc/ld.so.preload") {
+        let dev_null = cstr(b"/dev/null");
+        let preload = cstr(b"/etc/ld.so.preload");
+        if unsafe {
+            mount(
+                dev_null.as_ptr(),
+                preload.as_ptr(),
+                std::ptr::null(),
+                MS_BIND,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            die(
+                "mount(/dev/null -> /etc/ld.so.preload)",
+                " (hiding the primary's preload file from the payload's loader)",
+            );
+        }
     }
 
     let cwd_c = cstr(cwd.as_bytes());

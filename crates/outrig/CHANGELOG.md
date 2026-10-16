@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.**
+  glibc's loader opens that file on every start by its absolute name, and no loader option turns
+  that off. `outrig-enter` runs the payload through the sidecar's own loader inside the primary's
+  mount namespace, where `/etc` is the primary's, so every object the file listed was loaded into
+  the sidecar's server before `main`, with the server's environment and network, and nothing in
+  the session said so. An object built for a newer glibc than the sidecar's stopped the server from
+  starting, with a loader error naming a file the sidecar never had. When the payload's loader is
+  not musl's, the launcher now mounts `/dev/null` over the file, in the mount namespace it already
+  unshares for the graft, so the loader finds it empty and the primary keeps its own. The mask holds
+  for everything the payload starts, so the primary's own binaries it runs no longer preload what
+  the primary configured, until the primary replaces the file after the start (`sed -i`, or
+  deleting it and writing another), which takes the mask with it. A file the primary creates after
+  the start is never masked. A musl payload, whose loader has no such file, and a static one are
+  unchanged. A directory at that path, which glibc ignores, now fails the start with `Not a
+  directory`. The loader still finds some files in the primary: an absolute-symlink `DT_NEEDED`
+  library, its built-in search directories, and the entries of musl's path file (#595). (#268)
 - **A build-arg value holding a newline no longer shares an image's cache key with separate build
   args.** The key hashed each build arg as a `KEY=value` line with nothing escaped, so
   `{ A = "1\nB=2" }` and `{ A = "1", B = "2" }` fed it the same bytes while buildah got

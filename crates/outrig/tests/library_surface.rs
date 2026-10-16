@@ -14,12 +14,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
-    MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
-    SidecarWorkspaceAccess,
+    MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SecuritySpec, SidecarSpec,
+    SidecarView, SidecarWorkspaceAccess,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -112,6 +113,22 @@ fn build_shell_less_image(tag: &str) {
         "FROM docker.io/library/alpine:latest\n\
          RUN [\"/bin/busybox\", \"rm\", \"-f\", \
          \"/bin/sh\", \"/bin/ash\", \"/bin/bash\", \"/usr/bin/sh\", \"/usr/bin/ash\"]\n",
+    );
+}
+
+/// The filesystem server on a glibc base (`node:22-slim`): a `view = "primary"`
+/// payload whose loader the launcher has to run by name.
+///
+/// The `ENTRYPOINT` names `node` absolutely and the server by its real path
+/// rather than the `mcp-server-filesystem` shim, which is a shebang script and
+/// so refused before any of this is reached.
+fn build_glibc_fs_sidecar_image(tag: &str) {
+    build_image_from_dockerfile(
+        tag,
+        "FROM docker.io/library/node:22-slim\n\
+         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
+         ENTRYPOINT [\"/usr/local/bin/node\", \
+         \"/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js\"]\n",
     );
 }
 
@@ -710,16 +727,7 @@ async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
         std::process::id(),
     );
     // The absolute `/lib64` interpreter symlink comes free with the base image.
-    // The `ENTRYPOINT` names `node` absolutely and the server by its real path
-    // rather than the `mcp-server-filesystem` shim, which is a shebang script
-    // and so refused before any of this is reached.
-    build_image_from_dockerfile(
-        &sidecar_tag,
-        "FROM docker.io/library/node:22-slim\n\
-         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
-         ENTRYPOINT [\"/usr/local/bin/node\", \
-         \"/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js\"]\n",
-    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
     // Stock and unmodified: the primary contributes only its glibc version, so
     // a derived image would be a build that adds no layer.
     ensure_image(UBUNTU_IMAGE);
@@ -786,6 +794,306 @@ async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
     );
+}
+
+/// What glibc's loader prints, on stderr and before `main`, for each entry of
+/// `/etc/ld.so.preload` it cannot load. The `from` and the path pin it to that
+/// file; an `LD_PRELOAD` entry says `from LD_PRELOAD`.
+const PRELOAD_FILE_ERROR: &str = "from /etc/ld.so.preload";
+
+/// What the filesystem server has written to `path` once it has announced
+/// itself, which it does only after its transport is connected. The dynamic
+/// loader's own reports come before `main`, so by then they are in the file if
+/// they are coming at all -- which is what lets the caller assert one is
+/// absent. Polled: the file is filled by a separate `podman start --attach`.
+async fn stderr_once_running(path: &Path) -> String {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && text.contains("running on stdio")
+        {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{} never showed the server's startup line: {:?}",
+        path.display(),
+        std::fs::read_to_string(path),
+    );
+}
+
+/// `view = "primary"` with a **glibc** sidecar over a primary that ships
+/// `/etc/ld.so.preload` (#268).
+///
+/// glibc's loader opens that file on every start, by that absolute name, and no
+/// loader option turns that off. `outrig-enter` runs the payload through the
+/// sidecar's own loader *inside* the primary's mount namespace, so the name is
+/// the primary's file: every object it lists was loaded into the sidecar's
+/// server before `main`, with the server's environment and network, and one
+/// built for a newer glibc than the sidecar's stopped the server from starting
+/// at all.
+///
+/// The primary here lists an object that does not exist. The loader reports
+/// that on stderr and carries on, so it is the same read, visible without
+/// compiling a library. That makes the primary's own processes the control --
+/// they must print it, or the fixture proves nothing -- and the server's stderr
+/// the thing under test.
+///
+/// The pairing is the neighbor test's, `ubuntu:24.04` against `node:22-slim`: a
+/// glibc that differs from the sidecar's is the realistic shape of the failure.
+#[tokio::test]
+async fn primary_view_glibc_sidecar_does_not_load_the_primarys_ld_so_preload() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-preload-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-preload-primary-{}:latest",
+        std::process::id(),
+    );
+    ensure_image(UBUNTU_IMAGE);
+    build_image_from_dockerfile(
+        &primary_tag,
+        &format!(
+            "FROM {UBUNTU_IMAGE}\n\
+             RUN echo /opt/from-the-primary/missing.so > /etc/ld.so.preload\n"
+        ),
+    );
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The control. Without it a pass could mean the fixture never took effect,
+    // or that the loader words its report differently from what the assertions
+    // below look for.
+    let control = outrig
+        .exec_capture(&["true".into()], &ExecOptions::new())
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains(PRELOAD_FILE_ERROR),
+        "the primary's own loader should report its preload file, got: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("preloadfs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("preloadfs", ["/"]),
+        )
+        .await
+        .expect("a glibc sidecar must start over a primary that ships /etc/ld.so.preload");
+
+    // What the server's loader said about it.
+    let stderr = stderr_once_running(&session_dir.path().join("logs/preloadfs.stderr")).await;
+    assert!(
+        !stderr.contains(PRELOAD_FILE_ERROR),
+        "the server's loader should not have read the primary's preload file, got: {stderr}",
+    );
+
+    // And what the server itself finds at that path.
+    let seen = outrig
+        .call_tool(
+            "preloadfs",
+            "read_file",
+            serde_json::json!({ "path": "/etc/ld.so.preload" }),
+        )
+        .await
+        .expect("read the preload file through the view");
+    assert!(
+        !seen.is_error && seen.render_text().trim().is_empty(),
+        "the server should read the primary's preload file as empty, got: {}",
+        seen.render_text(),
+    );
+
+    // The mask is the launcher's own, in its own mount namespace: the primary
+    // keeps its file.
+    let kept = outrig
+        .exec_capture(
+            &["cat".into(), "/etc/ld.so.preload".into()],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&kept.stdout).contains("/opt/from-the-primary/missing.so"),
+        "the primary should still have its own preload file, got: {}",
+        String::from_utf8_lossy(&kept.stdout),
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("preloadfs"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// The mask over `/etc/ld.so.preload` does not depend on the launcher being
+/// able to read the file (#600).
+///
+/// The launcher is the sidecar image's user, here root, holding only the
+/// capabilities the sidecar was given. With `DAC_OVERRIDE` dropped it cannot
+/// open a file owned by the session user with mode `0600`, while the payload,
+/// which runs as that user, can -- so a probe that read "cannot open" as "not
+/// there" skipped the mask and the server preloaded the primary's file.
+#[tokio::test]
+async fn primary_view_sidecar_without_dac_override_masks_an_unreadable_ld_so_preload() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-preload-eacces-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-preload-eacces-primary-{}:latest",
+        std::process::id(),
+    );
+    ensure_image(UBUNTU_IMAGE);
+
+    // The session user is the invoking host user, so the file is theirs by id.
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let meta = std::fs::metadata(session_dir.path()).expect("stat session dir");
+    build_image_from_dockerfile(
+        &primary_tag,
+        &format!(
+            "FROM {UBUNTU_IMAGE}\n\
+             RUN echo /opt/from-the-primary/missing.so > /etc/ld.so.preload \
+             && chown {}:{} /etc/ld.so.preload && chmod 0600 /etc/ld.so.preload\n",
+            meta.uid(),
+            meta.gid(),
+        ),
+    );
+
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The control: the session user's own loader reads the file.
+    let control = outrig
+        .exec_capture(&["true".into()], &ExecOptions::new())
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains(PRELOAD_FILE_ERROR),
+        "the primary's own loader should report its preload file, got: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    let mut security = SecuritySpec::default();
+    security.capabilities.cap_drop = vec!["DAC_OVERRIDE".to_string()];
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("preloadfs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_security(security)
+                .with_entrypoint_server("preloadfs", ["/"]),
+        )
+        .await
+        .expect("a sidecar without DAC_OVERRIDE must start over the primary");
+
+    let stderr = stderr_once_running(&session_dir.path().join("logs/preloadfs.stderr")).await;
+    assert!(
+        !stderr.contains(PRELOAD_FILE_ERROR),
+        "the server's loader should not have read the primary's preload file, got: {stderr}",
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// The musl counterpart of the test above, pinning what musl's loader does with
+/// the primary's files: nothing, for the one that matters.
+///
+/// musl has no `/etc/ld.so.preload`. Its one startup file is
+/// `/etc/ld-musl-<arch>.path`, found relative to the *loader's own path* --
+/// `/mnt/lib/ld-musl-<arch>.so.1` here, so `/mnt/etc/ld-musl-<arch>.path`, the
+/// sidecar's -- and not the primary's.
+///
+/// The payload is `xz`, which needs `liblzma.so.5`. The sidecar moves that
+/// library out of every directory its loader searches, so on its own `xz` dies
+/// with `Error loading shared library liblzma.so.5`. The primary has the
+/// library only in `/opt/pmark`, which its path file names, and nowhere the
+/// loader's built-in directories reach. Were the primary's path file read, the
+/// loader would find the library there and `xz` would start instead.
+#[tokio::test]
+async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-pathfile-primary-{}:latest",
+        std::process::id(),
+    );
+    // The arch in the file's name is musl's own spelling, which `uname -m`
+    // matches on both x86-64 and aarch64.
+    build_image_from_dockerfile(
+        &primary_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz-libs \
+         && mkdir -p /opt/pmark \
+         && mv /usr/lib/liblzma.so.5* /opt/pmark/ \
+         && echo /opt/pmark:/lib:/usr/local/lib:/usr/lib > /etc/ld-musl-$(uname -m).path\n",
+    );
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-pathfile-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(
+        &sidecar_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/hidden \
+         && mv /usr/lib/liblzma.so.5* /opt/hidden/\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    );
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // `xz` is not an MCP server, so the add fails either way; what the
+    // container wrote says why. The loader's error is the pass, `xz` having
+    // started is the fail.
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("pathfile", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("pathfile", ["/"]),
+        )
+        .await
+        .expect_err("a library only the primary's path file names must not be found");
+    let stderr = std::fs::read_to_string(session_dir.path().join("logs/pathfile.stderr"))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("Error loading shared library liblzma.so.5"),
+        "the payload should fail to find liblzma.so.5, got: {stderr:?}",
+    );
+
+    assert_eq!(
+        sidecar_containers_labeled("pathfile"),
+        Vec::<String>::new(),
+        "a failed add should leave no container"
+    );
+    outrig.shutdown().await.expect("shutdown");
 }
 
 /// A `view = "primary"` sidecar whose `ENTRYPOINT` names a program no `PATH`

@@ -85,6 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.** Fixed
+  in `outrig` (#268). glibc's loader reads that file on every start, and inside the primary's mount
+  namespace it was the primary's: a library it listed was loaded into the sidecar's server, and one
+  built for a newer glibc than the sidecar's stopped the server from starting. For a payload whose
+  loader is not musl's, the launcher now masks the file with `/dev/null`: the primary keeps it, and
+  the server, and everything the server starts, sees it empty, until the primary replaces the file
+  after the start, which takes the mask with it. A musl or static payload is unchanged. See
+  [Primary filesystem view](../../doc/concepts/mcp-servers.md#primary-filesystem-view) and the
+  `outrig` changelog.
 - **A local model's cut-off turn names its finish reason and ceiling.** With `local-llm`, a turn
   that produced no text and no tool call -- in practice a reasoning model cut off at `max-tokens`
   inside its `<think>` block -- was reported without the line a remote turn gets, so it was told
