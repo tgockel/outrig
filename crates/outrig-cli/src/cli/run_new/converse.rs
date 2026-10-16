@@ -88,35 +88,45 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// a fresh `ctrl_c()` per wait, which would miss a press landing between two
 /// of them -- and a quick second press is the one that stops waiting.
 ///
-/// Nothing is left queued for stderr when this returns, since the caller
-/// writes to it next. End of input and the interpreter's exit show everything
-/// the agent sent first, for as long as the terminal takes. `/quit` and a
-/// second Ctrl-C do not wait for a stdout that may have stopped, so the few
+/// `out` is where everything is written, and is the caller's: what it says as
+/// the session closes goes through it too, queued behind what this showed, so
+/// it is written in turn and not while a write this left stuck holds the
+/// destination. End of input and the interpreter's exit show everything the
+/// agent sent first, for as long as the terminal takes. `/quit` and a second
+/// Ctrl-C do not wait for a stdout that may have stopped, nor, when stderr is
+/// the same destination, for a stderr that waits behind it, so the few
 /// messages taken but not yet written are dropped; so are they when the loop
-/// fails. A Ctrl-C ends a wait for the terminal. A write that fails while
-/// the session ends, as input does with stdout stopped and its reader gone,
-/// fails the session as one made while it runs does.
+/// fails. A Ctrl-C ends a wait for the terminal. A write that fails while the
+/// session ends, as input does with stdout stopped and its reader gone, fails
+/// the session as one made while it runs does.
 ///
 /// `shown` is the terminal's subscription to the session's events, which is
 /// where the Python each round runs is shown from.
-pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) -> Result<()> {
+pub(super) async fn converse(
+    session: &mut Session,
+    shown: &mut Subscription,
+    out: &Output,
+    failures: &mut Failures,
+) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
-    let (out, mut failures) = Output::stdio()?;
     let mut term = Terminal { out, reading: true };
-    let mut left = drive(session, shown, &mut term, &mut sigint, &mut failures).await;
+    let left = drive(session, shown, &mut term, &mut sigint, failures).await;
     if left.is_err() {
         // A failure does not wait on a stdout that may have stopped either.
-        term.out.abandon();
+        out.abandon();
     }
-    term.out.finish(sigint.recv()).await;
-    if left.is_ok() {
-        // A write that failed while this waited on it left output short of
-        // what the session was told, so the session did not end cleanly.
-        if let Ok(failed) = failures.try_recv() {
-            left = Err(failed.into());
-        }
+    out.settle(sigint.recv()).await;
+    reconcile(left, failures)
+}
+
+/// `left`, unless it is a success and a write has failed: that left output
+/// short of what the session was told, so the session did not end cleanly. It
+/// takes the writes that have failed by now, and none that are yet to.
+pub(super) fn reconcile(left: Result<()>, failures: &mut Failures) -> Result<()> {
+    match failures.try_recv() {
+        Ok(failed) if left.is_ok() => Err(failed.into()),
+        _ => left,
     }
-    left
 }
 
 /// The loop [`converse`] runs. It returns with everything it showed queued,
@@ -125,7 +135,7 @@ pub(super) async fn converse(session: &mut Session, shown: &mut Subscription) ->
 async fn drive(
     session: &mut Session,
     shown: &mut Subscription,
-    term: &mut Terminal,
+    term: &mut Terminal<'_>,
     sigint: &mut Signal,
     failures: &mut Failures,
 ) -> Result<()> {
@@ -166,7 +176,7 @@ async fn drive(
                     term.answered(queued, mid_round);
                 }
                 tokio::select! {
-                    () = show(&term.out, user.receive_waiting()) => {}
+                    () = show(term.out, user.receive_waiting()) => {}
                     _ = sigint.recv() => {
                         closer.close_admission();
                         term.out.abandon();
@@ -370,14 +380,14 @@ fn read_lines() -> std::io::Result<mpsc::UnboundedReceiver<std::io::Result<Strin
 
 /// What the session shows, rendered and queued on [`Output`], which writes it.
 /// Nothing here waits on the terminal.
-struct Terminal {
-    out: Output,
+struct Terminal<'a> {
+    out: &'a Output,
     /// Whether input is still being read. Once it is not, there is no prompt
     /// to draw.
     reading: bool,
 }
 
-impl Terminal {
+impl Terminal<'_> {
     fn prompt(&self) {
         if self.reading {
             self.out.text(PROMPT);

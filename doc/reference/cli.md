@@ -405,8 +405,11 @@ nothing else: the round, stderr, and Ctrl-C carry on. When input ends -- the end
 or Ctrl-D -- the lines typed before it that were refused are reported and what the agent had
 already sent is printed, then `run-new` exits; a task still sending is not waited for. `/quit` and
 a second Ctrl-C do not wait for a stdout that has stopped, so the few messages queued for it are
-dropped. The model's own text is commentary and goes to stderr with everything else, so `outrig
-run-new > out.txt` keeps exactly the messages the agent meant you to have.
+dropped. With stdout and stderr on one pipe, as in `outrig run-new 2>&1`, each message and each
+line is written whole, one at a time, so a line of stderr's never cuts a message; a stdout that has
+stopped then holds stderr up too, and `/quit` and a second Ctrl-C do not wait for either. The
+model's own text is commentary and goes to stderr with everything else, so `outrig run-new >
+out.txt` keeps exactly the messages the agent meant you to have.
 
 **No MCP server and no sidecar starts**, including servers an image declares in its
 `org.outrig.mcp` label; startup names the configured ones it left out. The model could not call
@@ -444,11 +447,17 @@ the close ended -- and exits with the status it decides:
 | 2      | Everything stopped, and some Python or binding call was cut off: it may have acted. |
 | 3      | Something could not be confirmed stopped, and may still be running.                 |
 
+Neither the closing line, `[outrig] closing the session`, nor the report is waited for before the
+stop starts, and neither makes the session fail if it cannot be written. If nothing is reading a
+pipe that carries stdout and stderr, the session is still stopped and its record finished, and
+`run-new` then waits five seconds for the report before it exits.
+
 If the interpreter exits -- Python that calls `os._exit`, say -- nothing typed could reach the
 agent any more, and the session ends, through the same report, with exit status 1, or 3 if the
 stop could not be confirmed. A conversation that fails -- a write to a stdout whose reader went
 away, say -- or a session record that cannot be written ends the same way, and its error is
-printed after the report.
+printed after the report. A write the conversation queued before `/quit` counts, if it fails
+before the stop is done; once the record is finished, nothing changes the status.
 
 Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
 cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping

@@ -31,12 +31,23 @@
 //! line is ended before it, and the prompt drawn again after. The frame is on
 //! stderr, so the stdout thread asks for it on stderr's queue, where it
 //! follows what was queued there before, and waits for the first part to be
-//! written before it writes the message. Stderr never waits on stdout.
+//! written before it writes the message. Stderr's queue never waits on
+//! stdout's.
 //!
 //! When stdout and stderr are one destination -- `2>&1`, or one terminal -- each
 //! write holds a lock, so a line too long for the destination to take at once
 //! is not cut by the other stream's. With two destinations the threads do not
 //! wait on each other.
+//!
+//! With one destination, a write to stderr waits behind the one stdout is in,
+//! so once the user has asked to go and stdout is abandoned, [`Output::settle`]
+//! waits on stderr no more than on stdout. The caller says what the session
+//! closes with through stderr's queue too, which writes it in turn and leaves
+//! the caller free to stop the session whether or not it could be written;
+//! [`Output::finish`] then waits for it only as long as the caller allows.
+//! That is not the conversation's output, so a write of it that fails is not
+//! reported through [`Failures`]; the caller reads what the conversation's did
+//! once the stop is done.
 //!
 //! Whether a message is framed is decided when the loop takes it, and the
 //! frame is applied when it is written. Behind a terminal that has fallen
@@ -61,6 +72,8 @@ const OUTBOX: usize = 4;
 enum ToStderr {
     /// Written as it is.
     Text(Vec<u8>),
+    /// Written as it is, and a failure to is not reported.
+    BestEffort(Vec<u8>),
     /// Answered once everything queued before it has been written. Nothing
     /// queued after it is, since the thread ends.
     Finish(oneshot::Sender<()>),
@@ -87,6 +100,8 @@ pub(super) struct Output {
     abandoned: CancellationToken,
     /// Cancelled when the last wait was cut short: stderr takes nothing more.
     closed: CancellationToken,
+    /// Whether the two are one destination.
+    shared: bool,
 }
 
 /// The writes that failed. Each thread stops at its first.
@@ -127,6 +142,7 @@ impl Output {
             stdout: to_stdout,
             abandoned,
             closed,
+            shared,
         };
         Ok((output, failures))
     }
@@ -135,6 +151,13 @@ impl Output {
     pub(super) fn text(&self, text: impl Into<Vec<u8>>) {
         // A thread that has gone has said why through `Failures`.
         let _ = self.stderr.send(ToStderr::Text(text.into()));
+    }
+
+    /// `text` on stderr, as it is, for what the session says as it closes. A
+    /// write of it that fails says nothing of the conversation, so it is not
+    /// reported through [`Failures`].
+    pub(super) fn text_best_effort(&self, text: impl Into<Vec<u8>>) {
+        let _ = self.stderr.send(ToStderr::BestEffort(text.into()));
     }
 
     /// `text` as a line on stderr.
@@ -180,27 +203,32 @@ impl Output {
     }
 
     /// Wait for what is queued to be written: stderr's, and stdout's too
-    /// unless it has been abandoned. When `interrupted` completes first -- the
-    /// user has pressed Ctrl-C on a terminal that has stopped -- stop waiting,
-    /// and abandon stdout, so that settling again does not wait on it either.
+    /// unless it has been abandoned, and then not stderr's either when the two
+    /// are one destination. When `interrupted` completes first -- the user has
+    /// pressed Ctrl-C on a terminal that has stopped -- stop waiting, and
+    /// abandon stdout, so that settling again does not wait on it either.
     pub(super) async fn settle(&self, interrupted: impl Future) {
         self.wait(false, interrupted).await;
     }
 
-    /// [`Output::settle`] for the last time: stderr's thread then ends, so
-    /// nothing that is queued later is written after the caller starts
-    /// writing stderr itself. If `interrupted` completes first it ends after
-    /// the write it is in, if any, and what is still queued is dropped.
+    /// [`Output::settle`] for the last time: it waits for stderr's queue
+    /// whatever has become of stdout, and stderr's thread then ends. If
+    /// `interrupted` completes first -- the caller's bound on the wait -- the
+    /// thread ends after the write it is in, if any, and what is still queued
+    /// is dropped.
     pub(super) async fn finish(&self, interrupted: impl Future) {
         self.wait(true, interrupted).await;
     }
 
     async fn wait(&self, finish: bool, interrupted: impl Future) {
         let written = async {
-            if !self.abandoned.is_cancelled() {
+            let abandoned = self.abandoned.is_cancelled();
+            if !abandoned {
                 self.drain_stdout().await;
             }
-            self.drain_stderr(finish).await;
+            if finish || !(abandoned && self.shared) {
+                self.drain_stderr(finish).await;
+            }
         };
         tokio::select! {
             () = written => {}
@@ -260,6 +288,12 @@ fn serve_stderr(
         }
         let written = match item {
             ToStderr::Text(text) => write_whole(&mut out, &text, serial),
+            ToStderr::BestEffort(text) => {
+                if write_whole(&mut out, &text, serial).is_err() {
+                    return;
+                }
+                Ok(())
+            }
             ToStderr::Written(done) => {
                 let _ = done.send(());
                 Ok(())
@@ -419,6 +453,11 @@ mod tests {
         Output::spawn(stdout.clone(), stderr.clone(), false).expect("threads")
     }
 
+    /// [`start`], with the two writers one destination.
+    fn start_shared(stdout: &Gate, stderr: &Gate) -> (Output, Failures) {
+        Output::spawn(stdout.clone(), stderr.clone(), true).expect("threads")
+    }
+
     fn written(log: &Log) -> Vec<String> {
         log.lock().expect("unpoisoned").clone()
     }
@@ -508,6 +547,35 @@ mod tests {
         .expect("threads");
 
         out.room().await.expect("room").send("m".into(), false);
+        let failed = failures.recv().await.expect("the write failed");
+        assert_eq!(failed.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// What the session says as it closes is best effort: a write of it that
+    /// fails is not a failure of the conversation, which is what [`Failures`]
+    /// reports.
+    #[tokio::test]
+    async fn a_failed_closing_write_is_not_reported() {
+        let log = Log::default();
+        let (out, mut failures) = Output::spawn(
+            Gate::open("O", &log),
+            Broken(io::ErrorKind::BrokenPipe),
+            false,
+        )
+        .expect("threads");
+
+        out.text_best_effort("closing\n");
+        out.finish(pending::<()>()).await;
+        assert!(failures.try_recv().is_err(), "the closing write was reported");
+
+        // The conversation's own write on the same destination is.
+        let (out, mut failures) = Output::spawn(
+            Gate::open("O", &log),
+            Broken(io::ErrorKind::BrokenPipe),
+            false,
+        )
+        .expect("threads");
+        out.text("note\n");
         let failed = failures.recv().await.expect("the write failed");
         assert_eq!(failed.kind(), io::ErrorKind::BrokenPipe);
     }
@@ -614,8 +682,7 @@ mod tests {
     async fn one_destination_is_written_one_stream_at_a_time() {
         let log = Log::default();
         let (stdout, stderr) = (Gate::shut("O", &log), Gate::open("E", &log));
-        let (out, _failures) =
-            Output::spawn(stdout.clone(), stderr.clone(), true).expect("threads");
+        let (out, _failures) = start_shared(&stdout, &stderr);
 
         out.room().await.expect("room").send("m".into(), false);
         stdout.reached(1);
@@ -629,6 +696,60 @@ mod tests {
         out.drain_stdout().await;
         out.drain_stderr(false).await;
         assert_eq!(written(&log), ["O:m\n", "E:note\n"]);
+    }
+
+    /// With one destination, stderr's writes wait behind stdout's stuck one, so
+    /// once stdout is abandoned settling waits on neither (#579). What is
+    /// queued after, as the session closes, is written in turn once the write
+    /// ends, and never inside it.
+    #[tokio::test]
+    async fn one_destination_abandoned_is_settled_without_waiting_on_either() {
+        let log = Log::default();
+        let (stdout, stderr) = (Gate::shut("O", &log), Gate::open("E", &log));
+        let (out, _failures) = start_shared(&stdout, &stderr);
+
+        out.room().await.expect("room").send("m".into(), false);
+        stdout.reached(1);
+        out.line("note");
+        out.abandon();
+        tokio::time::timeout(Duration::from_secs(10), out.settle(pending::<()>()))
+            .await
+            .expect("settling waited on stderr behind the stuck stdout");
+        out.line("closing");
+        out.line("report");
+
+        // Written behind stdout's write, whole, and in the order queued.
+        stdout.let_through();
+        out.finish(pending::<()>()).await;
+        assert_eq!(
+            written(&log),
+            ["O:m\n", "E:note\n", "E:closing\n", "E:report\n"]
+        );
+    }
+
+    /// The last wait ends at the caller's bound even when stdout's stuck write
+    /// is what holds stderr's up, so a destination that has stopped delays what
+    /// is printed and not the exit.
+    #[tokio::test]
+    async fn finishing_behind_a_stuck_stdout_ends_at_the_callers_bound() {
+        let log = Log::default();
+        let (stdout, stderr) = (Gate::shut("O", &log), Gate::open("E", &log));
+        let (out, _failures) = start_shared(&stdout, &stderr);
+
+        out.room().await.expect("room").send("m".into(), false);
+        stdout.reached(1);
+        out.abandon();
+        out.line("report");
+        let bound = tokio::time::sleep(Duration::from_millis(100));
+        tokio::time::timeout(Duration::from_secs(10), out.finish(bound))
+            .await
+            .expect("finishing waited past its bound");
+        assert!(written(&log).is_empty(), "{:?}", written(&log));
+
+        stdout.let_through();
+        tokio::time::timeout(Duration::from_secs(10), out.stderr.closed())
+            .await
+            .expect("the stderr thread ended");
     }
 
     /// A framed message whose write was abandoned midway does not draw the

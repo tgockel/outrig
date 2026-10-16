@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could not be confirmed. If the interpreter exits, the conversation fails -- a write to a
   stdout or stderr whose reader went away, say -- or the session's record cannot be written, the
   session ends with status 1, or 3 if its stop could not be confirmed; a failure's error is
-  printed after the report either way. It starts no MCP server
+  printed after the report either way. With stdout and stderr on one pipe, as in `2>&1`, a message
+  is written whole, and the closing line and the report come before or after it; a pipe nobody
+  reads delays what is printed and not the stop, and the exit waits five seconds for the report.
+  It starts no MCP server
   and no sidecar, since the model could not call them and a server in the primary container would
   sit beside the interpreter as the same user, holding its resolved secrets. Its session is
   recorded like `run`'s, in a container named

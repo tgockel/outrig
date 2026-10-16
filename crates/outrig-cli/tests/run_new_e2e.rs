@@ -16,8 +16,10 @@
 
 mod common;
 
+use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -129,6 +131,38 @@ image-name = "docker.io/library/alpine:latest"
     repo
 }
 
+/// `outrig run-new` in `repo`, with stdin piped and everything but stdout and
+/// stderr, which the caller wires, set up.
+fn run_new_command(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, String)]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_outrig"));
+    command
+        .args(["--global-config"])
+        .arg(global)
+        .arg("--session-root")
+        .arg(sessions)
+        .arg("run-new")
+        .current_dir(repo)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .env(KEY_VAR, "sk-ant-mock-key")
+        .env_remove(SECRET_VAR)
+        .env("OUTRIG_LOG", "info")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .stdin(Stdio::piped())
+        .kill_on_drop(true)
+        // A group of its own, led by outrig, as a shell's foreground job is.
+        .process_group(0);
+    command
+}
+
+/// `line` and a newline on outrig's stdin, as a terminal sends a typed line.
+async fn type_line(stdin: &mut ChildStdin, line: &str) {
+    stdin
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .expect("typed");
+}
+
 /// How a test reads the binary's stdout.
 enum Reader {
     /// As it arrives.
@@ -182,25 +216,9 @@ impl Session {
         env: &[(&str, String)],
         reader: Reader,
     ) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .args(["--global-config"])
-            .arg(global)
-            .arg("--session-root")
-            .arg(sessions)
-            .arg("run-new")
-            .current_dir(repo)
-            .envs(env.iter().map(|(name, value)| (name, value)))
-            .env(KEY_VAR, "sk-ant-mock-key")
-            .env_remove(SECRET_VAR)
-            .env("OUTRIG_LOG", "info")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
-            .stdin(Stdio::piped())
+        let mut child = run_new_command(repo, sessions, global, env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            // A group of its own, led by outrig, as a shell's foreground job is.
-            .process_group(0)
             .spawn()
             .expect("spawn outrig");
         let pid = child.id().expect("a pid").to_string();
@@ -251,10 +269,7 @@ impl Session {
     }
 
     async fn type_line(&mut self, line: &str) {
-        self.stdin
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .expect("typed");
+        type_line(&mut self.stdin, line).await;
     }
 
     /// Wait for outrig to exit, and return how, with what each stream carried.
@@ -898,6 +913,242 @@ async fn a_vanished_stdout_and_stderr_reader_ends_the_session_with_1_and_a_finis
     assert!(!record["ended_at"].is_null(), "{record:#}");
     // Gone as the process exits, since the stop it waited for ran; left behind
     // it was still stopping, and removed only as the unwind dropped it.
+    let container = record["container_name"].as_str().expect("a name");
+    let _tidy = RemoveOnDrop(container.to_string());
+    assert!(
+        podman_names(&format!("name={container}")).is_empty(),
+        "{record:#}"
+    );
+}
+
+/// An `outrig run-new 2>&1`: stdout and stderr are the write end of one pipe,
+/// which a thread of the test's reads, up to 4 KiB with 20 ms between reads, so
+/// a message of the agent's is written to it in many parts. Reading can be
+/// stopped with the read end held open, as a paused pager does, or ended by
+/// closing it, as a pager that quits does.
+struct Merged {
+    child: Child,
+    stdin: ChildStdin,
+    /// What has been read from the pipe.
+    read: Arc<Mutex<Vec<u8>>>,
+    reading: Arc<AtomicBool>,
+    hung_up: Arc<AtomicBool>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl Merged {
+    fn start(repo: &Path, sessions: &Path) -> Self {
+        let (mut pipe, writer) = std::io::pipe().expect("a pipe");
+        let mut child = run_new_command(repo, sessions, &repo.join("no-such-global.toml"), &[])
+            .stdout(writer.try_clone().expect("a second write end"))
+            .stderr(writer)
+            .spawn()
+            .expect("spawn outrig");
+        let stdin = child.stdin.take().expect("stdin");
+        let read = Arc::new(Mutex::new(Vec::new()));
+        let reading = Arc::new(AtomicBool::new(true));
+        let hung_up = Arc::new(AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let (read, reading) = (Arc::clone(&read), Arc::clone(&reading));
+            let hung_up = Arc::clone(&hung_up);
+            move || {
+                let mut buf = [0; 4096];
+                loop {
+                    std::thread::sleep(Duration::from_millis(20));
+                    if hung_up.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if !reading.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    match pipe.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => read
+                            .lock()
+                            .expect("unpoisoned")
+                            .extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            read,
+            reading,
+            hung_up,
+            reader,
+        }
+    }
+
+    async fn type_line(&mut self, line: &str) {
+        type_line(&mut self.stdin, line).await;
+    }
+
+    /// Wait until `what` of the message of `A`s has been read: past the
+    /// banner and everything else of stderr's, none of which has that many.
+    async fn wait_for_a_s(&self, what: usize) {
+        let count = || {
+            self.read
+                .lock()
+                .expect("unpoisoned")
+                .iter()
+                .filter(|b| **b == b'A')
+                .count()
+        };
+        wait_until(TEST_TIMEOUT, "the agent's message", || count() >= what).await;
+    }
+
+    /// Stop reading, with the pipe still open.
+    fn stop_reading(&self) {
+        self.reading.store(false, Ordering::SeqCst);
+    }
+
+    /// Close the read end, so that a write to the pipe fails.
+    async fn hang_up(&self) {
+        self.hung_up.store(true, Ordering::SeqCst);
+        // The reader checks between reads, and a paused one only then.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Wait for outrig to exit, with input still open as a terminal's is, then
+    /// read the rest of the pipe and return how it exited and all it wrote.
+    async fn exit(self) -> (std::process::ExitStatus, String) {
+        let Self {
+            mut child,
+            stdin,
+            read,
+            reading,
+            hung_up: _,
+            reader,
+        } = self;
+        let status = timeout(STEP_TIMEOUT, child.wait())
+            .await
+            .expect("exits")
+            .expect("wait");
+        drop(stdin);
+        reading.store(true, Ordering::SeqCst);
+        reader.join().expect("the reader finished");
+        let read = read.lock().expect("unpoisoned");
+        (status, String::from_utf8_lossy(&read).into_owned())
+    }
+}
+
+/// `text` with each run of 64 or more `A`s as `<N A>`, so that what a message
+/// of 900000 of them was written between shows.
+fn squeeze_runs(text: &str) -> String {
+    regex::Regex::new("A{64,}")
+        .expect("a pattern")
+        .replace_all(text, |run: &regex::Captures| {
+            format!("<{} A>", run[0].len())
+        })
+        .into_owned()
+}
+
+/// What the agent's code sends, and then waits out: a message much larger than
+/// a pipe holds, written to it in many parts as it is read, and a round that is
+/// still running at `/quit`.
+const BIG_MESSAGE: &str = "await runtime.channels['user'].send('A' * 900000)\n\
+                           await asyncio.sleep(60)";
+
+/// With stdout and stderr one pipe (#579), `/quit` while a message larger than
+/// the pipe holds is being written leaves the message whole: what the session
+/// says as it closes is written before or after it, and never inside it.
+#[tokio::test]
+async fn closing_a_session_whose_stdout_and_stderr_are_one_pipe_does_not_cut_a_message() {
+    let (addr, _requests) = start_mock_http(vec![submit("toolu_big", BIG_MESSAGE)]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Merged::start(repo.path(), sessions.path());
+
+    session.type_line("go").await;
+    session.wait_for_a_s(4096).await;
+    session.type_line("/quit").await;
+    let (status, output) = session.exit().await;
+
+    let shown = squeeze_runs(&output);
+    assert_eq!(status.code(), Some(0), "{shown}");
+    assert!(
+        shown.contains("<900000 A>"),
+        "the message was cut:\n{shown}"
+    );
+    assert!(shown.contains("[outrig] closing the session"), "{shown}");
+    assert!(shown.contains("[outrig] session closed:"), "{shown}");
+}
+
+/// With that pipe no longer read (#579), `/quit` still stops the session: the
+/// container is removed and the record finished while the pipe is unread, and
+/// `run-new` exits on its own, not once something reads again.
+#[tokio::test]
+async fn quit_stops_a_session_whose_one_pipe_is_no_longer_read() {
+    let (addr, _requests) = start_mock_http(vec![submit("toolu_big", BIG_MESSAGE)]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Merged::start(repo.path(), sessions.path());
+
+    session.type_line("go").await;
+    session.wait_for_a_s(4096).await;
+    session.stop_reading();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    session.type_line("/quit").await;
+
+    wait_until(
+        STEP_TIMEOUT,
+        "finished record while the pipe is unread",
+        || !the_record(sessions.path())["ended_at"].is_null(),
+    )
+    .await;
+    let record = the_record(sessions.path());
+    let container = record["container_name"].as_str().expect("a name");
+    let _tidy = RemoveOnDrop(container.to_string());
+    assert!(
+        podman_names(&format!("name={container}")).is_empty(),
+        "{record:#}"
+    );
+    let (status, output) = session.exit().await;
+    assert_eq!(status.code(), Some(0), "{}", squeeze_runs(&output));
+}
+
+/// What the agent's code sends, and then holds the interpreter against every
+/// interrupt: the stop waits out its five seconds for the code, so it lasts
+/// long enough to act in, and cuts the code off, which exits 2.
+const BIG_MESSAGE_AND_HOLD: &str = "await runtime.channels['user'].send('A' * 900000)\n\
+                                    import time\n\
+                                    while True:\n    try:\n        time.sleep(0.1)\n    \
+                                    except BaseException:\n        pass";
+
+/// With that pipe no longer read, a write the conversation queued -- here
+/// `/help`'s text -- is still waiting when `/quit` leaves, which does not wait
+/// for it. When the reader then goes away as the session stops, the write fails
+/// and the session did not end cleanly: the record and the exit status both say
+/// 1, not the 2 the stop would have decided alone.
+#[tokio::test]
+async fn a_write_that_fails_as_the_session_stops_ends_it_with_1() {
+    let (addr, _requests) = start_mock_http(vec![submit("toolu_big", BIG_MESSAGE_AND_HOLD)]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Merged::start(repo.path(), sessions.path());
+
+    session.type_line("go").await;
+    session.wait_for_a_s(4096).await;
+    session.stop_reading();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    session.type_line("/help").await;
+    session.type_line("/quit").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let record = the_record(sessions.path());
+    assert!(
+        record["ended_at"].is_null(),
+        "the stop was over before the reader went away: {record:#}"
+    );
+    session.hang_up().await;
+    let (status, output) = session.exit().await;
+
+    let shown = squeeze_runs(&output);
+    assert_eq!(status.code(), Some(1), "{shown}");
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 1, "{record:#}");
+    assert!(!record["ended_at"].is_null(), "{record:#}");
     let container = record["container_name"].as_str().expect("a name");
     let _tidy = RemoveOnDrop(container.to_string());
     assert!(

@@ -29,7 +29,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use nix::fcntl::{Flock, FlockArg};
@@ -52,6 +52,12 @@ use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 mod approve;
 mod converse;
 mod output;
+
+/// How long, once the session is stopped and its record finished, the report
+/// is waited for. A destination that has stopped -- a pager paused, a pipe
+/// nobody reads -- delays what is printed and not the exit, so the wait ends
+/// here with whatever was not written left unsaid.
+const REPORT_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 pub struct RunNewArgs {
@@ -150,6 +156,13 @@ pub async fn execute(
         exit_code: None,
         link_target: None,
     };
+    // Made before the container starts, so a process that cannot start its
+    // threads fails with nothing left to stop. The conversation writes through
+    // it, and so do the closing line and the report, in turn with what the
+    // agent sends. The banner and the report of a failed start are written
+    // directly: nothing is queued on it yet, so nothing is being written to
+    // compete with them.
+    let (out, mut failures) = output::Output::stdio()?;
     let started = start(Start {
         builder,
         cfg: &cfg,
@@ -193,20 +206,28 @@ pub async fn execute(
         session_id: sid.as_str(),
     }));
 
-    let conversed = converse::converse(&mut running, &mut shown).await;
+    let conversed = converse::converse(&mut running, &mut shown, &out, &mut failures).await;
 
     // Said first, since stopping can take a few seconds and a Ctrl-C there
-    // does nothing.
-    eprint_best_effort("[outrig] closing the session\n");
+    // does nothing. Queued, not written here: with stdout and stderr one pipe,
+    // a write waits for the message being written to it, and for as long as
+    // nobody reads the pipe, which the stop must not wait for.
+    out.text_best_effort("[outrig] closing the session\n");
     let report = running.shutdown(DEFAULT_DRAIN).await;
     let summary = summarize(&report);
-    eprint_best_effort(&render_report(&summary));
+    out.text_best_effort(render_report(&summary));
+    // `/quit` did not wait for what the conversation had queued, so a write of
+    // it that has failed since, as the stop ran, fails the session here.
+    let conversed = converse::reconcile(conversed, &mut failures);
     let outcome = outcome_of(conversed, &summary);
     // The status the process exits with, so the record never says otherwise.
     let exit = outcome.as_ref().copied().unwrap_or_else(CliError::exit_status);
     if let Err(e) = store.finalize(&sid, SystemTime::now(), exit) {
         tracing::warn!(target: "outrig::cli::run_new", "finalizing session {sid}: {e}");
     }
+    // Last, so the record is finished whether or not the report could be
+    // written, and the `error:` line printed once this returns follows it.
+    out.finish(tokio::time::sleep(REPORT_GRACE)).await;
     outcome
 }
 
