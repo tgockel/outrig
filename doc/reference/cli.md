@@ -308,7 +308,9 @@ so and names the image's own Python, if it has one, as the place to run such cod
 `pip` finds no wheel of such a package that fits, so it builds the package's source distribution
 instead: that fails for numpy, and succeeds for a package such as MarkupSafe whose source builds
 to pure Python, which then imports. When `pip` fails on a package that lists compiled wheels, it
-ends its output with a note saying so and naming the image's own Python. The note is the `pip`
+ends its output with a note saying so and naming the image's own Python. Under `--only-binary`,
+which leaves out a source distribution pip could otherwise build, the note says that instead and
+names no Python, since whether the source builds to pure Python is not known. The note is the `pip`
 command's: `sys.executable -m pip` runs the same pip without it, and `python3 -m pip` is the
 image's own, unchanged. In its Python,
 `runtime.python` summarizes this, `runtime.names()` lists what the agent has bound, and `help(x)`

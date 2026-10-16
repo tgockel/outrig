@@ -1073,8 +1073,11 @@ os.execve(sys.executable, [sys.executable, "-I", *sys.argv[1:]], env)
 # build backend and the two places a build can fail, remember that one did; a failure before them,
 # such as a hash that does not match, is not a failed build. The error pip raises when nothing
 # fits says why for a package whose compiled wheels are all there is of the versions asked for, by
-# the requirement and by a `-c` constraint, where nothing could be built. The note for the rest is
-# written after pip has exited with an error, as the last of its output.
+# the requirement and by a `-c` constraint, where nothing could be built. Where `--only-binary`
+# leaves out a source distribution that pip would otherwise take, pip could have built it, and
+# whether that works is not known: the error says what the flag did and nothing of where compiled
+# code can run. The note for the rest is written after pip has exited with an error, as the last
+# of its output.
 #
 # The supported tags are left alone: widening them would make pip prefer a compiled wheel to a pure
 # fallback wheel of the same version, as `charset-normalizer` publishes. The rule for a pure
@@ -1086,6 +1089,7 @@ os.execve(sys.executable, [sys.executable, "-I", *sys.argv[1:]], env)
 # Only the commands that reach the seams get the guard, since importing them is most of what it
 # costs.
 _PIP_GUARD = r'''
+import copy
 import sys
 
 
@@ -1094,6 +1098,7 @@ def guard():
     from pip._internal.exceptions import DistributionNotFound
     from pip._internal.distributions.sdist import SourceDistribution
     from pip._internal.index.package_finder import LinkEvaluator, LinkType
+    from pip._internal.models.candidate import InstallationCandidate
     from pip._internal.resolution.resolvelib.factory import Factory
     from pip._vendor.packaging.utils import canonicalize_name
     from pip._vendor.packaging.version import Version
@@ -1108,6 +1113,9 @@ def guard():
     compiled = {}
     # project -> the versions, as pip reads them, that have a candidate pip could install
     usable = {}
+    # project -> the source distributions that would be candidates but for the format control,
+    # which `--only-binary` sets to allow no sources, as pip makes a candidate of a link
+    left_out = {}
     # a source distribution's URL -> (project as named, version as written)
     sources = {}
     # the source distributions with compiled wheels that pip could not prepare or build, in order
@@ -1128,6 +1136,20 @@ def guard():
             elif kind is LinkType.platform_mismatch and link.is_wheel:
                 if not link.filename.endswith("-none-any.whl"):
                     compiled.setdefault(name, set()).add(link.filename.split("-", 2)[1])
+            elif kind is LinkType.format_unsupported and "source" not in self._formats:
+                # Not every link rejected here is one the format control cost: an egg, an old
+                # macOS archive, and any file pip cannot use are unsupported for what they are,
+                # and a source distribution can still be rejected for the Python it needs. Ask
+                # again as if sources were allowed, and take only what then fits, with the
+                # version pip reads. pip logs such a link as found, at debug level, as well as
+                # skipped. Being a candidate is not being taken: pip chooses among candidates by
+                # its release policy and passes over a yanked one, which `taken` asks of pip.
+                allowing = copy.copy(self)
+                allowing._formats = self._formats | {"source"}
+                fit, version = evaluate_link(allowing, link)
+                if fit is LinkType.candidate:
+                    candidate = InstallationCandidate(self.project_name, version, link)
+                    left_out.setdefault(name, set()).add(candidate)
         except Exception:
             pass
         return result
@@ -1160,9 +1182,28 @@ def guard():
     def fits(specifier, versions):
         return any(specifier.contains(Version(version), prereleases=True) for version in versions)
 
-    def stuck(cause, constraints):
-        """The project of a requirement whose versions that fit are all compiled, if it is one.
-        The versions that fit are those the requirement and the project's `-c` constraint allow."""
+    def taken(finder, specifier, name):
+        """Whether pip would take a source distribution of the project that `--only-binary` left
+        out, were the option not given. pip's own candidate evaluator says which of them its
+        release policy applies, for the specifier: a release candidate while a final release
+        fits, and any a `--pre` or `--only-final` decides. Then its resolver passes over a yanked
+        release unless the specifier pins a version and every release left is yanked (PEP 592).
+        Nothing that fits is usable where this is asked, so those left out are all there would
+        be. Hashes are not asked of pip, so a source whose hash does not match still counts."""
+        evaluator = finder.make_candidate_evaluator(name, specifier=specifier)
+        applicable = evaluator.get_applicable_candidates(list(left_out.get(name, ())))
+        yanked = [candidate.link.is_yanked for candidate in applicable]
+        pinned = any(
+            s.operator == "===" or (s.operator == "==" and not s.version.endswith(".*"))
+            for s in specifier
+        )
+        return bool(yanked) and (not all(yanked) or pinned)
+
+    def stuck(finder, cause, constraints):
+        """The project of a requirement whose versions that fit are all compiled, if it is one,
+        and whether pip would have taken a source distribution of such a version that
+        `--only-binary` left out. The versions that fit are those the requirement and the
+        project's `-c` constraint allow."""
         try:
             requirement = cause.requirement
             specifier = requirement.get_candidate_lookup()[1].req.specifier
@@ -1171,7 +1212,7 @@ def guard():
                 specifier &= constraints[name].specifier
             if fits(specifier, compiled.get(name, ())):
                 if not fits(specifier, usable.get(name, ())):
-                    return name
+                    return name, taken(finder, specifier, name)
         except Exception:
             pass
 
@@ -1179,13 +1220,24 @@ def guard():
         error = get_installation_error(self, e, *args, **kwargs)
         try:
             constraints = kwargs["constraints"] if "constraints" in kwargs else args[0]
-            names = sorted(filter(None, (stuck(cause, constraints) for cause in e.causes)))
-            if names and isinstance(error, DistributionNotFound):
-                rest = (
-                    "the versions asked for are published only as wheels for platforms this "
-                    "interpreter does not match."
-                )
-                error = DistributionNotFound(f"{error}\n{why(names[0], rest)}")
+            finder = self._finder
+            found = sorted(filter(None, (stuck(finder, cause, constraints) for cause in e.causes)))
+            if found and isinstance(error, DistributionNotFound):
+                project, omitted = found[0]
+                if omitted:
+                    note = (
+                        f"{project} has wheels for compiled code that this interpreter does not "
+                        "match, and `--only-binary` leaves out its source distribution. Without "
+                        "that option pip can build the source distribution, which is usable here "
+                        f"only if it builds to pure Python, since {NO_COMPILED}."
+                    )
+                else:
+                    note = why(
+                        project,
+                        "the versions asked for are published only as wheels for platforms this "
+                        "interpreter does not match.",
+                    )
+                error = DistributionNotFound(f"{error}\n{note}")
         except Exception:
             pass
         return error

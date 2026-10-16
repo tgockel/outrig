@@ -473,9 +473,10 @@ pub(crate) async fn pull(image: &str) {
 /// module holds `ANSWER = 42` and a `main()` that prints it, as the console
 /// script `script` when one is named and requiring the distribution `requires`
 /// when one is, and returns its path; `project(directory, name, tag=None,
-/// build=None)`, which writes what an index lists for `name` 1.0 -- a wheel
-/// tagged `tag` if one is given, and a source distribution if `build` is -- and
-/// `build` says what the source distribution's in-tree build backend does:
+/// build=None, version="1.0")`, which writes what an index lists for `name` at
+/// `version` -- a wheel tagged `tag` if one is given, and a source distribution
+/// if `build` is -- and `build` says what the source distribution's in-tree
+/// build backend does:
 /// `"pure"` builds a pure-Python wheel, as MarkupSafe's source does,
 /// `"fails"` raises while reading its metadata, as numpy's does without a
 /// compiler, and `"late"` raises building the wheel after its metadata read
@@ -528,37 +529,38 @@ BUILD = "BUILD"
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     if BUILD == "fails":
         raise RuntimeError("the build failed, as one with no compiler does")
-    dist = "NAME-1.0.dist-info"
+    dist = "NAME-VERSION.dist-info"
     os.makedirs(os.path.join(metadata_directory, dist))
     with open(os.path.join(metadata_directory, dist, "METADATA"), "w") as f:
-        f.write("Metadata-Version: 2.1\\nName: NAME\\nVersion: 1.0\\n")
+        f.write("Metadata-Version: 2.1\\nName: NAME\\nVersion: VERSION\\n")
     return dist
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     if BUILD != "pure":
         raise RuntimeError("the build failed, as one with no compiler does")
-    name = "NAME-1.0-py3-none-any.whl"
+    name = "NAME-VERSION-py3-none-any.whl"
     shutil.copy(os.path.join(os.path.dirname(__file__), "built.whl"),
                 os.path.join(wheel_directory, name))
     return name
 """
 
-def project(directory, name, tag=None, build=None):
+def project(directory, name, tag=None, build=None, version="1.0"):
     if tag:
-        wheel(directory, name, tag=tag)
+        wheel(directory, name, tag=tag, version=version)
     if build:
+        backend = BACKEND.replace("NAME", name).replace("VERSION", version)
         members = [
             ("pyproject.toml", b'[build-system]\nrequires = []\nbuild-backend = "backend"\n'
                                b'backend-path = ["."]\n'),
-            ("backend.py", BACKEND.replace("NAME", name).replace('"BUILD"', repr(build)).encode()),
+            ("backend.py", backend.replace('"BUILD"', repr(build)).encode()),
         ]
         if build == "pure":
             with tempfile.TemporaryDirectory() as built:
-                with open(wheel(built, name), "rb") as f:
+                with open(wheel(built, name, version=version), "rb") as f:
                     members.append(("built.whl", f.read()))
-        with tarfile.open(os.path.join(directory, f"{name}-1.0.tar.gz"), "w:gz") as t:
+        with tarfile.open(os.path.join(directory, f"{name}-{version}.tar.gz"), "w:gz") as t:
             for member, data in members:
-                info = tarfile.TarInfo(f"{name}-1.0/{member}")
+                info = tarfile.TarInfo(f"{name}-{version}/{member}")
                 info.size = len(data)
                 t.addfile(info, io.BytesIO(data))
 "#;

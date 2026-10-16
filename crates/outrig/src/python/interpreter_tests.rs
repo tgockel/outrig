@@ -3937,6 +3937,32 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
          project(index, 'extpure', tag=COMPILED, build='pure')\n\
          # What torch is: compiled wheels and nothing else.\n\
          project(index, 'extonly', tag=COMPILED)\n\
+         # The same, on a page that also links a file pip cannot use for a reason of its own, as an\n\
+         # index does: an egg, an old macOS archive, and a source distribution for no Python there\n\
+         # is. pip takes only archives from a directory, so each is a link on a page to reach it.\n\
+         project(index, 'extegg', tag=COMPILED)\n\
+         project(index, 'extmac', tag=COMPILED)\n\
+         project(index, 'extreq', tag=COMPILED)\n\
+         # Source distributions that build pure, in a directory pip does not read, so that only the\n\
+         # page's link to each, which says whether it is yanked, reaches pip. extyank has 1.0, yanked.\n\
+         # extmix has 1.0, yanked, and 2.0rc1, which is not. extpre has 2.0rc1 and nothing else.\n\
+         project(index, 'extyank', tag=COMPILED)\n\
+         project(index, 'extmix', tag=COMPILED)\n\
+         project(index, 'extpre', tag=COMPILED)\n\
+         linked = os.path.join(index, 'linked')\n\
+         os.makedirs(linked)\n\
+         project(linked, 'extyank', build='pure')\n\
+         project(linked, 'extmix', build='pure')\n\
+         project(linked, 'extmix', build='pure', version='2.0rc1')\n\
+         project(linked, 'extpre', build='pure', version='2.0rc1')\n\
+         open(os.path.join(index, 'links.html'), 'w').write(\
+             '<a href=\"extegg-1.0.egg\">extegg-1.0.egg</a>'\
+             '<a href=\"macosx10/extmac-1.0.zip\">extmac-1.0.zip</a>'\
+             '<a href=\"extreq-1.0.tar.gz\" data-requires-python=\"&lt;3\">extreq-1.0.tar.gz</a>'\
+             '<a href=\"linked/extyank-1.0.tar.gz\" data-yanked=\"withdrawn\">extyank-1.0.tar.gz</a>'\
+             '<a href=\"linked/extmix-1.0.tar.gz\" data-yanked=\"withdrawn\">extmix-1.0.tar.gz</a>'\
+             '<a href=\"linked/extmix-2.0rc1.tar.gz\">extmix-2.0rc1.tar.gz</a>'\
+             '<a href=\"linked/extpre-2.0rc1.tar.gz\">extpre-2.0rc1.tar.gz</a>')\n\
          # A wheel for Python 2 does not fit either, and is not compiled.\n\
          project(index, 'py2only', tag='py2-none-any', build='fails')\n\
          project(index, 'buildable', build='pure')\n\
@@ -3979,6 +4005,65 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
                  'extonly has compiled parts, and this interpreter cannot load compiled code' \
                  in text)";
     assert_eq!(k.output(4, only), "(True, True, True)\n");
+    // `--only-binary` leaves the source distribution out, so it never counts as one pip could use.
+    // That does not make it unpublished, and pip can build it without the flag, which works for a
+    // source that builds pure: the note names the flag, says nothing about what is published, and
+    // leaves out the image's Python, which may not be needed. Compiled wheels and nothing else are
+    // still all that is published, with or without the flag. So are they when the other file is
+    // one pip would not take with the flag off either -- an egg, a macOS archive, a source for
+    // another Python -- since the flag left out nothing that would have built: there is nothing to
+    // blame on it, and the answer is the same either way.
+    let binary = "out = {}\n\
+                  for name in ('extpure', 'ext', 'extonly'):\n\
+                  \x20   code, text = said(name, '--only-binary=:all:')\n\
+                  \x20   out[name] = (code != 0, '--only-binary' in text, \
+                                     'published only as wheels' in text, \
+                                     'Code that needs a compiled package can run with' in text)\n\
+                  for name in ('extegg', 'extmac', 'extreq'):\n\
+                  \x20   out[name] = [(code != 0, '--only-binary' in text, \
+                                      'published only as wheels' in text) \
+                                     for code, text in (said(name), \
+                                                        said(name, '--only-binary=:all:'))]\n\
+                  out";
+    assert_eq!(
+        k.output(8, binary),
+        "{'extpure': (True, True, False, False), 'ext': (True, True, False, False), \
+         'extonly': (True, False, True, True), \
+         'extegg': [(True, False, True), (True, False, True)], \
+         'extmac': [(True, False, True), (True, False, True)], \
+         'extreq': [(True, False, True), (True, False, True)]}\n"
+    );
+    // A source is what the flag left out only where pip would have taken it without the flag, and
+    // pip takes fewer than it finds. Which releases fit is its release policy: a release candidate
+    // is passed over while a final release fits, whether or not that final is yanked, and taken
+    // with `--pre`, or when it is all there is. Then a yanked release is passed over unless the
+    // requirement pins a version and every release left is yanked. So the project whose final is
+    // yanked is a source left out when pinned, or with `--pre`, which takes the candidate, and is
+    // nothing the flag cost when asked for as it stands. Each note is checked against what pip
+    // does without the flag, last and in an order in which a build that installs the project
+    // does not make the next run answer "already satisfied".
+    let policy = "out = {}\n\
+                  for key, args in (('yanked', ('extyank',)), ('yanked pinned', ('extyank==1.0',)), \
+                                    ('mixed', ('extmix',)), ('mixed --pre', ('extmix', '--pre')), \
+                                    ('mixed pinned', ('extmix==1.0',)), ('pre only', ('extpre',))):\n\
+                  \x20   code, text = said(*args, '--only-binary=:all:')\n\
+                  \x20   out[key] = (code != 0, '--only-binary' in text, \
+                                    'published only as wheels' in text)\n\
+                  out['retry'] = {'yanked': said('extyank')[0] != 0, \
+                                  'mixed': said('extmix')[0] != 0, \
+                                  'yanked pinned': said('extyank==1.0')[0] == 0, \
+                                  'mixed --pre': said('extmix', '--pre')[0] == 0, \
+                                  'mixed pinned': said('extmix==1.0')[0] == 0, \
+                                  'pre only': said('extpre')[0] == 0}\n\
+                  out";
+    assert_eq!(
+        k.output(9, policy),
+        "{'yanked': (True, False, True), 'yanked pinned': (True, True, False), \
+         'mixed': (True, False, True), 'mixed --pre': (True, True, False), \
+         'mixed pinned': (True, True, False), 'pre only': (True, True, False), \
+         'retry': {'yanked': True, 'mixed': True, 'yanked pinned': True, 'mixed --pre': True, \
+         'mixed pinned': True, 'pre only': True}}\n"
+    );
     // A wheel for another Python is not compiled, and a build that works needs no note.
     let pure = "code, text = said('py2only')\n\
                 code2, text2 = said('extpure')\n\
