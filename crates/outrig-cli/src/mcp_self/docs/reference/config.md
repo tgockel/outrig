@@ -845,6 +845,11 @@ access         = "read-write"
 - `mounts[*].access` (string, optional, default: `"read-only"`): either
   `"read-only"` or `"read-write"`.
 
+A repo config may not declare a `host-path` (primary, extra, or sidecar mount) that covers your home
+directory or one above it, or -- read-write -- the global config file or its directory: the repo
+config sits inside the workspace, so an agent could otherwise rewrite the global config for the
+next session. Declare such a mount in the global config if you mean it.
+
 The primary workspace bind-mount is always read-write and uses `--userns=keep-id` so files
 written inside the container appear with your host UID/GID. Extra mounts default to read-only;
 set `access = "read-write"` only for directories the agent should be able to modify. See

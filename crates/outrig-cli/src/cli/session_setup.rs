@@ -38,7 +38,8 @@ use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
-    RepoConfig, default_session_root, refuse_home_workspace, repo_config_path,
+    RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
+    repo_config_path,
 };
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
@@ -348,6 +349,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         if !declared {
             refuse_home_workspace(&workspace, &repo_root)?;
         }
+        refuse_repo_declared_mounts(&cfg, &repo_root, args.global_cfg_path)?;
         // No config of its own at the root, and no declared host path, means
         // the working directory by default, whether or not `--config`
         // supplied the settings.

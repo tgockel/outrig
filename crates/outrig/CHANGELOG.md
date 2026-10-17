@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Workspace::config_source` names the file that declared `host-path`**, as
+  `MountConfig::config_source` does for a mount (#445).
 - **`Config::warnings` reports what a config load set aside rather than failing on.** Each
   `ConfigWarning` names the file (`None` from `load_from_str`), the 1-based line, the key as a
   dotted TOML path such as `models."opus-4.8".context-window` or `workspace.mounts[1].acess`, and

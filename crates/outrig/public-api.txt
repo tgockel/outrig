@@ -653,6 +653,7 @@ pub fn outrig::config::SidecarConfig::new(impl core::convert::Into<alloc::string
 #[non_exhaustive] pub struct outrig::config::Workspace
 pub outrig::config::Workspace::mounts: alloc::vec::Vec<outrig::config::MountConfig>
 impl outrig::config::Workspace
+pub fn outrig::config::Workspace::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
 pub fn outrig::config::Workspace::container_path(&self) -> &std::path::Path
 pub fn outrig::config::Workspace::declared_container_path(&self) -> core::option::Option<&std::path::Path>
 pub fn outrig::config::Workspace::declared_host_path(&self) -> core::option::Option<&std::path::Path>

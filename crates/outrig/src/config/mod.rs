@@ -1448,6 +1448,13 @@ impl Workspace {
         )
     }
 
+    /// The config file that declared `host-path`, or `None` when none did: the
+    /// built-in `.`, or a value from [`Workspace::new`] or
+    /// [`set_host_path`](Self::set_host_path).
+    pub fn config_source(&self) -> Option<&ConfigSource> {
+        self.source.as_ref()
+    }
+
     /// The file to name in a diagnostic about `host-path`, or `None` when no
     /// file declared it: the built-in `.`, or a value from [`Workspace::new`]
     /// or [`set_host_path`](Self::set_host_path). Deliberately not defaulted

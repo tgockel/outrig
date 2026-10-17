@@ -21,7 +21,8 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("home/u")).unwrap();
         fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        fs::write(tmp.path().join("global.toml"), GLOBAL_WITH_MODEL).unwrap();
+        fs::create_dir_all(tmp.path().join("cfg")).unwrap();
+        fs::write(tmp.path().join("cfg/global.toml"), GLOBAL_WITH_MODEL).unwrap();
         Self { tmp }
     }
 
@@ -32,7 +33,7 @@ impl Fixture {
     /// `outrig <cmd> ...` from `cwd`, after the global flags every run here
     /// shares. The image is a raw local ref, so nothing is pulled.
     async fn run(&self, cwd: &Path, cmd: &[&str]) -> (bool, String) {
-        let global = self.tmp.path().join("global.toml");
+        let global = self.tmp.path().join("cfg/global.toml");
         let sessions = self.tmp.path().join("sessions");
         let mut args = vec![
             "--global-config",
@@ -69,6 +70,17 @@ fn assert_refused(fx: &Fixture, ok: bool, stderr: &str, workspace: &Path) {
         )),
         "the refusal names {}:\n{stderr}",
         workspace.display(),
+    );
+    assert!(fx.sessions().is_empty(), "nothing is recorded:\n{stderr}");
+}
+
+/// Refused before the session is recorded, naming the repo file that declared it.
+fn assert_repo_refused(fx: &Fixture, ok: bool, stderr: &str, declared_in: &Path) {
+    assert!(!ok, "must be refused:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("declared in {}", declared_in.display())),
+        "the refusal names {}:\n{stderr}",
+        declared_in.display(),
     );
     assert!(fx.sessions().is_empty(), "nothing is recorded:\n{stderr}");
 }
@@ -140,12 +152,76 @@ async fn an_out_of_tree_config_from_home_is_refused() {
     assert_refused(&fx, ok, &stderr, &home);
 }
 
-/// Declaring `host-path` mounts the home directory on purpose.
+/// A repo config is inside the workspace an agent can write, so it may not
+/// declare the home directory as the workspace (#445).
 #[tokio::test]
-async fn a_declared_host_path_may_name_home() {
+async fn a_repo_declared_host_path_may_not_name_home() {
     let fx = Fixture::new();
     let home = fx.home();
     write_repo_config(&home, "[workspace]\nhost-path = \".\"\n");
+
+    let (ok, stderr) = fx.run(&home, &["run"]).await;
+    assert_repo_refused(&fx, ok, &stderr, &home.join(".agents/outrig/config.toml"));
+}
+
+/// Nor may it mount the global config's directory read-write, which would let
+/// the agent rewrite the operator's config for the next session -- but a
+/// read-only mount of it is no such path.
+#[tokio::test]
+async fn a_repo_mount_covering_the_global_config_is_refused_when_read_write() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    let global_dir = fx.tmp.path().join("cfg");
+    let mount = |access: &str| {
+        format!(
+            "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+             access = \"{access}\"\n",
+            global_dir.display()
+        )
+    };
+
+    write_repo_config(&proj, &mount("read-write"));
+    let (ok, stderr) = fx.run(&proj, &["run"]).await;
+    assert_repo_refused(&fx, ok, &stderr, &proj.join(".agents/outrig/config.toml"));
+    assert!(stderr.contains("global config"), "{stderr}");
+
+    write_repo_config(&proj, &mount("read-only"));
+    let (_, stderr) = fx.run(&proj, &["run"]).await;
+    assert_allowed(&fx, &stderr, &proj);
+}
+
+/// A repo sidecar's mount is held to the same rule as the workspace's.
+#[tokio::test]
+async fn a_repo_sidecar_mount_covering_the_global_config_is_refused() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    write_repo_config(
+        &proj,
+        &format!(
+            "[sidecars.tools]\nimage = \"localhost/tools:latest\"\n\n\
+             [[sidecars.tools.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+             access = \"read-write\"\n",
+            fx.tmp.path().join("cfg").display()
+        ),
+    );
+    let (ok, stderr) = fx.run(&proj, &["run"]).await;
+    assert_repo_refused(&fx, ok, &stderr, &proj.join(".agents/outrig/config.toml"));
+    assert!(stderr.contains("sidecar \"tools\" mount"), "{stderr}");
+}
+
+/// A global-declared host path is the operator's own choice.
+#[tokio::test]
+async fn a_global_declared_host_path_may_name_home() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    fs::write(
+        fx.tmp.path().join("cfg/global.toml"),
+        format!(
+            "{GLOBAL_WITH_MODEL}\n[workspace]\nhost-path = \"{}\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
 
     let (_, stderr) = fx.run(&home, &["run"]).await;
     assert_allowed(&fx, &stderr, &home);

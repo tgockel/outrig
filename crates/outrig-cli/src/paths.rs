@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, ProjectDirs};
 use tempfile::NamedTempFile;
 
-use outrig::config::Config;
+use outrig::config::{Config, ConfigSource, MountAccess};
 use outrig::error::{IoPathExt, OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
@@ -314,6 +314,133 @@ fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -
          to mount it on purpose",
         workspace.display()
     )))
+}
+
+/// Canonicalize `p` even when it does not exist. Components are resolved left
+/// to right, so a symlink is followed before any `..` after it is applied; a
+/// component that does not exist is kept as written, and a later `..` pops it.
+fn canonical_or_normalized(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let absolute = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
+    };
+    let mut resolved = PathBuf::new();
+    for c in absolute.components() {
+        match c {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let Ok(real) = std::fs::canonicalize(&resolved) {
+                    resolved = real;
+                }
+            }
+            c => resolved.push(c),
+        }
+    }
+    resolved
+}
+
+/// Refuse a repo-declared host path that reaches the operator's own files. The
+/// repo config sits in the read-write workspace, so an agent can edit it for
+/// the next session; a repo `[workspace] host-path`, `[[workspace.mounts]]` or
+/// sidecar mount covering the home directory (or one above it), or read-write
+/// covering the global config file or its directory, would let that agent
+/// rewrite the global config the repo is not trusted to carry. A
+/// global-declared entry is the operator's own choice, and a hand-built one
+/// (`--volume`) carries no source.
+pub(crate) fn refuse_repo_declared_mounts(
+    cfg: &Config,
+    repo_root: &Path,
+    global_cfg: Option<&Path>,
+) -> Result<()> {
+    let home = BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    refuse_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg)
+}
+
+/// [`refuse_repo_declared_mounts`] against an explicit `home` (`None` skips the
+/// home rule). Paths are compared canonicalized, as in
+/// [`refuse_home_workspace_with`].
+fn refuse_repo_declared_mounts_with(
+    cfg: &Config,
+    repo_root: &Path,
+    home: Option<&Path>,
+    global_cfg: Option<&Path>,
+) -> Result<()> {
+    let home = home.map(canonical_or_normalized);
+    // The file as resolved, and as linked: a symlinked `config.toml` can be
+    // replaced by writing its directory, so that directory is covered too.
+    let global_cfgs: Vec<PathBuf> = global_cfg
+        .map(|c| {
+            let linked = match (c.parent(), c.file_name()) {
+                (Some(dir), Some(name)) => canonical_or_normalized(dir).join(name),
+                _ => c.to_path_buf(),
+            };
+            vec![canonical_or_normalized(c), linked]
+        })
+        .unwrap_or_default();
+    let check = |what: &str,
+                 source: Option<&ConfigSource>,
+                 host: PathBuf,
+                 access: MountAccess|
+     -> Result<()> {
+        let Some(source) = source.filter(|s| !matches!(s, ConfigSource::Global { .. })) else {
+            return Ok(());
+        };
+        let host = canonical_or_normalized(&host);
+        let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
+            "it is your home directory or above it".to_string()
+        } else if let Some(cfg) = global_cfgs
+            .iter()
+            .find(|c| access == MountAccess::ReadWrite && c.starts_with(&host))
+        {
+            format!(
+                "it is read-write and covers the global config ({})",
+                cfg.display()
+            )
+        } else {
+            return Ok(());
+        };
+        Err(OutrigError::Configuration(format!(
+            "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
+             that govern the next session\n\
+             help: a repo config may not do this; declare it in the global config if you \
+             mean it, or pass --volume",
+            host.display(),
+            source.config_path().display()
+        )))
+    };
+    let workspace = &cfg.workspace;
+    check(
+        "workspace host-path",
+        workspace.config_source(),
+        workspace.resolved_host_path(repo_root),
+        MountAccess::ReadWrite,
+    )?;
+    for m in &workspace.mounts {
+        check(
+            "mount",
+            m.config_source(),
+            m.resolved_host_path(repo_root),
+            m.access(),
+        )?;
+    }
+    for (name, sc) in &cfg.sidecars {
+        let what = format!("sidecar {name:?} mount");
+        for m in &sc.mounts {
+            check(
+                &what,
+                m.config_source(),
+                m.resolved_host_path(repo_root),
+                m.access(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Build context for one of outrig's built-in images, under the user cache
@@ -704,6 +831,34 @@ mod tests {
             refuse_home_workspace_with(allowed, &home, allowed)
                 .unwrap_or_else(|e| panic!("{} must be allowed: {e}", allowed.display()));
         }
+    }
+
+    /// An absent path compares by its normalized spelling, so a `..` through
+    /// a sibling directory does not make it look like it is inside one.
+    #[test]
+    fn an_absent_path_is_normalized_before_comparing() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let absent = root.join("cache/../conf/config.toml");
+        let got = canonical_or_normalized(&absent);
+        assert_eq!(got, root.join("conf/config.toml"));
+        assert!(!got.starts_with(root.join("cache")));
+    }
+
+    /// A `..` after a missing component is applied to the symlink-resolved
+    /// prefix, not folded across it.
+    #[test]
+    fn parent_traversal_through_a_missing_component_follows_earlier_symlinks() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::create_dir_all(root.join("private/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("private/sub"), root.join("cache/link")).unwrap();
+        let spelled = root.join("cache/link/absent/../../conf/outrig/config.toml");
+        let got = canonical_or_normalized(&spelled);
+        assert_eq!(got, root.join("private/conf/outrig/config.toml"));
+        assert!(!got.starts_with(root.join("cache")));
     }
 
     /// The refusal says which default put the workspace there: a repo config

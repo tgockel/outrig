@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo config can no longer mount your home directory or the global config read-write.** A
+  repo `[workspace] host-path`, `[[workspace.mounts]]`, or sidecar mount covering `$HOME` (or an ancestor), or a
+  read-write one covering the global config file or its directory, is refused, naming the file
+  that declared it. Such a mount would let an agent rewrite the global config -- providers,
+  `[network]`, `session-root` -- for the next session. Mounts declared in the global config and
+  `--volume` are unchanged. A repo that declared `host-path = "~"` now needs it in the global
+  config (#445).
 - **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.** Fixed
   in `outrig` (#268). glibc's loader reads that file on every start, and inside the primary's mount
   namespace it was the primary's: a library it listed was loaded into the sidecar's server, and one
