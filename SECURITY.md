@@ -53,6 +53,9 @@ Issues that bear on **host integrity** are in scope, for example:
 - A binding a repository's config declares (`[bindings.<name>]`) starting without the
   operator's approval of that exact declaration in that repository. A binding's factory is code
   the host runs as the user, and a repository's config is content the agent can write.
+- A request to a binding reaching its target when `[policy]` refused it, or when it was held for
+  an approval and was denied, cancelled, or never answered; or a repo config's `[policy]`
+  loosening what the global config's decides. A repo's `[policy]` may only add restrictions.
 
 ## Known boundaries (by design, not vulnerabilities)
 
@@ -82,9 +85,11 @@ Issues that bear on **host integrity** are in scope, for example:
   `${VAR}`. One process holds every binding of a session, so every binding's library runs with that
   one environment. Whatever the library does on the host is part of what the binding grants --
   GitPython runs `git`, which runs the hooks and `core.fsmonitor` a repository names, and the agent
-  can write `.git/` through the workspace mount. With no policy configured, every request the
-  agent's code makes of a binding runs, and is published as events. Binding a library is a
-  deliberate grant by whoever wrote the config, not a vulnerability.
+  can write `.git/` through the workspace mount. With no `[policy]` configured, every request the
+  agent's code makes of a binding runs, and is published as events. A rule decides requests, not
+  what an allowed call then does on the host -- the hooks and programs it runs, and the library's
+  calls into itself. Binding a library is a deliberate grant by whoever wrote the config, not a
+  vulnerability.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
   name through the interceptor is bound to it and cannot shed that binding, but one that
   connects by address and asserts no name at all offers nothing to match against. Hostname deny

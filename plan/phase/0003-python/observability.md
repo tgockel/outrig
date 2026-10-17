@@ -366,12 +366,12 @@ something over their own session, and it is worth keeping short enough that they
 
 **Decided in `0003-13`: `[events] mode = "off" | "record"`,** defaulting off. `0003-13` merged it
 as `[network].mode` merges, a repository's value replacing the global one. **Decided since (the
-maintainer, 2026-10-02): the global config's value stands.** When the global config sets
-`[events] mode`, that is the mode; a repository's value applies only when the global config says
-nothing. The reason is whose file it is: the record is the user's own recording of their own
-session, and a cloned project must not switch it on -- retaining the conversation and the argument
-previews the user did not ask to keep -- or off. This is the same shape as the policy layer, and
-`0003-24` lands it with that layer. There is no per-session CLI flag yet;
+maintainer, 2026-10-02; built in `0003-24`): the global config's value stands.** When the global
+config sets `[events] mode`, that is the mode; a repository's value applies only when the global
+config says nothing. The reason is whose file it is: the record is the user's own recording of
+their own session, and a cloned project must not switch it on -- retaining the conversation and
+the argument previews the user did not ask to keep -- or off. This is the same shape as the policy
+layer, and `0003-24` landed it with that layer, in `merge`. There is no per-session CLI flag yet;
 `plan/next/run-new-flag-parity.md` holds `--events`. Opt-in because the record holds the
 conversation.
 

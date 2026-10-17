@@ -20,9 +20,10 @@ use thiserror::Error;
 
 use super::{
     Binding, Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, Model,
-    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
-    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
-    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
+    ModelSourceRef, NetworkMode, PolicyAction, PolicyConfig, REQUEST_TIMEOUT_SECS_CEILING,
+    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -361,6 +362,20 @@ pub enum ConfigValidationError {
          global config"
     )]
     RepoNetworkPolicy { key: &'static str },
+
+    #[error(
+        "repo config may only restrict [policy]: {item} is allow, which belongs in \
+         global config"
+    )]
+    #[non_exhaustive]
+    RepoPolicyAllow { item: String },
+
+    #[error(
+        "{item}: operation {operation:?} is not one a rule can match; the operations are {}",
+        crate::config::OPERATIONS.join(", ")
+    )]
+    #[non_exhaustive]
+    PolicyOperation { item: String, operation: String },
 
     #[error(
         "model {model:?} (provider style={style}) must set 'identifier' (the \
@@ -751,6 +766,9 @@ pub(super) fn validate_with_options(
         validate_retry_budget_secs("top-level retry-budget-secs", value)?;
     }
     validate_network_policy(cfg)?;
+    for policy in std::iter::once(&cfg.policy).chain(cfg.restrictions()) {
+        validate_policy(policy)?;
+    }
 
     // Deliberately outside the `validate_llm` gate below, which `outrig build`
     // turns off, for two different reasons.
@@ -862,14 +880,48 @@ pub(super) fn validate_with_options(
 
 /// The rules that apply to a repo config file, checked on the unmerged value.
 ///
-/// Today there is one: `[network]`'s policy keys describe the machine's egress
-/// and belong to the operator, so a repo config may declare `mode` and nothing
-/// else. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
+/// `[network]`'s policy keys describe the machine's egress and belong to the
+/// operator, so a repo config may declare `mode` and nothing else; and a repo's
+/// `[policy]` may only restrict, so it may not say `allow`. See
+/// [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
-    match cfg.network.declared_policy_key() {
-        Some(key) => Err(ConfigValidationError::RepoNetworkPolicy { key }),
+    if let Some(key) = cfg.network.declared_policy_key() {
+        return Err(ConfigValidationError::RepoNetworkPolicy { key });
+    }
+    validate_policy(&cfg.policy)?;
+    let default =
+        (cfg.policy.default == Some(PolicyAction::Allow)).then(|| "[policy].default".to_string());
+    let rule = cfg
+        .policy
+        .rules
+        .iter()
+        .position(|rule| rule.action == PolicyAction::Allow)
+        .map(rule_item);
+    match default.or(rule) {
+        Some(item) => Err(ConfigValidationError::RepoPolicyAllow { item }),
         None => Ok(()),
     }
+}
+
+/// How an error names the `[[policy.rules]]` entry at `index`, counted from 1 as a reader of the
+/// file counts them.
+fn rule_item(index: usize) -> String {
+    format!("[[policy.rules]] #{}", index + 1)
+}
+
+/// Every rule's `operation` is one a request can have.
+fn validate_policy(policy: &PolicyConfig) -> Result<(), ConfigValidationError> {
+    for (i, rule) in policy.rules.iter().enumerate() {
+        if let Some(operation) = &rule.operation
+            && !crate::config::OPERATIONS.contains(&operation.as_str())
+        {
+            return Err(ConfigValidationError::PolicyOperation {
+                item: rule_item(i),
+                operation: operation.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {

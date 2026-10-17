@@ -198,6 +198,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4,096, and loses the oldest past that, which shows as a jump in the file's ids. The session's
   shutdown finishes the file, waiting at most two seconds, and its report says how many events
   the file lost and why; a session dropped without it finishes the file in the background.
+  `merge` keeps the global config's mode when it declares one: a repository's applies only when
+  the global config is silent, so a cloned project can neither start nor stop the user's
+  recording.
   The mode merges like `[network].mode`, and `outrig run` ignores it.
 
 - **`LaunchSpec::with_session_id` names the session.** The primary is named `outrig-<id>` and
@@ -295,6 +298,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its bindings: `binding.exited` records how it ended, as `BindingStop::exited` does, each call it
   was running is `unknown`, and a later call raises an error that says so. The vendored RPyC is
   mounted read-only at `/outrig/rpyc` in a session with bindings, where the interpreter imports it.
+
+- **`[policy]` decides each hosted request, and an `EscalationHandler` answers what it holds.**
+  `Config::policy` is a `PolicyConfig`: a `default` and `[[policy.rules]]`, each a `PolicyRule`
+  matching the binding, the host-side type, the member and the operation -- `*` a wildcard within
+  the first three -- and naming a `PolicyAction`: `allow`, `deny`, `escalate` or `evaluate`. The
+  rules are matched in the bindings process, so an allow costs no round trip. A call of what a
+  `getattr` returned is matched, recorded and shown as a call of that member on that type, with
+  its arguments; a `callattr` is a read and a call, and a call of the method the read would give
+  by its own name, and is refused when that cannot be known before the read runs; a bound method
+  is also its own name on its object's type; a call by a dunder name is also the operation it
+  stands for, `__repr__` a `repr`; a request passing a host callable whose own call the rules
+  would not allow, as an argument or a value to assign, is refused; `oldslicing` and `buffiter`
+  are refused; wildcards match without backtracking; and the type a rule matches is the one the
+  host names, never what the object says of itself. A deny raises
+  `runtime.Denied`, an `Exception` no hosted library defines, with the reason; the target never
+  runs, and the request ends `refused` with `HostedReason::Rule`, `Default`, `Approver` or
+  `NoApprover`. `escalate` -- and `evaluate`, until there is an evaluator -- holds the request,
+  on its connection's serving thread and in no binding's turn, for the handler installed with
+  `SessionBuilder::escalation`: an `async fn escalate(&self, Escalation) -> EscalationResult`,
+  shown the request's id, binding, agent, operation, member, type, argument previews, reason and
+  policy version, answering `EscalationAnswer::Allow` or `Deny`. An `Err`, a panic, or a task
+  ended unanswered denies; with no handler, the request is denied. The session's gate settles a
+  held request once -- the answer, the caller's interrupt, its connection's close, or the close
+  -- and `Escalation::withdrawn` tells the handler; a later answer is recorded as ignored, and an
+  allow that won before the close runs even after it. Each decision is a `hosted.decided` event
+  with a `DecidedBy` and the `PolicyVersion`, a digest of the rules in force; `session.policy`
+  publishes the version at start, and whether a request could wait with no handler to answer it.
+  A session with no `[policy]` decides nothing and records no decisions.
+
+  A repository's `[policy]` may only restrict. `merge` keeps the global config's as the merged
+  `policy` and the repository's beside it, each deciding on its own and the stricter action
+  winning. A repo `allow`, as a rule or as its `default`, is rejected at load as
+  `ConfigValidationError::RepoPolicyAllow`, and an operation outside the vocabulary is
+  `PolicyOperation`.
+  `Config::operator` is the global config as it was read, kept by `merge` -- or the config itself
+  when none was, as for one a program built -- so a repository's `[models.<name>]` or
+  `[providers.<name>]` cannot redefine what the operator's names resolve to there.
 
 ### Changed
 

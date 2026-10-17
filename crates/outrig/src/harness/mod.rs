@@ -20,6 +20,9 @@
 //!   repository's config declared starts only once its [`Approver`] approves
 //!   that exact declaration; each starts before the interpreter and stops with
 //!   the session.
+//! - **Policy.** `[policy]` rules decide each request agent code makes of a
+//!   binding: run it, refuse it, or hold it for the session's
+//!   [`EscalationHandler`] to answer.
 //! - **Stopping.** [`Session::close_admission`] refuses new work at once, and
 //!   [`Session::shutdown`] stops what is left and returns a
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
@@ -32,6 +35,7 @@ mod approval;
 pub(crate) mod bindings;
 mod builder;
 mod error;
+pub(crate) mod escalation;
 pub mod event;
 pub(crate) mod lifecycle;
 mod report;
@@ -43,6 +47,9 @@ pub use self::approval::{Approval, ApprovalRequest, Approver};
 pub use self::bindings::BindingSpec;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
+pub use self::escalation::{
+    Escalation, EscalationAnswer, EscalationHandler, EscalationResult, Withdrawn,
+};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
     ShutdownReport, Stopped, Verdict,
@@ -54,6 +61,9 @@ pub use crate::config::{EnvSecrets, Secrets};
 #[cfg(test)]
 #[path = "bindings_tests.rs"]
 mod bindings_tests;
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod policy_tests;
 
 /// How long [`Session::shutdown`] lets an execution that is still running
 /// finish, as `outrig run-new` uses it: long enough for one about to end to

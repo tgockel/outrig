@@ -261,6 +261,18 @@ class Marked:
         return "Marked"
 
 
+class Bag(dict):
+    """Attributes read from its items, as an attribute-dict library's objects are: what the
+    container writes with `bag[key] = value` it reads back as an attribute -- `____id_pack__`,
+    which RPyC asks an object for, among them."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
 class Root(Records):
     def __init__(self):
         Records.__init__(self)
@@ -278,6 +290,7 @@ class Root(Records):
         self.nested_type = Nested
         self.str_type = str
         self.root_type = Root
+        self.bag = Bag(secret="s")
         self.a = types.SimpleNamespace(b=types.SimpleNamespace(c="c"))
         self.b = "b"
         self.calls = 0
@@ -478,6 +491,14 @@ class Root(Records):
         """Counts its calls, so a test can show a refused request never reached it."""
         self.calls += 1
         return self.calls
+
+    # The same function under a second name: a bound method of it is still `noted`.
+    also_noted = noted
+
+    @property
+    def noted_later(self):
+        """`noted`, handed out by a property, as a library's dynamic attribute hands one out."""
+        return self.noted
 
     def call(self, fn, *args):
         return fn(*args)

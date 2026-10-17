@@ -187,7 +187,7 @@ fn the_harness_is_public_and_python_agent_is_gone() {
 /// Every history, view and event type the harness publishes takes a field or a
 /// variant without a break: `#[non_exhaustive]`, so an embedder reads them and
 /// constructs none. The exceptions have private fields, which is the same
-/// promise: an id, an agent's name, and a subscription.
+/// promise: an id, an agent's name, a policy's version, and a subscription.
 #[test]
 fn every_harness_event_type_grows_without_a_break() {
     const PRIVATE_FIELDS: &[&str] = &[
@@ -195,6 +195,7 @@ fn every_harness_event_type_grows_without_a_break() {
         "outrig::harness::event::CallId",
         "outrig::harness::event::ExecId",
         "outrig::harness::event::MessageId",
+        "outrig::harness::event::PolicyVersion",
         "outrig::harness::event::RequestId",
         "outrig::harness::event::Subject",
         "outrig::harness::event::Subscription",

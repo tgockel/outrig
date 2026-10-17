@@ -25,24 +25,41 @@
 //! so no request waits on a frame that will never be served. The relay holds at most
 //! [`CALLS_MAX`] requests of an agent that have not ended, and keeps [`NAME_MAX`] bytes of a name a
 //! label gives.
+//!
+//! The relay is also the gate for a request the process's policy holds for an answer -- an
+//! `escalate`, or an `evaluate` while there is no evaluator. The process asks with a `decision`
+//! line and waits; the relay asks the session's escalation handler, and the first of the handler's
+//! answer, the caller's interrupt, its connection's close, and the session's close settles the
+//! request, under the same lock the close takes. A later answer is recorded as ignored. Every
+//! answer goes to the process through the one queue, so an allow settled before the close reaches
+//! it ahead of the control line; and the relay records the outcome of a request it ends itself, so
+//! nothing the process does afterward -- or fails to do, killed -- changes it.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
 
 use super::host::PRIMARY;
 use super::supervisor::Process;
+use crate::config::PolicyAction;
 use crate::events::Events;
 use crate::harness::HostedCall;
+use crate::harness::escalation::{
+    Escalation, EscalationAnswer, EscalationResult, Handler, Withdrawal, Withdrawn,
+};
 use crate::harness::event::{
-    ExecId, HostedOutcome, HostedReason, Operation, Payload, ReceivedBy, RequestId,
+    DecidedBy, ExecId, HostedOutcome, HostedReason, Operation, Payload, PolicyLayer, PolicyVersion,
+    ReceivedBy, RequestId,
 };
 
 /// What the relay sends the interpreter: one protocol line, queued for its writer.
@@ -76,6 +93,8 @@ const NO_ROOM: &str =
     "the bindings process is not reading, and its queue has no room for the frame";
 const OUTRUN: &str = "a frame's parts outran the size its label declared";
 const STOPPED: &str = "the process holding the bindings has stopped";
+const INTERRUPTED: &str = "the call was cancelled before it ran: its caller was interrupted";
+const DISCONNECTED: &str = "its connection closed before it ran";
 /// How long the relay looks for the exit status of a process whose output closed unasked.
 const EXIT_LOOK: Duration = Duration::from_secs(1);
 
@@ -113,6 +132,69 @@ pub(crate) struct Notice {
     reason: String,
 }
 
+/// What decides a request the policy holds for an answer: the session's escalation handler, if it
+/// has one, and the version of the rules in force, which every decision carries.
+#[derive(Clone)]
+pub(crate) struct Approvals {
+    pub(crate) handler: Option<Handler>,
+    pub(crate) version: PolicyVersion,
+}
+
+impl fmt::Debug for Approvals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Approvals")
+            .field("handler", &self.handler.is_some())
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
+impl Default for Approvals {
+    fn default() -> Self {
+        Self {
+            handler: None,
+            version: PolicyVersion::new(""),
+        }
+    }
+}
+
+/// A decision line of the process: request `seq` on connection `conn`, which its policy holds
+/// for the owner's answer to the decision the line's `id` names, and how the binding described it.
+#[derive(Deserialize)]
+struct Ask {
+    agent: String,
+    binding: String,
+    conn: u64,
+    seq: u64,
+    action: PolicyAction,
+    reason: String,
+    operation: String,
+    member: Option<String>,
+    target: Option<String>,
+    #[serde(default)]
+    arguments: Vec<String>,
+    #[serde(default)]
+    keywords: BTreeMap<String, String>,
+}
+
+/// A request held for an answer: the decision the process waits on, and what tells the handler
+/// it stopped waiting.
+struct Held {
+    decision: u64,
+    withdrawal: Withdrawal,
+}
+
+/// How the gate settles a held request.
+enum Settle {
+    Allow,
+    /// Refused, recorded with this reason and detail.
+    Deny(HostedReason, String),
+    /// Never invoked, for this reason: the handler is told why, and the caller raises the text.
+    Cancel(Withdrawn, String),
+    /// Held once the session had closed, its closing error the detail.
+    Refuse(String),
+}
+
 /// An event line of the process about request `seq` on connection `conn`.
 #[derive(Deserialize)]
 struct Record {
@@ -139,6 +221,11 @@ struct Record {
     traceback: Option<String>,
     #[serde(default)]
     interrupted: bool,
+    /// A decision's: the action, what chose it, and the rule's layer and position.
+    action: Option<PolicyAction>,
+    by: Option<String>,
+    layer: Option<PolicyLayer>,
+    rule: Option<usize>,
 }
 
 /// A connection: agent, binding, and the interpreter's number for it.
@@ -161,6 +248,13 @@ struct Call {
     sent: bool,
     /// Its receipt published by the process.
     received: bool,
+    /// The request a callback made it inside, once the process received it.
+    parent: Option<RequestId>,
+    /// Why its caller stopped waiting -- an interrupt, or its connection's close -- once one
+    /// did: a decision it is then held for is cancelled at once, asking nobody.
+    withdrawn: Option<Withdrawn>,
+    /// Held for an answer.
+    held: Option<Held>,
 }
 
 /// Lines for the process: a whole frame, or one line of the relay's own.
@@ -210,9 +304,8 @@ struct State {
     /// The last request id given out.
     last_request: u64,
     after_close: Vec<HostedCall>,
-    /// Event lines of kinds the relay does not know, for a test that writes its own.
-    #[cfg(test)]
-    others: Option<mpsc::UnboundedSender<Value>>,
+    /// The escalation handlers asked and not yet done, aborted once the session has reported.
+    asking: Vec<AbortHandle>,
 }
 
 impl State {
@@ -290,6 +383,7 @@ struct Shared {
     to_interpreter: ToInterpreter,
     events: Events,
     bindings: Vec<String>,
+    approvals: Approvals,
 }
 
 impl fmt::Debug for Relay {
@@ -305,6 +399,7 @@ impl Relay {
         to_interpreter: ToInterpreter,
         events: Events,
         bindings: Vec<String>,
+        approvals: Approvals,
     ) -> Self {
         let mut state = State::default();
         state.agents.insert(PRIMARY.to_string());
@@ -313,6 +408,7 @@ impl Relay {
             to_interpreter,
             events,
             bindings,
+            approvals,
         }))
     }
 
@@ -341,6 +437,8 @@ impl Relay {
 
     /// One of `agent`'s `rpc` lines, for the process.
     pub(crate) fn rpc(&self, agent: &str, mut rpc: Rpc) {
+        // A cancel's numbers, looked up once each under the lock however many the line names.
+        let cancelled: HashSet<u64> = rpc.cancel.iter().flatten().copied().collect();
         self.with(|s| {
             if s.sealed {
                 return;
@@ -366,6 +464,7 @@ impl Relay {
                 if let Some(Frame::Gathering(item, _)) = s.frames.remove(&conn) {
                     s.discard(item);
                 }
+                self.disconnect(s, &conn);
                 if s.open.remove(&conn) {
                     reason.truncate(floor_char_boundary(&reason, REASON_MAX));
                     let cost = LINE + reason.len() as u64;
@@ -375,8 +474,17 @@ impl Relay {
                 return;
             }
             if let Some(mut seqs) = rpc.cancel.take() {
-                // A hint: one with no room is dropped, and its requests run as if their callers
-                // had waited.
+                // At the gate whatever the queue's room: a request held for an answer is cancelled
+                // now, and one the process has yet to hold will be the moment it asks.
+                let interrupted = |key: &Key| {
+                    key.0 == conn.0
+                        && key.1 == conn.1
+                        && key.2 == conn.2
+                        && cancelled.contains(&key.3)
+                };
+                self.withdraw_where(s, interrupted, Withdrawn::Interrupted);
+                // To the process, a hint: one with no room is dropped, and its requests run as if
+                // their callers had waited.
                 if s.open.contains(&conn) && s.fits(LINE) {
                     seqs.truncate(CANCEL_MAX);
                     line["cancel"] = seqs.into();
@@ -457,6 +565,9 @@ impl Relay {
                 since: Instant::now(),
                 sent: false,
                 received: false,
+                parent: None,
+                withdrawn: None,
+                held: None,
             };
             self.receipt(&call, ReceivedBy::Interpreter);
             let outcome = outcome(&notice.outcome);
@@ -473,6 +584,7 @@ impl Relay {
                 return false;
             }
             s.closing = Some(closing.to_string());
+            self.cancel_where(s, |_| true, Withdrawn::Closed, closing);
             let (mut refused, kept): (VecDeque<Item>, _) = std::mem::take(&mut s.queue)
                 .into_iter()
                 .partition(|item| item.request.is_some());
@@ -528,6 +640,9 @@ impl Relay {
     pub(crate) fn report(&self) -> Vec<HostedCall> {
         self.with(|s| {
             s.sealed = true;
+            for handler in s.asking.drain(..) {
+                handler.abort();
+            }
             s.after_close.clone()
         })
     }
@@ -549,12 +664,6 @@ impl Relay {
         let s = self.0.state.borrow();
         let lines = s.queue.iter().flat_map(|item| item.lines.clone());
         (lines.collect(), s.queued)
-    }
-
-    /// Where event lines of kinds the relay does not know go, for a test.
-    #[cfg(test)]
-    pub(crate) fn others(&self, others: mpsc::UnboundedSender<Value>) {
-        self.with(|s| s.others = Some(others));
     }
 
     /// Handle `line` as an event line the process wrote, for a test.
@@ -636,6 +745,9 @@ impl Relay {
                     since: Instant::now(),
                     sent: false,
                     received: false,
+                    parent: None,
+                    withdrawn: None,
+                    held: None,
                 };
                 if let Some((reason, error)) = refusal {
                     self.refuse(s, &key, &call, reason, &error);
@@ -666,6 +778,7 @@ impl Relay {
         (self.0.to_interpreter)(
             json!({"t": "rpc", "agent": agent, "binding": binding, "id": id, "closed": reason}),
         );
+        self.disconnect(s, conn);
         if s.open.remove(conn) {
             let line =
                 json!({"t": "rpc", "binding": binding, "agent": agent, "id": id, "closed": reason});
@@ -760,13 +873,12 @@ impl Relay {
     /// An event line of the process: a request's receipt, dispatch, outcome or callback,
     /// recorded under the request's id. Any other kind is a library's own.
     fn event(&self, line: Value) {
-        let kinds = ["received", "dispatched", "ended", "callback"];
+        if line["t"] == "decision" {
+            self.decision(line);
+            return;
+        }
+        let kinds = ["received", "decided", "dispatched", "ended", "callback"];
         if !kinds.contains(&line["kind"].as_str().unwrap_or_default()) {
-            #[cfg(test)]
-            if let Some(others) = &self.0.state.borrow().others {
-                let _ = others.send(line);
-                return;
-            }
             tracing::debug!("ignored an event line of a kind the relay does not know: {line}");
             return;
         }
@@ -811,12 +923,16 @@ impl Relay {
                             since: Instant::now(),
                             sent: true,
                             received: false,
+                            parent: None,
+                            withdrawn: None,
+                            held: None,
                         };
                         s.calls.insert(key.clone(), call);
                     }
                     let call = s.calls.get_mut(&key).expect("inserted above");
                     call.sent = true;
                     call.received = true;
+                    call.parent = parent;
                     // Its duration counts from here, as `hosted.ended`'s does.
                     call.since = Instant::now();
                     let received = Payload::HostedReceived {
@@ -833,6 +949,19 @@ impl Relay {
                         by: ReceivedBy::Binding,
                     };
                     self.0.events.emit(received);
+                }
+                "decided" => {
+                    let by = match (r.by.as_deref(), r.layer) {
+                        (Some("rule"), Some(layer)) => {
+                            r.rule.map(|rule| DecidedBy::Rule { layer, rule })
+                        }
+                        (Some("default"), Some(layer)) => Some(DecidedBy::Default { layer }),
+                        _ => None,
+                    };
+                    if let (Some(call), Some(by), Some(action)) = (s.calls.get(&key), by, r.action)
+                    {
+                        self.decided(call.id, &key, action, by, r.reason, false);
+                    }
                 }
                 "dispatched" => {
                     let request = s.calls.get(&key).map(|call| call.id);
@@ -885,6 +1014,257 @@ impl Relay {
         });
     }
 
+    /// Publish a decision about `request`, held under `key`, under the rules in force; `ignored`
+    /// for an answer that came after the request had stopped waiting for it.
+    fn decided(
+        &self,
+        request: RequestId,
+        key: &Key,
+        action: PolicyAction,
+        by: DecidedBy,
+        reason: Option<String>,
+        ignored: bool,
+    ) {
+        self.0.events.emit(Payload::HostedDecided {
+            request,
+            agent: key.0.clone(),
+            binding: key.1.clone(),
+            action,
+            by,
+            reason,
+            version: self.0.approvals.version.clone(),
+            ignored,
+        });
+    }
+
+    /// A decision line of the process: a request its policy holds for an answer. Settled at once
+    /// when it cannot wait -- the session has closed, its caller was interrupted, or nobody can
+    /// answer -- and otherwise held while the session's handler is asked. One the relay holds
+    /// nothing of, which only a library's own use of the primitive sends, is denied unrecorded.
+    fn decision(&self, line: Value) {
+        let Some(id) = line["id"].as_u64() else {
+            tracing::warn!("ignored a decision line from the bindings process without an id");
+            return;
+        };
+        let ask = serde_json::from_value::<Ask>(line).ok();
+        self.with(|s| {
+            if s.gone.is_some() || s.sealed {
+                return;
+            }
+            let found = ask.and_then(|ask| {
+                let key = (ask.agent.clone(), ask.binding.clone(), ask.conn, ask.seq);
+                s.calls.get(&key).map(|call| (ask, key, call))
+            });
+            let Some((ask, key, call)) = found else {
+                let detail = "the owner holds no request this decision is for";
+                let answer = json!({"action": "deny", "reason": "interception", "detail": detail});
+                return s.push(json!({"t": "decision", "id": id, "answer": answer}), LINE);
+            };
+            let (request, execid, parent) = (call.id, call.exec, call.parent);
+            if let Some(closing) = s.closing.clone() {
+                return self.settle(s, &key, id, Settle::Refuse(closing));
+            }
+            if let Some(why) = call.withdrawn {
+                let cancel = Settle::Cancel(why, withdrawn_text(why).into());
+                return self.settle(s, &key, id, cancel);
+            }
+            let handler = self.0.approvals.handler.clone();
+            let mut reason = ask.reason;
+            if ask.action == PolicyAction::Evaluate {
+                let next = match handler {
+                    Some(_) => PolicyAction::Escalate,
+                    None => PolicyAction::Deny,
+                };
+                let why = Some("no evaluator is configured".to_string());
+                self.decided(request, &key, next, DecidedBy::NoEvaluator, why, false);
+                reason = format!("{reason}, and no evaluator is configured");
+            }
+            let Some(handler) = handler else {
+                let (deny, why) = (PolicyAction::Deny, "no approver is installed");
+                self.decided(
+                    request,
+                    &key,
+                    deny,
+                    DecidedBy::NoApprover,
+                    Some(why.into()),
+                    false,
+                );
+                let detail = format!("{reason}; it was refused, since {why}");
+                return self.settle(s, &key, id, Settle::Deny(HostedReason::NoApprover, detail));
+            };
+            let withdrawal = Withdrawal::default();
+            let escalation = Escalation {
+                request,
+                parent,
+                agent: key.0.clone(),
+                execid,
+                binding: key.1.clone(),
+                operation: Operation::named(&ask.operation),
+                member: bounded(ask.member.as_deref()),
+                target: bounded(ask.target.as_deref()),
+                arguments: ask.arguments,
+                keywords: ask.keywords,
+                reason,
+                policy: self.0.approvals.version.clone(),
+                withdrawal: withdrawal.clone(),
+            };
+            // Spawned, not run: the handler's code runs on the runtime, outside this lock, which
+            // a handler that closes the session takes.
+            let asked = handler.escalate(escalation);
+            let asked = tokio::spawn(self.answer(asked, key.clone(), id, request));
+            s.asking.retain(|task| !task.is_finished());
+            s.asking.push(asked.abort_handle());
+            let held = Held {
+                decision: id,
+                withdrawal,
+            };
+            if let Some(call) = s.calls.get_mut(&key) {
+                call.held = Some(held);
+            }
+        });
+    }
+
+    /// Wait for `asked`, the handler's answer about the request held under `key` for `decision`,
+    /// and settle the request with it: an `Err` or a panic denies.
+    fn answer(
+        &self,
+        asked: impl Future<Output = EscalationResult> + Send + 'static,
+        key: Key,
+        decision: u64,
+        request: RequestId,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        // Weak, so a handler that never answers holds nothing of the session's.
+        let relay = Arc::downgrade(&self.0);
+        async move {
+            let answer = match AssertUnwindSafe(asked).catch_unwind().await {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(e)) => Err(format!("the escalation handler failed: {e}")),
+                Err(_) => Err("the escalation handler panicked".to_string()),
+            };
+            if let Some(shared) = relay.upgrade() {
+                Relay(shared).answered(&key, decision, request, answer);
+            }
+        }
+    }
+
+    /// The handler's answer for `request`, held under `key` for `decision`: it settles the
+    /// request if the request still waits for it, and is recorded as ignored if not. A failure
+    /// once the request stopped waiting -- a handler that gave up when told -- is no answer, and
+    /// is not recorded.
+    fn answered(
+        &self,
+        key: &Key,
+        decision: u64,
+        request: RequestId,
+        answer: Result<EscalationAnswer, String>,
+    ) {
+        self.with(|s| {
+            if s.sealed {
+                return;
+            }
+            let waiting = s
+                .calls
+                .get(key)
+                .and_then(|call| call.held.as_ref())
+                .is_some_and(|held| held.decision == decision);
+            let (action, reason) = match answer {
+                Ok(EscalationAnswer::Allow) => (PolicyAction::Allow, None),
+                Ok(EscalationAnswer::Deny(reason)) => (PolicyAction::Deny, Some(reason)),
+                Err(_) if !waiting => return,
+                Err(reason) => (PolicyAction::Deny, Some(reason)),
+            };
+            let by = DecidedBy::Approver;
+            self.decided(request, key, action, by, reason.clone(), !waiting);
+            if waiting {
+                let settle = match reason {
+                    None => Settle::Allow,
+                    Some(reason) => {
+                        let detail = format!("the approver denied it: {reason}");
+                        Settle::Deny(HostedReason::Approver, detail)
+                    }
+                };
+                self.settle(s, key, decision, settle);
+            }
+        });
+    }
+
+    /// Settle the request held -- or about to be -- under `key`, answering `decision`. Unless it
+    /// is allowed, its outcome is recorded here, since the owner decided it was never invoked,
+    /// and what the process writes of it after is ignored.
+    fn settle(&self, s: &mut State, key: &Key, decision: u64, settle: Settle) {
+        let held = s.calls.get_mut(key).and_then(|call| call.held.take());
+        let (answer, ended) = match settle {
+            Settle::Allow => (json!({"action": "allow"}), None),
+            Settle::Deny(reason, detail) => (
+                json!({"action": "deny", "reason": reason, "detail": &detail}),
+                Some((HostedOutcome::Refused, reason, Some(detail))),
+            ),
+            Settle::Cancel(why, detail) => {
+                if let Some(held) = &held {
+                    held.withdrawal.withdraw(why);
+                }
+                let reason = cancelled_for(why);
+                (
+                    json!({"action": "cancel", "reason": reason, "detail": detail}),
+                    Some((HostedOutcome::Cancelled, reason, None)),
+                )
+            }
+            Settle::Refuse(closing) => {
+                let reason = HostedReason::AdmissionClosed;
+                (
+                    json!({"action": "refuse", "reason": reason, "detail": &closing}),
+                    Some((HostedOutcome::Refused, reason, Some(closing))),
+                )
+            }
+        };
+        s.push(
+            json!({"t": "decision", "id": decision, "answer": answer}),
+            LINE,
+        );
+        if let Some((outcome, reason, detail)) = ended
+            && let Some(call) = s.calls.remove(key)
+        {
+            self.end(s, &call, outcome, Some(reason), detail);
+        }
+    }
+
+    /// Cancel every request held for an answer that `which` picks, for `why`, its caller
+    /// raising `detail`.
+    fn cancel_where(
+        &self,
+        s: &mut State,
+        which: impl Fn(&Key) -> bool,
+        why: Withdrawn,
+        detail: &str,
+    ) {
+        let held: Vec<_> = s
+            .calls
+            .iter()
+            .filter(|(key, _)| which(key))
+            .filter_map(|(key, call)| Some((key.clone(), call.held.as_ref()?.decision)))
+            .collect();
+        for (key, decision) in held {
+            self.settle(s, &key, decision, Settle::Cancel(why, detail.to_string()));
+        }
+    }
+
+    /// Cancel every request held for an answer on `conn`, which has closed.
+    fn disconnect(&self, s: &mut State, conn: &Conn) {
+        let on = |key: &Key| key.0 == conn.0 && key.1 == conn.1 && key.2 == conn.2;
+        self.withdraw_where(s, on, Withdrawn::Disconnected);
+    }
+
+    /// Note on every request `which` picks that its caller stopped waiting, for `why`, so a
+    /// decision it is later held for is cancelled at once; and cancel each already held. The
+    /// first reason given stands.
+    fn withdraw_where(&self, s: &mut State, which: impl Fn(&Key) -> bool, why: Withdrawn) {
+        let picked = s.calls.iter_mut().filter(|(key, _)| which(key));
+        for (_, call) in picked {
+            call.withdrawn.get_or_insert(why);
+        }
+        self.cancel_where(s, which, why, withdrawn_text(why));
+    }
+
     /// One of the process's `rpc` lines, for the interpreter, unless the process is taken as gone.
     /// A close it says of a connection is one the relay need not send it.
     fn forward(&self, line: Value) {
@@ -899,7 +1279,9 @@ impl Relay {
                     line["id"].as_u64(),
                 )
             {
-                s.open.remove(&(agent.to_string(), binding.to_string(), id));
+                let conn = (agent.to_string(), binding.to_string(), id);
+                self.disconnect(s, &conn);
+                s.open.remove(&conn);
             }
             (self.0.to_interpreter)(line);
         });
@@ -927,6 +1309,19 @@ impl Relay {
         for (key, call) in std::mem::take(&mut s.calls) {
             if !call.sent {
                 self.refuse(s, &key, &call, HostedReason::Exited, &text);
+                continue;
+            }
+            if let Some(held) = &call.held {
+                // Held for an answer, so never invoked.
+                held.withdrawal.withdraw(Withdrawn::Exited);
+                let detail = Some(text.clone());
+                self.end(
+                    s,
+                    &call,
+                    HostedOutcome::Refused,
+                    Some(HostedReason::Exited),
+                    detail,
+                );
                 continue;
             }
             if !call.received {
@@ -1060,6 +1455,28 @@ fn reason(name: &str) -> Option<HostedReason> {
         "interrupted" => Some(HostedReason::Interrupted),
         "closed" => Some(HostedReason::Closed),
         "disconnected" => Some(HostedReason::Disconnected),
+        "rule" => Some(HostedReason::Rule),
+        "default" => Some(HostedReason::Default),
+        "approver" => Some(HostedReason::Approver),
+        "no_approver" => Some(HostedReason::NoApprover),
         _ => None,
+    }
+}
+
+/// What the caller of a request cancelled for `why` raises, when the session's close is not it.
+fn withdrawn_text(why: Withdrawn) -> &'static str {
+    match why {
+        Withdrawn::Interrupted => INTERRUPTED,
+        _ => DISCONNECTED,
+    }
+}
+
+/// The reason a held request cancelled because of `why` ends with.
+fn cancelled_for(why: Withdrawn) -> HostedReason {
+    match why {
+        Withdrawn::Interrupted => HostedReason::Interrupted,
+        Withdrawn::Closed => HostedReason::Closed,
+        Withdrawn::Disconnected => HostedReason::Disconnected,
+        Withdrawn::Exited => HostedReason::Exited,
     }
 }

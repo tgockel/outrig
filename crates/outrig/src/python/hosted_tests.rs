@@ -203,12 +203,13 @@ fn every_request_is_recorded_receipt_first() {
             (Operation::Callattr, Some("__next__")),
             (Operation::Callattr, Some("__next__")),
             (Operation::Callattr, Some("__next__")),
+            // A call of what a read returned is recorded as the call of that member.
             (Operation::Getattr, Some("method")),
-            (Operation::Call, None),
+            (Operation::Call, Some("method")),
             (Operation::Getattr, Some("raise_fixture")),
-            (Operation::Call, None),
+            (Operation::Call, Some("raise_fixture")),
             (Operation::Getattr, Some("stamp")),
-            (Operation::Call, None),
+            (Operation::Call, Some("stamp")),
         ],
         "{requests:?}"
     );
@@ -1577,13 +1578,23 @@ struct Bare {
 
 impl Bare {
     fn new() -> Self {
+        Self::with(hosted::Approvals::default())
+    }
+
+    /// A bare relay whose escalations `approvals` answers.
+    fn with(approvals: hosted::Approvals) -> Self {
         let told = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&told);
         let to_interpreter: hosted::ToInterpreter =
             Arc::new(move |line| kept.lock().expect("told lock").push(line));
         let mut stream = StreamBuilder::default();
         let events = stream.subscribe(1024);
-        let relay = hosted::Relay::new(to_interpreter, stream.build(), vec!["fx".to_string()]);
+        let relay = hosted::Relay::new(
+            to_interpreter,
+            stream.build(),
+            vec!["fx".to_string()],
+            approvals,
+        );
         Self {
             relay,
             told,
@@ -1628,6 +1639,89 @@ impl Bare {
         }
         recorded
     }
+}
+
+/// A request whose connection closed before its binding asked for a decision -- received, then
+/// the connection closed, then the decision line -- is cancelled when it asks: the handler is
+/// never asked, so no answer can run what nobody waits for.
+#[tokio::test]
+async fn a_request_whose_connection_closed_before_it_asked_is_cancelled_unasked() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&asked);
+    let handler: crate::harness::escalation::Handler =
+        Arc::new(move |_: crate::harness::Escalation| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(crate::harness::EscalationAnswer::Allow))
+        });
+    let approvals = hosted::Approvals {
+        handler: Some(handler),
+        ..hosted::Approvals::default()
+    };
+    let mut bare = Bare::with(approvals);
+    bare.wrote("received", json!(4), json!({"operation": "call"}));
+    bare.rpc(1, json!({"closed": "the caller's kernel closed it"}));
+    bare.relay.wrote(json!({
+        "t": "decision", "id": 7, "agent": PRIMARY, "binding": "fx", "conn": 1, "seq": 4,
+        "action": "escalate", "reason": "operator rule 1 says escalate", "operation": "call",
+        "member": "noted", "target": "outrig_fixture.Root",
+    }));
+    tokio::task::yield_now().await;
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let answers: Vec<Value> = bare
+        .relay
+        .queued()
+        .0
+        .into_iter()
+        .filter(|line| line["t"] == "decision")
+        .collect();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0]["answer"]["action"], "cancel");
+    assert_eq!(answers[0]["answer"]["reason"], "disconnected");
+    assert!(
+        bare.recorded().iter().any(|payload| matches!(
+            payload,
+            Payload::HostedEnded {
+                outcome: HostedOutcome::Cancelled,
+                reason: Some(HostedReason::Disconnected),
+                ..
+            }
+        )),
+        "not recorded cancelled"
+    );
+}
+
+/// A cancel naming a great many requests costs one lookup per request the relay holds: with 1,024
+/// in flight, a cancel of a million numbers is handled at once, cancels every request it names,
+/// and passes the process only its first 16 as a hint.
+#[test]
+fn a_cancel_of_many_numbers_is_looked_up_once() {
+    let bare = Bare::new();
+    bare.rpc(1, json!({"data": "AAAA"}));
+    for seq in 1..=1024 {
+        bare.wrote("received", json!(seq), json!({"operation": "call"}));
+    }
+    let numbers: Vec<u64> = (1..=1_000_000).rev().collect();
+    let started = Instant::now();
+    bare.rpc(1, json!({"cancel": numbers}));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let (lines, _) = bare.relay.queued();
+    let hint = lines.last().expect("the hint");
+    assert_eq!(
+        hint["cancel"],
+        json!((1_000_000 - 15..=1_000_000).rev().collect::<Vec<u64>>())
+    );
+    // Every request it named is withdrawn: a decision any of them asks for is cancelled.
+    bare.relay.wrote(json!({
+        "t": "decision", "id": 7, "agent": PRIMARY, "binding": "fx", "conn": 1, "seq": 900,
+        "action": "escalate", "reason": "r", "operation": "call",
+    }));
+    let answer = bare.relay.queued().0.last().cloned().expect("an answer");
+    assert_eq!(answer["answer"]["action"], "cancel", "{answer}");
+    assert_eq!(answer["answer"]["reason"], "interrupted", "{answer}");
 }
 
 /// A label declaring a frame past the bound closes its connection before anything is held, and

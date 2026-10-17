@@ -2013,26 +2013,36 @@ allow = ["github.com:443"]
         assert_eq!(merged.network.mode(), NetworkMode::Filter);
     }
 
-    /// `[events].mode` follows the repo the way `[network].mode` does: a repo
-    /// that declares it wins, one that is silent -- or writes only the table
-    /// header -- inherits, and with neither it is off.
+    /// `[events].mode` is the global config's when it declares one, so a cloned
+    /// project can neither turn the user's recording of their own session on
+    /// nor off; a repo's applies only when the global config is silent -- or
+    /// writes only the table header -- and with neither it is off.
     #[test]
-    fn repo_events_mode_wins_and_silence_inherits() {
+    fn the_global_events_mode_stands_and_silence_inherits() {
         let record = || parse("[events]\nmode = \"record\"\n");
+        let off = || parse("[events]\nmode = \"off\"\n");
         assert_eq!(parse("").events.mode(), EventsMode::Off, "off by default");
-        assert_eq!(merge(record(), parse("")).events.mode(), EventsMode::Record);
         assert_eq!(
-            merge(record(), parse("[events]\n")).events.mode(),
+            merge(record(), off()).events.mode(),
+            EventsMode::Record,
+            "global record, repo off"
+        );
+        assert_eq!(
+            merge(parse(""), record()).events.mode(),
+            EventsMode::Record,
+            "global unset, repo record"
+        );
+        assert_eq!(
+            merge(parse("[events]\n"), record()).events.mode(),
             EventsMode::Record,
             "a bare table declares nothing"
         );
         assert_eq!(
-            merge(record(), parse("[events]\nmode = \"off\"\n"))
-                .events
-                .mode(),
-            EventsMode::Off
+            merge(off(), record()).events.mode(),
+            EventsMode::Off,
+            "global off, repo record"
         );
-        assert_eq!(merge(parse(""), record()).events.mode(), EventsMode::Record);
+        assert_eq!(merge(record(), parse("")).events.mode(), EventsMode::Record);
 
         let mut repo = Config::default();
         repo.events.set_mode(EventsMode::Record);

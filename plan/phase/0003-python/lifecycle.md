@@ -44,8 +44,10 @@ change closes Rust's gate and stops the relay forwarding to every binding, toget
 is admitted by one and not the other. The bindings learn of the close afterward:
 
 - **Rust's gate**, one per session, decides executions, child launches, and the boundary requests
-  held for a decision -- those a rule escalated or sent to the evaluator. `0003-24` builds it for
-  three races: an interrupt, a close, and an approval that arrives late. Whichever reaches the gate
+  held for a decision -- those a rule escalated or sent to the evaluator. `0003-24` built it for
+  three races: an interrupt, a close, and an approval that arrives late. The held requests are kept
+  in the relay's state, which the gate's close closes in the same step; a connection's close and
+  the interpreter's exit cancel them too. Whichever reaches the gate
   first decides. "Closed" and "allowed" cannot both win, so an allow that arrives after the close is
   recorded and changes nothing.
 - **The relay** orders the requests a rule allows against the close. Rules run in the binding
