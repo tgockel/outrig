@@ -320,6 +320,12 @@ fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -
 /// to right, so a symlink is followed before any `..` after it is applied; a
 /// component that does not exist is kept as written, and a later `..` pops it.
 fn canonical_or_normalized(p: &Path) -> PathBuf {
+    resolve_lenient(p).0
+}
+
+/// [`canonical_or_normalized`], plus the directory each name in `p` is looked
+/// up in.
+fn resolve_lenient(p: &Path) -> (PathBuf, Vec<PathBuf>) {
     use std::path::Component;
     let absolute = if p.is_absolute() {
         p.to_path_buf()
@@ -327,6 +333,7 @@ fn canonical_or_normalized(p: &Path) -> PathBuf {
         std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
     };
     let mut resolved = PathBuf::new();
+    let mut lookups = Vec::new();
     for c in absolute.components() {
         match c {
             Component::ParentDir => {
@@ -334,6 +341,7 @@ fn canonical_or_normalized(p: &Path) -> PathBuf {
             }
             Component::CurDir => {}
             Component::Normal(name) => {
+                lookups.push(resolved.clone());
                 resolved.push(name);
                 if let Ok(real) = std::fs::canonicalize(&resolved) {
                     resolved = real;
@@ -342,14 +350,59 @@ fn canonical_or_normalized(p: &Path) -> PathBuf {
             c => resolved.push(c),
         }
     }
-    resolved
+    (resolved, lookups)
+}
+
+/// Where a read-write mount lets an agent rewrite the global config, from the
+/// path as spelled. The next session reads that spelling through the kernel,
+/// not through [`canonical_or_normalized`], so it can land elsewhere than the
+/// guard looked.
+struct GlobalConfigReach {
+    spelled: PathBuf,
+    resolved: PathBuf,
+    /// The directory each name in the path is looked up in. An agent that can
+    /// write one can replace that name with a symlink, a missing one (which a
+    /// `..` after it pops without the agent in the way) and `config.toml`
+    /// itself included. A link followed to another link counts as one hop, so
+    /// only the directory holding the first is listed.
+    lookups: Vec<PathBuf>,
+}
+
+impl GlobalConfigReach {
+    fn of(spelled: &Path) -> Self {
+        let (resolved, lookups) = resolve_lenient(spelled);
+        Self {
+            spelled: spelled.to_path_buf(),
+            resolved,
+            lookups,
+        }
+    }
+
+    /// Why an agent with `host` mounted read-write could rewrite the global
+    /// config, if it could.
+    fn rewritable_through(&self, host: &Path) -> Option<String> {
+        if self.resolved.starts_with(host) {
+            return Some(format!(
+                "it is read-write and covers the global config ({})",
+                self.resolved.display()
+            ));
+        }
+        let dir = self.lookups.iter().find(|d| d.starts_with(host))?;
+        Some(format!(
+            "it is read-write and covers {}, which the global config path ({}) is looked up \
+             through, so an agent could redirect it by replacing a component",
+            dir.display(),
+            self.spelled.display()
+        ))
+    }
 }
 
 /// Refuse a repo-declared host path that reaches the operator's own files. The
 /// repo config sits in the read-write workspace, so an agent can edit it for
 /// the next session; a repo `[workspace] host-path`, `[[workspace.mounts]]` or
 /// sidecar mount covering the home directory (or one above it), or read-write
-/// covering the global config file or its directory, would let that agent
+/// covering the global config file, its directory, or a directory its path is
+/// looked up through (see [`GlobalConfigReach`]), would let that agent
 /// rewrite the global config the repo is not trusted to carry. A
 /// global-declared entry is the operator's own choice, and a hand-built one
 /// (`--volume`) carries no source.
@@ -372,17 +425,7 @@ fn refuse_repo_declared_mounts_with(
     global_cfg: Option<&Path>,
 ) -> Result<()> {
     let home = home.map(canonical_or_normalized);
-    // The file as resolved, and as linked: a symlinked `config.toml` can be
-    // replaced by writing its directory, so that directory is covered too.
-    let global_cfgs: Vec<PathBuf> = global_cfg
-        .map(|c| {
-            let linked = match (c.parent(), c.file_name()) {
-                (Some(dir), Some(name)) => canonical_or_normalized(dir).join(name),
-                _ => c.to_path_buf(),
-            };
-            vec![canonical_or_normalized(c), linked]
-        })
-        .unwrap_or_default();
+    let global = global_cfg.map(GlobalConfigReach::of);
     let check = |what: &str,
                  source: Option<&ConfigSource>,
                  host: PathBuf,
@@ -394,14 +437,10 @@ fn refuse_repo_declared_mounts_with(
         let host = canonical_or_normalized(&host);
         let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
             "it is your home directory or above it".to_string()
-        } else if let Some(cfg) = global_cfgs
-            .iter()
-            .find(|c| access == MountAccess::ReadWrite && c.starts_with(&host))
+        } else if access == MountAccess::ReadWrite
+            && let Some(why) = global.as_ref().and_then(|g| g.rewritable_through(&host))
         {
-            format!(
-                "it is read-write and covers the global config ({})",
-                cfg.display()
-            )
+            why
         } else {
             return Ok(());
         };
@@ -859,6 +898,95 @@ mod tests {
         let got = canonical_or_normalized(&spelled);
         assert_eq!(got, root.join("private/conf/outrig/config.toml"));
         assert!(!got.starts_with(root.join("cache")));
+    }
+
+    /// `refuse_repo_declared_mounts_with` for a repo config, under `root`,
+    /// declaring one mount of `host`, against a `global` config path and no
+    /// home rule. The refusal's text, if there is one.
+    fn refusal(root: &Path, host: &Path, access: &str, global: &Path) -> Option<String> {
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            format!(
+                "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+                 access = \"{access}\"\n",
+                host.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        refuse_repo_declared_mounts_with(&cfg, &repo, None, Some(global))
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// How a refusal names a directory the global config path is looked up
+    /// through.
+    fn looked_up_through(dir: &Path) -> String {
+        format!("covers {}, which the global config path", dir.display())
+    }
+
+    /// A `..` after a missing component is popped without the agent in the
+    /// way, yet the next session resolves the path through the kernel: an agent
+    /// that makes the component a symlink picks where `config.toml` is read. A
+    /// read-write mount of the directory it would be created in is refused
+    /// (#605).
+    #[test]
+    fn a_repo_mount_covering_where_a_missing_component_is_created_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let shared = root.join("shared");
+        fs::create_dir_all(shared.join("inner")).unwrap();
+        let global = shared.join("absent/../../conf/outrig/config.toml");
+
+        let err = refusal(&root, &shared, "read-write", &global).expect("the creation point");
+        assert!(err.contains(&looked_up_through(&shared)), "{err}");
+        assert!(err.contains(&global.display().to_string()), "{err}");
+
+        assert_eq!(refusal(&root, &shared, "read-only", &global), None);
+        // From below the creation point the agent cannot make `absent`.
+        assert_eq!(refusal(&root, &shared.join("inner"), "read-write", &global), None);
+    }
+
+    /// The same swap works on a symlink that is already there: the agent
+    /// replaces it in the directory that holds it, though the path resolves
+    /// somewhere else today.
+    #[test]
+    fn a_repo_mount_covering_a_symlink_in_the_global_config_path_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (links, real) = (root.join("links"), root.join("real"));
+        fs::create_dir_all(real.join("outrig")).unwrap();
+        fs::write(real.join("outrig/config.toml"), "").unwrap();
+        fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink(&real, links.join("cfg")).unwrap();
+        let global = links.join("cfg/outrig/config.toml");
+
+        let err = refusal(&root, &links, "read-write", &global).expect("the symlink's directory");
+        assert!(err.contains(&looked_up_through(&links)), "{err}");
+
+        // Where the file is today keeps its own reason.
+        let err = refusal(&root, &real, "read-write", &global).expect("the resolved file");
+        assert!(err.contains("covers the global config ("), "{err}");
+    }
+
+    /// A `config.toml` that is itself a symlink is replaced by writing the
+    /// directory that holds it, though the file it points at is elsewhere.
+    #[test]
+    fn a_repo_mount_covering_a_symlinked_global_config_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (links, real) = (root.join("links"), root.join("real"));
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("config.toml"), "").unwrap();
+        fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink(real.join("config.toml"), links.join("config.toml")).unwrap();
+
+        let err = refusal(&root, &links, "read-write", &links.join("config.toml"))
+            .expect("the symlink's directory");
+        assert!(err.contains(&looked_up_through(&links)), "{err}");
     }
 
     /// The refusal says which default put the workspace there: a repo config
