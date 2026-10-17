@@ -60,7 +60,7 @@ impl Status {
 }
 
 /// Most descriptors a child may hand back in one message.
-pub(crate) const MAX_FDS: usize = 3;
+pub(crate) const MAX_FDS: usize = 4;
 
 const CTRL_LEN: usize = cmsg_space(size_of::<[RawFd; MAX_FDS]>());
 

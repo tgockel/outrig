@@ -155,21 +155,23 @@ Accepted modes:
   port but 53, ICMP, anything else -- follows `default` directly.
 
 Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
-container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
-send DNS to the per-session in-namespace DNS listener, installs nftables redirection for
-outbound TCP and UDP/53 over both IPv4 and IPv6, and removes the nftables table during teardown.
-A lookup a tool sends to some other resolver address, such as `dig @8.8.8.8`, is redirected to
-the same listener and answered from the address it was sent to. The listener forwards each
-lookup on its own, up to 64 at once per container, so one name a host resolver is slow to answer
-does not hold up the container's other lookups. TCP connections are carried up to 256 at once per
-container, in either mode: each holds two of outrig's open files, and the limit keeps one container
-from taking all of them. A connection past it is closed as soon as it is accepted and recorded with
-`outrig.action = "deny"` and `outrig.rule = "connection-limit"`. For the same reason `outrig`
-raises its own soft open-file limit to the hard limit when it starts. A connection that reaches
-the interceptor's own listener without having been redirected to it, such as a process in the
-container connecting straight to the listener's port, is closed as soon as it is accepted and
-recorded with `outrig.action = "deny"` and `outrig.rule = "not-redirected"`, in either mode. If
-either mode is requested and setup fails, the session fails before MCP servers launch.
+container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to send
+DNS to the per-session in-namespace DNS listener, installs nftables redirection for outbound TCP and
+port 53 over both IPv4 and IPv6, and removes the nftables table during teardown. A lookup a tool
+sends to some other resolver address, such as `dig @8.8.8.8`, is redirected to the same listener and
+answered from the address it was sent to. That holds over TCP as well as UDP: the stub's retry after
+a truncated answer, `dig +tcp`, and `use-vc` are answered as a UDP lookup is, forwarded to the
+host's resolvers over TCP. The listener forwards each lookup on its own, up to 64 at once per
+container, so one name a host resolver is slow to answer does not hold up the container's other
+lookups. TCP connections are carried up to 256 at once per container, in either mode: each holds two
+of outrig's open files, and the limit keeps one container from taking all of them. A connection past
+it is closed as soon as it is accepted and recorded with `outrig.action = "deny"` and `outrig.rule =
+"connection-limit"`. For the same reason `outrig` raises its own soft open-file limit to the hard
+limit when it starts. A connection that reaches the interceptor's own listener without having been
+redirected to it, such as a process in the container connecting straight to the listener's port, is
+closed as soon as it is accepted and recorded with `outrig.action = "deny"` and `outrig.rule =
+"not-redirected"`, in either mode. If either mode is requested and setup fails, the session fails
+before MCP servers launch.
 
 Either mode refuses a container that holds `NET_ADMIN`. `CAP_NET_ADMIN` in a container's own
 network namespace is control of its nftables, so a root process in that container could delete the
@@ -224,15 +226,15 @@ connections are closed immediately and still write an audit record with
 least one `allow` or `deny` entry, even when `default = "allow"`. What a hostname entry can
 match, and so stop, is bounded: see [What a hostname rule matches](#what-a-hostname-rule-matches).
 
-`allow` and `deny` entries match TCP connections, which the interceptor carries and can name a
-host for. Anything else the container sends -- UDP to any port but 53, which is how QUIC and so
-HTTP/3 travel, ICMP, any other transport -- matches no entry and takes `default` directly. Under
-`default = "deny"` the kernel drops it, by a rule in the same nftables table: the sending tool
-fails at once with "Operation not permitted" rather than reaching the network. Such a datagram
-never reaches the interceptor, so it writes no `network.jsonl` record. Under `default = "allow"`,
-and in audit mode, it leaves by podman's default route, unrecorded. Name lookups, which are
-UDP/53, are decided by the name asked for instead; see below. Traffic between processes in the
-container over loopback is carried either way.
+`allow` and `deny` entries match TCP connections, which the interceptor carries and can name a host
+for. Anything else the container sends -- UDP to any port but 53, which is how QUIC and so HTTP/3
+travel, ICMP, any other transport -- matches no entry and takes `default` directly. Under `default =
+"deny"` the kernel drops it, by a rule in the same nftables table: the sending tool fails at once
+with "Operation not permitted" rather than reaching the network. Such a datagram never reaches the
+interceptor, so it writes no `network.jsonl` record. Under `default = "allow"`, and in audit mode,
+it leaves by podman's default route, unrecorded. Name lookups, which are over UDP or TCP port 53,
+are decided by the name asked for instead; see below. Traffic between processes in the container
+over loopback is carried either way.
 
 ### Name lookups
 
@@ -259,16 +261,19 @@ and musl waits out its own timeout. Under `default = "deny"` a reverse lookup, o
 a name no `allow` entry names, fails the same way.
 
 Every lookup writes a `network.jsonl` record, answered or refused, before the query is sent to a
-resolver. It is a UDP record for service `dns`, its `outrig.host` is the name asked for (with
-`outrig.host_source` `asserted`, since the container chose it), and `outrig.action` and
-`outrig.rule` say what was decided and by which entry; a query that is not a plain question is
-refused under `outrig.rule` `dns-unparsed`. Its other fields are those of a connection's record.
+resolver. It is a record for service `dns`, `udp` or `tcp` as the lookup was made, its `outrig.host`
+is the name asked for (with `outrig.host_source` `asserted`, since the container chose it), and
+`outrig.action` and `outrig.rule` say what was decided and by which entry; a query that is not a
+plain question is refused under `outrig.rule` `dns-unparsed`. A zone transfer (`AXFR` or `IXFR`)
+over TCP is refused under `dns-transfer`: its answer is several messages, which the listener does
+not carry. Its other fields are those of a connection's record.
 
 An allowed name can still carry data. `allow = ["*.example.com"]` lets the container look up
 `<data>.example.com`, which reaches the name servers of example.com, and the same entry grants
 connections to every host under it, so name only zones you would trust with either. An EDNS
-record a query carries is forwarded to the host's resolver whole. Entries for port 53 apply to
-TCP connections, which are decided by their destination like any other.
+record a query carries is forwarded to the host's resolver whole. A lookup is decided by its
+name alone, over TCP as over UDP, so an entry for port 53 -- `deny = ["*:53"]` -- does not govern
+it; no connection to port 53 is made that a destination could decide.
 
 > **Changed in 0.2.2.** Before this release every lookup was answered, whatever the policy.
 > Under `default = "deny"`, a name that resolved only because it fell in an allowed address or
@@ -307,7 +312,7 @@ remaining entries and then `default`; the entry is never turned into a deny, so
 Consequences worth planning for:
 
 - A container that reaches an address without asking the interceptor's resolver -- a baked
-  `/etc/hosts` entry, a hardcoded address, DNS carried over TCP or HTTPS -- earns no binding, so
+  `/etc/hosts` entry, a hardcoded address, DNS over HTTPS -- earns no binding, so
   hostname `allow` entries do not cover it. Address and CIDR entries still do.
 - `host.containers.internal` and `host.docker.internal`, which reach the host, are such
   `/etc/hosts` entries, so an entry naming them never matches; name their address instead. Under

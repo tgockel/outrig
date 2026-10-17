@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DNS over TCP works under network interception.** A truncated UDP answer's TCP retry, `dig
+  +tcp`, and `options use-vc` were refused at the container's `127.0.0.1` resolver, and a TCP
+  lookup sent to another resolver was carried as an opaque connection that bound no name. The
+  interceptor now serves port 53 over TCP beside UDP and redirects `tcp dport 53` to it, so a TCP
+  lookup is decided, audited, forwarded to the host's resolvers over TCP, and bound as a UDP one
+  is. A zone transfer (`AXFR`, `IXFR`) over TCP is refused under the rule `dns-transfer`. (#264)
 - **`devices` accepts podman's `<host>[:<container>][:<permissions>]` form, as it always did.** The
   reference said the colon form was refused while validation passed it to podman. The reference now
   documents it, and validation refuses a malformed entry -- more than three fields, a relative

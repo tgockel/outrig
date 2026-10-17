@@ -81,6 +81,9 @@ const PASTA_HOST_STAND_IN: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a lookup connection may sit between queries before it is closed.
+const DNS_TCP_IDLE: Duration = Duration::from_secs(10);
 /// The port a resolver answers on, which is the one the redirect carries to the
 /// DNS listener.
 const DNS_PORT: u16 = 53;
@@ -108,6 +111,11 @@ const UNREDIRECTED_RULE: &str = "not-redirected";
 /// [`CompiledNetworkPolicy::decide_lookup`]. Labelled like
 /// [`CONNECTION_LIMIT_RULE`], and for the same reason.
 const UNPARSED_LOOKUP_RULE: &str = "dns-unparsed";
+/// The rule a zone transfer over TCP is refused under: its answer is a run of
+/// messages, and the interceptor carries one.
+const TRANSFER_LOOKUP_RULE: &str = "dns-transfer";
+/// IXFR and AXFR, the query types answered by more than one message.
+const DNS_TYPES_TRANSFER: [u16; 2] = [251, 252];
 /// How long a listener waits before trying again after a failure that is not
 /// about one connection -- out of descriptors, buffers, memory. Connections
 /// finishing is what frees those, which takes time, and trying again at once
@@ -720,6 +728,7 @@ impl NetworkInterceptor {
         };
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
+        let dns_tcp_port = sockets.dns_tcp.local_addr()?.port();
 
         let target = Target::for_attach(pid, &self.session_id);
         let transcript = container.transcript();
@@ -746,8 +755,11 @@ impl NetworkInterceptor {
             &mut rollback,
             &target,
             resolver,
-            tcp_port,
-            dns_port,
+            ListenerPorts {
+                tcp: tcp_port,
+                dns: dns_port,
+                dns_tcp: dns_tcp_port,
+            },
             self.policy.default,
         )
         .await
@@ -793,10 +805,19 @@ impl NetworkInterceptor {
             cancel.clone(),
             live,
         ));
+        let (resolvers_tcp, bindings_tcp) = (resolvers.clone(), bindings.clone());
         tasks.spawn(dns_loop(
             sockets.dns,
             resolvers,
             bindings,
+            self.policy.clone(),
+            self.audit.for_attachment(name, generation),
+            cancel.clone(),
+        ));
+        tasks.spawn(dns_tcp_loop(
+            sockets.dns_tcp,
+            resolvers_tcp,
+            bindings_tcp,
             self.policy.clone(),
             self.audit.for_attachment(name, generation),
             cancel.clone(),
@@ -1017,10 +1038,20 @@ fn teardown_result(causes: Vec<NetworkTeardownCause>) -> Result<()> {
     }
 }
 
+/// Where the interceptor's listeners are, which the redirects are aimed at.
+#[derive(Debug, Clone, Copy)]
+struct ListenerPorts {
+    tcp: u16,
+    dns: u16,
+    dns_tcp: u16,
+}
+
 #[derive(Debug)]
 struct InterceptorSockets {
     tcp: TcpListener,
     dns: UdpSocket,
+    /// Port 53 over TCP, where a stub's retry after a truncated answer goes.
+    dns_tcp: TcpListener,
     /// Unconnected, for [`pasta_host_alias`].
     probe: std::net::TcpStream,
 }
@@ -1409,8 +1440,7 @@ async fn install_interception<F, Fut>(
     rollback: &mut Rollback,
     target: &Target,
     resolver: Option<Resolver>,
-    tcp_port: u16,
-    dns_port: u16,
+    ports: ListenerPorts,
     policy_default: NetworkAction,
 ) -> Result<()>
 where
@@ -1436,7 +1466,16 @@ where
     }
 
     let mut rules = tempfile::NamedTempFile::new()?;
-    rules.write_all(nft_rules(&target.table, tcp_port, dns_port, policy_default).as_bytes())?;
+    rules.write_all(
+        nft_rules(
+            &target.table,
+            ports.tcp,
+            ports.dns,
+            ports.dns_tcp,
+            policy_default,
+        )
+        .as_bytes(),
+    )?;
     rules.as_file_mut().sync_all()?;
     // Safe to arm before the apply because the name belongs to this attach
     // alone -- see `nft_table_name`. `create table` is belt to that brace: it
@@ -3105,7 +3144,44 @@ async fn dns_loop(
 /// Decides one query, records the decision, and then either refuses it or
 /// forwards it and sends `peer` whatever validly answers it, from `asked`, the
 /// address the query was sent to. When no resolver answers, `peer` is sent a
-/// SERVFAIL instead and the forward's failure is returned.
+/// SERVFAIL instead and the forward's failure is returned. See
+/// [`resolve_dns`], which does the deciding for both transports.
+async fn answer_dns(
+    socket: &UdpSocket,
+    raw: &[u8],
+    peer: SocketAddr,
+    asked: Asked,
+    context: &DnsContext,
+) -> io::Result<()> {
+    let dst = SocketAddr::new(asked.addr(), DNS_PORT);
+    let (reply, failure) = resolve_dns(raw, peer, dst, DnsTransport::Udp, context).await;
+    if let Some(reply) = reply {
+        let _ = send_answer(socket, &reply, peer, asked).await;
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// The transport a lookup arrived on, which is the one it is forwarded over:
+/// a client that asked over TCP gets the answer a resolver gives over TCP, not
+/// the truncated one it asked to avoid.
+#[derive(Clone, Copy)]
+enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+impl DnsTransport {
+    fn proto(self) -> &'static str {
+        match self {
+            DnsTransport::Udp => "udp",
+            DnsTransport::Tcp => "tcp",
+        }
+    }
+}
+
+/// Decides one query `peer` sent to `dst`, records the decision, and returns
+/// what `peer` is to be sent -- `None` for a query nothing can be said to --
+/// beside the forward's failure when no resolver answered.
 ///
 /// A lookup is a way out of the container -- the name reaches whoever serves
 /// its zone -- so it is decided like a connection is: by
@@ -3117,14 +3193,16 @@ async fn dns_loop(
 ///
 /// The record is written before the decision takes effect, and waited for, so
 /// a query that reached a resolver is in the audit log. A refusal is answered
-/// REFUSED and is not a failure to forward: it returns `Ok`.
-async fn answer_dns(
-    socket: &UdpSocket,
+/// REFUSED and is not a failure to forward: it has no failure. An answer that
+/// validly resolves a name is bound before it is returned, so a connection the
+/// client opens on the strength of it is decided with the name in hand.
+async fn resolve_dns(
     raw: &[u8],
     peer: SocketAddr,
-    asked: Asked,
+    dst: SocketAddr,
+    transport: DnsTransport,
     context: &DnsContext,
-) -> io::Result<()> {
+) -> (Option<Vec<u8>>, Option<io::Error>) {
     let query = dns_query(raw);
     tracing::debug!(
         target: "outrig::network",
@@ -3132,9 +3210,20 @@ async fn answer_dns(
         query.as_ref().map(|query| &query.question.name)
     );
     let plain = query.as_ref().filter(|query| query.is_plain_question(raw));
-    let decision = context
+    let mut decision = context
         .policy
         .decide_lookup(plain.map(|query| query.question.name.as_str()));
+    // A transfer's answer is several messages on one stream, and
+    // `forward_dns_tcp` carries one: what it would return is the first message
+    // as though it were all of it. Refused, and said to be, rather than cut.
+    // Read off the wire rather than from `query`: a valid name the policy's
+    // parser refuses -- an RFC 2317 `0/25.2.0.192.in-addr.arpa` -- leaves no
+    // `query`, and is forwarded all the same.
+    if matches!(transport, DnsTransport::Tcp)
+        && raw_qtype(raw).is_some_and(|qtype| DNS_TYPES_TRANSFER.contains(&qtype))
+    {
+        decision = PolicyDecision::new(NetworkAction::Deny, TRANSFER_LOOKUP_RULE);
+    }
     let refused = decision.action == NetworkAction::Deny;
     // `orig` and `dst` are as the dual-stack listener reports them, v4-mapped
     // for an IPv4 client. The record describes the exchange before any
@@ -3142,11 +3231,11 @@ async fn answer_dns(
     write_audit(
         &context.audit,
         AuditEvent {
-            proto: "udp",
+            proto: transport.proto(),
             opened: SystemTime::now(),
             duration: Duration::ZERO,
             orig: canonical(peer),
-            dst: canonical(SocketAddr::new(asked.addr(), DNS_PORT)),
+            dst: canonical(dst),
             resolved: ResolvedNames::default(),
             assertion: query
                 .as_ref()
@@ -3161,15 +3250,17 @@ async fn answer_dns(
     )
     .await;
     if refused {
-        if let Some(reply) = dns_error_reply(raw, query.as_ref(), DNS_RCODE_REFUSED) {
-            let _ = send_answer(socket, &reply, peer, asked).await;
-        }
-        return Ok(());
+        return (
+            dns_error_reply(raw, query.as_ref(), DNS_RCODE_REFUSED),
+            None,
+        );
     }
-    match forward_dns(raw, query.as_ref(), &context.resolvers).await {
+    let forwarded = match transport {
+        DnsTransport::Udp => forward_dns(raw, query.as_ref(), &context.resolvers).await,
+        DnsTransport::Tcp => forward_dns_tcp(raw, query.as_ref(), &context.resolvers).await,
+    };
+    match forwarded {
         Ok(response) => {
-            // Bound before the answer goes out, so a connection the client
-            // opens on the strength of it is decided with the name in hand.
             if let Some(query) = &query
                 && dns_response_is_bindable(&response)
             {
@@ -3180,15 +3271,9 @@ async fn answer_dns(
                 "dns response to {peer}: {} bytes",
                 response.len()
             );
-            let _ = send_answer(socket, &response, peer, asked).await;
-            Ok(())
+            (Some(response), None)
         }
-        Err(e) => {
-            if let Some(servfail) = dns_servfail(raw, query.as_ref()) {
-                let _ = send_answer(socket, &servfail, peer, asked).await;
-            }
-            Err(e)
-        }
+        Err(e) => (dns_servfail(raw, query.as_ref()), Some(e)),
     }
 }
 
@@ -3352,9 +3437,28 @@ async fn forward_dns(
     query: Option<&DnsQuery>,
     resolvers: &[SocketAddr],
 ) -> io::Result<Vec<u8>> {
+    forward_each(resolvers, |resolver| ask_resolver(raw, query, resolver)).await
+}
+
+/// [`forward_dns`] over TCP, for a query that arrived that way: each resolver
+/// is asked as RFC 7766 has it, a length-prefixed message on a connection of
+/// its own.
+async fn forward_dns_tcp(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolvers: &[SocketAddr],
+) -> io::Result<Vec<u8>> {
+    forward_each(resolvers, |resolver| ask_resolver_tcp(raw, query, resolver)).await
+}
+
+async fn forward_each<F, Fut>(resolvers: &[SocketAddr], ask: F) -> io::Result<Vec<u8>>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<Vec<u8>>>,
+{
     let mut failures = Vec::new();
     for resolver in resolvers {
-        match ask_resolver(raw, query, *resolver).await {
+        match ask(*resolver).await {
             Ok(response) => return Ok(response),
             Err(e) => {
                 tracing::debug!(target: "outrig::network", "dns forward to {resolver} failed: {e}");
@@ -3389,6 +3493,152 @@ async fn ask_resolver(
     socket.connect(resolver).await?;
     socket.send(raw).await?;
     recv_dns_answer(&socket, query, resolver).await
+}
+
+/// One resolver's turn at `raw` over TCP, within `DNS_TIMEOUT` as a whole. The
+/// answer is held to the same evidence a datagram is, by
+/// [`DnsQuery::answered_by`]: a stream from the resolver's own address cannot
+/// be raced from elsewhere, but one that answers some other question is not
+/// this one's answer.
+async fn ask_resolver_tcp(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolver: SocketAddr,
+) -> io::Result<Vec<u8>> {
+    let exchange = async {
+        let mut stream = TcpStream::connect(resolver).await?;
+        write_dns_frame(&mut stream, raw).await?;
+        read_dns_frame(&mut stream).await
+    };
+    let response = tokio::time::timeout(DNS_TIMEOUT, exchange)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))??;
+    let answers = match query {
+        Some(query) => query.answered_by(resolver, resolver, &response),
+        None => true,
+    };
+    if answers {
+        Ok(response)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the answer is not to the question asked",
+        ))
+    }
+}
+
+/// Reads one DNS message framed as RFC 7766 section 8 has it: its length as
+/// two bytes, then that many. `UnexpectedEof` at a frame boundary is how a
+/// client that has finished says so; see [`serve_dns_connection`].
+async fn read_dns_frame<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 2];
+    stream.read_exact(&mut len).await?;
+    let mut message = vec![0u8; usize::from(u16::from_be_bytes(len))];
+    stream.read_exact(&mut message).await?;
+    Ok(message)
+}
+
+async fn write_dns_frame<W: AsyncWrite + Unpin>(stream: &mut W, message: &[u8]) -> io::Result<()> {
+    let len = u16::try_from(message.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DNS message over 65535 bytes"))?;
+    // One write, so the frame leaves as one segment rather than two.
+    let mut frame = Vec::with_capacity(2 + message.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(message);
+    stream.write_all(&frame).await
+}
+
+/// Answers the container's lookups made over TCP: the stub's own retry after
+/// a truncated answer, which reaches port 53 on loopback directly, and a
+/// lookup to any other resolver, which the redirect brings here. The answer
+/// to each is decided, forwarded and bound as one made over UDP is; see
+/// [`resolve_dns`].
+///
+/// Each connection is served in a task of its own, at most [`DNS_IN_FLIGHT`]
+/// at once, which is the bound the UDP loop keeps on its lookups. With the set
+/// full the next connection waits in the listener's backlog.
+///
+/// Returns an error when the listener stopped taking connections before it
+/// was asked to; see [`after_listener_failure`].
+async fn dns_tcp_loop(
+    listener: TcpListener,
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let context = Arc::new(DnsContext {
+        resolvers,
+        bindings,
+        policy,
+        audit,
+    });
+    let mut conns = JoinSet::new();
+    let ended = loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            // Takes each finished connection back out, which frees its slot.
+            Some(_) = conns.join_next() => {}
+            accepted = listener.accept(), if conns.len() < DNS_IN_FLIGHT => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => match after_listener_failure("dns", e, &cancel).await {
+                        ControlFlow::Continue(()) => continue,
+                        ControlFlow::Break(e) => break Err(e),
+                    },
+                };
+                let context = context.clone();
+                conns.spawn(async move {
+                    serve_dns_connection(stream, canonical(peer), &context).await;
+                });
+            }
+        }
+    };
+    // Aborted rather than waited out, as the UDP loop's lookups are.
+    conns.shutdown().await;
+    ended.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "dns",
+        source,
+    })
+}
+
+/// Serves the queries one connection carries, one after another, until the
+/// client closes it, sends something unframeable, or stays silent for
+/// [`DNS_TCP_IDLE`] -- a client that connects and says nothing must not hold
+/// one of the loop's slots forever.
+async fn serve_dns_connection(mut stream: TcpStream, peer: SocketAddr, context: &DnsContext) {
+    // Where the client meant to send it: the resolver the redirect displaced,
+    // or this socket's own address when it connected to the loopback one
+    // directly, which no redirect touched.
+    let dst = match original_dst(&stream, peer).or_else(|_| stream.local_addr()) {
+        Ok(dst) => canonical(dst),
+        Err(e) => {
+            tracing::debug!(target: "outrig::network", "dns connection from {peer}: {e}");
+            return;
+        }
+    };
+    loop {
+        let raw = match tokio::time::timeout(DNS_TCP_IDLE, read_dns_frame(&mut stream)).await {
+            Ok(Ok(raw)) => raw,
+            // Closed, cut, or idle: the client is done either way.
+            Ok(Err(_)) | Err(_) => return,
+        };
+        let (reply, failure) = resolve_dns(&raw, peer, dst, DnsTransport::Tcp, context).await;
+        if let Some(e) = failure {
+            tracing::debug!(target: "outrig::network", "dns lookup over tcp: {e}");
+        }
+        // Bounded like the read: a client that sends queries and reads no
+        // answers would otherwise hold this slot on a full socket buffer.
+        if let Some(reply) = reply
+            && !matches!(
+                tokio::time::timeout(DNS_TCP_IDLE, write_dns_frame(&mut stream, &reply)).await,
+                Ok(Ok(()))
+            )
+        {
+            return;
+        }
+    }
 }
 
 /// Waits out the whole timeout for a datagram that actually answers `query`,
@@ -3543,13 +3793,17 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
     let net_ns_path = format!("/proc/{pid}/ns/net");
     let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
     let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
-    let (tcp, dns, probe) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
+    let (tcp, dns, dns_tcp, probe) =
+        bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
     let tcp = std::net::TcpListener::from(tcp);
     tcp.set_nonblocking(true)?;
+    let dns_tcp = std::net::TcpListener::from(dns_tcp);
+    dns_tcp.set_nonblocking(true)?;
 
     Ok(InterceptorSockets {
         tcp: TcpListener::from_std(tcp)?,
         dns: dns_listener(dns)?,
+        dns_tcp: TcpListener::from_std(dns_tcp)?,
         probe: std::net::TcpStream::from(probe),
     })
 }
@@ -3557,15 +3811,15 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
 fn bind_interceptor_socket_fds(
     user_ns: RawFd,
     net_ns: RawFd,
-) -> io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+) -> io::Result<(OwnedFd, OwnedFd, OwnedFd, OwnedFd)> {
     let (status, fds) =
         nsfork::fork_collect(|sock| child_bind_and_send_fds(sock, user_ns, net_ns))?;
     if status != nsfork::Status::OK {
         return Err(bind_failure(status));
     }
     let mut fds = fds.into_iter();
-    match (fds.next(), fds.next(), fds.next()) {
-        (Some(tcp), Some(dns), Some(probe)) => Ok((tcp, dns, probe)),
+    match (fds.next(), fds.next(), fds.next(), fds.next()) {
+        (Some(tcp), Some(dns), Some(dns_tcp), Some(probe)) => Ok((tcp, dns, dns_tcp, probe)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "network namespace helper did not return listener sockets",
@@ -3583,6 +3837,7 @@ enum BindStep {
     TcpListener = 3,
     DnsListener = 4,
     AddressProbe = 5,
+    DnsTcpListener = 6,
 }
 
 impl BindStep {
@@ -3593,6 +3848,7 @@ impl BindStep {
             BindStep::TcpListener,
             BindStep::DnsListener,
             BindStep::AddressProbe,
+            BindStep::DnsTcpListener,
         ]
         .into_iter()
         .find(|step| *step as u32 == code)
@@ -3605,6 +3861,7 @@ impl BindStep {
             BindStep::TcpListener => "bind the TCP listener",
             BindStep::DnsListener => "bind the DNS listener on port 53",
             BindStep::AddressProbe => "open the host alias probe",
+            BindStep::DnsTcpListener => "bind the DNS listener on TCP port 53",
         }
     }
 }
@@ -3642,6 +3899,10 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
         Ok(socket) => socket,
         Err(e) => return fail(BindStep::DnsListener, e),
     };
+    let dns_tcp = match bind_any(SockType::Stream, DNS_PORT) {
+        Ok(listener) => listener,
+        Err(e) => return fail(BindStep::DnsTcpListener, e),
+    };
     let probe = match nix::sys::socket::socket(
         nix::sys::socket::AddressFamily::Inet,
         SockType::Stream,
@@ -3655,7 +3916,12 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
     let _ = nsfork::send_status(
         sock,
         nsfork::Status::OK,
-        &[tcp.as_raw_fd(), dns.as_raw_fd(), probe.as_raw_fd()],
+        &[
+            tcp.as_raw_fd(),
+            dns.as_raw_fd(),
+            dns_tcp.as_raw_fd(),
+            probe.as_raw_fd(),
+        ],
     );
 }
 
@@ -3695,6 +3961,12 @@ fn bind_to(ty: SockType, addr: SocketAddr) -> nix::Result<OwnedFd> {
     let fd = socket(family, ty, SockFlag::SOCK_CLOEXEC, None)?;
     if addr.is_ipv6() {
         setsockopt(&fd, sockopt::Ipv6V6Only, &false)?;
+    }
+    // A fixed port a previous attach's connections may still hold in
+    // TIME_WAIT must be bindable again at once. It does not let a second
+    // live listener take the port.
+    if ty == SockType::Stream {
+        setsockopt(&fd, sockopt::ReuseAddr, &true)?;
     }
     bind(fd.as_raw_fd(), &SockaddrStorage::from(addr))?;
     if ty == SockType::Stream {
@@ -3884,7 +4156,13 @@ fn nft_table_name(session_id: &str) -> String {
 /// neighbor discovery is dropped too, which costs nothing here: a redirected
 /// flow needs no neighbor, DAD completes on its timer, and upstream
 /// connections are made from the host's namespace.
-fn nft_rules(table: &str, tcp_port: u16, dns_port: u16, policy_default: NetworkAction) -> String {
+fn nft_rules(
+    table: &str,
+    tcp_port: u16,
+    dns_port: u16,
+    dns_tcp_port: u16,
+    policy_default: NetworkAction,
+) -> String {
     let verdict = match policy_default {
         NetworkAction::Allow => "accept",
         NetworkAction::Deny => "drop",
@@ -3895,6 +4173,7 @@ create table inet {table}
 add chain inet {table} output {{ type nat hook output priority dstnat; policy accept; }}
 add rule inet {table} output ip daddr 127.0.0.0/8 return
 add rule inet {table} output ip6 daddr ::1 return
+add rule inet {table} output tcp dport 53 redirect to :{dns_tcp_port}
 add rule inet {table} output meta l4proto tcp redirect to :{tcp_port}
 add rule inet {table} output udp dport 53 redirect to :{dns_port}
 add chain inet {table} egress {{ type filter hook output priority filter; policy {verdict}; }}
@@ -4474,6 +4753,26 @@ fn push_dns_label(name: &mut String, label: &str) {
 /// otherwise claim more than the 63 a label may hold; the charset is checked
 /// because `.` forges a label boundary and anything outside letters, digits,
 /// `-`, and `_` cannot occur in a name a rule could legitimately name.
+/// The type of the first question in `packet`, with the name skipped by its
+/// framing alone: whatever bytes the labels hold, and no pointer. `None` when
+/// the packet holds no question or the name runs off its end.
+fn raw_qtype(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 12 || u16::from_be_bytes([packet[4], packet[5]]) == 0 {
+        return None;
+    }
+    let mut at = 12;
+    loop {
+        let len = usize::from(*packet.get(at)?);
+        at += 1;
+        match len {
+            0 => break,
+            1..=MAX_DNS_LABEL => at += len,
+            _ => return None,
+        }
+    }
+    Some(u16::from_be_bytes([*packet.get(at)?, *packet.get(at + 1)?]))
+}
+
 fn dns_label(bytes: &[u8]) -> Option<&str> {
     if bytes.is_empty() || bytes.len() > MAX_DNS_LABEL {
         return None;
@@ -4842,8 +5141,11 @@ mod tests {
             rollback,
             target,
             Some(resolver.open()),
-            4001,
-            4002,
+            ListenerPorts {
+                tcp: 4001,
+                dns: 4002,
+                dns_tcp: 4003,
+            },
             NetworkAction::Allow,
         )
         .await
@@ -5916,8 +6218,11 @@ mod tests {
             &mut rollback,
             &target(),
             None,
-            4001,
-            4002,
+            ListenerPorts {
+                tcp: 4001,
+                dns: 4002,
+                dns_tcp: 4003,
+            },
             NetworkAction::Allow,
         )
         .await
@@ -8192,6 +8497,266 @@ mod tests {
         );
     }
 
+    /// A `dns_tcp_loop` on a listener bound the way attach binds one,
+    /// forwarding to `resolvers`: its address, the token that ends the loop,
+    /// and the set holding it.
+    async fn spawned_dns_tcp_loop(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+        policy: Arc<CompiledNetworkPolicy>,
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = std::net::TcpListener::from(
+            bind_any(SockType::Stream, 0).expect("bind dns tcp listener"),
+        );
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_tcp_loop(
+            TcpListener::from_std(listener).expect("listener"),
+            resolvers,
+            bindings,
+            policy,
+            audit,
+            cancel.clone(),
+        ));
+        (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), cancel, tasks)
+    }
+
+    /// A resolver that answers every framed query it is sent over TCP with
+    /// `answer(query)`, and the address it is at.
+    async fn tcp_resolver(answer: fn(&DnsQuery) -> Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(raw) = read_dns_frame(&mut stream).await {
+                        let query = dns_query(&raw).expect("parse");
+                        write_dns_frame(&mut stream, &answer(&query))
+                            .await
+                            .expect("answer");
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn ask_over_tcp(listener: SocketAddr, txid: u16, name: &str) -> Vec<u8> {
+        let mut client = TcpStream::connect(listener).await.expect("connect");
+        write_dns_frame(&mut client, &dns_packet(txid, DNS_QUERY_FLAGS, name, &[]))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(2), read_dns_frame(&mut client))
+            .await
+            .expect("the lookup was not answered")
+            .expect("read the answer")
+    }
+
+    /// A lookup made over TCP is answered and bound as one made over UDP is.
+    #[tokio::test]
+    async fn a_lookup_over_tcp_is_answered_and_binds() {
+        let resolver = tcp_resolver(|query| {
+            let name = query.question.name.as_str();
+            dns_packet(
+                query.txid,
+                DNS_RESPONSE_FLAGS,
+                name,
+                &[Rr::A(name, [198, 51, 100, 9], 60)],
+            )
+        })
+        .await;
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![resolver], bindings.clone(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x4242, "tcp.test").await;
+
+        assert_eq!(dns_txid(&reply), Some(0x4242));
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.9")),
+            resolved(&["tcp.test"])
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A truncated answer is passed through and binds nothing, over TCP as
+    /// over UDP.
+    #[tokio::test]
+    async fn a_truncated_answer_over_tcp_binds_nothing() {
+        let resolver = tcp_resolver(|query| {
+            let name = query.question.name.as_str();
+            dns_packet(
+                query.txid,
+                DNS_RESPONSE_FLAGS | 0x0200,
+                name,
+                &[Rr::A(name, [198, 51, 100, 10], 60)],
+            )
+        })
+        .await;
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![resolver], bindings.clone(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x1, "cut.test").await;
+
+        assert_eq!(dns_flags(&reply).map(|f| f & 0x0200), Some(0x0200));
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.10")),
+            ResolvedNames::default()
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A lookup the policy refuses is answered REFUSED without a resolver
+    /// being asked, and no resolver is needed to say so.
+    #[tokio::test]
+    async fn a_refused_lookup_over_tcp_is_answered_refused() {
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), deny_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x7, "nope.test").await;
+
+        assert_eq!(
+            dns_flags(&reply).map(|f| f & 0x000f),
+            Some(DNS_RCODE_REFUSED)
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// With no resolver to answer, the client is told so rather than left to
+    /// wait, and the loop carries on.
+    #[tokio::test]
+    async fn an_unanswered_lookup_over_tcp_is_answered_servfail() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead = held.local_addr().expect("addr");
+        drop(held);
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![dead], empty_bindings(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x9, "down.test").await;
+
+        assert_eq!(dns_txid(&reply), Some(0x9));
+        assert_eq!(
+            dns_flags(&reply).map(|f| f & 0x000f),
+            Some(DNS_RCODE_SERVFAIL)
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A zone transfer answers in several messages, which the forward does
+    /// not carry; it is refused, not returned as its first message.
+    #[tokio::test]
+    async fn a_zone_transfer_over_tcp_is_refused_not_cut_short() {
+        // No resolver to ask: a forward would be answered SERVFAIL instead.
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), allow_all_policy()).await;
+        // The second is a valid zone name (RFC 2317) the policy's name parser
+        // does not take, so there is no parsed query to ask its type of.
+        for zone in ["example.test", "0/25.2.0.192.in-addr.arpa"] {
+            let mut query = dns_packet(0x5, DNS_QUERY_FLAGS, zone, &[]);
+            // The question's type, which is the last two bytes before its class.
+            let at = query.len() - 4;
+            query[at..at + 2].copy_from_slice(&252u16.to_be_bytes());
+            let mut client = TcpStream::connect(listener).await.expect("connect");
+            write_dns_frame(&mut client, &query).await.expect("send");
+
+            let reply = tokio::time::timeout(Duration::from_secs(2), read_dns_frame(&mut client))
+                .await
+                .expect("the transfer was not answered")
+                .expect("read the answer");
+
+            assert_eq!(
+                dns_flags(&reply).map(|f| f & 0x000f),
+                Some(DNS_RCODE_REFUSED),
+                "{zone}"
+            );
+        }
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A client that sends queries and never reads the answers must not hold
+    /// its connection forever: the write that cannot finish is given up on,
+    /// which is what frees the slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_reads_no_answers_does_not_keep_its_connection() {
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), deny_all_policy()).await;
+        let mut client = TcpStream::connect(listener).await.expect("connect");
+        let mut frame = Vec::new();
+        write_dns_frame(
+            &mut frame,
+            &dns_packet(0x6, DNS_QUERY_FLAGS, "flood.test", &[]),
+        )
+        .await
+        .expect("frame");
+        // Many to a write, so the buffers fill in few of them.
+        let frame = frame.repeat(512);
+        // Until the kernel will take no more in either direction, which is
+        // when the loop is parked in a write.
+        let mut full = 0;
+        while full < 2 {
+            match client.try_write(&frame) {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    full += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+
+        tokio::time::sleep(DNS_TCP_IDLE * 2).await;
+
+        // Whatever the server had already queued arrives, and then it ends:
+        // closed, not parked.
+        let mut sink = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), client.read(&mut sink)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(_)) => {}
+                Err(_) => panic!("the stalled connection was not closed"),
+            }
+        }
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The port a closed attach's connections still hold in `TIME_WAIT` can
+    /// be bound again at once, which a re-attach to the same container does;
+    /// a port a listener holds still cannot be.
+    #[tokio::test]
+    async fn the_fixed_listener_port_binds_again_after_a_server_first_close() {
+        let first = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        let port = first.local_addr().expect("addr").port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (served, _) = first.accept().expect("accept");
+        // The server closes first, which is what leaves it holding the port.
+        drop(served);
+        drop(client);
+
+        assert!(
+            bind_any(SockType::Stream, port).is_err(),
+            "a live listener's port must stay refused"
+        );
+        drop(first);
+        bind_any(SockType::Stream, port).expect("bind again with the old connection lingering");
+    }
+
     /// The script's shape: `create table` first, then nothing but flat
     /// `add chain` / `add rule` commands.
     fn assert_flat_nft_script(rules: &str) {
@@ -8216,7 +8781,7 @@ mod tests {
 
     #[test]
     fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
-        let rules = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        let rules = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Allow);
         assert_flat_nft_script(&rules);
         assert!(rules.contains("add rule inet outrig_test output ip daddr 127.0.0.0/8 return"));
         assert!(rules.contains("add rule inet outrig_test output ip6 daddr ::1 return"));
@@ -8224,6 +8789,13 @@ mod tests {
             rules.contains("add rule inet outrig_test output meta l4proto tcp redirect to :44123")
         );
         assert!(rules.contains("add rule inet outrig_test output udp dport 53 redirect to :44124"));
+        let dns = rules
+            .find("output tcp dport 53 redirect to :44125")
+            .expect("a TCP lookup is redirected to the DNS listener");
+        let generic = rules
+            .find("output meta l4proto tcp redirect to :44123")
+            .expect("generic TCP redirect");
+        assert!(dns < generic, "the DNS rule must come first: {rules}");
     }
 
     /// The `egress` chain's policy is the policy's `default`, and that is the
@@ -8237,8 +8809,8 @@ mod tests {
                  {{ type filter hook output priority filter; policy {verdict}; }}\n"
             )
         };
-        let allow = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
-        let deny = nft_rules("outrig_test", 44123, 44124, NetworkAction::Deny);
+        let allow = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Allow);
+        let deny = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Deny);
         assert_flat_nft_script(&deny);
         assert!(allow.contains(&chain("accept")), "{allow}");
         assert!(deny.contains(&chain("drop")), "{deny}");

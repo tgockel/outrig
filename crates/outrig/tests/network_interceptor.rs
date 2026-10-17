@@ -44,6 +44,18 @@ RUN apk add --no-cache ca-certificates curl shadow
     .expect("write Dockerfile");
 }
 
+/// [`write_curl_image_context`] with `dig`, which can ask over TCP.
+fn write_dig_image_context(dir: &Path) {
+    std::fs::write(
+        dir.join("Dockerfile"),
+        r#"
+FROM docker.io/library/alpine:latest
+RUN apk add --no-cache ca-certificates curl shadow bind-tools
+"#,
+    )
+    .expect("write Dockerfile");
+}
+
 async fn ensure_curl_image(context: &Path) -> ImageTag {
     let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, context, false)
@@ -1406,6 +1418,140 @@ async fn a_lookup_sent_to_another_resolver_is_answered() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// A lookup made over TCP is answered, whether the container's own resolver
+/// is asked -- where a stub's retry after a truncated answer goes -- or
+/// another one, which the redirect brings to the listener. Nothing but the
+/// listener could answer the second: the address is from a documentation
+/// range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_over_tcp_is_answered() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_dig_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    for args in [
+        &["+tcp", "+tries=1", "example.com"][..],
+        &["+tcp", "+tries=1", "@192.0.2.53", "example.com"][..],
+    ] {
+        let output = try_capture(
+            Command::new("podman")
+                .arg("exec")
+                .arg(container.name())
+                .arg("dig")
+                .args(args),
+        );
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("status: NOERROR"),
+            "dig {args:?} should be answered: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// A name resolved over TCP grants its hostname `allow` as one resolved over
+/// UDP does: the connection to the address `dig +tcp` returned is decided by
+/// `allow[0]`, with nothing but the lookup to have named it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_resolved_over_tcp_grants_a_hostname_allow() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_dig_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let looked_up = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["dig", "+tcp", "+short", "+tries=1", "example.com", "A"]),
+    );
+    let stdout = String::from_utf8_lossy(&looked_up.stdout);
+    let address = stdout
+        .lines()
+        .find(|line| line.parse::<std::net::Ipv4Addr>().is_ok())
+        .unwrap_or_else(|| panic!("dig +tcp returned no address: {stdout}"))
+        .to_string();
+
+    // `--resolve` makes the client dial the address itself, so the lookup is
+    // the only thing that can have bound it to the name.
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--resolve", &format!("example.com:443:{address}")],
+        "https://example.com/",
+    ));
+
+    let records = read_audit_records_until(&log_dir, |records| {
+        records
+            .iter()
+            .any(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+    })
+    .await;
+    let record = records
+        .iter()
+        .find(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+        .unwrap_or_else(|| panic!("no example.com:443 audit record in {records:#?}"));
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("allow"),
+        "a name resolved over TCP should grant its hostname rule: {record:#?}"
+    );
 
     interceptor
         .shutdown()
