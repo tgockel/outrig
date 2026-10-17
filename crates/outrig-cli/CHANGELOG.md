@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo mount can no longer cover a directory the global config's path passes through
+  read-write.** The #445 rule compared a mount with where that path resolves today, but the next
+  session resolves it again, so an agent that could write a directory in it could redirect it: by
+  replacing a symlink there, or by creating a missing component that a `..` after it had popped
+  (`XDG_CONFIG_HOME=/t/a/absent/../../conf` with `/t/a` mounted), and `config.toml` was then read
+  wherever the agent chose. A read-write repo mount covering such a directory is refused, naming
+  it and the path (#605).
 - **A repo config can no longer mount your home directory or the global config read-write.** A
   repo `[workspace] host-path`, `[[workspace.mounts]]`, or sidecar mount covering `$HOME` (or an ancestor), or a
   read-write one covering the global config file or its directory, is refused, naming the file

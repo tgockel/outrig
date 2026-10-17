@@ -34,6 +34,11 @@ impl Fixture {
     /// shares. The image is a raw local ref, so nothing is pulled.
     async fn run(&self, cwd: &Path, cmd: &[&str]) -> (bool, String) {
         let global = self.tmp.path().join("cfg/global.toml");
+        self.run_with_global(cwd, &global, cmd).await
+    }
+
+    /// [`run`](Self::run) reading the global config from `global`.
+    async fn run_with_global(&self, cwd: &Path, global: &Path, cmd: &[&str]) -> (bool, String) {
         let sessions = self.tmp.path().join("sessions");
         let mut args = vec![
             "--global-config",
@@ -58,6 +63,15 @@ fn write_repo_config(root: &Path, body: &str) {
     let dir = root.join(".agents/outrig");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("config.toml"), body).unwrap();
+}
+
+/// A repo config body declaring one extra mount of `host` at `/g`.
+fn mount_of(host: &Path, access: &str) -> String {
+    format!(
+        "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
+         access = \"{access}\"\n",
+        host.display()
+    )
 }
 
 /// Refused before the session is recorded, naming the directory.
@@ -172,22 +186,32 @@ async fn a_repo_mount_covering_the_global_config_is_refused_when_read_write() {
     let fx = Fixture::new();
     let proj = fx.home().join("proj");
     let global_dir = fx.tmp.path().join("cfg");
-    let mount = |access: &str| {
-        format!(
-            "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n\
-             access = \"{access}\"\n",
-            global_dir.display()
-        )
-    };
 
-    write_repo_config(&proj, &mount("read-write"));
+    write_repo_config(&proj, &mount_of(&global_dir, "read-write"));
     let (ok, stderr) = fx.run(&proj, &["run"]).await;
     assert_repo_refused(&fx, ok, &stderr, &proj.join(".agents/outrig/config.toml"));
     assert!(stderr.contains("global config"), "{stderr}");
 
-    write_repo_config(&proj, &mount("read-only"));
+    write_repo_config(&proj, &mount_of(&global_dir, "read-only"));
     let (_, stderr) = fx.run(&proj, &["run"]).await;
     assert_allowed(&fx, &stderr, &proj);
+}
+
+/// The path to the global config is checked as it was given, so a symlink in
+/// it makes the directory holding the link off limits read-write (#605).
+#[tokio::test]
+async fn a_repo_mount_covering_a_symlink_to_the_global_config_is_refused() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    let links = fx.tmp.path().join("links");
+    fs::create_dir_all(&links).unwrap();
+    std::os::unix::fs::symlink(fx.tmp.path().join("cfg"), links.join("cfg")).unwrap();
+
+    write_repo_config(&proj, &mount_of(&links, "read-write"));
+    let global = links.join("cfg/global.toml");
+    let (ok, stderr) = fx.run_with_global(&proj, &global, &["run"]).await;
+    assert_repo_refused(&fx, ok, &stderr, &proj.join(".agents/outrig/config.toml"));
+    assert!(stderr.contains("global config path"), "{stderr}");
 }
 
 /// A repo sidecar's mount is held to the same rule as the workspace's.
