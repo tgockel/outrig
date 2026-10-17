@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
 use nix::unistd::Pid;
-use serde_json::json;
 
 use super::relay::{Bind, Relay, TIMEOUT, fixture_dir, rpyc_dir};
 use super::supervisor::{self, Factory, Probe, STOP_GRACE, Spec, group_members};
@@ -48,6 +47,7 @@ fn spec<'a>(factory: &'a str, env: Option<&'a [(OsString, OsString)]>) -> Spec<'
             kwargs: serde_json::json!({}),
             serialize: false,
         }],
+        policy: crate::config::Policy::default().wire(),
         cwd: None,
         env,
         probe: None,
@@ -592,44 +592,6 @@ fn the_environment_is_inherited_unless_one_is_given() {
 
 // ---------------------------------------------------------------------------- the stdio
 
-#[test]
-fn frames_an_event_and_a_held_decision_interleave_on_one_binding() {
-    let mut relay = Relay::start();
-    relay.bind("fx", FACTORY);
-    relay.open("child");
-    relay.submit_in(
-        "primary",
-        1,
-        &with_root("print('decided', root.decide({'ask': 'push?'}))"),
-    );
-    let decision = relay.decision(TIMEOUT);
-    assert_eq!(decision.request, json!({"ask": "push?"}));
-    // Another agent's frames keep crossing while the request is held.
-    assert_eq!(
-        relay.output_in("child", 2, &with_root_in("child", "print(root.method(1))")),
-        "2\n"
-    );
-    relay.output_in(
-        "child",
-        3,
-        &with_root_in("child", "root.event({'kind': 'noted', 'n': 3})"),
-    );
-    assert_eq!(
-        relay.event(TIMEOUT),
-        json!({"t": "event", "kind": "noted", "n": 3})
-    );
-    assert!(
-        relay
-            .try_result_from("primary", 1, Duration::from_millis(300))
-            .is_none(),
-        "the request is held until the answer"
-    );
-    relay.answer(decision.id, json!({"allow": true}));
-    let result = relay.result_from("primary", 1, TIMEOUT);
-    assert_eq!(result["status"], "ok", "{result}");
-    assert_eq!(result["output"], "decided {'allow': True}\n");
-}
-
 /// A payload cannot take a decision's id or a line's kind, and one the owner would drop unread
 /// -- past the line bound -- raises in the caller instead of leaving it waiting for ever.
 #[test]
@@ -671,16 +633,13 @@ fn a_decision_payload_cannot_forge_the_envelope_or_pass_the_line_bound() {
     );
     assert_eq!(lines[3], "the event payload may not carry ['t']");
     // Nothing waits on the owner for any of them, and the table carries no stale entry: the
-    // next decision is numbered after them and is the one the owner sees.
-    relay.submit_in(
-        "primary",
-        2,
-        &with_root("print(root.decide({'ask': 'next?'}))"),
+    // next decision is answered. The owner holds no request it is for, so it denies it.
+    let out = relay.output(2, &with_root("print(root.decide({'ask': 'next?'}))"));
+    assert_eq!(
+        out,
+        "{'action': 'deny', 'detail': 'the owner holds no request this decision is for', \
+         'reason': 'interception'}\n"
     );
-    let decision = relay.decision(TIMEOUT);
-    assert_eq!(decision.request, json!({"ask": "next?"}));
-    relay.answer(decision.id, json!("yes"));
-    assert_eq!(relay.result_from("primary", 2, TIMEOUT)["output"], "yes\n");
 }
 
 // ---------------------------------------------------------------------------- through podman

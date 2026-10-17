@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-24` | Policy decides what crosses, and the user can be asked             |
 | `0003-25` | An evaluator judges what no rule settled                           |
 
 **The `outrig` package**

@@ -5,12 +5,14 @@ mod binding;
 mod env_ref;
 mod env_value;
 mod merge;
+mod policy;
 mod validate;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
@@ -20,6 +22,8 @@ pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
 pub use binding::{Binding, FactoryValue};
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use merge::merge;
+pub(crate) use policy::{OPERATIONS, Policy};
+pub use policy::{PolicyAction, PolicyConfig, PolicyRule};
 pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
 };
@@ -358,6 +362,22 @@ pub struct Config {
     /// [`Binding`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, Binding>,
+
+    /// What decides each request agent code makes of a binding: the operator's `[policy]` in a
+    /// config loaded from files, since [`merge`](fn@merge) keeps a repository's apart.
+    #[serde(default, skip_serializing_if = "PolicyConfig::is_default")]
+    pub policy: PolicyConfig,
+
+    /// The `[policy]` tables of the repository configs merged over this one, each of which may
+    /// only restrict [`policy`](Self::policy). Not serialized: a merged config written out and read
+    /// back keeps the operator's rules and loses only these.
+    #[serde(skip)]
+    restrictions: Vec<PolicyConfig>,
+
+    /// The global config as it was read, kept by [`merge`](fn@merge). See
+    /// [`operator`](Self::operator).
+    #[serde(skip)]
+    operator: Option<Arc<Config>>,
 }
 
 impl Config {
@@ -561,6 +581,23 @@ impl Config {
         keys.chain(refs).collect()
     }
 
+    /// The operator's layer: the global config as it was read, before any repository config was
+    /// merged over it, or this config itself when none was -- one a program built, which no
+    /// repository wrote.
+    ///
+    /// What a repository must not choose is read from here: [`merge`](fn@merge) lets a
+    /// repository's `[models.<name>]` or `[providers.<name>]` replace the global one of the same
+    /// name, and this layer still resolves the name to the operator's. It survives a clone, not
+    /// serialization: a config written out and read back is its own operator's layer.
+    pub fn operator(&self) -> &Config {
+        self.operator.as_deref().unwrap_or(self)
+    }
+
+    /// The repository `[policy]` tables that restrict this config's own.
+    pub(crate) fn restrictions(&self) -> &[PolicyConfig] {
+        &self.restrictions
+    }
+
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
     /// `repo_root: Some(_)` enables the on-disk existence checks for
     /// config-declared paths; `None` keeps the check pure-structural for unit
@@ -576,13 +613,15 @@ impl Config {
     /// [`validate`](Self::validate) runs on the merged config, which by
     /// construction has already taken its `[network]` policy from the global
     /// side and so cannot say which file declared what. These rules therefore
-    /// run per-file, before [`merge`](fn@merge). Today there is one: a repo
-    /// config may choose `[network].mode`, but `default`, `allow`, and `deny`
-    /// describe the machine's egress and stay with the operator.
+    /// run per-file, before [`merge`](fn@merge). A repo config may choose
+    /// `[network].mode`, but `default`, `allow`, and `deny` describe the
+    /// machine's egress and stay with the operator; and its `[policy]` may only
+    /// restrict, so an `allow` there -- a rule's or the `default` -- is refused.
     ///
     /// `Config::load` applies this to the repo file it reads. An embedder
     /// assembling a repo-side `Config` by hand should call it too -- `merge`
-    /// is infallible and simply drops a repo policy rather than reporting it.
+    /// is infallible and simply drops a repo's network policy, and a repo
+    /// `allow` it keeps can never take effect, rather than reporting either.
     pub fn validate_as_repo(&self) -> Result<()> {
         validate::validate_as_repo(self)?;
         Ok(())
@@ -1920,8 +1959,8 @@ pub enum EventsMode {
 /// The `[events]` block: whether a session records its agent's events.
 ///
 /// The field is private and `None` when the config did not declare it, as
-/// [`NetworkConfig`]'s `mode` is, so a repo table that declares nothing
-/// inherits the global choice rather than resetting it. Read the effective
+/// [`NetworkConfig`]'s `mode` is: a global config that declares it decides,
+/// and a repo's applies only when the global one is silent. Read the effective
 /// value with [`mode`](Self::mode).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -1942,11 +1981,11 @@ impl EventsConfig {
         self.mode = Some(mode);
     }
 
-    /// A repo's declared `mode` wins; a repo that declares none inherits.
-    fn apply_repo_overrides(&mut self, repo: &Self) {
-        if let Some(mode) = repo.mode {
-            self.mode = Some(mode);
-        }
+    /// The operator's declared `mode` stands; a repo's applies only when the
+    /// global config declares none. The record is the user's own of their own
+    /// session, so a cloned project can neither turn it on nor off.
+    fn inherit_from_repo(&mut self, repo: &Self) {
+        self.mode = self.mode.or(repo.mode);
     }
 
     fn is_default(&self) -> bool {

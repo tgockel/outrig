@@ -1936,10 +1936,21 @@ class _Wait:
     `_on_sigint` applies: a hosted call this program makes for itself is not an interrupt's to
     end. `asking` is what a boundary request it is waiting to send asks -- its operation, member
     and target -- while it waits for a free connection: a call woken then was never sent, which
-    the waker tells the host.
+    the waker tells the host. `seqs` are the requests the call sent, which a cancel names, and
+    no other call's: a callback's own call shares its connection with the call it is inside.
     """
 
-    __slots__ = ("pool", "execution", "interruptible", "waiting", "exc", "by", "conn", "asking")
+    __slots__ = (
+        "pool",
+        "execution",
+        "interruptible",
+        "waiting",
+        "exc",
+        "by",
+        "conn",
+        "asking",
+        "seqs",
+    )
 
     def __init__(self, pool, execution, interruptible):
         self.pool = pool
@@ -1950,6 +1961,7 @@ class _Wait:
         self.by = None
         self.conn = None
         self.asking = None
+        self.seqs = []  # the requests this call sent, which a cancel names
 
     def never_sent(self, outcome, reason):
         """Under the pool's condition variable: the line that tells the host this call was never
@@ -2080,9 +2092,12 @@ class _Pool:
                 return conn._request_here(handler, *args)
             except BaseException:
                 # The caller gave up on replies still to come -- interrupted, say -- so the host
-                # is told, and drops a request it has not run.
-                if conn.depth == 1 and conn._marks and not conn.closed_either():
-                    conn.cancel()
+                # is told, and drops a request of this call's it has not run: held for a
+                # decision, or waiting for its binding's turn. At any depth, since the cancel
+                # names this call's requests alone.
+                seqs = [seq for seq in wait.seqs if seq in conn._marks]
+                if seqs and not conn.closed_either():
+                    conn.cancel(seqs)
                 raise
             finally:
                 self.release(conn)
@@ -2536,6 +2551,9 @@ def _connection_class(rpyc):
                 seq = self._get_seq_id()
                 self._request_callbacks[seq] = callback
                 self._marks[seq] = marks
+                wait = _waits.get(threading.get_ident())
+                if wait is not None and wait.conn is self:
+                    wait.seqs.append(seq)
                 label = {
                     "request": seq,
                     "op": operation,
@@ -2653,6 +2671,12 @@ def _connection_class(rpyc):
             )
 
         def _unbox_exc(self, raw):
+            # The policy's refusal is `runtime.Denied`, known by the name the binding sends,
+            # before anything is rebuilt: no class of a local module named `outrig` is made.
+            if type(raw) is tuple and len(raw) == 4 and raw[0] == ("outrig", "Denied"):
+                args = raw[1]
+                refused = "the session's policy refused it"
+                return Denied(args[0] if args and type(args[0]) is str else refused)
             try:
                 return super()._unbox_exc(raw)
             except Exception as e:
@@ -2739,8 +2763,8 @@ def _connection_class(rpyc):
                     callback(True, exc)
                 self._pool.cond.notify_all()
 
-        def cancel(self):
-            """Tell the host the caller of each request outstanding here gave up on it."""
+        def cancel(self, seqs):
+            """Tell the host the caller of requests `seqs`, outstanding here, gave up on them."""
             with contextlib.suppress(Exception):
                 _send(
                     {
@@ -2748,7 +2772,7 @@ def _connection_class(rpyc):
                         "agent": self.agent,
                         "binding": self.binding,
                         "id": self.number,
-                        "cancel": list(self._marks),
+                        "cancel": list(seqs),
                     }
                 )
 
@@ -3437,6 +3461,21 @@ class Delivery:
     received_at: datetime.datetime
 
 
+class Denied(Exception):
+    """A hosted call the session's policy refused before the host ran it: a rule or a default
+    refused it, or whoever approves such calls said no. Nothing the call would have done on the
+    host happened. `reason` says what refused it.
+
+    No class a hosted library defines is one, and neither is the error of a call whose outcome on
+    the host is unknown, so `except` on the library's classes does not catch it. Catch it by name,
+    as `runtime.Denied`.
+    """
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class MessageAvailable(BaseException):
     """Raised by `runtime.wait` while a message waits unread on one of this agent's channels.
 
@@ -3687,10 +3726,12 @@ class Runtime:
     packages, and nothing compiled loads -- and where code that needs more can run.
 
     `runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
-    each is; asking makes no request to any of them.
+    each is; asking makes no request to any of them. A call to one that the session's policy
+    refuses raises `runtime.Denied`, and the host never ran it.
     """
 
     MessageAvailable = MessageAvailable
+    Denied = Denied
 
     def __init__(self, channels, held, history, context):
         self._channels = types.MappingProxyType(channels)

@@ -4,7 +4,7 @@ What decides whether a request from the container reaches a hosted object, and w
 about it. `hosted-objects.md` carries requests to the host and intercepts every one there; this
 page is what the interception enforces. It replaces `call-inspection.md`. The design was settled in
 the planning round of 2026-09-30. `0003-22` built the default -- every request runs, recorded --
-and admission's two places; `0003-24` builds rules, deny, and escalation, and `0003-25` the
+and admission's two places; `0003-24` built rules, deny, and escalation, and `0003-25` builds the
 evaluator.
 
 Three decisions apply throughout:
@@ -48,10 +48,11 @@ container claims. A local variable name is presentation and appears in no decisi
 default = "allow"
 
 [[policy.rules]]           # a person approves every push
-binding = "repo"
-type    = "git.remote.Remote"
-member  = "push"
-action  = "escalate"
+binding   = "repo"
+type      = "git.remote.Remote"
+member    = "push"
+operation = "call"
+action    = "escalate"
 
 [[policy.rules]]           # no git command by name, and no execute()
 binding = "repo"
@@ -59,8 +60,11 @@ type    = "git.cmd.Git"
 action  = "deny"
 ```
 
-The spellings are illustrative and `0003-24` settles the schema. In this sketch a field a rule
-leaves out matches anything, so the second rule refuses every request on a `Git` object.
+This is the schema `0003-24` settled. A field a rule leaves out matches anything, so the second
+rule refuses every request on a `Git` object; `*` is a wildcard within `binding`, `type` and
+`member`, and everything else matches exactly. The first rule names `operation = "call"`: a
+rule that names no operation matches the read of `push` as well as its call, and would ask
+twice, once with no arguments.
 
 A rule matches on four things: the binding, the host-side type of the object, the member name, and
 the operation. Rules are tried in order and the first match decides. A request no rule matches
@@ -94,17 +98,35 @@ the container cannot change.
 **A repo's `[policy]` may only add restrictions.** The repo config is repository content: a cloned
 project brings one, and the agent can edit it through the workspace mount. `SECURITY.md` already
 states the same rule for `[network]`, where a repo may choose the mode and only the operator's
-global config sets `default`, `allow`, and `deny`. How it is enforced -- which actions a repo rule
-may carry, and where repo rules sit in the order -- is `0003-24`'s. The operator's own rules cannot
-be redefined by a repo: OutRig keeps the operator's layer -- the global config, or a `Config` an
-embedder passes to the builder -- beside the merged config, and reads the operator's policy and the
-evaluator's model from it. `0003-24` keeps that layer, and `0003-25` uses it.
+global config sets `default`, `allow`, and `deny`. Each layer decides a request on its own -- its
+first matching rule, else its `default`; a repo layer with neither takes no part -- and the
+stricter action wins, `allow` < `evaluate` < `escalate` < `deny`. A repo `allow` could then never
+take effect, so it is rejected at load (`0003-24`). The operator's own rules cannot be redefined
+by a repo: OutRig keeps the operator's layer -- the global config, or a `Config` an embedder passes
+to the builder -- beside the merged config, which keeps the operator's `[policy]` as its own, and
+reads the evaluator's model from that layer. `0003-24` keeps the layer, and `0003-25` uses it.
+
+**What a request is matched as** (`0003-24`). A call of a callable a read returned is matched,
+evented and shown as a call of that member on that type, with its arguments; a callable reached
+under two members is matched as both. A bound method is also matched as its own function's name on
+its `__self__`'s type, however it was reached. RPyC's `callattr`, a read and a call in one request,
+matches as both, and as a call of the method the read would give, by its own name, found without
+running the read; one whose method cannot be found that way -- a property's -- is refused. A call
+by a dunder name with an operation of its own -- `__repr__`, say --
+matches as that operation too. A request passing a host callable whose own call the rules would
+not allow, as an argument or a value to assign, is refused, since the library could call it later
+with no request; `oldslicing`, whose fallback calls a second member, and `buffiter`, which runs
+each step of an iteration, are refused by the interception. A wildcard is matched without
+backtracking. The type a rule matches is the class's own qualified name, read from the class --
+never `____id_pack__` or `__class__`, which an object can be made to answer from the container --
+and a member read from a class matches the class's name. The strictest of a request's
+descriptions decides.
 
 Rules run in the serving process -- the bindings process for a factory binding, a host program's
 serving module for a live object (`0003-36`) -- from a table the owner sends it at start or at the
 object's registration, so an allow costs no round trip to the owner. That is `0003-24`'s fork 1,
-recommended there, and the admission design below assumes it. The escalation handler, the
-evaluator, and the gate that decides held requests are the owner's.
+taken there, and the admission design below assumes it. The escalation handler, the evaluator,
+and the gate that decides held requests are the owner's.
 
 **Admission is decided in two places**, and the owner's one `close_admission()` reaches them at
 different times (`lifecycle.md`). The call itself is one state change in Rust, and it returns at
@@ -147,8 +169,8 @@ A deny raises an OutRig exception in the caller, and the target is never invoked
 call would have done on the host happens, and the request's outcome is
 `refused`, with what denied it as the reason ("Events"). The exception is distinct from the
 library's own, so `except git.GitCommandError` does not catch it, and from a transport failure, so
-the agent can tell a call that did not happen from one whose outcome is unknown. Its name is
-`0003-24`'s.
+the agent can tell a call that did not happen from one whose outcome is unknown. It is
+`runtime.Denied`, an `Exception` with the reason as `reason`.
 
 **A rule's deny is final.** A human cannot override it. The rule is the operator's standing
 decision, and an override at the prompt would make every rule advisory -- in an embedding, to
@@ -167,11 +189,11 @@ The CLI's handler prints the pending request with an id, and the user answers at
 `/approve <id>` or `/deny <id>`:
 
 ```text
-outrig: [7] repo: call push on git.remote.Remote ('main',)
-        /approve 7  or  /deny 7
+[outrig] binding call 7 waits for your answer: repo: call push on git.remote.Remote ('main')
+[outrig]   operator rule 1 says escalate; type /approve 7 or /deny 7
 ```
 
-The format is illustrative. The rules around it are not:
+The rules around it:
 
 - **The call waits until it is answered, interrupted, or the session closes.** While it waits,
   the calling thread waits -- its kernel's loop with it, unless the call was made in a worker --
@@ -426,16 +448,6 @@ how risky a member is, and per-library tables are rejected above.
 
 ## Open questions
 
-- A callable obtained by an attribute read and called later is two requests: the read names the
-  member, and the call names none and acts on the callable's own type. GitPython's
-  `repo.git.status` is such a read -- `Git.__getattr__` returns a function -- so
-  `repo.git.status("--short")` is a read of `status` on `git.cmd.Git`, then a call on a
-  `function`. A rule can govern it only by matching the read, before the arguments exist, and an
-  approver asked about the read never sees them. A raw client can split a direct method call the
-  same way. Whether a call is described in terms of the read that produced its callable is
-  `0003-24`'s.
-- Whether a rule's type matches subclasses, or only the exact class. `0003-24`'s fork 3 recommends
-  exact names, which an operator can copy from the event stream.
 - Whether a repo `[policy.evaluator]` is rejected at load. Choosing the judge is not a restriction,
   and `0003-25`'s fork 1 recommends rejecting it. The other route is closed: a repo
   `[models.<name>]` replaces a global model of the same name when the configs merge, which would let
@@ -453,9 +465,10 @@ how risky a member is, and per-library tables are rejected above.
   produces through RPyC are reasoned from RPyC's proxy code, not observed.
 - That the providers' strict modes reject map-valued schemas comes from reading their
   documentation, not from a request made here.
-- That the owner's gate lets exactly one of interrupt, close, and allow win for a held request is
-  a design, not a measurement; `0003-24` tests it. `0003-22` tested the other half: a binding's
-  closed flag refused a request the binding read after it, one whose frame claimed bookkeeping.
+- That the owner's gate lets exactly one of interrupt, close, and allow win for a held request was
+  a design; `0003-24`'s tests force each order, with the binding stopped so an allow reaches it
+  after its closed flag. `0003-22` tested the other half: a binding's closed flag refused a
+  request the binding read after it, one whose frame claimed bookkeeping.
 - That delimiting evidence keeps the evaluator from following instructions inside it is not
   established by any test. Delimiting reduces a model's tendency to act on text it reads; it does
   not remove it, which is one reason the verdict is judgment.

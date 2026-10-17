@@ -238,3 +238,172 @@ runs, and a request that is not allowed never reaches its target.
 - `crates/outrig/src/config/merge.rs` -- the merge whose result the operator's layer is kept
   beside.
 - `plan/next/approval-reuse-with-explicit-scope.md` -- reuse, deferred.
+
+## Decisions
+
+Forks 1 to 4 were taken as recommended, with the hardening below. The maintainer decided two
+questions when asked.
+
+- **No decision events without a `[policy]` (the maintainer's call).** With nothing configured,
+  nothing is decided: every request runs under the unset default, so a per-request event saying
+  so would repeat itself. A session publishes one `session.policy` at start -- its version,
+  whether anything is configured, whether a request can be held, and whether a handler is
+  installed -- and a session with no rule and no `default` keeps `0003-22`'s three events per
+  request. Once anything is configured, every request decided by a rule carries a
+  `hosted.decided`, a default's allow included. `session.policy` is the "says so at start" for an
+  `escalate` with no handler too, with a `tracing` warning beside it.
+- **`plan/next/an-interrupted-nested-hosted-call-sends-no-cancel.md` folded in (the maintainer's
+  call).** Each call notes on its `_Wait` the sequence numbers of the requests it sent, and its
+  cancel line names those alone, so the `conn.depth == 1` rule is gone and an interrupted call
+  made inside a callback, held for an answer, ends `cancelled`. The entry is deleted.
+- **The operator's layer.** The merged `Config.policy` is the operator's `[policy]`, as
+  `[network]`'s policy keys already are, and each repository table is kept in a private
+  `#[serde(skip)]` list of restrictions. A first plan made the merged `policy` the repository's,
+  with the operator's read only from `Config::operator()`; a design review found that a TOML round
+  trip of a merged config, which `config_merge.rs` exercises, would then lose the operator's rules
+  and promote the repository's to the operator's. As built, a round trip loses only the
+  restrictions. `Config::operator()` is the global config as read, kept in an `Arc` by `merge` --
+  even when the global file is missing, so a repository's rules are never the operator's -- or the
+  config itself when none was kept. It takes part in `PartialEq`; no test compares whole merged
+  configs. This task reads `[models]` and `[providers]` from it only in tests; `0003-25` reads
+  them.
+- **`[events] mode`** is settled inside `merge`, which sees both files: the global value stands,
+  and a repository's fills in only when the global config is silent.
+- **The policy version** is the first 16 hex characters of a blake3 digest -- already a runtime
+  dependency -- of the layers as the bindings process reads them: the operator's default resolved
+  to the `allow` an unset one means, and each non-empty repository table. A `PolicyVersion` with a
+  private field, like the id types.
+- **Rule matching.** `operation` is an exact name from the boundary vocabulary less `buffiter` and
+  `oldslicing`, which are refused before anything is decided; `*` is a wildcard in `binding`,
+  `type` and `member` only, matched without backtracking -- the text before the first `*` and
+  after the last fixed, each piece between found leftmost in turn -- since a name is the
+  container's to make long. A rule that names no operation matches a member's read as
+  well as its call, so "a person approves every push" is written with `operation = "call"`, and
+  the documentation and `boundary-policy.md`'s example say so; otherwise the read asks too, with
+  no arguments.
+- **What a request is matched as**, the strictest of its descriptions deciding -- fork 4 and the
+  bypasses a design review of the plan found:
+  - A call of a reference a `getattr` returned is described as a call of that member on that
+    type, and its receipt and its escalation show it so. The origins are kept in the agent's
+    `Objects` slot as a list that only grows, so one function reached under two members is
+    matched as both.
+  - A bound method -- or a builtin one bound to an object -- is also matched as its own
+    function's name on its `__self__`'s type, read from slots, so `also_noted = noted` and a
+    method reached by iteration or returned by a call are still `noted`. Other callables a call
+    returned are matched by their own type, as the task says.
+  - `callattr` is a read and a call of its member too, and a call of the method the read would
+    give, by that method's own name, found with `inspect.getattr_static`, which runs no
+    descriptor; so a `callattr` of `also_noted` is `noted` before anything runs. Under a
+    configured policy, a `callattr` whose method cannot be found that way -- a property's, or
+    one `__getattr__` makes -- is refused by the interception.
+  - A call described by a dunder member -- by its route or its own name -- that has an operation
+    of its own is that operation too, so `__repr__` read and then called is a `repr`; and so is
+    a `callattr` of one.
+  - A request whose arguments -- nested in containers, or a `setattr` value -- hold a host callable
+    whose own call the rules would not allow is refused with `Denied`, recorded as the decision of
+    the argument's rule: the library could call it later with no request, so it cannot be asked
+    about.
+  - `buffiter` is refused by the interception: the interpreter's proxies iterate with
+    `__iter__` and `__next__`, and a batch would run each step of the iteration with no rule
+    asked about it.
+  - `oldslicing` is refused by the interception: no Python 3 proxy sends it, and its fallback
+    calls a second member.
+  - `__call__`, `__get__`, `__func__` and `__self__` are not on RPyC's safe list, so the attribute
+    check already refuses those aliases.
+- **The type is the host's.** RPyC's `get_id_pack` asks the object for `____id_pack__` and
+  `__class__`, which an attribute-dict object lets the container set, so the binding builds every
+  id_pack itself (`id_pack_of`), laid out as RPyC lays one out and named by `type_name`, read from
+  `type.__dict__`'s descriptors: a class's own qualified name, else the object's type's. Receipts,
+  previews, rule matching and the object table's keys then all carry the host's name. That also
+  makes `target` the qualified name `events.md` promised, where a nested class differs from
+  RPyC's `__name__`; a module is `builtins.module`.
+- **Deny** is `runtime.Denied`, an `Exception` with `reason`, beside `runtime.MessageAvailable`.
+  The binding raises its own `Denied` (`__module__ = "outrig"`), and the interpreter's
+  `_unbox_exc`, where every host exception is rebuilt, knows it by the name on the wire before
+  RPyC rebuilds anything, so a local module named `outrig` makes no class of it. The refusal
+  reasons are `rule`, `default`, `approver` and `no_approver`.
+- **The handler** is `EscalationHandler`, whose method returns `impl Future + Send`, so an
+  implementor writes `async fn`; the session holds it erased behind an `Arc`, and a blanket impl
+  takes a closure returning a future. The future gives an `EscalationResult`; an `Err`, a panic,
+  or the task ending unanswered denies. `Escalation::withdrawn()` is the cancellation signal, over
+  a private `tokio_util` token, since `public_api_boundary.rs` admits no `tokio_util` type.
+  `Escalation` has no public constructor: its id types have none either. Its `execid` is the
+  interpreter's claim, and its other fields come from the binding's decision line.
+- **The gate is the relay.** A held request is kept on its call in the relay's `State`, which
+  `Table::close` closes in the same step as admission, so one lock orders an answer against the
+  close. Decision
+  lines now ride the events channel: production never read the 64-slot decisions channel, which
+  would have stalled the stdout router once full, and `Process::answer` wrote around the relay's
+  queue. `Decision`, `take_decisions`, `Process::send` and `answer` are gone, and the two
+  supervisor tests that drove raw decision lines were moved: the interleaving one became
+  `a_held_request_blocks_only_its_caller`, and the payload one now sees the relay's answer to a
+  decision it holds no request for.
+- **What ends a held request.** The handler's answer; the interpreter's cancel line, which also
+  marks a call not yet held, since a cancel can reach the relay before the decision line, and
+  whatever the queue's room; a connection's close, from either side; the process's end, as
+  `refused`, `exited`; the close; and the interpreter's exit, which closes the relay at once --
+  `Table::close` does nothing while the exit's cause is awaited, and a decision line arriving then
+  must be refused too. For each but an allow, the relay records the outcome itself, and ignores
+  the `ended` the binding writes after, as it ignores one for any request it no longer holds: a
+  SIGKILL after the close cannot turn a cancelled request `unknown`. Each handler is one spawned
+  task -- spawned under the state's lock, which runs none of its code -- holding the relay weakly;
+  finished ones are pruned as others start, and those still running are aborted when the relay
+  reports. A handler's failure after the request stopped waiting is no answer and is not
+  recorded; an `Ok` answer then is recorded as ignored.
+- **An allow is honored after the flag.** The binding's reading thread marks a request `released`
+  as it hands over an allow, in pipe order against the control line, and `_control` leaves a
+  released request in its turn's line. An interrupt after the allow can still drop it before its
+  turn: decided `allow`, then `cancelled`, `interrupted`, as any forwarded request waiting for its
+  turn. A request whose caller gave up before it would be held is cancelled there, asking nobody.
+- **The CLI.** `run-new` prints `[outrig] binding call 7 waits for your answer: repo: call push
+  on git.remote.Remote ('main')` and the line saying how to answer, its fields' control and
+  direction characters escaped. The handler hands each call to the conversation's loop over a
+  channel, since stdin and the session belong to the loop; a call withdrawn first is noted and
+  forgotten, an id nothing waits under gets a note, and an ignored answer -- one that raced the
+  withdrawal, which the handler prefers to the withdrawal when both are ready -- is noted from the
+  event stream. Once input ends nobody is left to answer, so a
+  waiting call, and each that arrives after, is denied; otherwise piped input would leave the
+  round waiting for ever.
+- **Known limits**, documented: a rule keyed on `binding` covers that name only; what an allowed
+  call does on the host, a library calling a host object's methods by itself included, is not a
+  request; and a callback's request held for an answer holds a serialized binding's turn, filed
+  as `plan/next/a-held-callback-call-holds-its-bindings-turn.md`.
+- **`/simplify`** ran four reviews -- reuse, simplification, efficiency, altitude -- over the
+  change. Taken: the binding's own id_packs, above, in place of a second naming path for receipts
+  and previews; no `recorded` answer field or `Request.settled`, since the relay already ignores
+  an `ended` it does not hold; a held request kept on its call rather than in a second map, one
+  `cancel_where` for the close and a connection's close, and `Settle::Cancel` carrying the
+  `Withdrawn` alone; one task per escalation; `Escalation` built by the gate, with no `new` and no
+  `Described`; actions and layers read through `serde`; the version computed once, and not sent
+  to the process, which never read it; one decisions table in the binding; no policy work at all
+  in a session with nothing configured; `policy.loaded` renamed `session.policy`, so readers that
+  take `session.` events as the session's own need no exception; the interpreter's exit closing
+  the relay, and a handler's late failure not recorded, both behavior gaps the reviews found; and
+  the tests' shared helpers. Not taken: deriving `OPERATIONS` from `Operation`, which needs a
+  public `Operation::as_str`; trimming what `merge` keeps of the global config, once per load;
+  and memoizing a call's descriptions between its receipt and its decision.
+- **A review of the commit found five defects**, fixed in it. A `callattr` of a public alias was
+  matched only by the name it asked for, so a rule on the method it named passed it: it is now
+  also a call of the method `inspect.getattr_static` finds. A dunder read and then called was
+  matched only as a `call`, past a `repr` rule: each call description by a dunder now carries its
+  operation too, in the argument check as well. `buffiter` ran `__next__` with no decision about
+  it: it is refused. A connection that closed after its request was received and before the
+  binding asked for a decision left the request to be held and approved after its caller had
+  its error: a call now keeps why its caller stopped waiting -- an interrupt or its connection's
+  close -- and a decision line for it is cancelled without asking anyone. And a rule of several
+  `*` compiled to a backtracking regex, which took seconds over a long public name, holding the
+  binding's other requests: the matcher above replaces it.
+- **A second review found two more**, fixed in the commit. A `callattr` of a property, or of a
+  name `__getattr__` makes, that hands out a governed method was decided only by the name it
+  asked for, while a read and then a call of what it gave was refused. The review proposed
+  resolving the read and deciding the call before invoking it; that runs library code after the
+  dispatch event, and an escalation would then wait part-way through the request, inside a
+  serialized binding's turn. Since the interpreter's proxies send `callattr` only for a method
+  the type defines -- RPyC builds a proxy's class from the type's callable members -- such a
+  `callattr` is refused instead, under a configured policy, saying to read and then call; a
+  session with no policy, which decides nothing, answers it as before. A type whose own
+  `__getattribute__` answers a defined method's name with another callable is outside what the
+  static lookup sees. And a cancel line was matched against each request the relay held by
+  searching its whole list, under the state's lock, before it was cut to 16 for the hint: a
+  16 MiB cancel held the relay for seconds. The numbers are now a set, built before the lock,
+  every one still cancelled, and the hint keeps the first 16 in order.

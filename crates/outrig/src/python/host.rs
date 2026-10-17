@@ -1614,6 +1614,12 @@ where
         table.exiting = (!table.stopping).then(|| ClosedBy::InterpreterExited {
             cause: closed.to_string(),
         });
+        // The relay closes now, though the session's close waits for the exit's cause: nobody is
+        // left to wait for a hosted call, so nothing held for an answer may be allowed to run,
+        // nor anything more held.
+        if let (Some(by), Some(relay)) = (&table.exiting, &table.relay) {
+            relay.close(&Closed::from(by.clone()).to_string());
+        }
         table.stopping
     };
     let cause: Arc<str> = ended.await.into();

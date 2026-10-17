@@ -15,13 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::approval::{self, Approval, Approver, Store};
-use super::event::Payload;
+use super::escalation::Handler;
+use super::event::{Payload, PolicyVersion};
 use super::report::{BindingStop, HostedCall};
-use crate::config::{Binding, Config};
+use crate::config::{Binding, Config, Policy};
 use crate::error::{OutrigError, Result};
 use crate::events::Events;
 use crate::python::host::Interpreter;
-use crate::python::hosted::Relay;
+use crate::python::hosted::{Approvals, Relay};
 use crate::python::install::{self, Install};
 use crate::python::payload::{self, BINDINGS_MOUNT};
 use crate::python::supervisor::{self, Factory, STOP_GRACE, Spec};
@@ -135,6 +136,10 @@ pub(crate) struct Setup<'a> {
     pub(crate) approver: Option<Arc<dyn Approver>>,
     pub(crate) places: Places,
     pub(crate) events: &'a Events,
+    /// The rules every request to a binding is decided by.
+    pub(crate) policy: &'a Policy,
+    /// Who answers a request the rules escalate.
+    pub(crate) escalation: Option<Handler>,
 }
 
 /// `declared`, less each binding a repository declared that is not approved. One whose exact
@@ -273,6 +278,10 @@ pub(crate) async fn start(
             .map(|(declared, dir)| (!declared.spec.binding.requires.is_empty()).then_some(dir))
             .collect(),
         declared,
+        approvals: Approvals {
+            handler: setup.escalation.clone(),
+            version: PolicyVersion::new(setup.policy.version()),
+        },
         ..Bindings::default()
     };
     let (python, rpyc_dir) = (payload::host_python().await?, payload::rpyc_dir().await?);
@@ -282,6 +291,7 @@ pub(crate) async fn start(
         rpyc_dir: &rpyc_dir,
         paths: bindings.package_dirs(),
         bindings: factories,
+        policy: setup.policy.wire(),
         cwd: Some(setup.cwd),
         env: setup.env.or(inherited.as_deref()),
         #[cfg(test)]
@@ -309,6 +319,8 @@ pub(crate) struct Bindings {
     process: Option<supervisor::Process>,
     /// What carries the interpreter's hosted calls to the process, once connected.
     relay: Option<Relay>,
+    /// Who answers what the policy escalates, and the version of the rules, for the relay.
+    approvals: Approvals,
 }
 
 /// What the agent is told of one binding.
@@ -368,7 +380,8 @@ impl Bindings {
             return;
         };
         let names = self.declared.iter().map(|d| d.name.clone()).collect();
-        let relay = Relay::new(interpreter.relay_line(), events.clone(), names);
+        let approvals = self.approvals.clone();
+        let relay = Relay::new(interpreter.relay_line(), events.clone(), names, approvals);
         relay.attach(process);
         interpreter.attach_relay(relay.clone());
         self.relay = Some(relay);

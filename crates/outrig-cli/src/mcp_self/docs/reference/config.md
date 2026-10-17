@@ -11,7 +11,9 @@ outrig reads two TOML files:
   providers or models.
 
 Both files use the same schema. Names declared in either are visible everywhere; if a name
-appears in both files, the **repo entry wins**. Outrig keys are **kebab-case**; only inner-map
+appears in both files, the **repo entry wins**, except where
+[Resolution](#resolution-which-file-wins) says the global one stands: `[network]`'s policy,
+`[events] mode`, and `[policy]`. Outrig keys are **kebab-case**; only inner-map
 keys whose values map to environment variables (Dockerfile build-args, MCP `env` blocks) keep
 their as-written form. Unknown keys are an error -- outrig validates with `deny_unknown_fields`.
 
@@ -39,6 +41,9 @@ deny  = ["*:22"]                                      # optional; global only
 
 [events]
 mode = "off"                                          # optional: off or record
+
+[policy]
+default = "allow"                                     # optional; a repo may only restrict
 ```
 
 | Key                  | Type    | Required               | Where  | Description               |
@@ -57,6 +62,8 @@ mode = "off"                                          # optional: off or record
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
 | `network.deny`       | array   | no                     | global | Filter deny entries.      |
 | `events.mode`        | string  | no                     | either | Agent event log.          |
+| `policy.default`     | string  | no                     | either | Binding-call fallback.    |
+| `policy.rules`       | array   | no                     | either | Binding-call rules.       |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -75,7 +82,8 @@ of the endpoint.
 A `[network]` table that declares no `mode` declares nothing, so it inherits. Network policy
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
-`[events].mode` merges the same way as `[network].mode`.
+`[events].mode` can live in either file too, but when the global config sets it, that value
+stands. [`[policy]`](#policy) can live in either, and a repo's may only restrict the global one.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -251,9 +259,11 @@ mode = "off"
   holds -- including what you type to the agent and what it sends back, and each model call's
   conversation.
 
-The mode can live in either file, and a repo that declares it wins for that repo, as with
-`[network].mode`. `outrig run` reads the key and records nothing, and with `record` set it says
-so at startup. There is no command-line flag for it yet.
+The mode can live in either file. When the global config sets it, that value stands; a repo's
+applies only when the global config says nothing. The record is your own of your own session,
+so a cloned project can neither start recording it nor stop it. `outrig run` reads the key and
+records nothing, and with `record` set it says so at startup. There is no command-line flag for
+it yet.
 
 ## `[providers.<name>]`
 
@@ -738,6 +748,92 @@ their factories are called in, and the order their packages go on the import pat
 container and of the bindings' process alike: where two bindings' packages hold different
 versions of one package, both sides import the first binding's.
 
+[`[policy]`](#policy) decides which calls to a binding run.
+
+## `[policy]`
+
+> `outrig run-new` and the library's `harness` only.
+
+What decides each request the agent's Python makes of a [binding](#bindingsname): run it, refuse
+it, or hold it until someone answers. With no `[policy]`, every request runs, and is recorded
+when [`[events] mode = "record"`](#events) -- with a library that can run programs, that is
+arbitrary execution on the host, as you, on the record.
+
+```toml
+[policy]
+default = "allow"           # optional: allow, deny, escalate, or evaluate
+
+[[policy.rules]]            # a person approves every push
+binding   = "repo"
+type      = "git.remote.Remote"
+member    = "push"
+operation = "call"
+action    = "escalate"
+
+[[policy.rules]]            # no git command by name, and no execute()
+binding = "repo"
+type    = "git.cmd.Git"
+action  = "deny"
+```
+
+- `default` (string, optional, default: `allow`): the action for a request no rule matches.
+- `[[policy.rules]]` (array, optional): tried in order, and the first that matches decides. A
+  field left out matches anything. In `binding`, `type` and `member`, `*` stands for any run of
+  characters, and everything else matches exactly.
+  - `binding` (string): the binding's name.
+  - `type` (string): the qualified name of the host-side type of the object the request is made
+    on, as the event log records it as `target` -- `git.remote.Remote`. A subclass does not
+    match its base's name. A member read from a class matches the class's own name.
+  - `member` (string): the attribute the request names.
+  - `operation` (string): what the request asks, as the event log names it: `getattr`,
+    `setattr`, `delattr`, `call`, `callattr`, `repr`, `str`, `cmp`, `hash`, `dir`,
+    `instancecheck` or `ctxexit`.
+  - `action` (string, required): one of the four below.
+
+The actions:
+
+- `allow`: the request runs.
+- `deny`: the request is refused and its target never runs. The agent's code gets
+  `runtime.Denied`, whose `reason` names the rule, and no person can override it.
+- `escalate`: the request waits until someone answers it, its caller is interrupted, or the
+  session closes; OutRig sets no deadline. `run-new` shows it on stderr with an id, for
+  `/approve <id>` or `/deny <id>` (see the
+  [CLI reference](https://tgockel.github.io/outrig/reference/cli.html)); a program running a
+  session through the library installs its own handler. With nobody to ask, it is refused. Each
+  request asks again: no answer is remembered.
+- `evaluate`: reserved for a model that judges the request, which is not there yet. Until it
+  is, the request escalates when someone can be asked and is refused otherwise; it never runs
+  for want of a judge.
+
+**What a request is.** `repo.head.commit` is two reads, and `origin.push("main")` is a read of
+`push` and then a call. A call of what a read returned is matched -- and shown to whoever
+approves it -- as a call of that member on that type, with the call's own arguments. So a rule
+with `operation = "call"` asks once, about the call, while one that names no operation matches
+the read as well. The same holds however the call is made: RPyC's `callattr`, which reads and
+calls in one request, matches as both -- and is refused when what it would call cannot be known
+before it runs, as for a property; a method reached under another name, or other than by a
+read, matches as itself on its object's type too; a call of a dunder such as `__repr__` matches
+the operation it stands for, `repr`; and the strictest of the matches decides. A
+request that passes, as an argument or as a value to assign, a host method whose own call the
+rules would not allow is refused, since the library could call that method later with no
+request.
+
+**What a rule cannot see.** What an allowed call goes on to do on the host -- the hooks, programs
+and credential helpers it runs, and the library's calls into itself -- is not a request, and
+nothing decides it. A rule keyed on `binding` covers that name only; one on `type` covers every
+binding that hands out the type.
+
+**A repo config may only restrict.** Each file's `[policy]` decides a request on its own -- its
+first matching rule, else its `default` -- and the stricter action wins, from `allow` through
+`evaluate` and `escalate` to `deny`. A repo config with no matching rule and no `default` takes
+no part. So a repo can add a `deny` or an `escalate` and can never allow what the global config
+holds back; an `allow` in a repo config, as a rule's `action` or as its `default`, is rejected at
+load. A config a program gives the library is the operator's as a whole.
+
+Every decision is recorded with the policy's version, a digest of the rules in force, so a record
+says which rules decided it (see the
+[event log reference](https://tgockel.github.io/outrig/reference/events.html)).
+
 ## `[images.<name>]`
 
 You declare one or more image-configs. The selected one becomes the agent's environment.
@@ -1165,6 +1261,16 @@ off. Network policy keys are global-only: a repo config that sets `network.defau
 `network.allow`, or `network.deny` is rejected at load, and no repo value can reach the
 effective policy even if it carries one.
 
+`[events].mode` goes the other way: the global value stands when there is one, and a repo's
+applies only when the global config is silent.
+
+`[policy]` does not merge: the global config's rules and the repo config's each decide a request,
+and the stricter action wins (see [`[policy]`](#policy)).
+
+The global config is also kept as it was read, beside the merged result, and what a repository
+must not choose is read from it: a repo `[models.<name>]` or `[providers.<name>]` replaces the
+global one of the same name in the merged result, and not there.
+
 ### Path resolution
 
 A relative path is resolved against the directory of the config file that declared it, not
@@ -1242,6 +1348,11 @@ default = "deny"                                 # optional for filter mode
 allow = ["github.com:443", "*.npmjs.org"]        # optional; global only
 deny  = ["*:22"]                                 # optional; global only
 
+[[policy.rules]]                                 # optional; a person approves every push
+member    = "push"
+operation = "call"
+action    = "escalate"
+
 [providers.openai]
 style    = "openai"
 base-url = "https://api.openai.com/v1"
@@ -1297,6 +1408,10 @@ container-path = "/resources/shared-docs"
 host-path      = "/var/tmp/outrig-cache"
 container-path = "/resources/cache"
 access         = "read-write"
+
+[[policy.rules]]
+member = "execute"
+action = "deny"  # a repo's [policy] may only restrict
 
 [agents.coding]
 # model omitted -> uses global default-model = "fast"
@@ -1369,6 +1484,11 @@ image-config in the merged config but does not require agent/model/provider wiri
   requires at least one global `allow` or `deny` entry.
 - A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
   `[network].deny` are rejected there.
+- `[policy].default` and every `[[policy.rules]]` entry's `action` must be `allow`, `deny`,
+  `escalate`, or `evaluate`, and a rule's `operation`, if set, one of those
+  [`[policy]`](#policy) lists. The error names the rule by its position, counted from 1.
+- A repo config's `[policy]` may only restrict: an `allow` there, as `default` or as a rule's
+  `action`, is rejected.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.

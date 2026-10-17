@@ -51,6 +51,7 @@ use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
 mod approve;
 mod converse;
+mod escalate;
 mod output;
 
 /// How long, once the session is stopped and its record finished, the report
@@ -109,12 +110,15 @@ pub async fn execute(
 
     // What the session needs from outside, given before it starts: the
     // terminal sees each submission through a subscription of its own, and
-    // the event log is a second one when the user asked for it.
+    // the event log is a second one when the user asked for it. A binding
+    // call the policy holds for a person reaches the terminal's loop.
+    let (asking_tx, mut asking) = tokio::sync::mpsc::unbounded_channel();
     let agent_name = args.agent.clone().or_else(|| cfg.default_agent.clone());
     let mut builder = SessionBuilder::new(cfg.clone(), agent_name.as_deref(), args.model.as_deref())
         .secrets(EnvSecrets)
         .repo_root(&repo_root)
         .approver(approve::TerminalApprover)
+        .escalation(escalate::TerminalEscalation::new(asking_tx))
         .progress(progress_lines());
     if matches!(cfg.events.mode(), EventsMode::Record) {
         builder = builder.record_events();
@@ -206,7 +210,8 @@ pub async fn execute(
         session_id: sid.as_str(),
     }));
 
-    let conversed = converse::converse(&mut running, &mut shown, &out, &mut failures).await;
+    let conversed =
+        converse::converse(&mut running, &mut shown, &mut asking, &out, &mut failures).await;
 
     // Said first, since stopping can take a few seconds and a Ctrl-C there
     // does nothing. Queued, not written here: with stdout and stderr one pipe,

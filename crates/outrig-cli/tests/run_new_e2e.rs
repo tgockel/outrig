@@ -1752,7 +1752,7 @@ async fn every_hosted_request_is_recorded_through_run_new() {
             ("getattr", Some("a")),
             ("getattr", Some("b")),
             ("getattr", Some("method")),
-            ("call", None),
+            ("call", Some("method")),
             ("getattr", Some("sequence")),
             ("callattr", Some("__iter__")),
             ("callattr", Some("__next__")),
@@ -1774,7 +1774,7 @@ async fn every_hosted_request_is_recorded_through_run_new() {
             ("ctxexit", None),
             ("repr", None),
             ("getattr", Some("raise_fixture")),
-            ("call", None),
+            ("call", Some("raise_fixture")),
             ("getattr", Some("truth_tested")),
             ("getattr", Some("manager")),
             ("getattr", Some("entered")),
@@ -1926,4 +1926,244 @@ async fn a_gitpython_binding_is_used_as_plain_code() {
         ["builtins.StopIteration", "git.exc.GitCommandError"],
         "{requests:?}"
     );
+}
+
+/// The global config of a session holding the fixture binding, whose calls of `noted` a person
+/// approves.
+fn escalating_global(dir: &Path, requirement: &str) -> std::path::PathBuf {
+    let global = dir.join("config.toml");
+    std::fs::write(
+        &global,
+        format!(
+            "[bindings.fx]\ndescription = \"The fixture.\"\nrequires = [{requirement:?}]\n\
+             factory = \"outrig_fixture:make\"\n\n\
+             [[policy.rules]]\nmember = \"noted\"\noperation = \"call\"\naction = \"escalate\"\n"
+        ),
+    )
+    .expect("write the global config");
+    global
+}
+
+/// The id of the `nth` binding call `stderr` has shown waiting for an answer, once it has.
+async fn waiting_call(stderr: &Mutex<String>, nth: usize) -> u64 {
+    const WAITS: &str = " waits for your answer";
+    let shown = || stderr.lock().expect("unpoisoned").matches(WAITS).count() >= nth;
+    wait_until(STEP_TIMEOUT, &format!("binding call {nth} shown"), shown).await;
+    let text = stderr.lock().expect("unpoisoned").clone();
+    let line = text
+        .lines()
+        .filter(|line| line.contains(WAITS))
+        .nth(nth - 1)
+        .expect("the line");
+    let id = line
+        .split("binding call ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .expect("an id");
+    id.parse().unwrap_or_else(|_| panic!("{line}"))
+}
+
+/// A binding call the policy escalates is shown on stderr with its id and waits: `/approve <id>`
+/// runs it once and `/deny <id>` raises `runtime.Denied` in the agent's code, typed mid-round,
+/// and neither command reaches the agent's channel. An id nothing waits under -- one never
+/// asked about, or one already answered -- gets a note.
+#[tokio::test]
+async fn approve_and_deny_answer_a_binding_call_at_the_prompt() {
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let requirement = fixture_wheel(wheels.path());
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_1",
+            "user = runtime.channels['user']\n\
+             before = user.pending()\n\
+             print('first', fx.noted('main'))\n\
+             try:\n    fx.noted()\n\
+             except runtime.Denied as e:\n    print('denied', e.reason)\n\
+             print('pending', before, user.pending())\n\
+             print('calls', fx.calls)",
+        ),
+        text_reply("answered"),
+    ])
+    .await;
+    let repo = repo_with(addr, "[events]\nmode = \"record\"");
+    let home = tempfile::tempdir().expect("a home for the global config");
+    let global = escalating_global(home.path(), &requirement);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session.type_line("go").await;
+    let first = waiting_call(&session.stderr, 1).await;
+    session.type_line("/approve 999999").await;
+    wait_for(
+        &session.stderr,
+        "binding call 999999 is not waiting for an answer",
+        STEP_TIMEOUT,
+    )
+    .await;
+    session.type_line(&format!("/approve {first}")).await;
+    let second = waiting_call(&session.stderr, 2).await;
+    session.type_line(&format!("/deny {second}")).await;
+    wait_for(&session.stderr, "answered", TEST_TIMEOUT).await;
+    session.type_line(&format!("/approve {first}")).await;
+    wait_for(
+        &session.stderr,
+        &format!("binding call {first} is not waiting for an answer"),
+        STEP_TIMEOUT,
+    )
+    .await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "binding call {first} waits for your answer: fx: call noted on \
+             outrig_fixture.Root ('main')"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("type /approve {first} or /deny {first}")),
+        "{stderr}"
+    );
+
+    let recorded = drain_recorded(&mut requests);
+    let printed = tool_result(&recorded[1], "toolu_1");
+    assert_eq!(
+        printed.lines().collect::<Vec<_>>(),
+        [
+            "first 1",
+            "denied the approver denied it: denied at the prompt",
+            "pending 1 1",
+            "calls 1",
+        ],
+        "{printed}"
+    );
+    let log = the_log(sessions.path());
+    let typed: Vec<&str> = log
+        .iter()
+        .filter(|record| {
+            record["type"] == "org.outrig.message.sent" && record["data"]["from"] == "user"
+        })
+        .map(|record| record["data"]["body"].as_str().expect("a body"))
+        .collect();
+    assert_eq!(typed, ["go"], "a command reached the agent's channel");
+    // With a policy in force every request is decided -- the reads, by the default's allow --
+    // and the two calls by the rule and the answers given.
+    let decided: Vec<(u64, &str, &str)> = log
+        .iter()
+        .filter(|record| record["type"] == "org.outrig.hosted.decided")
+        .filter(|record| [first, second].contains(&record["data"]["request"].as_u64().unwrap_or(0)))
+        .map(|record| {
+            let data = &record["data"];
+            (
+                data["request"].as_u64().expect("a request"),
+                data["action"].as_str().expect("an action"),
+                data["by"].as_str().expect("what decided"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decided,
+        [
+            (first, "escalate", "rule"),
+            (first, "allow", "approver"),
+            (second, "escalate", "rule"),
+            (second, "deny", "approver"),
+        ]
+    );
+}
+
+/// Once input ends nobody is left to answer, so a binding call waiting then is denied, and the
+/// session goes on to end as piped input ends it.
+#[tokio::test]
+async fn a_binding_call_waiting_when_input_ends_is_denied() {
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let requirement = fixture_wheel(wheels.path());
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_1",
+            "try:\n    fx.noted()\n\
+             except runtime.Denied as e:\n    print('denied', e.reason)\n\
+             print('calls', fx.calls)",
+        ),
+        text_reply("done"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let home = tempfile::tempdir().expect("a home for the global config");
+    let global = escalating_global(home.path(), &requirement);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session.type_line("go").await;
+    waiting_call(&session.stderr, 1).await;
+    let (status, _, stderr) = session.exit(true).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    let printed = tool_result(&recorded[1], "toolu_1");
+    assert_eq!(
+        printed,
+        "denied the approver denied it: input ended, so nobody is left to answer\ncalls 0\n",
+        "{printed}"
+    );
+}
+
+/// Interrupting the agent's Python while its binding call waits for an answer withdraws the
+/// call: `run-new` says it no longer waits, `/approve` then gets a note that it is not waiting,
+/// and the call never runs.
+#[tokio::test]
+async fn an_interrupted_binding_call_stops_waiting_and_an_approve_after_runs_nothing() {
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let requirement = fixture_wheel(wheels.path());
+    let (addr, mut requests) = start_mock_http(vec![
+        submit("toolu_1", "fx.noted()"),
+        submit("toolu_2", "print('calls', fx.calls)"),
+        text_reply("done"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let home = tempfile::tempdir().expect("a home for the global config");
+    let global = escalating_global(home.path(), &requirement);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session.type_line("go").await;
+    let id = waiting_call(&session.stderr, 1).await;
+    ctrl_c(&session.pid);
+    wait_for(
+        &session.stderr,
+        &format!("binding call {id} no longer waits for an answer: its caller was interrupted"),
+        STEP_TIMEOUT,
+    )
+    .await;
+    session.type_line(&format!("/approve {id}")).await;
+    wait_for(
+        &session.stderr,
+        &format!("binding call {id} is not waiting for an answer"),
+        STEP_TIMEOUT,
+    )
+    .await;
+    wait_for(&session.stderr, "done", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    let recorded = drain_recorded(&mut requests);
+    let stopped = tool_result(&recorded[1], "toolu_1");
+    assert!(
+        stopped.contains("the user interrupted this call"),
+        "{stopped}"
+    );
+    assert_eq!(tool_result(&recorded[2], "toolu_2"), "calls 0\n");
 }

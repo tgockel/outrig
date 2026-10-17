@@ -53,7 +53,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt::{self, Write as _};
-use std::io::{self, ErrorKind};
+use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError, mpsc as std_mpsc};
@@ -118,6 +118,9 @@ pub(crate) struct Spec<'a> {
     pub(crate) paths: Vec<&'a Path>,
     /// The bindings, in the order their factories are called.
     pub(crate) bindings: Vec<Factory>,
+    /// The policy's tables and version, as [`Policy::wire`](crate::config::Policy::wire) gives
+    /// them: every request the process serves is decided by them.
+    pub(crate) policy: Value,
     /// The process's working directory; the owner's when `None`.
     pub(crate) cwd: Option<&'a Path>,
     /// Exactly the process's environment, or `None` to inherit the owner's -- the CLI's case, so
@@ -154,18 +157,6 @@ pub(crate) struct Factory {
 pub(crate) struct Probe {
     pub(crate) delay: Duration,
     pub(crate) path: std::path::PathBuf,
-}
-
-/// A request the process holds until [`Process::answer`] is called with its id.
-#[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the policy `0003-24` builds reads it")
-)]
-pub(crate) struct Decision {
-    pub(crate) id: u64,
-    /// The decision line less its `t` and `id`.
-    pub(crate) request: Value,
 }
 
 /// How [`Process::stop`] ended.
@@ -211,12 +202,8 @@ pub(crate) struct Process {
     /// `None` once [`Process::close_stdin`] was called.
     stdin: Option<mpsc::Sender<Value>>,
     rpc: Option<mpsc::Receiver<Value>>,
+    /// Its `event` and `decision` lines, in the order it wrote them.
     events: Option<mpsc::Receiver<Value>>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the policy `0003-24` builds reads it")
-    )]
-    decisions: Option<mpsc::Receiver<Decision>>,
     stderr: Arc<Mutex<VecDeque<String>>>,
     /// The qualified name of the type of what each binding's factory returned, by binding: the
     /// ready line's object.
@@ -316,11 +303,13 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
     let (stdin_tx, stdin_rx) = mpsc::channel(STDIN_QUEUE);
     let (rpc_tx, rpc_rx) = mpsc::channel(QUEUE);
     let (events_tx, events_rx) = mpsc::channel(QUEUE);
-    let (decisions_tx, decisions_rx) = mpsc::channel(QUEUE);
     // The bindings go first, ahead of anything else the owner sends; the queue is empty, so this
     // cannot wait.
     let paths: Vec<_> = spec.paths.iter().map(|dir| dir.to_string_lossy()).collect();
-    let _ = stdin_tx.try_send(json!({"t": "start", "paths": paths, "bindings": spec.bindings}));
+    let start = json!({
+        "t": "start", "paths": paths, "bindings": spec.bindings, "policy": spec.policy,
+    });
+    let _ = stdin_tx.try_send(start);
     tokio::spawn(write_lines(stdin, stdin_rx));
     // The handle exists before anything waits, so a `start` dropped while a factory runs --
     // under a timeout, say -- takes the whole group with it rather than the process alone.
@@ -330,7 +319,6 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
         stdin: Some(stdin_tx),
         rpc: Some(rpc_rx),
         events: Some(events_rx),
-        decisions: Some(decisions_rx),
         stderr: tail,
         types: Value::Null,
         reaped: false,
@@ -372,7 +360,7 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
     if let Some(why) = why {
         return Err(failed_start(process, drain, &who, why).await);
     }
-    tokio::spawn(route(stdout, rpc_tx, events_tx, decisions_tx));
+    tokio::spawn(route(stdout, rpc_tx, events_tx));
     Ok(process)
 }
 
@@ -415,45 +403,16 @@ impl Process {
         self.stdin.clone().expect("the process's stdin is open")
     }
 
-    /// Queue `message` as one line on the process's stdin -- an `rpc` frame, a decision's answer,
-    /// a control line; `BrokenPipe` once stdin is closed or the process is gone.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the policy `0003-24` builds reads it")
-    )]
-    pub(crate) async fn send(&self, message: Value) -> io::Result<()> {
-        let broken = || io::Error::new(ErrorKind::BrokenPipe, "the process's stdin is closed");
-        let stdin = self.stdin.as_ref().ok_or_else(broken)?;
-        stdin.send(message).await.map_err(|_| broken())
-    }
-
-    /// Answer decision `id` with `answer`, which releases the request the process held for it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the policy `0003-24` builds reads it")
-    )]
-    pub(crate) async fn answer(&self, id: u64, answer: Value) -> io::Result<()> {
-        self.send(json!({"t": "decision", "id": id, "answer": answer}))
-            .await
-    }
-
     /// The process's `rpc` lines, taken once.
     pub(crate) fn take_rpc(&mut self) -> mpsc::Receiver<Value> {
         self.rpc.take().expect("the rpc lines are taken once")
     }
 
-    /// The process's `event` lines, taken once.
+    /// The process's `event` and `decision` lines, in the order it wrote them, taken once: a
+    /// decision is answered through the same queue toward the process as everything else, so
+    /// one stream keeps a request's events and its decision in order.
     pub(crate) fn take_events(&mut self) -> mpsc::Receiver<Value> {
         self.events.take().expect("the event lines are taken once")
-    }
-
-    /// The process's decision requests, taken once.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the policy `0003-24` builds reads it")
-    )]
-    pub(crate) fn take_decisions(&mut self) -> mpsc::Receiver<Decision> {
-        self.decisions.take().expect("the decisions are taken once")
     }
 
     /// The last lines of the process's stderr.
@@ -710,7 +669,6 @@ async fn route(
     mut stdout: BufReader<ChildStdout>,
     rpc: mpsc::Sender<Value>,
     events: mpsc::Sender<Value>,
-    decisions: mpsc::Sender<Decision>,
 ) {
     let mut line = Vec::new();
     loop {
@@ -728,7 +686,7 @@ async fn route(
                 return;
             }
         }
-        let Ok(Value::Object(mut message)) = serde_json::from_slice::<Value>(&line) else {
+        let Ok(Value::Object(message)) = serde_json::from_slice::<Value>(&line) else {
             tracing::warn!(
                 "ignored a line from the bindings process that is not a protocol message: {:?}",
                 quoted(&line)
@@ -737,18 +695,7 @@ async fn route(
         };
         match message.get("t").and_then(Value::as_str) {
             Some("rpc") => drop(rpc.send(Value::Object(message)).await),
-            Some("event") => drop(events.send(Value::Object(message)).await),
-            Some("decision") => {
-                message.remove("t");
-                let Some(id) = message.remove("id").and_then(|id| id.as_u64()) else {
-                    tracing::warn!(
-                        "ignored a decision line from the bindings process without an id"
-                    );
-                    continue;
-                };
-                let request = Value::Object(message);
-                drop(decisions.send(Decision { id, request }).await);
-            }
+            Some("event" | "decision") => drop(events.send(Value::Object(message)).await),
             kind => tracing::warn!("ignored a line of kind {kind:?} from the bindings process"),
         }
     }

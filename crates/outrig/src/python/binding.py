@@ -21,11 +21,11 @@ and connection, split into bounded parts (`rpc` lines), both ways; from the owne
 line holding the bindings and the package directories; a `ready` line once every factory has
 returned, naming the type of what each returned, or a `failed` line naming the binding whose factory
 raised and what it raised; `event` lines -- a library's own, and each request's record: its
-receipt, its dispatch, which holds the request until the owner answers whether the event is
-`published`, refused if it is not, and its end; `decision` lines, each a request held on its
-serving thread until the owner's answer arrives under the same id, which `0003-24` asks for;
-`cancel` notices of requests whose callers were interrupted; and the `control` line that says the
-session has closed. Everything else it writes goes to stderr, where the owner logs it.
+receipt, the policy's decision, its dispatch, which holds the request until the owner answers
+whether the event is `published`, refused if it is not, and its end; `decision` lines, each a
+request the policy holds on its serving thread for the owner's answer, which arrives under the same
+id; `cancel` notices of requests whose callers were interrupted; and the `control` line that says
+the session has closed. Everything else it writes goes to stderr, where the owner logs it.
 
 The process is a supervised child of the owner, in a process group of its own, started with a
 parent-death signal (`SIGHUP`) the owner set before exec and left blocked until `main` has
@@ -62,6 +62,16 @@ it:
   public names alone.
 - No pickle, no import of anything the container names, no traceback text in an exception, and a
   release of more references than this connection handed out is refused.
+- `oldslicing` and `buffiter`, which no proxy of the interpreter's sends, are refused: each runs
+  more than its request names.
+
+Then the session's policy decides each boundary request, from the rule table on the `start` line
+(`Policy`): it runs, it is refused with `Denied`, or it waits on its serving thread -- holding no
+turn -- for the owner's answer to a `decision` line. A rule matches the request's binding, the
+host-side type of its target as this program names it (`type_name`, never what the object says of
+itself), its member, and its operation; a call of a callable a `getattr` returned is matched as a
+call of that member on that type (`Objects.originate`), and a request passing a host callable whose
+own call the policy would not allow is refused, since the host could call it later with no request.
 
 The frame channel below is a copy of the interpreter's, since the two programs share no module.
 Keep them the same.
@@ -72,6 +82,7 @@ import builtins
 import collections
 import contextlib
 import importlib
+import inspect
 import itertools
 import json
 import os
@@ -197,8 +208,11 @@ def _die(reason):
 # ---------------------------------------------------------------------------- events and decisions
 
 _decision_ids = itertools.count(1)
-# id -> the queue its serving thread waits on for the owner's answer. Serving threads add entries
-# and the reading thread pops them with no lock: each is one dict operation, atomic under the GIL.
+# id -> the queue its serving thread waits on for the owner's answer, and the request a policy
+# decision holds, if one does, which the reading thread marks `released` as it hands over the
+# owner's allow: so the mark falls in the pipe's order against the control line. Serving threads
+# add entries and the reading thread pops them with no lock: each is one dict operation, atomic
+# under the GIL.
 _decisions = {}
 
 
@@ -277,19 +291,37 @@ def _dropped(key, label, reason):
             _record(key, "ended", label, **ended)
 
 
-def _decide(payload):
-    """Ask the owner to decide `payload`, a dict, holding the calling thread -- and the request
-    it is serving -- until the answer arrives; returns the answer. A payload the owner would
-    not take -- one past the line bound, or not JSON -- raises here, before anything waits."""
+def _decide(payload, request=None):
+    """Ask the owner to decide `payload`, a dict, holding the calling thread -- and `request`,
+    the request it is serving -- until the answer arrives; returns the answer. A payload the
+    owner would not take -- one past the line bound, or not JSON -- raises here, before anything
+    waits."""
     did = next(_decision_ids)
     line = _line("decision", payload, id=did)
-    waiter = _decisions[did] = queue.SimpleQueue()
+    waiter = queue.SimpleQueue()
+    _decisions[did] = (waiter, request)
     try:
         _write(line)
     except BaseException:
         _decisions.pop(did, None)
         raise
     return waiter.get()
+
+
+def _go_on(answer):
+    """Return if the owner's `answer` to a held request allows it; else raise what ends it -- the
+    approver's deny, the cancel, or the close's refusal."""
+    answer = answer if isinstance(answer, dict) else {}
+    action, reason = answer.get("action"), answer.get("reason")
+    detail = str(answer.get("detail") or "")
+    if action == "allow":
+        return
+    if action == "refuse" or (action == "cancel" and reason == "closed"):
+        raise Closed(detail)
+    if action == "cancel":
+        raise EOFError(detail or "the call was cancelled before it ran")
+    code = reason if reason in ("approver", "no_approver") else "approver"
+    raise Denied(detail or f"the owner's answer could not be read: {answer!r}"[:TEXT_MAX], code)
 
 
 # The session's closing error once the owner's control line has said it closed -- the closed flag,
@@ -316,7 +348,8 @@ def _control(message):
         return
     _closing = text
     for request in list(_requests.values()):
-        if request.boundary:
+        # One the owner's gate allowed before the close is the drain's, as a forwarded one is.
+        if request.boundary and not request.released:
             request.turn.drop(request, Closed(text))
 
 
@@ -574,6 +607,19 @@ class Closed(Exception):
     __module__ = "outrig"
 
 
+class Denied(Exception):
+    """A request the session's policy refused before its target was invoked: by a rule, a default,
+    or the approver. `reason` says which, and crosses to the container, where the interpreter
+    raises it as `runtime.Denied`; `_code` is the reason its record gives, and stays here."""
+
+    __module__ = "outrig"
+
+    def __init__(self, reason, code):
+        super().__init__(reason)
+        self.reason = reason
+        self._code = code
+
+
 class ContainerError(Exception):
     """An exception the container raised inside a callback, rebuilt here as a plain `Exception`.
 
@@ -604,18 +650,229 @@ LABEL_CALLABLE = 105
 
 # The operators `cmp` may name: what the comparison dunders of a proxy send.
 COMPARISONS = frozenset(["__eq__", "__ne__", "__lt__", "__gt__", "__le__", "__ge__", "__cmp__"])
+# The operation a `callattr` of each of these dunders stands for, which a rule naming that
+# operation matches too.
+DUNDER_OPERATIONS = {
+    "__repr__": "repr",
+    "__str__": "str",
+    "__hash__": "hash",
+    "__exit__": "ctxexit",
+    **{name: "cmp" for name in COMPARISONS},
+}
 
 
 class _Context(threading.local):
     """Per thread: the request being served, which the callables it was passed belong to, or
     `None` while a reply to this side's own request is being unboxed, where a callable is
     refused; the references handed out while one message is boxed, taken back if that message is
-    never sent; and the seq of the request whose callback this thread is calling, the parent of
-    a request the container makes inside it."""
+    never sent; the seq of the request whose callback this thread is calling, the parent of a
+    request the container makes inside it; and the host objects a request's arguments name."""
 
     request = None
     boxed = None
     parent = None
+    # The host objects a request's arguments named, as `(id_pack, object)` in the order they were
+    # unboxed, while the request is unboxed.
+    passed = None
+
+
+# ---------------------------------------------------------------------------- the policy
+
+# Read from `type` itself, so a metaclass's descriptor of the same name never runs.
+_QUALNAME = type.__dict__["__qualname__"].__get__
+_MODULE = type.__dict__["__module__"].__get__
+
+
+def type_name(obj):
+    """The qualified name of `obj`'s type on the host -- or of `obj` itself when it is a class, as
+    a member read from a class is the member of its instances -- read from the class's own slots.
+    Never from the object: RPyC's id_pack asks the object for `____id_pack__` and `__class__`,
+    which an object whose attributes come from its items lets the container set."""
+    cls = obj if issubclass(type(obj), type) else type(obj)
+    try:
+        module = _MODULE(cls)
+    except AttributeError:
+        module = None
+    if type(module) is not str:
+        module = "?"
+    return f"{module}.{_QUALNAME(cls)}"
+
+
+def method_identity(obj):
+    """A bound method's own `(type, name)` -- its `__self__`'s type and its function's name -- read
+    from the method's slots, so no library code runs; `None` for anything else. It holds however
+    the method was reached: by a read, from a container, or from a call."""
+    if type(obj) is types.MethodType:
+        func = obj.__func__
+        if type(func) is types.FunctionType:
+            return type_name(obj.__self__), func.__name__
+    elif type(obj) is types.BuiltinMethodType:
+        owner = obj.__self__
+        if owner is not None and not issubclass(type(owner), types.ModuleType):
+            return type_name(owner), obj.__name__
+    return None
+
+
+def static_identity(obj, name):
+    """The method a read of `name` on `obj` would give, as its own `(type, name)`, found without
+    running the read: `inspect.getattr_static` looks in the instance's and the classes'
+    dictionaries and calls no descriptor. So a member that is another name for a method -- `alias =
+    push` in a class body -- is known as the method before anything runs. `None` when what it finds
+    is not a method this can name, or nothing is found, as for a name `__getattr__` makes."""
+    try:
+        found = inspect.getattr_static(obj, name)
+    except Exception:
+        return None
+    if type(found) in (staticmethod, classmethod):
+        found = found.__func__
+    if type(found) is types.FunctionType or type(found) in (
+        types.MethodDescriptorType,
+        types.WrapperDescriptorType,
+        types.ClassMethodDescriptorType,
+    ):
+        return type_name(obj), found.__name__
+    return method_identity(found)
+
+
+def calls_of(known):
+    """What a call of a callable known as each `(type, member)` of `known` is matched as: a call of
+    that member on that type, and, for a dunder with an operation of its own, that operation too
+    -- so a `__repr__` read and then called is still a `repr`."""
+    described = []
+    for type_, member in known:
+        described.append(("call", member, type_))
+        if member in DUNDER_OPERATIONS:
+            described.append((DUNDER_OPERATIONS[member], member, type_))
+    return described
+
+
+# How strict each action is: when layers, or a request's descriptions, disagree, the strictest
+# decides. An evaluator may allow without a person, and a person may allow where a deny never does.
+STRICTNESS = {"allow": 0, "evaluate": 1, "escalate": 2, "deny": 3}
+
+
+def _pattern(pattern):
+    """A rule's field as a test of a name: anything when it is absent, else the name exactly,
+    with `*` standing for any run of characters. A request that names no member matches only a
+    rule that names none.
+
+    Matched without backtracking, since a name is the container's to make long: the text before
+    the first `*` must begin the name and the text after the last end it, and each piece between
+    is found, leftmost, after the one before -- which, with `*` the only wildcard, is a match
+    whenever one exists."""
+    if pattern is None:
+        return lambda value: True
+    if "*" not in pattern:
+        return lambda value: value == pattern
+    first, *middle, last = pattern.split("*")
+
+    def matches(value):
+        if value is None or len(value) < len(first) + len(last):
+            return False
+        if not (value.startswith(first) and value.endswith(last)):
+            return False
+        at, end = len(first), len(value) - len(last)
+        for piece in middle:
+            found = value.find(piece, at, end)
+            if found < 0:
+                return False
+            at = found + len(piece)
+        return True
+
+    return matches
+
+
+class Verdict:
+    """What the policy decided of a request, and what decided it: `rule`, counted from 1, of
+    `layer`'s table, or its default when `rule` is `None`."""
+
+    def __init__(self, action, layer, rule):
+        self.action, self.layer, self.rule = action, layer, rule
+
+    @property
+    def code(self):
+        """The reason a refusal by it is recorded with."""
+        return "default" if self.rule is None else "rule"
+
+    def __str__(self):
+        if self.rule is None:
+            return f"the {self.layer} policy's default"
+        return f"{self.layer} rule {self.rule}"
+
+    def fields(self):
+        """The fields its `decided` record and its decision line carry."""
+        return dict(action=self.action, by=self.code, layer=self.layer, rule=self.rule)
+
+
+class Policy:
+    """The rules in force, as the owner sent them on the `start` line: the operator's table, its
+    `default` resolved, and each repository table that may only restrict it. Each layer decides on
+    its own -- its first matching rule, else its `default`; a repository table with neither takes
+    no part -- and the strictest action wins."""
+
+    def __init__(self, wire):
+        self.configured = wire["configured"] is True
+        tables = [("operator", wire["operator"]), *(("repo", table) for table in wire["repo"])]
+        self.layers = [(layer, *self._table(table)) for layer, table in tables]
+
+    @staticmethod
+    def _table(table):
+        rules = [
+            (
+                _pattern(rule.get("binding")),
+                _pattern(rule.get("type")),
+                _pattern(rule.get("member")),
+                rule.get("operation"),
+                rule["action"],
+            )
+            for rule in table["rules"]
+        ]
+        return rules, table.get("default")
+
+    @staticmethod
+    def _layer(layer, rules, default, binding, operation, member, type_):
+        """`layer`'s verdict on one description of a request: its first matching rule, else its
+        default; `None` when it has neither."""
+        for i, (matches_binding, matches_type, matches_member, op, action) in enumerate(rules, 1):
+            if (
+                op in (None, operation)
+                and matches_binding(binding)
+                and matches_type(type_)
+                and matches_member(member)
+            ):
+                return Verdict(action, layer, i)
+        return None if default is None else Verdict(default, layer, None)
+
+    def decide(self, binding, descriptions):
+        """The verdict on a request of `binding` described as each of `descriptions`,
+        `(operation, member, type)`: the strictest any layer gives any of them, the first of
+        equals."""
+        best = None
+        for operation, member, type_ in descriptions:
+            for layer in self.layers:
+                found = self._layer(*layer, binding, operation, member, type_)
+                if found is not None and (
+                    best is None or STRICTNESS[found.action] > STRICTNESS[best.action]
+                ):
+                    best = found
+                    if best.action == "deny":
+                        return best
+        return best or Verdict("allow", "operator", None)
+
+
+# Until the `start` line says otherwise: nothing configured, every request allowed.
+_policy = Policy({"configured": False, "operator": {"default": "allow", "rules": []}, "repo": []})
+
+
+def id_pack_of(obj):
+    """The id_pack `obj` is handed out under, laid out as RPyC's `get_id_pack` lays one out -- a
+    class as `(name, its id, 0)`, anything else as `(its type's name, the type's id, its id)` -- but
+    named by `type_name`. RPyC asks the object, for `____id_pack__` and `__class__`, which an object
+    whose attributes come from its items lets the container set; a name the binding gives is one a
+    receipt, a preview and a rule can take as the host's."""
+    if issubclass(type(obj), type):
+        return (type_name(obj), id(obj), 0)
+    return (type_name(obj), id(type(obj)), id(obj))
 
 
 # ---------------------------------------------------------------------------- the agent's objects
@@ -634,7 +891,9 @@ class Objects:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._slots = {}  # id_pack -> [obj, references held across the agent's connections]
+        # id_pack -> [obj, references held across the agent's connections, the `(type, member)`
+        # of each `getattr` that returned it]
+        self._slots = {}
         self._held = {}  # connection -> {id_pack -> references it handed out}
 
     def __len__(self):
@@ -648,10 +907,26 @@ class Objects:
     def add(self, conn, id_pack, obj):
         """One more reference to `obj`, handed out by `conn`."""
         with self._lock:
-            slot = self._slots.setdefault(id_pack, [obj, 0])
+            slot = self._slots.setdefault(id_pack, [obj, 0, []])
             slot[1] += 1
             held = self._held.setdefault(conn, {})
             held[id_pack] = held.get(id_pack, 0) + 1
+
+    def originate(self, id_pack, origin):
+        """Record that a `getattr` returned the object `id_pack` names as `origin`, its target's
+        type and the member read. Origins only accumulate while the object is held: a callable
+        reached under two members is matched as both, so neither route loosens the other."""
+        with self._lock:
+            slot = self._slots.get(id_pack)
+            if slot is not None and origin not in slot[2]:
+                slot[2].append(origin)
+
+    def origins(self, id_pack):
+        """Every `(type, member)` a `getattr` returned the object `id_pack` names as, in the order
+        they were recorded."""
+        with self._lock:
+            slot = self._slots.get(id_pack)
+            return tuple(slot[2]) if slot is not None else ()
 
     def release(self, conn, id_pack, count):
         """`count` fewer references from `conn` to the object `id_pack` names, unless that is more
@@ -770,11 +1045,13 @@ class Request:
     passed. A cancel or the close finds it in `_requests`: `dropped` is what it raises instead of
     running, once one of them took it out of the turn's line or a cancel came before its target
     was invoked; `interrupted` says a cancel came while it ran. `lock` orders a cancel against the
-    invocation, so a request is either dropped or noted, never run unnoted."""
+    invocation, so a request is either dropped or noted, never run unnoted. `released` once the
+    owner's gate allowed it, which the close then leaves to run."""
 
     dropped = None
     interrupted = False
     invoked = False
+    released = False
 
     def __init__(self, seq, boundary, turn):
         self.seq, self.boundary, self.turn = seq, boundary, turn
@@ -804,7 +1081,6 @@ def connection_class(rpyc):
     vinegar = rpyc.core.vinegar
     netref = rpyc.core.netref
     Connection = rpyc.core.protocol.Connection
-    get_id_pack = rpyc.lib.get_id_pack
     get_methods = rpyc.lib.get_methods
     safe_attrs = frozenset(rpyc.core.protocol.DEFAULT_CONFIG["safe_attrs"])
 
@@ -877,7 +1153,13 @@ def connection_class(rpyc):
 
     def check_member(handler, args):
         """The checks on the member a request names, made before its dispatch: the attribute
-        rule, and only comparison operators for `cmp`."""
+        rule, and only comparison operators for `cmp`. `oldslicing` and `buffiter` are refused
+        whole: no proxy of the interpreter's sends either, and each runs more than its request
+        names -- a second member, or each step of an iteration -- with no rule asked about it."""
+        if handler == consts.HANDLE_OLDSLICING:
+            raise Refused("oldslicing is Python 2's slicing, which this binding does not answer")
+        if handler == consts.HANDLE_BUFFITER:
+            raise Refused("buffiter is not answered: iterate with __iter__ and __next__")
         if handler == consts.HANDLE_CMP:
             if args[2] not in COMPARISONS:
                 raise Refused(f"{args[2]!r} is not a comparison operator")
@@ -886,7 +1168,8 @@ def connection_class(rpyc):
 
     class Named:
         """An object in a preview, by reference: its claimed type and number, never its own
-        `repr`, which would run its code."""
+        `repr`, which would run its code. One this binding handed out is named as `id_pack_of`
+        named it."""
 
         def __init__(self, id_pack):
             self.text = f"<{id_pack[0]} #{id_pack[2]}>"
@@ -1115,8 +1398,24 @@ def connection_class(rpyc):
                             # object past its release.
                             args = (target, *map(self._unbox, boxed[1][1:]))
                         else:
-                            args = self._unbox(boxed)
+                            decides = (
+                                _policy.configured
+                                and request.boundary
+                                and receipt["operation"] not in bookkeeping
+                            )
+                            self._context.passed = [] if decides else None
+                            try:
+                                args = self._unbox(boxed)
+                                passed = self._context.passed
+                            finally:
+                                self._context.passed = None
                             check_member(handler, args)
+                            if decides:
+                                # The target is the first object unboxed; the rest are arguments.
+                                arguments = passed if target is None else passed[1:]
+                                self._decide_policy(
+                                    request, seq, handler, target, args, arguments, receipt
+                                )
                         if handler not in unserialized:
                             # Once the request is checked, so a refused one waits for nobody; held
                             # until its exception, if any, is rendered below.
@@ -1127,7 +1426,8 @@ def connection_class(rpyc):
                             request.invoked = True
                         if request.boundary:
                             ack = next(_decision_ids)
-                            published = _decisions[ack] = queue.SimpleQueue()
+                            published = queue.SimpleQueue()
+                            _decisions[ack] = (published, None)
                             try:
                                 _record(self._key, "dispatched", seq, ack=ack)
                             except BaseException:
@@ -1137,6 +1437,13 @@ def connection_class(rpyc):
                                 raise Refused("the owner could not record this request")
                         res = method(self, *args)
                         reply = (consts.MSG_REPLY, self._box_tracked(res, handed))
+                        if (
+                            handler == consts.HANDLE_GETATTR
+                            and reply[1][0] == consts.LABEL_REMOTE_REF
+                            and callable(res)
+                        ):
+                            # Before the reply, so no call of it can come first.
+                            self._objects.originate(reply[1][1], (type_name(args[0]), args[1]))
                         ended = {"outcome": "returned"}
                     except BaseException as e:
                         # The reply never goes out, so nothing it would have referenced is held.
@@ -1147,6 +1454,12 @@ def connection_class(rpyc):
                         if e is request.dropped:
                             reason = "closed" if t is Closed else "interrupted"
                             ended = {"outcome": "cancelled", "reason": reason}
+                        elif t is Denied:
+                            ended = {
+                                "outcome": "refused",
+                                "reason": e._code,
+                                "detail": str(e)[:TEXT_MAX],
+                            }
                         elif request.invoked and (request.boundary or t is not Refused):
                             ended = {
                                 "outcome": "raised",
@@ -1214,9 +1527,99 @@ def connection_class(rpyc):
                     }
                 receipt["arguments"] = [preview(arg) for arg in rest[:PREVIEW_ITEMS]]
                 target = self._target(handler, boxed)
-                if target is not None and self._lookup(target, required=False) is not None:
-                    receipt["target"] = self._claimed(target)
+                obj = None if target is None else self._lookup(target, required=False)
+                if obj is not None:
+                    if handler == consts.HANDLE_CALL:
+                        # Shown as the call of the member it was read from, when it was.
+                        _, receipt["member"], receipt["target"] = self._calls(obj, target)[0]
+                    else:
+                        receipt["target"] = type_name(obj)
             return receipt
+
+        # ------------------------------------------------------------------ policy
+
+        def _calls(self, obj, id_pack):
+            """What a call of `obj` is matched as, `(operation, member, type)`: the call of each
+            member a `getattr` returned it as, and of a bound method's own; else a call of its own
+            type, naming no member. The first is how the call is shown."""
+            found = list(self._objects.origins(id_pack))
+            own = method_identity(obj)
+            if own is not None and own not in found:
+                found.append(own)
+            return calls_of(found) or [("call", None, type_name(obj))]
+
+        def _descriptions(self, handler, target, args):
+            """What a request is matched as, each description a way the request could be named
+            and each of which the policy must allow. `callattr` reads a member and calls what it
+            read, so it is all three, and a call of the method the read would give, by the
+            method's own name; one of a dunder that has an operation of its own is that operation
+            too. A `callattr` whose method cannot be known before the read runs -- a property's,
+            or one `__getattr__` makes -- is refused: no rule could decide what it would call, and
+            the interpreter's proxies send `callattr` only for a method its type defines, so a
+            read and then a call of what it gave is the way to it."""
+            operation = operations[handler]
+            if handler == consts.HANDLE_CALL:
+                return self._calls(args[0], target)
+            type_ = type_name(args[0])
+            at = member_at.get(handler)
+            member = args[at] if at is not None else None
+            described = [(operation, member, type_)]
+            if handler == consts.HANDLE_CALLATTR:
+                known = [(type_, member)]
+                canonical = static_identity(args[0], member)
+                if canonical is None:
+                    raise Refused(
+                        f"callattr of {member!r} on {type_} is not answered: what it would call "
+                        f"cannot be known before it runs; read {member!r} and call what it gives"
+                    )
+                if canonical not in known:
+                    known.append(canonical)
+                described += [("getattr", member, type_), *calls_of(known)]
+            return described
+
+        def _decide_policy(self, request, seq, handler, target, args, passed, receipt):
+            """The policy's decision on a boundary request, before it takes its turn, recorded as
+            `decided`: return to run it; raise `Denied` to refuse it; or hold it for the owner's
+            answer, and raise what ends it unless that is an allow."""
+            self._check_passed(seq, passed)
+            described = self._descriptions(handler, target, args)
+            verdict = _policy.decide(self._key[0], described)
+            _record(self._key, "decided", seq, **verdict.fields(), reason=None)
+            if verdict.action == "allow":
+                return
+            operation, member, type_ = described[0]
+            if verdict.action == "deny":
+                what = f"{operation} {member} on {type_}" if member else f"{operation} on {type_}"
+                raise Denied(f"{verdict} denies {what}", verdict.code)
+            with request.lock:
+                if request.dropped is not None:
+                    raise request.dropped  # its caller gave up before anyone was asked
+            binding, agent, conn = self._key
+            ask = dict(binding=binding, agent=agent, conn=conn, seq=seq, action=verdict.action)
+            ask.update(operation=operation, member=member, target=type_)
+            ask.update(arguments=receipt["arguments"], keywords=receipt["keywords"])
+            _go_on(_decide(dict(ask, reason=f"{verdict} says {verdict.action}"), request))
+
+        def _check_passed(self, seq, passed):
+            """Refuse a request that passes a host callable whose own call the policy would not
+            allow -- as an argument, nested in one, or as a value to assign: the host could call
+            it later with no request, so nobody could be asked about that call."""
+            for i, (id_pack, obj) in enumerate(passed, 1):
+                if not callable(obj):
+                    continue
+                calls = self._calls(obj, id_pack)
+                verdict = _policy.decide(self._key[0], calls)
+                if verdict.action == "allow":
+                    continue
+                _, member, type_ = calls[0]
+                what = type_ if member is None else f"{member} of {type_}"
+                reason = (
+                    f"argument {i} passes {what}, whose call {verdict} would "
+                    f"{verdict.action}; the host could call it later with no request"
+                )
+                refused = {**verdict.fields(), "action": "deny"}
+                _record(self._key, "decided", seq, **refused, reason=reason)
+                raise Denied(reason, verdict.code)
 
         def _send(self, msg, seq, args):
             """RPyC's, without its shared send queue: a frame past the bound raises in the thread
@@ -1282,7 +1685,10 @@ def connection_class(rpyc):
             if label == consts.LABEL_TUPLE:
                 return tuple(self._unbox(item) for item in value)
             if label == consts.LABEL_LOCAL_REF:
-                return self._lookup(value)
+                obj = self._lookup(value)
+                if self._context.passed is not None:
+                    self._context.passed.append((value, obj))
+                return obj
             if label == consts.LABEL_REMOTE_REF:
                 raise Refused(
                     f"an object of type {self._claimed(value)} was sent by reference, and only "
@@ -1367,7 +1773,7 @@ def connection_class(rpyc):
                     f"a {type(obj).__name__} object does not cross: it reaches this process's "
                     f"globals"
                 )
-            id_pack = get_id_pack(obj)
+            id_pack = id_pack_of(obj)
             self._objects.add(self, id_pack, obj)
             if self._context.boxed is not None:
                 self._context.boxed.append(id_pack)
@@ -1702,11 +2108,15 @@ def _handle(connections, line):
     message = json.loads(line)
     kind = message.get("t") if isinstance(message, dict) else None
     if kind in ("decision", "published"):
-        waiter = _decisions.pop(message.get("id"), None)
-        if waiter is None:
+        held = _decisions.pop(message.get("id"), None)
+        answer = message.get("answer")
+        if held is None:
             _diag(f"an answer to decision {message.get('id')!r}, which nothing awaits")
-        else:
-            waiter.put(message.get("answer"))
+            return
+        waiter, request = held
+        if request is not None and isinstance(answer, dict) and answer.get("action") == "allow":
+            request.released = True
+        waiter.put(answer)
         return
     if kind == "control":
         _control(message)
@@ -1789,7 +2199,9 @@ def main():
 
     Binding = connection_class(rpyc)
     stream = os.fdopen(_PROTO_IN, "rb")
-    paths, bindings = _arguments(stream.readline())
+    global _policy
+    paths, bindings, policy = _arguments(stream.readline())
+    _policy = Policy(policy)
     # In the session's order, which decides between two bindings that hold different versions of
     # one package, as the container's `sys.path` does.
     sys.path.extend(paths)
@@ -1819,9 +2231,10 @@ FAILED_MAX = 4096
 
 
 def _arguments(line):
-    """The package directories, and each binding as `(name, factory, args, kwargs, serialize)`,
-    from the owner's first line; or end the process saying why there are none: no factory runs on
-    a line this program did not understand."""
+    """The package directories, each binding as `(name, factory, args, kwargs, serialize)`, and the
+    policy's tables, from the owner's first line; or end the process saying why there are none: no
+    factory runs on a line this program did not understand, and no request on rules it could not
+    read."""
     if not line:
         _die("the owner closed the protocol before sending the bindings")
     try:
@@ -1831,16 +2244,18 @@ def _arguments(line):
             for b in message["bindings"]
         ]
         paths = message["paths"]
+        policy = message["policy"]
+        Policy(policy)  # every rule readable, or nothing starts
         if (
             message.get("t") != "start"
             or not isinstance(paths, list)
             or not all(isinstance(b[2], list) and isinstance(b[3], dict) for b in bindings)
         ):
             raise ValueError("not a start line")
-    except (ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
         _diag(f"the first line was not the bindings to start ({e}): {line[:200]!r}")
         os._exit(2)
-    return paths, bindings
+    return paths, bindings, policy
 
 
 if __name__ == "__main__":

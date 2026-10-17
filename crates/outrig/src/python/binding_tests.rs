@@ -29,7 +29,7 @@ const FACTORY: &str = "outrig_fixture:make";
 
 /// Python that binds `K` to `agent`'s kernel and `root` to its proxy of binding `fx`, then runs
 /// `body`.
-fn with_root_in(agent: &str, body: &str) -> String {
+pub(super) fn with_root_in(agent: &str, body: &str) -> String {
     format!(
         "import __main__\nAGENT = {agent:?}\nK = __main__._kernels[AGENT]\nroot = K.hosted('fx')\n{}",
         py(body)
@@ -37,7 +37,7 @@ fn with_root_in(agent: &str, body: &str) -> String {
 }
 
 /// [`with_root_in`] for the primary kernel.
-fn with_root(body: &str) -> String {
+pub(super) fn with_root(body: &str) -> String {
     with_root_in("primary", body)
 }
 
@@ -151,12 +151,12 @@ const RAW: &str = r#"
 "#;
 
 /// [`with_root`], then [`RAW`], then `body`.
-fn with_raw(body: &str) -> String {
+pub(super) fn with_raw(body: &str) -> String {
     with_root(&format!("{}\n{}", py(RAW), py(body)))
 }
 
 /// Every line of `output` that starts with `label`.
-fn lines_of<'a>(output: &'a str, label: &str) -> Vec<&'a str> {
+pub(super) fn lines_of<'a>(output: &'a str, label: &str) -> Vec<&'a str> {
     output
         .lines()
         .filter(|line| line.starts_with(label))
@@ -2600,7 +2600,7 @@ fn an_interrupt_cannot_lose_the_refusal_of_a_callback_the_host_calls_late() {
                 import __main__, signal, sys
                 from rpyc.core import vinegar
                 main = threading.get_ident()
-                __main__._Hosted.cancel = lambda self: None
+                __main__._Hosted.cancel = lambda self, seqs: None
                 ran = []
                 try:
                     stub.call_after(1, lambda: ran.append(1), {started})
