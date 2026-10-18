@@ -323,6 +323,7 @@ fn wheels(out_dir: &Path) {
 const PROGRAMS: &[(&str, &str)] = &[
     ("interpreter", "src/python/interpreter.py"),
     ("binding", "src/python/binding.py"),
+    ("program", "src/python/program.py"),
 ];
 
 /// Linux caps one argument string at 32 pages, and the interpreter's source

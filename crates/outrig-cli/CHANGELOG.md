@@ -98,8 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python does. A call made after the close raises `outrig.Closed`. If the bindings process dies,
   the session goes on without its bindings, and a call to one raises an error saying how the
   process ended.
-- **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
-  lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
+- **`outrig run-legacy`**, the interactive agent session `outrig run` starts without a script,
+  with the same flags and never a script, so a script can name the MCP-tool agent explicitly
+  before `run` moves to the Python one.
+- **`outrig run <script.py> [args...]`, a preview: a Python program on the host.** The script
+  runs as `__main__` under the Python OutRig carries, as `python3 <script> [args...]` would run
+  it: every argument after the script is its own, `--help` and OutRig's flag names included, and
+  its working directory, environment, streams and exit status are its own. It imports the
+  standard library, `outrig`, and modules beside the script, and nothing from the working
+  directory, `PYTHONPATH` or the user site. Starting it starts no container and calls no model.
+  The configuration is loaded once, from the invocation's directory, and `outrig.config()` is a
+  read-only view of its models, aliases, providers and defaults with no key in it. The session
+  flags are refused before the script, naming the flag. `SIGINT` and `SIGTERM` are forwarded to
+  the program's process group, and the program and what it started end if `outrig` dies. The
+  program does not read the terminal: a read from it fails with `EIO`. The exit status is the
+  program's, or 128 plus the signal that ended it. Bare `outrig run` is unchanged.
 
 ### Removed
 

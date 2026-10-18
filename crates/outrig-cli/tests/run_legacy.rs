@@ -1,5 +1,5 @@
-//! `outrig run-legacy` is `outrig run` under another name, and `outrig run-new`
-//! is a command of its own that leaves `run` as it was.
+//! `outrig run-legacy` is `outrig run` without a script, and `outrig run-new`
+//! is a command of its own that leaves the interactive `run` as it was.
 //!
 //! Not `e2e`-gated, like `builtin_default.rs`: the binary runs against a
 //! `podman` and `buildah` that fail at once, so each comparison is reached
@@ -187,19 +187,31 @@ async fn run_legacy_behaves_as_run() {
     }
 }
 
+/// `run-legacy` takes exactly the session's flags `run` takes, and no script.
 #[tokio::test]
-async fn run_legacy_has_run_s_help() {
+async fn run_legacy_has_run_s_session_flags() {
     let dir = tempfile::tempdir().expect("a dir");
     let run = outrig(dir.path(), &["run", "--help"]).await;
     let legacy = outrig(dir.path(), &["run-legacy", "--help"]).await;
-    assert!(run.status.success());
-    assert_eq!(text(&run.stdout), text(&legacy.stdout));
+    assert!(run.status.success() && legacy.status.success());
+    let (run, legacy) = (text(&run.stdout), text(&legacy.stdout));
+    let options = |help: &str| -> Vec<String> {
+        help.lines()
+            .filter(|line| line.trim_start().starts_with('-'))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(options(&run), options(&legacy), "{run}\n---\n{legacy}");
+    assert!(
+        run.contains("[SCRIPT]...") && !legacy.contains("SCRIPT"),
+        "{legacy}"
+    );
 }
 
-/// `run-new`'s help says what it is, and nothing about `run` suggests that
-/// `run` has changed: its summary and its own help are as they were.
+/// `run-new`'s help says what it is, `run`'s names both its forms and the
+/// retarget to come, and `run-legacy`'s is the interactive session's alone.
 #[tokio::test]
-async fn run_new_help_describes_it_without_touching_run() {
+async fn run_new_help_describes_it_and_run_names_both_forms() {
     let dir = tempfile::tempdir().expect("a dir");
     let help = text(&outrig(dir.path(), &["run-new", "--help"]).await.stdout);
     assert!(
@@ -218,7 +230,14 @@ async fn run_new_help_describes_it_without_touching_run() {
             .to_string()
     };
     assert!(
-        line("run").contains("Start an interactive agent session [alias: run-legacy]"),
+        line("run").contains(
+            "Start an interactive agent session, or run a Python program on the host (preview)"
+        ),
+        "{top}"
+    );
+    assert!(
+        line("run-legacy").contains("Start an interactive agent session")
+            && !line("run-legacy").contains("Python"),
         "{top}"
     );
     assert!(
@@ -228,10 +247,18 @@ async fn run_new_help_describes_it_without_touching_run() {
 
     let run = text(&outrig(dir.path(), &["run", "--help"]).await.stdout);
     assert!(
-        run.starts_with("Start an interactive agent session\n")
-            && !run.contains("run-new")
-            && !run.contains("Python"),
+        run.starts_with(
+            "Start an interactive agent session, or run a Python program on the host \
+             (preview).\n"
+        ) && run.contains("`outrig run-legacy` is the same command")
+            && run.contains("A later release makes `outrig run` the command")
+            && !run.contains("run-new"),
         "{run}"
+    );
+    let legacy = text(&outrig(dir.path(), &["run-legacy", "--help"]).await.stdout);
+    assert!(
+        legacy.starts_with("Start an interactive agent session.\n") && !legacy.contains("Python"),
+        "{legacy}"
     );
 }
 

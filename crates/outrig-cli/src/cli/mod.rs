@@ -13,6 +13,7 @@ pub mod logs;
 pub mod ls;
 pub mod mcp;
 pub mod mcp_self;
+pub mod program;
 pub mod run;
 pub mod run_new;
 pub mod run_new_only_keys;

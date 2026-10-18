@@ -632,6 +632,13 @@ def make_stubborn():
     return Root()
 
 
+def make_stubborn_child():
+    """A binding that SIGTERM ends, with a child that ignores it: a group whose leader is gone,
+    and can be reaped, while the group is not."""
+    subprocess.Popen(["sh", "-c", 'trap "" TERM; sleep 1000'])
+    return Root()
+
+
 def make_failing():
     """A factory that starts a program and then raises, writing its process group to
     `OUTRIG_FIXTURE_PGID_FILE` first, so a test can look for what it left behind."""

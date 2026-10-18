@@ -187,9 +187,10 @@ See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
 
 ### `outrig run`
 
-Start an interactive agent session. `outrig run-legacy` is another name for this command and
-reaches the same code, so a script can name the MCP-tool agent explicitly before `run` moves to
-the Python one.
+Start an interactive agent session, or, given a script, run a Python program on the host (a
+preview; see [below](#outrig-run-scriptpy)). `outrig run-legacy` takes the same flags and starts
+the same interactive session, but never a script, so a script can name the MCP-tool agent
+explicitly before `run` moves to the Python one.
 
 ```
 outrig run [--agent <name>]
@@ -256,6 +257,35 @@ what chose it. Declare `[workspace] host-path` to mount it on purpose; see
 [Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
+
+#### `outrig run <script.py>`
+
+Run a trusted Python program on the host (preview): the script as `__main__` under the Python
+OutRig carries, with every argument after it as its own. It starts no container and calls no
+model.
+
+```
+outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--verbose]
+       run <script.py> [args...]
+```
+
+- The global flags apply before the script, wherever they are written there. The session flags
+  above -- `--agent`, `--model`, `--image`, `--session-dir`, `--max-tool-calls`,
+  `--max-tool-result-bytes`, `--env`, `--network`, `--volume` -- are refused before it, naming
+  the flag, because the program chooses its own session's inputs.
+- Everything after the script is the program's `sys.argv`, unchanged: `--help`, `--`, and any
+  spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
+- The configuration is loaded and validated once, from the invocation's directory as for every
+  command, before the program starts. The program reads it as `outrig.config()`.
+- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group.
+- The exit status is the program's, or 128 plus the number of the signal that ended it. A script
+  that cannot be opened as a file, a configuration that does not load, or a declared workspace
+  whose path is not UTF-8, which `outrig.config()` cannot show, is an `error:` line and status
+  `1`, with nothing started.
+
+A later release makes `outrig run` the command of the sessions whose agents write Python. See
+[Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program
+sees.
 
 ### `outrig run-new`
 
@@ -745,6 +775,9 @@ only thing keeping it away from a build in flight.
 
 `outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
 there; the run is reported in full, and the container is named on stderr.
+
+`outrig run <script.py>` exits with its program's status, whatever it is, or with 128 plus the
+number of the signal that ended the program.
 
 ## Environment variables
 

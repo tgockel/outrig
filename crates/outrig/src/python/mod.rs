@@ -6,7 +6,9 @@
 //! in a session's container, submits executions, and correlates the replies.
 //! `recovery` waits for an execution's outcome, and cancels or interrupts one
 //! that will not end on its own -- because the user asked, or because it is
-//! spinning.
+//! spinning. `supervisor` starts the process holding a session's bindings on
+//! the host, and `program` an operator's Python program there, under
+//! `outrig run <script.py>`.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly: the
 //! agent loop in `crate::agent` drives it, and `crate::harness` is how the
@@ -16,6 +18,7 @@ pub(crate) mod host;
 pub(crate) mod hosted;
 pub(crate) mod install;
 pub(crate) mod payload;
+pub(crate) mod program;
 pub(crate) mod recovery;
 pub(crate) mod supervisor;
 
@@ -54,6 +57,10 @@ mod binding_tests;
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod supervisor_tests;
+
+#[cfg(test)]
+#[path = "program_tests.rs"]
+mod program_tests;
 
 #[cfg(test)]
 #[path = "hosted_tests.rs"]

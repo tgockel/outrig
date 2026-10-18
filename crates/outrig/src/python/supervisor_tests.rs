@@ -21,7 +21,7 @@ use serde_json::json;
 
 use super::relay::{Bind, Relay, TIMEOUT, fixture_dir, rpyc_dir};
 use super::supervisor::{self, Factory, Probe, STOP_GRACE, Spec, group_members};
-use super::testing::{Flag, capture, eventually, group_gone, py, python, wait_group_gone};
+use super::testing::{Flag, alive, capture, eventually, group_gone, py, python, wait_group_gone};
 
 const FACTORY: &str = "outrig_fixture:make";
 const ROLE: &str = "OUTRIG_TEST_OWNER_ROLE";
@@ -52,14 +52,6 @@ fn spec<'a>(factory: &'a str, env: Option<&'a [(OsString, OsString)]>) -> Spec<'
         env,
         probe: None,
     }
-}
-
-/// Whether `pid` is a live process: in `/proc`, and not a zombie.
-fn alive(pid: Pid) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.rsplit_once(')')
-            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
-    })
 }
 
 /// Python that binds `root` to `agent`'s proxy of binding `fx` and runs `body`.
@@ -427,6 +419,35 @@ fn a_binding_that_ignores_sigterm_is_killed_with_its_group_after_the_grace() {
         Some(Signal::SIGKILL as i32)
     );
     assert!(group_gone(pgid));
+}
+
+/// A stop cancelled after SIGTERM ended the leader -- which the stop's polling reaped -- but not
+/// its child, which ignores it, still ends the group: the handle keeps the group's cleanup until
+/// the stop has finished it, not only until the leader is reaped.
+#[test]
+fn a_stop_cancelled_after_the_leader_is_reaped_still_ends_the_group() {
+    let runtime = runtime();
+    let binding = runtime
+        .block_on(supervisor::start(spec(
+            "outrig_fixture:make_stubborn_child",
+            None,
+        )))
+        .expect("the binding starts");
+    let pgid = binding.pid();
+    eventually(
+        || {
+            group_members(pgid)
+                .iter()
+                .any(|member| member.comm == "sleep")
+                .then_some(())
+        },
+        || "the stubborn child".to_string(),
+    );
+    let cancelled = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_millis(500), binding.stop(STOP_GRACE)).await
+    });
+    assert!(cancelled.is_err(), "the stop finished: {cancelled:?}");
+    wait_group_gone(pgid, GONE_WITHIN);
 }
 
 #[test]

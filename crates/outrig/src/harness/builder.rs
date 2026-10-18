@@ -284,7 +284,7 @@ impl SessionBuilder {
     pub async fn start(mut self) -> Result<Session, SessionError> {
         let resolved = self.take_resolved()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
-        let repo_root = self.chosen_repo_root().map_err(start_error)?;
+        let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let mut spec = match self.container.take() {
             Some(spec) => spec,
             None => default_container(&self.config, self.agent.as_deref(), &repo_root)
@@ -353,17 +353,6 @@ impl SessionBuilder {
                 stop(outrig, &mut bindings).await;
                 Err(SessionError::Start(Failure(e)))
             }
-        }
-    }
-
-    /// The repository root the owner gave, made absolute against the current
-    /// directory, or the current directory.
-    fn chosen_repo_root(&self) -> Result<PathBuf, OutrigError> {
-        match &self.repo_root {
-            // Before anything keys on it: a relative root names another
-            // repository from another directory, under the same approval.
-            Some(root) => std::path::absolute(root).path_ctx("resolve", root),
-            None => std::env::current_dir().path_ctx("read", "."),
         }
     }
 
@@ -478,7 +467,7 @@ impl SessionBuilder {
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
         let resolved = self.take_resolved()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
-        let repo_root = self.chosen_repo_root().map_err(start_error)?;
+        let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = "test".to_string();
         let log_dir = self.host_log.clone().unwrap_or_default();
         let (events, lifecycle) = self.open_stream(&id, &log_dir).await?;
@@ -667,6 +656,18 @@ pub struct ContainerSpec {
     pub spec: LaunchSpec,
     /// The configured MCP servers the container does not start.
     pub left_out: Vec<String>,
+}
+
+/// The repository root an owner gave, made absolute against the current
+/// directory, or the current directory: what a session's, and a host
+/// program's, configuration resolves against.
+pub(super) fn chosen_repo_root(root: Option<&Path>) -> Result<PathBuf, OutrigError> {
+    match root {
+        // Before anything keys on it: a relative root names another
+        // repository from another directory, under the same approval.
+        Some(root) => std::path::absolute(root).path_ctx("resolve", root),
+        None => std::env::current_dir().path_ctx("read", "."),
+    }
 }
 
 /// The container a session runs in, for the `[images.<image>]` block of

@@ -61,6 +61,7 @@ pub(crate) const PACKAGE_MOUNT: &str = "/outrig/lib";
 /// source for a kernel and for a program on the host.
 const PACKAGE: &[(&str, &str)] = &[
     ("outrig/__init__.py", include_str!("outrig/__init__.py")),
+    ("outrig/_host.py", include_str!("outrig/_host.py")),
     ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),
     ("outrig/schema.py", include_str!("outrig/schema.py")),
 ];

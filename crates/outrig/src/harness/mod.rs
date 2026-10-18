@@ -25,6 +25,11 @@
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
 //!   execution running at the close ended.
 //!
+//! - **A host program.** [`HostProgram`] runs a trusted Python program on the
+//!   host as `outrig run <script.py>` does: its own `__main__`, argv, streams
+//!   and exit status, with `outrig.config()` a view of the configuration
+//!   holding no secret. It starts no session of its own.
+//!
 //! No type of the model-provider library this is built on appears here, so a
 //! release of it cannot break this surface.
 
@@ -34,6 +39,7 @@ mod builder;
 mod error;
 pub mod event;
 pub(crate) mod lifecycle;
+pub(crate) mod program;
 mod report;
 mod session;
 
@@ -43,6 +49,7 @@ pub use self::approval::{Approval, ApprovalRequest, Approver};
 pub use self::bindings::BindingSpec;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
+pub use self::program::{HostProgram, ProgramExit, RunningProgram};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
     ShutdownReport, Stopped, Verdict,

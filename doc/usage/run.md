@@ -9,6 +9,10 @@ It can also run **config-less**: in a directory with no `.agents/outrig/config.t
 current directory as the workspace and reads the agent from the global config. See
 [Config-less runs](#config-less-runs).
 
+Given a script, `outrig run <script.py> [args...]` instead runs a Python program on the host, a
+preview of a second way to drive OutRig. See
+[Running a Python program on the host](#running-a-python-program-on-the-host).
+
 ## Synopsis
 
 ```
@@ -541,6 +545,54 @@ caused by: provider returned: invalid_api_key
 ```
 
 `OPENAI_API_KEY` is unset, expired, or pointing at the wrong endpoint.
+
+## Running a Python program on the host
+
+> Preview. A later release makes `outrig run` the command of the sessions whose agents write
+> Python; until then the script form sits beside the interactive session, and `outrig
+> run-legacy` is the interactive session alone.
+
+```sh
+$ outrig run worker.py ./workspace "Fix the tests"
+```
+
+runs `worker.py` on the host as `python3 worker.py ./workspace "Fix the tests"` would, under the
+Python OutRig carries rather than any on your system. Starting it starts no container and calls
+no model.
+
+- **What it sees.** `sys.argv` is the script as you gave it and every argument after it,
+  unchanged -- `--help` and OutRig's own flag names included -- and `__name__` is `"__main__"`,
+  `__file__` the script, and the working directory, environment, stdin, stdout and stderr yours.
+  OutRig reads none of what it prints.
+- **What it imports.** The standard library, OutRig's own `outrig` package, and modules beside
+  the script. The interpreter runs isolated: neither the working directory, `PYTHONPATH`, nor
+  your user site is on `sys.path`. Like the agent's Python, it is a static build, so a package
+  with compiled parts does not load.
+- **The configuration.** Loaded and validated once, from the directory you ran `outrig` in --
+  with `--config` and the global file as for every command -- before the program starts, and
+  never again: not from the script's directory. `outrig.config()` is a read-only view of it: each
+  model with its provider, the identifier OutRig sends and its declared window, each alias with
+  its candidates in order, each provider's style and base URL, `default-model`, the resolved
+  `[workspace] host-path`, and `[events] mode`. No API key and no `${VAR}` value is in it.
+- **Flags.** `--config`, `--global-config`, `--session-root` and `-v` go before the script. The
+  interactive session's flags -- `--agent`, `--model` and the rest -- are refused there, since
+  the program chooses its own session's inputs; written after the script, they are the program's
+  arguments.
+- **Signals.** The program runs in a process group of its own. Ctrl-C, and `SIGINT` or `SIGTERM`
+  sent to `outrig`, are forwarded to that group, so the program sees them as it would from a
+  terminal. If `outrig` itself dies, the program and everything it started end with it.
+- **The terminal.** The program does not read the terminal: because its process group is not the
+  terminal's foreground group, a read from it fails at once with `EIO` (`input()` raises
+  `EOFError`). Input piped or redirected into `outrig run` reads as usual, and writing to the
+  terminal works.
+- **The exit status** is the program's: `0` off the end, `sys.exit`'s value, `1` with Python's
+  traceback for an uncaught exception, and 128 plus the signal's number for one a signal ended.
+  A script that cannot be opened as a file, or a configuration that does not load, is an
+  `error:` line and status `1`, with nothing started.
+
+The program is trusted code running with your authority, not a sandbox: it reads your files,
+holds your environment, and runs host commands. Keep its imports and any credentials it reads
+outside paths an agent can write.
 
 ## See also
 

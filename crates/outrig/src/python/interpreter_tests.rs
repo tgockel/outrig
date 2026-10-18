@@ -807,6 +807,22 @@ fn outrig_imports_in_every_kernel_as_that_kernels_runtime() {
     );
 }
 
+/// `outrig.config` is a host program's: in a kernel it is absent, so `hasattr`
+/// answers, and reading it says where it exists. No kernel holds the view.
+#[test]
+fn outrig_config_is_absent_in_a_kernel() {
+    let mut k = Interpreter::start();
+    let probe = "import outrig\n\
+                 print(hasattr(outrig, 'config'))\n\
+                 try:\n    outrig.config\n\
+                 except AttributeError as e:\n    print(e)";
+    assert_eq!(
+        k.output(1, probe),
+        "False\noutrig.config exists only in a program `outrig run` runs on the host, \
+         and this Python is not one\n"
+    );
+}
+
 /// A module in the workspace, imported once, reaches the runtime of whichever
 /// kernel calls it -- through `outrig.runtime`, and through the name a
 /// top-level `from outrig import runtime` bound when the first kernel

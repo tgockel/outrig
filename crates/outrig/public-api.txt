@@ -1444,6 +1444,12 @@ pub outrig::harness::ExecutionOutcome::status: outrig::harness::ExecutionStatus
 pub struct outrig::harness::Failure(_)
 impl outrig::harness::Failure
 pub fn outrig::harness::Failure::ran_python(&self) -> bool
+pub struct outrig::harness::HostProgram
+impl outrig::harness::HostProgram
+pub fn outrig::harness::HostProgram::args<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<std::ffi::os_str::OsString>
+pub fn outrig::harness::HostProgram::new(outrig::config::Config, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::harness::HostProgram::repo_root(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub async fn outrig::harness::HostProgram::start(self) -> core::result::Result<outrig::harness::RunningProgram, outrig::error::OutrigError>
 #[non_exhaustive] pub struct outrig::harness::HostedCall
 pub outrig::harness::HostedCall::agent: alloc::string::String
 pub outrig::harness::HostedCall::binding: alloc::string::String
@@ -1457,11 +1463,20 @@ pub outrig::harness::LogLoss::path: std::path::PathBuf
 pub outrig::harness::LogLoss::records: u64
 impl core::fmt::Display for outrig::harness::LogLoss
 pub fn outrig::harness::LogLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::ProgramExit
+impl outrig::harness::ProgramExit
+pub fn outrig::harness::ProgramExit::code(&self) -> i32
+pub fn outrig::harness::ProgramExit::status(&self) -> std::process::ExitStatus
 #[non_exhaustive] pub struct outrig::harness::RoundEnd
 pub outrig::harness::RoundEnd::reasoning: core::option::Option<alloc::string::String>
 pub outrig::harness::RoundEnd::reply: alloc::string::String
 pub outrig::harness::RoundEnd::still_running: outrig::harness::StillRunning
 pub outrig::harness::RoundEnd::stopped: core::option::Option<alloc::string::String>
+pub struct outrig::harness::RunningProgram
+impl outrig::harness::RunningProgram
+pub fn outrig::harness::RunningProgram::interrupt(&self)
+pub fn outrig::harness::RunningProgram::terminate(&self)
+pub async fn outrig::harness::RunningProgram::wait(&mut self) -> core::result::Result<outrig::harness::ProgramExit, outrig::error::OutrigError>
 pub struct outrig::harness::Session
 impl outrig::harness::Session
 pub fn outrig::harness::Session::close_admission(&self)

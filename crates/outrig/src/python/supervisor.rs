@@ -35,6 +35,10 @@
 //! [`Process::stop`] is the orderly path: `SIGTERM` to the group, a grace, `SIGKILL` to the
 //! group, the process reaped, and a report of whether the group is proven empty.
 //!
+//! A host program (`program.rs`) is the other supervised child: [`supervise`] and
+//! [`spawn_supervised`] start it with the same group, signal and check, and its bootstrap plays
+//! `binding.py`'s part in unblocking the signal and acting on it.
+//!
 //! [`crate::process::Cmd::spawn_owned`] is not used: `Cmd` takes a `&'static str` program and
 //! has no pre-exec hook, and the child is signaled as a group, which `process.rs` deliberately
 //! never does for the children sharing the owner's group. This is the second exception to that
@@ -193,9 +197,7 @@ impl fmt::Display for Member {
 /// writes, by kind.
 #[derive(Debug)]
 pub(crate) struct Process {
-    child: Child,
-    /// Its pid, which is also its process group's id.
-    pid: Pid,
+    child: Supervised,
     /// `None` once [`Process::close_stdin`] was called.
     stdin: Option<mpsc::Sender<Value>>,
     rpc: Option<mpsc::Receiver<Value>>,
@@ -204,9 +206,6 @@ pub(crate) struct Process {
     /// The qualified name of the type of what each binding's factory returned, by binding: the
     /// ready line's object.
     types: Value,
-    /// Whether `stop` reaped the process, so `Drop` has nothing left to kill. Until then the
-    /// unreaped process anchors the group's id, which names this group and no other.
-    reaped: bool,
 }
 
 /// Start the process holding the bindings `spec` describes, and wait for every factory to
@@ -226,50 +225,14 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-
-    let owner = getpid();
-    #[cfg(test)]
-    let probe = spec.probe.as_ref().map(|probe| {
-        let path = std::ffi::CString::new(probe.path.as_os_str().as_encoded_bytes())
-            .expect("a probe path without NUL");
-        let delay = nix::libc::timespec {
-            tv_sec: probe.delay.as_secs() as nix::libc::time_t,
-            tv_nsec: nix::libc::c_long::from(probe.delay.subsec_nanos()),
-        };
-        (path, delay)
-    });
-    // SAFETY: the hook runs in the child between fork and exec, a copy of a multi-threaded
-    // process with every other thread gone mid-step, so everything it calls is
-    // async-signal-safe -- open, write, close, nanosleep, sigprocmask, prctl, getppid and
-    // _exit -- and it allocates nothing and takes no lock.
-    unsafe {
-        cmd.pre_exec(move || {
+        .stderr(Stdio::piped());
+    supervise(
+        &mut cmd,
+        Supervision {
             #[cfg(test)]
-            if let Some((path, delay)) = &probe {
-                note(path, b"forked ", Some(getpid()));
-                nix::libc::nanosleep(delay, std::ptr::null_mut());
-            }
-            let mut blocked = SigSet::empty();
-            blocked.add(DEATH_SIGNAL);
-            sigprocmask(SigmaskHow::SIG_BLOCK, Some(&blocked), None)?;
-            set_pdeathsig(DEATH_SIGNAL)?;
-            if getppid() != owner {
-                #[cfg(test)]
-                if let Some((path, _)) = &probe {
-                    note(path, b"parent-changed", None);
-                }
-                nix::libc::_exit(3);
-            }
-            #[cfg(test)]
-            if let Some((path, _)) = &probe {
-                note(path, b"parent-ok", None);
-            }
-            Ok(())
-        })
-    };
+            probe: spec.probe.clone(),
+        },
+    );
 
     // What did not start, when something stops the process: every binding, or the one whose
     // factory raised.
@@ -282,17 +245,15 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
         [one] => format!("the binding {one}"),
         _ => format!("the bindings {}", names.join(", ")),
     };
-    let armed = spawn_on_parent_thread(cmd).await.map_err(|e| {
+    let mut child = spawn_supervised(cmd).await.map_err(|e| {
         OutrigError::Configuration(format!(
             "{who} did not start: cannot run {}: {e}",
             spec.python.display()
         ))
     })?;
-    let mut child = armed.into_child();
-    let pid = Pid::from_raw(child.id().expect("a child not yet waited on") as i32);
-    let stdin = child.stdin.take().expect("stdin is piped");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdin = child.stdio().stdin.take().expect("stdin is piped");
+    let mut stdout = BufReader::new(child.stdio().stdout.take().expect("stdout is piped"));
+    let stderr = child.stdio().stderr.take().expect("stderr is piped");
 
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&tail)));
@@ -308,13 +269,11 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Process> {
     // under a timeout, say -- takes the whole group with it rather than the process alone.
     let mut process = Process {
         child,
-        pid,
         stdin: Some(stdin_tx),
         rpc: Some(rpc_rx),
         events: Some(events_rx),
         stderr: tail,
         types: Value::Null,
-        reaped: false,
     };
 
     // The first line is the greeting, read here; the rest are the router's.
@@ -365,10 +324,7 @@ async fn failed_start(
     what: &str,
     why: String,
 ) -> OutrigError {
-    let _ = kill(group(process.pid), Signal::SIGKILL);
-    process.reaped = reap_by(&mut process.child, Instant::now() + KILL_WAIT)
-        .await
-        .is_some();
+    process.child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
     let mut message = format!("{what} did not start: {why}");
     let stderr = process.stderr();
@@ -381,7 +337,7 @@ async fn failed_start(
 impl Process {
     /// The process's pid, which is also its process group's id.
     pub(crate) fn pid(&self) -> Pid {
-        self.pid
+        self.child.pid()
     }
 
     /// The qualified name of the type of the object `binding`'s factory returned, such as
@@ -418,70 +374,9 @@ impl Process {
         self.stdin = None;
     }
 
-    /// Stop the process and everything it started: `SIGTERM` to its group, `grace` for the group
-    /// to leave, `SIGKILL` to the group if it has not, the process reaped, and the report.
+    /// Stop the process and everything it started: see [`Supervised::stop`].
     pub(crate) async fn stop(mut self, grace: Duration) -> Stopped {
-        let group = group(self.pid);
-        let _ = kill(group, Signal::SIGTERM);
-        let deadline = Instant::now() + grace;
-        let mut status = None;
-        loop {
-            if status.is_none() {
-                status = self.child.try_wait().ok().flatten();
-            }
-            // Only once the process itself is reaped can the group be empty.
-            if status.is_some() && group_empty(group) {
-                self.reaped = true;
-                return Stopped {
-                    status,
-                    group_empty: true,
-                    killed: false,
-                    survivors: Vec::new(),
-                };
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(GRACE_POLL).await;
-        }
-        // Before the reap: an unreaped process keeps the group's id from being reused.
-        let _ = kill(group, Signal::SIGKILL);
-        let deadline = Instant::now() + KILL_WAIT;
-        if status.is_none() {
-            // Bounded: a thread stuck in uninterruptible I/O -- a request to a hung FUSE
-            // daemon, say -- outlasts `SIGKILL`, and the process is then left to `kill_on_drop`
-            // and tokio's orphan queue, its group not proven empty.
-            status = reap_by(&mut self.child, deadline).await;
-        }
-        self.reaped = status.is_some();
-        while !group_empty(group) {
-            if Instant::now() >= deadline {
-                return Stopped {
-                    status,
-                    group_empty: false,
-                    killed: true,
-                    survivors: group_members(self.pid),
-                };
-            }
-            tokio::time::sleep(KILL_POLL).await;
-        }
-        Stopped {
-            status,
-            group_empty: true,
-            killed: true,
-            survivors: Vec::new(),
-        }
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        // Not stopped, or stopped part way: the group dies now, while the unreaped process still
-        // anchors its id. The process itself is then killed once more and reaped by
-        // `kill_on_drop` and tokio's orphan queue; the group is what only this knows about.
-        if !self.reaped {
-            let _ = kill(group(self.pid), Signal::SIGKILL);
-        }
+        self.child.stop(grace).await
     }
 }
 
@@ -531,22 +426,195 @@ fn group_empty(group: Pid) -> bool {
     kill(group, None) == Err(Errno::ESRCH)
 }
 
-/// A child whose group dies with this value until the child is taken out: what crosses from
-/// the parent thread to the caller, so a `start` dropped in between -- its child made, its
-/// reply never read -- still ends the group, where dropping the child alone would end the
-/// leader and leave what its factory had started.
-struct Armed(Option<Child>);
+/// What [`supervise`] arms a child with beyond the defaults: nothing, outside tests.
+#[derive(Default)]
+pub(crate) struct Supervision {
+    /// A test's view into the window between fork and exec; see [`Probe`].
+    #[cfg(test)]
+    pub(crate) probe: Option<Probe>,
+}
 
-impl Armed {
-    fn into_child(mut self) -> Child {
-        self.0.take().expect("the child is present until taken")
+/// Make `cmd` start as a supervised child: the leader of a process group of its own, with the
+/// parent-death signal set and blocked, and the parent check, all between fork and exec (the
+/// module doc says why each). Its program unblocks the signal once its handler is in place.
+/// Spawn it with [`spawn_supervised`], so the signal is tied to the one thread that lives as
+/// long as this process.
+pub(crate) fn supervise(cmd: &mut Command, supervision: Supervision) {
+    cmd.process_group(0).kill_on_drop(true);
+    let owner = getpid();
+    #[cfg(test)]
+    let probe = supervision.probe.as_ref().map(|probe| {
+        let path = std::ffi::CString::new(probe.path.as_os_str().as_encoded_bytes())
+            .expect("a probe path without NUL");
+        let delay = nix::libc::timespec {
+            tv_sec: probe.delay.as_secs() as nix::libc::time_t,
+            tv_nsec: nix::libc::c_long::from(probe.delay.subsec_nanos()),
+        };
+        (path, delay)
+    });
+    #[cfg(not(test))]
+    let Supervision {} = supervision;
+    // SAFETY: the hook runs in the child between fork and exec, a copy of a multi-threaded
+    // process with every other thread gone mid-step, so everything it calls is
+    // async-signal-safe -- open, write, close, nanosleep, sigprocmask, prctl, getppid and
+    // _exit -- and it allocates nothing and takes no lock.
+    unsafe {
+        cmd.pre_exec(move || {
+            #[cfg(test)]
+            if let Some((path, delay)) = &probe {
+                note(path, b"forked ", Some(getpid()));
+                nix::libc::nanosleep(delay, std::ptr::null_mut());
+            }
+            let mut blocked = SigSet::empty();
+            blocked.add(DEATH_SIGNAL);
+            sigprocmask(SigmaskHow::SIG_BLOCK, Some(&blocked), None)?;
+            set_pdeathsig(DEATH_SIGNAL)?;
+            if getppid() != owner {
+                #[cfg(test)]
+                if let Some((path, _)) = &probe {
+                    note(path, b"parent-changed", None);
+                }
+                nix::libc::_exit(3);
+            }
+            #[cfg(test)]
+            if let Some((path, _)) = &probe {
+                note(path, b"parent-ok", None);
+            }
+            Ok(())
+        })
+    };
+}
+
+/// A supervised child, and the group it leads: what [`spawn_supervised`] returns. The group is
+/// this handle's to end until it is settled: dropped before then -- not stopped, stopped part way,
+/// or its start dropped before anything held it -- the whole group dies, what the child started
+/// included, where `kill_on_drop` would end the leader alone.
+#[derive(Debug)]
+pub(crate) struct Supervised {
+    child: Child,
+    /// Its pid, which is also its process group's id: kept past the reap, since the group can
+    /// outlive its leader, and only `kill(-pgid, 0)` proves it gone.
+    pid: Pid,
+    /// Whether the group is no longer this handle's to kill: [`Supervised::stop`] proved it empty,
+    /// or reaped the child after its last `SIGKILL`; [`Supervised::kill`] reaped the child; or
+    /// [`Supervised::wait`] saw the child exit on its own, which leaves the rest of its group
+    /// running by design. Not merely the leader reaped: a stop cancelled after its polling reaped
+    /// the leader leaves the group's survivors, which still hold its id, to the drop.
+    settled: bool,
+}
+
+impl Supervised {
+    fn new(child: Child) -> Self {
+        let pid = Pid::from_raw(child.id().expect("a child not yet waited on") as i32);
+        Self {
+            child,
+            pid,
+            settled: false,
+        }
+    }
+
+    /// Its pid, which is also its process group's id.
+    pub(crate) fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Whether it has been reaped: tokio forgets the id of a child it has seen exit.
+    fn reaped(&self) -> bool {
+        self.child.id().is_none()
+    }
+
+    /// The child, for its piped stdio.
+    pub(crate) fn stdio(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Send `signal` to its group, unless the child has been reaped: an owner's signal is for a
+    /// group whose leader still anchors its id.
+    pub(crate) fn signal(&self, signal: Signal) {
+        if !self.reaped() {
+            let _ = kill(group(self.pid), signal);
+        }
+    }
+
+    /// Wait for it to exit, and reap it. Cancel-safe. The rest of its group is not waited for,
+    /// and is no longer this handle's to end.
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait().await?;
+        self.settled = true;
+        Ok(status)
+    }
+
+    /// `SIGKILL` to its group, and the child reaped if it can be within [`KILL_WAIT`].
+    pub(crate) async fn kill(&mut self) {
+        let _ = kill(group(self.pid), Signal::SIGKILL);
+        self.settled = reap_by(&mut self.child, Instant::now() + KILL_WAIT)
+            .await
+            .is_some();
+    }
+
+    /// Stop it and everything it started: `SIGTERM` to its group, `grace` for the group to leave,
+    /// `SIGKILL` to the group if it has not, the child reaped, and the report.
+    pub(crate) async fn stop(&mut self, grace: Duration) -> Stopped {
+        let group = group(self.pid);
+        let _ = kill(group, Signal::SIGTERM);
+        let deadline = Instant::now() + grace;
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                status = self.child.try_wait().ok().flatten();
+            }
+            // Only once the process itself is reaped can the group be empty.
+            if status.is_some() && group_empty(group) {
+                self.settled = true;
+                return Stopped {
+                    status,
+                    group_empty: true,
+                    killed: false,
+                    survivors: Vec::new(),
+                };
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(GRACE_POLL).await;
+        }
+        // Before the reap: an unreaped process keeps the group's id from being reused.
+        let _ = kill(group, Signal::SIGKILL);
+        let deadline = Instant::now() + KILL_WAIT;
+        if status.is_none() {
+            // Bounded: a thread stuck in uninterruptible I/O -- a request to a hung FUSE
+            // daemon, say -- outlasts `SIGKILL`, and the process is then left to `kill_on_drop`
+            // and tokio's orphan queue, its group not proven empty.
+            status = reap_by(&mut self.child, deadline).await;
+        }
+        self.settled = status.is_some();
+        while !group_empty(group) {
+            if Instant::now() >= deadline {
+                return Stopped {
+                    status,
+                    group_empty: false,
+                    killed: true,
+                    survivors: group_members(self.pid),
+                };
+            }
+            tokio::time::sleep(KILL_POLL).await;
+        }
+        Stopped {
+            status,
+            group_empty: true,
+            killed: true,
+            survivors: Vec::new(),
+        }
     }
 }
 
-impl Drop for Armed {
+impl Drop for Supervised {
     fn drop(&mut self) {
-        if let Some(id) = self.0.as_ref().and_then(Child::id) {
-            let _ = kill(group(Pid::from_raw(id as i32)), Signal::SIGKILL);
+        // Unsettled, the group dies now -- with its leader reaped or not: survivors hold its id.
+        // The process itself is then killed once more and reaped by `kill_on_drop` and tokio's
+        // orphan queue; the group is what only this knows about.
+        if !self.settled {
+            let _ = kill(group(self.pid), Signal::SIGKILL);
         }
     }
 }
@@ -554,9 +622,10 @@ impl Drop for Armed {
 /// A spawn to run on the parent thread.
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The one thread that parents every bindings process, started on first use. As with `supervise.rs`'s
-/// reaper, only a successful start is remembered, so a thread that could not be started is
-/// tried again by the next caller rather than failing every one.
+/// The one thread that parents every supervised child -- each bindings process, and a host
+/// program -- started on first use. As with `supervise.rs`'s reaper, only a successful start is
+/// remembered, so a thread that could not be started is tried again by the next caller rather
+/// than failing every one.
 fn parent_thread() -> io::Result<std_mpsc::Sender<Job>> {
     static PARENT: Mutex<Option<std_mpsc::Sender<Job>>> = Mutex::new(None);
 
@@ -566,7 +635,7 @@ fn parent_thread() -> io::Result<std_mpsc::Sender<Job>> {
     }
     let (tx, rx) = std_mpsc::channel::<Job>();
     std::thread::Builder::new()
-        .name("outrig-bind".to_string())
+        .name("outrig-parent".to_string())
         .spawn(move || {
             for job in rx {
                 // The thread's end would signal every process it started, so a panic in one
@@ -578,21 +647,22 @@ fn parent_thread() -> io::Result<std_mpsc::Sender<Job>> {
     Ok(tx)
 }
 
-/// Spawn `cmd` from the parent thread, under the calling runtime.
-async fn spawn_on_parent_thread(mut cmd: Command) -> io::Result<Armed> {
+/// Spawn `cmd`, which [`supervise`] armed, from the parent thread, under the calling runtime.
+pub(crate) async fn spawn_supervised(mut cmd: Command) -> io::Result<Supervised> {
     let handle = Handle::current();
     let (tx, rx) = oneshot::channel();
     let job: Job = Box::new(move || {
         let _runtime = handle.enter();
-        // A reply nobody reads -- the requester's `start` dropped meanwhile -- drops the
-        // `Armed` value, which ends the group.
-        let _ = tx.send(cmd.spawn().map(|child| Armed(Some(child))));
+        // A reply nobody reads -- the requester's start dropped meanwhile -- drops the
+        // `Supervised` value, which ends the group.
+        let _ = tx.send(cmd.spawn().map(Supervised::new));
     });
     parent_thread()?
         .send(job)
-        .map_err(|_| io::Error::other("the thread that starts bindings is gone"))?;
-    rx.await
-        .map_err(|_| io::Error::other("the thread that starts bindings dropped the spawn"))?
+        .map_err(|_| io::Error::other("the thread that starts supervised children is gone"))?;
+    rx.await.map_err(|_| {
+        io::Error::other("the thread that starts supervised children dropped the spawn")
+    })?
 }
 
 /// Append `text`, then `pid` in decimal when given, then a newline to the probe file at `path`,
@@ -721,6 +791,6 @@ fn tail_text(tail: &Mutex<VecDeque<String>>) -> String {
 }
 
 /// The start of `line`, as a diagnostic quotes it.
-fn quoted(line: &[u8]) -> String {
+pub(super) fn quoted(line: &[u8]) -> String {
     String::from_utf8_lossy(&line[..line.len().min(QUOTED)]).into_owned()
 }

@@ -505,12 +505,18 @@ identifier = "test-model"
 "#;
 
 /// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
-/// probes and pulls fail instantly instead of hitting the network.
+/// probes and pulls fail instantly instead of hitting the network. Each call
+/// is appended to `<dir>/runtime.log`, so a test can say none was made.
 #[allow(dead_code)]
-fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
+pub fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
+    let log = dir.join("runtime.log");
     for name in ["podman", "buildah"] {
         let stub = dir.join(name);
-        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write runtime stub");
+        let script = format!(
+            "#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 1\n",
+            log.display()
+        );
+        std::fs::write(&stub, script).expect("write runtime stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("chmod runtime stub");
     }

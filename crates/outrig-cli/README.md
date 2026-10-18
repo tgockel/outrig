@@ -41,7 +41,8 @@ src/, and doc/. src/ has lib.rs and main.rs...
 outrig init               # set up global config and scaffold an image config
 outrig config init        # configure global settings interactively
 outrig run                # start an interactive agent session
-outrig run-legacy         # another name for `run`
+outrig run worker.py      # preview: run a Python program on the host
+outrig run-legacy         # the interactive session alone, never a script
 outrig run-new            # preview: a session whose agent acts by writing Python
 outrig mcp                # serve the configured MCP servers as one MCP over stdio
 outrig design prompt      # generate AI-assisted design prompts

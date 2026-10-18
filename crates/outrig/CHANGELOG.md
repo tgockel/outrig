@@ -320,6 +320,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its JSON key, and `text()` renders the JSON Schema with every `doc()` text verbatim.
   Channel contracts take the same types, and a dataclass sent on a channel now crosses as its
   fields' values under their keys, where before the send raised.
+- **`harness::HostProgram`: a trusted Python program on the host, as `outrig run <script.py>`
+  runs one.** `HostProgram::new(config, script)`, with `args` and `repo_root`, starts the script
+  as `__main__` under the payload's interpreter, isolated, with `outrig` and the script's
+  directory on `sys.path`; it inherits this process's working directory, environment and stdio.
+  It is a supervised child, as the bindings process is: a process group of its own, and the
+  parent-death signal, so it and what it started end with this process. A script that cannot be
+  opened as a file fails `start` before anything is unpacked. `RunningProgram::interrupt` and
+  `terminate` send `SIGINT` and `SIGTERM` to its group -- nothing here installs a signal handler
+  -- and `wait` returns a `ProgramExit`, whose `code` is the program's status or 128 plus the
+  signal that ended it. The program reaches the engine over two inherited pipes that nothing it
+  starts inherits: `outrig.config()` there is a frozen view of the `Config` -- each model's
+  provider, effective identifier and declared window, each alias's candidates in order, each
+  provider's style and base URL, `default-model`, the resolved workspace and the events mode --
+  holding no key and no `${VAR}`. In a kernel, `outrig.config` is absent.
 
 ### Changed
 
