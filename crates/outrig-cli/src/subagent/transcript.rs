@@ -74,6 +74,28 @@ impl Transcript {
         self.write(&format!("\n=== prompt ===\n{prompt}\n")).await;
     }
 
+    /// Which models answered the round's model calls, when a chain moved off its
+    /// head (#265). `answered` holds indices into `chain`, the launch's
+    /// candidates in chain order; one line per candidate, in the header's own
+    /// shape.
+    ///
+    /// Nothing when the head alone answered, which is every round of a
+    /// single-candidate launch: the header already names where the subagent
+    /// started, so a subagent that never moved keeps the transcript it had. An
+    /// index `chain` has no label for is skipped, for the reason a failed write
+    /// is -- logging never fails a round.
+    pub async fn record_answered(&mut self, chain: &[ModelLabel], answered: &[usize]) {
+        if answered.iter().all(|&index| index == 0) {
+            return;
+        }
+        let lines: Vec<String> = answered
+            .iter()
+            .filter_map(|&index| chain.get(index))
+            .map(ModelLabel::detail)
+            .collect();
+        self.record_outcome("answered by", &lines.join("\n")).await;
+    }
+
     pub async fn record_reply(&mut self, reply: &str) {
         if reply.is_empty() {
             return;
@@ -172,6 +194,53 @@ mod tests {
 
         let text = read_back(dir.path(), "audit").await;
         assert!(text.contains("first") && text.contains("second"));
+    }
+
+    fn candidate(name: &str, provider: &str, identifier: &str) -> ModelLabel {
+        ModelLabel {
+            name: name.to_string(),
+            provider: provider.to_string(),
+            identifier: identifier.to_string(),
+        }
+    }
+
+    fn chain() -> Vec<ModelLabel> {
+        vec![
+            candidate("head-model", "head", "claude-sonnet-4-6"),
+            candidate("next-model", "next", "claude-opus-4-7"),
+        ]
+    }
+
+    /// The block names every model that answered, in the shape the header uses
+    /// for the one it started on.
+    #[tokio::test]
+    async fn records_the_models_that_answered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = Transcript::open(dir.path(), &[], "audit", None).await;
+        log.record_answered(&chain(), &[0, 1]).await;
+
+        assert_eq!(
+            read_back(dir.path(), "audit").await,
+            "=== subagent audit ===\n\
+             \n--- answered by ---\n\
+             model: head-model / provider: head / claude-sonnet-4-6\n\
+             model: next-model / provider: next / claude-opus-4-7\n"
+        );
+    }
+
+    /// A subagent that never left its head -- or never had a chain -- has
+    /// nothing to record, and its transcript stays byte for byte what it was.
+    #[tokio::test]
+    async fn a_round_the_head_answered_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = Transcript::open(dir.path(), &[], "audit", None).await;
+        log.record_answered(&chain(), &[0]).await;
+        log.record_answered(&chain(), &[]).await;
+
+        assert_eq!(
+            read_back(dir.path(), "audit").await,
+            "=== subagent audit ===\n"
+        );
     }
 
     /// The streaming path returns an empty reply for the primary agent, and a

@@ -75,8 +75,12 @@ That includes [aliases](../reference/config.md), since an alias is a model like 
 alias is offered when **at least one** of its candidates is reachable in this build, which is what
 lets `alias = ["opus-local", "opus-anthropic"]` stay launchable without `--features local-llm`
 where naming `opus-local` directly would not be. A launch under an alias reports the hop it took --
-`(model: cheap -> fast)` -- in the launch trace, the tool result, and the transcript header, so
-the answer to "which model actually ran" is never inferred.
+`(model: cheap -> fast)` -- in the launch trace, the tool result, and the transcript header, which
+name the candidate the subagent *starts* on. An alias that lists more than one can move mid-round,
+so the transcript also records each round a later candidate answered: an `--- answered by ---`
+block naming every model that answered a call that round, in the order the alias lists them. A
+round the first candidate answered throughout adds nothing. Together they mean the answer to "which
+model actually ran" is never inferred.
 
 This is for delegating mechanical work. Grepping a tree, summarizing logs, or checking whether a
 symbol is still used does not need the parent's expensive reasoning model, and moving it to a cheap

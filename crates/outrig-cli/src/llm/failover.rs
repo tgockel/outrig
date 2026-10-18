@@ -48,7 +48,8 @@
 //! [`ChainDeadline`]: super::retry::ChainDeadline
 //! [`retry`]: super::retry
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, PromptError,
@@ -193,11 +194,22 @@ struct Abandoned {
 /// `Clone` because rig's `CompletionModel` requires it and `Agent` clones the
 /// model per request. Every field shares rather than rebuilds: the candidates
 /// behind an `Arc` so cloning cannot re-pay a mistralrs weight load, and the
-/// policy's own clone deliberately shares the chain deadline.
+/// policy's own clone deliberately shares the chain deadline and the record of
+/// who answered.
 #[derive(Clone)]
 pub struct FailoverModel {
     candidates: Arc<Vec<Box<dyn Candidate>>>,
     policy: RetryPolicy,
+    /// Indices into `candidates` that returned `Ok` since the last
+    /// [`take_answered`](Self::take_answered), for attribution after the fact
+    /// (#265).
+    ///
+    /// A set, because every call starts again at the head: one round of several
+    /// calls can be answered by the head, by a fallback, or by both, and the
+    /// latest call's candidate says nothing of the others. Shared across rig's
+    /// per-request clones, as the policy's chain deadline is, so whoever holds
+    /// the model sees what any clone recorded. Never held across an await.
+    answered: Arc<Mutex<BTreeSet<usize>>>,
     /// ANDed across the chain, computed once at build time -- see
     /// [`composes_native_output_with_tools`].
     ///
@@ -226,8 +238,19 @@ impl FailoverModel {
         Self {
             candidates: Arc::new(candidates),
             policy,
+            answered: Arc::default(),
             composes,
         }
+    }
+
+    /// The candidates that returned `Ok` to a `completion()` call since this was
+    /// last asked, as indices into the list the chain was built from, ascending.
+    ///
+    /// A call that failed on every candidate answered nothing and is not here.
+    pub(crate) fn take_answered(&self) -> Vec<usize> {
+        std::mem::take(&mut *self.answered.lock().expect("answered record"))
+            .into_iter()
+            .collect()
     }
 }
 
@@ -343,7 +366,13 @@ impl CompletionModel for FailoverModel {
             attempt.max_tokens = candidate.max_tokens();
 
             match candidate.completion(attempt).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    self.answered
+                        .lock()
+                        .expect("answered record")
+                        .insert(index);
+                    return Ok(response);
+                }
                 Err(error) => {
                     // Announced once per move, on stderr beside the retry
                     // lines. An alias already widens what a config typo can
@@ -797,6 +826,80 @@ mod tests {
             2,
             "the second call must try candidate one again"
         );
+    }
+
+    /// #265: after a call that moved, the record holds the candidate that
+    /// answered. Through a clone, since rig clones the model per request and
+    /// what a clone records has to reach whoever holds the original.
+    #[tokio::test]
+    async fn the_record_holds_the_candidate_a_move_landed_on() {
+        let model = chain(vec![
+            Box::new(Scripted::failing("bedrock", http_status(503))),
+            Box::new(Scripted::ok("anthropic")),
+        ]);
+
+        model
+            .clone()
+            .completion(request())
+            .await
+            .expect("moves to second");
+
+        assert_eq!(model.take_answered(), [1]);
+    }
+
+    /// A head that answers is recorded like any other candidate: whether that
+    /// is worth saying is for the reader of the record, not the record.
+    #[tokio::test]
+    async fn the_record_holds_the_head_when_only_the_head_answered() {
+        let model = chain(vec![
+            Box::new(Scripted::ok("bedrock")),
+            Box::new(Scripted::ok("anthropic")),
+        ]);
+
+        model.completion(request()).await.expect("head answers");
+        model.completion(request()).await.expect("head answers");
+
+        assert_eq!(model.take_answered(), [0]);
+    }
+
+    /// A round is several calls and each starts at the head, so one can be
+    /// answered by a fallback and the next by the head: the record is a set,
+    /// in chain order, and reading it starts it over.
+    #[tokio::test]
+    async fn a_mixed_round_records_both_and_reading_drains() {
+        let model = chain(vec![
+            Box::new(Scripted::new(
+                "bedrock",
+                vec![Err(http_status(429)), Ok("recovered")],
+            )),
+            Box::new(Scripted::ok("anthropic")),
+        ]);
+
+        model.completion(request()).await.expect("moves to second");
+        model.completion(request()).await.expect("head recovered");
+
+        assert_eq!(model.take_answered(), [0, 1]);
+        assert!(
+            model.take_answered().is_empty(),
+            "the next round starts from an empty record"
+        );
+    }
+
+    /// A call that failed on every candidate produced no output, so nothing
+    /// is attributed to anyone.
+    #[tokio::test]
+    async fn an_exhausted_chain_records_nothing() {
+        let model = chain(vec![
+            Box::new(Scripted::failing("bedrock", http_status(503))),
+            Box::new(Scripted::failing("anthropic", http_status(503))),
+        ]);
+
+        model
+            .completion(request())
+            .await
+            .expect_err("every candidate failed");
+
+        assert!(model.take_answered().is_empty());
     }
 
     /// Streaming reaches no candidate at all; the mistralrs arm, which is the

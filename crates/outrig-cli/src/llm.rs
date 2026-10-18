@@ -2003,6 +2003,21 @@ impl RigAgent {
             }
         }
     }
+
+    /// The candidates of a chain that answered a model call since this was last
+    /// asked, as indices into [`ResolvedAgent::candidates`] -- the chain is
+    /// built from that list in order -- ascending (#265).
+    ///
+    /// Empty for a single-candidate agent, whose one candidate is index 0 and
+    /// the model it was launched on. For a chain it is what a transcript needs
+    /// to attribute a round honestly: a launch label names the head, but a call
+    /// that failed over was answered by a later candidate.
+    pub(crate) fn take_answered(&self) -> Vec<usize> {
+        match self {
+            RigAgent::Failover { agent, .. } => agent.model.take_answered(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A [`RigAgent`] plus the recipe to rebuild it when `/sidecar add` grows

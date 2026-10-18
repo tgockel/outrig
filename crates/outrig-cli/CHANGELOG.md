@@ -85,6 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent's transcript now says which model answered when a model alias failed over.** The
+  transcript header, the launch trace, and the tool result name the alias's first candidate, so a
+  subagent whose calls moved to a later candidate (head rate-limited, down, or refusing its key)
+  was attributed to a model that wrote none of it, with no trace of the move but stderr. Each round
+  that a later candidate answered now writes an `--- answered by ---` block naming every model that
+  answered a call in it, in alias order; the header still names where the subagent started. A
+  subagent that never left its first candidate, or a launch under a single model, is unchanged
+  (#265).
 - **A repo mount can no longer cover a directory the global config's path passes through
   read-write.** The #445 rule compared a mount with where that path resolves today, but the next
   session resolves it again, so an agent that could write a directory in it could redirect it: by

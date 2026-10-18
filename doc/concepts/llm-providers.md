@@ -183,8 +183,10 @@ A move happens *between* model calls, never around a whole turn, so tool calls t
 ran are not re-executed -- a turn that fails on its fifth model call has already run the tool calls
 from the first four, and those stay done.
 
-The cost is that one reply can be half one model's work. That is why a move prints, and why the
-banner lists the fallbacks a session may reach before it starts.
+The cost is that one reply can be half one model's work. That is why a move prints, why the banner
+lists the fallbacks a session may reach before it starts, and why a
+[subagent's transcript](subagents.md) records which models answered a round that left the first
+candidate.
 
 The history travels with the chain, with one exception: an Anthropic candidate is sent only the
 reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, or an OpenAI-style

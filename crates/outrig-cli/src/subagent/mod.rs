@@ -40,7 +40,7 @@ use futures_util::future::select_all;
 use outrig::config::Config;
 use tokio::task::JoinHandle;
 
-use crate::llm::{ResolvedAgent, TurnStop};
+use crate::llm::{ResolvedAgent, ResolvedCandidate, TurnStop};
 use crate::session_tool::{SessionTool, SharedTools};
 use state::{GaveUp, Outcome, SubagentShared};
 
@@ -237,6 +237,13 @@ impl SubagentRegistry {
         // and the header cannot disagree about which model ran. Cloned because
         // `label` moves into the round loop below.
         let launched_as = label.clone();
+        // Every candidate, in the order `build_agent` chains them: that order is
+        // how the indices `RigAgent::take_answered` reports find their label.
+        let chain: Vec<ModelLabel> = resolved
+            .candidates
+            .iter()
+            .map(ModelLabel::of_candidate)
+            .collect();
         {
             let entries = self.lock();
             if entries.contains_key(name) {
@@ -289,6 +296,7 @@ impl SubagentRegistry {
             self.ctx.log_dir.clone(),
             self.ctx.ancestry.clone(),
             label,
+            chain,
         ));
         let abort = task.abort_handle();
         // Register before the name check below, not after it: the ledger is
@@ -710,8 +718,10 @@ impl ModelLabel {
     ///
     /// That is the model the subagent starts on, and for a chain it is a
     /// preference rather than a certainty: a mid-turn move changes which model
-    /// is answering without changing this label. Attribution that has to be
-    /// exact about what served a given reply cannot read it -- see #265.
+    /// is answering without changing this label. The transcript records the
+    /// move itself, one `answered by` block per round that left the head (#265),
+    /// so attribution that has to be exact about what served a reply reads
+    /// that and not this.
     fn of(resolved: &ResolvedAgent) -> Self {
         Self {
             // `model_display`, not `model_name`: a launch under an alias shows
@@ -720,6 +730,17 @@ impl ModelLabel {
             name: resolved.model_display(),
             provider: resolved.provider_name().to_string(),
             identifier: resolved.model_identifier().to_string(),
+        }
+    }
+
+    /// One candidate of the chain a launch resolved to, for the transcript's
+    /// `answered by` block. The concrete row, never an alias hop: an answer came
+    /// from a row.
+    fn of_candidate(candidate: &ResolvedCandidate) -> Self {
+        Self {
+            name: candidate.model_name.clone(),
+            provider: candidate.provider_name.clone(),
+            identifier: candidate.model_identifier.clone(),
         }
     }
 
@@ -932,6 +953,7 @@ async fn run_rounds(
     log_dir: PathBuf,
     ancestry: Vec<String>,
     label: Option<ModelLabel>,
+    chain: Vec<ModelLabel>,
 ) {
     let mut history = Vec::new();
     let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref()).await;
@@ -962,6 +984,9 @@ async fn run_rounds(
         let outcome = agent
             .run_turn_captured(&prompt, &mut history, &name, injections)
             .await;
+        // Asked whether the turn succeeded or not: the calls before a failing
+        // one may already have been answered by a fallback.
+        let answered = agent.take_answered();
 
         // Why the round failed, if it did. Worked out before the round stops
         // taking steers, since it decides where the ones no result carried go.
@@ -1016,6 +1041,7 @@ async fn run_rounds(
         let steers = shared.close_injections(failure.is_none());
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
+        log.record_answered(&chain, &answered).await;
         log.record_reply(&reply).await;
         if shared.gave_up() == Some(GaveUp::KeptReport) {
             // The give-up goes beside the report rather than over it (#350), as
@@ -1201,6 +1227,38 @@ pub(crate) mod fixtures {
         let mut cfg = test_config();
         cfg.models
             .insert("cheap".to_string(), Model::alias(["fast"]));
+        cfg
+    }
+
+    /// [`test_config`] plus `chain`, an alias over `head-model` and
+    /// `next-model`, each on a provider of its own at the endpoint given.
+    ///
+    /// Retries are off, so a head that fails hands the call to `next-model` at
+    /// once instead of riding out a budget first.
+    pub(crate) fn chain_config(head_url: &str, next_url: &str) -> Config {
+        let mut cfg = test_config();
+        for (provider, url, model, identifier) in [
+            ("head", head_url, "head-model", "head-id"),
+            ("next", next_url, "next-model", "next-id"),
+        ] {
+            cfg.providers.insert(
+                provider.to_string(),
+                LlmProvider::openai(
+                    url,
+                    ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
+                    OpenAiOptions::new()
+                        .with_request_timeout_secs(60)
+                        .with_retry_budget_secs(0),
+                ),
+            );
+            let mut row = Model::new(provider);
+            row.identifier = Some(identifier.to_string());
+            cfg.models.insert(model.to_string(), row);
+        }
+        cfg.models.insert(
+            "chain".to_string(),
+            Model::alias(["head-model", "next-model"]),
+        );
         cfg
     }
 
@@ -1937,9 +1995,7 @@ mod tests {
     /// follow-up itself: had the steer run as a round of its own, that round
     /// would have come first.
     async fn follow_up(registry: &SubagentRegistry, provider: &mut ScriptedProvider) -> ModelCall {
-        tokio::time::timeout(WAIT_TIMEOUT, until_idle(registry, "probe"))
-            .await
-            .expect("the round went idle");
+        probe_went_idle(registry).await;
         assert_eq!(
             registry.send("probe", FOLLOW_UP.to_string()),
             Ok("started a new round")
@@ -2893,9 +2949,7 @@ mod tests {
         provider: &mut ScriptedProvider,
         log_dir: &tempfile::TempDir,
     ) {
-        tokio::time::timeout(WAIT_TIMEOUT, until_idle(registry, "probe"))
-            .await
-            .expect("the round went idle");
+        probe_went_idle(registry).await;
         assert_eq!(
             registry.get_result("probe").await,
             Ok(Outcome::Result("the findings".to_string())),
@@ -2905,9 +2959,7 @@ mod tests {
         // The next round records its prompt before its first model call, so
         // by now the round's transcript entry is written.
         let call = follow_up(registry, provider).await;
-        let transcript = tokio::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
-            .await
-            .expect("transcript exists");
+        let transcript = probe_transcript(log_dir).await;
         assert!(
             transcript.contains(&format!("\n--- {what} ---\n")),
             "{what} is noted: {transcript}"
@@ -3792,6 +3844,187 @@ mod tests {
             text.starts_with(
                 "=== subagent audit (model: cheap -> fast / provider: openai / gpt-4o-mini) ===\n"
             ),
+            "got: {text}"
+        );
+    }
+
+    /// A registry whose subagents run against `chain` -- see [`chain_config`] --
+    /// with `head` and `next` as the two providers behind it.
+    fn chain_registry(
+        head: &ScriptedProvider,
+        next: &ScriptedProvider,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
+        registry_with(
+            chain_config(&head.server.base_url, &next.server.base_url),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        )
+    }
+
+    /// `probe` launched under `chain`, with its first round under way.
+    async fn launch_probe_on_chain(
+        head: &ScriptedProvider,
+        next: &ScriptedProvider,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
+        let (registry, log_dir) = chain_registry(head, next);
+        registry
+            .launch("probe", Some("chain"), None, "do the work".to_string())
+            .await
+            .expect("launch");
+        (registry, log_dir)
+    }
+
+    /// Wait for `probe`'s round to end, without letting a round that never does
+    /// hang the test.
+    async fn probe_went_idle(registry: &SubagentRegistry) {
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(registry, "probe"))
+            .await
+            .expect("the round went idle");
+    }
+
+    async fn probe_transcript(log_dir: &tempfile::TempDir) -> String {
+        tokio::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
+            .await
+            .expect("transcript exists")
+    }
+
+    /// Run `probe`'s round -- a report, then a close -- against `provider`, and
+    /// assert the transcript up to the next round's prompt is `header` and that
+    /// round and nothing else.
+    async fn assert_round_transcript(
+        registry: &SubagentRegistry,
+        provider: &mut ScriptedProvider,
+        log_dir: &tempfile::TempDir,
+        header: &str,
+    ) {
+        provider.next_call().await.set_result("the findings");
+        provider.next_call().await.reply("done");
+        let call = follow_up(registry, provider).await;
+
+        let expected = format!(
+            "{header}\n=== prompt ===\ndo the work\n\
+             \n--- reply ---\ndone\n\
+             \n--- result ---\nthe findings\n\
+             \n=== prompt ===\n"
+        );
+        let text = probe_transcript(log_dir).await;
+        assert!(text.starts_with(&expected), "got: {text}");
+        call.reply("ok");
+    }
+
+    /// #265: the head is down for every call, so the fallback wrote everything
+    /// the round produced. The header still names where the subagent started,
+    /// and the transcript says who answered.
+    #[tokio::test]
+    async fn the_transcript_names_the_fallback_that_answered() {
+        let mut head = ScriptedProvider::start().await;
+        let mut next = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe_on_chain(&head, &next).await;
+
+        head.next_call().await.fail(StatusCode::SERVICE_UNAVAILABLE);
+        next.next_call().await.set_result("written by the fallback");
+        head.next_call().await.fail(StatusCode::SERVICE_UNAVAILABLE);
+        next.next_call().await.reply("done");
+        probe_went_idle(&registry).await;
+
+        let text = probe_transcript(&log_dir).await;
+        assert!(
+            text.starts_with(
+                "=== subagent probe (model: chain -> head-model / provider: head / head-id) ===\n"
+            ),
+            "the header is where the subagent started: {text}"
+        );
+        assert!(
+            text.contains("\n--- answered by ---\nmodel: next-model / provider: next / next-id\n"),
+            "the fallback is named: {text}"
+        );
+        assert!(
+            !text.contains("model: head-model / provider: head / head-id\n"),
+            "the head answered nothing: {text}"
+        );
+    }
+
+    /// A round is several model calls and each starts at the head, so the head
+    /// can answer one that a fallback did not. The block names both, in chain
+    /// order, rather than whichever answered last.
+    #[tokio::test]
+    async fn a_round_answered_by_both_names_both() {
+        let mut head = ScriptedProvider::start().await;
+        let mut next = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe_on_chain(&head, &next).await;
+
+        head.next_call().await.fail(StatusCode::SERVICE_UNAVAILABLE);
+        next.next_call().await.set_result("written by the fallback");
+        head.next_call().await.reply("done");
+        probe_went_idle(&registry).await;
+
+        assert!(
+            probe_transcript(&log_dir).await.contains(
+                "\n--- answered by ---\n\
+                 model: head-model / provider: head / head-id\n\
+                 model: next-model / provider: next / next-id\n"
+            ),
+            "both are named, head first"
+        );
+    }
+
+    /// A chain whose head answers everything is where the subagent started, so
+    /// its transcript carries nothing the header does not say.
+    #[tokio::test]
+    async fn a_chain_whose_head_answers_adds_nothing() {
+        let mut head = ScriptedProvider::start().await;
+        let next = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe_on_chain(&head, &next).await;
+
+        assert_round_transcript(
+            &registry,
+            &mut head,
+            &log_dir,
+            "=== subagent probe (model: chain -> head-model / provider: head / head-id) ===\n",
+        )
+        .await;
+    }
+
+    /// The same round under a single candidate, as it was before the record
+    /// existed: byte for byte, with no block.
+    #[tokio::test]
+    async fn a_single_candidate_transcript_is_unchanged() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe(&provider, 4).await;
+
+        assert_round_transcript(
+            &registry,
+            &mut provider,
+            &log_dir,
+            "=== subagent probe ===\n",
+        )
+        .await;
+    }
+
+    /// An inherited launch has no model in its header, but it runs the parent's
+    /// chain, and a move there is as invisible as under a named alias.
+    #[tokio::test]
+    async fn an_inherited_launch_under_a_chain_records_a_move() {
+        let mut head = ScriptedProvider::start().await;
+        let mut next = ScriptedProvider::start().await;
+        let (mut registry, log_dir) = chain_registry(&head, &next);
+        registry.ctx.resolved =
+            resolve_launch_model(&registry.ctx, Some("chain")).expect("chain resolves");
+        registry
+            .launch("probe", None, None, "do the work".to_string())
+            .await
+            .expect("launch");
+
+        head.next_call().await.fail(StatusCode::SERVICE_UNAVAILABLE);
+        next.next_call().await.set_result("written by the fallback");
+        head.next_call().await.fail(StatusCode::SERVICE_UNAVAILABLE);
+        next.next_call().await.reply("done");
+        probe_went_idle(&registry).await;
+
+        let text = probe_transcript(&log_dir).await;
+        assert!(text.starts_with("=== subagent probe ===\n"), "got: {text}");
+        assert!(
+            text.contains("\n--- answered by ---\nmodel: next-model / provider: next / next-id\n"),
             "got: {text}"
         );
     }
