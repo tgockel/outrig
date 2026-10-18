@@ -6,12 +6,16 @@
 //! transcription of it, so an edit that reintroduces a key the schema does not
 //! have fails here instead of turning into a warning at the reader's first
 //! `outrig mcp`. `doc/usage/mcp.md` advertised `[workspace] root = "."` for
-//! three releases; `Workspace` has no `root`.
+//! three releases; `Workspace` has no `root`. The startup transcript on the
+//! `outrig run` page is held to the phases `run_smoke` checks the binary for.
 
 use std::path::Path;
 
 use outrig::config::Config;
 use outrig_cli::image_setup::render::{self, BaseImage, McpServer, Toolchain};
+
+mod common;
+use common::{STARTUP_PHASES, assert_lines_in_order};
 
 /// `doc/` lives at the workspace root; this crate's manifest dir is
 /// `crates/outrig-cli`. Same walk as `prompt_doc_sync.rs`.
@@ -37,6 +41,16 @@ fn fenced_block_after(markdown: &str, heading: &str, lang: &str) -> String {
         .unwrap_or_else(|| panic!("unterminated ```{lang} block under {heading:?}"))
         .0
         .to_string()
+}
+
+#[test]
+fn the_run_pages_startup_transcript_shows_every_startup_phase() {
+    let page = workspace_root().join("doc/usage/run.md");
+    let markdown =
+        std::fs::read_to_string(&page).unwrap_or_else(|e| panic!("{}: {e}", page.display()));
+    let transcript = fenced_block_after(&markdown, "\n## REPL banner\n", "");
+
+    assert_lines_in_order(&transcript, STARTUP_PHASES);
 }
 
 #[test]

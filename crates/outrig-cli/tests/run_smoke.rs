@@ -30,8 +30,9 @@ use tokio::time::timeout;
 
 mod common;
 use common::{
-    CannedResponse, E2E_TIMEOUT, fixture_mcp_fs_dir, next_recorded, podman_names, start_mock_http,
-    stream_lines, wait_for_stderr_value, wait_until_gone,
+    CannedResponse, E2E_TIMEOUT, STARTUP_PHASES, assert_lines_in_order, fixture_mcp_fs_dir,
+    next_recorded, podman_names, start_mock_http, stream_lines, wait_for_stderr_value,
+    wait_until_gone,
 };
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
@@ -254,31 +255,14 @@ async fn run_drives_one_tool_call_and_prints_reply() {
         stderr_str.contains("[outrig] agent:"),
         "stderr lacked banner: {stderr_str}"
     );
-    assert_stderr_lines_in_order(
-        &stderr_str,
-        &[
-            "[outrig] loading config",
-            "[outrig] config loaded",
-            "[outrig] resolving agent and container",
-            "[outrig] agent/container resolved",
-            "[outrig] computing image tag",
-            "[outrig] image tag computed",
-            "[outrig] ensuring image",
-            "[outrig] image ready:",
-            "[outrig] starting container",
-            "[outrig] container ready:",
-            "[outrig] bootstrapping container user",
-            "[outrig] container user ready",
-            "[outrig] MCP fs: initializing",
-            "[outrig] MCP fs: initialized",
-            "[outrig] MCP fs: listing tools",
-            "[outrig] MCP fs: tools ready",
-            "[outrig] building agent",
-            "[outrig] agent ready",
-            "[outrig] agent:",
-            "[outrig] base-url:          http://127.0.0.1:",
-            "[outrig] entering REPL",
-        ],
+    assert_lines_in_order(&stderr_str, STARTUP_PHASES);
+    assert!(
+        stderr_str.contains("[outrig] MCP configuration ready: 1 server ("),
+        "stderr lacked the MCP configuration count: {stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("[outrig] base-url:          http://127.0.0.1:"),
+        "stderr lacked the mock's base-url: {stderr_str}"
     );
     assert!(
         stderr_str.contains("[outrig] tool call: fs__list_directory"),
@@ -458,7 +442,7 @@ async fn a_cache_miss_shows_the_build_on_a_plain_run() {
         captured.status,
         captured.stderr
     );
-    assert_stderr_lines_in_order(
+    assert_lines_in_order(
         &captured.stderr,
         &[
             "[outrig] ensuring image smoke-miss:",
@@ -1416,17 +1400,6 @@ struct Captured {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
-}
-
-fn assert_stderr_lines_in_order(stderr: &str, needles: &[&str]) {
-    let mut offset = 0;
-    for needle in needles {
-        let haystack = &stderr[offset..];
-        let Some(pos) = haystack.find(needle) else {
-            panic!("stderr lacked ordered startup line {needle:?}: {stderr}");
-        };
-        offset += pos + needle.len();
-    }
 }
 
 async fn run_child(args: &[&str], repo: &Path) -> Captured {

@@ -782,3 +782,49 @@ pub async fn run_outrig_output(
     .expect("outrig timed out")
     .expect("spawn outrig")
 }
+
+/// The startup progress lines `outrig run` prints on stderr, in order, from
+/// the first one to the one that opens the REPL, each as far as it is the same
+/// from one run to the next. `run_smoke` holds the binary to it and
+/// `doc_contracts` holds the transcript on `doc/usage/run.md` to it, so
+/// neither can lose a step the other still shows.
+#[allow(dead_code)]
+pub const STARTUP_PHASES: &[&str] = &[
+    "[outrig] loading config",
+    "[outrig] config loaded",
+    "[outrig] workspace:",
+    "[outrig] resolving agent and container",
+    "[outrig] agent/container resolved",
+    "[outrig] computing image tag",
+    "[outrig] image tag computed",
+    "[outrig] ensuring image",
+    "[outrig] image ready:",
+    "[outrig] starting container",
+    "[outrig] container ready:",
+    "[outrig] bootstrapping container user",
+    "[outrig] container user ready",
+    "[outrig] reading and merging MCP configuration",
+    "[outrig] MCP configuration ready:",
+    "[outrig] MCP fs: initializing",
+    "[outrig] MCP fs: initialized",
+    "[outrig] MCP fs: listing tools",
+    "[outrig] MCP fs: tools ready",
+    "[outrig] building agent",
+    "[outrig] agent ready",
+    "[outrig] agent:",
+    "[outrig] base-url:",
+    "[outrig] entering REPL",
+];
+
+/// Panics unless every needle occurs in `text`, each after the one before it.
+#[allow(dead_code)]
+pub fn assert_lines_in_order(text: &str, needles: &[&str]) {
+    let mut offset = 0;
+    for needle in needles {
+        let haystack = &text[offset..];
+        let Some(pos) = haystack.find(needle) else {
+            panic!("text lacked ordered startup line {needle:?}: {text}");
+        };
+        offset += pos + needle.len();
+    }
+}

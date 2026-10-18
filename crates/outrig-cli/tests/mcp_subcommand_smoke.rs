@@ -34,11 +34,15 @@ use outrig_cli::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 mod common;
-use common::{E2E_TIMEOUT, fixture_mcp_fs_dir, podman_names, stream_lines, wait_for_stderr_value};
+use common::{
+    E2E_TIMEOUT, assert_lines_in_order, fixture_mcp_fs_dir, podman_names, stream_lines,
+    wait_for_stderr_value,
+};
 
 fn fs_spec() -> McpServerSpec {
     McpServerSpec::Short(vec![
@@ -896,6 +900,69 @@ async fn run_mcp_expecting_failure(
     (stderr, sessions)
 }
 
+/// A stderr reader that goes away mid-startup costs the command its progress
+/// lines and nothing else: `show-merged` still prints the merged table and
+/// finishes the session. The reader leaves as soon as the MCP configuration
+/// step opens, so the line that closes it is the first write to a closed pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_show_merged_survives_stderr_closing_mid_startup() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--session-root")
+        .arg(sessions.path())
+        .args(["mcp", "show-merged"])
+        .current_dir(repo_dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp show-merged");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped"));
+    let reach_step = async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = stderr.read_line(&mut line).await.expect("read stderr");
+            assert_ne!(read, 0, "stderr ended before the MCP configuration step");
+            if line.contains("[outrig] reading and merging MCP configuration") {
+                break;
+            }
+        }
+    };
+    timeout(E2E_TIMEOUT, reach_step)
+        .await
+        .unwrap_or_else(|_| panic!("no MCP configuration step within {E2E_TIMEOUT:?}"));
+    drop(stderr);
+
+    let output = timeout(E2E_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("show-merged did not exit within {E2E_TIMEOUT:?}"))
+        .expect("wait for outrig");
+    assert!(
+        output.status.success(),
+        "show-merged exited {:?} after its stderr closed; stdout: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("fs"),
+        "show-merged printed no table: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let listed = SessionStore::new(sessions.path().to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions;
+    assert!(
+        listed.iter().all(|session| session.ended_at.is_some()),
+        "the session was left unfinalized: {listed:?}"
+    );
+}
+
 /// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
 /// assert it fails with the undeclared-server error. Returns the session
 /// records left under `session_root`.
@@ -913,6 +980,19 @@ async fn run_mcp_with_undeclared_env_server(
     assert!(
         stderr.contains("image 'smoke' has no MCP server 'no_such_server'"),
         "stderr should name the undeclared server: {stderr}"
+    );
+    // The refusal belongs to the MCP configuration step, not to whatever
+    // printed last before it (#269).
+    assert_lines_in_order(
+        &stderr,
+        &[
+            "[outrig] reading and merging MCP configuration",
+            "has no MCP server 'no_such_server'",
+        ],
+    );
+    assert!(
+        !stderr.contains("[outrig] MCP configuration ready"),
+        "a refused plan is not ready: {stderr}"
     );
     sessions
 }

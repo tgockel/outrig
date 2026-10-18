@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -65,19 +66,28 @@ pub(crate) struct ProgressSpan {
 impl ProgressSpan {
     pub(crate) fn start(label: impl Into<String>) -> Self {
         let label = label.into();
-        eprintln!("[outrig] {label}");
+        progress_line(format_args!("[outrig] {label}"));
         Self {
             started: Instant::now(),
         }
     }
 
     pub(crate) fn done(self, message: impl AsRef<str>) {
-        eprintln!(
+        progress_line(format_args!(
             "[outrig] {} ({})",
             message.as_ref(),
             format_elapsed(self.started.elapsed())
-        );
+        ));
     }
+}
+
+/// One progress line on stderr, dropped if stderr cannot take it. `eprintln!`
+/// panics on a failed write, and a reader that closes its end of the pipe
+/// mid-startup would then end the command partway -- before a `show-merged`
+/// table is printed or the session is finalized -- over lines it chose not to
+/// read.
+fn progress_line(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 pub(crate) fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -832,6 +842,9 @@ pub(crate) async fn launch_declared_sidecar(
 /// check `--env SERVER:` names against it, start `start = "auto"` sidecars,
 /// and attach the network interceptor to every running container.
 ///
+/// Building the plan is a step of its own on stderr, so a failure in it prints
+/// under that step's line rather than under `container user ready`.
+///
 /// Failure routing: image-ensure / start / bootstrap / interceptor-attach
 /// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
 /// sidecar, and continues; `abort` propagates). Label-merge collisions and
@@ -841,6 +854,7 @@ async fn setup_sidecars_and_network(
     args: SidecarPhaseArgs<'_>,
     containers: &mut SessionContainers,
 ) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
+    let span = ProgressSpan::start("reading and merging MCP configuration");
     let mut plan = sidecar::plan_from_config(args.cfg, args.image_cfg);
     let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
@@ -897,6 +911,11 @@ async fn setup_sidecars_and_network(
     // than after `setup` returns so an undeclared name takes `setup`'s abort
     // path, which stops the containers and finalizes the session record.
     check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
+    let server_count = plan.servers.len();
+    let server_word = plural(server_count, "server", "servers");
+    span.done(format!(
+        "MCP configuration ready: {server_count} {server_word}"
+    ));
 
     // Phase C -- start the auto sidecars concurrently, inserting in name order.
     start_auto_sidecars(&plan, &args, to_start, containers).await?;
@@ -1204,7 +1223,7 @@ fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliErr
 ///
 /// Reports a progress pair like the primary's, and shows a cache miss's build
 /// as it runs for the same reason: without them a sidecar that needs building
-/// is a silent pause between `container user ready` and whatever comes next.
+/// is a long pause that names nothing.
 /// `declared_by` is where the sidecars using `image_name` wrote it
 /// ([`SidecarPlan::image_declared_by`]), which a raw ref that is not local
 /// names in its error.

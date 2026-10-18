@@ -212,15 +212,20 @@ tools) and `shell` is unavailable. Full details in
    their `/etc/passwd` entry names. The image needs no `useradd`/`groupadd` for this. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
-6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
+6. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp` label,
+   then overlay `[images.<name>.mcp]` from config by server name. Each declared sidecar's image is
+   ensured and its label merged, and the `start = "auto"` sidecars are started. A sidecar failure
+   follows the block's `on-failure` key; a malformed label, or two labels claiming one server
+   name, is a startup error. See [Config -> sidecars](../reference/config.md#sidecarssc).
+7. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
    The default mode skips this step entirely.
-7. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
+8. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`. Each of those two gets 120 seconds; a server
    that misses either fails startup, with its stderr in the error.
-8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
+9. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
    an agentless session resolves as though the agent had no keys set), pick the
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
    must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
@@ -229,13 +234,13 @@ tools) and `shell` is unavailable. Full details in
    mistralrs models, `--device` overrides the model's configured `device` for this run. For
    OpenAI-style models, `--device` is rejected. Then read the API key from the env var named in
    the provider's `api-key`. Build the Rig provider client.
-9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
-   `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
-   `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
-   system prompt at all.
-10. **Open the REPL.** Banner on stderr, `> ` prompt on the terminal, ready for input.
+10. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
+    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
+    `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
+    system prompt at all.
+11. **Open the REPL.** Banner on stderr, `> ` prompt on the terminal, ready for input.
 
-If anything before step 10 fails, `outrig run` reports the error on stderr and exits non-zero
+If anything before step 11 fails, `outrig run` reports the error on stderr and exits non-zero
 without starting the REPL.
 
 ## REPL banner
@@ -246,8 +251,8 @@ A typical startup looks like:
 [outrig] loading config
 [outrig] config loaded: /home/you/coding/.agents/outrig/config.toml (1ms)
 [outrig] workspace: /home/you/coding
-[outrig] resolving agent and image-config
-[outrig] agent/image-config resolved: agent coding, image-config coding (0ms)
+[outrig] resolving agent and container
+[outrig] agent/container resolved: agent coding, container coding (0ms)
 [outrig] computing image tag
 [outrig] image tag computed: coding:8c2a4f7e91d6b5a3 (32ms)
 [outrig] ensuring image coding:8c2a4f7e91d6b5a3

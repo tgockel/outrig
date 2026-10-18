@@ -85,6 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig run` and `outrig mcp` report the MCP configuration step at startup again.** Nothing
+  was printed between `container user ready` and `MCP <server>: initializing`, though that stretch
+  reads the images' `org.outrig.mcp` labels, ensures sidecar images, and builds the placement
+  plan, so a malformed label, two labels claiming one server name, a sidecar image that would not
+  build, or an `--env SERVER:...` naming an undeclared server printed its error directly under
+  `container user ready`, as if the user bootstrap had failed. The step is bracketed by
+  `reading and merging MCP configuration` and `MCP configuration ready: <n> servers (<elapsed>)`
+  again, as `doc/usage/run.md` shows, and the page's other stale startup lines (`resolving agent
+  and image-config`) now match what is printed (#269).
 - **A subagent's transcript now says which model answered when a model alias failed over.** The
   transcript header, the launch trace, and the tool result name the alias's first candidate, so a
   subagent whose calls moved to a later candidate (head rate-limited, down, or refusing its key)
