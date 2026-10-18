@@ -1465,17 +1465,15 @@ where
         written?;
     }
 
+    let script = nft_rules(
+        &target.table,
+        ports.tcp,
+        ports.dns,
+        ports.dns_tcp,
+        policy_default,
+    );
     let mut rules = tempfile::NamedTempFile::new()?;
-    rules.write_all(
-        nft_rules(
-            &target.table,
-            ports.tcp,
-            ports.dns,
-            ports.dns_tcp,
-            policy_default,
-        )
-        .as_bytes(),
-    )?;
+    rules.write_all(script.as_bytes())?;
     rules.as_file_mut().sync_all()?;
     // Safe to arm before the apply because the name belongs to this attach
     // alone -- see `nft_table_name`. `create table` is belt to that brace: it
@@ -1552,6 +1550,30 @@ where
         armed,
         delete_nft_table_by_handle(target.pid, rollback.netns_inode(), handle),
     );
+    // A zero exit and a table handle say the table exists, not that the
+    // transaction made what was in it: nft 1.0.9 exited zero having dropped a
+    // nested chain (see `nft_rules`), and a table with no chain redirects
+    // nothing.
+    //
+    // The echo is the commit's own account, one `# handle` per object made, so
+    // a shortfall is the commit missing part of the script. Counted, not
+    // matched: nft rewrites rule text on the way out, and a count survives
+    // that where a comparison of lines would not. Only a shortfall is refused;
+    // an extra line cannot mean something was dropped.
+    //
+    // After the narrowing on purpose: the handle came from this attach's own
+    // commit, so the undo that deletes by it is safe to leave armed, and the
+    // caller's `undo_now` removes the table that was made.
+    let committed = echoed_handles(&echo).count();
+    let declared = script.lines().count();
+    if committed < declared {
+        return Err(OutrigError::Configuration(format!(
+            "nft committed {committed} of the {declared} objects in the redirect \
+             script for table {}, so part of the redirect is not in place; the \
+             attach is undone rather than kept on that footing",
+            target.table
+        )));
+    }
     Ok(())
 }
 
@@ -4048,16 +4070,27 @@ const NFT_DELETE_IN_NAMESPACE: &str = "[ \"$(readlink /proc/self/ns/net)\" = \"$
 /// Matched on the name as a whole token, so a table whose name merely starts
 /// the same is not mistaken for this one.
 fn table_handle_in(output: &[u8], table: &str) -> Option<u64> {
-    let output = std::str::from_utf8(output).ok()?;
-    output.lines().find_map(|line| {
-        let (named, handle) = line.split_once("# handle ")?;
+    echoed_handles(output).find_map(|(named, handle)| {
         let tokens: Vec<&str> = named.split_whitespace().collect();
         tokens
             .windows(3)
             .any(|w| w == ["table", "inet", table])
-            .then(|| handle.split_whitespace().next()?.parse().ok())
-            .flatten()
+            .then_some(handle)
     })
+}
+
+/// Each object an `nft --echo --handle` commit reports, as the command that
+/// made it and the handle nft gave it: one `<command> # handle N` line per
+/// object. Output that is not text reports none.
+fn echoed_handles(output: &[u8]) -> impl Iterator<Item = (&str, u64)> {
+    std::str::from_utf8(output)
+        .ok()
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| {
+            let (named, handle) = line.split_once("# handle ")?;
+            Some((named, handle.split_whitespace().next()?.parse().ok()?))
+        })
 }
 
 fn nsenter_nft(pid: u32) -> Cmd {
@@ -4165,6 +4198,10 @@ fn nft_table_name(session_id: &str) -> String {
 /// neighbor discovery is dropped too, which costs nothing here: a redirected
 /// flow needs no neighbor, DAD completes on its timer, and upstream
 /// connections are made from the host's namespace.
+///
+/// One object per line: a `create` or an `add`, each of which `--echo
+/// --handle` reports with a handle of its own. [`install_interception`]
+/// counts the lines and refuses a commit that echoes fewer.
 fn nft_rules(
     table: &str,
     tcp_port: u16,
@@ -5056,6 +5093,32 @@ mod tests {
     /// The handle [`FakeRunner`] says nft assigned the table it created.
     const FAKE_HANDLE: u64 = 7;
 
+    /// What nft echoes for a commit that made the first `objects` commands of
+    /// the redirect script: each one, with a `# handle` of its own, and the
+    /// generation line. Built from [`nft_rules`] so a complete commit is the
+    /// script's own size, whatever that comes to.
+    fn commit_echo(objects: usize) -> Vec<u8> {
+        let script = nft_rules(&target().table, 4001, 4002, 4003, NetworkAction::Allow);
+        let mut echo: String = script
+            .lines()
+            .take(objects)
+            .zip(FAKE_HANDLE..)
+            .map(|(command, handle)| format!("{command} # handle {handle}\n"))
+            .collect();
+        echo.push_str("# new generation 2 by process 111 (nft)\n");
+        echo.into_bytes()
+    }
+
+    fn complete_commit_echo() -> Vec<u8> {
+        commit_echo(usize::MAX)
+    }
+
+    /// The echo nft 1.0.9 gave for a script whose chain it dropped: the table
+    /// and nothing in it.
+    fn table_only_echo() -> Vec<u8> {
+        commit_echo(1)
+    }
+
     /// The `run` seam under test: records every command it is handed and does
     /// whatever the injected plan says that command should do. This is what
     /// lets the ordering, an nft apply that fails, and a cancellation landing
@@ -5104,13 +5167,7 @@ mod tests {
             // Without this the tests would exercise only the unnarrowed undo,
             // which is the fallback rather than the rule.
             if rendered.contains("--echo --handle") {
-                return Ok(self.echo.clone().unwrap_or_else(|| {
-                    format!(
-                        "create table inet {} # handle {FAKE_HANDLE}\n",
-                        target().table
-                    )
-                    .into_bytes()
-                }));
+                return Ok(self.echo.clone().unwrap_or_else(complete_commit_echo));
             }
             Ok(Vec::new())
         }
@@ -6382,6 +6439,70 @@ mod tests {
                 "the table left behind has to reach the caller: {residue:#?}"
             );
         }
+    }
+
+    /// A commit that made the table and not everything the script declares is
+    /// not an interception. The attach fails, and -- unlike a table nothing
+    /// can name -- what it made is its to remove, since the handle came from
+    /// its own commit: the caller's rollback deletes it by that handle.
+    #[tokio::test]
+    async fn a_commit_that_made_less_than_the_script_declares_fails_the_attach() {
+        let declared = echoed_handles(&complete_commit_echo()).count();
+        for (shape, echo) in [
+            ("the table alone", table_only_echo()),
+            ("one rule short", commit_echo(declared - 1)),
+        ] {
+            let fake = FakeRunner {
+                echo: Some(echo),
+                ..Default::default()
+            };
+            let run = |cmd: Cmd| fake.run(cmd);
+            let resolver = FakeResolver::new();
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+
+            let failed = install(&run, &mut rollback, &target(), &resolver)
+                .await
+                .expect_err("a commit short of the script fails the attach");
+            assert!(
+                failed
+                    .to_string()
+                    .contains("objects in the redirect script"),
+                "and says what was short ({shape}): {failed}"
+            );
+
+            let residue = rollback.undo_now(&run).await;
+            assert!(residue.is_empty(), "{residue:#?}");
+            assert!(
+                fake.ran().last().is_some_and(|cmd| {
+                    cmd.contains("delete table inet handle")
+                        && cmd.contains(&FAKE_HANDLE.to_string())
+                }),
+                "the table the commit did make is removed by the handle its own \
+                 commit reported ({shape}): {:#?}",
+                fake.ran()
+            );
+        }
+    }
+
+    /// Only a shortfall is refused. The check is a count, so it holds across
+    /// an nft that echoes the same commit a little differently; a line more
+    /// than the script declares cannot mean something was left out.
+    #[tokio::test]
+    async fn a_commit_that_echoes_more_than_the_script_declares_is_kept() {
+        let mut echo = complete_commit_echo();
+        echo.extend_from_slice(b"add rule inet outrig_test egress counter # handle 99\n");
+        let fake = FakeRunner {
+            echo: Some(echo),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+
+        install(&run, &mut rollback, &target(), &resolver)
+            .await
+            .expect("install interception");
     }
 
     /// The handle is read from the echo of the transaction that created the

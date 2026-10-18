@@ -160,6 +160,10 @@ fn outrig_table_name(pid: u32) -> Option<String> {
         .filter(|name| name.starts_with("outrig_"))
 }
 
+/// Whether the namespace holds a redirect table of any contents. Right for
+/// asking whether one is *gone*: a table left half-made still counts as
+/// there. For whether interception is *installed*, see
+/// [`netns_has_complete_redirect`].
 fn netns_has_outrig_table(pid: u32) -> bool {
     let output = run_capture(Command::new("nsenter").args([
         "-t",
@@ -171,6 +175,33 @@ fn netns_has_outrig_table(pid: u32) -> bool {
         "tables",
     ]));
     String::from_utf8_lossy(&output.stdout).contains("outrig_")
+}
+
+/// Whether the namespace holds the whole redirect table interception
+/// installs, and not only a table by its name: both chains, with every rule
+/// the script gives them. An empty table passes the name alone while
+/// redirecting nothing.
+///
+/// The counts are those of `nft_rules`, which this crate cannot call: `output`
+/// carries the five redirect rules and `egress` the three that keep the
+/// namespace's own traffic. A rule added to the script fails this loudly.
+fn netns_has_complete_redirect(pid: u32) -> bool {
+    let Some(table) = outrig_table_name(pid) else {
+        return false;
+    };
+    let listed = nft_in_netns(pid, &["list", "table", "inet", &table]);
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    chain_rules(&listing, "output") == Some(5) && chain_rules(&listing, "egress") == Some(3)
+}
+
+/// How many rules `chain` holds in an `nft list table` listing, or `None`
+/// when the listing has no such chain.
+fn chain_rules(listing: &str, chain: &str) -> Option<usize> {
+    let opening = format!("chain {chain} {{");
+    let mut lines = listing.lines().map(str::trim);
+    lines.find(|line| *line == opening)?;
+    // The line after the opening is the chain's `type ... hook ...` header.
+    Some(lines.skip(1).take_while(|line| *line != "}").count())
 }
 
 /// Wait for the reaper to delete a dropped attachment's redirect table.
@@ -1033,8 +1064,14 @@ async fn two_containers_attribute_audit_records_and_detach_cleanly() {
 
     let pid_a = container_root_pid(&container_a);
     let pid_b = container_root_pid(&container_b);
-    assert!(netns_has_outrig_table(pid_a));
-    assert!(netns_has_outrig_table(pid_b));
+    assert!(
+        netns_has_complete_redirect(pid_a),
+        "container a's redirect table should be whole"
+    );
+    assert!(
+        netns_has_complete_redirect(pid_b),
+        "container b's redirect table should be whole"
+    );
 
     interceptor
         .detach(container_b.name())
@@ -1045,7 +1082,7 @@ async fn two_containers_attribute_audit_records_and_detach_cleanly() {
         "detach should delete container b's nft table"
     );
     assert!(
-        netns_has_outrig_table(pid_a),
+        netns_has_complete_redirect(pid_a),
         "detach of b must not disturb container a's nft table"
     );
 
@@ -2037,7 +2074,10 @@ async fn a_container_holding_sys_admin_is_still_attached() {
         !tried.status.success() && stderr.contains("Operation not permitted"),
         "SYS_ADMIN alone must not configure the network namespace: {stderr}"
     );
-    assert!(netns_has_outrig_table(pid));
+    assert!(
+        netns_has_complete_redirect(pid),
+        "a container holding SYS_ADMIN should still get a whole redirect table"
+    );
 
     interceptor
         .shutdown()
