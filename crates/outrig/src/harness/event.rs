@@ -27,10 +27,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use crate::config::{PolicyAction, RoleAlternation};
+use crate::config::RoleAlternation;
 
 /// How many events a subscription holds for its reader before it starts
 /// losing the oldest, unless its owner chose otherwise.
@@ -135,30 +135,6 @@ id_type!(
     /// about the request carries it.
     RequestId
 );
-
-/// A digest of the rules in force: each policy layer's rules in order, and its default. Two
-/// sessions with the same rules have the same version, and changing a rule's action, or the order
-/// of two rules, changes it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct PolicyVersion(Arc<str>);
-
-impl PolicyVersion {
-    /// A version as a test of an escalation handler would give it.
-    pub fn new(version: impl Into<Arc<str>>) -> Self {
-        Self(version.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PolicyVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -402,33 +378,6 @@ pub enum Payload {
         parent: Option<RequestId>,
         by: ReceivedBy,
     },
-    /// One decision about a request, under the rules `version` names: the action a rule or a
-    /// default chose, or an approver's answer. `ignored` for an answer that came after the request
-    /// had settled -- cancelled, or already answered -- and so changed nothing.
-    #[non_exhaustive]
-    HostedDecided {
-        request: RequestId,
-        agent: String,
-        binding: String,
-        action: PolicyAction,
-        #[serde(flatten)]
-        by: DecidedBy,
-        reason: Option<String>,
-        version: PolicyVersion,
-        ignored: bool,
-    },
-    /// The policy a session started with, as `version`. With nothing `configured` every request
-    /// runs and none carries a decision. `asks` when some request can be held for an answer --
-    /// an `escalate`, or an `evaluate` while there is no evaluator -- and `handler` when an
-    /// escalation handler is installed to give it; one that `asks` with no `handler` denies each
-    /// such request.
-    #[non_exhaustive]
-    SessionPolicy {
-        version: PolicyVersion,
-        configured: bool,
-        asks: bool,
-        handler: bool,
-    },
     /// A request's target is about to be invoked: published before it is.
     #[non_exhaustive]
     HostedDispatched {
@@ -502,8 +451,6 @@ impl Payload {
             Payload::MessageReceived { .. } => "message.received",
             Payload::BindingExited { .. } => "binding.exited",
             Payload::HostedReceived { .. } => "hosted.received",
-            Payload::HostedDecided { .. } => "hosted.decided",
-            Payload::SessionPolicy { .. } => "session.policy",
             Payload::HostedDispatched { .. } => "hosted.dispatched",
             Payload::HostedEnded { .. } => "hosted.ended",
             Payload::HostedCallback { .. } => "hosted.callback",
@@ -520,10 +467,8 @@ impl Payload {
             | Self::InterpreterDiagnostic { .. }
             | Self::InterpreterExited { .. }
             | Self::BindingRefused { .. }
-            | Self::BindingExited { .. }
-            | Self::SessionPolicy { .. } => None,
+            | Self::BindingExited { .. } => None,
             Self::HostedReceived { agent, .. }
-            | Self::HostedDecided { agent, .. }
             | Self::HostedDispatched { agent, .. }
             | Self::HostedEnded { agent, .. }
             | Self::HostedCallback { agent, .. } => Some(Subject::agent(agent)),
@@ -622,37 +567,6 @@ pub enum ReceivedBy {
     Interpreter,
 }
 
-/// What made a decision about a hosted request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(tag = "by", rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DecidedBy {
-    /// A rule of `layer`'s: its `rule`th, counted from 1 as the file lists them.
-    #[non_exhaustive]
-    Rule { layer: PolicyLayer, rule: usize },
-    /// `layer`'s `[policy] default`, since none of its rules matched.
-    #[non_exhaustive]
-    Default { layer: PolicyLayer },
-    /// The session's escalation handler.
-    Approver,
-    /// No escalation handler is installed, so a request that would wait for one is denied.
-    NoApprover,
-    /// `evaluate`, with no evaluator configured: the request goes to the escalation handler, or is
-    /// denied when there is none.
-    NoEvaluator,
-}
-
-/// Whose `[policy]` a rule or default is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum PolicyLayer {
-    /// The operator's: the global config, or the whole of a config a program built.
-    Operator,
-    /// A repository's, which may only restrict the operator's.
-    Repo,
-}
-
 /// How a hosted request ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -692,17 +606,8 @@ pub enum HostedReason {
     Closed,
     /// The bindings process was killed at shutdown.
     Killed,
-    /// Its connection closed before the bindings process read it, or while it waited for a
-    /// decision.
+    /// Its connection closed before the bindings process read it.
     Disconnected,
-    /// A policy rule denied it; `detail` names the rule and its layer.
-    Rule,
-    /// A layer's `[policy] default` denied it, no rule matching.
-    Default,
-    /// The escalation handler denied it, failed, or was dropped without answering.
-    Approver,
-    /// It was escalated, and no escalation handler is installed.
-    NoApprover,
 }
 
 /// A tool a model call carries, as the provider is told of it.

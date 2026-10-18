@@ -428,10 +428,9 @@ starts the container and the interpreter, and prints the image, the model, and t
 version. The session is recorded like any other, so `outrig ls`, `discard`, and `clean` see it;
 its record is written once the interpreter is up, under the name of the container it runs in.
 
-The slash commands are `/help`, `/quit`, and `/approve <id>` and `/deny <id>`, which answer a
-call into a binding (below); none of them reaches the agent, even typed while a round runs. A
-blank line is ignored. A failed round is reported and the session carries on; the messages it
-had not read are still waiting, so a line typed next is announced with them.
+The only slash commands are `/help` and `/quit`, and a blank line is ignored. A failed round is
+reported and the session carries on; the messages it had not read are still waiting, so a line
+typed next is announced with them.
 
 **Leaving.** `/quit`, the end of input, and a second Ctrl-C at the prompt each close the session
 to new work, then stop it: Python still running, and calls into bindings, are given five seconds
@@ -495,25 +494,9 @@ again. With no terminal on stdin -- a script, CI -- `run-new` says which binding
 how to approve it, and the session runs without it. The agent is told each binding's name and
 description, and its Python uses each under that name as its library documents:
 `repo.head.commit.hexsha`. Each read or call waits for the host's answer, and holds the agent's
-event loop until it comes. Every call it makes is checked on the host, decided by the config's
-[`[policy]`](config.md#policy), and, with `[events] mode = "record"`, recorded. If the bindings
-process dies, the session goes on without its bindings, and a call to one raises an error saying
-how the process ended.
-
-A call the policy refuses never runs, and the agent's code gets `runtime.Denied`. One the policy
-escalates waits for you, and is shown on stderr with its id, the binding, what it asks, and a
-preview of its arguments:
-
-```text
-[outrig] binding call 7 waits for your answer: repo: call push on git.remote.Remote ('main')
-[outrig]   operator rule 1 says escalate; type /approve 7 or /deny 7
-```
-
-`/approve 7` runs it once and `/deny 7` refuses it, mid-round included. Every escalated call asks
-again; no answer is remembered. A call whose caller is interrupted, or which the session's close
-withdraws, stops waiting, and `run-new` says so; an id nothing waits under gets a note, and so
-does an answer that arrived as its call stopped waiting, which changed nothing. Once input has
-ended there is nobody to answer, so a call that waits then is refused.
+event loop until it comes. Every call it makes is checked on the host and, with
+`[events] mode = "record"`, recorded. If the bindings process dies, the session goes on without
+its bindings, and a call to one raises an error saying how the process ended.
 
 With `[events] mode = "record"`, the session records what its agent did in
 `logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each

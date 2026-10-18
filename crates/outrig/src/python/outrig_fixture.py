@@ -261,18 +261,6 @@ class Marked:
         return "Marked"
 
 
-class Bag(dict):
-    """Attributes read from its items, as an attribute-dict library's objects are: what the
-    container writes with `bag[key] = value` it reads back as an attribute -- `____id_pack__`,
-    which RPyC asks an object for, among them."""
-
-    def __getattr__(self, name):
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(name) from None
-
-
 class Root(Records):
     def __init__(self):
         Records.__init__(self)
@@ -290,7 +278,6 @@ class Root(Records):
         self.nested_type = Nested
         self.str_type = str
         self.root_type = Root
-        self.bag = Bag(secret="s")
         self.a = types.SimpleNamespace(b=types.SimpleNamespace(c="c"))
         self.b = "b"
         self.calls = 0
@@ -416,19 +403,12 @@ class Root(Records):
 
         __main__._event(payload)
 
-    def decide(self, payload):
-        """Hold this call until the owner answers `payload`, through the binding program's own
-        primitive, and return the answer."""
-        import __main__
-
-        return __main__._decide(payload)
-
-    def decide_path(self, raw):
-        """`decide` with a path the host made from the bytes `raw`, as a library reports a file
+    def event_path(self, raw):
+        """`event` with a path the host made from the bytes `raw`, as a library reports a file
         name: not UTF-8 when the bytes are not."""
         import __main__
 
-        return __main__._decide({"path": os.fsdecode(raw)})
+        __main__._event({"path": os.fsdecode(raw)})
 
     def env(self, name):
         return os.environ.get(name)
@@ -492,16 +472,26 @@ class Root(Records):
         self.calls += 1
         return self.calls
 
-    # The same function under a second name: a bound method of it is still `noted`.
-    also_noted = noted
-
-    @property
-    def noted_later(self):
-        """`noted`, handed out by a property, as a library's dynamic attribute hands one out."""
-        return self.noted
-
     def call(self, fn, *args):
         return fn(*args)
+
+    def call_in_thread(self, fn, *args):
+        """`fn(*args)` on a thread of its own, joined, as a library that calls back from a worker
+        does: the callback's own requests are served away from the thread this call holds."""
+        box = {}
+
+        def run():
+            try:
+                box["value"] = fn(*args)
+            except BaseException as e:
+                box["error"] = e
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def call_with_nested(self, fn):
         """`fn(self.nested)`: a callback given a host object."""
@@ -612,6 +602,26 @@ class Root(Records):
 
 def make():
     return Root()
+
+
+class Vivid(dict):
+    """An attribute-dict that makes up what it lacks, as `addict.Dict` does: reading a missing
+    attribute stores and returns a new, empty one -- `____id_pack__` among them, which RPyC asks
+    an object for, and which is unhashable."""
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__") and name != "____id_pack__":
+            raise AttributeError(name)
+        return self.setdefault(name, Vivid())
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def make_vivid():
+    root = Vivid()
+    root.name = "root"
+    return root
 
 
 def make_stubborn():

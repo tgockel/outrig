@@ -1,7 +1,7 @@
 //! The binding supervisor against real processes: a binding's group ends with its owner --
 //! killed with `kill -9`, or gone before the parent-death signal was set -- and not with a pool
 //! thread's exit or a Ctrl-C; its stop escalates and proves its group empty; and its stdio
-//! carries events and decision requests beside the frames.
+//! carries events beside the frames.
 //!
 //! The owner's death needs an owner that is a process of its own: [`owner_process`] is this
 //! test binary re-run on that one test, with `OUTRIG_TEST_OWNER_ROLE` saying what it does and
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
 use nix::unistd::Pid;
+use serde_json::json;
 
 use super::relay::{Bind, Relay, TIMEOUT, fixture_dir, rpyc_dir};
 use super::supervisor::{self, Factory, Probe, STOP_GRACE, Spec, group_members};
@@ -47,7 +48,6 @@ fn spec<'a>(factory: &'a str, env: Option<&'a [(OsString, OsString)]>) -> Spec<'
             kwargs: serde_json::json!({}),
             serialize: false,
         }],
-        policy: crate::config::Policy::default().wire(),
         cwd: None,
         env,
         probe: None,
@@ -592,53 +592,45 @@ fn the_environment_is_inherited_unless_one_is_given() {
 
 // ---------------------------------------------------------------------------- the stdio
 
-/// A payload cannot take a decision's id or a line's kind, and one the owner would drop unread
-/// -- past the line bound -- raises in the caller instead of leaving it waiting for ever.
+/// An event's payload cannot take the line's kind, and one the owner would drop unread -- past the
+/// line bound, or not UTF-8 -- raises in the library that published it.
 #[test]
-fn a_decision_payload_cannot_forge_the_envelope_or_pass_the_line_bound() {
+fn an_event_payload_cannot_forge_the_envelope_or_pass_the_line_bound() {
     let mut relay = Relay::start();
     relay.bind("fx", FACTORY);
     let out = relay.output(
         1,
         &with_root(
             r#"
-            for payload in ({'id': 999}, {'t': 'rpc'}, {'big': 'x' * (2 << 20)}):
+            for payload in ({'t': 'rpc'}, {'big': 'x' * (2 << 20)}):
                 try:
-                    root.decide(payload)
+                    root.event(payload)
                 except ValueError as e:
                     print(e.args[0])
             try:
-                root.event({'t': 'rpc'})
+                root.event_path(b'/tmp/x\xff')
             except ValueError as e:
                 print(e.args[0])
-            try:
-                root.decide_path(b'/tmp/x\xff')
-            except ValueError as e:
-                print(e.args[0])
+            root.event({'kind': 'noted', 'n': 3})
             "#,
         ),
     );
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 5, "{out}");
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[0], "the event payload may not carry ['t']");
     assert!(
-        lines[4].starts_with("the decision payload holds text that is not UTF-8"),
+        lines[1].starts_with("the event line is ")
+            && lines[1].ends_with(" bytes, past the 1048576-byte bound"),
         "{out}"
     );
-    assert_eq!(lines[0], "the decision payload may not carry ['id']");
-    assert_eq!(lines[1], "the decision payload may not carry ['t']");
     assert!(
-        lines[2].starts_with("the decision line is ")
-            && lines[2].ends_with(" bytes, past the 1048576-byte bound"),
+        lines[2].starts_with("the event payload holds text that is not UTF-8"),
         "{out}"
     );
-    assert_eq!(lines[3], "the event payload may not carry ['t']");
-    // Nothing waits on the owner for any of them, and the table carries no stale entry: the
-    // next decision is answered. The owner holds no request it is for, so it denies it.
-    let out = relay.output(2, &with_root("print(root.decide({'ask': 'next?'}))"));
+    // None of them reached the owner: the next event it reads is the one that was well formed.
     assert_eq!(
-        out,
-        "{'action': 'deny', 'detail': 'the owner holds no request this decision is for', \
-         'reason': 'interception'}\n"
+        relay.event(TIMEOUT),
+        json!({"t": "event", "kind": "noted", "n": 3})
     );
 }
 

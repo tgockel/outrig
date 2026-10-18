@@ -7,15 +7,12 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Brief, Declared, Places, Setup};
-use super::escalation::{EscalationHandler, Handler};
-use super::event::{DEFAULT_CAPACITY, Payload, PolicyVersion, Subscription};
+use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
 use super::{Failure, Session, SessionError};
 use crate::agent::ledger::Ledger;
 use crate::agent::{self, Agent, AgentError, ResolvedAgent};
-use crate::config::{
-    Config, ConfigValidationError, EnvSecrets, ImageConfig, Policy, Secrets, lexical,
-};
+use crate::config::{Config, ConfigValidationError, EnvSecrets, ImageConfig, Secrets, lexical};
 use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError};
 use crate::events::{Events, StreamBuilder};
@@ -90,7 +87,6 @@ pub struct SessionBuilder {
     /// The bindings process's environment, exactly, when the owner gave one.
     bindings_env: Option<Vec<(OsString, OsString)>>,
     approver: Option<Arc<dyn Approver>>,
-    escalation: Option<Handler>,
     repo_root: Option<PathBuf>,
     /// Where a test's bindings install and remember approvals, in place of
     /// the user's own.
@@ -126,7 +122,6 @@ impl SessionBuilder {
             bound: Vec::new(),
             bindings_env: None,
             approver: None,
-            escalation: None,
             repo_root: None,
             #[cfg(test)]
             places: None,
@@ -217,16 +212,6 @@ impl SessionBuilder {
         self
     }
 
-    /// Ask `handler` about each hosted request the session's `[policy]` holds
-    /// for an answer -- an `escalate`, or an `evaluate` while no evaluator is
-    /// configured. Without one, each such request is refused, its reason
-    /// saying no approver is installed, and the session's `session.policy`
-    /// event says so at start.
-    pub fn escalation(mut self, handler: impl EscalationHandler + 'static) -> Self {
-        self.escalation = Some(Arc::new(handler));
-        self
-    }
-
     /// The repository the session works on: what a relative `{ path }` in a
     /// binding's arguments resolves against, whichever file declared it,
     /// what a repository's approval is for, and -- for the container
@@ -309,14 +294,13 @@ impl SessionBuilder {
         let id = resolve_session_id(&spec).map_err(start_error)?;
         spec.session_id = Some(id.clone());
         let (events, lifecycle) = self.open_stream(&id, &spec.log_dir).await?;
-        let policy = self.load_policy(&events);
 
         let cwd = spec
             .workspace
             .as_ref()
             .map_or_else(|| repo_root.clone(), |workspace| lexical(&workspace.host));
         let mut bindings = self
-            .start_bindings(declared, &repo_root, &cwd, &events, &policy)
+            .start_bindings(declared, &repo_root, &cwd, &events)
             .await
             .map_err(start_error)?;
         if !bindings.is_empty()
@@ -391,7 +375,6 @@ impl SessionBuilder {
         repo_root: &Path,
         cwd: &Path,
         events: &Events,
-        policy: &Policy,
     ) -> Result<Bindings, OutrigError> {
         if declared.is_empty() {
             return Ok(Bindings::default());
@@ -408,8 +391,6 @@ impl SessionBuilder {
             approver: self.approver.clone(),
             places,
             events,
-            policy,
-            escalation: self.escalation.clone(),
         };
         let declared = bindings::approve(declared, &setup).await;
         if declared.is_empty() {
@@ -428,27 +409,6 @@ impl SessionBuilder {
         let started = bindings::start(declared, packages, &setup).await?;
         report(Progress::Finished(Step::Bindings));
         Ok(started)
-    }
-
-    /// The policy in force, published as the session starts: its version,
-    /// whether anything is configured, and whether a request it holds for an
-    /// answer has anyone to give one.
-    fn load_policy(&self, events: &Events) -> Policy {
-        let policy = Policy::of(&self.config);
-        let (asks, handler) = (policy.asks(), self.escalation.is_some());
-        if asks && !handler {
-            tracing::warn!(
-                "the session's [policy] can hold a binding call for an answer, and no \
-                 escalation handler is installed: each such call is refused"
-            );
-        }
-        events.emit(Payload::SessionPolicy {
-            version: PolicyVersion::new(policy.version()),
-            configured: policy.configured(),
-            asks,
-            handler,
-        });
-        policy
     }
 
     /// The session's stream, opened before anything starts so its first
@@ -522,9 +482,8 @@ impl SessionBuilder {
         let id = "test".to_string();
         let log_dir = self.host_log.clone().unwrap_or_default();
         let (events, lifecycle) = self.open_stream(&id, &log_dir).await?;
-        let policy = self.load_policy(&events);
         let mut bindings = self
-            .start_bindings(declared, &repo_root, &repo_root, &events, &policy)
+            .start_bindings(declared, &repo_root, &repo_root, &events)
             .await
             .map_err(start_error)?;
         self.report(Progress::Started(Step::Python));

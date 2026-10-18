@@ -271,13 +271,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that carries no such number. Every request the process's checks see is recorded in the stream,
   under a `RequestId`: `hosted.received` before anything is decided about it, with its `Operation`,
   member, host-side type and a bounded preview of each argument -- an object named by its type and a
-  reference number, never by its `repr`; `hosted.dispatched` before its target runs, which the
+  reference number, never by its `repr`, and each read from the host's side, not asked of the
+  object, so one that makes up the attributes it lacks, as `addict.Dict` does, is handed out like
+  any other; `hosted.dispatched` before its target runs, which the
   process waits for; and `hosted.ended` with a `HostedOutcome` -- `returned`, `raised` with the type
   and the host's traceback text, `refused`, `cancelled`, or `unknown` -- and a `HostedReason`.
   Bookkeeping is recorded only when refused. A callback a library makes is `hosted.callback`, and a
   request made inside one names its parent. An interrupt ends the caller's wait; a call already
   running runs on, and its outcome notes the interrupt, while one still waiting for its binding's
-  turn or for a connection is `cancelled`. One that arrives while the answer is being read is raised
+  turn or for a connection is `cancelled` -- a callback's own call too, and not the call the
+  callback runs inside. One that arrives while the answer is being read is raised
   as the call ends, and one that finds an argument's own code running as the request is built -- a
   path's `__fspath__` -- or the code that rebuilds a host exception -- a class's
   `__init_subclass__` -- or that boxes the exception a callback raised -- a property it reads -- is
@@ -298,43 +301,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its bindings: `binding.exited` records how it ended, as `BindingStop::exited` does, each call it
   was running is `unknown`, and a later call raises an error that says so. The vendored RPyC is
   mounted read-only at `/outrig/rpyc` in a session with bindings, where the interpreter imports it.
-
-- **`[policy]` decides each hosted request, and an `EscalationHandler` answers what it holds.**
-  `Config::policy` is a `PolicyConfig`: a `default` and `[[policy.rules]]`, each a `PolicyRule`
-  matching the binding, the host-side type, the member and the operation -- `*` a wildcard within
-  the first three -- and naming a `PolicyAction`: `allow`, `deny`, `escalate` or `evaluate`. The
-  rules are matched in the bindings process, so an allow costs no round trip. A call of what a
-  `getattr` returned is matched, recorded and shown as a call of that member on that type, with
-  its arguments; a `callattr` is a read and a call, and a call of the method the read would give
-  by its own name, and is refused when that cannot be known before the read runs; a bound method
-  is also its own name on its object's type; a call by a dunder name is also the operation it
-  stands for, `__repr__` a `repr`; a request passing a host callable whose own call the rules
-  would not allow, as an argument or a value to assign, is refused; `oldslicing` and `buffiter`
-  are refused; wildcards match without backtracking; and the type a rule matches is the one the
-  host names, never what the object says of itself. A deny raises
-  `runtime.Denied`, an `Exception` no hosted library defines, with the reason; the target never
-  runs, and the request ends `refused` with `HostedReason::Rule`, `Default`, `Approver` or
-  `NoApprover`. `escalate` -- and `evaluate`, until there is an evaluator -- holds the request,
-  on its connection's serving thread and in no binding's turn, for the handler installed with
-  `SessionBuilder::escalation`: an `async fn escalate(&self, Escalation) -> EscalationResult`,
-  shown the request's id, binding, agent, operation, member, type, argument previews, reason and
-  policy version, answering `EscalationAnswer::Allow` or `Deny`. An `Err`, a panic, or a task
-  ended unanswered denies; with no handler, the request is denied. The session's gate settles a
-  held request once -- the answer, the caller's interrupt, its connection's close, or the close
-  -- and `Escalation::withdrawn` tells the handler; a later answer is recorded as ignored, and an
-  allow that won before the close runs even after it. Each decision is a `hosted.decided` event
-  with a `DecidedBy` and the `PolicyVersion`, a digest of the rules in force; `session.policy`
-  publishes the version at start, and whether a request could wait with no handler to answer it.
-  A session with no `[policy]` decides nothing and records no decisions.
-
-  A repository's `[policy]` may only restrict. `merge` keeps the global config's as the merged
-  `policy` and the repository's beside it, each deciding on its own and the stricter action
-  winning. A repo `allow`, as a rule or as its `default`, is rejected at load as
-  `ConfigValidationError::RepoPolicyAllow`, and an operation outside the vocabulary is
-  `PolicyOperation`.
-  `Config::operator` is the global config as it was read, kept by `merge` -- or the config itself
-  when none was, as for one a program built -- so a repository's `[models.<name>]` or
-  `[providers.<name>]` cannot redefine what the operator's names resolve to there.
 
 ### Changed
 

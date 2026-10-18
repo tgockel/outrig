@@ -98,15 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python does. A call made after the close raises `outrig.Closed`. If the bindings process dies,
   the session goes on without its bindings, and a call to one raises an error saying how the
   process ended.
-- **`[policy]` decides each call into a binding, and `/approve <id>` and `/deny <id>` answer one
-  that waits for you.** A rule matches the binding, the host-side type, the member and the
-  operation, and allows, denies, escalates or evaluates; a call it refuses never runs, and the
-  agent's code gets `runtime.Denied`. An escalated call is shown on stderr with its id, the
-  binding, what it asks and a preview of its arguments, and waits until you type `/approve <id>`
-  or `/deny <id>` -- mid-round included, neither reaching the agent -- its caller is interrupted,
-  or the session closes. Nothing is remembered between calls. An id nothing waits under gets a
-  note, and once input has ended a waiting call is refused. A repository's `[policy]` may only
-  add restrictions, and an `allow` there is rejected at load. See `doc/reference/config.md`.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

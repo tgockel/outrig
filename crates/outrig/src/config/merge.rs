@@ -2,8 +2,6 @@
 //! with the same key (no per-key merging within an entry), except extra
 //! workspace mounts which are concatenated in global-then-repo order.
 
-use std::sync::Arc;
-
 use super::Config;
 
 /// Merge `global` and `repo`, with `repo` winning on every collision.
@@ -24,14 +22,6 @@ use super::Config;
 ///   its own policy cannot widen or inject one, whatever built it.
 /// - `[events].mode` is the global config's when it declares one; a repo's
 ///   applies only when the global config is silent.
-/// - `[policy]` is the global config's. A repo's `[policy]` is kept beside it
-///   as a restriction: each decides a request on its own and the stricter
-///   action wins, so a repo can add a deny or an escalation and can never
-///   allow what the operator's rules hold back.
-/// - The global config itself is kept, as read, as the merged config's
-///   [`operator`](Config::operator) layer -- or the global's own operator
-///   layer, when `global` is itself a merged config -- so what a repo must not
-///   choose can still be read from the operator's files.
 /// - `[workspace]` primary fields merge per key, like the scalars above: a
 ///   repo declaration wins, otherwise a global one is inherited, otherwise the
 ///   key stays `None` and [`Workspace`](super::Workspace)'s accessors apply
@@ -45,20 +35,6 @@ use super::Config;
 /// base directory that text meant. Nothing in outrig writes a merged config
 /// back to disk.
 pub fn merge(global: Config, repo: Config) -> Config {
-    let operator = Some(
-        global
-            .operator
-            .clone()
-            .unwrap_or_else(|| Arc::new(global.clone())),
-    );
-
-    let mut restrictions = global.restrictions;
-    restrictions.extend(
-        std::iter::once(repo.policy)
-            .chain(repo.restrictions)
-            .filter(|table| !table.is_default()),
-    );
-
     let mut providers = global.providers;
     providers.extend(repo.providers);
 
@@ -110,8 +86,5 @@ pub fn merge(global: Config, repo: Config) -> Config {
         images,
         sidecars,
         bindings,
-        policy: global.policy,
-        restrictions,
-        operator,
     }
 }

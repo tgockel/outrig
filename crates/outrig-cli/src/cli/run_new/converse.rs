@@ -37,15 +37,7 @@
 //! Stdin is read on a thread of its own rather than through tokio. A read is
 //! always in flight, and tokio's blocking read would hold the runtime open at
 //! exit until the user pressed Enter; a thread does not hold up the process.
-//!
-//! A binding call the session's `[policy]` holds for a person is shown as it
-//! arrives, with its id, and answered with `/approve <id>` or `/deny <id>`,
-//! mid-round included; neither command reaches the agent's channel. One that
-//! stops waiting first -- its caller interrupted, say -- is noted and
-//! forgotten. Once input has ended nobody is left to answer, so each call
-//! waiting then, and each that arrives after, is denied.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
 use std::io::BufRead;
@@ -53,17 +45,14 @@ use std::pin::Pin;
 
 use futures_util::FutureExt;
 use futures_util::stream::{FuturesOrdered, StreamExt};
-use outrig::harness::event::{DecidedBy, Payload, Received, Subscription};
-use outrig::harness::{
-    EscalationAnswer, RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks,
-};
+use outrig::harness::event::{Payload, Received, Subscription};
+use outrig::harness::{RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks};
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
-use super::escalate::{Asking, pending_text, withdrawn_text};
 use super::output::{Failures, Output, PROMPT};
 use crate::error::Result;
-use crate::repl::{HelpEntry, INTERRUPT_NOTICE, compose_help};
+use crate::repl::{INTERRUPT_NOTICE, compose_help};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -72,24 +61,6 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// refused on the host has its answer already; only an interpreter nothing can
 /// run in -- native code holding it -- takes this long.
 const ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The commands that answer a binding call waiting for a person.
-const ANSWERS: [HelpEntry; 2] = [
-    HelpEntry {
-        syntax: "/approve <id>",
-        description: "run binding call <id>, which waits for your answer",
-    },
-    HelpEntry {
-        syntax: "/deny <id>",
-        description: "refuse it; the agent's code gets runtime.Denied",
-    },
-];
-
-/// Why a call waiting once input has ended is denied.
-const NOBODY: &str = "input ended, so nobody is left to answer";
-
-/// The binding calls waiting for an answer, by id, each with where its answer goes.
-type Pending = BTreeMap<u64, oneshot::Sender<EscalationAnswer>>;
 
 /// A round in flight, borrowing the session for as long as it runs.
 type Round<'a> = Pin<Box<dyn Future<Output = std::result::Result<RoundOutcome, SessionError>> + 'a>>;
@@ -130,19 +101,16 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// the session as one made while it runs does.
 ///
 /// `shown` is the terminal's subscription to the session's events, which is
-/// where the Python each round runs is shown from; `asking` is where the
-/// session's escalation handler hands over each binding call held for an
-/// answer.
+/// where the Python each round runs is shown from.
 pub(super) async fn converse(
     session: &mut Session,
     shown: &mut Subscription,
-    asking: &mut mpsc::UnboundedReceiver<Asking>,
     out: &Output,
     failures: &mut Failures,
 ) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut term = Terminal { out, reading: true };
-    let left = drive(session, shown, asking, &mut term, &mut sigint, failures).await;
+    let left = drive(session, shown, &mut term, &mut sigint, failures).await;
     if left.is_err() {
         // A failure does not wait on a stdout that may have stopped either.
         out.abandon();
@@ -167,7 +135,6 @@ pub(super) fn reconcile(left: Result<()>, failures: &mut Failures) -> Result<()>
 async fn drive(
     session: &mut Session,
     shown: &mut Subscription,
-    asking: &mut mpsc::UnboundedReceiver<Asking>,
     term: &mut Terminal<'_>,
     sigint: &mut Signal,
     failures: &mut Failures,
@@ -177,8 +144,7 @@ async fn drive(
     let closer = session.closer();
     let mut lines = read_lines()?;
     let session = Mutex::new(session);
-    let help = compose_help(&ANSWERS);
-    let mut pending = Pending::new();
+    let help = compose_help(&[]);
 
     let mut round: Option<Round<'_>> = None;
     // Each posted line's answer, and whether it was typed while a round ran.
@@ -290,29 +256,12 @@ async fn drive(
                 }
             }
             Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round),
-            Some(asked) = asking.recv() => match asked {
-                Asking::Pending(request, answer) if term.reading => {
-                    term.notice(&pending_text(&request), round.is_none());
-                    pending.insert(request.request.get(), answer);
-                }
-                Asking::Pending(_, answer) => {
-                    let _ = answer.send(EscalationAnswer::Deny(NOBODY.to_string()));
-                }
-                Asking::Withdrawn(id, why) => {
-                    if pending.remove(&id.get()).is_some() {
-                        term.notice(&withdrawn_text(id, why), round.is_none());
-                    }
-                }
-            },
             line = lines.recv(), if term.reading => {
                 let Some(line) = line else {
                     if round.is_none() {
                         term.out.text("\n");
                     }
                     term.reading = false;
-                    for (_, answer) in std::mem::take(&mut pending) {
-                        let _ = answer.send(EscalationAnswer::Deny(NOBODY.to_string()));
-                    }
                     continue;
                 };
                 let line = line?;
@@ -335,11 +284,6 @@ async fn drive(
                             return Ok(());
                         }
                         ["help"] => term.note(&help),
-                        ["approve", id] => term.note(&answer(&mut pending, id, true)),
-                        ["deny", id] => term.note(&answer(&mut pending, id, false)),
-                        ["approve" | "deny"] => {
-                            term.note("[outrig] say which binding call: /approve <id> or /deny <id>");
-                        }
                         // `raw`, as typed.
                         _ => term.note(&format!("[outrig] unknown command: /{raw}")),
                     }
@@ -357,28 +301,6 @@ async fn drive(
                 }
             }
         }
-    }
-}
-
-/// Answer binding call `id`, allowing it or not, and say what came of it: a
-/// call no longer waiting -- answered, withdrawn, or never asked about -- is
-/// noted, not an error.
-fn answer(pending: &mut Pending, id: &str, allow: bool) -> String {
-    let Ok(number) = id.parse::<u64>() else {
-        return format!("[outrig] {id:?} is not a binding call's id");
-    };
-    let Some(waiting) = pending.remove(&number) else {
-        return format!("[outrig] binding call {number} is not waiting for an answer");
-    };
-    let (answer, said) = if allow {
-        (EscalationAnswer::Allow, "allowed")
-    } else {
-        let denied = EscalationAnswer::Deny("denied at the prompt".to_string());
-        (denied, "denied")
-    };
-    match waiting.send(answer) {
-        Ok(()) => format!("[outrig] {said} binding call {number}"),
-        Err(_) => format!("[outrig] binding call {number} is not waiting for an answer"),
     }
 }
 
@@ -477,38 +399,15 @@ impl Terminal<'_> {
         self.out.line(text);
     }
 
-    /// A note that arrives on its own rather than in answer to what was typed:
-    /// at the prompt, it starts a line of its own and the prompt is drawn
-    /// again after it.
-    fn notice(&self, text: &str, at_prompt: bool) {
-        let at_prompt = at_prompt && self.reading;
-        if at_prompt {
-            self.out.text("\n");
-        }
-        self.note(text);
-        if at_prompt {
-            self.prompt();
-        }
-    }
-
     /// What the terminal shows of one of the session's events: each
     /// submission as it starts, and a note when some were not shown.
     fn event(&self, received: Received) {
         match received {
-            Received::Event(event) => match &event.payload {
-                Payload::ExecSubmitted { source, .. } => self.out.text(render_submission(source)),
-                // An answer given as the call stopped waiting, which the session ignored.
-                Payload::HostedDecided {
-                    request,
-                    by: DecidedBy::Approver,
-                    ignored: true,
-                    ..
-                } => self.note(&format!(
-                    "[outrig] binding call {request} had stopped waiting; the answer changed \
-                     nothing"
-                )),
-                _ => {}
-            },
+            Received::Event(event) => {
+                if let Payload::ExecSubmitted { source, .. } = &event.payload {
+                    self.out.text(render_submission(source));
+                }
+            }
             Received::Missed(missed) => {
                 self.note(&format!(
                     "[outrig] {missed} of the session's events were not shown here; Python that \

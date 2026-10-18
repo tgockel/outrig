@@ -155,16 +155,11 @@ pub outrig::config::ConfigValidationError::ModelSourceConflict::model: alloc::st
 pub outrig::config::ConfigValidationError::ModelSourceMissing::model: alloc::string::String
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid::message: alloc::string::String
-#[non_exhaustive] pub outrig::config::ConfigValidationError::PolicyOperation
-pub outrig::config::ConfigValidationError::PolicyOperation::item: alloc::string::String
-pub outrig::config::ConfigValidationError::PolicyOperation::operation: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
-#[non_exhaustive] pub outrig::config::ConfigValidationError::RepoPolicyAllow
-pub outrig::config::ConfigValidationError::RepoPolicyAllow::item: alloc::string::String
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::max: u64
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::path: alloc::string::String
@@ -416,15 +411,6 @@ pub fn outrig::config::NetworkMode::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for outrig::config::NetworkMode
 pub type outrig::config::NetworkMode::Err = alloc::string::String
 pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self, Self::Err>
-#[non_exhaustive] pub enum outrig::config::PolicyAction
-pub outrig::config::PolicyAction::Allow
-pub outrig::config::PolicyAction::Deny
-pub outrig::config::PolicyAction::Escalate
-pub outrig::config::PolicyAction::Evaluate
-impl outrig::config::PolicyAction
-pub fn outrig::config::PolicyAction::as_str(self) -> &'static str
-impl core::fmt::Display for outrig::config::PolicyAction
-pub fn outrig::config::PolicyAction::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum outrig::config::RoleAlternation
 pub outrig::config::RoleAlternation::Relaxed
 pub outrig::config::RoleAlternation::Strict
@@ -500,7 +486,6 @@ pub outrig::config::Config::events: outrig::config::EventsConfig
 pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
-pub outrig::config::Config::policy: outrig::config::PolicyConfig
 pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
 pub outrig::config::Config::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
@@ -519,7 +504,6 @@ pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Op
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
-pub fn outrig::config::Config::operator(&self) -> &outrig::config::Config
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_workspace_mounts(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
@@ -627,21 +611,6 @@ pub fn outrig::config::OpenAiOptions::new() -> Self
 pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_role_alternation(self, outrig::config::RoleAlternation) -> Self
-#[non_exhaustive] pub struct outrig::config::PolicyConfig
-pub outrig::config::PolicyConfig::default: core::option::Option<outrig::config::PolicyAction>
-pub outrig::config::PolicyConfig::rules: alloc::vec::Vec<outrig::config::PolicyRule>
-#[non_exhaustive] pub struct outrig::config::PolicyRule
-pub outrig::config::PolicyRule::action: outrig::config::PolicyAction
-pub outrig::config::PolicyRule::binding: core::option::Option<alloc::string::String>
-pub outrig::config::PolicyRule::member: core::option::Option<alloc::string::String>
-pub outrig::config::PolicyRule::operation: core::option::Option<alloc::string::String>
-pub outrig::config::PolicyRule::type_name: core::option::Option<alloc::string::String>
-impl outrig::config::PolicyRule
-pub fn outrig::config::PolicyRule::binding(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn outrig::config::PolicyRule::member(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn outrig::config::PolicyRule::new(outrig::config::PolicyAction) -> Self
-pub fn outrig::config::PolicyRule::operation(self, impl core::convert::Into<alloc::string::String>) -> Self
-pub fn outrig::config::PolicyRule::type_name(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub struct outrig::config::ResolvedEnvValue
 impl outrig::config::ResolvedEnvValue
 pub fn outrig::config::ResolvedEnvValue::literal(impl core::convert::Into<alloc::string::String>) -> Self
@@ -1022,15 +991,6 @@ pub mod outrig::harness::event
 #[non_exhaustive] pub enum outrig::harness::event::Abandoned
 pub outrig::harness::event::Abandoned::Runaway
 pub outrig::harness::event::Abandoned::User
-#[non_exhaustive] pub enum outrig::harness::event::DecidedBy
-pub outrig::harness::event::DecidedBy::Approver
-#[non_exhaustive] pub outrig::harness::event::DecidedBy::Default
-pub outrig::harness::event::DecidedBy::Default::layer: outrig::harness::event::PolicyLayer
-pub outrig::harness::event::DecidedBy::NoApprover
-pub outrig::harness::event::DecidedBy::NoEvaluator
-#[non_exhaustive] pub outrig::harness::event::DecidedBy::Rule
-pub outrig::harness::event::DecidedBy::Rule::layer: outrig::harness::event::PolicyLayer
-pub outrig::harness::event::DecidedBy::Rule::rule: usize
 #[non_exhaustive] pub enum outrig::harness::event::ExecStatus
 pub outrig::harness::event::ExecStatus::Error
 pub outrig::harness::event::ExecStatus::Lost
@@ -1044,17 +1004,13 @@ pub outrig::harness::event::HostedOutcome::Returned
 pub outrig::harness::event::HostedOutcome::Unknown
 #[non_exhaustive] pub enum outrig::harness::event::HostedReason
 pub outrig::harness::event::HostedReason::AdmissionClosed
-pub outrig::harness::event::HostedReason::Approver
 pub outrig::harness::event::HostedReason::Closed
-pub outrig::harness::event::HostedReason::Default
 pub outrig::harness::event::HostedReason::Disconnected
 pub outrig::harness::event::HostedReason::Exited
 pub outrig::harness::event::HostedReason::Interception
 pub outrig::harness::event::HostedReason::Interrupted
 pub outrig::harness::event::HostedReason::Killed
-pub outrig::harness::event::HostedReason::NoApprover
 pub outrig::harness::event::HostedReason::QueueFull
-pub outrig::harness::event::HostedReason::Rule
 #[non_exhaustive] pub enum outrig::harness::event::Operation
 pub outrig::harness::event::Operation::Buffiter
 pub outrig::harness::event::Operation::Call
@@ -1126,15 +1082,6 @@ pub outrig::harness::event::Payload::ExecSubmitted::source: alloc::string::Strin
 pub outrig::harness::event::Payload::HostedCallback::agent: alloc::string::String
 pub outrig::harness::event::Payload::HostedCallback::binding: alloc::string::String
 pub outrig::harness::event::Payload::HostedCallback::parent: outrig::harness::event::RequestId
-#[non_exhaustive] pub outrig::harness::event::Payload::HostedDecided
-pub outrig::harness::event::Payload::HostedDecided::action: outrig::config::PolicyAction
-pub outrig::harness::event::Payload::HostedDecided::agent: alloc::string::String
-pub outrig::harness::event::Payload::HostedDecided::binding: alloc::string::String
-pub outrig::harness::event::Payload::HostedDecided::by: outrig::harness::event::DecidedBy
-pub outrig::harness::event::Payload::HostedDecided::ignored: bool
-pub outrig::harness::event::Payload::HostedDecided::reason: core::option::Option<alloc::string::String>
-pub outrig::harness::event::Payload::HostedDecided::request: outrig::harness::event::RequestId
-pub outrig::harness::event::Payload::HostedDecided::version: outrig::harness::event::PolicyVersion
 #[non_exhaustive] pub outrig::harness::event::Payload::HostedDispatched
 pub outrig::harness::event::Payload::HostedDispatched::agent: alloc::string::String
 pub outrig::harness::event::Payload::HostedDispatched::binding: alloc::string::String
@@ -1242,11 +1189,6 @@ pub outrig::harness::event::Payload::ModelUsageReplaced::usage: outrig::harness:
 pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
 pub outrig::harness::event::Payload::RoundStarted::round: u32
-#[non_exhaustive] pub outrig::harness::event::Payload::SessionPolicy
-pub outrig::harness::event::Payload::SessionPolicy::asks: bool
-pub outrig::harness::event::Payload::SessionPolicy::configured: bool
-pub outrig::harness::event::Payload::SessionPolicy::handler: bool
-pub outrig::harness::event::Payload::SessionPolicy::version: outrig::harness::event::PolicyVersion
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionReport
 pub outrig::harness::event::Payload::SessionReport::bindings: core::option::Option<outrig::harness::BindingStop>
 pub outrig::harness::event::Payload::SessionReport::closed_by: outrig::harness::ClosedBy
@@ -1268,9 +1210,6 @@ pub outrig::harness::event::Payload::TurnCommitted::round: u32
 pub outrig::harness::event::Payload::TurnCommitted::turn: u64
 impl outrig::harness::event::Payload
 pub fn outrig::harness::event::Payload::kind(&self) -> &'static str
-#[non_exhaustive] pub enum outrig::harness::event::PolicyLayer
-pub outrig::harness::event::PolicyLayer::Operator
-pub outrig::harness::event::PolicyLayer::Repo
 #[non_exhaustive] pub enum outrig::harness::event::ProbeVerdict
 pub outrig::harness::event::ProbeVerdict::Blocked
 pub outrig::harness::event::ProbeVerdict::Spinning
@@ -1383,12 +1322,6 @@ pub outrig::harness::event::ModelCall::left_out: alloc::vec::Vec<outrig::harness
 pub outrig::harness::event::ModelCall::opening: core::option::Option<serde_json::value::Value>
 pub outrig::harness::event::ModelCall::round: u32
 pub outrig::harness::event::ModelCall::withheld: alloc::vec::Vec<outrig::harness::event::Chosen>
-pub struct outrig::harness::event::PolicyVersion(_)
-impl outrig::harness::event::PolicyVersion
-pub fn outrig::harness::event::PolicyVersion::as_str(&self) -> &str
-pub fn outrig::harness::event::PolicyVersion::new(impl core::convert::Into<alloc::sync::Arc<str>>) -> Self
-impl core::fmt::Display for outrig::harness::event::PolicyVersion
-pub fn outrig::harness::event::PolicyVersion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::event::Repeat
 pub outrig::harness::event::Repeat::role: outrig::harness::event::Role
 pub outrig::harness::event::Repeat::turn: core::option::Option<u64>
@@ -1436,9 +1369,6 @@ impl core::convert::From<outrig::harness::ClosedBy> for outrig::harness::Closed
 pub fn outrig::harness::Closed::from(outrig::harness::ClosedBy) -> Self
 impl core::fmt::Display for outrig::harness::ClosedBy
 pub fn outrig::harness::ClosedBy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-#[non_exhaustive] pub enum outrig::harness::EscalationAnswer
-pub outrig::harness::EscalationAnswer::Allow
-pub outrig::harness::EscalationAnswer::Deny(alloc::string::String)
 #[non_exhaustive] pub enum outrig::harness::ExecutionStatus
 pub outrig::harness::ExecutionStatus::Error
 pub outrig::harness::ExecutionStatus::Ok
@@ -1472,11 +1402,6 @@ pub outrig::harness::Tasks::Listed::names: alloc::vec::Vec<alloc::string::String
 pub outrig::harness::Verdict::Clean
 pub outrig::harness::Verdict::NotProvenStopped
 pub outrig::harness::Verdict::StoppedWithUnknown
-#[non_exhaustive] pub enum outrig::harness::Withdrawn
-pub outrig::harness::Withdrawn::Closed
-pub outrig::harness::Withdrawn::Disconnected
-pub outrig::harness::Withdrawn::Exited
-pub outrig::harness::Withdrawn::Interrupted
 #[non_exhaustive] pub struct outrig::harness::ApprovalRequest
 pub outrig::harness::ApprovalRequest::declaration: alloc::string::String
 pub outrig::harness::ApprovalRequest::declared_in: core::option::Option<std::path::PathBuf>
@@ -1509,22 +1434,6 @@ pub outrig::harness::ContainerSpec::spec: outrig::LaunchSpec
 pub struct outrig::harness::EnvSecrets
 impl outrig::config::Secrets for outrig::config::EnvSecrets
 pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
-#[non_exhaustive] pub struct outrig::harness::Escalation
-pub outrig::harness::Escalation::agent: alloc::string::String
-pub outrig::harness::Escalation::arguments: alloc::vec::Vec<alloc::string::String>
-pub outrig::harness::Escalation::binding: alloc::string::String
-pub outrig::harness::Escalation::execid: core::option::Option<outrig::harness::event::ExecId>
-pub outrig::harness::Escalation::keywords: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
-pub outrig::harness::Escalation::member: core::option::Option<alloc::string::String>
-pub outrig::harness::Escalation::operation: outrig::harness::event::Operation
-pub outrig::harness::Escalation::parent: core::option::Option<outrig::harness::event::RequestId>
-pub outrig::harness::Escalation::policy: outrig::harness::event::PolicyVersion
-pub outrig::harness::Escalation::reason: alloc::string::String
-pub outrig::harness::Escalation::request: outrig::harness::event::RequestId
-pub outrig::harness::Escalation::target: core::option::Option<alloc::string::String>
-impl outrig::harness::Escalation
-pub fn outrig::harness::Escalation::is_withdrawn(&self) -> core::option::Option<outrig::harness::Withdrawn>
-pub async fn outrig::harness::Escalation::withdrawn(&self) -> outrig::harness::Withdrawn
 #[non_exhaustive] pub struct outrig::harness::EventDelivery
 pub outrig::harness::EventDelivery::last_sequence: u64
 pub outrig::harness::EventDelivery::log: core::option::Option<outrig::harness::LogLoss>
@@ -1574,7 +1483,6 @@ pub fn outrig::harness::SessionBuilder::bind(self, impl core::convert::Into<allo
 pub fn outrig::harness::SessionBuilder::bindings_env<K, V>(self, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> Self where K: core::convert::Into<std::ffi::os_str::OsString>, V: core::convert::Into<std::ffi::os_str::OsString>
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
-pub fn outrig::harness::SessionBuilder::escalation(self, impl outrig::harness::EscalationHandler + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
 pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function::FnMut(outrig::harness::Progress) + core::marker::Send + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
@@ -1606,10 +1514,6 @@ pub trait outrig::harness::Approver: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::Approver::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval
 impl<F> outrig::harness::Approver for F where F: core::ops::function::Fn(&outrig::harness::ApprovalRequest) -> outrig::harness::Approval + core::marker::Send + core::marker::Sync
 pub fn F::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval
-pub trait outrig::harness::EscalationHandler: core::marker::Send + core::marker::Sync
-pub fn outrig::harness::EscalationHandler::escalate(&self, outrig::harness::Escalation) -> impl core::future::future::Future<Output = outrig::harness::EscalationResult> + core::marker::Send
-impl<F, Fut> outrig::harness::EscalationHandler for F where F: core::ops::function::Fn(outrig::harness::Escalation) -> Fut + core::marker::Send + core::marker::Sync, Fut: core::future::future::Future<Output = outrig::harness::EscalationResult> + core::marker::Send
-pub fn F::escalate(&self, outrig::harness::Escalation) -> impl core::future::future::Future<Output = outrig::harness::EscalationResult> + core::marker::Send
 pub trait outrig::harness::Secrets: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::Secrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 impl outrig::config::Secrets for outrig::config::EnvSecrets
@@ -1617,7 +1521,6 @@ pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<
 impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
 pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 pub async fn outrig::harness::container_spec(&outrig::config::Config, &str, core::option::Option<&outrig::image::ImageTag>, &std::path::Path, std::path::PathBuf) -> core::result::Result<outrig::harness::ContainerSpec, outrig::error::OutrigError>
-pub type outrig::harness::EscalationResult = core::result::Result<outrig::harness::EscalationAnswer, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub mod outrig::image
 #[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
 pub outrig::image::ImageBuildOutcome::cache_hit: bool

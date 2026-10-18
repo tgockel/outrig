@@ -69,9 +69,9 @@ session's own: the one `session.json` and `outrig ls` show, which its containers
 
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
-and neither do the session's own, `session.state`, `session.policy` and `session.report`, or those
-of the process holding its bindings, `binding.refused` and `binding.exited`. A request to a
-binding is the agent's that made it.
+and neither do the session's own, `session.state` and `session.report`, or those of the process
+holding its bindings, `binding.refused` and `binding.exited`. A request to a binding is the
+agent's that made it.
 
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
@@ -186,13 +186,6 @@ the same call, and records no new `model.call`.
     `<pid> <command> <state>`, and how the process ended when it ended before the stop, as its
     `binding.exited` says, or `null`. A group not proven empty makes `stopped` `not_proven`.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
-- `session.policy` -- the `[policy]` the session started with, once, before its agent starts:
-  `version`, a digest of the rules in force -- each layer's rules in order, and its `default` --
-  which every `hosted.decided` carries; `configured`, `false` when no rule and no `default` is
-  declared, in which case every request runs and none carries a decision; `asks`, whether a
-  request can be held for an answer -- an `escalate`, or an `evaluate` while there is no
-  evaluator; and `handler`, whether anything is installed to answer one. A policy that `asks`
-  with no `handler` refuses each such request.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
   `reason`, which says whether the operator did not approve the declaration, nobody could be
@@ -304,8 +297,7 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   anything is decided about it. `request`, an id OutRig gives it, which the request's other events
   carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `operation`, what it
   asks of its target; `member`, the attribute it names, or `null`; `target`, the qualified name of
-  its target's type on the host -- the class's own, for a member read from a class -- as the host
-  names it, or `null`; `arguments`, a preview of each positional argument,
+  its target's type on the host, or `null`; `arguments`, a preview of each positional argument,
   and `keywords`, one per keyword argument, by name; `parent`, the request a callback made it
   under, or `null`; and `by`: `binding` when the bindings process received it, or, for one it
   never received, `relay` -- refused, or lost with the process or its connection, on its way
@@ -313,20 +305,8 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   `callattr`, `repr`, `str`, `cmp`, `hash`, `dir`, `instancecheck`, `buffiter`, `oldslicing` or
   `ctxexit`, each recorded every time; `ping`, `close`, `getroot`, `inspect`, `pickle` or `del`,
   bookkeeping, recorded only when refused; or `unknown`, a request type outside the protocol. A
-  method call is two requests, a `getattr` and a `call`, and the `call` names the member and the
-  type the `getattr` read it from; a `for` loop is a `callattr` of `__iter__`, then one of
-  `__next__` per item, the last of which raises `StopIteration`. `buffiter` and `oldslicing` are
-  always refused.
-- `hosted.decided` -- one decision about a request, under a `[policy]`: `request`, `agent`,
-  `binding`; `action`, `allow`, `deny`, `escalate` or `evaluate`; `by`, what made it -- `rule`,
-  with its `layer`, `operator` or `repo`, and its position among that layer's rules, `rule`,
-  counted from 1; `default`, with its `layer`; `approver`, the escalation handler's answer;
-  `no_approver`, an escalation with no handler installed, which denies; or `no_evaluator`, an
-  `evaluate` with no evaluator, which escalates when there is a handler and denies when not --
-  then `reason`, text that says more, or `null`; `version`, the policy's, as `session.policy` gave
-  it; and `ignored`, `true` for an answer that came after the request had stopped waiting, which
-  changed nothing. A request's decisions come after its receipt and before its dispatch. A
-  session with no `[policy]` publishes none.
+  method call is two requests, a `getattr` and a `call`; a `for` loop is a `callattr` of
+  `__iter__`, then one of `__next__` per item, the last of which raises `StopIteration`.
 - `hosted.dispatched` -- `request`, `agent`, `binding`: the request's target is about to run,
   published before it does. A request whose target never runs has none.
 - `hosted.ended` -- how a request ended: `request`, `agent`, `binding`; `outcome`; `reason`, for
@@ -336,16 +316,12 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   interrupted while the target ran; and `duration`, seconds from its receipt. `outcome` is:
   - `returned` or `raised` -- the target ran.
   - `refused` -- the target never ran: `interception`, the bindings process's checks refused it;
-    `rule` or `default`, the policy's rule or a layer's `default` denied it, `detail` naming
-    which; `approver`, the escalation handler denied it, failed, or ended without answering;
-    `no_approver`, it was escalated with no handler installed; `admission_closed`, the session
-    was closed to new work; `queue_full`, the bindings process was not taking calls and the
-    queue to it had no room, or the agent already had 1,024 requests in flight; or `exited`, the
-    process had ended.
+    `admission_closed`, the session was closed to new work; `queue_full`, the bindings process
+    was not taking calls and the queue to it had no room, or the agent already had 1,024 requests
+    in flight; or `exited`, the process had ended.
   - `cancelled` -- the target never ran: `interrupted`, its caller was interrupted first;
-    `closed`, the session closed while it waited for an answer, its binding's turn, or a free
-    connection; or `disconnected`, its connection closed before the bindings process read it,
-    or while it waited for an answer.
+    `closed`, the session closed while it waited for its binding's turn or a free connection; or
+    `disconnected`, its connection closed before the bindings process read it.
   - `unknown` -- no reply came: `killed`, the bindings process was killed at shutdown, or
     `exited`, it ended on its own. Whether the target ran is open.
 

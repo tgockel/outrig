@@ -6,10 +6,9 @@
 //! a session starts it, over the fixture package with a factory per binding. The interpreter's
 //! `rpc` lines and notices go to the session's relay, as `host.rs` hands them to it, and what the
 //! relay sends the interpreter is written to its stdin; everything else the interpreter says is
-//! handed to the test, as are the process's decision requests and the event lines the relay does
-//! not know. The relay's events are recorded on a stream the test reads. The harness counts the
-//! `rpc` lines each way and remembers the longest, which is how a test checks the frame bound
-//! held in transit.
+//! handed to the test, as are the event lines the relay does not know. The relay's events are
+//! recorded on a stream the test reads. The harness counts the `rpc` lines each way and remembers
+//! the longest, which is how a test checks the frame bound held in transit.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -32,11 +31,9 @@ use super::hosted::{self, Notice, Rpc};
 use super::payload;
 use super::supervisor::{self, Factory, Process, Spec, Stopped};
 use super::testing::{Start, capture, host_home, interpreter_command, python, python_command};
-use crate::config::Policy;
 use crate::events::{Events, StreamBuilder};
 use crate::harness::bindings::Brief;
-use crate::harness::escalation::Handler;
-use crate::harness::event::{Event, PolicyVersion, Received, Subscription, TryRecvError};
+use crate::harness::event::{Event, Received, Subscription, TryRecvError};
 use crate::harness::{Closed, ClosedBy};
 
 /// How long any one reply may take. A 64 MiB result crosses in a few seconds on a loaded runner.
@@ -350,6 +347,8 @@ struct Bound {
     relay: hosted::Relay,
     /// A sender into the process's stdin, `None` once a test has closed it.
     stdin: Option<mpsc::Sender<Value>>,
+    /// Event lines the relay does not know.
+    events: mpsc::UnboundedReceiver<Value>,
 }
 
 pub(crate) struct Relay {
@@ -372,9 +371,6 @@ pub(crate) struct Relay {
     declared: Vec<(Factory, PathBuf)>,
     env: Option<Vec<(OsString, OsString)>>,
     cwd: Option<PathBuf>,
-    /// The rules the bindings process decides by, and who answers what they escalate.
-    policy: Policy,
-    escalation: Option<Handler>,
     process: Option<Bound>,
     /// The stream the relays record to, and the test's subscription to it.
     events: Events,
@@ -464,8 +460,6 @@ impl Relay {
             declared: Vec::new(),
             env: None,
             cwd: None,
-            policy: Policy::default(),
-            escalation: None,
             process: None,
             events: stream.build(),
             subscription,
@@ -478,13 +472,6 @@ impl Relay {
         assert_eq!(ready["t"], "ready", "{ready}");
         assert_eq!(ready["agent"], PRIMARY, "{ready}");
         relay
-    }
-
-    /// Decide every request by `policy`, and ask `escalation` about what it holds for an answer,
-    /// from the next binding declared.
-    pub(crate) fn govern(&mut self, policy: Policy, escalation: Option<Handler>) {
-        self.policy = policy;
-        self.escalation = escalation;
     }
 
     /// Declare binding `name` over the fixture, with `factory` as `module:callable`, and start
@@ -562,7 +549,6 @@ impl Relay {
             rpyc_dir: rpyc_dir(),
             paths,
             bindings: self.declared.iter().map(|(f, _)| f.clone()).collect(),
-            policy: self.policy.wire(),
             cwd: self.cwd.as_deref(),
             env: self.env.as_deref(),
             probe: None,
@@ -572,19 +558,13 @@ impl Relay {
             .block_on(supervisor::start(spec))
             .unwrap_or_else(|e| panic!("the bindings did not start: {e}"));
         let names = self.declared.iter().map(|(f, _)| f.name.clone()).collect();
-        let approvals = hosted::Approvals {
-            handler: self.escalation.clone(),
-            version: PolicyVersion::new(self.policy.version()),
-        };
-        let relay = hosted::Relay::new(
-            Arc::clone(&self.to_interpreter),
-            self.events.clone(),
-            names,
-            approvals,
-        );
+        let relay =
+            hosted::Relay::new(Arc::clone(&self.to_interpreter), self.events.clone(), names);
         for agent in &self.agents {
             relay.opened(agent);
         }
+        let (others, events) = mpsc::unbounded_channel();
+        relay.others(others);
         {
             let _entered = self.runtime.enter();
             relay.attach(&mut process);
@@ -594,6 +574,7 @@ impl Relay {
             stdin: Some(process.sender()),
             process,
             relay,
+            events,
         });
     }
 
@@ -709,6 +690,15 @@ impl Relay {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The next event line the bindings process writes, within `within`.
+    pub(crate) fn event(&mut self, within: Duration) -> Value {
+        let bound = self.process.as_mut().expect("a started bindings process");
+        self.runtime
+            .block_on(async { tokio::time::timeout(within, bound.events.recv()).await })
+            .unwrap_or_else(|_| panic!("no event from the bindings within {within:?}"))
+            .expect("the process's event lines")
     }
 
     /// Stop the bindings process as a session's shutdown would, with `grace` between the

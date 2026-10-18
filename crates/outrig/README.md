@@ -86,18 +86,12 @@ let spec = LaunchSpec::from_image("my-image:latest", BTreeMap::new(), "/tmp/outr
 
 ```rust,no_run
 # async fn example(config: outrig::config::Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-use outrig::harness::{
-    DEFAULT_DRAIN, Escalation, EscalationAnswer, RoundOutcome, SessionBuilder, Verdict,
-};
+use outrig::harness::{DEFAULT_DRAIN, RoundOutcome, SessionBuilder, Verdict};
 
 // Everything the session needs from outside, given before it starts: here, each `${VAR}` its
-// model's key names is read from this program's own store rather than the environment, and a
-// binding call the config's `[policy]` escalates is answered by this program -- which refuses it.
+// model's key names is read from this program's own store rather than the environment.
 let mut builder = SessionBuilder::new(config, Some("coding"), None)
-    .secrets(|var: &str| (var == "ANTHROPIC_API_KEY").then(|| "sk-...".to_string()))
-    .escalation(|request: Escalation| async move {
-        Ok(EscalationAnswer::Deny(format!("nobody here approves {}", request.reason)))
-    });
+    .secrets(|var: &str| (var == "ANTHROPIC_API_KEY").then(|| "sk-...".to_string()));
 let mut events = builder.subscribe();
 let mut session = builder.start().await?;
 

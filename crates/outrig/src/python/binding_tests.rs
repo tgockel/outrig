@@ -29,7 +29,7 @@ const FACTORY: &str = "outrig_fixture:make";
 
 /// Python that binds `K` to `agent`'s kernel and `root` to its proxy of binding `fx`, then runs
 /// `body`.
-pub(super) fn with_root_in(agent: &str, body: &str) -> String {
+fn with_root_in(agent: &str, body: &str) -> String {
     format!(
         "import __main__\nAGENT = {agent:?}\nK = __main__._kernels[AGENT]\nroot = K.hosted('fx')\n{}",
         py(body)
@@ -37,7 +37,7 @@ pub(super) fn with_root_in(agent: &str, body: &str) -> String {
 }
 
 /// [`with_root_in`] for the primary kernel.
-pub(super) fn with_root(body: &str) -> String {
+fn with_root(body: &str) -> String {
     with_root_in("primary", body)
 }
 
@@ -151,12 +151,12 @@ const RAW: &str = r#"
 "#;
 
 /// [`with_root`], then [`RAW`], then `body`.
-pub(super) fn with_raw(body: &str) -> String {
+fn with_raw(body: &str) -> String {
     with_root(&format!("{}\n{}", py(RAW), py(body)))
 }
 
 /// Every line of `output` that starts with `label`.
-pub(super) fn lines_of<'a>(output: &'a str, label: &str) -> Vec<&'a str> {
+fn lines_of<'a>(output: &'a str, label: &str) -> Vec<&'a str> {
     output
         .lines()
         .filter(|line| line.starts_with(label))
@@ -318,6 +318,28 @@ fn ordinary_use_gives_the_hosts_answer() {
          after\n\
          False\n"
     );
+}
+
+/// An object that makes up every attribute it lacks -- an attribute-dict library's, as
+/// `addict.Dict` -- is handed out under an id the host makes, never one it asks the object for: as
+/// the root, and as a child a read returns.
+#[test]
+fn an_object_that_makes_up_attributes_is_handed_out_as_any_other() {
+    let mut relay = Relay::start();
+    relay.bind("fx", "outrig_fixture:make_vivid");
+    let out = relay.output(
+        1,
+        &with_root(
+            r#"
+            print(root["name"])
+            child = root.child
+            child["n"] = 1
+            print(root.child["n"], root["child"]["n"])
+            print(sorted(root.keys()))
+            "#,
+        ),
+    );
+    assert_eq!(out, "root\n1 1\n['child', 'name']\n");
 }
 
 // ---------------------------------------------------------------------------- a client by hand

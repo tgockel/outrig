@@ -20,24 +20,24 @@ use super::{
 use crate::agent::mock_http::MODEL;
 use crate::config::{Binding, Config, ConfigValidationError, FactoryValue};
 use crate::error::OutrigError;
-use crate::python::host::{Execution, Outcome};
+use crate::python::host::Outcome;
 use crate::python::testing::{Flag, group_gone, pip_env, wait_group_gone, wheel_links, within};
 
 const VAR: &str = "OUTRIG_TEST_BINDINGS_KEY";
 
 /// A repository and a global config beside it, with a provider, a model and a `coding` agent,
 /// and the directories a session's packages and approvals go in.
-pub(super) struct Bed {
+struct Bed {
     _root: tempfile::TempDir,
-    pub(super) repo: PathBuf,
-    pub(super) global: PathBuf,
+    repo: PathBuf,
+    global: PathBuf,
     packages: PathBuf,
     approvals: PathBuf,
-    pub(super) records: PathBuf,
+    records: PathBuf,
 }
 
 impl Bed {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let path = |name: &str| {
             let dir = root.path().join(name);
@@ -64,7 +64,7 @@ impl Bed {
 
     /// Write the global config, holding `global`'s bindings, and the repository's, holding
     /// `repo`'s.
-    pub(super) fn write(&self, global: &str, repo: &str) {
+    fn write(&self, global: &str, repo: &str) {
         std::fs::write(
             &self.global,
             format!(
@@ -91,7 +91,7 @@ identifier = "{MODEL}"
             .expect("write the repo config");
     }
 
-    pub(super) fn load(&self) -> Config {
+    fn load(&self) -> Config {
         Config::load(&self.repo, Some(&self.global)).unwrap_or_else(|e| panic!("{e}"))
     }
 
@@ -108,7 +108,7 @@ identifier = "{MODEL}"
     }
 
     /// A session over `cfg` in this repository, with its packages and approvals here.
-    pub(super) fn builder(&self, cfg: Config) -> SessionBuilder {
+    fn builder(&self, cfg: Config) -> SessionBuilder {
         SessionBuilder::new(cfg, Some("coding"), None)
             .secrets(|var: &str| (var == VAR).then(|| "sk-test".to_string()))
             .repo_root(&self.repo)
@@ -161,34 +161,25 @@ fn counting(answer: Approval) -> (impl Fn(&ApprovalRequest) -> Approval, Arc<Ato
     (approver, asked)
 }
 
-pub(super) async fn start(builder: SessionBuilder) -> Session {
+async fn start(builder: SessionBuilder) -> Session {
     within(builder.start_on_host())
         .await
         .unwrap_or_else(|e| panic!("the session did not start: {e}"))
 }
 
-pub(super) async fn stop(session: Session) -> ShutdownReport {
+async fn stop(session: Session) -> ShutdownReport {
     within(session.shutdown(DEFAULT_DRAIN)).await
 }
 
 /// What `source` printed, run in `session`'s primary kernel.
-pub(super) async fn output(session: &Session, source: &str) -> String {
-    printed(&mut submit(session, source)).await
-}
-
-/// `source`, submitted to `session`'s primary kernel.
-pub(super) fn submit(session: &Session, source: &str) -> Execution {
-    session
+async fn output(session: &Session, source: &str) -> String {
+    let mut execution = session
         .interpreter()
         .submit(source)
-        .unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// What `execution` printed, once it has run.
-pub(super) async fn printed(execution: &mut Execution) -> String {
+        .unwrap_or_else(|e| panic!("{e}"));
     match within(execution.outcome()).await {
         Outcome::Ok(report) => report.output,
-        other => panic!("the execution did not run: {other:?}"),
+        other => panic!("{source:?} did not run: {other:?}"),
     }
 }
 
@@ -218,7 +209,7 @@ fn pid_of(pid: &Value) -> Pid {
 }
 
 /// `[bindings.fx]`: the hosted-call fixture, installed from the test wheels.
-pub(super) const FIXTURE: &str = r#"
+const FIXTURE: &str = r#"
 [bindings.fx]
 description = "the fixture"
 requires    = ["outrig_fixture"]
@@ -236,7 +227,7 @@ async fn with_fixture(bed: &Bed) -> (Session, Subscription, Pid) {
 }
 
 /// Wait, without holding the runtime, until `flag` is raised.
-pub(super) async fn raised(flag: &Flag) {
+async fn raised(flag: &Flag) {
     within(async {
         while !flag.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -246,7 +237,7 @@ pub(super) async fn raised(flag: &Flag) {
 }
 
 /// The events the subscription holds.
-pub(super) fn taken(events: &mut Subscription) -> Vec<Arc<Event>> {
+fn taken(events: &mut Subscription) -> Vec<Arc<Event>> {
     let mut held = Vec::new();
     while let Ok(received) = events.try_recv() {
         if let Received::Event(event) = received {

@@ -203,13 +203,12 @@ fn every_request_is_recorded_receipt_first() {
             (Operation::Callattr, Some("__next__")),
             (Operation::Callattr, Some("__next__")),
             (Operation::Callattr, Some("__next__")),
-            // A call of what a read returned is recorded as the call of that member.
             (Operation::Getattr, Some("method")),
-            (Operation::Call, Some("method")),
+            (Operation::Call, None),
             (Operation::Getattr, Some("raise_fixture")),
-            (Operation::Call, Some("raise_fixture")),
+            (Operation::Call, None),
             (Operation::Getattr, Some("stamp")),
-            (Operation::Call, Some("stamp")),
+            (Operation::Call, None),
         ],
         "{requests:?}"
     );
@@ -611,6 +610,63 @@ fn an_interrupted_serialize_waiter_is_cancelled() {
     release.raise();
     assert_eq!(relay.result_from("primary", 1, TIMEOUT)["output"], "a\n");
     assert_eq!(relay.output(2, &with_stub("print(stub.calls)")), "0\n");
+}
+
+/// A callback's own request, interrupted while it waits for a serialized binding's turn, is
+/// cancelled at its depth, and only it: the host calls the callback from a worker thread while the
+/// call it is inside holds the turn, so the request waits there. The callback catches the
+/// interrupt and returns, and the outer call, which was not cancelled with it, returns too.
+#[test]
+fn an_interrupted_nested_request_waiting_for_the_turn_is_cancelled_alone() {
+    let mut relay = Relay::start();
+    relay.bind_serialized("fx", FACTORY);
+    relay.output(1, &with_stub("stub.public"));
+    relay.submit_in(
+        "primary",
+        2,
+        &with_stub(
+            r#"
+            def callback():
+                try:
+                    return stub.noted()
+                except KeyboardInterrupt:
+                    return "interrupted"
+            print(stub.call_in_thread(callback))
+            "#,
+        ),
+    );
+    // Its receipt says it reached the binding, where it waits for the turn.
+    relay.hosted_events_until(TIMEOUT, |events| {
+        events.iter().any(|event| {
+            matches!(&event.payload, Payload::HostedReceived { member, .. }
+                if member.as_deref() == Some("noted"))
+        })
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    relay.interrupt("primary", 2, false);
+    assert_eq!(
+        relay.result_from("primary", 2, TIMEOUT)["output"],
+        "interrupted\n"
+    );
+    let requests = by_request(&relay.hosted_events());
+    let noted = requests
+        .values()
+        .find(|events| {
+            matches!(&events[0].payload, Payload::HostedReceived { member, .. }
+                if member.as_deref() == Some("noted"))
+        })
+        .expect("the callback's request");
+    assert_eq!(
+        ended(noted),
+        (HostedOutcome::Cancelled, Some(HostedReason::Interrupted))
+    );
+    // Nothing else was cancelled with it: the call it was inside ran to its end.
+    let cancelled = requests
+        .values()
+        .filter(|events| ended(events).0 == HostedOutcome::Cancelled)
+        .count();
+    assert_eq!(cancelled, 1, "{requests:?}");
+    assert_eq!(relay.output(3, &with_stub("print(stub.calls)")), "0\n");
 }
 
 /// A call interrupted while it waits for a free connection never reaches the binding, and is
@@ -1578,23 +1634,13 @@ struct Bare {
 
 impl Bare {
     fn new() -> Self {
-        Self::with(hosted::Approvals::default())
-    }
-
-    /// A bare relay whose escalations `approvals` answers.
-    fn with(approvals: hosted::Approvals) -> Self {
         let told = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&told);
         let to_interpreter: hosted::ToInterpreter =
             Arc::new(move |line| kept.lock().expect("told lock").push(line));
         let mut stream = StreamBuilder::default();
         let events = stream.subscribe(1024);
-        let relay = hosted::Relay::new(
-            to_interpreter,
-            stream.build(),
-            vec!["fx".to_string()],
-            approvals,
-        );
+        let relay = hosted::Relay::new(to_interpreter, stream.build(), vec!["fx".to_string()]);
         Self {
             relay,
             told,
@@ -1639,89 +1685,6 @@ impl Bare {
         }
         recorded
     }
-}
-
-/// A request whose connection closed before its binding asked for a decision -- received, then
-/// the connection closed, then the decision line -- is cancelled when it asks: the handler is
-/// never asked, so no answer can run what nobody waits for.
-#[tokio::test]
-async fn a_request_whose_connection_closed_before_it_asked_is_cancelled_unasked() {
-    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count = Arc::clone(&asked);
-    let handler: crate::harness::escalation::Handler =
-        Arc::new(move |_: crate::harness::Escalation| {
-            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            std::future::ready(Ok(crate::harness::EscalationAnswer::Allow))
-        });
-    let approvals = hosted::Approvals {
-        handler: Some(handler),
-        ..hosted::Approvals::default()
-    };
-    let mut bare = Bare::with(approvals);
-    bare.wrote("received", json!(4), json!({"operation": "call"}));
-    bare.rpc(1, json!({"closed": "the caller's kernel closed it"}));
-    bare.relay.wrote(json!({
-        "t": "decision", "id": 7, "agent": PRIMARY, "binding": "fx", "conn": 1, "seq": 4,
-        "action": "escalate", "reason": "operator rule 1 says escalate", "operation": "call",
-        "member": "noted", "target": "outrig_fixture.Root",
-    }));
-    tokio::task::yield_now().await;
-    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let answers: Vec<Value> = bare
-        .relay
-        .queued()
-        .0
-        .into_iter()
-        .filter(|line| line["t"] == "decision")
-        .collect();
-    assert_eq!(answers.len(), 1, "{answers:?}");
-    assert_eq!(answers[0]["answer"]["action"], "cancel");
-    assert_eq!(answers[0]["answer"]["reason"], "disconnected");
-    assert!(
-        bare.recorded().iter().any(|payload| matches!(
-            payload,
-            Payload::HostedEnded {
-                outcome: HostedOutcome::Cancelled,
-                reason: Some(HostedReason::Disconnected),
-                ..
-            }
-        )),
-        "not recorded cancelled"
-    );
-}
-
-/// A cancel naming a great many requests costs one lookup per request the relay holds: with 1,024
-/// in flight, a cancel of a million numbers is handled at once, cancels every request it names,
-/// and passes the process only its first 16 as a hint.
-#[test]
-fn a_cancel_of_many_numbers_is_looked_up_once() {
-    let bare = Bare::new();
-    bare.rpc(1, json!({"data": "AAAA"}));
-    for seq in 1..=1024 {
-        bare.wrote("received", json!(seq), json!({"operation": "call"}));
-    }
-    let numbers: Vec<u64> = (1..=1_000_000).rev().collect();
-    let started = Instant::now();
-    bare.rpc(1, json!({"cancel": numbers}));
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
-    let (lines, _) = bare.relay.queued();
-    let hint = lines.last().expect("the hint");
-    assert_eq!(
-        hint["cancel"],
-        json!((1_000_000 - 15..=1_000_000).rev().collect::<Vec<u64>>())
-    );
-    // Every request it named is withdrawn: a decision any of them asks for is cancelled.
-    bare.relay.wrote(json!({
-        "t": "decision", "id": 7, "agent": PRIMARY, "binding": "fx", "conn": 1, "seq": 900,
-        "action": "escalate", "reason": "r", "operation": "call",
-    }));
-    let answer = bare.relay.queued().0.last().cloned().expect("an answer");
-    assert_eq!(answer["answer"]["action"], "cancel", "{answer}");
-    assert_eq!(answer["answer"]["reason"], "interrupted", "{answer}");
 }
 
 /// A label declaring a frame past the bound closes its connection before anything is held, and

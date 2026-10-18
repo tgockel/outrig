@@ -30,28 +30,6 @@ use crate::events::Events;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `step`, or a panic once it has taken longer than [`TIMEOUT`].
-/// How the hosted request `request` ended, from its `hosted.ended` among `events`.
-pub(crate) fn ended(
-    events: &[Arc<crate::harness::event::Event>],
-    request: crate::harness::event::RequestId,
-) -> (
-    crate::harness::event::HostedOutcome,
-    Option<crate::harness::event::HostedReason>,
-) {
-    events
-        .iter()
-        .find_map(|event| match &event.payload {
-            crate::harness::event::Payload::HostedEnded {
-                request: r,
-                outcome,
-                reason,
-                ..
-            } if *r == request => Some((*outcome, *reason)),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("{request} has not ended"))
-}
-
 pub(crate) async fn within<F: Future>(step: F) -> F::Output {
     tokio::time::timeout(TIMEOUT, step)
         .await

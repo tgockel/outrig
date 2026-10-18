@@ -58,7 +58,3 @@ mod supervisor_tests;
 #[cfg(test)]
 #[path = "hosted_tests.rs"]
 mod hosted_tests;
-
-#[cfg(test)]
-#[path = "policy_tests.rs"]
-mod policy_tests;
