@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ImageConfig::set_build_paths` replaces the source shape whole.** On a pull-source config it
+  wrote the build paths and left `image_name` set, so the config had both shapes at once:
+  `ImageConfig::source` panicked, and with it `LaunchSpec::from_config` and image acquisition,
+  while `Config::validate` reported a conflict between `image-name` and `dockerfile` the caller
+  never wrote. It now clears `image_name` as well. Nothing changes on a config that was already a
+  build source, and `outrig-cli` never called it. (#270)
 - **The interceptor's accept loop takes a finished connection back when it finishes.** It took
   them back only when the next connection arrived, so a container that opened a burst of
   connections and went quiet left the attachment holding one completed task per connection until
@@ -35,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ImageConfig::set_image_name` turns an image-config into a pull source in place.** It is the
+  counterpart of `set_build_paths` and mirrors `from_image_name`: it sets `image_name`, clears
+  both build paths, and drops the recorded `ConfigSource`. Converting a build source to a pull
+  source had no way to clear the private build paths before. `build_args` is left alone, as
+  `set_build_paths` leaves it, and validation still reports `ImageNameWithBuildArgs` if any
+  remain. `image_name` is still a public field, so assigning it directly can still leave the
+  build paths set and reach the `source` panic; closing that takes a breaking release. (#270)
 - **`Workspace::config_source` names the file that declared `host-path`**, as
   `MountConfig::config_source` does for a mount (#445).
 - **`Config::warnings` reports what a config load set aside rather than failing on.** Each

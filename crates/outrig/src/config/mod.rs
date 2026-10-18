@@ -2148,6 +2148,12 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
 /// would be resolved against the directory of a file it never came from. Read
 /// them with [`dockerfile`](Self::dockerfile) / [`context`](Self::context),
 /// write them with [`set_build_paths`](Self::set_build_paths).
+///
+/// The source shape is replaced whole: [`set_build_paths`](Self::set_build_paths)
+/// and [`set_image_name`](Self::set_image_name) each write one shape and clear
+/// the other, so neither leaves the both-set state that
+/// [`source`](Self::source) panics on. `image_name` is still a public field,
+/// and assigning it directly does not clear the build paths.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -2367,18 +2373,36 @@ impl ImageConfig {
         self.context.as_deref()
     }
 
-    /// Declare both build paths, dropping any recorded [`ConfigSource`]: the
-    /// new values did not come from a config file, so they resolve against the
-    /// `repo_root` passed to
-    /// [`resolved_build_paths`](Self::resolved_build_paths).
+    /// Make this a build-source config: declare both build paths, clear
+    /// `image_name`, and drop any recorded [`ConfigSource`]. The new values did
+    /// not come from a config file, so they resolve against the `repo_root`
+    /// passed to [`resolved_build_paths`](Self::resolved_build_paths).
     ///
-    /// The pair is replaced together because one source backs both: a setter
-    /// for one path alone would clear the source its untouched sibling still
-    /// depends on. [`source`](Self::source) requires the two to be set together
-    /// in any case.
+    /// The source shape is replaced whole, so a pull-source config comes out as
+    /// a build source rather than as both. The pair is written together because
+    /// one source backs both: a setter for one path alone would clear the
+    /// source its untouched sibling still depends on. `build_args` is left as
+    /// it was.
     pub fn set_build_paths(&mut self, dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) {
+        self.image_name = None;
         self.dockerfile = Some(dockerfile.into());
         self.context = Some(context.into());
+        self.source = None;
+    }
+
+    /// Make this a pull-source config: name the image, clear both build paths,
+    /// and drop any recorded [`ConfigSource`], which existed only to resolve
+    /// those paths. The counterpart of [`set_build_paths`](Self::set_build_paths)
+    /// and the in-place form of [`from_image_name`](Self::from_image_name).
+    ///
+    /// `build_args` is left as it was, so a build-source config that declared
+    /// any still fails validation with
+    /// [`ConfigValidationError::ImageNameWithBuildArgs`] until they are
+    /// cleared.
+    pub fn set_image_name(&mut self, image_name: impl Into<String>) {
+        self.image_name = Some(image_name.into());
+        self.dockerfile = None;
+        self.context = None;
         self.source = None;
     }
 

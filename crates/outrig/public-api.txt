@@ -559,6 +559,7 @@ pub fn outrig::config::ImageConfig::from_dockerfile(impl core::convert::Into<std
 pub fn outrig::config::ImageConfig::from_image_name(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::ImageConfig::resolved_build_paths(&self, &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
 pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>)
+pub fn outrig::config::ImageConfig::set_image_name(&mut self, impl core::convert::Into<alloc::string::String>)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MistralrsDeviceParseError
 impl core::error::Error for outrig::config::MistralrsDeviceParseError

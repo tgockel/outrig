@@ -14,9 +14,9 @@ and `context` together. So:
 - a caller can still write `image.image_name = Some(..)` on a build-source config and reach the
   panic, exactly as they could before 0002-42; and
 - `set_build_paths` on a *pull*-source config manufactures the both-set state, which is a
-  blessed method producing a value its own type rejects. That half needs no break, and is
-  filed for 0.2.1 as #270: `set_build_paths` clears `image_name`, and a new
-  `set_image_name` clears both paths.
+  blessed method producing a value its own type rejects. That half needed no break, and
+  landed in 0.2.2 as #270: `set_build_paths` clears `image_name`, and a new `set_image_name`
+  clears both paths.
 
 What stays here is the field, which only a breaking release can close.
 
@@ -28,8 +28,9 @@ The shape is replaced whole, so no sequence of public calls reaches the state `s
 
 - `image_name` becomes private with an `image_name()` getter, alongside `dockerfile()` and
   `context()`.
-- A test that every public mutation sequence leaves `source()` callable, ideally exhaustive over
-  the two setters #270 adds rather than a sampled pair.
+- Extend #270's test that every sequence of the two setters leaves `source()` callable
+  (`every_sequence_of_the_two_setters_leaves_source_callable` in
+  `crates/outrig/tests/config_accessors.rs`) to cover the removed field assignment.
 - `crates/outrig/public-api.txt` regenerated; `crates/outrig/CHANGELOG.md` records the break.
 
 ## Notes
