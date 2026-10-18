@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The interceptor's accept loop takes a finished connection back when it finishes.** It took
+  them back only when the next connection arrived, so a container that opened a burst of
+  connections and went quiet left the attachment holding one completed task per connection until
+  it was next used or detached. Memory only, and bounded by the size of the burst. (#267)
 - **The tool-name prefix is no longer promised for a server name too long to carry it.** A name
   outrig rewrites to fit 64 characters is cut at a fixed length without regard for where the
   server name ends, so on a server name of 55 characters or more a rewritten name had none of

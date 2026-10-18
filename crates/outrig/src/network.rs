@@ -2375,8 +2375,8 @@ impl Accept for TcpListener {
 /// Split out for one reason: the claim that finished connections are taken
 /// back out of the set as they complete is only observable in the set itself,
 /// and a test cannot see one the loop owns privately. Removing the
-/// `reap_finished` call below otherwise fails nothing -- a finished task is
-/// not an alive task, so no task count notices the handles piling up.
+/// `join_next` arm below otherwise fails nothing -- a finished task is not an
+/// alive task, so no task count notices the handles piling up.
 ///
 /// `Ok` once `cancel` ends it; an error when the listener stopped taking
 /// connections first.
@@ -2395,6 +2395,13 @@ async fn accept_into<L: Accept>(
     loop {
         let (stream, peer) = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            // Takes each finished connection back out as it finishes, rather
+            // than when the next one arrives: a loop parked in `accept` has no
+            // other reason to wake for it. An empty set does not match, which
+            // leaves this arm out of the iteration. A connection that
+            // panicked is dropped here as it is in `reap_finished` and the
+            // drain after this loop.
+            Some(_) = conns.join_next() => continue,
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
                 Err(e) => match after_listener_failure("tcp", e, cancel).await {
@@ -2427,9 +2434,10 @@ async fn accept_into<L: Accept>(
             record_refused(audit, bindings, peer, dst, UNREDIRECTED_RULE, cancel).await;
             continue;
         }
-        // Reaped here, as each connection arrives, rather than before the
-        // accept: it can have waited a long time, and a connection that
-        // finished meanwhile is not one this is still carrying.
+        // The arm above takes finished connections back one at a time, and
+        // `accept` can win the race with it: one that finished meanwhile is
+        // not one this is still carrying, and the limit below must not count
+        // it.
         reap_finished(conns);
         if conns.len() >= TCP_CONNECTIONS {
             drop(stream);
@@ -2606,9 +2614,10 @@ async fn record_refused(
 }
 
 /// Takes the handles of connections that have already finished out of
-/// `conns`. Without this a `JoinSet` only ever spawned into keeps one handle
-/// per connection the attachment has ever served, which is exactly the state
-/// a long-lived attachment must not accumulate.
+/// `conns`, so a count of it is a count of the connections still running.
+/// What keeps a `JoinSet` only ever spawned into from holding one handle per
+/// connection the attachment has ever served is [`accept_into`]'s `join_next`
+/// arm, which takes each one back as it finishes.
 fn reap_finished(conns: &mut JoinSet<()>) {
     while conns.try_join_next().is_some() {}
 }
@@ -6627,6 +6636,36 @@ mod tests {
         assert!(waited.is_ok(), "the audit log never reached {want} records");
     }
 
+    /// Waits until every connection the accept loop started has ended, counted
+    /// by the clones of its `live` sender they hold, and the loop has had its
+    /// turn since. `watch` is a weak handle on that sender; the test keeps the
+    /// one strong sender besides the connections' clones.
+    ///
+    /// A loop that ends first -- by a cancel, as the tests' do -- ends without
+    /// reaping, so what it holds then is a question of order and says nothing
+    /// about whether it takes finished connections back.
+    ///
+    /// The turn is yielded rather than waited for: the test runtime has one
+    /// thread, and the task that finished woke the loop before this is polled
+    /// again, so one yield already puts the loop ahead of this in the queue.
+    /// The rest are margin against a scheduler that orders it otherwise.
+    async fn await_connections_taken_back(watch: &mpsc::WeakSender<()>) {
+        let waited = tokio::time::timeout(Duration::from_secs(30), async {
+            while watch.strong_count() > 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{} connections never ended",
+            watch.strong_count() - 1
+        );
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// The one record `dir`'s audit log holds, read as it is the instant it is
     /// asked for -- no polling, no retry, so a record written late is a
     /// failure rather than a slow pass.
@@ -7475,9 +7514,9 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Connections that have finished do not stay in the set the accept loop
-    /// keeps them in. A set only ever spawned into holds one handle per
-    /// connection the attachment has ever served.
+    /// `reap_finished` takes every finished connection out of the set the
+    /// accept loop keeps them in, so a count of it is a count of the ones
+    /// still running.
     #[tokio::test]
     async fn finished_connections_do_not_pile_up_in_the_accept_loop_set() {
         let mut conns = JoinSet::new();
@@ -7502,9 +7541,10 @@ mod tests {
         );
     }
 
-    /// The same claim against the loop rather than the helper: it is the loop
-    /// that has to keep taking finished connections back out, and a test that
-    /// calls `reap_finished` itself cannot tell whether the loop still does.
+    /// What keeps that set from holding a handle per connection the attachment
+    /// has ever served is the loop taking each one back as it finishes, and a
+    /// test that calls `reap_finished` itself cannot tell whether it still
+    /// does.
     #[tokio::test]
     async fn the_accept_loop_keeps_taking_finished_connections_back() {
         const SERVED: usize = 64;
@@ -7518,6 +7558,8 @@ mod tests {
         // Held here rather than by the loop, which is the whole reason the
         // accepting half takes it by reference.
         let mut conns = JoinSet::new();
+        let (live, _idle) = mpsc::channel(1);
+        let watch = live.downgrade();
 
         let token = cancel.clone();
         let log = dir.path().to_path_buf();
@@ -7537,29 +7579,84 @@ mod tests {
                 // connection writes one before its task ends, and the audit
                 // writer is a queue of one on a runtime this test shares with
                 // it -- so a sleep here says nothing about how many
-                // connections are still in flight, and a machine slow enough
-                // to lag the writer would leave a whole burst of them for the
-                // assertion below to count.
+                // connections are still in flight.
                 await_audit_records(&log, served).await;
             }
+            // The last one has no further accept to be taken back at, so it
+            // is the loop parked in `accept` that has to take it.
+            await_connections_taken_back(&watch).await;
         });
 
-        run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns)
+        run_accept_loop_holding(&listener, &audit, &cancel, &conn_cancel, &mut conns, &live)
             .await
             .expect("only the cancel ends the loop");
         clients.await.expect("clients");
 
-        // Not zero: the loop reaps as each connection arrives, so the
-        // connection it served last is still held either way, and the drain
-        // that follows `accept_into` in production is what collects it. What
-        // the gate above buys is that only the last one or two can be --
-        // every earlier connection had a whole further connection's worth of
-        // the loop to be taken back in. The claim is that the carrier does
-        // not grow with the number of connections served: without the reap
-        // all SERVED of them are still here.
         assert!(
-            conns.len() < 8,
+            conns.is_empty(),
             "{} of {SERVED} finished connections were never taken back out of the carrier",
+            conns.len()
+        );
+    }
+
+    /// A burst that finishes while the loop is parked in `accept` is taken
+    /// back whole, without another connection arriving to prompt it. The
+    /// shape of a package install or a `git clone` followed by a quiet turn.
+    #[tokio::test]
+    async fn a_burst_that_finishes_while_the_loop_is_parked_is_taken_back() {
+        const BURST: usize = 16;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = Counting {
+            inner: Redirected::elsewhere(listener),
+            accepted: accepted.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let mut conns = JoinSet::new();
+        let (live, _idle) = mpsc::channel(1);
+        let watch = live.downgrade();
+
+        let token = cancel.clone();
+        let log = dir.path().to_path_buf();
+        let clients = tokio::spawn(async move {
+            // Ends the loop however this task does; see
+            // `the_accept_loop_keeps_taking_finished_connections_back`.
+            let _ends_the_loop = token.drop_guard();
+            // Silent and open, so each connection parks in the sniff read
+            // until it is closed.
+            let mut open = Vec::new();
+            for _ in 0..BURST {
+                open.push(TcpStream::connect(addr).await.expect("connect"));
+            }
+            // Counted at the listener, which only goes up, rather than by the
+            // connections still running: a silent one gives up after
+            // `SNIFF_TIMEOUT` on its own, and a count of the running ones
+            // would then never reach BURST.
+            let all_accepted = tokio::time::timeout(Duration::from_secs(30), async {
+                while accepted.load(std::sync::atomic::Ordering::SeqCst) < BURST {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(all_accepted.is_ok(), "the loop never accepted {BURST}");
+            // Dropped in one go, while the loop has nothing left to accept.
+            drop(open);
+            await_audit_records(&log, BURST).await;
+            await_connections_taken_back(&watch).await;
+        });
+
+        run_accept_loop_holding(&listener, &audit, &cancel, &conn_cancel, &mut conns, &live)
+            .await
+            .expect("only the cancel ends the loop");
+        clients.await.expect("clients");
+
+        assert!(
+            conns.is_empty(),
+            "{} of {BURST} finished connections were still held by a loop with nothing to accept",
             conns.len()
         );
     }
@@ -7736,6 +7833,28 @@ mod tests {
         }
     }
 
+    /// A listener that counts the connections it has handed the loop, for a
+    /// test that has to know the loop has them all and cannot see the loop's
+    /// own state. Unlike the connections still running, the count never goes
+    /// down.
+    struct Counting {
+        inner: Redirected,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Accept for Counting {
+        async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            let accepted = self.inner.accept().await?;
+            self.accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(accepted)
+        }
+
+        fn original_dst(&self, stream: &TcpStream, peer: SocketAddr) -> io::Result<SocketAddr> {
+            self.inner.original_dst(stream, peer)
+        }
+    }
+
     /// The accept loop over `listener`, carrying `conns`, until `cancel` or
     /// the listener ends it. Under [`deny_all_policy`], so a connection it
     /// accepts is never dialed.
@@ -7747,6 +7866,19 @@ mod tests {
         conns: &mut JoinSet<()>,
     ) -> io::Result<()> {
         let (live, _idle) = mpsc::channel(1);
+        run_accept_loop_holding(listener, audit, cancel, conn_cancel, conns, &live).await
+    }
+
+    /// [`run_accept_loop`] with the carrier's `live` sender kept by the test,
+    /// so it can count the connections still running by the clones they hold.
+    async fn run_accept_loop_holding(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+        live: &mpsc::Sender<()>,
+    ) -> io::Result<()> {
         accept_into(
             listener,
             audit,
@@ -7756,7 +7888,7 @@ mod tests {
             cancel,
             conn_cancel,
             conns,
-            &live,
+            live,
         )
         .await
     }
