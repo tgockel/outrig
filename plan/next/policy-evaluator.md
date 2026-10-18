@@ -1,4 +1,14 @@
-# 0003-25 -- An evaluator judges what no rule settled
+# A model judges a request the operator left to it
+
+> **Waits on `plan/next/binding-permissions.md`.** This was task `0003-25`, written against
+> `0003-24`'s `[policy]` rules, which were reverted before release (2026-10-18). Nothing in 0.3
+> holds a request for a decision, so there is nothing for an evaluator to judge. Its points about
+> the judge itself do not depend on the rule language: a repository cannot choose it, its
+> instructions are trusted and the evidence is delimited, its answer is validated, its failure is
+> never an allow, and its usage is not a round's. The rest -- `evaluate` as a rule action, the rule
+> that chose it -- does, and goes with it. One question was answered before it was deferred: the
+> policy's version covers the judge's model and instructions as well as the rules, when a judge is
+> configured.
 
 ## Context
 
@@ -163,8 +173,9 @@ Against a mock provider:
 
 ## See also
 
-- `plan/phase/0003-python/boundary-policy.md` -- the evaluator: off by default, `evaluate` only,
-  failure never allows, usage attributed separately.
+- `plan/next/binding-permissions.md` -- the permissions an evaluator would serve.
+- `plan/done/phase/0003-python/tasks/0003-24-policy-decides-what-crosses.md` -- the reverted rules
+  and gate this was written against.
 - `plan/phase/0003-python/observability.md` -- the integration-audit category its events belong
   to.
 - `plan/next/event-audience-projections.md` -- whether the evaluator's evidence becomes one

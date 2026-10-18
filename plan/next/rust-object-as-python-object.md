@@ -46,10 +46,9 @@ builder.bind("task", Arc::new(TaskService::new(..)));
   answers from the schema, and `runtime.bindings` lists it beside hosted objects.
 - A call carries its arguments by value, as JSON, in a message kind of its own on the interpreter
   pipe. Rust checks them against the schema and calls `call`. No binding process or RPyC is used.
-- The boundary is a hosted object's: `[[policy.rules]]` (`0003-24`) match the binding, the
-  described type, the method and the operation; `evaluate` sends the call to the evaluator
-  (`0003-25`); each call is evented as in `0003-22`; admission and the shutdown report cover it
-  (`plan/phase/0003-python/lifecycle.md`).
+- The boundary is a hosted object's: binding the object is the grant
+  (`plan/phase/0003-python/boundary-policy.md`); each call is evented as in `0003-22`; admission
+  and the shutdown report cover it (`plan/phase/0003-python/lifecycle.md`).
 - Calls are synchronous, with the same spelling as a hosted object's, so the two read alike
   (`mcp-wrappers.md`); a caller that must stay reachable uses `asyncio.to_thread` as it would for
   any hosted call. `CallContext` carries the call id, the binding and a cancellation signal, so
@@ -63,6 +62,5 @@ lists; how an MCP tool's schema and name become a Python method.
 
 - Agent code calls a bound service's method and gets Python data back. Arguments outside the
   schema fail before `call` runs.
-- A `deny` rule on a method never invokes `call`; an `escalate` rule waits for `/approve`.
 - An MCP server's tools are methods of a bound object, served by OutRig's Rust client.
 - Shutdown signals cancellation to running calls and reports each one's outcome.

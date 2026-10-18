@@ -33,11 +33,11 @@ An instruction-only skill, one with no `skill.py`, needs none of this. Its direc
 body loaded when the skill is used, and the agent reads it as it reads any message.
 
 `run-new`'s REPL matches `/help` and `/quit` in `crates/outrig-cli/src/cli/run_new/converse.rs`,
-`0003-24` adds `/approve` and `/deny`, and any other `/word` is an unknown command today.
+and any other `/word` is an unknown command today.
 
 This is also the task where the phase's parts first run together. The phase's exit criteria ask
-for a skill that uses a binding, runs typed children in parallel with one of them repaired, and
-meets an escalated call, working end to end through `run-new`, and this task's acceptance runs it.
+for a skill that uses a binding and runs typed children in parallel with one of them repaired,
+working end to end through `run-new`, and this task's acceptance runs it.
 
 ## Goal
 
@@ -159,7 +159,7 @@ agent's history like anything else it ran.
   typed-agent calls it makes carry the invocation's id, through a context variable `invoke` sets
   around the entry, which tasks the entry starts and `to_thread` workers inherit; a hosted call
   made on the entry's own thread runs in its context already. It is diagnostic context, not a
-  principal: policy never reads it, and code in the same interpreter can set or clear it
+  principal: nothing decides by it, and code in the same interpreter can set or clear it
   (`skills.md`). A skill's helper called directly -- its module imported and the function called,
   without `invoke` -- produces the boundary events of its hosted calls without the id, and no
   invocation events.
@@ -263,8 +263,8 @@ model makes of a directive is not measured here.
 - **An instruction-only skill's directive delivers its `SKILL.md` body followed by the line**,
   with the skill named on the `Delivery`, and the agent needs no `invoke` to read it. A directive
   for a skill with a `skill.py` delivers the line alone.
-- With a skill named `approve` present, `/approve <id>` runs the built-in, and the skill was
-  reported when the catalog was read.
+- With a skill named `help` present, `/help` runs the built-in, and the skill was reported when
+  the catalog was read.
 - **Invocation events**: a directive the REPL resolves publishes `skill.directive.received`, and
   the agent's `invoke` publishes `skill.invocation.started` -- the skill, its source, its digest,
   the instance, how it was obtained and the injected binding names -- and
@@ -280,21 +280,18 @@ model makes of a directive is not measured here.
   an `@outrig.agent` call it makes carry the invocation's id in their events. The same helper
   called directly, after `import outrig_skills.review_diff.skill`, produces the hosted call's
   boundary events without an invocation id, and no invocation events.
-- **The parts compose, end to end**, through `run-new` with a mock model, a mock evaluator and a
-  binding of `0003-16`'s fixture library. A `/name` directive is parsed by a child into
-  `ReviewDiffParams`, and the entry uses its bound binding; makes three `@outrig.agent` calls,
-  which return handles that `asyncio.gather` accepts, one of whose children completes with a wrong
-  shape once and is repaired; and makes a hosted call that an `evaluate` rule sends to the
-  evaluator, which answers `escalate`, and that runs once `/approve` is typed.
+- **The parts compose, end to end**, through `run-new` with a mock model and a binding of
+  `0003-16`'s fixture library. A `/name` directive is parsed by a child into `ReviewDiffParams`,
+  and the entry uses its bound binding and makes three `@outrig.agent` calls, which return handles
+  that `asyncio.gather` accepts, one of whose children completes with a wrong shape once and is
+  repaired.
   The events' parentage matches the run: the parse call and each child call under the invocation,
   the repair under its call, and each boundary event under its execution, the entry's carrying the
   invocation's id. Each child's usage is in its own events and in its call's, the invocation's and
-  the round's totals, once each, and the evaluator's usage is in its own decision event and in
-  none of those totals.
+  the round's totals, once each.
 - **Shutdown with typed children running**: the same run, shut down while the three calls are
-  under way and the escalated call waits for an answer, settles each call's waiter with the
-  documented error, cancels the pending escalation, lists every child's work and every hosted
-  call in the `ShutdownReport`, and returns within the test's deadline.
+  under way, settles each call's waiter with the documented error, lists every child's work and
+  every hosted call in the `ShutdownReport`, and returns within the test's deadline.
 - `crates/outrig/public-api.txt` regenerated: the way to send a message naming a skill, the
   invocation events, and the invocation's id on the events that carry it are its only additions.
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
@@ -323,10 +320,6 @@ model makes of a directive is not measured here.
 
 - **Hard: `0003-22`.** Injection passes a binding's host reference, which needs bindings in the
   kernel.
-- **Hard: `0003-24`.** `/approve` and `/deny` are built-ins a skill's name can collide with, and
-  the end-to-end acceptance meets an escalated call.
-- **Hard: `0003-25`.** The end-to-end acceptance's escalation comes from the evaluator, whose
-  usage it checks is kept apart.
 - **Hard: `0003-31`.** The parse is a typed agent call: `parse_params(text) -> <Skill>Params |
   Clarification` is declared with `@outrig.agent`, its child is spawned and released as a
   decorated call's is, and its completion is decoded strictly -- the union by `0003-26`'s rule,

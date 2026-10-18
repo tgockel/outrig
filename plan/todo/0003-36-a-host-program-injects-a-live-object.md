@@ -15,8 +15,8 @@ That makes a second serving endpoint. One bindings process holds every factory b
 connection, by the same serving machinery: `binding.py` holds the interception, the per-kernel
 object tables, the serialize turn, the request records and the `published` handshake inside a
 process entry point that owns its stdio and signals, and this task extracts them into a module the
-program imports. The relay routes each binding to its endpoint; admission, policy (`0003-24`),
-events and the drain are the same for both.
+program imports. The relay routes each binding to its endpoint; admission, events and the drain
+are the same for both.
 
 Two rules come from R3. `outrig.bindings[name]` (`0003-26`) is the authoritative lookup, and a
 convenience global of the binding's name is installed only where the name is free; today
@@ -30,8 +30,8 @@ the call is still running -- rather than call the session stopped, and the progr
 
 `session.inject("notes", notes)` returns once every agent can reach `notes` --
 `outrig.bindings["notes"]` always, the global `notes` where the name is free -- and every
-operation on it runs in the program's process under the same admission, policy, events and
-shutdown accounting as a factory binding's.
+operation on it runs in the program's process under the same admission, events and shutdown
+accounting as a factory binding's.
 
 ## Deliverables
 
@@ -42,9 +42,9 @@ shutdown accounting as a factory binding's.
   `asyncio` or `outrig`, or is a dunder raises, as `0003-20` refuses them for a declaration; a
   name that is a builtin is registered and reachable through `outrig.bindings`, but installed as
   no global, so `print` stays `print`. The exception classes are this task's.
-- **The serving module.** The interception, the per-kernel `Objects` tables, `Turn`, the request
-  records with the `published` handshake, and the rule table of `0003-24`, extracted from
-  `binding.py` into an importable module of the `outrig` package (fork 3). The program's copy
+- **The serving module.** The interception, the per-kernel `Objects` tables, `Turn`, and the
+  request records with the `published` handshake, extracted from `binding.py` into an importable
+  module of the `outrig` package (fork 3). The program's copy
   serves connections carried as `rpc` frames on the owner connection, a thread per connection as
   RPyC's model has it, never on the program's loop; `binding.py`'s entry point becomes a wrapper
   over the same module. A live method that needs the program's loop uses
@@ -63,9 +63,8 @@ shutdown accounting as a factory binding's.
   docstring's first line, and names the `outrig.bindings[...]` path where the global is occupied;
   a binding injected while a round runs is announced per fork 2. No `repr`, property or iteration
   is run to describe an object: its type and `__doc__` are read, and nothing else.
-- **Policy.** Rules run in the serving module from the table pushed at registration, with the
-  policy version; `escalate` and `evaluate` reach the engine's gate as before. The trusted program
-  needs no declaration approval; every operation on its object is still decided.
+- **The grant.** The trusted program needs no declaration approval: injecting the object is the
+  grant (`boundary-policy.md`), and every operation on it is still evented.
 - **Lifetime and stop.** Live calls drain with the rest. At terminating, nothing can end a call
   running in the program's thread, so the relay seals its record as `unknown` with a new reason,
   still running: its `hosted.ended` event is published with that outcome before the report, the
@@ -97,9 +96,7 @@ shutdown accounting as a factory binding's.
   before entry installs the binding at start.
 - The orientation carries `Notes`'s qualified type name and its docstring's first line, and a
   `Notes.__repr__` that writes a file is never run.
-- **Policy decides a live object's operations.** A deny rule on `Notes.read` leaves a host-side
-  counter at zero and raises `0003-24`'s exception in the caller; an escalate rule holds the call
-  for the handler; the events have `0003-22`'s shape with the binding's name.
+- A live object's operations are evented in `0003-22`'s shape, with the binding's name.
 - `serialize=True` makes two kernels' calls never overlap in the program; `False` lets them.
 - **The program's loop is its own.** A live method that uses
   `asyncio.run_coroutine_threadsafe(...).result()` into the program's loop returns to its caller
@@ -136,7 +133,6 @@ shutdown accounting as a factory binding's.
 ## Dependencies
 
 - **Hard: 0003-23.** The synchronous proxies a live object is reached through.
-- **Hard: 0003-24.** The rule table and the gate the serving module uses.
 - **Hard: 0003-26.** `outrig.bindings`, and the package the serving module belongs to.
 - **Hard: 0003-29.** The session, the owner connection, `ShutdownException` and the report.
 - **Hard: 0003-35.** Host-driven agents, through which this task's acceptance runs agent code.
@@ -144,7 +140,7 @@ shutdown accounting as a factory binding's.
 ## See also
 
 - `plan/phase/0003-python/hosted-objects.md` -- "Live objects", "Presentation" and "Lifetime".
-- `plan/phase/0003-python/boundary-policy.md` -- rules in the serving process.
+- `plan/phase/0003-python/boundary-policy.md` -- the binding is the grant, and what is recorded.
 - `plan/phase/0003-python/security.md` -- what a live object grants.
 - `plan/phase/0003-python/lifecycle.md` -- the live-call rows.
 - `crates/outrig/src/python/binding.py`, `hosted.rs` and `interpreter.py` -- the serving code,

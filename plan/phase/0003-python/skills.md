@@ -187,7 +187,7 @@ From the agent's side a skill is a Python package.
 - **Invoking adds nothing to the agent's namespace.** No name is bound in the agent's globals. The
   agent can still `import outrig_skills.review_diff.skill as rd` and call helpers directly, which
   is ordinary Python: it skips `invoke`'s parse, its injection and its invocation events, and does
-  not skip the boundary policy a hosted call goes through.
+  not skip the interception and events a hosted call goes through.
 
 ### Changed files and reload
 
@@ -254,10 +254,9 @@ user types   /review-diff a.py b.py --max-parallel 2 --allow-partial
 ```
 
 **The REPL** takes a line beginning `/` as it does now: a built-in command runs, and otherwise the
-name is looked up in the catalog. Built-in commands win -- `/quit`, `/help`, and `/approve` and
-`/deny` from `boundary-policy.md` -- and a skill whose name one of them takes is reported when the
-catalog is read; it stays reachable through `invoke`. A name that is neither is an unknown
-command, as `run-new` reports it today.
+name is looked up in the catalog. Built-in commands win -- `/quit` and `/help` -- and a skill whose
+name one of them takes is reported when the catalog is read; it stays reachable through `invoke`. A
+name that is neither is an unknown command, as `run-new` reports it today.
 
 **The line reaches the main agent as ordinary user-channel text.** For a skill with a `skill.py`,
 the body is the line as typed; for an instruction-only skill, it is the `SKILL.md` body followed
@@ -478,10 +477,10 @@ That is also why a repository's skills need no approval where its bindings do
 the container and does nothing the agent could not do by writing the same code; project skills
 are repository content, trusted as much as any file in the workspace the agent can already run.
 
-A hosted call a skill makes goes through the same boundary policy as any other
-(`boundary-policy.md`). The invocation's context -- the skill's name, its digest, the invocation's
-id -- is attached to those boundary events as diagnostic correlation, not as a principal. Code in
-the same interpreter can set or clear such context, so policy does not treat it as identity.
+A hosted call a skill makes crosses the boundary as any other does (`boundary-policy.md`). The
+invocation's context -- the skill's name, its digest, the invocation's id -- is attached to those
+boundary events as diagnostic correlation, not as a principal. Code in the same interpreter can set
+or clear such context, so nothing treats it as identity.
 
 ## Events
 

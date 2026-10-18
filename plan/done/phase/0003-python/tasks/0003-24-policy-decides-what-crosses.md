@@ -1,5 +1,16 @@
 # 0003-24 -- Policy decides what crosses, and the user can be asked
 
+> **Reverted before release (2026-10-18).** Everything below was built in `24a333c` and taken out
+> before any tag carried it: `[policy]` and its rules, `runtime.Denied`, the escalation handler,
+> `/approve` and `/deny`, the decision events and `Config::operator()`. Rules about a binding's
+> types, members and operations cannot say what an operator means -- "read-only git" -- and a
+> policy written in them is a mess no one can review. In 0.3 the binding is the grant: having a
+> remote object is permission to use it (`plan/phase/0003-python/boundary-policy.md`). Finer
+> permissions are `plan/next/binding-permissions.md`. Three parts stayed, since they hold without
+> a policy: the global `[events]` mode stands over a repository's; the binding names an object it
+> hands out from the host's side, never asking the object; and an interrupted call cancels its own
+> requests at any depth, a callback's included. This file stays as the record of what was tried.
+
 ## Context
 
 `0003-22` sends every hosted request through Rust and records it, and decides nothing: with no

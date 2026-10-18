@@ -345,14 +345,14 @@ wants an interrupted workflow to stop its children keeps the handles and cancels
 ("A workflow").
 
 **Each call gets a new child, which is released when the call's result settles** -- accepted,
-rejected, cancelled, out of budget, or ended by the session closing (`lifecycle.md`). Underneath,
-a call is `work.md`'s explicit API: spawn a child, submit one piece of work, and release the child
-when the work settles. Releasing it closes the child's subtree the way a session close does: its
-own children are released, its pending escalations are cancelled, its running execution is
-interrupted, and its forwarded hosted calls finish, or are reported `unknown` if their binding
-dies (`lifecycle.md`, "Releasing a child"). An agent that wants one child to take several
-submissions in turn, keeping its namespace and history between them, uses that API directly; one
-that wants a child to answer many typed requests declares an agent class (`agent-classes.md`).
+rejected, cancelled, out of budget, or ended by the session closing (`lifecycle.md`). Underneath, a
+call is `work.md`'s explicit API: spawn a child, submit one piece of work, and release the child
+when the work settles. Releasing it closes the child's subtree the way a session close does: its own
+children are released, its running execution is interrupted, and its forwarded hosted calls finish,
+or are reported `unknown` if their binding dies (`lifecycle.md`, "Releasing a child"). An agent that
+wants one child to take several submissions in turn, keeping its namespace and history between them,
+uses that API directly; one that wants a child to answer many typed requests declares an agent class
+(`agent-classes.md`).
 
 ## Placement and limits
 
@@ -382,8 +382,7 @@ giving co-hosted agents different grants would be presentation only, so none is 
 - **Tokens.** A per-tree token budget bounds what a tree of children spends. A call whose child
   runs out before completing settles with a budget error, never with an empty result.
 - **Spend.** A child's model usage is attributed to the child and added to its call, to the skill
-  invocation the call ran under, and to the main agent's round. The boundary evaluator's usage is
-  attributed separately (`boundary-policy.md`).
+  invocation the call ran under, and to the main agent's round.
 
 A child's thread is not the main thread, so the interrupt, a signal aimed at the main thread,
 cannot reach it. A child whose code wedges is contained and not recoverable: its parent is told,

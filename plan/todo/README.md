@@ -98,12 +98,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Host objects and the boundary**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-25` | An evaluator judges what no rule settled                           |
-
 **The `outrig` package**
 
 | Task      | What it settles                                                    |
@@ -175,11 +169,13 @@ Cross-cutting notes the individual tasks carry rather than this file:
   and binds the synchronous proxy `0003-17` proved; `hosted-objects.md` records the decision.
 - Close behavior lands with each resource: the task that adds a resource adds its row to
   `lifecycle.md`'s close table, so no single shutdown task has to reopen the others.
-- Credential isolation became hosted objects (`0003-16` through `0003-25`), and subagents became
+- Credential isolation became hosted objects (`0003-16` through `0003-24`), and subagents became
   `0003-26`, `0003-30`, `0003-31` and `0003-34`. MCP as Python objects, interpreter restart,
   confining what a hosted library does on the host, and the other deferred subjects have design
   pages or `plan/next/` entries and no tasks. They are out of scope by the phase README's own
-  list, not forgotten.
+  list, not forgotten. `0003-24`'s `[policy]` was reverted before release and `0003-25`'s
+  evaluator went back to `plan/next/`: in 0.3 the binding is the grant, and finer permissions are
+  `plan/next/binding-permissions.md`.
 - `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
   box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
 

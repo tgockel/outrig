@@ -38,16 +38,15 @@ it adds no reach a model did not have, because a model that saw it could already
 execution is awaiting, resource events. Not model-visible, so it needs its own justification
 rather than inheriting one.
 
-**Integration audit** -- what crossed the hosted-object boundary and what was decided about it
+**Integration audit** -- what crossed the hosted-object boundary and what came of it
 (`hosted-objects.md`, `boundary-policy.md`). A hosted request is recorded as events that share its
-id: its receipt, published before dispatch, with bounded previews of its arguments; its decision --
-the rule's action, the evaluator's verdict, or the approver's answer -- with the effective policy's
-version, a digest of the rules in force; its dispatch; and its outcome. A request never dispatched
-has no dispatch event. The category carries the warning any call log carries: the most useful
-field, the arguments, is also the one most likely to hold a secret. It also holds things no model
-saw -- a host traceback stays in the event and out of the agent's error -- so, like execution
-diagnostics, it needs its own justification. An event never calls into an object to describe it:
-a preview is built from the by-value form that crossed, and a host object is named by its type.
+id: its receipt, published before dispatch, with bounded previews of its arguments; its dispatch;
+and its outcome. A request never dispatched has no dispatch event. The category carries the warning
+any call log carries: the most useful field, the arguments, is also the one most likely to hold a
+secret. It also holds things no model saw -- a host traceback stays in the event and out of the
+agent's error -- so, like execution diagnostics, it needs its own justification. An event never
+calls into an object to describe it: a preview is built from the by-value form that crossed, and a
+host object is named by its type.
 
 What the single rule got right and the three must keep: capture is a decision with consequences,
 not a free byproduct. Even recording exactly model-visible text changes its retention and its
@@ -232,11 +231,6 @@ each:
   type, bounded previews, the outcome (`returned`, `raised`, `refused`, `cancelled` or `unknown`,
   as `lifecycle.md` defines them), duration, and the call a callback ran under; each callback's
   invocation, `hosted.callback`; and the bindings process's exit mid-session, `binding.exited`;
-- `0003-24`: each request's decision -- a rule's action with the rule's position and layer, the
-  `default`, or the approver's answer -- with the effective policy's version; and each escalation
-  with its answer, its cancellation, or the late answer that changed nothing;
-- `0003-25`: each evaluator verdict, as a request's decision, and each evaluation's usage,
-  attributed apart from the agent's, so a judge's tokens never appear in a round's total;
 - `0003-36`: each live object a host program injects, `binding.injected`, with its name and
   host-side type; its calls produce the same `hosted.*` events as a factory binding's.
 
@@ -293,20 +287,19 @@ losses, and a jump in the file's ids shows where each gap is. A record that must
 the mandatory sink below, and not in this phase.
 
 Two neighbors to keep distinct. `Transcript` is a public sink for podman and buildah transcripts
-whose future `plan/todo/README.md` records as undecided; it is a text log, not an event stream,
-and this subject should not absorb it. And `boundary-policy.md` is the other half of a hosted
-call's record: it decides what crosses, before the call is dispatched. This page records what was
-decided and what happened, and makes no enforcement claim. An event is a record of what the session
-observed, not a grant, and a call denied before dispatch is denied whether or not anyone is
-subscribed.
+whose future `plan/todo/README.md` records as undecided; it is a text log, not an event stream, and
+this subject should not absorb it. And `boundary-policy.md` is the other half of a hosted call's
+record: it says what crosses -- what a binding grants, and what admission refuses. This page records
+what happened, and makes no enforcement claim. An event is a record of what the session observed,
+not a grant, and a call refused before dispatch is refused whether or not anyone is subscribed.
 
 ## Not in this phase
 
 - **A mandatory audit sink** (`plan/next/mandatory-audit-sink.md`): a subscriber whose failure to
   take an event stops admission, so that no hosted call runs without a record.
 - **Per-audience projections** (`plan/next/event-audience-projections.md`): different views of one
-  event for the agent, an approver, the CLI's file, and an embedder's interface -- a host path an
-  approver needs to see, for one, and a generic subscriber should not.
+  event for the agent, the CLI's file, and an embedder's interface -- a host path an operator
+  needs to see, for one, and a generic subscriber should not.
 
 ## The renderer
 
@@ -364,14 +357,14 @@ something over their own session, and it is worth keeping short enough that they
 
 ## Opt-in
 
-**Decided in `0003-13`: `[events] mode = "off" | "record"`,** defaulting off. `0003-13` merged it
-as `[network].mode` merges, a repository's value replacing the global one. **Decided since (the
-maintainer, 2026-10-02; built in `0003-24`): the global config's value stands.** When the global
-config sets `[events] mode`, that is the mode; a repository's value applies only when the global
-config says nothing. The reason is whose file it is: the record is the user's own recording of
-their own session, and a cloned project must not switch it on -- retaining the conversation and
-the argument previews the user did not ask to keep -- or off. This is the same shape as the policy
-layer, and `0003-24` landed it with that layer, in `merge`. There is no per-session CLI flag yet;
+**Decided in `0003-13`: `[events] mode = "off" | "record"`,** defaulting off. `0003-13` merged it as
+`[network].mode` merges, a repository's value replacing the global one. **Decided since (the
+maintainer, 2026-10-02; built in `0003-24`, and kept when that task was reverted): the global
+config's value stands.** When the global config sets `[events] mode`, that is the mode; a
+repository's value applies only when the global config says nothing. The reason is whose file it is:
+the record is the user's own recording of their own session, and a cloned project must not switch it
+on -- retaining the conversation and the argument previews the user did not ask to keep -- or off.
+`merge` keeps the global value. There is no per-session CLI flag yet;
 `plan/next/run-new-flag-parity.md` holds `--events`. Opt-in because the record holds the
 conversation.
 
@@ -382,12 +375,11 @@ what it writes to disk. A host program's sessions follow the CLI's reading: `000
 receives events whatever the mode says.
 
 **Boundary events follow the same opt-in (the maintainer's call).** They reach `events.jsonl` only
-when the mode is on. The consequence is worth stating, because the default policy is allow,
-published as events: with no rules configured, every hosted call runs and is evented
-(`boundary-policy.md`), and with the mode off the CLI writes none of those events anywhere. A user
-who wants a record of what an agent did through its bindings turns the mode on. Boundary events
-carry argument previews, the same kind of content the opt-in already guards, so they are not
-exempt from it.
+when the mode is on. The consequence is worth stating, because the binding is the grant: every
+hosted call runs and is evented (`boundary-policy.md`), and with the mode off the CLI writes none of
+those events anywhere. A user who wants a record of what an agent did through its bindings turns the
+mode on. Boundary events carry argument previews, the same kind of content the opt-in already
+guards, so they are not exempt from it.
 
 ## Rejected alternatives
 

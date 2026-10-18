@@ -109,13 +109,13 @@ other calls: several run at once, up to four, and a fifth waits for a free conne
 binding declared `serialize = true` runs its calls one after another (`hosted-objects.md`,
 `0003-17`).
 
-An interrupt reaches a hosted call and raises where the call was made (`0003-17`). What it does
-to the call depends on where the call is. A call waiting for approval is cancelled and never runs
-later (`boundary-policy.md`). A call already running on the host is the fourth cancellation
-above, made concrete: RPyC has no cancel message, so the host call continues until it returns,
-and its reply is recorded as `returned` or `raised` with the note that the caller was
-interrupted. A worker's call is not woken; cancelling the task that awaits it ends that wait, and
-the call runs on (`0003-23`).
+An interrupt reaches a hosted call and raises where the call was made (`0003-17`). What it does to
+the call depends on where the call is. A call waiting for a free connection is cancelled and never
+runs later (`hosted-objects.md`). A call already running on the host is the fourth cancellation
+above, made concrete: RPyC has no cancel message, so the host call continues until it returns, and
+its reply is recorded as `returned` or `raised` with the note that the caller was interrupted. A
+worker's call is not woken; cancelling the task that awaits it ends that wait, and the call runs on
+(`0003-23`).
 
 ### What a completion does, precisely
 

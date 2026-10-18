@@ -411,9 +411,9 @@ by either, it stays settled.
 
 **Releasing the instance closes the child's subtree** the way `lifecycle.md`'s "Releasing a child"
 says: its own children -- instances it constructed, decorated calls in flight -- are released the
-same way, its pending escalations are cancelled, its running execution is interrupted, and its
-forwarded hosted calls finish, or are reported `unknown` if their binding dies. `0003-30` builds
-and tests that; the class adds nothing to it beyond the requests that settle.
+same way, its running execution is interrupted, and its forwarded hosted calls finish, or are
+reported `unknown` if their binding dies. `0003-30` builds and tests that; the class adds nothing to
+it beyond the requests that settle.
 
 **The GC backstop.** An instance collected unreleased is released by the runtime. `outrig.Agent`
 holds a finalizer that cannot await and runs on whichever thread dropped the last reference, so

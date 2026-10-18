@@ -31,12 +31,11 @@ that is now one of three commands.
 Note these pages are symlinks into `crates/outrig-cli/src/mcp_self/docs/`, so editing them edits
 shipped tool output.
 
-The phase also grew after this task was first written. Hosted objects and boundary policy, the
-embedding API, skills and typed agents all ship in it (`0003-16` through `0003-34`), and each
-implementing task documents its own behavior when it is done. What none of them owns is a
-reader's account across them: the config reference as a whole, the REPL's new commands in one
-place, a concepts page a person reads before declaring a binding, and `SECURITY.md` saying the same
-thing as the code.
+The phase also grew after this task was first written. Hosted objects, the embedding API, skills and
+typed agents all ship in it (`0003-16` through `0003-34`), and each implementing task documents its
+own behavior when it is done. What none of them owns is a reader's account across them: the config
+reference as a whole, the REPL's new commands in one place, a concepts page a person reads before
+declaring a binding, and `SECURITY.md` saying the same thing as the code.
 
 ## Goal
 
@@ -67,41 +66,36 @@ MCP now sits, and what a binding lets an agent do on the host.
   `[bindings]` with its tagged path form, the approval a repo-declared binding needs, the order
   bindings' packages take on `sys.path`, the names a binding cannot take, and `serialize` under
   `[bindings.<name>]`, which gives a binding whose library is not thread-safe one call at a time
-  where the default serves each connection on its own thread; `[policy]`, `[[policy.rules]]` and
-  `[policy.evaluator]`, with what a repo config may and may not set there, and that the policy and
-  the evaluator's model are read from the operator's layer -- the global config, or the `Config`
-  an embedder passes; `[events]`, with its precedence rule: a `mode` the global config sets stands,
-  and a repo's applies only when the global config says nothing (`0003-24`); `subagent-width-max`
-  as `run`'s key, which the new loop does not read; `subagent-depth-max`, which applies to both
-  loops; `children-max` (default 64), which counts resident children, wedged ones included until
-  they are reclaimed, and `model-concurrency-max` (default 8), which bounds model requests in
-  flight -- the session-wide limits `0003-30` adds, neither of which bounds CPU or memory inside an
-  admitted kernel; the per-tree token budget; the `[host]` table with the cooperative grace a host
-  program gets before the engine escalates (`0003-29`); and a table of which settings apply to a
-  host program's session and which do not (R7): `default-image`, `[workspace]`, `[models]`,
-  `[providers]`, `default-model`, `[policy]` and `[events]` apply; a primary `preamble`,
-  `[agents.<name>]` and `default-agent` do not, and never select a host-declared class's model,
-  image or instructions.
-- **`doc/reference/events.md` extended with every event type the phase added after `0003-13`**:
-  the session states and the in-memory stream's gap reporting (`0003-19`), a hosted request's
-  receipt, decision, dispatch and outcome (`0003-22`, `0003-24`), the evaluator's verdicts and
-  usage (`0003-25`), `agent.request.*` (`0003-30`), `agent.call.*` (`0003-31`),
-  `agent.instance.*` (`0003-34`), `skill.directive.received` and `skill.invocation.*`
-  (`0003-33`), and `binding.injected` (`0003-36`), each with its category.
-- **`doc/reference/cli.md` lists `/approve <id>`, `/deny <id>` and `/name text`** among
-  `run-new`'s commands, with what each does, that a pending request waits until it is answered,
-  interrupted or the session closes, and that built-in commands win over a skill's name. For
-  `/name text`: the REPL parses nothing; the line is delivered to the agent, whose
-  `outrig.skills.invoke(name, text)` has a typed agent call parse the text into the skill's
-  `<Skill>Params`, and an agent that understood the text itself calls `invoke(name, params=...)`,
-  which makes no model call. Either way the instance is on the invocation's event.
+  where the default serves each connection on its own thread; `[events]`, with its precedence rule:
+  a `mode` the global config sets stands, and a repo's applies only when the global config says
+  nothing (`0003-24`); `subagent-width-max` as `run`'s key, which the new loop does not read;
+  `subagent-depth-max`, which applies to both loops; `children-max` (default 64), which counts
+  resident children, wedged ones included until they are reclaimed, and `model-concurrency-max`
+  (default 8), which bounds model requests in flight -- the session-wide limits `0003-30` adds,
+  neither of which bounds CPU or memory inside an admitted kernel; the per-tree token budget; the
+  `[host]` table with the cooperative grace a host program gets before the engine escalates
+  (`0003-29`); and a table of which settings apply to a host program's session and which do not
+  (R7): `default-image`, `[workspace]`, `[models]`, `[providers]`, `default-model` and `[events]`
+  apply; a primary `preamble`, `[agents.<name>]` and `default-agent` do not, and never select a
+  host-declared class's model, image or instructions.
+- **`doc/reference/events.md` extended with every event type the phase added after `0003-13`**: the
+  session states and the in-memory stream's gap reporting (`0003-19`), a hosted request's receipt,
+  dispatch and outcome (`0003-22`), `agent.request.*` (`0003-30`), `agent.call.*` (`0003-31`),
+  `agent.instance.*` (`0003-34`), `skill.directive.received` and `skill.invocation.*` (`0003-33`),
+  and `binding.injected` (`0003-36`), each with its category.
+- **`doc/reference/cli.md` lists `/name text`** among `run-new`'s commands, with what it does, and
+  that built-in commands win over a skill's name. The REPL parses nothing; the line is delivered to
+  the agent, whose `outrig.skills.invoke(name, text)` has a typed agent call parse the text into the
+  skill's `<Skill>Params`, and an agent that understood the text itself calls
+  `invoke(name, params=...)`, which makes no model call. Either way the instance is on the
+  invocation's event.
 - **A concepts page on hosted objects and the boundary**: what a binding is, that a hosted object
   acts with the host user's authority, the same paths on both sides, that a hosted object is used
   as its library documents and a call on it blocks the agent's loop until the host answers while
   `asyncio.to_thread` keeps the loop turning, `outrig.bindings[name]` as the authoritative lookup
   beside the convenience global, a live object a host program injects beside a factory binding,
-  what crosses and what is refused, the default of allow with every request published
-  as events, rules and escalation, and the evaluator.
+  what crosses and what is refused, and that the binding is the grant: every request to a bound
+  object runs and is published as events.
 - **Skills and typed agents in the Python-runtime concepts page**: the two skill roots and the
   shadowing rule, `/name`, `outrig.skills` -- `invoke(name, text)` deriving `<Skill>Params` from
   the entry's signature and having a typed agent call parse the text into it, and
@@ -113,10 +107,11 @@ MCP now sits, and what a binding lets an agent do on the host.
   shut down, and one started with no primary agent (`0003-28`); every public item of the API has
   rustdoc.
 - **A `SECURITY.md` consistency check**: its in-scope and known-boundaries lists against what
-  shipped -- a repo `[policy]` that loosens a global one is in scope, as a repo `[network]` that
-  widens the egress policy is; a hosted object's host authority and the allow-and-publish
-  default are known boundaries; a host program is trusted host code with the user's authority,
-  not a sandbox, and a live object it injects acts with that authority (`0003-27`, `0003-36`).
+  shipped -- a repo-declared binding that starts without the operator's approval is in scope, as a
+  repo `[network]` that widens the egress policy is; a hosted object's host authority, and the
+  binding as the grant with every request published, are known boundaries; a host program is trusted
+  host code with the user's authority, not a sandbox, and a live object it injects acts with that
+  authority (`0003-27`, `0003-36`).
 - Any `TODO: Incomplete` marker whose behavior is now real, dropped -- and any that is still
   honest, kept.
 
@@ -156,9 +151,6 @@ MCP now sits, and what a binding lets an agent do on the host.
 
 - **Hard: `0003-13`.** It wrote `doc/reference/events.md`, which this task extends with every
   event type the later tasks add.
-- **Hard: `0003-24`.** `/approve`, `/deny` and `[policy]` must exist before the reference
-  documents them.
-- **Hard: `0003-25`.** `[policy.evaluator]` must exist before the reference documents it.
 - **Hard: `0003-31`.** The typed-agent half of the concepts page describes `@outrig.agent`.
 - **Hard: `0003-33`.** `/name` and the skills half of the concepts page need the directive.
 - **Hard: `0003-34`.** The concepts page describes `outrig.Agent`, request channels and release,

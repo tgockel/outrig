@@ -43,31 +43,23 @@ The owner's single `close_admission()` is one state change in Rust, and it retur
 change closes Rust's gate and stops the relay forwarding to every binding, together, so no request
 is admitted by one and not the other. The bindings learn of the close afterward:
 
-- **Rust's gate**, one per session, decides executions, child launches, and the boundary requests
-  held for a decision -- those a rule escalated or sent to the evaluator. `0003-24` built it for
-  three races: an interrupt, a close, and an approval that arrives late. The held requests are kept
-  in the relay's state, which the gate's close closes in the same step; a connection's close and
-  the interpreter's exit cancel them too. Whichever reaches the gate
-  first decides. "Closed" and "allowed" cannot both win, so an allow that arrives after the close is
-  recorded and changes nothing.
-- **The relay** orders the requests a rule allows against the close. Rules run in the binding
-  process (`0003-24`'s fork 1), so such a request never passes through Rust's gate, and the relay is
-  the last point the owner holds it. A request the relay had not forwarded when it stopped -- one in
-  its queue, or one that arrives later -- is refused in Rust and reaches no binding. One it had
-  forwarded belongs to the drain: the owner cannot take it back, its binding may read it and invoke
-  its target after `close_admission()` has returned, the drain waits for it, and its outcome is the
-  one the binding reports (`0003-22`).
+- **Rust's gate**, one per session, decides executions and child launches.
+- **The relay** orders boundary requests against the close. A request never passes through Rust's
+  gate, and the relay is the last point the owner holds it. A request the relay had not forwarded
+  when it stopped -- one in its queue, or one that arrives later -- is refused in Rust and reaches
+  no binding. One it had forwarded belongs to the drain: the owner cannot take it back, its binding
+  may read it and invoke its target after `close_admission()` has returned, the drain waits for it,
+  and its outcome is the one the binding reports (`0003-22`).
 - **Each serving process's closed flag** -- the bindings process's, and a live object's serving
   module's in the host program (`0003-36`) -- is installed asynchronously. The relay enqueues a
   control line behind the frames it had forwarded, without waiting -- a binding that has stopped
   reading, with a full pipe, does not delay the close -- and the binding sets its flag when it reads
-  the line. From then on it refuses a request a rule allows, with admission closed as the reason,
-  and cancels one it had read but not started, waiting for the serialize lock. Until the binding
-  observes the flag a forwarded request may start, and then it drains; so the cancellation of a
-  waiting call is relative to the binding observing its flag, not to the close returning. The flag
-  only makes a refusal faster than running the call would be, and nothing the owner relies on
-  depends on when a binding reads the line. A binding still honors an allow the gate issued before
-  the close.
+  the line. From then on it refuses a request, with admission closed as the reason, and cancels
+  one it had read but not started, waiting for the serialize lock. Until the binding observes the
+  flag a forwarded request may start, and then it drains; so the cancellation of a waiting call is
+  relative to the binding observing its flag, not to the close returning. The flag only makes a
+  refusal faster than running the call would be, and nothing the owner relies on depends on when a
+  binding reads the line.
 
 A call waiting at the close for a free connection -- every connection in its kernel's pool for the
 binding has a call in flight (`0003-17`) -- has not been sent. It is woken with the closing error
@@ -79,10 +71,9 @@ the relay's and the flag's: a call refused there never reaches its target, whate
 next.
 
 **Closing admission is the owner's act, not a request.** `close_admission()` is not a boundary
-request: no policy rule sees it, no evaluator judges it, and no approver is asked. It changes the
-session's state and returns at once. So the owner can always stop without the agent's cooperation:
-nothing the agent does -- a call it holds in approval, an execution that never yields, an
-evaluation still running -- can delay the close.
+request, and nothing the agent can reach decides it. It changes the session's state and returns at
+once. So the owner can always stop without the agent's cooperation: nothing the agent does -- a
+hosted call that never returns, an execution that never yields -- can delay the close.
 
 There is no agent-side counterpart. Agent code cannot end its own session through any OutRig API;
 `embedding.md` describes how an embedder whose agent should be able to say it is done builds that
@@ -95,8 +86,6 @@ from a hosted client, and why neither side then waits on the other.
 ```text
 closing      admission closed: Rust's gate shut and the relay's forwarding stopped, in one
                step; a control line enqueued to each binding
-             pending approvals and evaluations cancelled; a late answer is recorded and
-               ignored
              hosted calls the relay had not forwarded refused in Rust; a call waiting for
                a free connection woken with the closing error
              child work and unanswered requests cancelled, and every waiter on them
@@ -123,14 +112,12 @@ R6's escalation of one that does not respond ("The host program", below).
 The session's state, as its events report it (`embedding.md`), is *closing* from
 `close_admission()` through terminating, and *reported* once the report exists.
 
-**Closing** settles everything the owner still holds. A call waiting for an approval is cancelled
-through the escalation handler's cancellation (`boundary-policy.md`), so the approver's interface
-can withdraw the request. A call the relay had not forwarded is refused there and never reaches
-its binding, and one waiting for a free connection is woken with the closing error. A call the
-relay had forwarded is its binding's to finish: the binding refuses it if it reads it after its
-flag, cancels it if it was still waiting for the serialize lock when the binding observed the
-flag, and otherwise runs it -- so a forwarded call can start after `close_admission()` has
-returned, and the drain waits for it. A child's work is cancelled: its round makes no further
+**Closing** settles everything the owner still holds. A call the relay had not forwarded is refused
+there and never reaches its binding, and one waiting for a free connection is woken with the closing
+error. A call the relay had forwarded is its binding's to finish: the binding refuses it if it reads
+it after its flag, cancels it if it was still waiting for the serialize lock when the binding
+observed the flag, and otherwise runs it -- so a forwarded call can start after `close_admission()`
+has returned, and the drain waits for it. A child's work is cancelled: its round makes no further
 model call, and a request it had not answered is cancelled with it. Every caller waiting on
 something cancelled or refused here is woken with an error that says the session is closing, so
 nothing is left waiting.
@@ -205,14 +192,12 @@ the session.
   condition variable, where the interpreter's reader thread can wake it. It was never sent, so
   the host has no record of it and the interpreter reports it. Outcome: woken with the closing error
   and recorded `cancelled`, with the close as the reason. Invoked: no. Effects: none possible.
-- *Queued in the relay, or made after the close* -- not forwarded when the relay stopped, so
-  refused in Rust and never seen by its binding; once the close has reached the interpreter, a
-  call made after it is refused there, before it is sent. Outcome: `refused`, the reason
-  admission closed; the caller gets the closing error, an `outrig.Closed`. A request Rust's gate
-  holds is cancelled by the gate instead (**Pending approvals and evaluations**, below). Invoked:
-  no. Effects: none possible. Bookkeeping -- fetching a root, listing a proxy's methods,
-  releasing a reference -- is not refused: a call the binding was forwarded may need it to
-  finish.
+- *Queued in the relay, or made after the close* -- not forwarded when the relay stopped, so refused
+  in Rust and never seen by its binding; once the close has reached the interpreter, a call made
+  after it is refused there, before it is sent. Outcome: `refused`, the reason admission closed; the
+  caller gets the closing error, an `outrig.Closed`. Invoked: no. Effects: none possible.
+  Bookkeeping -- fetching a root, listing a proxy's methods, releasing a reference -- is not
+  refused: a call the binding was forwarded may need it to finish.
 - *Forwarded, not yet read by its binding* -- in the pipe ahead of the control line, which cannot
   overtake it, so its binding reads it before its flag and runs it, after the close has
   returned: it is then a running call, below. The owner cannot take it back, so it belongs to the
@@ -242,15 +227,6 @@ the session.
   nothing interrupts a callback looping on a worker or on a child's kernel, so its outer call ends
   with its binding, `unknown`, and the container stop ends the callback. Invoked: yes, the outer
   call's target. Effects: as for a running call.
-
-**Pending approvals and evaluations** (`0003-24`, `0003-25`)
-
-- *Being evaluated* -- a policy rule or the evaluator is still deciding. Outcome: `cancelled`, never
-  invoked; the evaluation is abandoned and the caller gets the closing error; a verdict that
-  arrives afterward is recorded and changes nothing. Invoked: no. Effects: none possible.
-- *Waiting for an approval.* Outcome: `cancelled`, never invoked, through the escalation
-  handler's cancellation; a later answer is recorded and ignored; the caller gets the closing
-  error. Invoked: no. Effects: none possible.
 
 **Child work** (`0003-30`)
 
@@ -335,10 +311,10 @@ is one of five, the same outcomes its events record:
 
 - `returned` -- its target returned;
 - `raised` -- its target raised, and the exception's type is recorded;
-- `refused` -- never invoked, with the reason: a rule, the approver, the evaluator, admission
-  closed, or interception refusing the request;
+- `refused` -- never invoked, with the reason: admission closed, or interception refusing the
+  request;
 - `cancelled` -- never invoked, because it was interrupted, or the session closed, while it was
-  held for a decision, waiting for a free connection, or waiting for the serialize lock;
+  waiting for a free connection or for the serialize lock;
 - `unknown` -- forwarded, with no reply: its binding was killed at shutdown, its binding process
   died, or, for a live object, its call was still running in the host program when the report was
   sealed (`0003-36`); whether its target was invoked, or finished, is open.
@@ -391,8 +367,6 @@ launched -- the way a session close does, while the rest of the session runs on:
   and a reply in flight at the release is refused; a reply validated before the release stays
   settled;
 - its own children are released, so each closes its own subtree the same way;
-- its pending escalations are cancelled through the escalation handler's cancellation, and a late
-  answer is recorded and ignored;
 - its running execution is interrupted;
 - its forwarded hosted calls finish, or are reported `unknown`. A release kills no binding, since
   the bindings process serves every kernel in the session, and nothing stops a call on the host: a
@@ -468,7 +442,6 @@ close: admission closes, and what was waiting is settled as it would be at close
 - An execution that was running is `unknown`: a confirmed exit means it is over, however it ended
   (`execution-and-rounds.md`).
 - Child work and outstanding requests are reported terminated.
-- A pending approval is `cancelled`, since its caller is gone.
 - A hosted call already running keeps running on the host, because its binding does not know the
   caller died, until it returns or `shutdown` kills the group. No caller is left to receive what
   it returns. Its outcome is `returned` or `raised` if it returns, and `unknown` if the group is
@@ -516,30 +489,25 @@ A cancelled wait never cancels work, and none of the five replays anything.
 The agent's code is running a workflow in execution E12, in round R5. The session has one binding,
 `repo`, a GitPython `Repo` -- the phase's example of a hosted library. Earlier in E12 the code
 started a push as a background task,
-`asyncio.create_task(asyncio.to_thread(repo.remotes.origin.push), name="push")` -- call C40, in
-the bindings process. It also started a child to review a section, work item W3, and now awaits
-both in `asyncio.gather(push, review)`. The child, in its own kernel with its own connection to
-the binding, called `repo.git.execute([...])`; policy escalated that call, C41, and it is waiting
-for an answer. Then the operator stops the session.
+`asyncio.create_task(asyncio.to_thread(repo.remotes.origin.push), name="push")` -- call C40, in the
+bindings process. It also started a child to review a section, work item W3, and now awaits both in
+`asyncio.gather(push, review)`. Then the operator stops the session.
 
 ```text
 t0      the owner drops the round it was driving, calls close_admission(), which
         returns at once, and calls shutdown(30 s)
         closing:
-          C41  approval cancelled through the handler; the child's call raises the
-               closing error; C41 is never invoked
           W3   cancelled: the child's round makes no further model call; W3 settles
                with the documented error, and E12's gather raises it
         draining begins
-t0+2s   the approver answers allow for C41: recorded, changes nothing
 t0+4s   C40 returns: outcome returned, its result recorded
         E12 has already ended with error, from the gather; nothing is left running,
         so the drain ends
         terminating: kernels interrupted, none of them running; the repo binding's
         group sent SIGTERM, its process reaped and the group empty; container stopped
         reported: admission closed; owned execution proven stopped; E12 error;
-        C40 returned; C41 cancelled while waiting for approval, never invoked;
-        W3 cancelled, every waiter settled; no subscriber missed an event
+        C40 returned; W3 cancelled, every waiter settled; no subscriber missed an
+        event
 ```
 
 Three variants:
@@ -549,13 +517,12 @@ Three variants:
   outcome: the embedder can finish its task and must treat that outcome as unknown.
 - **The group not confirmed empty.** A process in it outlasted SIGKILL -- in uninterruptible sleep,
   say. The report reads not proven stopped, and the embedder must not call the stop clean.
-- **The interpreter died instead.** E12 is `unknown`, W3 is terminated, C41 is `cancelled` because
-  its caller is gone, and C40 runs on in its binding: `returned` if it returns, `unknown` if
-  `shutdown` kills the group first. No fresh interpreter starts in 0.3.
+- **The interpreter died instead.** E12 is `unknown`, W3 is terminated, and C40 runs on in its
+  binding: `returned` if it returns, `unknown` if `shutdown` kills the group first. No fresh
+  interpreter starts in 0.3.
 
 What did not happen matters as much: nothing reconnected, nothing retried C40, no source was
-replayed, no waiter was left waiting, the late allow for C41 ran nothing, and the completed push
-was not undone.
+replayed, no waiter was left waiting, and the completed push was not undone.
 
 ## Rejected alternatives
 
@@ -564,13 +531,12 @@ exception is how the agent learns that a call was refused. Rejected as the mecha
 code can catch any exception, and because an exception in the container does not stop a call
 already running on the host. The exception informs the agent; the gate enforces.
 
-**Rejected: starting calls the owner still holds during the drain.** A call queued in the relay,
-held at the gate, or waiting for a connection at the close could be started and given the drain
-like any other. Rejected because once the owner has decided to stop, a call that has not left it
-is an effect the session can still avoid, and the agent will not get to act on its result. A call
-the relay had already forwarded is outside this rule: the owner cannot take it back, so it
-belongs to the drain, and its binding refuses or cancels it only once it observes its flag
-("Admission").
+**Rejected: starting calls the owner still holds during the drain.** A call queued in the relay, or
+waiting for a connection at the close, could be started and given the drain like any other. Rejected
+because once the owner has decided to stop, a call that has not left it is an effect the session can
+still avoid, and the agent will not get to act on its result. A call the relay had already forwarded
+is outside this rule: the owner cannot take it back, so it belongs to the drain, and its binding
+refuses or cancels it only once it observes its flag ("Admission").
 
 **Rejected: leaving a cancelled child's waiters waiting.** Cheapest, since nothing has to be
 settled. Rejected because the code awaiting the child would wait out the whole drain and then be

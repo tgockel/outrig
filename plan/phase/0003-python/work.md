@@ -378,11 +378,10 @@ one would take.
 
 What a close does to children -- their work cancelled, and every waiter on it settled with a
 documented error rather than left pending -- is `lifecycle.md`'s. So is what releasing one child
-does, explicitly or when a decorated call settles: it closes that child's subtree the way a
-session close does. Its work is cancelled and every waiter settled, its own children are
-released, its pending escalations are cancelled, its running execution is interrupted, and its
-forwarded hosted calls finish, or are reported `unknown` if their binding dies (`lifecycle.md`,
-"Releasing a child").
+does, explicitly or when a decorated call settles: it closes that child's subtree the way a session
+close does. Its work is cancelled and every waiter settled, its own children are released, its
+running execution is interrupted, and its forwarded hosted calls finish, or are reported `unknown`
+if their binding dies (`lifecycle.md`, "Releasing a child").
 
 Releasing an agent class instance is the same release with three ways to reach it: `await
 foo.release()`, which is idempotent; leaving `async with FooAgent() as foo:`; and the runtime's

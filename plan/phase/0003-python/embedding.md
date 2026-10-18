@@ -47,17 +47,12 @@ CocoClaw and any other embedder start a system the same way.
 
 - **Configuration and the model.** A `Config`, which is what the CLI loads from TOML, and the agent
   and model to run. A model that cannot be resolved, or a secret that cannot be, fails the start
-  before any container starts, as `PythonAgent::check` lets `run-new` fail today. OutRig keeps
-  the operator's layer of the configuration beside the merged one and reads the operator's policy
-  and the evaluator's model from it, so a repository's config cannot redefine either (`0003-24`).
-  The CLI's operator layer is its global config; a `Config` an embedder passes counts as the
-  operator's layer.
-- **A secret resolver.** A hook the session calls to resolve each `${VAR}` its configuration
-  names, for every model the session calls: the agent's, a child's, and the evaluator's. Today
-  `ApiKeyRef::resolve` and `ResolvedEnvValue::resolve` read `std::env::var` directly. The CLI
-  passes a resolver that reads the process environment, which keeps today's behavior. An
-  embedder running many sessions in one process, each with its own key, passes a resolver per
-  session and changes no environment at all.
+  before any container starts, as `PythonAgent::check` lets `run-new` fail today.
+- **A secret resolver.** A hook the session calls to resolve each `${VAR}` its configuration names,
+  for every model the session calls: the agent's and a child's. Today `ApiKeyRef::resolve` and
+  `ResolvedEnvValue::resolve` read `std::env::var` directly. The CLI passes a resolver that reads
+  the process environment, which keeps today's behavior. An embedder running many sessions in one
+  process, each with its own key, passes a resolver per session and changes no environment at all.
 - **Bindings** (`hosted-objects.md`), each with its name, description, factory and arguments; and
   optionally the environment and credentials the one host process holding them all runs with,
   which every binding of the session shares. The CLI supplies none, so the bindings inherit the
@@ -72,10 +67,6 @@ CocoClaw and any other embedder start a system the same way.
   supplies its own decision, or refuses repository bindings. What a session does with no approver
   at all is what `0003-20` settled: the binding does not start, and the session runs without it,
   publishing `binding.refused`.
-- **An escalation handler** (`boundary-policy.md`): trusted code that receives each escalated call,
-  with a cancellation, and answers allow or deny for that one call. The call waits until it is
-  answered, interrupted, or the session closes. OutRig sets no expiry: a handler that wants a
-  deadline answers deny when it passes.
 - **Skill sources** (`skills.md`). The project and user sources are OutRig's; an embedder can add
   its own, so a skill can come from the embedder's store rather than from a directory.
 - **Event subscribers** (`observability.md`). Each receives the session's stream in sequence
@@ -90,18 +81,16 @@ leaves (`0003-19`):
 | secret resolver | one that reads the process environment                                  |
 | bindings        | `[bindings]` from global config, and from the repository once approved  |
 | approver        | a terminal prompt at session start for each unapproved repo binding     |
-| escalation      | a terminal prompt answered with `/approve <id>` or `/deny <id>`         |
 | skill sources   | the project's `.agents/skills` and the user's `~/.agents/skills`        |
 | subscribers     | the `events.jsonl` writer, when `[events] mode = "record"`              |
 | quit            | `/quit` or EOF: `close_admission()`, `shutdown(deadline)`, a report     |
 | exit status     | 0 clean; 2 stopped, with unknown outcomes; 3 not proven stopped         |
 
-A host program supplies less, through the engine (`0003-29`): the configuration the launcher
-loaded; the environment's secrets through the same resolver; a workspace and mounts as
-`Session`'s arguments; live objects through `inject`; a subscription made when its session is
-built; and its own control flow in place of rounds. It supplies no approver, so a repo-declared
-binding is refused, and no escalation handler, so `escalate` denies
-(`plan/next/host-program-approves-repo-bindings.md`, `plan/next/python-escalation-handler.md`).
+A host program supplies less, through the engine (`0003-29`): the configuration the launcher loaded;
+the environment's secrets through the same resolver; a workspace and mounts as `Session`'s
+arguments; live objects through `inject`; a subscription made when its session is built; and its own
+control flow in place of rounds. It supplies no approver, so a repo-declared binding is refused
+(`plan/next/host-program-approves-repo-bindings.md`).
 
 **Why a resolver rather than the environment.** The environment is one table for the whole
 process, shared by every session and every thread in it. An embedder that set a key, started a
@@ -171,7 +160,6 @@ which is `0003-20`'s:
 let mut session = SessionBuilder::new(config, agent, model)
     .secrets(resolver)              // resolves each ${VAR} for this session
     .bind("tasks", task_client)     // a pure-Python client, hosted like any library
-    .escalation(handler)
     .subscribe(sink)
     .start()
     .await?;
@@ -226,21 +214,20 @@ print(session.shutdown_report)
 - **Agents.** `outrig.Agent` subclasses declared in the program and driven from it
   (`agent-classes.md`, "From the host program"; `0003-35`).
 
-The engine survives the program (`0003-29`): a program that exits or dies with a session open
-has its sessions shut down and their reports printed; one that does not respond to a forwarded
-SIGINT or SIGTERM gets a configurable cooperative grace, then SIGTERM and SIGKILL to its group
-(`lifecycle.md`, "The host program"). What a program does not have in this phase: rounds and a
-user channel, since it has no primary; an escalation handler and an approver, which are
-`plan/next/` entries; skill sources of its own; and the explicit child API. The Python API is
-fixed at the 0.3.0 release with the Rust one.
+The engine survives the program (`0003-29`): a program that exits or dies with a session open has
+its sessions shut down and their reports printed; one that does not respond to a forwarded SIGINT or
+SIGTERM gets a configurable cooperative grace, then SIGTERM and SIGKILL to its group
+(`lifecycle.md`, "The host program"). What a program does not have in this phase: rounds and a user
+channel, since it has no primary; an approver, which is a `plan/next/` entry; skill sources of its
+own; and the explicit child API. The Python API is fixed at the 0.3.0 release with the Rust one.
 
 ## Stopping
 
 The owner stops a session with `close_admission()` and `shutdown(deadline) -> ShutdownReport`, and
-neither needs the agent's cooperation. `close_admission` is not a boundary request: no policy rule
-sees it, no approver is asked, it waits on nothing, and it returns at once. `shutdown` waits on
-agent code at most until the deadline, then stops what is left. `lifecycle.md` has the sequence,
-what it does to each resource, and what the report says.
+neither needs the agent's cooperation. `close_admission` is not a boundary request: it waits on
+nothing, and it returns at once. `shutdown` waits on agent code at most until the deadline, then
+stops what is left. `lifecycle.md` has the sequence, what it does to each resource, and what the
+report says.
 
 **There is no agent-side request to finish.** Agent code cannot end its own session through any
 OutRig API. An embedder whose agent should be able to say it is done builds that from its own
@@ -252,24 +239,6 @@ reported `unknown`, so a client should signal and return. What "done" means -- f
 handed to someone else -- and whether the agent may say it, are the embedder's.
 
 ## What stays the embedder's
-
-**Who may approve.** The escalation handler decides who answers an approval. OutRig decides only
-that the call waits until it is answered, interrupted, or closed. An ordinary question an agent
-asks through an embedder's service and a security approval may share a UI, and they have different
-authority:
-
-|                   | an ordinary question               | a security approval                   |
-|-------------------|------------------------------------|---------------------------------------|
-| starts from       | the agent's call on a service      | the boundary, holding a call          |
-| has the call run? | yes; asking is the operation       | no; the call waits                    |
-| who may answer    | the embedder's question policy     | approvers the embedder selected       |
-| free-text answer  | data for the agent                 | never read as permission              |
-| no, none, or late | data, or a timeout, for the agent  | not allow; a late allow runs nothing  |
-| through policy?   | yes, as a hosted call              | no; the handler calls services itself |
-
-The last row matters most. The handler is trusted host code and calls the embedder's services
-directly, so asking for an approval never needs an approval itself. A peer allowed to answer an
-agent's questions is not thereby allowed to approve a host call.
 
 **The task's transitions.** When the embedder's own task is finished, abandoned or failed, and what
 it records. It makes that transition after reading the shutdown report, not when a round ends.
@@ -295,11 +264,10 @@ as nothing having happened. OutRig adds no durable call ledger to cover it.
 There is no Rust trait for presenting a Rust object to agent Python in 0.3. An embedder whose
 service is Rust ships a pure-Python client package and declares it as a binding, hosted like any
 library (`hosted-objects.md`): installed into the binding cache with `--only-binary=:all:` from a
-pure-Python wheel -- platform tag `any`, ABI tag `none`, and a Python tag that includes Python 3,
-as `py3-none-any` and `py2.py3-none-any` are -- constructed by its factory in a host process of its
-own, and reached from agent Python as ordinary objects, with the same interception, policy and
-events as any hosted object. The client talks to the service over whatever transport the embedder
-already has.
+pure-Python wheel -- platform tag `any`, ABI tag `none`, and a Python tag that includes Python 3, as
+`py3-none-any` and `py2.py3-none-any` are -- constructed by its factory in a host process of its
+own, and reached from agent Python as ordinary objects, with the same interception and events as any
+hosted object. The client talks to the service over whatever transport the embedder already has.
 
 Two consequences follow from that, and both are the embedder's to design around:
 
@@ -319,8 +287,8 @@ Two consequences follow from that, and both are the embedder's to design around:
   its service can answer its own pending waits then and let those calls return within the drain.
 
 **Why no trait now.** A trait needs a descriptor format -- methods, argument and result schemas --
-and a second way of presenting an object beside hosted Python objects, with interception, policy
-and events built a second time. A pure-Python client uses the one path this phase builds.
+and a second way of presenting an object beside hosted Python objects, with interception and events
+built a second time. A pure-Python client uses the one path this phase builds.
 `plan/next/rust-object-as-python-object.md` records the trait, and `mcp-wrappers.md` routes MCP
 servers through it.
 
@@ -349,12 +317,10 @@ it finds comes back as `plan/next/` entries, or as tasks `/groom-plan` numbers.
 
 ## Rejected alternatives
 
-**Rejected: embedding by launching the CLI and reading its output.** The cheapest integration,
-since `run-new` exists. Rejected because control would depend on text: whether a round ended,
-whether Python is running, and whether a call waits for approval would all be parsed from lines
-written for a person, and approving a call would mean typing `/approve` into a child's stdin. The
-owner holds the session as a value instead, and a log is one consumer of the events, never the
-control path.
+**Rejected: embedding by launching the CLI and reading its output.** The cheapest integration, since
+`run-new` exists. Rejected because control would depend on text: whether a round ended and whether
+Python is running would be parsed from lines written for a person. The owner holds the session as a
+value instead, and a log is one consumer of the events, never the control path.
 
 **Rejected: keeping `PythonAgent` beside the new API.** It would leave `run-new` untouched.
 Rejected because with two entry points the CLI exercises one and embedders use the other, and the

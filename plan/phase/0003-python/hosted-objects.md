@@ -31,7 +31,7 @@ does not have.
   +--------------------------------------+      +----------------------------------+
   | Rust owner                           |  (1) | interpreter process              |
   |   relays frames, one bounded queue   |<---->|   reader thread routes `rpc`     |
-  |   per serving process; escalation;   |      |   frames to their kernel         |
+  |   per serving process; admission;    |      |   frames to their kernel         |
   |   events                             |      |   kernel `root`:  proxy `repo`   |
   +--------------------------------------+      |   kernel `child`: proxy `repo`   |
          ^                      ^               +----------------------------------+
@@ -155,7 +155,7 @@ holds, after its session has started, with `session.inject(name, obj)` (`0003-36
 stays in the program's process; agents hold proxies to it and use it as "Calls are synchronous"
 describes, and `inject` returns once every existing agent, and every agent made later, can reach
 it. The program needs no declaration approval, since it is the owner; every operation on the
-object is still decided by policy and recorded as events, as a factory binding's are.
+object is still intercepted and recorded as events, as a factory binding's are.
 
 What differs from a factory binding:
 
@@ -247,7 +247,7 @@ configured one that differs is a config error rather than a remapping (`0003-20`
 
 **Mount access limits the container and nothing else.** A directory mounted read-only cannot be
 written by agent code and can be written by a hosted object, which runs on the host as the user and
-never sees the mount. What limits a binding is the host user's authority and policy, not the
+never sees the mount. What limits a binding is the host user's authority and what was bound, not the
 mount table (`security.md`, `boundary-policy.md`).
 
 Two limits, stated rather than implied:
@@ -330,7 +330,7 @@ table. Every request a kernel sends passes through it before RPyC acts on it, an
   method, read attributes through its format string; so would the `str` type itself, which a
   library can return, so `format` and `format_map` are also denied on a `str` target.
 - **Members are public or denied.** A public name -- one without a leading underscore -- may be
-  read, written, deleted, and called, and policy decides each request. Private and dunder names
+  read, written, deleted, and called, and each request is recorded. Private and dunder names
   are denied, except those on RPyC's safe list: `__iter__`, `__next__`, `__len__`, `__getitem__`,
   `__contains__`, `__enter__`, `__exit__`, the operators, and a few more. That keeps `__class__`,
   `__dict__`, `__globals__`, `__mro__`, and `__subclasses__` -- the attributes through which one
@@ -380,7 +380,7 @@ Arguments, from the container:
   by-value form, which the host rebuilds as builtins: a list arrives as a `list`, and a path as the
   `str` or `bytes` that `os.fspath` returned. The copy is made once, in the agent's own execution,
   before the request is sent. The host never calls back into the container to read an argument,
-  and what policy sees is what the library receives.
+  and what the events record is what the library receives.
 - **A subclass of a by-value type crosses as its base value**, read through the base type's own
   method so that no override runs: an `IntEnum` member arrives as its `int`, a named tuple as a
   `tuple`, a `str` subclass as a `str`, and an `OrderedDict`, `defaultdict` or `Counter` as a
@@ -401,7 +401,7 @@ Arguments, from the container:
   what it returns ("Calls are synchronous"). Each invocation is a reverse interaction, evented with
   the id of the call it
   ran inside. A hosted call made from inside a callback is an ordinary request on the callback's
-  connection, and goes through policy (`boundary-policy.md`). What it returns crosses back to the
+  connection, intercepted and recorded (`boundary-policy.md`). What it returns crosses back to the
   host by the same rules as an argument -- by value, or as the shim's copy -- and any other
   reference into the container is refused.
 - **Anything else** -- a generator, a dataclass instance, any other container object -- is refused
@@ -416,7 +416,7 @@ Results, from the host:
   is a request per item, and `len` of it one more.
 - A proxy's class is built from the host's listing of the object's members, which holds its public
   names, those on RPyC's safe list, and -- for an object the host can call -- `__call__`. The
-  safe list does not include `__call__`, and a call is a request of its own, decided like any
+  safe list does not include `__call__`, and a call is a request of its own, recorded like any
   other; without it no proxy of a hosted method could be called, and listing it only for callable
   objects keeps `callable()` on a proxy truthful.
 - The same host object returned twice on one connection is the same proxy, and on two of a
@@ -534,7 +534,7 @@ performance. `0003-17` proved the mechanism, and `0003-23` binds it under the bi
   fixes a proxy's class as it unboxes the proxy (`0003-23`'s `## Decisions`).
 - **RPyC's request timeout is off.** Its default is 30 seconds, after which the caller stops
   waiting while the host carries on -- an `unknown` outcome chosen by a constant rather than by
-  anyone. A push, a clone, or a call waiting for approval can legitimately take longer.
+  anyone. A push, a clone, or a call waiting on a person can legitimately take longer.
 
 **A call blocks its caller, and only its caller.** The calling thread waits for the host's
 answer, so a call made on a kernel's own thread holds that kernel's event loop: no message is
@@ -584,20 +584,18 @@ serialize = true
 ```
 
 Under `serialize = true` the binding runs one call at a time across all its connections, in the
-order they reached it. A call made inside a callback of the call in progress runs at once: the
-outer call waits for the callback, and the callback waits for its request. Nothing special
-identifies it -- the callback's request arrives on the outer call's connection and is served on
-the thread running the outer call, which holds the binding's lock, and the lock is re-entrant.
-The lock is taken just before the target is invoked, after policy has decided, so a call held for
-an approval holds it for nobody, and the binding serves other calls while the approver decides
-(`boundary-policy.md`). The cost is the one the default avoids: under `serialize = true`, a call
-that blocks for an hour holds every other call to that binding for an hour, from every kernel.
+order they reached it. A call made inside a callback of the call in progress runs at once: the outer
+call waits for the callback, and the callback waits for its request. Nothing special identifies it
+-- the callback's request arrives on the outer call's connection and is served on the thread running
+the outer call, which holds the binding's lock, and the lock is re-entrant. The lock is taken just
+before the target is invoked. The cost is the one the default avoids: under `serialize = true`, a
+call that blocks for an hour holds every other call to that binding for an hour, from every kernel.
 `0003-20` delivers the setting; `0003-17` proved both modes, starting the binding program with
 `--serialize`, which is how the setting reaches it. The lock is granted in arrival order and is
 re-entrant for the thread holding it. A waiter stops waiting, and its request is recorded
 `cancelled`, when a cancel names its request or when the binding observes the close; bookkeeping
-still waits its turn, since a call the binding was forwarded may need it to finish (`0003-22`).
-A live object declares the same with `inject(..., serialize=True)` ("Live objects").
+still waits its turn, since a call the binding was forwarded may need it to finish (`0003-22`). A
+live object declares the same with `inject(..., serialize=True)` ("Live objects").
 
 **Why every binding is not serialized.** Until the review of 2026-10-02 this page said the
 opposite: one request at a time per binding process, so that no hosted library had to be
@@ -613,27 +611,27 @@ file while a hosted call writes the same file -- the repository's index, a file 
 -- is not serialized with that call, and the file holds whatever the two writes leave.
 
 **An interrupt raises where the call is made** -- by waking the calling thread's wait through the
-pool's condition variable, on every kernel the primary included, rather than by the primary's
-SIGINT path, which could raise between a frame's header and its body (`0003-17`). A call whose
-target had been invoked keeps running on the host, because RPyC has no request that cancels one.
-Its reply, when it comes, is not handed to anyone, but it is recorded: the call's outcome is
-`returned` or `raised`, with the note that the caller had been interrupted, and the connection
-stays usable -- though not before that reply has arrived: the next call into the pool reads it and
-drops it, and the connection is free again. A callback the library makes after its caller was
-interrupted is refused the same way, when that next call reads it, so a library that calls back
-then waits for the kernel's next call into the pool (`0003-17`). Only a call whose binding is
-killed or dies before replying is `unknown`, in the sense `execution-and-rounds.md` gives it: the
-host cannot say whether it took effect, and nothing retries it. A call not yet invoked -- held for
-a decision, waiting for a free connection, or waiting for the serialize lock -- is `cancelled`,
-with the reason interrupted, and its target never runs (`boundary-policy.md`). The interpreter
-tells the binding with a cancel line, which the relay sends behind the request it names, so it can
-reach the binding before the connection's thread has taken that request: the binding keeps it for
-the request's receipt while a frame on the connection is untaken, at most 16 at a time, and closes
-a connection that would have it keep more (`0003-22`). A `to_thread` worker's call is not woken:
-the worker's frames hold no agent code, so cancelling the task that awaits it ends that wait --
-a task's cancellation, the second of the four `execution-and-rounds.md` distinguishes -- while the
-worker's call runs on until the host answers, bounded by the pool (`0003-23`, fork 3); the call
-itself is the fourth, an accepted remote operation.
+pool's condition variable, on every kernel the primary included, rather than by the primary's SIGINT
+path, which could raise between a frame's header and its body (`0003-17`). A call whose target had
+been invoked keeps running on the host, because RPyC has no request that cancels one. Its reply,
+when it comes, is not handed to anyone, but it is recorded: the call's outcome is `returned` or
+`raised`, with the note that the caller had been interrupted, and the connection stays usable --
+though not before that reply has arrived: the next call into the pool reads it and drops it, and the
+connection is free again. A callback the library makes after its caller was interrupted is refused
+the same way, when that next call reads it, so a library that calls back then waits for the kernel's
+next call into the pool (`0003-17`). Only a call whose binding is killed or dies before replying is
+`unknown`, in the sense `execution-and-rounds.md` gives it: the host cannot say whether it took
+effect, and nothing retries it. A call not yet invoked -- waiting for a free connection, or waiting
+for the serialize lock -- is `cancelled`, with the reason interrupted, and its target never runs
+(`boundary-policy.md`). The interpreter tells the binding with a cancel line, which the relay sends
+behind the request it names, so it can reach the binding before the connection's thread has taken
+that request: the binding keeps it for the request's receipt while a frame on the connection is
+untaken, at most 16 at a time, and closes a connection that would have it keep more (`0003-22`). A
+`to_thread` worker's call is not woken: the worker's frames hold no agent code, so cancelling the
+task that awaits it ends that wait -- a task's cancellation, the second of the four
+`execution-and-rounds.md` distinguishes -- while the worker's call runs on until the host answers,
+bounded by the pool (`0003-23`, fork 3); the call itself is the fourth, an accepted remote
+operation.
 
 A call made in a worker costs that worker thread for as long as the host takes, which is
 `asyncio.to_thread`'s own cost and the caller's choice. Cancelling a call already invoked is
@@ -645,19 +643,19 @@ and keep this calling convention, is `potential/custom-hosted-object-protocol.md
 A factory binding lives as long as its session (`0003-20`): its process starts before the
 interpreter and is killed with its process group at shutdown. A live object lives as long as its
 program; the session's close ends the agents' access to it and nothing else ("Live objects"). A
-proxy is usable while its session lives and not after.
-Nothing reconnects, nothing rebinds an old proxy to a new process, and no record of calls outlives
-the session. A call running at shutdown is given until the drain deadline, and one still running
-then is `unknown`, its binding killed -- also when a program the library forked out of the binding's
-process group holds the process's output open past the stop, which the shutdown waits five seconds
-for before it takes the process as gone (`lifecycle.md`). A call the owner still holds at the close
-is never forwarded: one queued in the relay is refused there, one held for a decision is
-`cancelled`, and one still waiting in the container for a free connection is woken with the closing
-error. A call the relay had forwarded is its binding's to finish: the binding reads it ahead of its
-closed flag and runs it, which may be after the close has returned, unless it is still waiting for
-the serialize lock when the binding observes the flag, which cancels it (`lifecycle.md`). The
-interpreter's death ends the session, bindings included: it is reported as an event, and the session
-then closes and reports as at shutdown (`plan/next/interpreter-restart-with-a-reset-notice.md`).
+proxy is usable while its session lives and not after. Nothing reconnects, nothing rebinds an old
+proxy to a new process, and no record of calls outlives the session. A call running at shutdown is
+given until the drain deadline, and one still running then is `unknown`, its binding killed -- also
+when a program the library forked out of the binding's process group holds the process's output open
+past the stop, which the shutdown waits five seconds for before it takes the process as gone
+(`lifecycle.md`). A call the owner still holds at the close is never forwarded: one queued in the
+relay is refused there, and one still waiting in the container for a free connection is woken with
+the closing error. A call the relay had forwarded is its binding's to finish: the binding reads it
+ahead of its closed flag and runs it, which may be after the close has returned, unless it is still
+waiting for the serialize lock when the binding observes the flag, which cancels it
+(`lifecycle.md`). The interpreter's death ends the session, bindings included: it is reported as an
+event, and the session then closes and reports as at shutdown
+(`plan/next/interpreter-restart-with-a-reset-notice.md`).
 
 **A call that outlives its caller runs to completion.** A call still running in its binding when its
 kernel is released (`0003-30`, through `Kernel.close_hosted`, which closes the kernel's pool and
@@ -696,9 +694,9 @@ example:
 
 None of this is policed by the transport, and none of it is a defect of the mechanism: it is what
 running a full library on the host means. It is documented here and in `security.md`, and the
-operator decides which requests run with `boundary-policy.md`, whose default -- allow, published as
-events -- lets every call run and publishes it. Confining what a hosted library's programs can do
-on the host is `plan/next/hosted-effect-confinement.md`.
+operator decides what the agent can reach by what is bound: the binding is the grant
+(`boundary-policy.md`), so every call runs and is published. Confining what a hosted library's
+programs can do on the host is `plan/next/hosted-effect-confinement.md`.
 
 ## Rejected alternatives
 
@@ -715,8 +713,8 @@ interpreter protocol already exists, belongs to the Rust owner, and is not inher
 subprocesses.
 
 **Rejected: RPyC classic mode.** It gives the client the host interpreter: `eval`, `execute`, and
-arbitrary imports. A binding grants a library's object graph, request by request, where policy can
-see and decide each one.
+arbitrary imports. A binding grants a library's object graph, request by request, where interception
+can see and record each one.
 
 **Rejected: wrapper objects on the host.** Wrapping every object the host returns in an
 intercepting proxy keeps RPyC's public interface. It breaks identity -- a wrapper passed back must

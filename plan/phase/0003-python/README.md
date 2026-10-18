@@ -56,8 +56,8 @@ the 0.2.x line can keep editing its own copy without conflict.
 
 The phase then widens what that Python can reach and who can drive it. The session's owner --
 the CLI, or a Rust program that embeds OutRig -- can supply host objects the agent uses as
-ordinary Python, with every operation on them published as events on the session's stream and
-subject to a policy the owner sets. Project skills become Python modules the main agent invokes,
+ordinary Python, with every operation on them published as events on the session's stream; the
+binding is the grant. Project skills become Python modules the main agent invokes,
 and agent code can call typed child agents as functions, or keep one as an object that answers
 typed requests, and combine their results with ordinary Python. The loop is driven through a
 public session API that `run-new` uses like any other embedder. This is a breaking change and the
@@ -128,11 +128,10 @@ the mechanism is general.
   are mounted at their host paths, so a path means the same thing on both sides. The object acts
   with the user's authority on the host, which `security.md` states plainly. `hosted-objects.md`
   designs it.
-- A policy over what crosses. Every operation on a hosted object is published as events on the
+- The binding is the grant. Every operation on a hosted object is published as events on the
   session's stream, which the CLI writes to `events.jsonl` only when `[events] mode = "record"`.
-  The default is allow, published as events; rules can deny an operation or hold it for the user,
-  who answers with `/approve` or `/deny`. A model the operator enables can judge what no rule
-  settled. `boundary-policy.md` designs it.
+  Having the object is permission to use it, and a repository's binding needs the operator's
+  approval. `boundary-policy.md` designs it.
 - Child agents agent code can call. `runtime.spawn` and `child.submit` create a child and give
   it work; `@outrig.agent` declares a typed function whose call runs a fresh child and returns
   a handle whose result is validated, so a workflow can fan work out and combine the results in
@@ -185,7 +184,6 @@ written against.
   gone.
 - A declared binding's operations run on the host, and every one appears in the session's
   events.
-- A denied operation never reaches its target, and an escalated one waits for `/approve`.
 - Shutdown reports the outcome of every call it closed, `unknown` included.
 - A typed child's result is validated, and an invalid one is repaired without re-running the
   work that produced it.
@@ -193,8 +191,8 @@ written against.
   takes a second request whose round reads what the first one bound (`0003-34`).
 - `/name text` runs a skill's entry through the main agent, its parameters mapped from the text
   by a typed agent call, visible in its history.
-- A skill that uses a binding, runs typed children in parallel with one repaired, and meets an
-  escalated call works end to end through `run-new` (`0003-33`).
+- A skill that uses a binding and runs typed children in parallel with one repaired works end to
+  end through `run-new` (`0003-33`).
 - A hosted library keeps its calling convention: `repo.head.commit.hexsha` is plain code, and a
   call blocks its caller and nothing else (`0003-23`).
 - `outrig run <script.py>` runs a program that enters a session with no primary agent, drives a
@@ -211,7 +209,7 @@ written against.
 `doc/concepts/containers.md`, `doc/concepts/mcp-servers.md`, `doc/concepts/mcp-trust-model.md`,
 `doc/concepts/subagents.md`, `doc/reference/config.md`, `doc/reference/cli.md`, and
 `SECURITY.md` -- the MCP pages most of all, since this phase demotes MCP from the way an agent
-acts to one integration surface among others. Hosted objects, policy, skills and the session API
+acts to one integration surface among others. Hosted objects, skills and the session API
 and the host-program mode have no `doc/` page yet; `0003-37` writes them, and `doc/usage/run.md`
 and `doc/reference/cli.md` gain the script form.
 
@@ -221,7 +219,8 @@ and `doc/reference/cli.md` gain the script form.
 the per-step index. They cover the deliverables above; the subjects listed as out of scope below
 have design pages or `plan/next/` entries and no tasks. The planning round of 2026-10-15 folded in
 the host-program requirements (R1-R9): six tasks placed by dependency, and `0003-23` through
-`0003-31` moved to make room.
+`0003-31` moved to make room. `0003-24` was reverted before release, its file kept in
+`plan/done/` as the record, and `0003-25` went back to `plan/next/` as `policy-evaluator.md`.
 
 The ordering puts a usable command early. `0003-01` through `0003-05` are the shortest path to an
 interactive `run-new`, and everything after is additive. One consequence is worth knowing before
@@ -278,9 +277,12 @@ each resource: the task that adds a resource adds its row to `lifecycle.md`'s cl
   events in memory through the session API; nothing listens.
 - The 0.3.0 release itself -- version, migration guide, public surface freeze, the `run`
   retarget, and the documentation contracts that go with them.
-- A Python escalation handler and an approver for a host program, and installing a program's
-  PEP 723 dependencies. Each has a `plan/next/` entry; a program's session refuses repo-declared
-  bindings meanwhile, and `escalate` denies with no handler.
+- An approver for a host program, and installing a program's PEP 723 dependencies. Each has a
+  `plan/next/` entry; a program's session refuses repo-declared bindings meanwhile.
+- Permissions finer than the binding -- "read-only git" -- and a model judging a request.
+  `0003-24` built rules over a binding's methods and was reverted before release: rules in those
+  terms cannot say what an operator means. `plan/next/binding-permissions.md` and
+  `plan/next/policy-evaluator.md` hold the deferred work.
 - Cleanup after the engine itself is killed. `lifecycle.md` records the limitation for every
   owner, and a host program changes nothing about it.
 - A Rust embedder injecting a live object. Its objects are bindings through `bind`;

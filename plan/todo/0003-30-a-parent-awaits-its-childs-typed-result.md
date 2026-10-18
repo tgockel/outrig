@@ -58,8 +58,8 @@ child's round that spent it and added to the rounds above it, is how an embedder
 piece of work cost (`typed-agents.md`).
 
 Ending a child has to be as complete as ending a session. A child being released may have
-children of its own, requests received and not yet answered, a call waiting for an approval, an
-execution running, and hosted calls under way on the host. `lifecycle.md`'s "Releasing a child"
+children of its own, requests received and not yet answered, an execution running, and hosted
+calls under way on the host. `lifecycle.md`'s "Releasing a child"
 closes that subtree the way a session close does, and this task builds it.
 
 ## Goal
@@ -126,10 +126,9 @@ including when the session closes.
 - **Releasing a child closes its subtree** as a session close does (`lifecycle.md`, "Releasing a
   child"). Its work is cancelled -- the running submission, and every request waiting or received
   and unanswered -- and every waiter on it settled with `AgentReleased`; its own children are
-  released the same way; its hosted calls waiting for an approval or an evaluation are cancelled
-  through `0003-24`'s gate and the handler's signal; its running execution is interrupted, and a
-  child that never yields is wedged (fork 7); and its forwarded hosted calls run on in their
-  bindings and are reported with their outcome, or `unknown` if their binding dies. What becomes
+  released the same way; its running execution is interrupted, and a child that never yields is
+  wedged (fork 7); and its forwarded hosted calls run on in their bindings and are reported with
+  their outcome, or `unknown` if their binding dies. What becomes
   of its kernel and of background tasks still running there, per fork 9. A decorated call's child
   is released this way once its call settles (`0003-31`), and an agent class's child when its
   instance is released or collected (`0003-34`).
@@ -204,8 +203,7 @@ including when the session closes.
   outermost call, reported per fork 8. A round that answers several requests is attributed to the
   round and not divided among them (fork 12); `agent.request.settled` names the rounds the request
   spanned, so a reader can see what was spent while it was open. `0003-33` adds the skill
-  invocation the work ran under to the same chain. The evaluator's usage is never added
-  (`0003-25`).
+  invocation the work ran under to the same chain.
 - **Depth.** `subagent-depth-max` is enforced at spawn, the main agent being depth 1: a spawn
   from an agent already at the limit is refused rather than made to wait, since waiting cannot
   change a depth.
@@ -221,12 +219,10 @@ including when the session closes.
   the end of its response or its failure, a retry taking a new one -- and for nothing else: never
   during an execution, so a parent whose code awaits a child holds none, and a tree deeper than
   the permit count completes. Every model request the session makes takes one, the main agent's
-  rounds and the evaluator's calls (`0003-25`) included. A hosted call held for the evaluator's
-  verdict is inside an execution and holds no permit, so no deadlock follows. A request made with
-  every permit held waits in a queue in arrival order; a caller cancelled while queued -- its
-  child released, the session closing -- is removed from the queue without a permit being leaked
-  or the queue left inconsistent. The queue holds at most one entry per agent's round, and the
-  evaluator's own cap (`0003-25`) bounds its entries, so `children-max` and that cap bound it.
+  rounds included. A request made with every permit held waits in a queue in arrival order; a
+  caller cancelled while queued -- its child released, the session closing -- is removed from the
+  queue without a permit being leaked or the queue left inconsistent. The queue holds at most one
+  entry per agent's round, so `children-max` bounds it.
   Neither this nor `children-max` bounds the CPU or memory a child's own code uses once its
   kernel is admitted; that is `runtime-protection.md`'s and
   `plan/phase/0003-python/potential/resource-scheduling.md`'s.
@@ -312,10 +308,6 @@ including when the session closes.
 - **A parent awaiting a child holds no permit.** With `model-concurrency-max = 1`, a parent whose
   code awaits a child whose code awaits a grandchild completes, each level's execution waiting
   while holding no permit, and the record shows the three rounds' requests one after another.
-- **An evaluation and a round take turns.** With `model-concurrency-max = 1` and a rule that
-  sends the fixture binding's call to the evaluator (`0003-25`), the round's model requests and
-  the evaluator's request are never in flight at the same time, and both complete: the
-  evaluator's `allow` admits the call, the call returns, and the round ends.
 - **An exhausted token budget raises a typed error** in the waiter, and the child makes no model
   call after the budget is spent.
 - **Cancelling a waiter leaves the work running**: the work settles later, and a new await
@@ -400,12 +392,11 @@ including when the session closes.
 - **A release batch is all or nothing.** A batch naming one child twice, and one naming a child
   this agent did not spawn, each raise and release none of the batch: every other child in it
   still takes a submission.
-- **A released child's subtree goes with it.** Releasing a child whose own child is working and
-  whose execution waits on an escalated hosted call: the grandchild is released and its waiters
-  settle with `AgentReleased`, the handler sees the cancellation signal and the call's target is
-  never invoked (a host-side counter stays at zero), and the child's own waiters settle with
-  `AgentReleased` -- a request it had received and not answered among them. With fork 9's
-  recommendation, a background task the child had started is cancelled, and its kernel is gone.
+- **A released child's subtree goes with it.** Releasing a child whose own child is working: the
+  grandchild is released and its waiters settle with `AgentReleased`, and the child's own waiters
+  settle with `AgentReleased` -- a request it had received and not answered among them. With
+  fork 9's recommendation, a background task the child had started is cancelled, and its kernel is
+  gone.
 - **`model=` resolves through config**: a spawn naming an alias sends the child's model calls to
   the model the alias resolves to, asserted at the mock provider, and an unknown name fails the
   spawn with the configured names and makes no child.
@@ -460,8 +451,7 @@ including when the session closes.
    write the queue itself. `h.cancel()` on a queued item removes it.
 5. **What the token budget covers -- Recommended: one budget per session, counting every model
    call of every child and their descendants, and not the main agent's rounds**, which the user
-   starts and can stop. A budget per `spawn` would not bound a loop that spawns. The evaluator's
-   usage is `0003-25`'s and is not counted.
+   starts and can stop. A budget per `spawn` would not bound a loop that spawns.
 6. **How a child builds its result -- Recommended: the result type and the dataclasses it uses
    are bound into the child's namespace by their class names, beside the inputs, and the
    completion call takes an instance or its JSON form.** `typed-agents.md` leaves this to this
@@ -564,14 +554,10 @@ including when the session closes.
 - **Hard: `0003-13`.** A child's events go to the stream, under the child's own `subject`.
 - **Hard: `0003-19`.** The runner is the session's round loop run for a child, and close and
   shutdown are the session's.
-- **Hard: `0003-24`.** Releasing a child cancels its held requests through that task's gate and
-  the handler's signal. Through it, `0003-22`, whose proxies in every kernel give a child its
-  parent's bindings, and whose forwarded calls a release lets run on, reporting `unknown` only if
-  their binding dies.
+- **Hard: `0003-22`.** Its proxies in every kernel give a child its parent's bindings, and its
+  forwarded calls a release lets run on, reporting `unknown` only if their binding dies.
 - **Hard: `0003-28`.** The runner is built on a session that may have no primary agent; the
   registry, the ledger and the gate are the session's.
-- **Hard: `0003-25`.** The evaluator whose call takes a permit, which the acceptance item on
-  `model-concurrency-max = 1` exercises.
 - **Hard: `0003-26`.** Completions and replies decode with `outrig.schema`, and a submission's or
   a request channel's instructions carry its schema text.
 - **Soft: `0003-15`.** A child resolves its own model, alias failover included, and its rounds

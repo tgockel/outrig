@@ -8,8 +8,9 @@ design claims about it.
 The boundary has two halves, and they fail independently. *Placement* decides whether the trusted
 side can be inspected or interfered with by the code calling it. *Mediation* decides what the calls
 that cross it are allowed to do. Getting placement right and mediation wrong yields a process the
-sandbox cannot read but can ask for anything -- and under the default this phase ships, that is
-what a binding is, deliberately, until the operator tightens it.
+sandbox cannot read but can ask for anything -- and in this phase that is what a binding is,
+deliberately: having the object is permission to use it, and finer permissions are
+`plan/next/binding-permissions.md`.
 
 Three Pythons appear on this page, and confusing them inverts the design. The **agent
 interpreter** is the static CPython in the primary container, the one the model submits code to;
@@ -22,9 +23,10 @@ interpreter" means the agent interpreter.
 
 `0003-18` proved the bindings process and its supervision, and `0003-20` built it into the session,
 with the declarations, the approval of repo-declared ones, and same-path mounts; `0003-22` put the
-interception in every session and records every request it decides, and `0003-24` builds the policy.
-`SECURITY.md`'s "Known boundaries" carries the entry `0003-20` added: a binding acts with the host
-user's authority, and the default -- allow, published as events -- runs every call and publishes it.
+interception in every session and records every request it carries. `0003-24` built a policy of
+rules over method calls, which was taken out before release (`boundary-policy.md`). `SECURITY.md`'s
+"Known boundaries" carries the entry `0003-20` added: a binding acts with the host user's
+authority, and every call to it runs and is published.
 
 Until then, OutRig starts nothing that holds a credential from its config where the agent can
 reach it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
@@ -131,8 +133,8 @@ example:
   binding through which the agent can run host programs is one through which it can change what
   later sessions are granted.
 
-This is documented, not policed. The transport does not limit it, and policy decides which
-requests run, not what a request does on the host. Confining a hosted library's effects is
+This is documented, not policed. The transport does not limit it, and interception sees which
+requests are made, not what a request does on the host. Confining a hosted library's effects is
 `plan/next/hosted-effect-confinement.md`.
 
 So what a binding grants is decided by what is bound, and the recommendation for a consequential
@@ -141,20 +143,20 @@ action is a narrow binding the operator owns rather than the library that perfor
 the intended effect -- `publish_commit(repo_id, commit_oid, destination_id, expected_remote_oid)` --
 resolve their identifiers through configuration the operator wrote, recheck the expected remote
 state when they execute, and control the hooks, helpers and configuration the operation runs with.
-Its arguments are by value, so an approver's preview shows the intended effect, and the binding's
-own recheck at execution is what makes the decision hold (`boundary-policy.md`). Binding the library
-itself, a `Repo` with everything reachable from it, is an affirmative choice to grant the host
-user's authority with events as the record; renaming a generic method proves nothing, since the
-library under it still runs whatever the repository names.
+Its arguments are by value, so its events show the intended effect, and the binding's own recheck at
+execution is what makes the effect hold (`boundary-policy.md`). Binding the library itself, a `Repo`
+with everything reachable from it, is an affirmative choice to grant the host user's authority with
+events as the record; renaming a generic method proves nothing, since the library under it still
+runs whatever the repository names.
 
 **The old guarantee, restated.** OutRig still puts no credential from its config into the sandbox,
 and a binding does not move one there: credentials stay in the bindings process's environment, the
 user's ssh-agent, and the user's credential helpers. What a binding adds is a way to use them from
 the sandbox, and, through a library that runs programs, a way to read whatever the bindings process
-can read. Policy cannot prevent it: an allowed commit runs a hook the agent wrote, with the
+can read. Nothing at the boundary prevents it: a commit runs a hook the agent wrote, with the
 bindings' environment. Keeping a credential from the agent means giving the bindings process an
-environment without it -- which the embedding API can do for a session's bindings and the CLI
-does not -- or the confinement that entry describes.
+environment without it -- which the embedding API can do for a session's bindings and the CLI does
+not -- or the confinement that entry describes.
 
 ## Repo-declared bindings need the operator's approval
 
@@ -171,21 +173,13 @@ they come from the operator or the embedder directly. `0003-20` built it: when n
 prompted -- no terminal, or an embedder with no approver -- the binding does not start, the session
 runs without it, and a `binding.refused` event says which and how to approve it.
 
-The same reasoning gives the policy rule: a repo's `[policy]` may only add restrictions
-(`boundary-policy.md`), as a repo's `[network]` may not widen the operator's egress policy
-(`SECURITY.md`). OutRig reads the operator's policy and the evaluator's model from the operator's
-own layer -- the global config, or a `Config` an embedder passes to the builder -- which a repo
-config cannot redefine.
+## The binding is the grant
 
-## The default, and tightening it
-
-With nothing configured, every hosted call runs and is published as events: the default is allow,
-published as events (`boundary-policy.md`). With a library that runs programs, that is arbitrary
-host execution, recorded. The default exists so an operator sees what an agent actually does before
-constraining it, and it is the operator's to tighten: a rule that denies or escalates a type or a
-member, a stricter `[policy] default`, or `default = "escalate"` with `/approve` and `/deny` at the
-prompt. The events are a record only where something keeps them -- in the CLI, `events.jsonl`, when
-`[events] mode = "record"`.
+Every hosted call runs and is published as events (`boundary-policy.md`): having the object is
+permission to use it. With a library that runs programs, that is arbitrary host execution,
+recorded. What is granted is decided by what is bound ("What a binding grants"), and finer
+permissions than the binding are `plan/next/binding-permissions.md`. The events are a record only
+where something keeps them -- in the CLI, `events.jsonl`, when `[events] mode = "record"`.
 
 ## Agents are not isolated from each other, and it does not matter
 
@@ -231,10 +225,9 @@ that assumption and no more:
   number the relay holds it by (`hosted-objects.md`).
   What the host queues for an interpreter that stops reading is not yet bounded
   (`plan/next/bound-what-the-host-queues-for-the-interpreter.md`).
-- **What an allowed call does is the operator's grant.** Under the default -- allow, published as
-  events -- with a library that runs programs, a steered model can do on the host what the user
-  can, and the events record it. Nothing here makes that safe; the operator's policy narrows it,
-  and a narrow binding ("What a binding grants") leaves less to narrow.
+- **What a call does is the operator's grant.** With a library that runs programs, a steered
+  model can do on the host what the user can, and the events record it. Nothing here makes that
+  safe; a narrow binding ("What a binding grants") grants less.
 - **Capture and attribution are not security mechanisms.** Output attribution
   (`agent-placement.md`) holds against ordinary code, and deliberate evasion is outside this model.
 
