@@ -166,3 +166,87 @@ becomes a declared dataclass only when it has exactly the declared shape.
   maintainer's `ReviewResult`.
 - `plan/phase/0003-python/messages.md` -- the serializable subset.
 - `crates/outrig/src/python/interpreter.py` -- `_CURRENT`, `_check_subset` and `_conforms`.
+
+## Decisions
+
+Forks 2, 3 and 4 were taken as recommended, fork 3 with the refinement below.
+
+- **Where the package lives (fork 1, made concrete).** The source is
+  `crates/outrig/src/python/outrig/`, one file per module, compiled in with `include_str!` through
+  `payload::PACKAGE`; `build.rs` is unchanged, since Cargo already tracks an included file.
+  `payload::package_dir()` writes the files once into
+  `<cache>/outrig/package/outrig-<blake3, 16 hex>/`, staged and renamed into place under the same
+  lock the payload's unpack uses. The digest covers every path and content, so a build with other
+  sources writes beside an older copy instead of reading it, the guarantee the payload's pin gives
+  the interpreter. Every session mounts it read-only at `/outrig/lib` -- not only a session with
+  bindings, as RPyC is -- and `payload::mount()` became `mounts()`, returning both. A unit test
+  holds `PACKAGE` to the directory's listing, so a new module cannot be left out of every kernel.
+- **How the interpreter finds it.** A second positional argument, `<agent-id> <outrig-dir>
+  [<rpyc-dir>]`, as RPyC's directory is passed: the host-run tests start the same program with a
+  host path, so a constant mount path in `interpreter.py` would not serve them. `main()` appends it
+  right after the standard library, before RPyC and the workspace, imports `outrig`,
+  `outrig.schema` and `outrig._kernel`, and installs the kernel adapter. Failing to import it is a
+  usage-class exit 2: channel contracts are checked by `outrig.schema`, so no kernel can be built
+  without it.
+- **What only a kernel has.** `outrig/__init__.py`'s module `__getattr__` raises `RuntimeError`
+  for `runtime` and `bindings` until `outrig._kernel.install` binds them, which only the
+  interpreter does. On the host the attribute exists and says why it has no value, rather than
+  being an `AttributeError` that reads as a typo; any other unknown name is still an
+  `AttributeError`, which is what RPyC's `getattr(outrig, "Refused", None)` relies on. Outside every
+  execution's context in a kernel, both raise `RuntimeError` too, with the message naming
+  `threading.Thread`, `asyncio.to_thread` and `contextvars.copy_context().run`. `repr` of either
+  never raises, since a debugger or traceback formats it.
+- **`outrig.runtime` and `outrig.bindings` resolve through the kernel, not its globals.** `Kernel`
+  gained `runtime`, the object it binds as the global, and `outrig.bindings` reads `Kernel.stubs`,
+  which already held the runtime's own reference to each binding's stub. Rebinding either global
+  changes neither.
+- **Spellings.** `declare(t)` returns a `Schema` with `decode(value)`, `encode(value)`,
+  `json_schema()` and `text()`. A failed decode raises `DecodeError(ValueError)` carrying
+  `problems`, each a `Problem(path, message)`, at most `PROBLEMS_MAX = 20`, and `more`, the count
+  past it. `Problem` is a slotted class rather than a `NamedTuple`: the tuple's inherited members
+  put `help(outrig.schema)` past the kernel's 8 KiB `help()` bound, and a test holds it under.
+- **`encode` is public.** A channel's `send` needs it now -- sending a dataclass raised inside
+  `json.dumps` before this task -- and `0003-30`'s completion takes an instance or its JSON form.
+  It checks the instance by exact type, as `_conforms` did, and raises `TypeError` listing each
+  place with its path.
+- **Fork 3, refined.** A value decodes against a union when exactly one member accepts it, or when
+  every member that accepts it builds an equal value of one type: `3` against `int | float` is
+  `3`, not ambiguous, while two dataclasses that both accept an object are. A value only one
+  member accepts is taken as that member built it, never compared, since a dataclass's own
+  `__eq__` is agent code that may raise or never answer equal. When no member
+  accepts it, the problem is worded by the one member of the value's JSON kind if there is one --
+  so `Optional[Note]` reports the note's problems, not "matches none" -- and otherwise names them.
+- **Decoding builds a dataclass by calling it**, so an omitted field takes the class's own
+  `default` or `default_factory` and nothing else, and an exception from `__init__` or
+  `__post_init__` is a problem at that path. A field with `init=False` is refused at declaration,
+  since decoding could not set it. An integer in a `float` field stays an integer, as Python's
+  annotations allow; nothing converts it.
+- **Markers.** `alias()` is refused anywhere but a field's own annotation, and more than one
+  `doc()` or `alias()` on one annotation, or two fields with one JSON key, is refused at
+  declaration. Metadata that is not OutRig's is ignored, as `Annotated` intends. A hint that does
+  not resolve is found field by field after `get_type_hints` fails, so the error names the field.
+- **Paths.** A field reads `.key` when the key is identifier-like (hyphens allowed, as in
+  `.duplicate-status`) and `['key']` otherwise; a map key is always `['key']` and an index `[i]`,
+  giving the task's `$.notes['unbounded-retry-loop'].severity`. A key that is an aliased field's own
+  name is reported unknown with the right key named, which is what a repair needs.
+- **Schema text.** The declared dataclass renders inline, every other dataclass once under
+  `$defs`, referenced by `$ref`, and a reference back to the declared one is `{"$ref": "#"}`.
+  Each property carries its `doc()` text first, as `description`.
+- **Channels.** `_check_subset`, `_dataclass_fields` and `_conforms` are gone: `Endpoint` compiles
+  each direction once through `outrig.schema`, with the existing error prefixes kept; a direction
+  that carries nothing is a union of no types, which takes nothing. `send` transmits the encoded
+  form, and when the contract takes the message's type -- a `Verdict`, or the list a `list[Row]`
+  contract names -- its refusal lists what is wrong inside it, with paths, rather than naming the
+  type. `_deliver` checks a host body as `send` checks an instance, which a JSON body never is, and
+  queues the copy that check makes; so a dataclass contract still refuses what the host posts:
+  decoding a body into an instance would run agent code on the reader thread. Making host bodies
+  decode, and the type identifier `messages.md` puts beside a message's fields, are `0003-30`'s,
+  where channels between agents arrive.
+- **`outrig.Refused` and `outrig.Closed` stay RPyC's generic classes.** `0003-23` left replacing
+  them with the package's own to this task as optional. The package defines neither, so RPyC's
+  lookup on it finds nothing and falls back as before. The test that put a module of its own in
+  `sys.modules['outrig']` now restores the real package afterward rather than deleting it.
+- **The maintainer's `ReviewResult` is a fixture**, `review_fixture.py` and
+  `review_fixture.json`, copied from `typed-agents.md` unchanged. The schema tests run the payload's
+  interpreter on the host with the package directory on `sys.path`, which is the host program's
+  case as well.

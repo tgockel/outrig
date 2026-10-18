@@ -58,3 +58,7 @@ mod supervisor_tests;
 #[cfg(test)]
 #[path = "hosted_tests.rs"]
 mod hosted_tests;
+
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod schema_tests;

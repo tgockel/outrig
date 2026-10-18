@@ -27,8 +27,9 @@ the build warns and every launch fails with a message saying so. The same build 
 embeds the pinned RPyC wheel that carries hosted-object requests between the interpreter and the
 bindings process; `OUTRIG_RPYC_WHEEL` names a local copy of it for a build with no network.
 OutRig reserves `/outrig` inside the container, so neither the workspace nor a mount may be
-placed there; a session's bindings mount their packages read-only under `/outrig/bindings`, and
-RPyC at `/outrig/rpyc`.
+placed there. OutRig's own Python package, `outrig`, is part of the build too, and every session
+mounts it read-only at `/outrig/lib`; a session's bindings mount their packages read-only under
+`/outrig/bindings`, and RPyC at `/outrig/rpyc`.
 
 ## Example
 

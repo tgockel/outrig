@@ -665,7 +665,7 @@ mod e2e {
         let mut launch = ContainerLaunchSpec::default();
         launch
             .mounts
-            .push(payload::mount().await.expect("the payload"));
+            .extend(payload::mounts().await.expect("the payload"));
         launch
             .mounts
             .push(ContainerMount::shared_read_only(dir.clone(), &at));

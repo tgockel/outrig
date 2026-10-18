@@ -178,15 +178,19 @@ pub(super) async fn spawn(agent: Option<&str>) -> Child {
     spawn_with(agent, None).await
 }
 
-/// [`spawn`], with `rpyc` -- the vendored RPyC's directory -- after the agent,
-/// as a session with bindings starts it.
+/// [`spawn`], with `rpyc` -- the vendored RPyC's directory -- after the agent
+/// and the package, as a session with bindings starts it.
 async fn spawn_with(agent: Option<&str>, rpyc: Option<&Path>) -> Child {
     let python = payload::host_python()
         .await
         .expect("the payload this build embedded");
+    let package = payload::package_dir()
+        .await
+        .expect("the package this build carries");
     tokio::process::Command::new(python)
         .args(ARGS)
         .args(agent)
+        .args(agent.map(|_| package))
         .args(rpyc)
         .env("HOME", host_home())
         .env_remove("PYTHONUSERBASE")
@@ -251,7 +255,7 @@ pub(crate) fn python_command(home: Option<&Path>) -> Command {
 /// The interpreter as `Interpreter::start` starts it, on the host, per `start`.
 pub(crate) fn interpreter_command(start: &Start) -> Command {
     let mut command = python_command(start.home);
-    command.args(ARGS).arg(PRIMARY);
+    command.args(ARGS).arg(PRIMARY).arg(package());
     if let Some(dir) = start.dir {
         command.current_dir(dir);
     }
@@ -293,6 +297,21 @@ pub(crate) fn python() -> &'static Path {
         runtime
             .block_on(payload::host_python())
             .expect("the payload this build embedded")
+    })
+}
+
+/// OutRig's own package on the host, written once for the whole binary: what
+/// the interpreter takes after the agent id, as a session's takes
+/// `PACKAGE_MOUNT`.
+pub(crate) fn package() -> &'static Path {
+    static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
+    PACKAGE.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime to write the package on");
+        runtime
+            .block_on(payload::package_dir())
+            .expect("the package this build carries")
     })
 }
 

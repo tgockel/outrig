@@ -101,7 +101,7 @@ use crate::harness::event::{self, ExecStatus, Payload, Refusal};
 use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
 use super::hosted::{Notice, Relay, Rpc};
-use super::payload::PAYLOAD_MOUNT;
+use super::payload::{PACKAGE_MOUNT, PAYLOAD_MOUNT};
 use super::recovery::{self, Found, Timings, Verdict, Watched};
 
 /// The program the interpreter runs, passed on its command line: `build.rs`
@@ -117,8 +117,8 @@ const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootst
 /// which the program still reads.
 pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 
-/// The primary agent's id: the program's one argument, and the agent every
-/// request here addresses.
+/// The primary agent's id: the program's first argument, and the agent every
+/// request here addresses. The second is where OutRig's own package is.
 pub(crate) const PRIMARY: &str = "primary";
 
 /// How long a started interpreter has to greet. CPython starts and compiles
@@ -570,7 +570,7 @@ pub(crate) fn bindings_message(
 impl Interpreter {
     /// Start the interpreter in `container` and wait for it to greet.
     ///
-    /// The container must have the payload mounted, as every session's
+    /// The container must have the payload's mounts, as every session's
     /// primary does, and its user bootstrapped. Without the payload, podman's
     /// own error is what the startup error carries.
     pub(crate) async fn start(
@@ -582,7 +582,7 @@ impl Interpreter {
         let argv: Vec<String> = [python.as_str()]
             .into_iter()
             .chain(ARGS)
-            .chain([PRIMARY])
+            .chain([PRIMARY, PACKAGE_MOUNT])
             .chain(rpyc)
             .map(String::from)
             .collect();

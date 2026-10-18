@@ -302,6 +302,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was running is `unknown`, and a later call raises an error that says so. The vendored RPyC is
   mounted read-only at `/outrig/rpyc` in a session with bindings, where the interpreter imports it.
 
+- **`import outrig` in every kernel, and strict decoding into declared types.** OutRig's own
+  Python package is mounted read-only at `/outrig/lib` in every session and imported by the
+  interpreter ahead of the workspace, so a module of the agent's -- which has no `runtime` global
+  -- reaches it too. `outrig.runtime` is the runtime of the execution reading it, decided at each
+  read, so a module imported once serves every kernel, and a `threading.Thread` or a
+  `to_thread` worker the execution started reads the execution's own; where no execution's
+  context reaches, it raises a `RuntimeError` that says how to carry one. `outrig.bindings[name]`
+  is the calling kernel's proxy of a binding, whatever its global of that name now holds, and a
+  `KeyError` for a name the session has not bound. `outrig.schema` declares a type with
+  `declare(T)`, which refuses at once a type outside the serializable subset -- now with
+  `Literal` of str, int and bool values, and `Annotated` around any type -- naming the field. The
+  `Schema` it returns decodes a JSON value strictly into `T`: an unknown key, a missing required
+  key -- one whose type allows null included -- and `null` where the type has no `None` are each
+  a problem, reported with its JSON path in a `DecodeError`; a field left out takes only its
+  dataclass default. `doc(text)` and `alias(name)` in a field's `Annotated` are its description
+  and its JSON key, and `text()` renders the JSON Schema with every `doc()` text verbatim.
+  Channel contracts take the same types, and a dataclass sent on a channel now crosses as its
+  fields' values under their keys, where before the send raised.
+
 ### Changed
 
 - **`[[workspace.mounts]].container-path` is optional, and defaults to the resolved

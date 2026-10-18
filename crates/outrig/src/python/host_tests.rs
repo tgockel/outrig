@@ -818,15 +818,15 @@ mod e2e {
     use crate::python::payload;
     use crate::python::testing::{ALPINE, PIP_PROBE, PYTHON_ALPINE, pull};
 
-    /// A running `image` with its user bootstrapped, and the payload mounted
-    /// as every session mounts it when `with_payload`.
+    /// A running `image` with its user bootstrapped, and the payload's mounts
+    /// as every session has them when `with_payload`.
     async fn session(image: &str, with_payload: bool) -> Container {
         pull(image).await;
         let mut launch = ContainerLaunchSpec::default();
         if with_payload {
             launch
                 .mounts
-                .push(payload::mount().await.expect("the payload"));
+                .extend(payload::mounts().await.expect("the payload"));
         }
         let mut container = Container::start(&ImageTag::new(image), launch)
             .await

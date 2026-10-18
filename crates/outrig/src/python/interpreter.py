@@ -56,7 +56,6 @@ import inspect
 import io
 import itertools
 import json
-import math
 import mmap
 import multiprocessing.pool
 import operator
@@ -1680,6 +1679,9 @@ LABEL_SET = 103
 LABEL_FROZENSET = 104
 LABEL_CALLABLE = 105
 
+# `outrig.schema`, from OutRig's own package, which `main` imports from the directory it is given:
+# what checks a channel's contract, and turns a message into what crosses.
+_schema = None
 # The vendored RPyC, imported by `main` from the directory it is given, and the connection class
 # built over it; `None` when the interpreter was started without one.
 _rpyc = None
@@ -2348,6 +2350,24 @@ def _coroutine_function(fn):
     if type(fn) is types.MethodType:
         fn = fn.__func__
     return type(fn) is types.FunctionType and bool(fn.__code__.co_flags & inspect.CO_COROUTINE)
+
+
+def _load_outrig(directory):
+    """Import OutRig's own package from `directory`, and give it this process's executions:
+    `outrig.runtime` and `outrig.bindings` are those of the execution reading them."""
+    global _schema
+    sys.path.append(directory)
+    import outrig._kernel
+    import outrig.schema
+
+    outrig._kernel.install(_calling)
+    _schema = outrig.schema
+
+
+def _calling():
+    """The kernel of the execution this code belongs to, or `None` outside every execution."""
+    execution = _CURRENT.get()
+    return None if execution is None else execution.kernel
 
 
 def _load_rpyc(directory):
@@ -3328,31 +3348,16 @@ QUEUE_MAX = 256  # unread messages one endpoint holds
 MESSAGE_MAX = 1 << 20  # bytes of the protocol line one sent message becomes
 SEND_WINDOW = 16  # messages one endpoint sends ahead of the other end receiving them
 
-# What a contract may name: the types with an obvious JSON form, and what is built from them.
-_SCALARS = (str, bool, int, float, type(None))
-_UNIONS = (typing.Union, types.UnionType)
-
-_SUBSET = (
-    "str, bool, int, float, None, list[T], dict[str, T], unions of these, and dataclasses whose "
-    "fields are all of these"
-)
-
-
-def _describe(t):
-    """A type as a contract error names it: `bytes`, `set[int]`, `Row`."""
-    if t is type(None):
-        return "None"
-    if typing.get_origin(t) is None and isinstance(t, type):
-        return _type_qualname(t)
-    return repr(t).removeprefix("typing.")
+# What a contract may name -- the types with an obvious JSON form, and what is built from them --
+# is `outrig.schema`'s to say, so a channel and a declared result never take different types.
 
 
 def _describe_all(contract):
-    return " | ".join(map(_describe, contract)) if contract else "nothing"
+    return " | ".join(map(_schema._describe, contract)) if contract else "nothing"
 
 
 def _contract(declared, where):
-    """One direction's contract, as the tuple of types it admits.
+    """One direction's contract: the tuple of types it admits, and their `outrig.schema` schema.
 
     `declared` is a type, a union of types, or a tuple of them, `()` for a direction that carries
     nothing. Every type must be in the serializable subset, checked here rather than at the first
@@ -3360,82 +3365,12 @@ def _contract(declared, where):
     nested in a dataclass.
     """
     members = declared if isinstance(declared, tuple) else _union_members(declared)
-    for member in members:
-        _check_subset(member, where, "", set())
-    return tuple(type(None) if member is None else member for member in members)
+    members = tuple(type(None) if member is None else member for member in members)
+    return members, _schema._contract(members, where)
 
 
 def _union_members(t):
-    return typing.get_args(t) if typing.get_origin(t) in _UNIONS else (t,)
-
-
-def _check_subset(t, where, inside, seen):
-    """Raise `TypeError` unless `t` is in the serializable subset. `inside` names the field."""
-    if t is None or t in _SCALARS:
-        return
-    origin, args = typing.get_origin(t), typing.get_args(t)
-    if origin in _UNIONS:
-        for member in args:
-            _check_subset(member, where, inside, seen)
-        return
-    if origin is list and len(args) == 1:
-        _check_subset(args[0], where, inside, seen)
-        return
-    if origin is dict and len(args) == 2 and args[0] is str:
-        _check_subset(args[1], where, inside, seen)
-        return
-    if origin is None and isinstance(t, type) and dataclasses.is_dataclass(t):
-        # A dataclass that refers to itself is checked once.
-        if t in seen:
-            return
-        seen.add(t)
-        for field, hint in _dataclass_fields(t, where):
-            _check_subset(hint, where, f" (field {field!r} of {_type_qualname(t)})", seen)
-        return
-    raise TypeError(
-        f"{where} {_describe(t)}{inside}, which is outside the subset a channel can carry: "
-        f"{_SUBSET}"
-    )
-
-
-def _dataclass_fields(t, where):
-    """`(name, type)` for each of dataclass `t`'s fields, its annotations resolved."""
-    try:
-        hints = typing.get_type_hints(t)
-    except Exception as e:
-        raise TypeError(
-            f"{where} {_type_qualname(t)}, whose field types cannot be resolved: "
-            f"{_type_name(type(e))}: {e}"
-        ) from None
-    return [(field.name, hints.get(field.name, field.type)) for field in dataclasses.fields(t)]
-
-
-def _conforms(value, t):
-    """Whether `value` is of contract type `t`.
-
-    By exact type, so a subclass carrying behavior does not pass as its base and `True` is not an
-    `int`; an `int` does pass as a `float`, as it does in Python's own annotations. Only a
-    dataclass's fields are read, and only by the agent's own `send`: a body from the host is plain
-    JSON, never a dataclass instance, so checking one runs no agent code.
-    """
-    if t is type(None):
-        return value is None
-    if t is float:
-        return type(value) in (int, float) and math.isfinite(value)
-    if t in _SCALARS:
-        return type(value) is t
-    origin, args = typing.get_origin(t), typing.get_args(t)
-    if origin in _UNIONS:
-        return any(_conforms(value, member) for member in args)
-    if origin is list:
-        return type(value) is list and all(_conforms(item, args[0]) for item in value)
-    if origin is dict:
-        return type(value) is dict and all(
-            type(key) is str and _conforms(item, args[1]) for key, item in value.items()
-        )
-    return type(value) is t and all(
-        _conforms(getattr(value, field), hint) for field, hint in _dataclass_fields(t, "")
-    )
+    return typing.get_args(t) if typing.get_origin(t) in _schema._UNIONS else (t,)
 
 
 class _Refused(Exception):
@@ -3504,8 +3439,8 @@ class Endpoint:
     """
 
     def __init__(self, agent, name, *, receives, sends):
-        self._receives = _contract(receives, f"channel {name!r} cannot receive")
-        self._sends = _contract(sends, f"channel {name!r} cannot send")
+        self._receives, self._receiving = _contract(receives, f"channel {name!r} cannot receive")
+        self._sends, self._sending = _contract(sends, f"channel {name!r} cannot send")
         self._agent = agent
         self._name = name
         self._lock = threading.Lock()
@@ -3617,14 +3552,23 @@ class Endpoint:
         other end receives one. Sending does not end anything -- not the round, and not the code
         that sends.
         """
-        if not any(_conforms(message, t) for t in self._sends):
+        # As JSON: a dataclass crosses as its fields' values, under their keys, never as itself.
+        body, problems = self._sending._encoding(message)
+        if problems:
+            kind = type(message)
+            if self._sending._node.fits(message):
+                # Its type is one the channel sends, so what is wrong is inside it.
+                raise TypeError(
+                    f"channel {self._name!r} cannot send this {_type_qualname(kind)}:\n"
+                    f"{problems.listing()}"
+                )
             raise TypeError(
                 f"channel {self._name!r} sends {_describe_all(self._sends)}, not "
-                f"{_type_name(type(message))}"
+                f"{_type_name(kind)}"
             )
         # Encoded here rather than on the reserve: running out of memory while building the
         # agent's own message is the agent's to see.
-        line = _encode({"t": "send", "agent": self._agent, "channel": self._name, "body": message})
+        line = _encode({"t": "send", "agent": self._agent, "channel": self._name, "body": body})
         if len(line) > MESSAGE_MAX:
             raise ValueError(
                 f"this message is {len(line)} bytes as sent, past the {MESSAGE_MAX} a channel "
@@ -3661,12 +3605,17 @@ class Endpoint:
         of memory never queues a message twice; waking the receivers comes after, and cannot undo
         it.
         """
-        if not any(_conforms(body, t) for t in self._receives):
+        # Checked as `send` checks an instance, which a body from the host -- plain JSON -- never
+        # is: a dataclass the contract names is refused rather than built, since building one
+        # runs the agent's code, and this is the reader thread. What is queued is the copy the
+        # check makes.
+        copy, problems = self._receiving._encoding(body)
+        if problems:
             raise _Refused(
                 f"channel {self._name!r} receives {_describe_all(self._receives)}, not "
                 f"{_type_name(type(body))}"
             )
-        delivery = Delivery(body, sender, datetime.datetime.now(datetime.timezone.utc))
+        delivery = Delivery(copy, sender, datetime.datetime.now(datetime.timezone.utc))
         with self._lock:
             if len(self._queue) >= QUEUE_MAX:
                 raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
@@ -3706,6 +3655,10 @@ class Runtime:
 
     `runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
     each is; asking makes no request to any of them.
+
+    Code in a module reaches the same runtime after `import outrig`, as `outrig.runtime`, and
+    each binding as `outrig.bindings[name]`; `outrig.schema` declares types, decodes JSON into
+    them strictly, and renders their JSON Schema.
     """
 
     MessageAvailable = MessageAvailable
@@ -3860,7 +3813,9 @@ class Kernel:
         # other end of it.
         self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
         self.history = History()
-        self.globals["runtime"] = Runtime(
+        # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
+        # global comes to hold.
+        self.runtime = self.globals["runtime"] = Runtime(
             self.channels, self.held, self.history, Context(agent, self.history)
         )
         sys.modules[self.module.__name__] = self.module
@@ -4863,17 +4818,27 @@ def _read():
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or not _valid_agent(sys.argv[1]):
-        _diag(f"usage: python3 -I -c <program> <agent-id> [<rpyc-dir>]; got {sys.argv[1:]!r}")
+    if len(sys.argv) not in (3, 4) or not _valid_agent(sys.argv[1]):
+        _diag(
+            "usage: python3 -I -c <program> <agent-id> <outrig-dir> [<rpyc-dir>]; "
+            f"got {sys.argv[1:]!r}"
+        )
         os._exit(2)
     global _primary, _reader_thread
     # Before any agent exists, and every process it starts inherits it.
     _set_ceiling()
+    # Straight after the standard library, and before anything agent code can write joins
+    # `sys.path`, for the reason RPyC is: what `import outrig` finds is this process's own.
+    try:
+        _load_outrig(sys.argv[2])
+    except Exception as e:
+        _diag(f"OutRig's package could not be imported from {sys.argv[2]}: {e!r}")
+        os._exit(2)
     # Before the workspace joins `sys.path`, so a module there named `rpyc` is not what this
     # process imports, and before any agent code runs, so `sys.modules` holds this copy for the
     # interpreter's life: a later `pip install rpyc` changes nothing in here.
-    if len(sys.argv) == 3:
-        _load_rpyc(sys.argv[2])
+    if len(sys.argv) == 4:
+        _load_rpyc(sys.argv[3])
     _open_imports()
     primary = Kernel(sys.argv[1])
     primary.thread = threading.current_thread()

@@ -640,7 +640,9 @@ waiting (`work.md`, "Limits belong outside generated code").
   `doc` and `alias` markers: they construct, `get_type_hints(..., include_extras=True)` returns the
   markers, omitting a required-but-nullable field raises `TypeError`, and two instances do not share
   a `questions` default. `0003-08`'s contract check refusing `ReviewResult` was measured the same
-  way. Nothing else on this page has been run.
+  way. `0003-26` then ran them with the real markers: they declare, the example decodes to the
+  instance it describes, and the schema text carries every `doc()` text verbatim. Nothing else on
+  this page has been run.
 - That Anthropic's and OpenAI's strict modes reject map-valued schemas was read from their
   documentation in planning, not sent to either.
 - The workflow has not run. Its diff helpers handle the common `diff --git` shape only: renames,

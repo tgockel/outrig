@@ -1,0 +1,13 @@
+{"verdict": {"status": "reject-changes",
+             "message": "The retry loop can spin forever on a permanent error."},
+ "notes": {"unbounded-retry-loop": {
+    "location": "src/net/retry.py:42-42", "severity": "high",
+    "message": "retry() never gives up on a permanent 4xx, so callers hang.",
+    "duplicate-status": "not-found", "duplicate-reference": null}},
+ "pre-existing-issues": {"missing-client-timeout": {
+    "location": "src/net/client.py:10-10", "severity": "medium",
+    "message": "The HTTP client has no default timeout. Base behavior is unchanged by this change.",
+    "duplicate-status": "duplicate", "duplicate-reference": "#123"}},
+ "questions": {"intended-retry-budget": {
+    "location": null,
+    "message": "Is there a product requirement for the total retry time?"}}}

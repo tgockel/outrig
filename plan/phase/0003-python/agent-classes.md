@@ -633,9 +633,10 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
   defers collection to the collector's next pass, and a finalizer that runs at interpreter exit
   may find the loop closed. The acceptance uses `gc.collect()`, which says nothing about when the
   collector runs unprompted.
-- That `make_dataclass` output passes `0003-26`'s declaration and schema path -- `get_type_hints`
-  resolves a generated class's annotations in the namespace of its `__module__`, which the
-  generator has to set -- is `0003-26`'s added acceptance item, not a result.
+- `0003-26` measured `make_dataclass` output given real types -- `Annotated`, `Literal` and an
+  `alias` among them: it declares, decodes and renders, and since its annotations are objects
+  rather than strings, they resolve whatever its `__module__` names. A generator that passed
+  string annotations would still have to set `__module__`.
 - The announcer generalization. `announcement` (`channel.rs:98-115`) knows a channel by name and
   count only; saying "requests" for a request channel needs the `pending` protocol message to
   carry each channel's kind, or the host to remember the kinds it declared. Neither exists. The

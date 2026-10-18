@@ -712,11 +712,11 @@ fn check_session_id(id: &str) -> Result<()> {
 
 /// The primary's `podman run` inputs for `session_id`: its name,
 /// `outrig-<id>`, and its launch spec, carrying the session label and
-/// `python` among its mounts.
+/// `python`, the payload's mounts, among its mounts.
 fn primary_launch(
     spec: &LaunchSpec,
     session_id: &str,
-    python: ContainerMount,
+    python: [ContainerMount; 2],
 ) -> (String, ContainerLaunchSpec) {
     let launch = ContainerLaunchSpec {
         workspace: spec.workspace.as_ref().map(|workspace| {
@@ -732,7 +732,7 @@ fn primary_launch(
             .map(|mount| {
                 ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
             })
-            .chain([python])
+            .chain(python)
             .chain(spec.packages.iter().cloned())
             .collect(),
         capabilities: ContainerCapabilities::from(&spec.security.capabilities),
@@ -889,9 +889,9 @@ impl Outrig {
     /// none; see [`LaunchSpec::session_id`].
     ///
     /// The container gets OutRig's static CPython read-only at
-    /// `/outrig/python`, whatever the image holds. The interpreter is embedded
-    /// in this build; the first launch on a machine unpacks it under the user's
-    /// cache directory. Before any image build, this fails if the workspace or
+    /// `/outrig/python`, whatever the image holds, and OutRig's own Python
+    /// package at `/outrig/lib`. Both are embedded in this build; the first
+    /// launch on a machine writes them under the user's cache directory. Before any image build, this fails if the workspace or
     /// a mount is placed at or under `/outrig`, which OutRig reserves, if the
     /// session id cannot name a container, or if the build could not embed
     /// the payload.
@@ -905,7 +905,7 @@ impl Outrig {
         // reason `reject_reserved` is: an id podman cannot name costs nothing
         // to refuse here and a build to refuse at `podman run`.
         let session_id = resolve_session_id(spec)?;
-        let python = payload::mount().await?;
+        let python = payload::mounts().await?;
 
         let image_tag = match &spec.source {
             LaunchSource::Build {
@@ -1778,10 +1778,13 @@ mod tests {
         assert_eq!(spec.session_id.as_deref(), Some("abc"));
     }
 
-    /// OutRig's payload mount as `payload::mount()` hands it over, without
+    /// OutRig's payload mounts as `payload::mounts()` hands them over, without
     /// unpacking anything.
-    fn python_stand_in() -> ContainerMount {
-        ContainerMount::shared_read_only("/host/python", "/outrig/python")
+    fn python_stand_in() -> [ContainerMount; 2] {
+        [
+            ContainerMount::shared_read_only("/host/python", "/outrig/python"),
+            ContainerMount::shared_read_only("/host/package", "/outrig/lib"),
+        ]
     }
 
     #[test]

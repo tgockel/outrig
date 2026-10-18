@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use super::host::PRIMARY;
 use super::hosted;
 use super::relay::{Relay, TIMEOUT, fixture_dir};
-use super::testing::{Flag, eventually, py};
+use super::testing::{Flag, Start, eventually, py};
 use crate::events::StreamBuilder;
 use crate::harness::HostedCall;
 use crate::harness::event::{
@@ -769,6 +769,64 @@ fn a_binding_the_session_does_not_hold_is_refused_by_the_relay() {
         "{out}"
     );
     assert!(relay.hosted_events().is_empty());
+}
+
+/// `outrig.bindings[name]` is the calling kernel's own proxy of the binding: a
+/// function in a module imported once, called from two kernels, gets each
+/// caller's -- not `is`-identical, and both reaching the one object on the
+/// host -- whatever the kernel's global of that name holds. A name the session
+/// has not bound is a `KeyError`.
+#[test]
+fn outrig_bindings_is_each_calling_kernels_own_proxy() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("shared.py"),
+        py(r#"
+        import outrig
+
+        seen = []
+
+        def fx():
+            return outrig.bindings['fx']
+        "#),
+    )
+    .expect("write");
+    let mut relay = Relay::start_with(&Start {
+        dir: Some(workspace.path()),
+        ..Start::default()
+    });
+    relay.bind("fx", FACTORY);
+    relay.declare_bindings();
+    relay.open("b");
+    let probe = |agent: &str| {
+        py(&format!(
+            r#"
+            import outrig, shared, __main__
+            fx = None
+            mine = shared.fx()
+            shared.seen.append(mine)
+            print(mine is __main__._kernels[{agent:?}].stubs['fx'], mine.ask('which?'))
+            print(list(outrig.bindings), 'fx' in outrig.bindings, outrig.bindings)
+            try:
+                outrig.bindings['missing']
+            except KeyError as e:
+                print('KeyError', e)
+            "#
+        ))
+    };
+    assert_eq!(
+        relay.output(1, &probe("primary")),
+        "True 1\n['fx'] True <outrig.bindings: fx>\nKeyError 'missing'\n"
+    );
+    assert_eq!(
+        relay.output_in("b", 1, &probe("b")),
+        "True 2\n['fx'] True <outrig.bindings: fx>\nKeyError 'missing'\n",
+        "the second ticket from the same object"
+    );
+    assert_eq!(
+        relay.output_in("b", 2, "shared.seen[0] is not shared.seen[1]"),
+        "True\n"
+    );
 }
 
 /// A stub is bound in a kernel opened after the bindings were declared, and the inventory lists

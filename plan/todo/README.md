@@ -98,12 +98,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**The `outrig` package**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-26` | `outrig` imports in every kernel and on the host, decodes strictly |
-
 **A host program**
 
 | Task      | What it settles                                                    |

@@ -781,6 +781,123 @@ fn two_agents_keep_separate_namespaces() {
     assert_eq!(k.output_in("sub", 3, on_main), "False\n");
 }
 
+/// `import outrig` works in the first kernel and in one opened later, and in
+/// each `outrig.runtime` is that kernel's own runtime.
+#[test]
+fn outrig_imports_in_every_kernel_as_that_kernels_runtime() {
+    let mut k = Interpreter::start();
+    k.open("sub");
+    let probe = |agent: &str| {
+        format!(
+            "import outrig, __main__\n\
+             mine = __main__._kernels[{agent:?}].runtime\n\
+             print(outrig.runtime.history is runtime.history is mine.history, \
+             outrig.runtime.channels is runtime.channels, \
+             outrig.runtime.history is __main__._kernels['primary'].runtime.history, \
+             type(outrig.runtime) is type(runtime), outrig.runtime)"
+        )
+    };
+    assert_eq!(
+        k.output(1, &probe("primary")),
+        "True True True False <runtime: channels 'user'>\n"
+    );
+    assert_eq!(
+        k.output_in("sub", 1, &probe("sub")),
+        "True True False False <runtime: channels 'user'>\n"
+    );
+}
+
+/// A module in the workspace, imported once, reaches the runtime of whichever
+/// kernel calls it -- through `outrig.runtime`, and through the name a
+/// top-level `from outrig import runtime` bound when the first kernel
+/// imported it.
+#[test]
+fn a_module_imported_once_reaches_each_callers_runtime() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("shared.py"),
+        py(r#"
+        import outrig
+        from outrig import runtime
+
+        def runtimes():
+            return outrig.runtime.history, runtime.history
+        "#),
+    )
+    .expect("write");
+    let mut k = Interpreter::spawn(&Start {
+        dir: Some(workspace.path()),
+        ..Start::default()
+    });
+    k.open("sub");
+    let probe = "import shared\n\
+                 shared.importers = getattr(shared, 'importers', []) + [runtime]\n\
+                 print([h is runtime.history for h in shared.runtimes()], len(shared.importers))";
+    assert_eq!(k.output(1, probe), "[True, True] 1\n");
+    assert_eq!(
+        k.output_in("sub", 1, probe),
+        "[True, True] 2\n",
+        "one module, imported once"
+    );
+}
+
+/// `outrig.runtime` follows the execution into a `to_thread` worker and a
+/// `threading.Thread`. Where no execution's context reaches -- a context of
+/// its own, a thread `_thread` starts -- it raises, saying how to carry one.
+#[test]
+fn outrig_runtime_follows_the_execution_into_threads_and_says_where_it_cannot() {
+    let mut k = Interpreter::start();
+    let out = k.output(
+        1,
+        &py(r#"
+        import _thread, contextvars, threading, outrig
+        def mine():
+            return outrig.runtime.history is runtime.history
+        print('to_thread', await asyncio.to_thread(mine))
+        seen = []
+        thread = threading.Thread(target=lambda: seen.append(mine()))
+        thread.start()
+        thread.join()
+        print('Thread', seen)
+        def outside(fn):
+            try:
+                return fn()
+            except Exception as e:
+                return f'{type(e).__name__}: {e}'
+        print(outside(lambda: contextvars.Context().run(mine)))
+        print(outside(lambda: contextvars.Context().run(lambda: outrig.bindings['fx'])))
+        print(contextvars.Context().run(repr, outrig.runtime))
+        done = threading.Event()
+        started = []
+        _thread.start_new_thread(lambda: (started.append(outside(mine)), done.set()), ())
+        done.wait(10)
+        print('start_new_thread', started[0].split(':')[0])
+        "#),
+    );
+    let outside = |name: &str| {
+        format!(
+            "RuntimeError: outrig.{name} is the calling execution's, and this code runs outside \
+             every execution: in a thread started with _thread.start_new_thread, say, or a \
+             pool's initializer, or a context of its own. Carry the execution's context to it -- \
+             start the thread with threading.Thread, hand the work to asyncio.to_thread, or run \
+             it through contextvars.copy_context().run(...) called inside the execution"
+        )
+    };
+    assert_eq!(
+        out,
+        format!(
+            "to_thread True\n\
+             Thread [True]\n\
+             {}\n\
+             {}\n\
+             <outrig.runtime, outside every execution>\n\
+             start_new_thread RuntimeError\n",
+            outside("runtime"),
+            outside("bindings"),
+        )
+    );
+}
+
 #[test]
 fn deep_recursion_off_the_main_thread_raises_rather_than_crashing() {
     // musl's default thread stack overflows before CPython's recursion limit
@@ -2687,6 +2804,68 @@ fn a_contract_outside_the_serializable_subset_is_refused_at_construction() {
          <endpoint 'x': receives Row | None, sends Row | None, 0 pending>\n\
          <endpoint 'x': receives int | bool, sends int | bool, 0 pending>\n\
          <endpoint 'x': receives nothing, sends nothing, 0 pending>\n"
+    );
+}
+
+/// A channel contract takes what `outrig.schema` takes: a dataclass with a
+/// `Literal` field and an `Annotated` one is accepted, a message that conforms
+/// reaches the host as JSON under the fields' keys, and one whose `Literal`
+/// field holds another value is refused when it is sent, naming where.
+#[test]
+fn a_contract_takes_literal_and_annotated_fields() {
+    let mut k = Interpreter::start();
+    let made = k.output(
+        1,
+        &py(r#"
+        import __main__
+        from dataclasses import dataclass
+        from typing import Annotated, Literal, Optional
+        from outrig.schema import alias, doc
+
+        @dataclass(frozen=True)
+        class Verdict:
+            status: Literal['approve', 'reject']
+            next_step: Annotated[Optional[str], alias('next-step'), doc('What comes next.')]
+
+        typed = __main__.Endpoint('primary', 'typed', receives=Verdict, sends=Verdict)
+        __main__._kernels['primary'].channels['typed'] = typed
+        print(typed)
+        "#),
+    );
+    assert_eq!(
+        made,
+        "<endpoint 'typed': receives Verdict, sends Verdict, 0 pending>\n"
+    );
+
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 2, "src":
+        "await runtime.channels['typed'].send(Verdict('approve', None))"}));
+    assert_eq!(
+        k.recv(),
+        json!({"t": "send", "agent": PRIMARY, "channel": "typed",
+               "body": {"status": "approve", "next-step": null}})
+    );
+    let result = k.recv();
+    assert!(
+        result["t"] == "result" && result["status"] == "ok",
+        "{result}"
+    );
+
+    let result = k.exec(
+        3,
+        "await runtime.channels['typed'].send(Verdict('maybe', 'x'))",
+    );
+    assert_eq!(result["status"], "error", "{result}");
+    assert!(
+        text(&result["error"]).ends_with(
+            "TypeError: channel 'typed' cannot send this Verdict:\n  \
+             $.status: expected Literal['approve', 'reject'], not 'maybe'\n"
+        ),
+        "{result}"
+    );
+    let result = k.exec(4, "await runtime.channels['typed'].send('approve')");
+    assert!(
+        text(&result["error"]).ends_with("TypeError: channel 'typed' sends Verdict, not str\n"),
+        "{result}"
     );
 }
 

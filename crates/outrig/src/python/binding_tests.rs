@@ -4133,9 +4133,9 @@ fn a_missing_or_refused_attribute_is_an_attribute_error() {
     );
 }
 
-/// RPyC rebuilds the binding's refusal as `outrig.Refused` where a module `outrig` with a class
-/// `Refused` imports in the container -- one of the workspace's, say -- rather than as its own
-/// class of that name: the refusal of a name is an `AttributeError` either way.
+/// RPyC rebuilds the binding's refusal as `outrig.Refused` where the module `outrig` has a class
+/// `Refused` -- one agent code put in `sys.modules` in place of OutRig's own package, say -- rather
+/// than as its own class of that name: the refusal of a name is an `AttributeError` either way.
 #[test]
 fn a_refusal_rebuilt_from_a_local_outrig_module_is_an_attribute_error_too() {
     let mut relay = Relay::start();
@@ -4145,6 +4145,7 @@ fn a_refusal_rebuilt_from_a_local_outrig_module_is_an_attribute_error_too() {
         &with_stub(
             r#"
             import sys, types
+            package = sys.modules['outrig']
             module = sys.modules['outrig'] = types.ModuleType('outrig')
             exec('class Refused(Exception):\n    pass\n', module.__dict__)
             try:
@@ -4158,7 +4159,7 @@ fn a_refusal_rebuilt_from_a_local_outrig_module_is_an_attribute_error_too() {
                 except module.Refused as e:
                     print('set', isinstance(e, AttributeError))
             finally:
-                del sys.modules['outrig']
+                sys.modules['outrig'] = package
             "#,
         ),
     );
@@ -4450,6 +4451,35 @@ fn a_plain_callback_runs_on_the_thread_serving_its_call() {
         "in the callback\n('MainThread', 'the calling execution', 7)\n\
          (True, 'the calling execution')\n"
     );
+}
+
+/// A callback of a hosted call runs in the calling execution's context, so
+/// `outrig.runtime` there is the calling kernel's runtime -- on the kernel's
+/// thread and in a `to_thread` worker, in the first kernel and a later one.
+#[test]
+fn outrig_runtime_in_a_callback_is_the_calling_executions() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    relay.open("b");
+    for (agent, id) in [("primary", 1), ("b", 1)] {
+        let out = relay.output_in(
+            agent,
+            id,
+            &with_stub_in(
+                agent,
+                r#"
+                import outrig
+                def callback(nested):
+                    return outrig.runtime.history is runtime.history is K.runtime.history
+                print(stub.call_with_nested(callback))
+                def in_worker():
+                    return stub.call(lambda: outrig.runtime.history is K.runtime.history)
+                print(await asyncio.to_thread(in_worker))
+                "#,
+            ),
+        );
+        assert_eq!(out, "True\nTrue\n", "{agent}");
+    }
 }
 
 /// The release of a kernel -- `close_hosted`, from another thread -- while a call on its thread

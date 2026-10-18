@@ -125,9 +125,9 @@ declared unions, and dataclasses whose every field is drawn from the same subset
 NaN are excluded because not every encoding carries them faithfully. A declaration outside the
 subset is an error at construction, not a failure at first send.
 
-A typed result needs two more, `Literal` and `Annotated`, which `0003-26` adds for
-`outrig.schema` (`typed-agents.md`). Whether channel contracts take them too is that task's fork,
-recommended yes, so that a channel and a result type never accept different types.
+A typed result needs two more, `Literal` and `Annotated`, which `0003-26` added for
+`outrig.schema` (`typed-agents.md`). Channel contracts take them too: a contract is checked by
+`outrig.schema` itself, so a channel and a result type never accept different types.
 
 The subset is the same whether a type appears at the top level of a contract or nested inside a
 dataclass. There is no rule that the outermost thing must be a dataclass.

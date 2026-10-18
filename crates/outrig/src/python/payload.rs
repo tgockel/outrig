@@ -15,6 +15,12 @@
 //! once into a directory named for the pin. The bindings process imports RPyC
 //! from that directory, and a session with bindings mounts it read-only in the
 //! container at [`RPYC_MOUNT`], where the interpreter imports it.
+//!
+//! OutRig's own Python package, `outrig`, is the one part written here rather
+//! than fetched: its sources are compiled in, and [`package_dir`] writes them
+//! once into a directory named for their digest. Every session mounts it
+//! read-only at [`PACKAGE_MOUNT`], where each kernel imports it, and a program
+//! on the host imports the same files.
 
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -45,6 +51,19 @@ pub(crate) const BINDINGS_MOUNT: &str = "/outrig/bindings";
 /// a session with bindings: the interpreter imports it from there to reach
 /// them.
 pub(crate) const RPYC_MOUNT: &str = "/outrig/rpyc";
+
+/// Where OutRig's own package is bound, read-only, inside every session's
+/// primary container: the directory holding `outrig/`, which the interpreter
+/// puts on `sys.path` straight after the standard library.
+pub(crate) const PACKAGE_MOUNT: &str = "/outrig/lib";
+
+/// The `outrig` package, each file by its path under [`package_dir`]. One
+/// source for a kernel and for a program on the host.
+const PACKAGE: &[(&str, &str)] = &[
+    ("outrig/__init__.py", include_str!("outrig/__init__.py")),
+    ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),
+    ("outrig/schema.py", include_str!("outrig/schema.py")),
+];
 
 /// The pinned archive, as `build.rs` verified it; empty when that build could
 /// not fetch it.
@@ -128,6 +147,63 @@ pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// OutRig's own package on the host: a directory holding `outrig/`, written
+/// from the sources this build carries the first time it is asked for. A
+/// session mounts it read-only at [`PACKAGE_MOUNT`].
+///
+/// Named for a digest of every file in it, as the payload is for its pin, so a
+/// build with other sources writes beside an older copy rather than reading
+/// it: the package a kernel imports is always the one its interpreter was
+/// built with.
+pub(crate) async fn package_dir() -> Result<PathBuf> {
+    let dir = cache_dir("outrig package")?
+        .join("outrig/package")
+        .join(package_name());
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    let target = dir.clone();
+    tokio::task::spawn_blocking(move || locked_once(&target, || write_package(&target)))
+        .await
+        .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
+    Ok(dir)
+}
+
+/// `outrig-` and the first 16 hex digits of a digest of [`PACKAGE`]'s paths
+/// and contents.
+fn package_name() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (path, source) in PACKAGE {
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(source.as_bytes());
+        hasher.update(&[0]);
+    }
+    format!("outrig-{}", &hasher.finalize().to_hex()[..16])
+}
+
+/// Write [`PACKAGE`] to `dir`, staged beside it and renamed into place as
+/// [`unpack`] does, so `dir` holds the whole package or does not exist. Run
+/// under [`locked_once`], which has made `dir`'s parent.
+fn write_package(dir: &Path) -> Result<()> {
+    let parent = dir.parent().expect("the package directory has a parent");
+    let stage = tempfile::Builder::new()
+        .prefix(".write-")
+        .tempdir_in(parent)
+        .path_ctx("create a directory in", parent)?;
+    for (path, source) in PACKAGE {
+        let file = stage.path().join(path);
+        let at = file.parent().expect("a package file is in a directory");
+        std::fs::create_dir_all(at).path_ctx("create", at)?;
+        std::fs::write(&file, source).path_ctx("write", &file)?;
+    }
+    match std::fs::rename(stage.path(), dir) {
+        Ok(()) => Ok(()),
+        Err(_) if dir.is_dir() => Ok(()),
+        Err(e) => Err(e).path_ctx("move the written package to", dir),
+    }
+}
+
 /// The user's cache directory, or a configuration error naming `what` could
 /// not be placed.
 pub(super) fn cache_dir(what: &str) -> Result<PathBuf> {
@@ -143,13 +219,14 @@ pub(super) fn cache_dir(what: &str) -> Result<PathBuf> {
     })
 }
 
-/// The payload's mount: [`host_dir`], bound read-only at [`PAYLOAD_MOUNT`],
-/// as every session's primary container gets it.
-pub(crate) async fn mount() -> Result<ContainerMount> {
-    Ok(ContainerMount::shared_read_only(
-        host_dir().await?,
-        PAYLOAD_MOUNT,
-    ))
+/// The payload's mounts, as every session's primary container gets them:
+/// [`host_dir`] bound read-only at [`PAYLOAD_MOUNT`], and [`package_dir`] at
+/// [`PACKAGE_MOUNT`].
+pub(crate) async fn mounts() -> Result<[ContainerMount; 2]> {
+    Ok([
+        ContainerMount::shared_read_only(host_dir().await?, PAYLOAD_MOUNT),
+        ContainerMount::shared_read_only(package_dir().await?, PACKAGE_MOUNT),
+    ])
 }
 
 /// Refuse a caller-chosen container destination at or under [`OUTRIG_ROOT`].
@@ -546,6 +623,45 @@ mod tests {
             .filter(|name| !name.ends_with(".lock"))
             .collect();
         assert_eq!(beside, [RPYC], "the stage was left behind");
+    }
+
+    /// Every file under `src/python/outrig/` is in [`PACKAGE`], and nothing
+    /// else: a module added to the directory and not to the list would be
+    /// missing from every kernel.
+    #[test]
+    fn the_package_lists_every_file_in_its_directory() {
+        let python = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/python");
+        let mut found: Vec<_> = walkdir::WalkDir::new(python.join("outrig"))
+            .into_iter()
+            .filter_entry(|entry| entry.file_name() != "__pycache__")
+            .map(|entry| entry.expect("a readable entry"))
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let relative = entry.path().strip_prefix(&python).unwrap();
+                relative.to_string_lossy().into_owned()
+            })
+            .collect();
+        found.sort();
+        let mut listed: Vec<_> = PACKAGE.iter().map(|(path, _)| path.to_string()).collect();
+        listed.sort();
+        assert_eq!(found, listed);
+    }
+
+    #[test]
+    fn the_package_is_written_whole_under_its_digest() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path().join("package").join(package_name());
+        locked_once(&dir, || write_package(&dir)).unwrap();
+        for (path, source) in PACKAGE {
+            assert_eq!(std::fs::read_to_string(dir.join(path)).unwrap(), *source);
+        }
+        let beside: Vec<_> = std::fs::read_dir(cache.path().join("package"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".lock"))
+            .collect();
+        assert_eq!(beside, [package_name()], "the stage was left behind");
+        assert!(package_name().starts_with("outrig-") && package_name().len() == 23);
     }
 
     #[test]
