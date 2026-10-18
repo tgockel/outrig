@@ -63,6 +63,16 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 /// list this small.
 const TOOLS_TTL_MS: u64 = 300_000;
 
+/// What the server tells a client about its tool names. The prefix claim is
+/// scoped on purpose: a name rewritten to fit is cut at a fixed length, which
+/// for a long enough server name falls inside the server name (see
+/// [`crate::tool_name`]), so a client is told to treat names as opaque rather
+/// than to split them.
+const INSTRUCTIONS: &str = "Tools are namespaced as <server>__<tool>; the prefix identifies which \
+     backing MCP server hosts the tool. A name that had to be rewritten to fit ends in a \
+     short hash, and when the server's own name is very long it may be cut inside it. Treat \
+     every name as opaque: call each tool by exactly the name listed.";
+
 /// Private supertrait bound: nothing outside this crate can name
 /// [`sealed::Sealed`], so nothing outside can implement [`BackingClient`].
 mod sealed {
@@ -328,10 +338,7 @@ impl<C: BackingClient> ProxyServer<C> {
 
         let server_config = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("outrig", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Tools are namespaced as <server>__<tool>; the prefix identifies which \
-                 backing MCP server hosts the tool.",
-            );
+            .with_instructions(INSTRUCTIONS);
 
         Ok(Self {
             inner: Arc::new(ProxyInner {

@@ -1112,8 +1112,11 @@ Notes:
 - The first element of `command` must be on `$PATH` inside the container, or absolute.
 - The map key (e.g. `fs`, `shell`, `build`) is the server name. It must match
   `^[a-zA-Z][a-zA-Z0-9_-]*$` and be unique within an image-config.
-- The server name appears in `outrig logs <session> <server>` and as the prefix on every tool
-  the server advertises (`<server>__<tool>`).
+- The server name appears in `outrig logs <session> <server>` and as the prefix on the tools
+  the server advertises (`<server>__<tool>`). The rule bounds no length, but a tool name outrig
+  has to rewrite to fit 64 characters keeps the prefix only for a name of 54 characters or
+  fewer -- see
+  [Concepts -> MCP Servers](../concepts/mcp-servers.md#long-server-names).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
   resolved from the host environment at MCP startup and shown only as the reference -- see the
   subsection below.

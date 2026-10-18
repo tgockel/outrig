@@ -404,7 +404,10 @@ a character outside that set, one too long to fit, or one on a server whose own 
 in `_` or contains `__` -- is advertised with a short hash suffix instead, as
 `fs__read_file_5d2270`. The suffix depends only on the server and tool names, so a client
 reconnecting to the same servers sees the names it saw before, whatever order those servers
-list their tools in.
+list their tools in. That hash-suffixed name keeps the `<server>__` prefix only while the
+server's name is 54 characters or fewer; past that the cut can fall inside the server name,
+which is why the proxy's `instructions` tell a client to treat names as opaque and call each
+exactly as listed.
 
 Sixty-four characters cannot encode every possible pair, so two tools can still want one
 name. outrig widens one side's suffix rather than dropping either, and picks which side

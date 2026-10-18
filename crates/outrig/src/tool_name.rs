@@ -24,6 +24,19 @@
 //! re-deriving the later name through [`suffixed`] at a wider width, which is
 //! why that entry point exists.
 //!
+//! The truncation is over the composed body, not over its two parts, so it
+//! does not know where the server name ends. A lossy name keeps
+//! `<server>__` and the start of the tool name only while the server name is
+//! at most `MAX_NAME_LEN - 1 - hex_len - 3` characters: 54 at the default
+//! width, fewer once [`mcp_proxy`](crate::mcp_proxy) has widened a suffix. One
+//! character past that the tool name is gone, two past it the separator is
+//! cut, and three past it the name is the front of the server name and a
+//! hash. Server names are not length-bounded, so this is a limit on what the
+//! prefix promises and not a case config validation rules out. It costs
+//! nothing in routing: both callers look the whole name up and never split
+//! it. Changing where the cut falls renames names a client may have cached,
+//! which is why the golden vectors pin the long-server cases too.
+//!
 //! Both `outrig run` (through the companion `outrig-cli` crate) and the
 //! [`mcp_proxy`](crate::mcp_proxy) server share this so they advertise
 //! identical public names for the same upstream tool.

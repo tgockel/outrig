@@ -559,6 +559,54 @@ fn a_tool_no_width_can_separate_goes_unadvertised() {
 }
 
 #[tokio::test]
+async fn a_server_name_too_long_for_its_prefix_still_routes_every_tool() {
+    // 57 characters is the first length where a rewritten name is cut inside
+    // the server name (see `tool_name`), so the prefix is gone from both. The
+    // proxy routes by a lookup on the whole name, which is what makes that a
+    // legibility problem and not a reachability one.
+    let server = "s".repeat(57);
+    let fs = Arc::new(
+        FakeClient::new(&server)
+            .with_tool("read/file")
+            .with_tool("read file")
+            .respond_ok("read/file", "from the slash", false)
+            .respond_ok("read file", "from the space", false),
+    );
+    let proxy = ProxyServer::build(vec![fs]).await.unwrap();
+
+    let (names, bodies) = advertised(&proxy).await;
+    assert_eq!(names.len(), 2, "both tools must be advertised: {names:?}");
+    assert_ne!(names[0], names[1]);
+    for name in &names {
+        assert!(name.len() <= 64, "{name:?}");
+        assert!(
+            !name.contains("__"),
+            "this length must exercise the cut inside the server name: {name:?}"
+        );
+    }
+    assert_eq!(bodies, ["from the slash", "from the space"]);
+}
+
+#[tokio::test]
+async fn instructions_tell_a_client_to_treat_names_as_opaque() {
+    // The prefix claim holds for a name advertised as written and not for one
+    // rewritten on a long server name, so the instructions must not leave a
+    // client to split names on `__`.
+    let fs = Arc::new(FakeClient::new("fs").with_tool("read_file"));
+    let proxy = ProxyServer::build(vec![fs]).await.unwrap();
+
+    let instructions = proxy.get_info().instructions.expect("instructions set");
+    assert!(
+        instructions.contains("<server>__<tool>"),
+        "{instructions:?}"
+    );
+    assert!(
+        instructions.contains("exactly the name listed"),
+        "{instructions:?}"
+    );
+}
+
+#[tokio::test]
 async fn iter_public_names_matches_list_tools() {
     let fs = Arc::new(
         FakeClient::new("fs")

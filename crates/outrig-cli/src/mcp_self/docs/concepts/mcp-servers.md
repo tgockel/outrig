@@ -47,7 +47,8 @@ Each entry is one of:
 
 Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within an image-config.
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call
-traces, in the prefix that gets attached to every tool the server exposes.
+traces, in the prefix that gets attached to the tools the server exposes (see
+[Tool name prefixing](#tool-name-prefixing) for the length that prefix holds to).
 
 ## Sidecar placement
 
@@ -436,7 +437,8 @@ own environment. Only the human at the REPL or the embedding program can.
 
 Two different MCP servers can have a tool with the same name (e.g. both `fs` and `archive` might
 define `read_file`). To avoid collisions and keep the LLM's tool-name space predictable, outrig
-**always** prefixes every tool with its server name:
+prefixes every tool with its server name, as far as the 64-character limit on a name allows (see
+[Long server names](#long-server-names)):
 
 ```
 fs__list_directory
@@ -488,6 +490,27 @@ You can list every tool currently registered with the agent from inside the REPL
   shell__exec          Run a shell command and return its stdout/stderr.
 >
 ```
+
+### Long server names
+
+The server-name rule bounds spelling, not length, and a rewritten name is cut at a fixed length
+without regard for where the server name ends, so the prefix survives a rewrite only while the
+server name leaves room for it. At the default six-character suffix, a rewritten name for a
+server whose name is:
+
+- **54 characters or fewer** reads `<server>__<start of the tool>_<hash>`.
+- **55 characters** keeps `<server>__` and none of the tool's name.
+- **56 characters** keeps half the separator, so it reads `<server>__<hash>`.
+- **57 characters or more** is cut inside the server name: the first 57 characters of it, `_`,
+  and the hash, with no `__`.
+
+A widened suffix leaves less room, so a widened name loses the prefix at a shorter server name.
+A name advertised as written is not affected, and begins `<server>__` in full. Routing is not
+affected either, since a name is looked up whole rather than split. What suffers is legibility:
+a person or a model reading the tool list cannot tell which server hosts such a tool, which is
+why `outrig mcp` tells its client to treat names as opaque and call each exactly as listed.
+Keeping server names to 54 characters or fewer avoids it for every name outrig does not have to
+widen.
 
 ## Protocol revisions and list caching
 

@@ -121,6 +121,14 @@ fn golden_vectors_pin_the_advertised_mapping() {
     let both = format!("{}/{}", "a".repeat(50), "b".repeat(50));
     let at_limit = "t".repeat(60);
     let past_limit = "t".repeat(61);
+    // The three server lengths where the cut stops keeping the prefix: the
+    // tool name is gone, then half the separator, then all of it.
+    let (s55, s56, s57) = ("s".repeat(55), "s".repeat(56), "s".repeat(57));
+    let (long55, long56, long57) = (
+        format!("{s55}___c28d86"),
+        format!("{s56}__e0566b"),
+        format!("{s57}_e15714"),
+    );
     let cases: &[(&str, &str, &str)] = &[
         // unchanged
         ("fs", "read_file", "fs__read_file"),
@@ -156,12 +164,95 @@ fn golden_vectors_pin_the_advertised_mapping() {
         ("a_", "b", "a___b_1b7557"),
         ("a", "_b", "a___b"),
         ("fs__a", "b", "fs__a__b_f08ff9"),
+        // a server name long enough that the cut lands in or beside it
+        (&s55, "read_file", &long55),
+        (&s56, "read_file", &long56),
+        (&s57, "read_file", &long57),
     ];
 
     for (server, tool, expected) in cases {
         let got = sanitize(server, tool);
         assert_eq!(&got, expected, "({server:?}, {tool:?})");
         assert_well_formed(&got);
+    }
+}
+
+#[test]
+fn a_rewritten_name_keeps_its_server_prefix_up_to_the_documented_length() {
+    // The limit `doc/concepts/mcp-servers.md` ("Long server names") states.
+    // The trailing `/` makes the pair lossy at every length, and the body is
+    // cut at `room` characters before the suffix goes on.
+    let room = MAX_NAME_LEN - 1 - HASH_HEX_LEN;
+    for len in 1..=80usize {
+        let server = "s".repeat(len);
+        let got = sanitize(&server, "a/");
+        assert_well_formed(&got);
+        let hex = expected_hex(&server, "a/", HASH_HEX_LEN);
+        let ctx = format!("server of {len} chars: {got:?}");
+
+        if len + 3 <= room {
+            // The prefix, and the start of the tool's name, survive.
+            assert!(got.starts_with(&format!("{server}__a_")), "{ctx}");
+        } else if len + 2 == room {
+            // `<server>__` fits exactly; the tool's name does not.
+            assert_eq!(got, format!("{server}___{hex}"), "{ctx}");
+        } else if len + 1 == room {
+            // Half the separator survives, and the suffix's `_` completes a
+            // `__` -- so the hash reads as the tool's name.
+            assert_eq!(got, format!("{server}__{hex}"), "{ctx}");
+        } else {
+            // The cut is inside the server name.
+            assert_eq!(got, format!("{}_{hex}", &server[..room]), "{ctx}");
+            assert!(!got.contains("__"), "{ctx}");
+        }
+    }
+}
+
+#[test]
+fn a_wider_suffix_leaves_less_room_for_the_prefix() {
+    // Widening the suffix takes room from the body one character per hex
+    // digit, so the longest server name that keeps the start of the tool's
+    // name shrinks in step: one character past it the tool's name is gone.
+    for width in 1..=MAX_HASH_HEX_LEN {
+        let room = MAX_NAME_LEN - 1 - width;
+        for len in 1..=room.saturating_sub(3) {
+            let server = "s".repeat(len);
+            let got = suffixed(&server, "a/", width);
+            assert_well_formed(&got);
+            assert!(
+                got.starts_with(&format!("{server}__a")),
+                "width {width}, server of {len} chars: {got:?}"
+            );
+        }
+        if let Some(len) = room.checked_sub(2).filter(|&len| len > 0) {
+            let server = "s".repeat(len);
+            let hex = expected_hex(&server, "a/", width);
+            assert_eq!(
+                suffixed(&server, "a/", width),
+                format!("{server}___{hex}"),
+                "width {width}, server of {len} chars"
+            );
+        }
+    }
+}
+
+#[test]
+fn long_server_names_still_tell_tools_apart() {
+    // Past the limit the name is no longer decodable, but the suffix still
+    // separates tools that differ only in what was replaced or cut.
+    for len in [55usize, 56, 57, 60, 70] {
+        let server = "s".repeat(len);
+        let names: Vec<String> = ["read/file", "read file", "read_file", "write_file"]
+            .iter()
+            .map(|tool| sanitize(&server, tool))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            assert_well_formed(name);
+            assert!(
+                !names[..i].contains(name),
+                "server of {len} chars: {name:?} repeats"
+            );
+        }
     }
 }
 

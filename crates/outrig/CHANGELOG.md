@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The tool-name prefix is no longer promised for a server name too long to carry it.** A name
+  outrig rewrites to fit 64 characters is cut at a fixed length without regard for where the
+  server name ends, so on a server name of 55 characters or more a rewritten name had none of
+  the tool's name, and from 57 no `__` -- while the `outrig mcp` instructions and the docs said
+  the prefix always names the server. The instructions now say a rewritten name ends in a hash
+  and may be cut inside a long server name, and to call each tool by exactly the name listed;
+  the docs state the 54-character limit. No advertised name changes, and routing was never
+  affected, since a name is looked up whole. (#266)
 - **DNS over TCP works under network interception.** A truncated UDP answer's TCP retry, `dig
   +tcp`, and `options use-vc` were refused at the container's `127.0.0.1` resolver, and a TCP
   lookup sent to another resolver was carried as an opaque connection that bound no name. The
