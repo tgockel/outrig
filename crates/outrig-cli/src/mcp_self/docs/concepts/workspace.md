@@ -134,7 +134,17 @@ the repo root -- the directory holding `.agents/outrig/`, or the current directo
 config is found -- and a session refuses to start when that is your home directory or a directory
 above it, such as `/` or `/home`. Running from `~`, an MCP client that starts outrig in `/`, or a
 stray `~/.agents/outrig/config.toml` would otherwise put `~/.ssh` in the container. To mount your
-home directory on purpose, declare it, for example `host-path = "~"`.
+home directory on purpose, declare it in the global config, for example `host-path = "~"`.
+
+Nor does it pick a directory that contains your global config. The workspace is read-write, so an
+agent working in one could rewrite that file -- a provider's `api-key`, the `[network]` policy,
+`session-root` -- for the next session. A session therefore also refuses to start when an
+undeclared workspace contains the global config file, or a directory its path is looked up through
+(a symlink or a missing component there could be swapped to redirect it). Running from
+`~/.outrig` with no repo config above it does this, as does running from a project that holds the
+file `--global-config` names. Run from a project directory that does not hold it. To give the
+agent the global config on purpose, pass `--volume` for it, or declare `host-path` in the global
+config, which sets the workspace of every session whose repo config declares none.
 
 Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
 SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root

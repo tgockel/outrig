@@ -98,8 +98,9 @@ config. With no agent it resolves no model and no provider either, so a working 
 it needs -- the built-in default supplies the image and two MCP servers. Pass
 `--image <local-ref>` to proxy a different image instead; its proxied MCP servers come from
 that image's `org.outrig.mcp` labels. As with `outrig run`, the current directory can't be your
-home directory or one above it unless the global config declares `[workspace] host-path` -- so an
-MCP client that starts outrig in `/` or `~` needs `--config` naming a repo.
+home directory, one above it, or one that contains the global config, unless the global config
+declares `[workspace] host-path` -- so an MCP client that starts outrig in `/` or `~` needs
+`--config` naming a repo.
 
 With `--attach`, image-config selection is different:
 

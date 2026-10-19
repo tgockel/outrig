@@ -31,7 +31,7 @@ use tokio::time::timeout;
 
 mod common;
 use common::{
-    E2E_TIMEOUT, GLOBAL_WITH_MODEL, fixture_mcp_fs_dir, podman_names, stream_lines,
+    E2E_TIMEOUT, GLOBAL_WITH_MODEL, RepoDir, fixture_mcp_fs_dir, podman_names, stream_lines,
     wait_for_stderr_value, wait_until_gone,
 };
 
@@ -44,8 +44,6 @@ const SILENT_SERVER: &str = r#"["cat"]"#;
 
 /// A fixture repo whose image hosts one MCP server, `fs`, run as `fs_server`,
 /// and `extra` more, appended to the same table.
-/// The model `outrig run` needs comes from [`GLOBAL_WITH_MODEL`], passed as
-/// the global config; `outrig mcp` ignores it.
 fn write_config(repo: &Path, fs_server: &str, extra: &str) {
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
@@ -65,7 +63,6 @@ context = "{context}"
         context = fixture_mcp_fs_dir().display(),
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
-    std::fs::write(repo.join("global.toml"), GLOBAL_WITH_MODEL).expect("write global config");
 }
 
 /// One `outrig` process, its stdin held open, and the directories it writes.
@@ -79,7 +76,7 @@ struct Outrig {
     stderr_task: JoinHandle<()>,
     sessions: TempDir,
     session_dir: TempDir,
-    _repo: TempDir,
+    _repo: RepoDir,
 }
 
 impl Outrig {
@@ -90,16 +87,21 @@ impl Outrig {
         Self::spawn_with(command, fs_server, "")
     }
 
-    /// [`Outrig::spawn`] with `extra` MCP servers declared beside `fs`.
+    /// [`Outrig::spawn`] with `extra` MCP servers declared beside `fs`. The
+    /// model `outrig run` needs comes from [`GLOBAL_WITH_MODEL`], passed as the
+    /// global config beside the repo -- one inside it is refused (#609);
+    /// `outrig mcp` ignores it.
     fn spawn_with(command: &[&str], fs_server: &str, extra: &str) -> Self {
-        let repo = tempfile::tempdir().expect("tempdir repo");
+        let repo = RepoDir::new();
         write_config(repo.path(), fs_server, extra);
+        let global = repo.beside("global.toml");
+        std::fs::write(&global, GLOBAL_WITH_MODEL).expect("write global config");
         let sessions = tempfile::tempdir().expect("tempdir sessions");
         let session_dir = tempfile::tempdir().expect("tempdir session");
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
             .arg("--global-config")
-            .arg(repo.path().join("global.toml"))
+            .arg(&global)
             .arg("--session-root")
             .arg(sessions.path())
             .args(command)

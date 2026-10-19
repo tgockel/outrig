@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A workspace outrig picks can no longer contain the global config.** With no config declaring
+  `[workspace] host-path`, the workspace is the repo root, or the current directory when there is
+  no repo config, and it is mounted read-write. Only the home-directory rule (#411) judged it, so
+  `outrig run` or `outrig mcp` from a directory that held the global config file, was its
+  directory (`cd ~/.outrig`), or held a directory its path is looked up through, such as a
+  symlink, let the agent rewrite the provider `api-key`, `[network]` policy, and `session-root`
+  the next session loads. Such a session is now refused before anything starts, naming the
+  directory, why, and what chose the workspace. A workspace the global config declares, and
+  `--volume`, are unchanged. A global config kept inside a project (a dotfiles repo, or an
+  `XDG_CONFIG_HOME` under the project) has to move out of it, or declare `host-path` in the
+  global config (#609).
 - **`outrig run` and `outrig mcp` report the MCP configuration step at startup again.** Nothing
   was printed between `container user ready` and `MCP <server>: initializing`, though that stretch
   reads the images' `org.outrig.mcp` labels, ensures sidecar images, and builds the placement

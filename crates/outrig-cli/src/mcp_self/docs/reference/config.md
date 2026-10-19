@@ -849,7 +849,8 @@ A repo config may not declare a `host-path` (primary, extra, or sidecar mount) t
 directory or one above it, or -- read-write -- the global config file, its directory, or a
 directory its path passes through (a symlink or missing component there could be swapped to
 redirect it): the repo config sits inside the workspace, so an agent could otherwise rewrite the
-global config for the next session. Declare such a mount in the global config if you mean it.
+global config for the next session. Declare such a mount in the global config if you mean it. A
+workspace no config declares is held to the same two rules.
 
 The primary workspace bind-mount is always read-write and uses `--userns=keep-id` so files
 written inside the container appear with your host UID/GID. Extra mounts default to read-only;

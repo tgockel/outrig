@@ -710,6 +710,37 @@ identifier = "test-model"
 #[allow(dead_code)]
 pub const ABSENT_IMAGE: &str = "localhost/outrig-test-absent:latest";
 
+/// A fixture repo at `<tmp>/repo`, with the rest of `<tmp>` for what a session
+/// must not be able to rewrite. The repo is the workspace outrig mounts
+/// read-write by default, so a global config inside it would let the agent
+/// rewrite what the next session loads, and `run` and `mcp` refuse that layout
+/// (#609). Keep the global config beside the repo, as an operator's is.
+#[allow(dead_code)]
+pub struct RepoDir {
+    tmp: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+#[allow(dead_code)]
+impl RepoDir {
+    pub fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir repo");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Self { tmp, repo }
+    }
+
+    /// The repo: the session's working directory and workspace.
+    pub fn path(&self) -> &Path {
+        &self.repo
+    }
+
+    /// `name` in the directory holding the repo, outside the workspace.
+    pub fn beside(&self, name: &str) -> PathBuf {
+        self.tmp.path().join(name)
+    }
+}
+
 /// `path` as the `&str` an argument list wants.
 #[allow(dead_code)]
 pub fn utf8(path: &Path) -> &str {

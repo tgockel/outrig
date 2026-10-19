@@ -133,8 +133,8 @@ root (mounted at `/workspace`) and reads the agent, model, and provider from the
 path). You need not pass `--image`: with nothing else naming one, the session falls through to
 [the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
 unknown ref is used as a local Podman image and is never pulled. The current directory can't be
-your home directory or one above it, unless the *global* config declares `[workspace] host-path`;
-see
+your home directory, one above it, or one that contains the global config, unless the *global*
+config declares `[workspace] host-path`; see
 [Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 What the global config must still supply is a **model**. The session does not need an agent --

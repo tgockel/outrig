@@ -30,9 +30,9 @@ use tokio::time::timeout;
 
 mod common;
 use common::{
-    CannedResponse, E2E_TIMEOUT, STARTUP_PHASES, assert_lines_in_order, fixture_mcp_fs_dir,
-    next_recorded, podman_names, start_mock_http, stream_lines, wait_for_stderr_value,
-    wait_until_gone,
+    CannedResponse, E2E_TIMEOUT, RepoDir, STARTUP_PHASES, assert_lines_in_order,
+    fixture_mcp_fs_dir, next_recorded, podman_names, start_mock_http, stream_lines,
+    wait_for_stderr_value, wait_until_gone,
 };
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
@@ -63,13 +63,16 @@ default-model = "fast"
     );
 }
 
-/// Where the fixture's global config lives. `run_child` points
-/// `XDG_CONFIG_HOME` here, so the provider and its model are read from the
-/// operator's side of the merge -- a repo config may not declare a provider
-/// that carries an `api-key` -- and the developer's real global config is
-/// never read.
+/// Where the fixture's global config lives, beside the repo and not in it: the
+/// repo is the default workspace, and `run` refuses one that holds the global
+/// config (#609). `run_child` points `XDG_CONFIG_HOME` here, so the provider
+/// and its model are read from the operator's side of the merge -- a repo
+/// config may not declare a provider that carries an `api-key` -- and the
+/// developer's real global config is never read.
 fn xdg_config_home(repo: &Path) -> PathBuf {
-    repo.join("xdg")
+    repo.parent()
+        .expect("a fixture repo has a parent")
+        .join("xdg")
 }
 
 /// `top` lands with the other scalar keys, above every table; `agents` lands
@@ -152,11 +155,12 @@ context = "{context}"
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
 }
 
-/// What makes a miss fixture a miss: the repo tempdir's name, which no earlier
-/// run of this binary can have used, reduced to what a shell word is happy
-/// with.
+/// What makes a miss fixture a miss: the name of the tempdir holding the repo
+/// (the repo itself is always `<tempdir>/repo`), which no earlier run of this
+/// binary can have used, reduced to what a shell word is happy with.
 fn miss_nonce(repo: &Path) -> String {
-    repo.file_name()
+    repo.parent()
+        .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .expect("tempdir name is UTF-8")
         .chars()
@@ -222,7 +226,7 @@ async fn run_drives_one_tool_call_and_prints_reply() {
     let server_handle = tokio::spawn(run_mock_openai(listener));
 
     // 2. Build the fixture repo in a tempdir.
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_smoke_config(repo_dir.path(), &mock_addr.to_string());
 
     let sessions = tempfile::tempdir().expect("tempdir sessions");
@@ -331,7 +335,7 @@ async fn run_without_an_agent_sends_no_preamble() {
     let (request_tx, mut request_rx) = mpsc::unbounded_channel();
     let server_handle = tokio::spawn(run_mock_openai_capturing(listener, Some(request_tx)));
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_agentless_config(repo_dir.path(), &mock_addr.to_string());
 
     let sessions = tempfile::tempdir().expect("tempdir sessions");
@@ -405,7 +409,7 @@ async fn a_cache_miss_shows_the_build_on_a_plain_run() {
 
     let (mock_addr, _requests) =
         start_mock_http(vec![CannedResponse::ok(plain_reply("built fine"))]).await;
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     let nonce = miss_nonce(repo_dir.path());
     write_miss_config(
         repo_dir.path(),
@@ -502,7 +506,7 @@ async fn a_cache_miss_under_verbose_prints_each_build_line_once() {
 
     let (mock_addr, _requests) =
         start_mock_http(vec![CannedResponse::ok(plain_reply("built fine"))]).await;
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     let nonce = miss_nonce(repo_dir.path());
     write_miss_config(
         repo_dir.path(),
@@ -583,7 +587,7 @@ async fn a_failing_build_on_a_plain_run_does_not_repeat_its_output() {
         .with_ansi(false)
         .try_init();
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     let nonce = miss_nonce(repo_dir.path());
     // The model is never reached; any closed port will do.
     write_miss_config(
@@ -672,7 +676,7 @@ async fn verbose_run_writes_container_log_and_enables_trace() {
     let mock_addr = listener.local_addr().expect("mock addr");
     let server_handle = tokio::spawn(run_mock_openai(listener));
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_smoke_config(repo_dir.path(), &mock_addr.to_string());
 
     let sessions = tempfile::tempdir().expect("tempdir sessions");
@@ -801,7 +805,7 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     );
     let server_handle = tokio::spawn(run_mock_openai_resume(listener, request_tx, second));
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_smoke_config(repo_dir.path(), &mock_addr.to_string());
 
     let sessions = tempfile::tempdir().expect("tempdir sessions");
@@ -937,7 +941,7 @@ async fn endpoint_failure_after_a_tool_call_retains_it_for_continue() {
     );
     let server_handle = tokio::spawn(run_mock_openai_resume(listener, request_tx, rate_limited));
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     // Retries off, so the 429 ends the turn at once.
     write_config(
         repo_dir.path(),
@@ -1155,7 +1159,7 @@ async fn run_sigint_to_the_group_mid_turn_keeps_the_mcp_transports() {
     ])
     .await;
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_smoke_config(repo_dir.path(), &mock_addr.to_string());
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let session_dir = tempfile::tempdir().expect("tempdir session");
@@ -1238,7 +1242,7 @@ async fn run_sigint_mid_sidecar_add_cancels_it_and_a_retry_starts_over() {
 
     let (mock_addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
 
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let repo_dir = RepoDir::new();
     write_slow_sidecar_config(repo_dir.path(), &mock_addr.to_string());
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let session_dir = tempfile::tempdir().expect("tempdir session");

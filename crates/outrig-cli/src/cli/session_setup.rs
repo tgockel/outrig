@@ -40,7 +40,7 @@ use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
     RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
-    repo_config_path,
+    refuse_workspace_covering_global_config, repo_config_path,
 };
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
@@ -347,7 +347,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None => None,
     };
     // A workspace no config declared is outrig's pick, and outrig never picks
-    // the home directory or one above it. An attached session mounts nothing.
+    // the home directory or one above it, nor one that contains the global
+    // config. An attached session mounts nothing.
     if attach.is_none() {
         // Spelled without the default `.` it joins to the root.
         let workspace: PathBuf = cfg
@@ -358,6 +359,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         let declared = cfg.workspace.declared_host_path().is_some();
         if !declared {
             refuse_home_workspace(&workspace, &repo_root)?;
+            refuse_workspace_covering_global_config(&workspace, &repo_root, args.global_cfg_path)?;
         }
         refuse_repo_declared_mounts(&cfg, &repo_root, args.global_cfg_path)?;
         // No config of its own at the root, and no declared host path, means

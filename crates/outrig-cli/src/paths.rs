@@ -302,18 +302,25 @@ fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -
     } else {
         format!("above your home directory ({})", home.display())
     };
-    let repo_cfg = repo_config_path(repo_root);
-    let why = if repo_cfg.is_file() {
-        format!("{} makes it the repo root", repo_cfg.display())
-    } else {
-        "no repo config was found, so it is the current directory".to_string()
-    };
+    let why = implicit_workspace_origin(repo_root);
     Err(OutrigError::Configuration(format!(
         "refusing to mount {} as the workspace: it is {what}, and {why}\n\
          help: run outrig from a project directory, or declare [workspace] host-path \
          to mount it on purpose",
         workspace.display()
     )))
+}
+
+/// What made `repo_root` the workspace when no config declared one, for a
+/// refusal to name: the repo config at the root, or no repo config at all, which
+/// leaves the current directory.
+fn implicit_workspace_origin(repo_root: &Path) -> String {
+    let repo_cfg = repo_config_path(repo_root);
+    if repo_cfg.is_file() {
+        format!("{} makes it the repo root", repo_cfg.display())
+    } else {
+        "no repo config was found, so it is the current directory".to_string()
+    }
 }
 
 /// Canonicalize `p` even when it does not exist. Components are resolved left
@@ -397,6 +404,35 @@ impl GlobalConfigReach {
     }
 }
 
+/// Refuse a workspace no config declared when it is read-write over the global
+/// config: its file, its directory, or a directory its path is looked up
+/// through (see [`GlobalConfigReach`]). A file that is not there yet counts,
+/// since an agent could create it. Like [`refuse_home_workspace`], this is about
+/// outrig's own pick -- the repo root, or the current directory -- so the caller
+/// asks only when `[workspace] host-path` is declared nowhere: the global
+/// config's own is the operator's choice, and a repo's is judged by
+/// [`refuse_repo_declared_mounts`].
+pub(crate) fn refuse_workspace_covering_global_config(
+    workspace: &Path,
+    repo_root: &Path,
+    global_cfg: Option<&Path>,
+) -> Result<()> {
+    let Some(global) = global_cfg.map(GlobalConfigReach::of) else {
+        return Ok(());
+    };
+    let workspace = canonical_or_normalized(workspace);
+    let Some(reason) = global.rewritable_through(&workspace) else {
+        return Ok(());
+    };
+    Err(OutrigError::Configuration(format!(
+        "refusing to mount {} as the workspace: {reason}, and {}\n\
+         help: run outrig from a project directory that does not hold the global config, \
+         or declare [workspace] host-path in the global config to mount it on purpose",
+        workspace.display(),
+        implicit_workspace_origin(repo_root)
+    )))
+}
+
 /// Refuse a repo-declared host path that reaches the operator's own files. The
 /// repo config sits in the read-write workspace, so an agent can edit it for
 /// the next session; a repo `[workspace] host-path`, `[[workspace.mounts]]` or
@@ -405,7 +441,8 @@ impl GlobalConfigReach {
 /// looked up through (see [`GlobalConfigReach`]), would let that agent
 /// rewrite the global config the repo is not trusted to carry. A
 /// global-declared entry is the operator's own choice, and a hand-built one
-/// (`--volume`) carries no source.
+/// (`--volume`) carries no source. Neither does an undeclared workspace, which is
+/// outrig's own pick: [`refuse_workspace_covering_global_config`] asks about it.
 pub(crate) fn refuse_repo_declared_mounts(
     cfg: &Config,
     repo_root: &Path,
@@ -1021,6 +1058,137 @@ mod tests {
         assert!(
             err.to_string()
                 .contains(&format!("it is above your home directory ({})", home.display())),
+            "{err}",
+        );
+    }
+
+    /// [`refuse_workspace_covering_global_config`] for `workspace` against
+    /// `global`, the repo root being `workspace` too, as it is for an undeclared
+    /// workspace. The refusal's text, if there is one.
+    fn workspace_refusal(workspace: &Path, global: Option<&Path>) -> Option<String> {
+        refuse_workspace_covering_global_config(workspace, workspace, global)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// A workspace no config declared is read-write, so one that contains the
+    /// global config -- its file, or a directory above it -- is refused, as a
+    /// repo mount of it is (#609). A file that is not there yet counts: an agent
+    /// could create it. A directory beside the config or below it does not.
+    #[test]
+    fn an_implicit_workspace_containing_the_global_config_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let conf = root.join("proj/conf");
+        fs::create_dir_all(conf.join("work")).unwrap();
+        fs::create_dir_all(root.join("proj/src")).unwrap();
+        let global = conf.join("config.toml");
+
+        for present in [false, true] {
+            if present {
+                fs::write(&global, "").unwrap();
+            }
+            for workspace in [conf.clone(), root.join("proj"), root.clone()] {
+                let err = workspace_refusal(&workspace, Some(&global))
+                    .unwrap_or_else(|| panic!("{} must be refused", workspace.display()));
+                assert_eq!(
+                    err,
+                    format!(
+                        "configuration: refusing to mount {} as the workspace: it is read-write \
+                         and covers the global config ({}), and no repo config was found, so it \
+                         is the current directory\n\
+                         help: run outrig from a project directory that does not hold the \
+                         global config, or declare [workspace] host-path in the global config \
+                         to mount it on purpose",
+                        workspace.display(),
+                        global.display()
+                    ),
+                );
+            }
+            for workspace in [conf.join("work"), root.join("proj/src"), root.join("other")] {
+                assert_eq!(
+                    workspace_refusal(&workspace, Some(&global)),
+                    None,
+                    "{} must be allowed",
+                    workspace.display()
+                );
+            }
+        }
+        assert_eq!(workspace_refusal(&conf, None), None);
+        assert_eq!(workspace_refusal(&conf, Some(Path::new("/dev/null"))), None);
+    }
+
+    /// The refusal says which default put the workspace there, as the home
+    /// refusal does: a repo config at the root, or no repo config at all.
+    #[test]
+    fn global_config_refusal_names_the_default_that_chose_it() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let global = root.join("config.toml");
+
+        let err = workspace_refusal(&root, Some(&global)).unwrap();
+        assert!(
+            err.contains(", and no repo config was found, so it is the current directory\n"),
+            "{err}",
+        );
+
+        let config = write_repo_config(&root);
+        let err = workspace_refusal(&root, Some(&global)).unwrap();
+        assert!(
+            err.contains(&format!(
+                ", and {} makes it the repo root\n",
+                config.display()
+            )),
+            "{err}",
+        );
+    }
+
+    /// A directory the global config path is looked up through is as good as
+    /// the file: an agent that can write it replaces a symlink there, or
+    /// creates a missing component that a `..` after it had popped (#605).
+    #[test]
+    fn an_implicit_workspace_where_the_global_config_path_is_looked_up_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (proj, real) = (root.join("proj"), root.join("real"));
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(real.join("outrig")).unwrap();
+        fs::write(real.join("outrig/config.toml"), "").unwrap();
+        std::os::unix::fs::symlink(&real, proj.join("cfg")).unwrap();
+        let global = proj.join("cfg/outrig/config.toml");
+
+        let err = workspace_refusal(&proj, Some(&global)).expect("the symlink's directory");
+        assert!(err.contains(&looked_up_through(&proj)), "{err}");
+        assert!(err.contains(&global.display().to_string()), "{err}");
+        // Where the file is today keeps its own reason.
+        let err = workspace_refusal(&real, Some(&global)).expect("the resolved file");
+        assert!(err.contains("covers the global config ("), "{err}");
+
+        let shared = root.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let global = shared.join("absent/../../conf/outrig/config.toml");
+        let err = workspace_refusal(&shared, Some(&global)).expect("the creation point");
+        assert!(err.contains(&looked_up_through(&shared)), "{err}");
+    }
+
+    /// The workspace is compared by where it resolves, so a symlink to the
+    /// global config's directory is refused like the directory, and named as
+    /// the directory.
+    #[test]
+    fn a_symlinked_spelling_of_the_workspace_is_compared_by_where_it_resolves() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let conf = root.join("conf");
+        fs::create_dir_all(&conf).unwrap();
+        let link = root.join("link-to-conf");
+        std::os::unix::fs::symlink(&conf, &link).unwrap();
+
+        let err = workspace_refusal(&link, Some(&conf.join("config.toml"))).expect("resolves");
+        assert!(
+            err.contains(&format!(
+                "refusing to mount {} as the workspace",
+                conf.display()
+            )),
             "{err}",
         );
     }

@@ -290,8 +290,9 @@ a repo config and does not fall through; pass `--image outrig-default` to pre-wa
 built-in.
 
 Whichever way the repo root is found, a workspace no config declares is never your home
-directory or a directory above it: `run` and `mcp` refuse to start, naming the directory and
-what chose it. Declare `[workspace] host-path` to mount it on purpose; see
+directory or a directory above it, nor one that contains the global config: `run` and `mcp`
+refuse to start, naming the directory and what chose it. Declare `[workspace] host-path` in the
+global config to mount it on purpose; see
 [Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.

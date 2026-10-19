@@ -41,7 +41,10 @@ lives in the workspace, which is mounted read-write, so an agent can edit it in 
 have the next session load the result. That is why what reaches the host's secrets stays
 global-only: a provider carrying an `api-key` -- a reference to a variable in the operator's
 environment, paired with the `base-url` it is sent to -- is refused in a repo config, as the
-`[network]` policy keys are. A repo config may still name global providers from its models.
+`[network]` policy keys are. A repo config may still name global providers from its models. For
+the same reason, a session whose workspace would contain the global config is refused, whether a
+repo config declared that workspace or outrig picked it; the global config's own `[workspace]` and
+`--volume` are the operator's choice.
 
 [Subagents](subagents.md) do not bend this. An agent can launch one with `outrig__subagent`, but a
 subagent runs in the container that is already there, over the MCP connections that are already

@@ -1,6 +1,7 @@
 //! A workspace outrig picks by default is never the home directory or one
-//! above it (#411). Run against a `HOME` in a tempdir, with the stubbed
-//! runtime of [`common::run_outrig_with_env`], so nothing real is mounted.
+//! above it (#411), nor one that contains the global config (#609). Run
+//! against a `HOME` in a tempdir, with the stubbed runtime of
+//! [`common::run_outrig_with_env`], so nothing real is mounted.
 
 mod common;
 
@@ -49,6 +50,19 @@ impl Fixture {
         args.extend_from_slice(cmd);
         args.extend_from_slice(&["--image", "localhost/outrig-test-absent:latest"]);
         run_outrig_with_env(cwd, &args, &[("HOME", &self.home())]).await
+    }
+
+    /// [`run`](Self::run) with no `--global-config`: the global config is the
+    /// `~/.outrig/config.toml` of the fixture's `HOME`, since an empty
+    /// `XDG_CONFIG_HOME` names no location.
+    async fn run_default_global(&self, cwd: &Path, cmd: &[&str]) -> (bool, String) {
+        let sessions = self.tmp.path().join("sessions");
+        let mut args = vec!["--session-root", sessions.to_str().unwrap()];
+        args.extend_from_slice(cmd);
+        args.extend_from_slice(&["--image", "localhost/outrig-test-absent:latest"]);
+        let home = self.home();
+        let env = [("HOME", home.as_path()), ("XDG_CONFIG_HOME", Path::new(""))];
+        run_outrig_with_env(cwd, &args, &env).await
     }
 
     fn sessions(&self) -> Vec<Session> {
@@ -260,4 +274,159 @@ async fn a_config_less_run_below_home_is_allowed() {
 
     let (_, stderr) = fx.run(&proj, &["run"]).await;
     assert_allowed(&fx, &stderr, &proj);
+}
+
+/// The default workspace is read-write, so a global config inside it is one the
+/// agent can rewrite for the next session. With no repo config the working
+/// directory is the workspace, and one holding the file `--global-config` names
+/// is refused (#609), as a repo-declared mount of it is (#445).
+#[tokio::test]
+async fn a_config_less_run_over_the_global_config_is_refused() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    let global = proj.join("g.toml");
+    fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+
+    for cmd in ["run", "mcp"] {
+        let (ok, stderr) = fx.run_with_global(&proj, &global, &[cmd]).await;
+        assert_refused(&fx, ok, &stderr, &proj);
+        assert!(
+            stderr.contains(&format!("covers the global config ({})", global.display())),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("no repo config was found, so it is the current directory"),
+            "{stderr}"
+        );
+    }
+}
+
+/// A repo config at the root makes the root the workspace from anywhere below
+/// it, so the global config's directory inside the repo is refused from there
+/// too, and the refusal names the repo config that chose it.
+#[tokio::test]
+async fn a_repo_root_over_the_global_configs_directory_is_refused() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    write_repo_config(&proj, "");
+    let global = proj.join("conf/global.toml");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+    let nested = proj.join("src");
+    fs::create_dir_all(&nested).unwrap();
+
+    let (ok, stderr) = fx.run_with_global(&nested, &global, &["run"]).await;
+    assert_refused(&fx, ok, &stderr, &proj);
+    assert!(
+        stderr.contains(&format!(
+            "{} makes it the repo root",
+            proj.join(".agents/outrig/config.toml").display()
+        )),
+        "{stderr}"
+    );
+}
+
+/// A symlink in the global config's path, inside the workspace, lets the agent
+/// redirect where the next session reads it (#605); the directory holding the
+/// link is refused as a default workspace, spelled absolutely or not.
+#[tokio::test]
+async fn a_symlink_in_the_global_config_path_inside_the_workspace_is_refused() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    std::os::unix::fs::symlink(fx.tmp.path().join("cfg"), proj.join("link")).unwrap();
+
+    for global in [
+        proj.join("link/global.toml"),
+        PathBuf::from("link/global.toml"),
+    ] {
+        let (ok, stderr) = fx.run_with_global(&proj, &global, &["run"]).await;
+        assert_refused(&fx, ok, &stderr, &proj);
+        assert!(
+            stderr.contains(&format!("global config path ({})", global.display())),
+            "{stderr}"
+        );
+    }
+}
+
+/// The default location is the same hole from its own directory: with no repo
+/// config above `~/.outrig`, running there makes it the workspace. A project
+/// beside it, or a directory below it, does not contain the file.
+#[tokio::test]
+async fn the_default_global_config_directory_is_refused_as_a_default_workspace() {
+    let fx = Fixture::new();
+    let dir = fx.home().join(".outrig");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), GLOBAL_WITH_MODEL).unwrap();
+
+    let (ok, stderr) = fx.run_default_global(&dir, &["run"]).await;
+    assert_refused(&fx, ok, &stderr, &dir);
+    assert!(
+        stderr.contains(&format!(
+            "covers the global config ({})",
+            dir.join("config.toml").display()
+        )),
+        "{stderr}"
+    );
+
+    for cwd in ["proj", ".outrig/work"] {
+        let fx = Fixture::new();
+        let (dir, cwd) = (fx.home().join(".outrig"), fx.home().join(cwd));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), GLOBAL_WITH_MODEL).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        let (_, stderr) = fx.run_default_global(&cwd, &["run"]).await;
+        assert_allowed(&fx, &stderr, &cwd);
+    }
+}
+
+/// A workspace the global config declares is the operator's own choice, over
+/// the global config itself included.
+#[tokio::test]
+async fn a_global_declared_host_path_may_cover_the_global_config() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    let global = proj.join("g.toml");
+    fs::write(
+        &global,
+        format!(
+            "{GLOBAL_WITH_MODEL}\n[workspace]\nhost-path = \"{}\"\n",
+            proj.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr) = fx.run_with_global(&proj, &global, &["run"]).await;
+    assert_allowed(&fx, &stderr, &proj);
+}
+
+/// So is `--volume`: the global config's directory can be handed to the agent
+/// on purpose, from a project that does not hold it.
+#[tokio::test]
+async fn a_volume_of_the_global_configs_directory_is_allowed() {
+    let fx = Fixture::new();
+    let proj = fx.home().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    let volume = format!("{}:/g:rw", fx.tmp.path().join("cfg").display());
+
+    let (_, stderr) = fx.run(&proj, &["run", "--volume", &volume]).await;
+    assert_allowed(&fx, &stderr, &proj);
+}
+
+/// `HOME` holding the global config breaks both rules; the home refusal is the
+/// more basic one, so it is the one reported.
+#[tokio::test]
+async fn the_home_refusal_comes_before_the_global_config_one() {
+    let fx = Fixture::new();
+    let home = fx.home();
+    let global = home.join("g.toml");
+    fs::write(&global, GLOBAL_WITH_MODEL).unwrap();
+
+    let (ok, stderr) = fx.run_with_global(&home, &global, &["run"]).await;
+    assert_refused(&fx, ok, &stderr, &home);
+    assert!(stderr.contains("it is your home directory"), "{stderr}");
+    assert!(!stderr.contains("covers the global config"), "{stderr}");
 }
