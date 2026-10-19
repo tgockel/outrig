@@ -5,13 +5,17 @@ outrig reads two TOML files:
 - **Global config** -- user/machine-level. Default location: `~/.outrig/config.toml` (or
   `<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set to an absolute path). Holds
   `[providers.<name>]` and (typically) `[models.<name>]` since those reference API keys and
-  model identifiers that belong to the user, not to any one repo.
+  model identifiers that belong to the user, not to any one repo. It is also where
+  [`[repo]`](#repo) lives, which says which host environment variables a repo config may
+  reference.
 - **Repo config** at `.agents/outrig/config.toml` -- repository-level, committed to source
   control. Holds `[workspace]`, `[images.<name>]`, `[agents.<name>]`, and any repo-specific
   models, which may name the global providers. A repo config may not declare a provider that
   carries an `api-key`: the file sits inside the read-write workspace, so an agent could edit
   it for the next session, and a key names a secret in the operator's environment. Keyless
-  `style = "mistralrs"` providers are the exception.
+  `style = "mistralrs"` providers are the exception. For the same reason it may reference a
+  host variable in `build-args` or an MCP `env` only if the global config lists it in
+  [`[repo]`](#repo) `env-allow`.
 
 Both files use the same schema. Names declared in either are visible everywhere; if a name
 appears in both files, the **repo entry wins**. Outrig keys are **kebab-case**; only inner-map
@@ -42,6 +46,9 @@ mode = "default"                                      # optional: default, audit
 default = "deny"                                      # optional for filter mode
 allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
 deny  = ["*:22"]                                      # optional; global only
+
+[repo]
+env-allow = ["GITHUB_TOKEN"]                          # optional; global only
 ```
 
 | Key                     | Type    | Required               | Where  | Description               |
@@ -61,6 +68,7 @@ deny  = ["*:22"]                                      # optional; global only
 | `network.default`       | string  | no                     | global | Filter fallback action.   |
 | `network.allow`         | array   | no                     | global | Filter allow entries.     |
 | `network.deny`          | array   | no                     | global | Filter deny entries.      |
+| `repo.env-allow`        | array   | no                     | global | Variables a repo may use. |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -87,6 +95,9 @@ session records and model downloads, and for sessions also where `outrig clean` 
 A `[network]` table that declares no `mode` declares nothing, so it inherits. Network policy
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
+`[repo].env-allow` is global-only too: it says which host variables a repo config's `${VAR}`
+references may name, so a repo file cannot answer for itself. A repo config that declares it is
+rejected at load. See [`[repo]`](#repo).
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). A relative value resolves against the global config's
@@ -351,6 +362,53 @@ name the interceptor validated and `asserted` for one the client claimed.
 override this setting for one fresh session. `--network audit` and `--network filter` are
 rejected with `outrig mcp --attach` because borrowed containers are not retrofitted with a new
 interceptor.
+
+## `[repo]`
+
+Global config only. `[repo]` says what a repo config may take from your machine. Today that is
+one key, `env-allow`:
+
+```toml
+[repo]
+env-allow = ["GITHUB_TOKEN", "HTTPS_PROXY"]    # optional; default: none
+```
+
+A `${VAR}` reference in a repo config's `build-args` or in an MCP server's `env` is resolved from
+the host environment, and the value goes to code the repo controls: a build of its own
+Dockerfile, or a server command it chose. The repo config sits inside the read-write workspace,
+so it may be committed hostile, or edited by the agent for the next session. A repo config file
+may therefore name only the variables `env-allow` lists, and the list is empty by default:
+
+- **A reference to a variable that is not listed is refused when the config loads** -- by
+  `outrig run`, `outrig mcp`, and `outrig build` alike, before anything is built or started, and
+  before the variable is read. The error names the image, the build-arg or the server and its
+  `env` key, the variable, and the file that declared it, and says to list the variable here.
+- **A literal needs no entry.** Neither does anything you wrote or typed yourself: `--env` values
+  on the command line, and the `build-args` and `env` of images declared in the global config,
+  which may reference any variable.
+- **Every image a repo config file declares is checked**, used or not, because loading does not
+  know which one a session will select. A `--config` file is a repo config for this rule, so a
+  profile of your own loaded that way needs its variables listed here too.
+- **One list covers both places** -- build-args and MCP `env` -- and applies to every repo this
+  machine runs. An entry is an exact variable name, `^[A-Z_][A-Z0-9_]*$` as in a `${VAR}`
+  reference. There are no patterns.
+
+**A variable on the list is the repo's to route.** The repo decides which build-arg or server
+environment receives it, and the Dockerfile `RUN` step or MCP server that gets it can do anything
+the container may with it: print it, write it into the workspace, or send it wherever the
+session's [network policy](#network) lets traffic out. A build-arg is also recorded in the
+image's history (`podman history --no-trunc`). List a variable only if you would hand it to
+everyone who can change that repo's config, the agent included.
+
+A repo config may not declare `env-allow`, even as an empty list, any more than it may set
+`session-root` or the `[network]` policy keys: it would be answering for itself. The load
+rejects the file and names the key.
+
+The global config is read leniently (see [What a load sets aside](#what-a-load-sets-aside)), so
+an `env-allow` that is misspelled, is not a list, or holds an entry that is not a variable name
+is set aside with a warning instead of stopping every repo on the machine. That leaves the list
+empty and every reference refused: a mistake here narrows what a repo may read and never widens
+it. The warning is printed before the refusal it causes.
 
 ## `[providers.<name>]`
 
@@ -890,6 +948,8 @@ name must be a valid container image repository component -- see the validation 
   [MCP `env` value syntax](#mcp-env-value-syntax) below describes for podman. buildah itself
   records every build-arg a `RUN` step sees, value included, in the image's history
   (`podman history --no-trunc`), so a build-arg does not keep a secret out of the image.
+  In a repo config a reference may name only a variable the global config lists in
+  [`[repo]`](#repo) `env-allow`; one you declare in the global config may name any.
 
 ### Use-existing-image (new form)
 
@@ -1049,7 +1109,8 @@ tests = { command = ["test-mcp"], call-timeout-secs = 1800 }
 lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
 grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 
-# entrypoint-stdio -- no command; the container's ENTRYPOINT is the server
+# entrypoint-stdio -- no command; the container's ENTRYPOINT is the server. In a repo config,
+# FETCH_TOKEN has to be listed in the global config's [repo] env-allow.
 fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
 serve = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
 ```
@@ -1063,7 +1124,8 @@ image, or declare any other MCP command that should run inside the container.
   invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env`, which
   stores them in the container's config, visible to `podman inspect` on the host. A `${VAR}`
   value reaches podman by name rather than on its command line; see the
-  [value syntax](#mcp-env-value-syntax).
+  [value syntax](#mcp-env-value-syntax). In a repo config a reference may name only a variable
+  the global config lists in [`[repo]`](#repo) `env-allow`.
 - `sidecar` (string, optional): run this server in the named
   [`[sidecars.<sc>]`](#sidecarssc) container instead of the primary.
   With `command`, the server is exec-stdio in that container; *without* `command`, that
@@ -1120,7 +1182,8 @@ Notes:
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#long-server-names).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
   resolved from the host environment at MCP startup and shown only as the reference -- see the
-  subsection below.
+  subsection below. A reference in a repo config file is refused at load unless the global
+  config's [`[repo]`](#repo) `env-allow` lists the variable.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
   repo-config-only and rejected in labels; `call-timeout-secs` is allowed). Repo config entries
   override image entries by server name, wholesale -- a label's `call-timeout-secs` does not
@@ -1226,6 +1289,11 @@ verbatim, including malformed-looking references (lower-case names, unmatched br
 embedded substitution). If the named host env var is unset when the MCP server is about to
 start, MCP startup fails with an error naming the variable, the server, and the env key.
 
+In a repo config file a reference is first held to the global config's [`[repo]`](#repo)
+`env-allow`: a variable that is not listed there is refused when the config loads, whether or
+not it is set. A literal is not a reference and needs no entry, and neither does a value you
+type with `--env`.
+
 A reference's value stays out of what outrig prints and off podman's command line, which any
 local user can read with `ps` for as long as the command runs -- for an exec-stdio server, the
 whole session. outrig's errors, the `--verbose` transcript (`container.log` and the terminal),
@@ -1280,10 +1348,14 @@ used in full (no per-key merging).
                                   [models.review]                    repo only
 ```
 
-The one map with a repo-side restriction is `[providers.<name>]`: a repo config may declare
-only providers without an `api-key` (`style = "mistralrs"`), so every keyed provider in the
-effective config is one the global file declared, `base-url` included. A repo `[models.<name>]`
-names a global provider the way `fast` does above.
+Two maps have a repo-side restriction. A repo config may declare only providers without an
+`api-key` (`style = "mistralrs"`), so every keyed provider in the effective config is one the
+global file declared, `base-url` included; a repo `[models.<name>]` names a global provider the
+way `fast` does above. And an image a repo config declares may reference a host variable, in
+`build-args` or an MCP `env`, only if the global config's [`[repo]`](#repo) `env-allow` lists
+it. A repo image replaces a global one of the same name whole, references included, so the
+restriction follows whichever file's entry wins: the references in an image you declare in the
+global config are yours, and are not held to the list.
 
 `outrig run` walks the chain at startup: agent -> model (explicit or `default-model`) -> provider
 -> resolved api-key from env. Anything that fails to resolve is an error printed to stderr
@@ -1389,6 +1461,9 @@ mode = "default"                                 # optional; default, audit, or 
 default = "deny"                                 # optional for filter mode
 allow = ["github.com:443", "*.npmjs.org"]        # optional; global only
 deny  = ["*:22"]                                 # optional; global only
+
+[repo]
+env-allow = ["GITHUB_TOKEN"]                     # optional; global only
 
 [providers.openai]
 style    = "openai"
@@ -1501,7 +1576,9 @@ for each thing it set aside, and goes on:
 
 Validation then runs on what is left, so an entry something else needed is still an error --
 printed after the warning that explains it. A misspelled `provider` is warned about, and then
-its model is refused for having no provider. Some things are never set aside:
+its model is refused for having no provider. Likewise an `env-allow` that is set aside leaves
+the [`[repo]`](#repo) list empty, so a repo config's references are refused, after the warning
+that says why. Some things are never set aside:
 
 - anything in `[network]`, `[images.<name>.security]`, or `[sidecars.<sc>.security]`, where
   leaving a key out could give a container more access than the file asks for;
@@ -1584,6 +1661,14 @@ image-config in the merged config but does not require agent/model/provider wiri
 - A repo config may declare only providers without an `api-key` (`style = "mistralrs"`); an
   `openai` or `anthropic` provider in `.agents/outrig/config.toml`, or in a `--config` file,
   is rejected there, naming the provider and the variable its key references.
+- `[repo].env-allow` may be set only in the global config; a repo config that declares it, even
+  as `env-allow = []`, is rejected there. Each entry must be a variable name, matching
+  `^[A-Z_][A-Z0-9_]*$`; in the global config a bad entry sets the whole key aside with a warning.
+- Every `${VAR}` in the `build-args` or an MCP `env` of an image that `.agents/outrig/config.toml`,
+  or a `--config` file, declares must name a variable the global config's `[repo].env-allow`
+  lists. The load is refused otherwise, naming the image, the build-arg or the server and its
+  `env` key, the variable, and the file. Images the global config declares, literal values, and
+  `--env` values are not held to the list.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.

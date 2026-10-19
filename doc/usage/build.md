@@ -50,7 +50,10 @@ outrig build [--image <name>]
      A literal build-arg is passed as `KEY=value`. A `${VAR}` one is passed as a bare `KEY`,
      with the value in buildah's environment rather than on its command line, and outrig's
      errors and logs show it as `KEY=${VAR}` -- see
-     [the value syntax](../reference/config.md#mcp-env-value-syntax).
+     [the value syntax](../reference/config.md#mcp-env-value-syntax). In a repo config a
+     `${VAR}` build-arg may name only a variable the global config lists in
+     [`[repo]` `env-allow`](../reference/config.md#repo); any other is refused when the config
+     loads, before buildah runs.
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.

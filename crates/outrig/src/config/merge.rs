@@ -21,6 +21,9 @@ use super::Config;
 /// - `session-root` and `model-cache-root` are global-only: they are taken
 ///   from `global` and never read from `repo`, so a repo value cannot move
 ///   where this machine writes, whatever built it.
+/// - `[repo]` is global-only too, for the same reason: a repo value cannot
+///   widen which host variables a repo config may reference, whatever built
+///   it. [`Config::validate`] reads that list off the merged result.
 /// - `[network].mode` follows repo precedence when the repo config declares
 ///   `mode`; a `[network]` table that declares no mode inherits the global
 ///   one. Policy keys (`default`, `allow`, `deny`) are global-only: this
@@ -82,6 +85,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         mcp_call_timeout_secs: repo.mcp_call_timeout_secs.or(global.mcp_call_timeout_secs),
         network,
+        repo: global.repo,
         providers,
         models,
         agents,

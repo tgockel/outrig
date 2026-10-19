@@ -243,8 +243,10 @@ outrig run [--agent <name>]
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for MCP servers. `KEY=VALUE`
   applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
   the `${VAR}` host-env-reference syntax described in
-  [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
-  on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
+  [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax); you typed them, so they are
+  not held to the global config's [`[repo]` `env-allow`](config.md#repo) list. Within a scope,
+  last wins on duplicate keys. Precedence per key: config-file env < global `--env` <
+  per-server `--env`.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   **deprecated** with the in-process backend it selects hardware for; override the in-process
   mistralrs model device for this run. Rejected for OpenAI-style models, and

@@ -337,10 +337,16 @@ async fn a_self_referencing_tmpdir_build_arg_arrives_unchanged() {
     std::fs::write(&config, text).unwrap();
     std::fs::create_dir_all(tmp.path().join("rel")).unwrap();
     let cache = tempfile::tempdir().unwrap();
+    // The repo config names `TMPDIR`, and a repo file may reference only the
+    // variables the global config lists (#444).
+    let global_dir = tempfile::tempdir().unwrap();
+    let global = global_dir.path().join("config.toml");
+    std::fs::write(&global, "[repo]\nenv-allow = [\"TMPDIR\"]\n").unwrap();
 
     let out = try_capture(
         Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .args(["--global-config", "/dev/null"])
+            .arg("--global-config")
+            .arg(&global)
             .args(["build", "--image", "coding"])
             .current_dir(tmp.path())
             .env("TMPDIR", "rel")

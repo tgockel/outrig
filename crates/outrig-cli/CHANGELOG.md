@@ -85,6 +85,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo config file may reference only the host variables the global config allows.**
+  `outrig run`, `outrig mcp`, and `outrig build` refuse a `${VAR}` in `build-args` or in an MCP
+  server's `env` that `.agents/outrig/config.toml`, or a `--config` file, declares, naming the
+  image, the key, the variable and the file, unless the variable is listed in the new
+  global-only `[repo] env-allow` of `~/.outrig/config.toml` or a `--global-config` file. Before,
+  any variable in your environment resolved, so a cloned repo -- or one whose config the agent
+  edited during the previous session -- could hand `GITHUB_TOKEN` or a cloud credential to a build
+  of its own Dockerfile or to a server command it chose. The list is empty by default, so a repo
+  that references a variable needs it added once:
+
+  ```toml
+  [repo]
+  env-allow = ["GITHUB_TOKEN"]
+  ```
+
+  A variable on the list is the repo's to route, so list only what you would hand to everyone who
+  can change that repo's config, the agent included. `--env` values, the images in your own global
+  config, and literal values are not held to the list. A global `env-allow` that is misspelled or
+  not a list is set aside with a warning, printed before the refusal it causes. Fixed in `outrig`;
+  see that crate's changelog. (#444)
 - **A workspace outrig picks can no longer contain the global config.** With no config declaring
   `[workspace] host-path`, the workspace is the repo root, or the current directory when there is
   no repo config, and it is mounted read-write. Only the home-directory rule (#411) judged it, so

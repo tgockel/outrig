@@ -4,9 +4,12 @@
 //! Two entry points, because two kinds of rule live here. [`validate`] runs on
 //! the *merged* config and checks that it hangs together. [`validate_as_repo`]
 //! runs on a single *unmerged* repo file and checks what that file was allowed
-//! to say -- a question the merged value cannot answer, since the merge has by
-//! then taken each global-only key from the global side and replaced any
-//! global provider a repo entry shadowed, with no record of which file won.
+//! to say on its own -- a question the merged value mostly cannot answer, since
+//! the merge has by then taken each global-only key from the global side and
+//! replaced any global provider a repo entry shadowed, with no record of which
+//! file won. An image-config is the exception: it records whether a repo file
+//! declared it, which is what lets [`validate`] hold that file's `${VAR}`
+//! references to the global config's `[repo] env-allow`.
 //!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
@@ -20,11 +23,11 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec,
-    MistralrsDeviceSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
-    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
-    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
-    normalize_capability_name,
+    Config, EnvValue, ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING,
+    McpServerSpec, MistralrsDeviceSpec, Model, ModelSourceRef, NetworkMode,
+    REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
+    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
+    TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -417,6 +420,40 @@ pub enum ConfigValidationError {
         var: String,
     },
 
+    // The names in the next two come from a repo file, so they print with
+    // `{:?}`: a control character in one would otherwise reach the operator's
+    // terminal. `var` cannot hold one -- it matched the reference grammar.
+    #[error(
+        "repo config may not reference ${{{var}}} in image {image:?} build-arg {key:?}{}: \
+         list {var:?} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    RepoBuildArgRef {
+        image: String,
+        key: String,
+        var: String,
+        /// The repo config file that declared the image, or `None` when
+        /// unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "repo config may not reference ${{{var}}} in image {image:?} mcp server {server:?} \
+         env key {key:?}{}: list {var:?} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    RepoMcpEnvRef {
+        image: String,
+        server: String,
+        key: String,
+        var: String,
+        /// The repo config file that declared the image, or `None` when
+        /// unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
          model-id or model-path; got neither"
@@ -715,6 +752,7 @@ pub(super) fn validate_with_options(
             });
         }
         validate_image_security(image_name, image)?;
+        validate_repo_env_refs(cfg, image_name, image)?;
 
         for (server_name, spec) in &image.mcp {
             if !is_valid_mcp_server_name(server_name) {
@@ -920,16 +958,17 @@ pub(super) fn validate_with_options(
 
 /// The rules that apply to a repo config file, checked on the unmerged value.
 ///
-/// Three today, drawing one line: what the operator's machine does stays with
+/// Four today, drawing one line: what the operator's machine does stays with
 /// the operator. `session-root` and `model-cache-root` pick where this machine
 /// writes -- for sessions also where `clean` and `discard` delete and what
 /// `clean` reads as a stray container -- so one machine has one of each.
 /// `[network]`'s policy keys describe the machine's egress, so a repo config
-/// may declare `mode` and nothing else. A provider's `api-key` names a host
-/// environment variable and its `base-url` says where the host process sends
-/// it, so a repo config may declare only providers that carry no key --
-/// `style = "mistralrs"` today; a repo model may still name a global provider.
-/// Checked in schema order. See
+/// may declare `mode` and nothing else. `[repo].env-allow` says which host
+/// variables a repo config may reference, a question a repo file must not
+/// answer for itself. A provider's `api-key` names a host environment variable
+/// and its `base-url` says where the host process sends it, so a repo config
+/// may declare only providers that carry no key -- `style = "mistralrs"` today;
+/// a repo model may still name a global provider. Checked in schema order. See
 /// [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
     if cfg.session_root.is_some() {
@@ -945,6 +984,11 @@ pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError
     if let Some(key) = cfg.network.declared_policy_key() {
         return Err(ConfigValidationError::RepoNetworkPolicy { key });
     }
+    if !cfg.repo.is_default() {
+        return Err(ConfigValidationError::RepoGlobalOnlyKey {
+            key: "[repo].env-allow",
+        });
+    }
     for (name, provider) in &cfg.providers {
         // Deliberately without a `_` arm, as in `validate`: a new provider
         // style has to say here whether a repo file may declare it.
@@ -957,6 +1001,66 @@ pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError
                 });
             }
             LlmProvider::Mistralrs { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Hold the `${VAR}` references of an image a repo config file declared to the
+/// global config's `[repo] env-allow`.
+///
+/// A reference in `build-args` or in an MCP server's `env` is read from the
+/// host environment and handed to code the repo controls -- a build of its own
+/// Dockerfile, a server command it chose -- so a repo file may name only the
+/// variables the operator listed. The two places are the only ones the schema
+/// holds an [`EnvValue`] in. An image's own `org.outrig.mcp` label can carry
+/// such references too, and this does not see them (#624).
+///
+/// This is a rule of the merged value, not of [`validate_as_repo`], because it
+/// needs the global config's list as well as the repo file. The CLI also
+/// reports what the load set aside between the two steps, and a global
+/// `env-allow` that was set aside is the reason a reference is then refused,
+/// so the warning has to come first.
+///
+/// An image no file declared -- hand-built, or read by `Config::load_from_str`
+/// -- and one the global config declared are the caller's own, and are not held
+/// to the list. Every image a repo file declares is checked, used or not:
+/// validation does not know which one a session will select.
+fn validate_repo_env_refs(
+    cfg: &Config,
+    image_name: &str,
+    image: &ImageConfig,
+) -> Result<(), ConfigValidationError> {
+    if !image.repo_declared {
+        return Ok(());
+    }
+    // Matched without a `_` arm, like the provider styles: a new way to name a
+    // host variable has to say here whether it needs listing.
+    let unlisted = |value: &EnvValue| match value {
+        EnvValue::EnvRef(var) if !cfg.repo.env_allow().contains(var) => Some(var.clone()),
+        EnvValue::EnvRef(_) | EnvValue::Literal(_) => None,
+    };
+    for (key, value) in &image.build_args {
+        if let Some(var) = unlisted(value) {
+            return Err(ConfigValidationError::RepoBuildArgRef {
+                image: image_name.to_string(),
+                key: key.clone(),
+                var,
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    for (server, spec) in &image.mcp {
+        for (key, value) in spec.env() {
+            if let Some(var) = unlisted(value) {
+                return Err(ConfigValidationError::RepoMcpEnvRef {
+                    image: image_name.to_string(),
+                    server: server.clone(),
+                    key: key.clone(),
+                    var,
+                    declared_in: image.declared_in(),
+                });
+            }
         }
     }
     Ok(())

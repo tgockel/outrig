@@ -315,6 +315,12 @@ pub struct Config {
     pub mcp_call_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
+    /// Global-only, like [`session_root`](Self::session_root): which host
+    /// variables a repo config file may reference. A repo config that declares
+    /// `[repo].env-allow` fails [`validate_as_repo`](Self::validate_as_repo),
+    /// and [`merge`] never reads it from the repo side.
+    #[serde(default, skip_serializing_if = "RepoPolicy::is_default")]
+    pub repo: RepoPolicy,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -592,6 +598,13 @@ impl Config {
     /// `repo_root: Some(_)` enables the on-disk existence checks for
     /// config-declared paths; `None` keeps the check pure-structural for unit
     /// tests.
+    ///
+    /// One rule needs both files, so it is checked here, on the merged value: a
+    /// `${VAR}` in the `build-args` or MCP `env` of an image a repo config file
+    /// declared must name a variable the global config's
+    /// [`[repo].env-allow`](RepoPolicy::env_allow) lists. Images the global
+    /// config declared, and images no file declared -- hand-built, or read by
+    /// [`load_from_str`](Self::load_from_str) -- are not held to it.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
         Ok(())
@@ -604,19 +617,26 @@ impl Config {
     /// construction has already taken its global-only keys from the global
     /// side and replaced any global provider a repo entry shadowed, and so
     /// cannot say which file declared what. These rules therefore run
-    /// per-file, before [`merge`](fn@merge). Today there are three. A repo
+    /// per-file, before [`merge`](fn@merge). Today there are four. A repo
     /// config may not set `session-root` or `model-cache-root`, which choose
     /// where this machine writes. It may choose `[network].mode`, but
     /// `default`, `allow`, and `deny` describe the machine's egress and stay
-    /// with the operator. And it may declare only providers that carry no
-    /// `api-key`: a key names a host environment variable, and a repo that
-    /// could pair one with its own `base-url` would decide where the
+    /// with the operator. It may not declare `[repo].env-allow`, even empty: it
+    /// says what a repo config may reference from the host environment, which a
+    /// repo file must not answer for itself. And it may declare only providers
+    /// that carry no `api-key`: a key names a host environment variable, and a
+    /// repo that could pair one with its own `base-url` would decide where the
     /// operator's secret is sent.
     ///
     /// `Config::load` applies this to the repo file it reads. An embedder
     /// assembling a repo-side `Config` by hand should call it too -- `merge`
     /// is infallible: it drops a repo policy or root rather than reporting it,
     /// and it takes a repo provider as written.
+    ///
+    /// What a repo file may *reference* is not checked here: that needs the
+    /// global config's `[repo]` list too, so [`validate`](Self::validate) checks
+    /// it on the merged value. A repo-side `Config` assembled by hand carries no
+    /// record of the file that declared its images, and is not held to the list.
     pub fn validate_as_repo(&self) -> Result<()> {
         validate::validate_as_repo(self)?;
         Ok(())
@@ -2062,6 +2082,65 @@ pub(crate) fn parse_network_host_pattern(
     }
 }
 
+/// The `[repo]` block, in the global config only: what a repo config file may
+/// take from this machine. The one key today is `env-allow`, the host variables
+/// a `${VAR}` reference in a repo config's `build-args` or MCP `env` may name;
+/// none by default. A variable on the list is the repo's to route: the repo
+/// picks which build-arg or server environment receives the value.
+///
+/// Only the operator's file may declare it. A repo file that declares
+/// `env-allow`, even empty, fails [`Config::validate_as_repo`], and
+/// [`merge`](fn@merge) reads it from the global side alone;
+/// [`Config::validate`] holds every image a repo file declares to it. The field
+/// is private, like [`NetworkConfig`]'s, so `None` is "not declared" rather than
+/// an empty list: read what is in effect with [`env_allow`](Self::env_allow).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct RepoPolicy {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_env_allow"
+    )]
+    env_allow: Option<Vec<String>>,
+}
+
+impl RepoPolicy {
+    /// The variables a repo config may reference: what was declared, and
+    /// nothing when the config declared none, which allows no reference.
+    pub fn env_allow(&self) -> &[String] {
+        self.env_allow.as_deref().unwrap_or_default()
+    }
+
+    /// Declare the variables a repo config may reference. An entry that is not
+    /// a variable name (`^[A-Z_][A-Z0-9_]*$`) allows nothing, since no reference
+    /// can match it.
+    pub fn set_env_allow(&mut self, vars: impl IntoIterator<Item = impl Into<String>>) {
+        self.env_allow = Some(vars.into_iter().map(Into::into).collect());
+    }
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Read `env-allow`, holding each entry to the grammar of a `${VAR}` reference.
+/// An entry no reference could match -- lower case, wrapped in `${...}`, a glob
+/// -- would otherwise allow nothing without saying so. The global config reads
+/// leniently, so there the error sets the whole key aside with a warning, which
+/// leaves the list empty: every reference is refused, never one more allowed.
+fn deserialize_env_allow<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    let names = Vec::<String>::deserialize(deserializer)?;
+    match names.iter().find(|name| !env_ref::is_env_var_name(name)) {
+        Some(name) => Err(serde::de::Error::custom(format!(
+            "env-allow entry {name:?} is not a variable name (must match ^[A-Z_][A-Z0-9_]*$)"
+        ))),
+        None => Ok(Some(names)),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -2172,6 +2251,17 @@ pub struct ImageConfig {
     #[serde(skip)]
     #[schemars(skip)]
     source: Option<ConfigSource>,
+    /// Whether a repo config file declared this entry; `false` for the global
+    /// config's, and for one no file declared. Set at load time beside
+    /// [`source`](Self::config_source) and never deserialized, but kept apart
+    /// from it: [`set_build_paths`](Self::set_build_paths) and
+    /// [`set_image_name`](Self::set_image_name) clear `source`, which only
+    /// resolves relative paths, and say nothing about who wrote the `${VAR}`
+    /// references in `build-args` and `mcp` that [`Config::validate`] holds to
+    /// `[repo] env-allow`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    repo_declared: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
@@ -2356,6 +2446,7 @@ impl ImageConfig {
             build_args: BTreeMap::new(),
             security: ContainerSecurity::default(),
             source: None,
+            repo_declared: false,
             mcp: BTreeMap::new(),
         }
     }
@@ -2382,7 +2473,7 @@ impl ImageConfig {
     /// a build source rather than as both. The pair is written together because
     /// one source backs both: a setter for one path alone would clear the
     /// source its untouched sibling still depends on. `build_args` is left as
-    /// it was.
+    /// it was, and so is whether a repo config file declared the entry.
     pub fn set_build_paths(&mut self, dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) {
         self.image_name = None;
         self.dockerfile = Some(dockerfile.into());
@@ -2398,7 +2489,8 @@ impl ImageConfig {
     /// `build_args` is left as it was, so a build-source config that declared
     /// any still fails validation with
     /// [`ConfigValidationError::ImageNameWithBuildArgs`] until they are
-    /// cleared.
+    /// cleared. Whether a repo config file declared the entry is left as it was
+    /// too.
     pub fn set_image_name(&mut self, image_name: impl Into<String>) {
         self.image_name = Some(image_name.into());
         self.dockerfile = None;
@@ -2415,7 +2507,10 @@ impl ImageConfig {
         self.source.as_ref()
     }
 
+    /// Record the file this entry was read from. Anything but the global config
+    /// is a repo config.
     pub(crate) fn set_config_source(&mut self, source: ConfigSource) {
+        self.repo_declared = !matches!(source, ConfigSource::Global { .. });
         self.source = Some(source);
     }
 

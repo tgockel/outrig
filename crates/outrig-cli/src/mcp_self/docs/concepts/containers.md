@@ -629,9 +629,19 @@ command = ["bash", "-lc", "exec shell-mcp-command"]
 env     = { HTTPS_PROXY = "${HTTPS_PROXY}", NO_PROXY = "${NO_PROXY}" }
 ```
 
+A repo config may reference a host variable only if the global config lists it, so for the
+config above `~/.outrig/config.toml` needs the two names under
+[`[repo]`](../reference/config.md#repo):
+
+```toml
+[repo]
+env-allow = ["HTTPS_PROXY", "NO_PROXY"]
+```
+
 `outrig run --env 'HTTPS_PROXY=${HTTPS_PROXY}'` does the same for every server in one session,
-single-quoted so your shell leaves the reference for outrig. See
-[the value syntax](../reference/config.md#mcp-env-value-syntax) for how each form reaches podman.
+single-quoted so your shell leaves the reference for outrig, and needs no entry: you typed it.
+See [the value syntax](../reference/config.md#mcp-env-value-syntax) for how each form reaches
+podman.
 
 A proxy named this way is the agent's to read, credentials included: every process the server
 starts inherits it. Under a `filter` [network policy](../reference/config.md#network), traffic

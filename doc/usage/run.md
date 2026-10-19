@@ -42,7 +42,9 @@ outrig run [--agent <name>]
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for the MCP servers this session
   starts. `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one server by name.
   Values take the same `${VAR}` host-env-reference syntax config files use, described in
-  [Reference -> Config](../reference/config.md#mcp-env-value-syntax). Within a scope the last
+  [Reference -> Config](../reference/config.md#mcp-env-value-syntax). You typed them, so
+  they are not held to the global config's [`[repo]` `env-allow`](../reference/config.md#repo)
+  list, which governs a repo config's references. Within a scope the last
   value given for a key wins; across scopes the per-key precedence is config-file env < global
   `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not declare
   is an error.

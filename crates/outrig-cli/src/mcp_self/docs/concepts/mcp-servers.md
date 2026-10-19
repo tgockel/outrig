@@ -43,7 +43,9 @@ Each entry is one of:
 - A **table** (full form): `{ command = [...], env = { KEY = "value", ... } }`. The `env` map is
   added to the `podman exec` invocation for this server. A `${VAR}` value is passed by name,
   off podman's command line, and outrig shows it only as the reference; see
-  [the value syntax](../reference/config.md#mcp-env-value-syntax).
+  [the value syntax](../reference/config.md#mcp-env-value-syntax). In a repo config a `${VAR}`
+  may name only a variable the global config lists in
+  [`[repo]` `env-allow`](../reference/config.md#repo).
 
 Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within an image-config.
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call

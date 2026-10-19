@@ -176,8 +176,19 @@ pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: 
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RepoBuildArgRef
+pub outrig::config::ConfigValidationError::RepoBuildArgRef::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::RepoBuildArgRef::image: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoBuildArgRef::key: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoBuildArgRef::var: alloc::string::String
 pub outrig::config::ConfigValidationError::RepoGlobalOnlyKey
 pub outrig::config::ConfigValidationError::RepoGlobalOnlyKey::key: &'static str
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RepoMcpEnvRef
+pub outrig::config::ConfigValidationError::RepoMcpEnvRef::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::RepoMcpEnvRef::image: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpEnvRef::key: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpEnvRef::server: alloc::string::String
+pub outrig::config::ConfigValidationError::RepoMcpEnvRef::var: alloc::string::String
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy
 pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RepoProviderApiKey
@@ -498,6 +509,7 @@ pub outrig::config::Config::model_cache_root: core::option::Option<std::path::Pa
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
 pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
+pub outrig::config::Config::repo: outrig::config::RepoPolicy
 pub outrig::config::Config::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::SidecarConfig>
@@ -633,6 +645,10 @@ impl outrig::config::OpenAiOptions
 pub fn outrig::config::OpenAiOptions::new() -> Self
 pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
+#[non_exhaustive] pub struct outrig::config::RepoPolicy
+impl outrig::config::RepoPolicy
+pub fn outrig::config::RepoPolicy::env_allow(&self) -> &[alloc::string::String]
+pub fn outrig::config::RepoPolicy::set_env_allow(&mut self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>)
 pub struct outrig::config::ResolvedEnvValue
 impl outrig::config::ResolvedEnvValue
 pub fn outrig::config::ResolvedEnvValue::resolve(outrig::config::EnvValue) -> core::result::Result<Self, outrig::config::EnvValueError>

@@ -649,6 +649,13 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     );
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
+    // The repo config names the token, and a repo file may reference only the
+    // variables the global config lists (#444). A global config of its own also
+    // keeps this off the developer's real one.
+    let global_dir = tempfile::tempdir().expect("tempdir global");
+    let global = global_dir.path().join("config.toml");
+    std::fs::write(&global, format!("[repo]\nenv-allow = [\"{TOKEN_VAR}\"]\n"))
+        .expect("write global config");
 
     // `-v` mirrors every podman command line to stderr and `container.log`.
     // The `--env` reference is passed as text: no shell expands it, so the
@@ -657,7 +664,13 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     let mut run = spawn_mcp(
         repo_dir.path(),
         sessions.path(),
-        &["-v", "--env", &exec_env],
+        &[
+            "--global-config",
+            global.to_str().expect("utf-8 path"),
+            "-v",
+            "--env",
+            &exec_env,
+        ],
     );
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");

@@ -41,7 +41,10 @@ lives in the workspace, which is mounted read-write, so an agent can edit it in 
 have the next session load the result. That is why what reaches the host's secrets stays
 global-only: a provider carrying an `api-key` -- a reference to a variable in the operator's
 environment, paired with the `base-url` it is sent to -- is refused in a repo config, as the
-`[network]` policy keys are. A repo config may still name global providers from its models. For
+`[network]` policy keys are. A repo config may still name global providers from its models. A
+repo config file may reference a host variable, in `build-args` or an MCP server's `env`, only
+if the global config lists it in [`[repo]` `env-allow`](../reference/config.md#repo): the value
+goes to code the repo controls, so a variable on that list is the repo's to route. For
 the same reason, a session whose workspace would contain the global config is refused, whether a
 repo config declared that workspace or outrig picked it; the global config's own `[workspace]` and
 `--volume` are the operator's choice.

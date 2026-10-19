@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo config file may reference only the host variables the global config allows.** `${VAR}` in
+  `[images.<n>].build-args` and in an MCP server's `env` resolved any variable in the operator's
+  environment, so a committed `.agents/outrig/config.toml` -- or one the agent edited through the
+  read-write workspace for the next session -- could hand `AWS_SECRET_ACCESS_KEY` or `GITHUB_TOKEN`
+  to a build of its own Dockerfile or to a server command of its choosing. A new global-only
+  `[repo] env-allow = [...]` lists the variables a repo config file may name, and is empty by
+  default. `Config::validate` -- so every `Config::load*` -- refuses a reference to any other
+  variable in an image that `.agents/outrig/config.toml` or a `--config` file declares, as the new
+  `ConfigValidationError::RepoBuildArgRef` or `RepoMcpEnvRef`, naming the image, the key, the
+  variable and the file. The rule is a validation rule rather than part of `validate_as_repo`
+  because it needs the global config's list as well as the repo file, and because a global
+  `env-allow` set aside with a warning is the reason a reference is then refused, which the warning
+  has to precede. `validate_as_repo` refuses a repo file that declares `[repo].env-allow`, even
+  empty. A variable on the list is the repo's to route: the repo picks which build-arg or server
+  environment receives it. The global config's own images, literal values, and `--env` overlays are
+  unchanged, and so is `merge`, which reads `[repo]` from the global side only. Each image records
+  whether a repo file declared it, as `ImageConfig::config_source` records which file, but
+  `set_build_paths` and `set_image_name` do not clear it. A `Config` read by `Config::load_from_str`
+  or built by hand declares no file, so it is not held to the list. New public items:
+  `Config::repo`, `RepoPolicy`. If a repo config of yours references a host variable, list it under
+  `[repo]` in `~/.outrig/config.toml` or a file passed as `--global-config`. An outrig release
+  before 0.2.2 does not know `[repo]` and refuses a global config that has it. (#444)
 - **Attaching network interception checks that nft committed all of the redirect script.** It took
   a zero exit and the table's handle in nft's echo as proof the ruleset was in, so a commit that
   made the table and not its chains or rules -- nft 1.0.9 did exactly that to a nested script --

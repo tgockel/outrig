@@ -8,10 +8,10 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    ApiKeyRef, BuildImageNameError, Config, ConfigSource, ConfigValidationError, ImageConfig,
-    LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction,
-    NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SidecarOnFailure, SidecarStart,
-    SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
+    ApiKeyRef, BuildImageNameError, Config, ConfigSource, ConfigValidationError, EnvValue,
+    ImageConfig, LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation,
+    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SidecarOnFailure,
+    SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -3500,9 +3500,10 @@ model-path = "weights.gguf"
     }
 
     /// The full fixture has the shape of a *global* file: it carries both
-    /// roots and keyed providers, so as a repo config it is refused. The
-    /// rules run in schema order, so the roots are named first; without them,
-    /// the first keyed provider in map order is.
+    /// roots, `[repo]`, and keyed providers, so as a repo config it is
+    /// refused. The rules run in schema order, so the roots are named first;
+    /// without them, `[repo]`; without that, the first keyed provider in map
+    /// order is.
     #[test]
     fn the_fixture_is_refused_as_a_repo_config() {
         let tmp = tempdir().unwrap();
@@ -3519,13 +3520,30 @@ model-path = "weights.gguf"
             "got: {err:?}",
         );
 
-        let rootless: Vec<&str> = FIXTURE_FULL
-            .lines()
-            .filter(|line| {
-                !line.starts_with("session-root") && !line.starts_with("model-cache-root")
-            })
-            .collect();
-        write_repo_cfg(tmp.path(), &rootless.join("\n"));
+        let without = |prefixes: &[&str]| -> String {
+            FIXTURE_FULL
+                .lines()
+                .filter(|line| !prefixes.iter().any(|prefix| line.starts_with(prefix)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        write_repo_cfg(tmp.path(), &without(&["session-root", "model-cache-root"]));
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "[repo].env-allow"
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        write_repo_cfg(
+            tmp.path(),
+            &without(&["session-root", "model-cache-root", "[repo]", "env-allow"]),
+        );
 
         let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
         assert!(
@@ -6181,5 +6199,482 @@ max-tokens = "plenty"
             matches!(err, OutrigError::ConfigDottedKey { .. }),
             "got: {err:?}"
         );
+    }
+}
+
+/// #444: a repo config file may reference only the host variables the global
+/// config's `[repo] env-allow` lists. Every refusal here comes from a file
+/// load, because only a load records, on each image, the kind of file that
+/// declared it.
+mod repo_env_allow {
+    use super::*;
+
+    use outrig::config::ConfigWarningKind;
+
+    const LIST_GITHUB: &str = "[repo]\nenv-allow = [\"GITHUB_TOKEN\"]\n";
+
+    /// A build-from-Dockerfile image `dev` whose `build-args` are `build_args`
+    /// (an inline table), beside the Dockerfile it names.
+    fn write_build_arg_repo(root: &Path, build_args: &str) {
+        write_repo_cfg(
+            root,
+            &format!(
+                "[images.dev]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n\
+                 build-args = {build_args}\n"
+            ),
+        );
+        fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+    }
+
+    /// The repo config under `root` -- and `file`, which the caller has given
+    /// the same text -- through each of the six loaders, as `(name, result)`.
+    fn every_loader(
+        root: &Path,
+        file: &Path,
+        global: Option<&Path>,
+    ) -> Vec<(&'static str, outrig::error::Result<Config>)> {
+        vec![
+            ("load", Config::load(root, global)),
+            (
+                "load_for_run",
+                Config::load_for_run(root, global, None, None),
+            ),
+            ("load_for_build", Config::load_for_build(root, global)),
+            ("load_file", Config::load_file(file, root, global)),
+            (
+                "load_file_for_run",
+                Config::load_file_for_run(file, root, global, None, None),
+            ),
+            (
+                "load_file_for_build",
+                Config::load_file_for_build(file, root, global),
+            ),
+        ]
+    }
+
+    /// The issue's first case. `build-args = { X = "${VAR}" }` in a repo file,
+    /// with nothing listed, is refused by every loader -- `--config` included
+    /// -- naming the image, the key, the variable, and the file that declared
+    /// it.
+    #[test]
+    fn a_repo_build_arg_reference_off_the_list_is_refused() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let repo_file = tmp.path().join(".agents/outrig/config.toml");
+        let file = tmp.path().join("ci.toml");
+        fs::copy(&repo_file, &file).unwrap();
+
+        for (loader, result) in every_loader(tmp.path(), &file, Some(&global)) {
+            let declared = if loader.starts_with("load_file") {
+                &file
+            } else {
+                &repo_file
+            };
+            let err = result.expect_err(loader);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "repo config may not reference ${{GITHUB_TOKEN}} in image \"dev\" \
+                     build-arg \"GH\" (declared in {declared:?}): list \"GITHUB_TOKEN\" in \
+                     [repo] env-allow in global config to allow it"
+                ),
+                "{loader}",
+            );
+            let validation = expect_load_validation_err(err);
+            assert!(
+                matches!(
+                    &validation,
+                    ConfigValidationError::RepoBuildArgRef { image, key, var, declared_in, .. }
+                        if image == "dev"
+                            && key == "GH"
+                            && var == "GITHUB_TOKEN"
+                            && declared_in.as_deref() == Some(declared.as_path())
+                ),
+                "{loader}: got {validation:?}",
+            );
+        }
+    }
+
+    /// The issue's second case, in each shape an `[images.<n>.mcp]` entry with
+    /// an environment takes: exec-stdio in the primary, exec-stdio in a named
+    /// sidecar, and entrypoint-stdio in an anonymous one. The error also names
+    /// the server.
+    #[test]
+    fn a_repo_mcp_env_reference_off_the_list_is_refused() {
+        for (server, entry, key, var) in [
+            (
+                "fetch",
+                r#"{ command = ["fetch"], env = { PLAIN = "x", TOKEN = "${FETCH_TOKEN}" } }"#,
+                "TOKEN",
+                "FETCH_TOKEN",
+            ),
+            (
+                "fs",
+                r#"{ command = ["fs"], sidecar = "tools", env = { K = "${SIDE_SECRET}" } }"#,
+                "K",
+                "SIDE_SECRET",
+            ),
+            (
+                "serve",
+                r#"{ image = "ghcr.io/example/mcp-fetch:2", env = { T = "${ENTRY_SECRET}" } }"#,
+                "T",
+                "ENTRY_SECRET",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            let global = write_global_cfg(tmp.path(), "");
+            write_repo_cfg(
+                tmp.path(),
+                &format!(
+                    "[sidecars.tools]\nimage = \"mcp-tools\"\n\n\
+                     [images.dev]\nimage-name = \"docker.io/library/debian\"\n\n\
+                     [images.dev.mcp]\nshort = [\"bin\"]\n{server} = {entry}\n"
+                ),
+            );
+
+            let err =
+                expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+            assert!(
+                matches!(
+                    &err,
+                    ConfigValidationError::RepoMcpEnvRef {
+                        image, server: s, key: k, var: v, declared_in: Some(_), ..
+                    } if image == "dev" && s == server && k == key && v == var
+                ),
+                "{server}: got {err:?}",
+            );
+            assert!(
+                err.to_string().contains(&format!(
+                    "in image \"dev\" mcp server \"{server}\" env key \"{key}\""
+                )),
+                "{server}: got {err}",
+            );
+        }
+    }
+
+    /// A listed variable loads as it did before the rule, the reference kept
+    /// for the call site that resolves it; a second variable beside it that is
+    /// not listed is still refused.
+    #[test]
+    fn a_listed_variable_loads_and_an_unlisted_one_beside_it_does_not() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), LIST_GITHUB);
+
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("a listed build-arg loads");
+        assert_eq!(
+            cfg.images["dev"].build_args["GH"],
+            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+        );
+        assert_eq!(cfg.repo.env_allow(), ["GITHUB_TOKEN"]);
+
+        write_repo_cfg(
+            tmp.path(),
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { T = \"${GITHUB_TOKEN}\" } }\n",
+        );
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("a listed MCP env loads");
+        assert_eq!(
+            cfg.images["dev"].mcp["srv"].env()["T"],
+            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+        );
+
+        write_build_arg_repo(
+            tmp.path(),
+            r#"{ GH = "${GITHUB_TOKEN}", AWS = "${AWS_SECRET_ACCESS_KEY}" }"#,
+        );
+        let err = expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef { key, var, .. }
+                    if key == "AWS" && var == "AWS_SECRET_ACCESS_KEY"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// A value is a reference only when it is `${VAR}` whole, so a literal
+    /// -- including one that merely looks like a reference -- names no host
+    /// variable and needs no entry.
+    #[test]
+    fn literals_and_non_references_need_no_entry() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[images.dev]
+dockerfile = "Dockerfile"
+context    = "."
+build-args = { NODE_VERSION = "20", LOWER = "${lower}", EMBEDDED = "pre-${X}-post", BARE = "$FOO" }
+
+[images.dev.mcp]
+fetch = { command = ["fetch"], env = { CARGO_HOME = "/workspace/.cargo", LOWER = "${lower}" } }
+"#,
+        );
+        fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        Config::load(tmp.path(), Some(&global)).expect("literals are not references");
+    }
+
+    /// The rule is about what a repo file may name. The operator's own global
+    /// config names what it likes -- but a repo image of the same name replaces
+    /// the whole entry, references included, so what it then holds is the
+    /// repo's.
+    #[test]
+    fn a_global_configs_own_references_need_no_entry_but_a_repo_replacement_does() {
+        let tmp = tempdir().unwrap();
+        let gdir = tmp.path().join("global");
+        fs::create_dir_all(&gdir).unwrap();
+        fs::write(gdir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let global = write_global_cfg(
+            &gdir,
+            r#"
+[images.shared]
+dockerfile = "Dockerfile"
+context    = "."
+build-args = { T = "${OPERATOR_SECRET}" }
+
+[images.shared-mcp]
+image-name = "docker.io/library/debian"
+
+[images.shared-mcp.mcp]
+srv = { command = ["srv"], env = { K = "${OPERATOR_SECRET}" } }
+"#,
+        );
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        write_repo_cfg(&repo, "");
+
+        let cfg = Config::load(&repo, Some(&global)).expect("the operator's own references load");
+        let secret = EnvValue::EnvRef("OPERATOR_SECRET".to_string());
+        assert_eq!(cfg.images["shared"].build_args["T"], secret);
+        assert_eq!(cfg.images["shared-mcp"].mcp["srv"].env()["K"], secret);
+
+        fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        write_repo_cfg(
+            &repo,
+            "[images.shared]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n\
+             build-args = { T = \"${OPERATOR_SECRET}\" }\n",
+        );
+        let err = expect_load_validation_err(Config::load(&repo, Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef { image, .. } if image == "shared"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// `source` says where an image's paths came from, and `set_build_paths`
+    /// and `set_image_name` clear it. Who wrote the references in `build-args`
+    /// and `mcp` is not that, so an embedder that loads, rewrites an image's
+    /// paths, and then validates does not turn the repo's references into a
+    /// hand-built entry's.
+    #[test]
+    fn rewriting_a_loaded_images_paths_does_not_exempt_it() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let mut cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+            .expect("the load alone refuses no reference");
+        let image = cfg.images.get_mut("dev").unwrap();
+        image.set_build_paths("Dockerfile", ".");
+        assert!(
+            image.config_source().is_none(),
+            "the setter forgot the file"
+        );
+        let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef {
+                    declared_in: None,
+                    ..
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        write_repo_cfg(
+            tmp.path(),
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { K = \"${SECRET}\" } }\n",
+        );
+        let mut cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+            .expect("the load alone refuses no reference");
+        let image = cfg.images.get_mut("dev").unwrap();
+        image.set_image_name("ubuntu");
+        assert!(
+            image.config_source().is_none(),
+            "the setter forgot the file"
+        );
+        let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoMcpEnvRef {
+                    declared_in: None,
+                    ..
+                }
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// The boundary, on record: an image no file declared -- read by
+    /// `Config::load_from_str`, or built by hand -- is the caller's own, so it
+    /// is not held to the list, and `validate_as_repo`, a rule of one file,
+    /// says nothing about references.
+    #[test]
+    fn an_image_no_file_declared_is_not_held_to_the_list() {
+        let cfg = parse(
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { K = \"${SECRET}\" } }\n",
+        );
+        assert!(cfg.images["dev"].config_source().is_none());
+        cfg.validate(None).expect("an unstamped image is exempt");
+        cfg.validate_as_repo()
+            .expect("a repo file's references are validate's rule");
+
+        let mut image = ImageConfig::from_dockerfile("Dockerfile", ".");
+        image
+            .build_args
+            .insert("T".to_string(), EnvValue::EnvRef("SECRET".to_string()));
+        let mut cfg = Config::default();
+        cfg.images.insert("dev".to_string(), image);
+        cfg.validate(None)
+            .expect("a hand-built image is its builder's own");
+    }
+
+    /// Only the operator's file says what a repo file may reference, so a repo
+    /// file declaring the list is refused whatever it holds -- an empty list
+    /// too, which still touches the policy -- before any reference is read.
+    #[test]
+    fn a_repo_file_may_not_declare_the_list() {
+        for body in [
+            "[repo]\nenv-allow = [\"GITHUB_TOKEN\"]\n",
+            "[repo]\nenv-allow = []\n",
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(tmp.path(), body);
+
+            let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+            assert!(
+                matches!(
+                    err,
+                    ConfigValidationError::RepoGlobalOnlyKey {
+                        key: "[repo].env-allow"
+                    }
+                ),
+                "{body}: got {err:?}",
+            );
+            assert_eq!(
+                err.to_string(),
+                "repo config may not set [repo].env-allow; it belongs in global config",
+            );
+        }
+
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "[repo]\n");
+        Config::load(tmp.path(), None).expect("a `[repo]` table that declares nothing is fine");
+    }
+
+    /// `merge` is infallible, so it must be unable to apply a list a repo side
+    /// carries -- a hand-built value that never met `validate_as_repo`.
+    #[test]
+    fn merge_never_reads_the_list_from_the_repo_side() {
+        let mut repo = Config::default();
+        repo.repo.set_env_allow(["GITHUB_TOKEN"]);
+        assert!(
+            repo.validate_as_repo().is_err(),
+            "the repo value really declares it",
+        );
+
+        let merged = merge(Config::default(), repo.clone());
+        assert!(merged.repo.env_allow().is_empty());
+
+        let merged = merge(parse("[repo]\nenv-allow = [\"HTTPS_PROXY\"]\n"), repo);
+        assert_eq!(merged.repo.env_allow(), ["HTTPS_PROXY"]);
+    }
+
+    /// The global file reads leniently, so an `env-allow` that does not
+    /// deserialize is set aside with a warning rather than failing every repo
+    /// on the machine. That leaves the list empty and every reference refused:
+    /// a mistake there narrows access and never widens it. The load returns the
+    /// warning and the refusal comes from the validation after it, the order
+    /// the CLI prints them in, so the warning explains the refusal.
+    #[test]
+    fn an_env_allow_that_does_not_deserialize_is_set_aside_and_refuses_everything() {
+        for (body, key) in [
+            ("[repo]\nenv-allow = \"GITHUB_TOKEN\"\n", "repo.env-allow"),
+            ("[repo]\nenv-allow = [\"github_token\"]\n", "repo.env-allow"),
+            (
+                "[repo]\nenv-allow = [\"${GITHUB_TOKEN}\"]\n",
+                "repo.env-allow",
+            ),
+            ("[repo]\nenv-allow = [\"GITHUB_*\"]\n", "repo.env-allow"),
+            (
+                "[repo]\nenv-allow = [\"GITHUB_TOKEN\", 5]\n",
+                "repo.env-allow",
+            ),
+            ("[repo]\nenv-alow = [\"GITHUB_TOKEN\"]\n", "repo.env-alow"),
+        ] {
+            let tmp = tempdir().unwrap();
+            let global = write_global_cfg(tmp.path(), body);
+            write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+
+            let cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+                .unwrap_or_else(|e| panic!("{body}: the load must go on: {e}"));
+            let keys: Vec<&str> = cfg.warnings().iter().map(|w| w.key()).collect();
+            assert_eq!(keys, [key], "{body}");
+            assert!(cfg.repo.env_allow().is_empty(), "{body}");
+
+            let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+            assert!(
+                matches!(err, ConfigValidationError::RepoBuildArgRef { .. }),
+                "{body}: got {err:?}",
+            );
+        }
+
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "[repo]\nenv-allow = [\"github_token\"]\n");
+        let cfg = Config::load_global(&global).unwrap();
+        assert!(
+            matches!(
+                cfg.warnings()[0].kind(),
+                ConfigWarningKind::InvalidValue { reason, .. }
+                    if reason == "env-allow entry \"github_token\" is not a variable name \
+                                  (must match ^[A-Z_][A-Z0-9_]*$)"
+            ),
+            "got: {:?}",
+            cfg.warnings()[0],
+        );
+        assert!(
+            toml::from_str::<Config>("[repo]\nenv-allow = [\"github_token\"]\n").is_err(),
+            "the type itself stays strict",
+        );
+    }
+
+    /// The list is serialized state: a config written out and read back holds
+    /// the same one, and an absent list writes no `[repo]` table at all.
+    #[test]
+    fn the_list_round_trips_and_an_absent_one_is_not_written() {
+        let cfg = parse("[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"HTTPS_PROXY\"]\n");
+        assert_eq!(cfg.repo.env_allow(), ["GITHUB_TOKEN", "HTTPS_PROXY"]);
+
+        let text = toml::to_string(&cfg).expect("config serializes");
+        assert!(
+            text.contains("[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"HTTPS_PROXY\"]"),
+            "got: {text}",
+        );
+        assert_eq!(parse(&text).repo, cfg.repo);
+
+        let text = toml::to_string(&Config::default()).expect("config serializes");
+        assert!(!text.contains("repo"), "got: {text}");
     }
 }
