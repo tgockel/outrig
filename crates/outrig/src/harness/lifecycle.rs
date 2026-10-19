@@ -6,7 +6,8 @@
 //! report exists, and *reported* once it does. Once closing, no state follows
 //! but reported, which the shutdown publishes as the stream's last event: a
 //! round still running at the close runs on, and its turns change nothing an
-//! owner reads from here.
+//! owner reads from here. A session with no primary agent runs no round, so it
+//! is idle from its start until it closes.
 
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 

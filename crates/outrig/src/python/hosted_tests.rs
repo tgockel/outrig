@@ -1699,6 +1699,7 @@ impl Bare {
         let mut stream = StreamBuilder::default();
         let events = stream.subscribe(1024);
         let relay = hosted::Relay::new(to_interpreter, stream.build(), vec!["fx".to_string()]);
+        relay.opened(PRIMARY);
         Self {
             relay,
             told,

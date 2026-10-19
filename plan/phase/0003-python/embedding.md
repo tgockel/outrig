@@ -40,14 +40,16 @@ beside the old rather than replacing it. `0003-19` chooses the Rust shape that k
 ## What the embedder supplies
 
 Starting a session is one call from a loaded `Config` (`0003-19`): it launches the container,
-starts the interpreter, resolves the model and returns the running session, and there is no
-sequence of steps an embedder orders itself. Everything the session needs from outside is given to
-that call, through a builder, before it starts. `run-new` makes the same call, so the CLI,
-CocoClaw and any other embedder start a system the same way.
+starts the interpreter, resolves the model -- for a session with a primary agent -- and returns the
+running session, and there is no sequence of steps an embedder orders itself. Everything the
+session needs from outside is given to that call, through a builder, before it starts. `run-new`
+makes the same call, so the CLI, CocoClaw and any other embedder start a system the same way.
 
 - **Configuration and the model.** A `Config`, which is what the CLI loads from TOML, and the agent
   and model to run. A model that cannot be resolved, or a secret that cannot be, fails the start
-  before any container starts, as `PythonAgent::check` lets `run-new` fail today.
+  before any container starts, as `PythonAgent::check` lets `run-new` fail today. A session with
+  no primary agent resolves no model and asks for no secret as it starts; `check()` still resolves
+  a model the builder names (`0003-28`).
 - **A secret resolver.** A hook the session calls to resolve each `${VAR}` its configuration names,
   for every model the session calls: the agent's and a child's. Today `ApiKeyRef::resolve` and
   `ResolvedEnvValue::resolve` read `std::env::var` directly. The CLI passes a resolver that reads
@@ -114,10 +116,12 @@ spawned meanwhile would inherit the key. Edition 2024, which this workspace uses
 
 **A session may have no primary agent** (`0003-28`). A host program's session has none: the
 program constructs the agents it wants (`agent-classes.md`, "From the host program") and owns its
-control flow, so there are no rounds to drive, no user channel and no interrupter; `round()` and
-its companions answer with a documented error, and the session's state is `idle` from `starting`
+control flow, so there are no rounds to drive, no user channel and no interrupter. The builder asks
+for one with `no_primary()`; `round()` then answers `SessionError::NoPrimary`, `user_channel()`,
+`interrupter()` and `model()` answer `None`, and the session's state is `idle` from `starting`
 until `closing`. Everything else -- bindings, admission, events, the ledger, children, the report
--- is the session's and works the same. No hidden primary is made to satisfy the API.
+-- is the session's and works the same. No hidden primary is made to satisfy the API: the
+interpreter starts with no kernel, and opens one only for an agent that exists.
 
 **The session's state is an event, not text to parse.** An embedder that shows "model working",
 "Python running", "waiting for input" and "stopped" reads them from events
@@ -125,8 +129,10 @@ until `closing`. Everything else -- bindings, admission, events, the ledger, chi
 
 - *starting* -- the container, the bindings and the interpreter are coming up;
 - *idle* -- no round is running;
-- *round running* -- a round is in progress, and the model is being called;
-- *executing* -- within a round, a submission is running in the interpreter;
+- *round running* -- a round is in progress, and the model is being called; only with a primary
+  agent;
+- *executing* -- within a round, a submission is running in the interpreter; only with a primary
+  agent;
 - *closing* -- from `close_admission()` to the report: `lifecycle.md`'s closing, draining and
   terminating steps;
 - *reported* -- the shutdown report exists.

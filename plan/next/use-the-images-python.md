@@ -22,8 +22,9 @@ and the agent would import what the project imports.
 
 - A config choice, per image or per agent, naming the interpreter to run: OutRig's (the default)
   or the image's, by path or as `python3` on the image's `PATH`. The host launches
-  `<that python> -I -c PROGRAM <agent-id>` exactly as it launches the payload's today
-  (`Interpreter::start` in `crates/outrig/src/python/host.rs`).
+  `<that python> -I -c PROGRAM <outrig-dir> [<rpyc-dir>]` exactly as it launches the payload's
+  today (`Interpreter::start` in `crates/outrig/src/python/host.rs`), and opens the primary's
+  kernel the same way too.
 - A startup check that the image's Python can run the program, with an error that says what is
   missing. The program needs at least:
   - Python 3.13, or whatever version the program is written for. It uses `asyncio` internals,

@@ -174,7 +174,7 @@ async fn an_interpreter_that_exits_mid_execution_is_an_exit_not_an_error() {
 async fn an_interpreter_that_cannot_start_says_why() {
     let message = startup_error(
         within(Interpreter::from_child(
-            spawn(None).await,
+            spawn(&[]).await,
             crate::events::Events::off(),
         ))
         .await,
@@ -416,17 +416,87 @@ async fn an_interpreter_that_never_greets_is_a_startup_error() {
     );
 }
 
+/// The interpreter greets before it has any kernel, so its `ready` names no
+/// agent, and a kernel's `ready` -- the primary's included -- is not a greeting.
 #[tokio::test]
-async fn a_greeting_that_is_not_the_primarys_ready_is_a_startup_error() {
+async fn a_greeting_that_is_not_the_interpreters_ready_is_a_startup_error() {
     for greeting in [
-        json!({"t": "ready", "agent": "someone-else", "version": "3.13"}),
-        json!({"t": "ready", "agent": PRIMARY}),
+        json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}),
+        json!({"t": "ready"}),
+        json!({"t": "ready", "error": "no kernel"}),
         json!({"t": "result", "agent": PRIMARY, "id": 1, "status": "ok"}),
     ] {
         let (mut fake, host) = Fake::pair();
         fake.send(greeting.clone()).await;
         let message = startup_error(within(connect(host)).await);
         assert!(message.contains("greeted with"), "{greeting}: {message}");
+    }
+}
+
+// ---------------------------------------------------------------------------- opening a kernel
+
+/// An open is done when its kernel says it is ready: the primary agent's is
+/// asked for on the interpreter's main thread, and any other on a thread of
+/// its own.
+#[tokio::test]
+async fn an_open_is_done_when_its_kernel_is_ready() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    for (agent, main) in [(PRIMARY, true), ("child", false)] {
+        let (opened, ()) = tokio::join!(within(interpreter.open(agent)), async {
+            let open = fake.expect("open").await;
+            assert_eq!(open, json!({"t": "open", "agent": agent, "main": main}));
+            fake.send(json!({"t": "ready", "agent": agent, "version": "3.13"}))
+                .await;
+        });
+        opened.unwrap_or_else(|e| panic!("{agent}: {e}"));
+    }
+}
+
+/// A kernel the interpreter could not build fails its open at once, with why.
+#[tokio::test]
+async fn an_open_the_interpreter_refuses_fails_with_why() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let (opened, ()) = tokio::join!(within(interpreter.open("child")), async {
+        fake.expect("open").await;
+        fake.send(json!({"t": "ready", "agent": "child", "error": "no thread to run it on"}))
+            .await;
+    });
+    match opened {
+        Err(InterpreterError::Open { agent, reason }) => {
+            assert_eq!(
+                (agent.as_str(), reason.as_str()),
+                ("child", "no thread to run it on")
+            );
+        }
+        other => panic!("expected the open to fail, got {other:?}"),
+    }
+}
+
+/// An open never answered fails once its bound has passed.
+#[tokio::test(start_paused = true)]
+async fn an_open_that_is_never_answered_fails_after_its_bound() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let (opened, _) = tokio::join!(interpreter.open("child"), fake.expect("open"));
+    match opened {
+        Err(InterpreterError::Open { reason, .. }) => assert!(
+            reason.contains("did not report ready within 30s"),
+            "{reason}"
+        ),
+        other => panic!("expected the open to fail, got {other:?}"),
+    }
+}
+
+/// An open whose interpreter exits before answering fails with how it ended.
+#[tokio::test]
+async fn an_open_the_interpreter_exits_before_answering_fails_with_how() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let (opened, ()) = tokio::join!(within(interpreter.open("child")), async move {
+        fake.expect("open").await;
+        drop(fake);
+    });
+    match opened {
+        Err(InterpreterError::Gone(cause)) => assert!(cause.contains(HUNG_UP), "{cause}"),
+        other => panic!("expected the interpreter gone, got {other:?}"),
     }
 }
 
@@ -844,6 +914,9 @@ mod e2e {
         let interpreter = within(Interpreter::start(&container, Events::off(), None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+        within(interpreter.open(PRIMARY))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, "1 + 1").await, ok("2\n"));
         // The memory ceiling, read from what the container sees -- its cgroup
         // and its memory -- and inherited by a program the interpreter starts.
@@ -869,6 +942,9 @@ mod e2e {
         let interpreter = within(Interpreter::start(&container, Events::off(), None))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+        within(interpreter.open(PRIMARY))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
         let installed = "pip('install', '--no-index', wheel('/tmp', 'outrig_probe'))\n\
                          import outrig_probe\n\
@@ -890,6 +966,9 @@ mod e2e {
     async fn the_agents_pip_and_the_images_python_do_not_share_a_site() {
         let container = session(PYTHON_ALPINE, true).await;
         let interpreter = within(Interpreter::start(&container, Events::off(), None))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        within(interpreter.open(PRIMARY))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
@@ -922,6 +1001,9 @@ mod e2e {
     async fn the_compiled_parts_note_is_the_payloads_pip_and_not_the_images() {
         let container = session(PYTHON_ALPINE, true).await;
         let interpreter = within(Interpreter::start(&container, Events::off(), None))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        within(interpreter.open(PRIMARY))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
@@ -1064,8 +1146,7 @@ async fn an_exit_the_session_asked_for_is_expected() {
 async fn an_exit_seen_before_the_owner_closes_is_still_the_close() {
     let (dir, events) = recording().await;
     let (mut fake, (replies, requests)) = Fake::pair();
-    fake.send(json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}))
-        .await;
+    fake.send(json!({"t": "ready", "version": "3.13"})).await;
     let (diagnose, diagnosed) = tokio::sync::oneshot::channel::<()>();
     let cause = async move {
         let _ = diagnosed.await;

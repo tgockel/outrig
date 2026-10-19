@@ -181,25 +181,15 @@ pub(crate) fn host_home() -> PathBuf {
 }
 
 /// The payload's interpreter, started as `Interpreter::start` starts it but on
-/// the host, with `agent` as its argument when there is one.
-pub(super) async fn spawn(agent: Option<&str>) -> Child {
-    spawn_with(agent, None).await
-}
-
-/// [`spawn`], with `rpyc` -- the vendored RPyC's directory -- after the agent
-/// and the package, as a session with bindings starts it.
-async fn spawn_with(agent: Option<&str>, rpyc: Option<&Path>) -> Child {
+/// the host, with `arguments` after the program: where OutRig's package is,
+/// and the vendored RPyC's directory for a session with bindings.
+pub(super) async fn spawn(arguments: &[&Path]) -> Child {
     let python = payload::host_python()
         .await
         .expect("the payload this build embedded");
-    let package = payload::package_dir()
-        .await
-        .expect("the package this build carries");
     tokio::process::Command::new(python)
         .args(ARGS)
-        .args(agent)
-        .args(agent.map(|_| package))
-        .args(rpyc)
+        .args(arguments)
         .env("HOME", host_home())
         .env_remove("PYTHONUSERBASE")
         .stdin(Stdio::piped())
@@ -210,25 +200,31 @@ async fn spawn_with(agent: Option<&str>, rpyc: Option<&Path>) -> Child {
         .expect("the interpreter starts")
 }
 
-/// A started interpreter addressing the primary agent.
+/// A started interpreter addressing the primary agent, whose kernel is open.
 pub(crate) async fn start_on_host() -> Interpreter {
     start_on_host_with(Events::off()).await
 }
 
 /// [`start_on_host`], recording to `events`.
 pub(crate) async fn start_on_host_with(events: Events) -> Interpreter {
-    start_on_host_rpyc(events, None).await
+    let interpreter = start_on_host_rpyc(events, None).await;
+    within(interpreter.open(PRIMARY))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    interpreter
 }
 
-/// [`start_on_host_with`], importing RPyC from `rpyc` when given: an interpreter
-/// that can reach a session's bindings.
+/// An interpreter started as a session starts one, holding no kernel yet,
+/// importing RPyC from `rpyc` when given: one that can reach a session's
+/// bindings.
 pub(crate) async fn start_on_host_rpyc(events: Events, rpyc: Option<&Path>) -> Interpreter {
-    within(Interpreter::from_child(
-        spawn_with(Some(PRIMARY), rpyc).await,
-        events,
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("{e}"))
+    let package = payload::package_dir()
+        .await
+        .expect("the package this build carries");
+    let arguments: Vec<&Path> = [package.as_path()].into_iter().chain(rpyc).collect();
+    within(Interpreter::from_child(spawn(&arguments).await, events))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// How a test starts the interpreter on the host. By default: in the test's
@@ -263,7 +259,7 @@ pub(crate) fn python_command(home: Option<&Path>) -> Command {
 /// The interpreter as `Interpreter::start` starts it, on the host, per `start`.
 pub(crate) fn interpreter_command(start: &Start) -> Command {
     let mut command = python_command(start.home);
-    command.args(ARGS).arg(PRIMARY).arg(package());
+    command.args(ARGS).arg(package());
     if let Some(dir) = start.dir {
         command.current_dir(dir);
     }
@@ -309,7 +305,7 @@ pub(crate) fn python() -> &'static Path {
 }
 
 /// OutRig's own package on the host, written once for the whole binary: what
-/// the interpreter takes after the agent id, as a session's takes
+/// the interpreter takes as its first argument, as a session's takes
 /// `PACKAGE_MOUNT`.
 pub(crate) fn package() -> &'static Path {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
@@ -375,8 +371,7 @@ impl Fake {
     /// observe, which recording sends first, is read here.
     pub(crate) async fn connected_with(events: Events) -> (Interpreter, Self) {
         let (mut fake, host) = Self::pair();
-        fake.send(json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}))
-            .await;
+        fake.send(json!({"t": "ready", "version": "3.13"})).await;
         let observing = events.is_on();
         let interpreter = within(connect_with(host, events))
             .await

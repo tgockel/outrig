@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that outlasted the retry budget, still says to send another.
 
   The user reaches the agent through its `user` channel, not through the prompt.
-  `Session::user_channel` returns a `UserChannel`, whose `send` queues text for the agent and
+  `Session::user_channel` returns its `UserChannel`, whose `send` queues text for the agent and
   whose `receive` yields what the agent's code sends back -- including from a task still running
   after its round ended. `round` takes no prompt: it tells the model how many messages wait,
   never what they say, and returns `RoundOutcome::NothingNew` without calling the model when
@@ -334,6 +334,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider, effective identifier and declared window, each alias's candidates in order, each
   provider's style and base URL, `default-model`, the resolved workspace and the events mode --
   holding no key and no `${VAR}`. In a kernel, `outrig.config` is absent.
+- **A session with no primary agent: `SessionBuilder::no_primary`.** It resolves no model and asks
+  its `Secrets` resolver for nothing as it starts, and has no rounds: `Session::round` returns
+  `SessionError::NoPrimary`, and `Session::user_channel`, `Session::interrupter` and
+  `Session::model` return `None`, which is why each now returns an `Option`. Its container,
+  interpreter and bindings, its admission, its events and its `ShutdownReport` are what a session
+  with a primary has. It is `idle` from `starting` until `closing`, publishes no `agent.started`
+  or `agent.stopped`, and its report lists no executions. `check` still resolves a model the
+  builder names, and an agent it names must still be configured, since it chooses the container's
+  image. The interpreter now starts with no kernel and builds one for each agent the
+  session opens, the primary's on its main thread, so a session with none has no hidden one.
 
 ### Changed
 

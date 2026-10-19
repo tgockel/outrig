@@ -87,7 +87,7 @@ let spec = LaunchSpec::from_image("my-image:latest", BTreeMap::new(), "/tmp/outr
 
 ```rust,no_run
 # async fn example(config: outrig::config::Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-use outrig::harness::{DEFAULT_DRAIN, RoundOutcome, SessionBuilder, Verdict};
+use outrig::harness::{DEFAULT_DRAIN, RoundOutcome, SessionBuilder, SessionError, Verdict};
 
 // Everything the session needs from outside, given before it starts: here, each `${VAR}` its
 // model's key names is read from this program's own store rather than the environment.
@@ -96,8 +96,10 @@ let mut builder = SessionBuilder::new(config, Some("coding"), None)
 let mut events = builder.subscribe();
 let mut session = builder.start().await?;
 
-// The user reaches the agent through its channel; a round runs on what waits there.
-session.user_channel().send("summarize the README").await?;
+// The user reaches the agent through its channel; a round runs on what waits there. A session
+// started with `no_primary` has neither.
+let user = session.user_channel().ok_or(SessionError::NoPrimary)?;
+user.send("summarize the README").await?;
 if let RoundOutcome::Ended(end) = session.round().await? {
     println!("{}", end.reply);
 }

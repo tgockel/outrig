@@ -1381,6 +1381,7 @@ pub outrig::harness::RoundOutcome::Ended(outrig::harness::RoundEnd)
 pub outrig::harness::RoundOutcome::NothingNew
 #[non_exhaustive] pub enum outrig::harness::SessionError
 pub outrig::harness::SessionError::Closed(outrig::harness::Closed)
+pub outrig::harness::SessionError::NoPrimary
 pub outrig::harness::SessionError::Resolve(outrig::harness::Failure)
 pub outrig::harness::SessionError::Round(outrig::harness::Failure)
 pub outrig::harness::SessionError::Start(outrig::harness::Failure)
@@ -1483,14 +1484,14 @@ pub fn outrig::harness::Session::close_admission(&self)
 pub fn outrig::harness::Session::closer(&self) -> outrig::harness::Closer
 pub fn outrig::harness::Session::container_name(&self) -> &str
 pub fn outrig::harness::Session::id(&self) -> &str
-pub fn outrig::harness::Session::interrupter(&self) -> impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static
-pub fn outrig::harness::Session::model(&self) -> &str
+pub fn outrig::harness::Session::interrupter(&self) -> core::option::Option<impl core::ops::function::Fn() -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync + 'static>
+pub fn outrig::harness::Session::model(&self) -> core::option::Option<&str>
 pub fn outrig::harness::Session::python_version(&self) -> &str
 pub async fn outrig::harness::Session::round(&mut self) -> core::result::Result<outrig::harness::RoundOutcome, outrig::harness::SessionError>
 pub async fn outrig::harness::Session::shutdown(self, core::time::Duration) -> outrig::harness::ShutdownReport
 pub async fn outrig::harness::Session::start(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
 pub fn outrig::harness::Session::stop_held(&self) -> core::option::Option<alloc::string::String>
-pub fn outrig::harness::Session::user_channel(&self) -> outrig::harness::UserChannel
+pub fn outrig::harness::Session::user_channel(&self) -> core::option::Option<outrig::harness::UserChannel>
 pub struct outrig::harness::SessionBuilder
 impl outrig::harness::SessionBuilder
 pub fn outrig::harness::SessionBuilder::approver(self, impl outrig::harness::Approver + 'static) -> Self
@@ -1499,6 +1500,7 @@ pub fn outrig::harness::SessionBuilder::bindings_env<K, V>(self, impl core::iter
 pub fn outrig::harness::SessionBuilder::check(&self) -> core::result::Result<(), outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::container(self, outrig::LaunchSpec) -> Self
 pub fn outrig::harness::SessionBuilder::new(outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> Self
+pub fn outrig::harness::SessionBuilder::no_primary(self) -> Self
 pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function::FnMut(outrig::harness::Progress) + core::marker::Send + 'static) -> Self
 pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
 pub fn outrig::harness::SessionBuilder::repo_root(self, impl core::convert::Into<std::path::PathBuf>) -> Self

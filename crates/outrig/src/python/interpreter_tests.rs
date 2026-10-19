@@ -55,6 +55,12 @@ impl Interpreter {
         Self::spawn(&Start::default())
     }
 
+    /// The interpreter with no kernel open, as a session with no primary
+    /// agent starts it.
+    fn start_without_kernel() -> Self {
+        Self::spawn_opening(&Start::default(), false)
+    }
+
     /// The interpreter under a memory ceiling of `bytes`: a soft `RLIMIT_DATA`
     /// already in place when it starts, which it keeps rather than raising to
     /// its own. Far quicker to reach than half the machine.
@@ -66,6 +72,12 @@ impl Interpreter {
     }
 
     fn spawn(start: &Start) -> Self {
+        Self::spawn_opening(start, true)
+    }
+
+    /// The interpreter per `start`, greeted, with the primary agent's kernel
+    /// opened onto the main thread when `primary` asks for it.
+    fn spawn_opening(start: &Start, primary: bool) -> Self {
         let mut child = interpreter_command(start)
             .spawn()
             .expect("the interpreter starts");
@@ -97,9 +109,17 @@ impl Interpreter {
             stderr,
             ready: Value::Null,
         };
-        interpreter.ready = interpreter.recv();
+        // The greeting names no agent, so it is read as `recv` reads nothing else.
+        interpreter.ready = interpreter.recv_unnamed();
         assert_eq!(interpreter.ready["t"], "ready", "{}", interpreter.ready);
-        assert_eq!(interpreter.ready["agent"], PRIMARY, "{}", interpreter.ready);
+        assert!(
+            interpreter.ready.get("agent").is_none(),
+            "the greeting names an agent: {}",
+            interpreter.ready
+        );
+        if primary {
+            interpreter.open_on_main(PRIMARY);
+        }
         interpreter
     }
 
@@ -115,7 +135,17 @@ impl Interpreter {
 
     /// The next message, whatever it is. Every message names an agent.
     fn recv(&mut self) -> Value {
-        let message = match self.replies.recv_timeout(TIMEOUT) {
+        let message = self.recv_unnamed();
+        assert!(
+            message["agent"].is_string(),
+            "a message without an agent id: {message}"
+        );
+        message
+    }
+
+    /// The next message, which need not name an agent: the greeting.
+    fn recv_unnamed(&mut self) -> Value {
+        match self.replies.recv_timeout(TIMEOUT) {
             Ok(Ok(message)) => message,
             Ok(Err(bad)) => panic!("{bad}"),
             Err(RecvTimeoutError::Timeout) => {
@@ -124,12 +154,7 @@ impl Interpreter {
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("the interpreter exited; stderr: {}", self.stderr())
             }
-        };
-        assert!(
-            message["agent"].is_string(),
-            "a message without an agent id: {message}"
-        );
-        message
+        }
     }
 
     /// Submit `source` and return its result, which must be the very next
@@ -191,11 +216,24 @@ impl Interpreter {
             .collect()
     }
 
+    /// Open a kernel for `agent` on a thread of its own, as every agent but
+    /// the primary is opened.
     fn open(&mut self, agent: &str) {
-        self.send(json!({"t": "open", "agent": agent}));
+        self.opened(json!({"t": "open", "agent": agent}));
+    }
+
+    /// Open a kernel for `agent` onto the main thread, as the host opens the
+    /// primary agent's.
+    fn open_on_main(&mut self, agent: &str) {
+        self.opened(json!({"t": "open", "agent": agent, "main": true}));
+    }
+
+    /// Send `open`, whose answer must be its kernel's `ready`.
+    fn opened(&mut self, open: Value) {
+        self.send(open.clone());
         let ready = self.recv();
         assert!(
-            ready["t"] == "ready" && ready["agent"] == agent,
+            ready["t"] == "ready" && ready["agent"] == open["agent"] && ready["error"].is_null(),
             "got: {ready}"
         );
     }
@@ -293,14 +331,52 @@ fn bind_children(k: &mut Interpreter, id: u64, flag: &Flag) {
 // ---------------------------------------------------------------------------- the protocol
 
 #[test]
-fn ready_names_the_primary_and_the_payload_version() {
-    let k = Interpreter::start();
+fn the_greeting_names_the_payload_version_and_no_agent() {
+    let k = Interpreter::start_without_kernel();
+    assert!(k.ready.get("agent").is_none(), "{}", k.ready);
     let version = text(&k.ready["version"]);
     assert!(
         payload::PAYLOAD.starts_with(&format!("cpython-{version}+")),
         "{version} is not {}",
         payload::PAYLOAD
     );
+}
+
+/// The interpreter builds no kernel of its own: until the host opens one,
+/// there is no agent to run anything in, the primary included. A kernel opened
+/// onto the main thread runs there, and any other on a thread of its own.
+#[test]
+fn a_kernel_exists_only_once_the_host_opens_it() {
+    let mut k = Interpreter::start_without_kernel();
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src": "1"}));
+    k.await_stderr("no agent 'primary'");
+    let thread = "import threading\n\
+                  t = threading.current_thread()\n\
+                  print(t.name, t is threading.main_thread())";
+    k.open("child");
+    assert_eq!(k.output_in("child", 2, thread), "kernel-child False\n");
+    k.open_on_main(PRIMARY);
+    assert_eq!(k.output(3, thread), "MainThread True\n");
+}
+
+/// A SIGINT that arrives while no kernel is on the main thread -- one a
+/// session with no primary agent never opens -- finds no agent code there to
+/// interrupt, and the interpreter goes on serving the kernels opened after it.
+#[test]
+fn a_sigint_with_no_kernel_on_the_main_thread_changes_nothing() {
+    let mut k = Interpreter::start_without_kernel();
+    k.open("child");
+    let pid = Pid::from_raw(k.child.id() as i32);
+    nix::sys::signal::kill(pid, Signal::SIGINT).expect("the signal is sent");
+    // Linux hands a process's signal to its main thread first, which runs the
+    // handler at once: one that raised would have ended `main`, and with it
+    // the process, before this wakes.
+    let main_alive = "import threading, time\n\
+                      time.sleep(0.2)\n\
+                      print(threading.main_thread().is_alive())";
+    assert_eq!(k.output_in("child", 1, main_alive), "True\n");
+    k.open("later");
+    assert_eq!(k.output_in("later", 2, "print('served')"), "served\n");
 }
 
 #[test]
@@ -460,9 +536,6 @@ fn messages_the_interpreter_cannot_route_are_ignored() {
         json!({"t": "exec", "agent": PRIMARY, "id": "2", "src": "2"}),
         json!({"t": "exec", "agent": PRIMARY, "id": 3}),
         json!({"t": "exec", "id": 4, "src": "4"}),
-        json!({"t": "open", "agent": PRIMARY}),
-        json!({"t": "open", "agent": "a.b"}),
-        json!({"t": "open", "agent": ""}),
     ] {
         k.send(message);
     }
@@ -475,11 +548,53 @@ fn messages_the_interpreter_cannot_route_are_ignored() {
         "no agent 'nobody'",
         "has no integer id",
         "has no source",
-        "agent 'primary' is already open",
-        "'a.b' cannot name an agent",
     ] {
         k.await_stderr(needle);
     }
+}
+
+/// An `open` the interpreter cannot carry out is answered with why, so a host
+/// waiting for the kernel need not wait out its bound; and reported, as every
+/// message the interpreter ignores is. Nothing is opened.
+#[test]
+fn an_open_that_fails_is_answered_with_why() {
+    let mut k = Interpreter::start();
+    for (open, why) in [
+        (
+            json!({"t": "open", "agent": PRIMARY}),
+            "agent 'primary' is already open",
+        ),
+        (
+            json!({"t": "open", "agent": "a.b"}),
+            "'a.b' cannot name an agent",
+        ),
+        (json!({"t": "open", "agent": ""}), "'' cannot name an agent"),
+        (
+            json!({"t": "open", "agent": "second", "main": true}),
+            "agent 'primary' already has the main thread",
+        ),
+    ] {
+        k.send(open.clone());
+        let answer = k.recv();
+        assert!(
+            answer["t"] == "ready"
+                && answer["agent"] == open["agent"]
+                && answer["version"].is_null()
+                && text(&answer["error"]) == why,
+            "{open} was answered with {answer}"
+        );
+        k.await_stderr(why);
+    }
+    // The refused main kernel was never built, and the name is free.
+    k.open("second");
+    assert_eq!(
+        k.output_in(
+            "second",
+            1,
+            "import threading; print(threading.current_thread().name)"
+        ),
+        "kernel-second\n"
+    );
 }
 
 // ---------------------------------------------------------------------------- the session module

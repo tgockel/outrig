@@ -26,6 +26,10 @@ pub enum SessionError {
     /// read are still waiting, and what it ran is kept.
     #[error(transparent)]
     Round(Failure),
+    /// The session has no primary agent to run a round: it was started with
+    /// [`SessionBuilder::no_primary`](super::SessionBuilder::no_primary).
+    #[error("the session has no primary agent, so it runs no rounds")]
+    NoPrimary,
 }
 
 /// What went wrong, rendered as text: what OutRig's own types and the model

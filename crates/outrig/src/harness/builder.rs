@@ -3,15 +3,14 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use super::approval::Approver;
-use super::bindings::{self, BindingSpec, Bindings, Brief, Declared, Places, Setup};
+use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
 use super::{Failure, Session, SessionError};
-use crate::agent::ledger::Ledger;
-use crate::agent::{self, Agent, AgentError, ResolvedAgent};
+use crate::agent::{self, AgentError, ResolvedAgent};
 use crate::config::{Config, ConfigValidationError, EnvSecrets, ImageConfig, Secrets, lexical};
 use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError};
@@ -47,22 +46,24 @@ pub enum Progress {
 }
 
 /// What a session needs from outside, given before it starts: the
-/// configuration, the agent and the model to run, the container, the secrets
-/// its model calls need, its bindings and who approves a repository's, who
-/// subscribes to its events, and whether it records them.
-/// [`SessionBuilder::start`] starts it, in one call.
+/// configuration, the agent and the model to run -- or none, for a session
+/// with no primary agent -- the container, the secrets its model calls need,
+/// its bindings and who approves a repository's, who subscribes to its events,
+/// and whether it records them. [`SessionBuilder::start`] starts it, in one
+/// call.
 ///
 /// ```no_run
 /// # async fn example(
 ///     config: outrig::config::Config,
 /// ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// use outrig::harness::{DEFAULT_DRAIN, SessionBuilder};
+/// use outrig::harness::{DEFAULT_DRAIN, SessionBuilder, SessionError};
 ///
 /// let mut builder = SessionBuilder::new(config, Some("coding"), None)
 ///     .secrets(|var: &str| (var == "ANTHROPIC_API_KEY").then(|| "sk-...".to_string()));
 /// let mut events = builder.subscribe();
 /// let mut session = builder.start().await?;
-/// session.user_channel().send("summarize the README").await?;
+/// let user = session.user_channel().ok_or(SessionError::NoPrimary)?;
+/// user.send("summarize the README").await?;
 /// let outcome = session.round().await?;
 /// session.close_admission();
 /// let report = session.shutdown(DEFAULT_DRAIN).await;
@@ -98,6 +99,9 @@ pub struct SessionBuilder {
     /// The stream a test built itself, in place of the builder's.
     #[cfg(test)]
     events: Option<Events>,
+    /// Whether the session has a primary agent: until
+    /// [`SessionBuilder::no_primary`], it does.
+    primary: bool,
 }
 
 impl SessionBuilder {
@@ -107,7 +111,8 @@ impl SessionBuilder {
     ///
     /// By default its keys are read from the process environment, nothing
     /// subscribes, nothing is recorded, and the container is the one
-    /// [`Session::start`] describes.
+    /// [`Session::start`] describes. [`SessionBuilder::no_primary`] makes it
+    /// a session with no primary agent.
     pub fn new(config: Config, agent: Option<&str>, model: Option<&str>) -> Self {
         Self {
             config,
@@ -129,7 +134,24 @@ impl SessionBuilder {
             host_log: None,
             #[cfg(test)]
             events: None,
+            primary: true,
         }
+    }
+
+    /// Start the session with no primary agent: it resolves no model, and asks
+    /// the secret resolver for nothing, as it starts. It has no rounds, no
+    /// `user` channel and no interrupter (see [`Session`]); everything else --
+    /// its container, interpreter and bindings, its admission, its events and
+    /// its report -- is the session's, as it is with one. Its state is `idle`
+    /// from `starting` until `closing`.
+    ///
+    /// The agent [`SessionBuilder::new`] names still chooses the image of the
+    /// container [`Session::start`] describes, and [`SessionBuilder::check`]
+    /// still resolves the model it names, when it names one. An agent the
+    /// configuration does not define fails `check` and the start alike.
+    pub fn no_primary(mut self) -> Self {
+        self.primary = false;
+        self
     }
 
     /// Launch `spec` as the session's container, once its model and keys have
@@ -244,8 +266,17 @@ impl SessionBuilder {
     /// it needs, checked without starting anything -- so a caller can fail on
     /// a configuration that names no usable model before it pulls or builds an
     /// image.
+    ///
+    /// A session with no primary agent resolves no model as it starts, so
+    /// this resolves one only when the builder names it: a misspelled name
+    /// fails here all the same, as does an agent the configuration does not
+    /// define.
     pub fn check(&self) -> Result<(), SessionError> {
-        self.resolved()?;
+        if self.primary || self.model.is_some() {
+            self.resolved()?;
+        } else if let Some(name) = &self.agent {
+            agent::find_agent(&self.config, name).map_err(|e| SessionError::Resolve(Failure(e)))?;
+        }
         bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         Ok(())
     }
@@ -266,10 +297,21 @@ impl SessionBuilder {
         Ok(self.resolved.get_or_init(|| resolved))
     }
 
-    /// [`SessionBuilder::resolved`], taken for the start.
-    fn take_resolved(&mut self) -> Result<ResolvedAgent, SessionError> {
+    /// [`SessionBuilder::resolved`], taken for the start, or `None` for a
+    /// session with no primary agent, which resolves nothing but fails on an
+    /// agent the configuration does not define.
+    fn resolution(&mut self) -> Result<Option<ResolvedAgent>, SessionError> {
+        if !self.primary {
+            if let Some(name) = &self.agent {
+                agent::find_agent(&self.config, name)
+                    .map_err(|e| SessionError::Resolve(Failure(e)))?;
+            }
+            return Ok(None);
+        }
         self.resolved()?;
-        Ok(self.resolved.take().expect("resolved by the line above"))
+        Ok(Some(
+            self.resolved.take().expect("resolved by the line above"),
+        ))
     }
 
     fn report(&mut self, progress: Progress) {
@@ -280,9 +322,10 @@ impl SessionBuilder {
 
     /// Start the session: resolve its model, approve, install and start its
     /// bindings, launch its container, start the interpreter in it, and build
-    /// the agent. On failure nothing it started is left running.
+    /// the agent -- or, for a session with no primary agent, everything but the
+    /// model and the agent. On failure nothing it started is left running.
     pub async fn start(mut self) -> Result<Session, SessionError> {
-        let resolved = self.take_resolved()?;
+        let resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let mut spec = match self.container.take() {
@@ -325,7 +368,7 @@ impl SessionBuilder {
         let interpreter = match Interpreter::start(outrig.primary(), events.clone(), rpyc).await {
             Ok(interpreter) => interpreter,
             Err(e) => {
-                stop(outrig, &mut bindings).await;
+                stop(Some(outrig), &mut bindings).await;
                 return Err(SessionError::Start(Failure(e.into())));
             }
         };
@@ -339,21 +382,8 @@ impl SessionBuilder {
             .filter(|workspace| !workspace.as_os_str().is_empty())
             .map(Path::to_path_buf);
         let name = primary.name().to_string();
-        match assemble(
-            &resolved,
-            interpreter,
-            &name,
-            workspace.as_deref(),
-            &bindings.briefs(),
-            &events,
-            &lifecycle,
-        ) {
-            Ok(agent) => Ok(Session::new(id, agent, Some(outrig), lifecycle, bindings)),
-            Err(e) => {
-                stop(outrig, &mut bindings).await;
-                Err(SessionError::Start(Failure(e)))
-            }
-        }
+        let session = Session::new(id, interpreter, Some(outrig), name, lifecycle, bindings);
+        assemble(session, resolved.as_ref(), workspace.as_deref()).await
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -465,7 +495,7 @@ impl SessionBuilder {
     /// host. The session's id is `test`.
     #[cfg(test)]
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
-        let resolved = self.take_resolved()?;
+        let resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = "test".to_string();
@@ -481,21 +511,8 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         self.report(Progress::Finished(Step::Python));
-        match assemble(
-            &resolved,
-            interpreter,
-            "(host)",
-            None,
-            &bindings.briefs(),
-            &events,
-            &lifecycle,
-        ) {
-            Ok(agent) => Ok(Session::new(id, agent, None, lifecycle, bindings)),
-            Err(e) => {
-                bindings.stop_after_failed_start().await;
-                Err(SessionError::Start(Failure(e)))
-            }
-        }
+        let session = Session::new(id, interpreter, None, "(host)".into(), lifecycle, bindings);
+        assemble(session, resolved.as_ref(), None).await
     }
 }
 
@@ -542,43 +559,31 @@ async fn default_container(
     Ok(spec.with_session_id(id))
 }
 
-/// The agent over `interpreter`, its admission the session's, and the session
-/// idle.
-fn assemble(
-    resolved: &ResolvedAgent,
-    interpreter: Interpreter,
-    container_name: &str,
+/// `session`, with the primary agent `resolved` names -- none, for a session
+/// with no primary agent -- in a container whose workspace is `workspace`, and
+/// idle. A primary that cannot be built stops what the start launched.
+async fn assemble(
+    mut session: Session,
+    resolved: Option<&ResolvedAgent>,
     workspace: Option<&Path>,
-    bindings: &[Brief],
-    events: &Events,
-    lifecycle: &Arc<Lifecycle>,
-) -> Result<Agent, AgentError> {
-    lifecycle.attach(interpreter.gate());
-    // Weak: the interpreter outlives nothing the session holds, and a strong
-    // reference from it back to the session would.
-    let weak: Weak<Lifecycle> = Arc::downgrade(lifecycle);
-    interpreter.on_exit(move || {
-        if let Some(lifecycle) = weak.upgrade() {
-            lifecycle.exited();
-        }
-    });
-    let agent = Agent::build(
-        resolved,
-        interpreter,
-        container_name,
-        workspace,
-        bindings,
-        Ledger::new(events.clone()),
-        Arc::clone(lifecycle),
-    )?;
-    lifecycle.set(super::event::SessionState::Idle);
-    Ok(agent)
+) -> Result<Session, SessionError> {
+    if let Some(resolved) = resolved
+        && let Err(e) = session.build_primary(resolved, workspace).await
+    {
+        session.abandon().await;
+        return Err(SessionError::Start(Failure(e)));
+    }
+    session.idle();
+    Ok(session)
 }
 
-/// Stop what a failed start launched -- its bindings, then its container --
-/// saying so if that fails too.
-async fn stop(outrig: Outrig, bindings: &mut Bindings) {
+/// Stop what a failed start launched -- its bindings, then its container when
+/// it has one -- saying so if that fails too.
+pub(super) async fn stop(container: Option<Outrig>, bindings: &mut Bindings) {
     bindings.stop_after_failed_start().await;
+    let Some(outrig) = container else {
+        return;
+    };
     for failed in outrig.stop().await {
         tracing::warn!(target: "outrig::harness", "stopping a session that failed to start: {failed}");
     }

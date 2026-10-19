@@ -306,6 +306,10 @@ own task. It holds:
   missed (`observability.md`). The stream never waits on a subscriber, so a stalled one cannot
   delay shutdown; the report says what it missed instead.
 
+A session with no primary agent (`0003-28`) reports the same way. The executions the report lists
+are the primary's, so it lists none, and it publishes no `agent.stopped`; everything else is as
+above.
+
 An execution's outcome is `ok`, `error` or `unknown` (`execution-and-rounds.md`). A hosted call's
 is one of five, the same outcomes its events record:
 

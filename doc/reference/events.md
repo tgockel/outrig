@@ -168,7 +168,9 @@ the same call, and records no new `model.call`.
   is closed to new work until its shutdown report exists, and `reported` once it does. The first
   event of a session is `starting`, and the last is `reported`. Once `closing`, no state follows
   but `reported`, even while a round that was running at the close runs on. The interpreter
-  exiting is `interpreter.exited` rather than a state; the session is then `closing`.
+  exiting is `interpreter.exited` rather than a state; the session is then `closing`. A session
+  with no primary agent runs no round, so it is `idle` from `starting` until `closing`, and never
+  `round_running` or `executing`.
 - `session.report` -- what the session's shutdown found, just before `reported`:
   - `closed_by`: what closed the session to new work: `{"by": "owner"}`, or
     `{"by": "interpreter_exited", "cause": ...}`.
@@ -197,7 +199,8 @@ the same call, and records no new `model.call`.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
   and `tool_result_max`.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the
-  container, before `session.report`.
+  container, before `session.report`. A session with no primary agent records neither this nor
+  `agent.started`.
 - `round.started` -- `round`. A round is numbered as its first turn commits, so a round that
   fails or is interrupted before committing one leaves its number to the next.
 - `exec.completed` -- how an execution ended, when its result arrived.

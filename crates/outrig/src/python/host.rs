@@ -3,6 +3,9 @@
 //! [`Interpreter::start`] execs the program inside a session's primary
 //! container and waits for its `ready` greeting, so an interpreter that cannot
 //! run there is a startup error rather than a hang on the first submission.
+//! The interpreter starts with no kernel. Each is built when the host opens it
+//! ([`Interpreter::open`]), the primary agent's too, which a session with one
+//! opens as it starts.
 //! Two tasks then own the transport between them: a writer, the only thing
 //! that touches the exec's stdin, and a reader, the only thing that reads its
 //! stdout and the one that correlates each reply to the request that asked for
@@ -109,7 +112,8 @@ use super::recovery::{self, Found, Timings, Verdict, Watched};
 /// caps one argument at 128 KiB and the source is past that.
 const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootstrap"));
 
-/// What the payload's `python3` is started with, ahead of the agent id. `-I`
+/// What the payload's `python3` is started with, ahead of where OutRig's own
+/// package is, and the vendored RPyC when the session has bindings. `-I`
 /// isolates it: no `PYTHON*` variable or other configuration the image carries
 /// reaches it, and neither the working directory nor the environment pip
 /// installs into is on `sys.path` until the program puts them there, after the
@@ -117,8 +121,8 @@ const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootst
 /// which the program still reads.
 pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 
-/// The primary agent's id: the program's first argument, and the agent every
-/// request here addresses. The second is where OutRig's own package is.
+/// The primary agent's id: the kernel opened on the interpreter's main thread,
+/// where an interrupt reaches it, and the agent every request here addresses.
 pub(crate) const PRIMARY: &str = "primary";
 
 /// How long a started interpreter has to greet. CPython starts and compiles
@@ -288,6 +292,10 @@ pub(crate) enum InterpreterError {
     /// The interpreter can no longer be reached; nothing was sent.
     #[error("the Python interpreter is gone: {0}")]
     Gone(Arc<str>),
+    /// The kernel the host opened for `agent` was not built, or never said it
+    /// was.
+    #[error("agent {agent:?} did not open: {reason}")]
+    Open { agent: String, reason: String },
     /// A message the channel did not take. Nothing was queued.
     #[error("not delivered: {0}")]
     Refused(String),
@@ -405,6 +413,9 @@ struct Table {
     exiting: Option<ClosedBy>,
     /// What carries hosted calls to the session's bindings, when it has any.
     relay: Option<Relay>,
+    /// Who waits for each kernel being opened: its `ready`, or why it was not
+    /// built.
+    opening: HashMap<String, oneshot::Sender<Result<(), String>>>,
 }
 
 /// What an exit is told.
@@ -468,13 +479,25 @@ struct Envelope {
     reply: Reply,
 }
 
+/// The interpreter's first line: a `ready` naming no agent, since no kernel
+/// exists until the host opens one.
+#[derive(Deserialize)]
+struct Greeting {
+    agent: Option<String>,
+    #[serde(flatten)]
+    reply: Reply,
+}
+
 /// Unknown kinds are ignored, as the interpreter ignores kinds it does not
 /// know.
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum Reply {
+    /// The interpreter's greeting, which names no agent, or an opened kernel's
+    /// answer: built, or the error that kept it from being built.
     Ready {
-        version: String,
+        version: Option<String>,
+        error: Option<String>,
     },
     Result(WireResult),
     Inv {
@@ -568,7 +591,8 @@ pub(crate) fn bindings_message(
 }
 
 impl Interpreter {
-    /// Start the interpreter in `container` and wait for it to greet.
+    /// Start the interpreter in `container` and wait for it to greet. It holds
+    /// no kernel until [`Interpreter::open`] opens one.
     ///
     /// The container must have the payload's mounts, as every session's
     /// primary does, and its user bootstrapped. Without the payload, podman's
@@ -582,7 +606,7 @@ impl Interpreter {
         let argv: Vec<String> = [python.as_str()]
             .into_iter()
             .chain(ARGS)
-            .chain([PRIMARY, PACKAGE_MOUNT])
+            .chain([PACKAGE_MOUNT])
             .chain(rpyc)
             .map(String::from)
             .collect();
@@ -614,8 +638,9 @@ impl Interpreter {
     /// tasks. `ended` is awaited once `replies` closes, or the greeting fails,
     /// and says why.
     ///
-    /// When `events` records, the interpreter is asked to say when the agent's
-    /// code takes a message, which nothing else needs to know.
+    /// When `events` records, the interpreter is asked to say when an agent's
+    /// code takes a message, which nothing else needs to know: asked before any
+    /// kernel exists, so every kernel says so.
     pub(super) async fn connect<R, W, E>(
         replies: R,
         requests: W,
@@ -638,18 +663,13 @@ impl Interpreter {
                 return Err(InterpreterError::Startup(format!("{problem}; {cause}")));
             }
         };
-        let observe = events.is_on();
         let table = Arc::new(Mutex::new(Table {
             events: events.clone(),
             ..Table::default()
         }));
         let (lines, queued) = mpsc::unbounded_channel();
-        if observe {
-            let id = lock(&table).next_id();
-            let _ = lines.send(format!(
-                "{}\n",
-                json!({"t": "observe", "agent": PRIMARY, "id": id})
-            ));
+        if events.is_on() {
+            let _ = lines.send(format!("{}\n", json!({"t": "observe"})));
         }
         tokio::spawn(write_requests(requests, queued, Arc::clone(&table)));
         let lines = Lines::Open(lines);
@@ -700,6 +720,38 @@ impl Interpreter {
     /// Where this interpreter's agent's events are recorded.
     pub(crate) fn events(&self) -> &Events {
         &self.events
+    }
+
+    /// Open a kernel for `agent` and wait until it is built: the primary
+    /// agent's on the interpreter's main thread, where an interrupt reaches it,
+    /// and any other on a thread of its own. The relay attached by then, when
+    /// the session has bindings, carries its hosted calls.
+    ///
+    /// One the interpreter could not build fails with why, and one it never
+    /// answers for fails once [`READY_TIMEOUT`] has passed.
+    pub(crate) async fn open(&self, agent: &str) -> Result<(), InterpreterError> {
+        let (waiter, receiver) = oneshot::channel();
+        {
+            let mut table = lock(&self.table);
+            table.open()?;
+            table.opening.insert(agent.to_string(), waiter);
+            if let Some(relay) = &table.relay {
+                relay.opened(agent);
+            }
+            self.send(json!({"t": "open", "agent": agent, "main": agent == PRIMARY}))?;
+        }
+        let not_opened = |reason| InterpreterError::Open {
+            agent: agent.to_string(),
+            reason,
+        };
+        let Ok(answered) = tokio::time::timeout(READY_TIMEOUT, answer(&self.table, receiver)).await
+        else {
+            lock(&self.table).opening.remove(agent);
+            return Err(not_opened(format!(
+                "it did not report ready within {READY_TIMEOUT:?}"
+            )));
+        };
+        answered?.map_err(not_opened)
     }
 
     /// Submit `source` to run in the agent's namespace.
@@ -873,10 +925,16 @@ impl Interpreter {
     }
 
     /// Carry hosted calls through `relay`, built over [`Interpreter::relay_line`]: from now on
-    /// the interpreter's `rpc` lines and its notices go to it, and the session's close reaches
-    /// it with admission's.
+    /// the interpreter's `rpc` lines and its notices go to it, for each kernel opened from now
+    /// on, and the session's close reaches it with admission's.
     pub(crate) fn attach_relay(&self, relay: Relay) {
         lock(&self.table).relay = Some(relay);
+    }
+
+    /// Queue `line` as it is, for a test that speaks the protocol itself.
+    #[cfg(test)]
+    pub(crate) fn send_line(&self, line: Value) {
+        self.lines.send(format!("{line}\n"));
     }
 
     /// What a relay sends the interpreter through: a line queued for the writer, which never
@@ -1518,8 +1576,8 @@ async fn answer<T>(
         .map_err(|_| InterpreterError::Gone(lock(table).cause()))
 }
 
-/// Read the interpreter's first line, which must be the primary's `ready`, and
-/// return the version it names.
+/// Read the interpreter's first line, which must be its own `ready`, naming no
+/// agent, and return the version it names.
 async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<String, String> {
     let mut line = Vec::new();
     let read =
@@ -1529,14 +1587,18 @@ async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<String, St
         Ok(Err(e)) => Err(format!("its greeting could not be read: {e}")),
         Ok(Ok(None)) => Err("its output closed before it reported ready".to_string()),
         Ok(Ok(Some(cut))) => match serde_json::from_slice(&line) {
-            Ok(Envelope {
-                agent,
-                reply: Reply::Ready { version },
-            }) if cut == 0 && agent == PRIMARY => Ok(version),
+            Ok(Greeting {
+                agent: None,
+                reply:
+                    Reply::Ready {
+                        version: Some(version),
+                        error: None,
+                    },
+            }) if cut == 0 => Ok(version),
             _ => {
                 line.truncate(200);
                 Err(format!(
-                    "it greeted with {:?} rather than the primary's ready",
+                    "it greeted with {:?} rather than its ready",
                     String::from_utf8_lossy(&line)
                 ))
             }
@@ -1658,8 +1720,10 @@ where
             .waiter
             .send(Outcome::Unknown(Unknown::Exited { id: slot.id, cause }));
     }
-    // Dropping the waiters fails each query with the cause just recorded.
+    // Dropping the waiters fails each query, and each kernel being opened, with
+    // the cause just recorded.
     table.queries.clear();
+    table.opening.clear();
     table.gone.send_replace(true);
 }
 
@@ -1686,8 +1750,18 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         }
         return;
     }
+    if let Reply::Ready { error, .. } = reply {
+        match lock(table).opening.remove(&agent) {
+            Some(waiter) => {
+                let _ = waiter.send(error.map_or(Ok(()), Err));
+            }
+            None => tracing::warn!("ignored a ready from agent {agent:?}, which nothing opened"),
+        }
+        return;
+    }
     if agent != PRIMARY {
-        tracing::warn!("ignored a message for agent {agent:?}, which this host did not open");
+        // Any other kernel the host opened is reached through its bindings alone.
+        tracing::warn!("ignored a message for agent {agent:?}: only the primary's are read here");
         return;
     }
     match reply {
@@ -1780,8 +1854,7 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 to: PRIMARY_SUBJECT.to_string(),
             });
         }
-        Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
-        Reply::Rpc(_) | Reply::Hosted(_) => {}
+        Reply::Ready { .. } | Reply::Rpc(_) | Reply::Hosted(_) => {}
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
             String::from_utf8_lossy(line)

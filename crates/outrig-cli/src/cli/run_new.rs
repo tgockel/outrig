@@ -200,7 +200,7 @@ pub async fn execute(
     eprint_best_effort(&render_banner(&Banner {
         image_config_row: builtin_image::banner_image_config_row(&image_cfg_name, builtin_default),
         image_tag: &session.image_tag,
-        model: running.model(),
+        model: running.model().unwrap_or_default(),
         python_version: running.python_version(),
         container_name: running.container_name(),
         session_id: sid.as_str(),

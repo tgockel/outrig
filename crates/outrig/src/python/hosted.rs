@@ -37,7 +37,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
-use super::host::PRIMARY;
 use super::supervisor::Process;
 use crate::events::Events;
 use crate::harness::HostedCall;
@@ -306,10 +305,8 @@ impl Relay {
         events: Events,
         bindings: Vec<String>,
     ) -> Self {
-        let mut state = State::default();
-        state.agents.insert(PRIMARY.to_string());
         Self(Arc::new(Shared {
-            state: watch::Sender::new(state),
+            state: watch::Sender::new(State::default()),
             to_interpreter,
             events,
             bindings,
@@ -327,14 +324,8 @@ impl Relay {
         ));
     }
 
-    /// Carry `agent`'s lines too.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the host opens no agent but the primary until `0003-30`"
-        )
-    )]
+    /// Carry `agent`'s lines too: the host has opened a kernel for it. A relay carries no agent's
+    /// until told of it, the primary's included.
     pub(crate) fn opened(&self, agent: &str) {
         self.with(|s| s.agents.insert(agent.to_string()));
     }

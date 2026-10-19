@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-28` | A session runs with no primary agent                               |
 | `0003-29` | A host program owns a session, and the engine survives it          |
 
 **Children**

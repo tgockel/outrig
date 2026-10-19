@@ -6,10 +6,12 @@
 //! and model, the container, the secrets its model calls need, and its event
 //! subscriptions -- and starts it in one call. The [`Session`] it gets back
 //! owns the container, the Python interpreter in it, and the agent, and
-//! everything the session started is stopped through it.
+//! everything the session started is stopped through it. A session started
+//! with [`SessionBuilder::no_primary`] has no agent of its own and owns the
+//! rest just the same.
 //!
 //! - **Rounds.** [`Session::round`] drives one, and says how it ended and what
-//!   it left running.
+//!   it left running. A session with no primary agent runs none.
 //! - **Events.** Each subscription receives the session's events in order
 //!   ([`event`]); one that falls behind loses a counted gap and never slows the
 //!   session. Its state -- starting, idle, round running, executing, closing,
@@ -61,6 +63,10 @@ pub use crate::config::{EnvSecrets, Secrets};
 #[cfg(test)]
 #[path = "bindings_tests.rs"]
 mod bindings_tests;
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;
 
 /// How long [`Session::shutdown`] lets an execution that is still running
 /// finish, as `outrig run-new` uses it: long enough for one about to end to

@@ -27,7 +27,7 @@ pub(super) const SIGNATURE: &str = "signed-by-the-mock";
 /// One request as the mock saw it, before any client library is asked to
 /// interpret it.
 #[derive(Debug)]
-pub(super) struct RecordedRequest {
+pub(crate) struct RecordedRequest {
     pub(super) path: String,
     /// Each header as sent, its name lowercased.
     pub(super) headers: Vec<(String, String)>,
@@ -46,7 +46,7 @@ impl RecordedRequest {
 
 /// One canned response.
 #[derive(Clone)]
-pub(super) struct CannedResponse {
+pub(crate) struct CannedResponse {
     status: u16,
     body: Value,
     /// Sent besides the content type, length, and `Connection: close`.
@@ -431,7 +431,7 @@ pub(super) fn strict_refusal(body: &Value) -> Option<CannedResponse> {
 /// The server answers `script` in order, one response per connection. Past
 /// the end of the script it repeats the last entry rather than hanging, so an
 /// unexpected extra request fails a count assertion instead of a timeout.
-pub(super) async fn start(
+pub(crate) async fn start(
     script: Vec<CannedResponse>,
 ) -> (
     std::net::SocketAddr,
@@ -472,7 +472,7 @@ async fn start_with(
 }
 
 /// Everything the mock has recorded so far.
-pub(super) fn drain(rx: &mut mpsc::UnboundedReceiver<RecordedRequest>) -> Vec<RecordedRequest> {
+pub(crate) fn drain(rx: &mut mpsc::UnboundedReceiver<RecordedRequest>) -> Vec<RecordedRequest> {
     let mut out = Vec::new();
     while let Ok(recorded) = rx.try_recv() {
         out.push(recorded);

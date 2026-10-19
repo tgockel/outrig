@@ -238,7 +238,7 @@ async fn shut_down(agent: Session) -> ShutdownReport {
 
 /// Send `message` on the agent's user channel, as a person typing it does.
 async fn post(agent: &Session, message: &str) {
-    within(agent.user_channel().send(message))
+    within(agent.user_channel().expect("a primary agent").send(message))
         .await
         .unwrap_or_else(|e| panic!("the message was not delivered: {e}"));
 }
@@ -664,7 +664,7 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
     };
     dropped_round(&mut agent, "set x", second_call).await;
     assert_eq!(
-        agent.agent.history.len(),
+        agent.primary().history.len(),
         1,
         "what the round ran is kept as it is dropped, not a round later"
     );
@@ -891,7 +891,7 @@ async fn the_agent_names_its_model_and_its_python() {
         vec![text_reply("unused")],
     )
     .await;
-    assert_eq!(agent.model(), "sonnet");
+    assert_eq!(agent.model(), Some("sonnet"));
     assert_eq!(
         agent.python_version(),
         start_on_host().await.version(),
@@ -1019,7 +1019,7 @@ async fn messages_and_replies_keep_their_order() {
         ],
     )
     .await;
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
     for (n, text) in ["one", "two", "three"].into_iter().enumerate() {
         let waiting = within(user.send(text)).await.expect("delivered");
         assert_eq!(waiting, n + 1);
@@ -1060,7 +1060,7 @@ async fn a_send_from_a_background_task_reaches_the_user_after_the_round() {
         ],
     )
     .await;
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
 
     assert_eq!(round(&mut agent, "start it").await, "started it");
     std::fs::write(release.path(), b"").expect("release the task");
@@ -1078,7 +1078,7 @@ async fn taking_what_is_waiting_does_not_wait_behind_a_listener() {
         vec![text_reply("unused")],
     )
     .await;
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
     let listener = user.clone();
     let listening = listener.receive();
     tokio::pin!(listening);
@@ -1112,7 +1112,7 @@ async fn a_message_arriving_mid_round_is_announced_in_the_next_result() {
         ],
     )
     .await;
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
     let meanwhile = async {
         running.reached().await;
         user.send("the password is xyzzy").await.expect("delivered");
@@ -1172,7 +1172,7 @@ async fn a_message_ends_a_wait_and_the_round_goes_on() {
         ],
     )
     .await;
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
     let meanwhile = async {
         parked.reached().await;
         user.send("change of plan").await.expect("delivered");
@@ -1311,7 +1311,7 @@ async fn three_narrow_rounds(
     Vec<RecordedRequest>,
 ) {
     let (mut agent, mut requests) = agent_over(var, MODEL, "max-tokens = 4096", script).await;
-    agent.agent.history.set_window(NARROW);
+    agent.primary().history.set_window(NARROW);
     for message in ["one", "two", "three"] {
         round(&mut agent, message).await;
     }
@@ -1472,7 +1472,7 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
         ],
     )
     .await;
-    agent.agent.history.set_window(NARROW);
+    agent.primary().history.set_window(NARROW);
     round(&mut agent, "one").await;
     round(&mut agent, "two").await;
     assert_eq!(
@@ -1480,7 +1480,7 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
         "(round ended: tool-call iteration max (1) reached)"
     );
     assert_eq!(
-        agent.agent.history.len(),
+        agent.primary().history.len(),
         4,
         "the capped round's two turns, once"
     );
@@ -1490,7 +1490,7 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
         .await
         .expect_err("the second model call failed");
     assert_eq!(
-        agent.agent.history.len(),
+        agent.primary().history.len(),
         5,
         "the failed round's finished turn"
     );
@@ -1502,13 +1502,13 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
     };
     dropped_round(&mut agent, "dropped", second_call).await;
     assert_eq!(
-        agent.agent.history.len(),
+        agent.primary().history.len(),
         6,
         "the dropped round's finished turn"
     );
 
     round(&mut agent, "done?").await;
-    assert_eq!(agent.agent.history.len(), 7);
+    assert_eq!(agent.primary().history.len(), 7);
     let last = mock_http::drain(&mut requests)
         .pop()
         .expect("the last round's request");
@@ -1641,7 +1641,7 @@ fn manifests(agent: &Session) -> Arc<Mutex<Vec<Manifest>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
     agent
-        .agent
+        .primary()
         .history
         .on_manifest(move |manifest| record.lock().expect("manifests").push(manifest.clone()));
     seen
@@ -1685,7 +1685,7 @@ async fn a_turn_too_large_for_the_window_ends_its_round_and_later_rounds_go_on()
     ] {
         assert!(reply.contains(needle), "{needle:?} in {reply}");
     }
-    assert_eq!(agent.agent.history.len(), 1, "the turn is kept");
+    assert_eq!(agent.primary().history.len(), 1, "the turn is kept");
     assert_eq!(
         mock_http::drain(&mut requests).len(),
         1,
@@ -1972,7 +1972,7 @@ async fn agent_on_a_strict_mock(
 /// Three rounds on the [`NARROW`] window, then a fourth the provider refuses:
 /// the error that round ends with.
 async fn refused_fourth_round(agent: &mut Session) -> String {
-    agent.agent.history.set_window(NARROW);
+    agent.primary().history.set_window(NARROW);
     for message in ["one", "two", "three"] {
         round(agent, message).await;
     }
@@ -1992,7 +1992,7 @@ fn each_call_reconstructs(
     manifests: &[Manifest],
 ) {
     for (n, (request, manifest)) in recorded.iter().zip(manifests).enumerate() {
-        let rebuilt = on_the_wire(style, agent.agent.history.reconstruct(manifest));
+        let rebuilt = on_the_wire(style, agent.primary().history.reconstruct(manifest));
         assert_eq!(
             rebuilt,
             conversation(style, request),
@@ -2044,13 +2044,13 @@ async fn every_cut_driven(
     mut requests: tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
     mut submitted: Subscription,
 ) -> (Session, Vec<RecordedRequest>, Vec<Manifest>) {
-    agent.agent.history.set_window(NARROW);
+    agent.primary().history.set_window(NARROW);
     // Room for either of round 5's large turns and what else there is, not
     // both: the model's own budget, its window shrunk to leave that room.
-    let real = (*agent.agent.budget).clone();
+    let real = (*agent.primary().budget).clone();
     let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
-    agent.agent.budget = Arc::new(Budget { window, ..real });
-    Arc::get_mut(&mut agent.agent.agent.model)
+    agent.primary_mut().budget = Arc::new(Budget { window, ..real });
+    Arc::get_mut(&mut agent.primary_mut().agent.model)
         .expect("no call is in flight")
         .narrow_head(window);
     let seen = manifests(&agent);
@@ -2140,7 +2140,7 @@ async fn each_calls_manifest_reconstructs_what_the_provider_received() {
         let (agent, recorded, manifests) = every_cut(style, &var).await;
         for (n, manifest) in manifests.iter().enumerate() {
             assert_eq!(manifest.call, n as u64);
-            assert_eq!(manifest.budget, *agent.agent.budget);
+            assert_eq!(manifest.budget, *agent.primary().budget);
         }
         each_call_reconstructs(style, &agent, &recorded, &manifests);
     }
@@ -2302,7 +2302,7 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
             vec![text_reply("ok")],
         )
         .await;
-        let budget = &agent.agent.budget;
+        let budget = &agent.primary().budget;
         assert_eq!(
             (
                 budget.model.as_str(),
@@ -2316,7 +2316,8 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
         round(&mut agent, "go").await;
         let manifest = seen.lock().expect("manifests")[0].clone();
         assert_eq!(
-            manifest.budget, *agent.agent.budget,
+            manifest.budget,
+            *agent.primary().budget,
             "the call was held to it"
         );
     }
@@ -2344,7 +2345,7 @@ async fn no_context_window_assumes_one_whatever_the_identifier() {
             vec![style.text("ok")],
         )
         .await;
-        let budget = &agent.agent.budget;
+        let budget = &agent.primary().budget;
         assert_eq!(
             (budget.window, budget.window_assumed, budget.reserve),
             (ASSUMED_CONTEXT_WINDOW, true, reserve),
@@ -2922,7 +2923,13 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
     ] {
         let (mut agent, mut requests) =
             agent_over(var, identifier, keys, vec![text_reply("ok")]).await;
-        let head = agent.agent.agent.model.budgets().next().expect("a head");
+        let head = agent
+            .primary()
+            .agent
+            .model
+            .budgets()
+            .next()
+            .expect("a head");
         assert_eq!(head.max_tokens, Some(expected), "{identifier}");
         round(&mut agent, "hi").await;
         let recorded = mock_http::drain(&mut requests);
@@ -3138,7 +3145,7 @@ async fn a_recorded_session_is_the_agents_timeline() {
     .await;
     assert_eq!(round(&mut agent, "hello").await, "first");
     assert_eq!(round(&mut agent, "promote").await, "done");
-    let user = agent.user_channel();
+    let user = agent.user_channel().expect("a primary agent");
     assert_eq!(
         within(user.receive()).await.as_deref(),
         Some("got hello"),
@@ -3862,7 +3869,7 @@ async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
     assert_eq!(
         agent.model(),
-        "head",
+        Some("head"),
         "what every call is tried against first"
     );
 
@@ -4365,9 +4372,9 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     strict(&mut cfg, "second");
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
-    agent.agent.history.set_window(NARROW);
+    agent.primary().history.set_window(NARROW);
     let alternation: Vec<_> = agent
-        .agent
+        .primary()
         .agent
         .model
         .budgets()
@@ -4471,7 +4478,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
     let dir = tempfile::tempdir().expect("a log dir");
     let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
     let ceilings: Vec<_> = agent
-        .agent
+        .primary()
         .agent
         .model
         .budgets()
@@ -4657,7 +4664,7 @@ async fn a_turn_no_model_of_the_chain_can_hold_ends_its_round_and_later_rounds_g
     ] {
         assert!(reply.contains(needle), "{needle:?} in {reply}");
     }
-    assert_eq!(agent.agent.history.len(), 1, "the turn is kept");
+    assert_eq!(agent.primary().history.len(), 1, "the turn is kept");
     assert_eq!(
         mock_http::drain(&mut head_requests).len(),
         1,
@@ -5045,7 +5052,7 @@ async fn round_pressed(
     running: &Running,
     presses: usize,
 ) -> (String, Vec<Option<String>>) {
-    let interrupt = agent.interrupter();
+    let interrupt = agent.interrupter().expect("a primary agent");
     let pressing = async {
         running.reached().await;
         (0..presses).map(|_| interrupt()).collect()
@@ -5105,7 +5112,7 @@ async fn ctrl_c_with_no_python_running_does_nothing() {
         vec![submit("toolu_x", "x = 1"), text_reply("bound")],
     )
     .await;
-    let interrupt = agent.interrupter();
+    let interrupt = agent.interrupter().expect("a primary agent");
     assert_eq!(interrupt(), None);
     assert_eq!(agent.stop_held(), None);
     assert_eq!(round(&mut agent, "bind").await, "bound");
@@ -5464,7 +5471,7 @@ async fn session_usage_is_the_unique_attempts_and_a_round_total_is_inclusive() {
     let mut agent = agent_of(&cfg, var, events::opened(dir.path()).await).await;
     round(&mut agent, "set x").await;
     round(&mut agent, "again").await;
-    let live = agent.agent.ledger().session_total();
+    let live = agent.primary().ledger().session_total();
     shut_down(agent).await;
 
     let records = events::recorded(dir.path());
@@ -5527,7 +5534,7 @@ async fn a_late_usage_record_replaces_a_null_once_and_a_replay_agrees() {
     post(&agent, "fail").await;
     within(agent.round()).await.expect_err("the call failed");
     let attempt = AttemptId::new(1);
-    let ledger = agent.agent.ledger().clone();
+    let ledger = agent.primary().ledger().clone();
     assert_eq!(ledger.total(&[attempt]), None, "null, never zero");
 
     assert!(matches!(
@@ -5558,7 +5565,7 @@ async fn a_late_usage_record_replaces_a_null_once_and_a_replay_agrees() {
     )
     .await;
     round(&mut other, "go").await;
-    let other_ledger = other.agent.ledger().clone();
+    let other_ledger = other.primary().ledger().clone();
     assert_eq!(
         other_ledger.usage_of(attempt),
         None,
@@ -5729,7 +5736,7 @@ async fn the_interpreter_exiting_is_an_event_then_a_close() {
 
 /// Send `message`, whether or not the agent's channel takes it.
 async fn post_unchecked(agent: &Session, message: &str) {
-    let _ = within(agent.user_channel().send(message)).await;
+    let _ = within(agent.user_channel().expect("a primary agent").send(message)).await;
 }
 
 /// Two sessions in one process, each resolving the same `${VAR}` through a

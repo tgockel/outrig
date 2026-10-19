@@ -468,9 +468,12 @@ impl Relay {
             runtime,
             stats,
         };
-        let ready = relay.recv();
+        // The greeting names no agent: the interpreter starts with none, and the primary's kernel
+        // is opened onto its main thread, as a session with a primary opens it.
+        let ready = relay.recv_unnamed(TIMEOUT);
         assert_eq!(ready["t"], "ready", "{ready}");
-        assert_eq!(ready["agent"], PRIMARY, "{ready}");
+        assert!(ready.get("agent").is_none(), "{ready}");
+        relay.opened(PRIMARY, true);
         relay
     }
 
@@ -738,7 +741,17 @@ impl Relay {
     }
 
     fn recv_fresh(&mut self, within: Duration) -> Value {
-        let message = match self.other.recv_timeout(within) {
+        let message = self.recv_unnamed(within);
+        assert!(
+            message["agent"].is_string(),
+            "a message without an agent id: {message}"
+        );
+        message
+    }
+
+    /// The next message to arrive within `within`, which need not name an agent: the greeting.
+    fn recv_unnamed(&mut self, within: Duration) -> Value {
+        match self.other.recv_timeout(within) {
             Ok(Ok(message)) => message,
             Ok(Err(bad)) => panic!("{bad}"),
             Err(RecvTimeoutError::Timeout) => {
@@ -747,12 +760,7 @@ impl Relay {
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("the interpreter exited; stderr: {}", self.stderr())
             }
-        };
-        assert!(
-            message["agent"].is_string(),
-            "a message without an agent id: {message}"
-        );
-        message
+        }
     }
 
     /// The next message `matches`, within `within`; the messages read meanwhile that do not are
@@ -941,14 +949,20 @@ impl Relay {
 
     /// Open a kernel for `agent` and wait for its greeting.
     pub(crate) fn open(&mut self, agent: &str) {
+        self.opened(agent, false);
+    }
+
+    /// Open a kernel for `agent`, onto the interpreter's main thread with `main`, and wait for
+    /// its greeting. The relay carries its lines from then on, and every later relay too.
+    fn opened(&mut self, agent: &str, main: bool) {
         self.agents.push(agent.to_string());
         if let Some(bound) = &self.process {
             bound.relay.opened(agent);
         }
-        self.send(json!({"t": "open", "agent": agent}));
+        self.send(json!({"t": "open", "agent": agent, "main": main}));
         let ready = self.recv();
         assert!(
-            ready["t"] == "ready" && ready["agent"] == agent,
+            ready["t"] == "ready" && ready["agent"] == agent && ready["error"].is_null(),
             "got: {ready}"
         );
     }

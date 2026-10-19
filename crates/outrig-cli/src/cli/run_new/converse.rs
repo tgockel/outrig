@@ -139,8 +139,10 @@ async fn drive(
     sigint: &mut Signal,
     failures: &mut Failures,
 ) -> Result<()> {
-    let user = session.user_channel();
-    let interrupt = session.interrupter();
+    // `run-new` always starts its session with a primary agent.
+    let (Some(user), Some(interrupt)) = (session.user_channel(), session.interrupter()) else {
+        return Err(SessionError::NoPrimary.into());
+    };
     let closer = session.closer();
     let mut lines = read_lines()?;
     let session = Mutex::new(session);

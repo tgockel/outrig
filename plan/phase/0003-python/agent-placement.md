@@ -214,6 +214,11 @@ parent's work, do not. The port aims the signal at the main thread itself with `
 rather than raising it from the reader thread, so a primary blocked in a system call wakes to take
 it too.
 
+The interpreter starts with no kernel, and builds each one the host opens (`0003-28`). The host
+opens the primary's onto the main thread, which waits until it does. A session with no primary
+agent opens none there: its main thread only waits, taking signals and doing nothing with them,
+and none of its kernels is reached by a signal. Each is in a subagent's place, below.
+
 A wedged subagent is therefore contained but unrecoverable. Its siblings keep running, because
 CPython drops the GIL every switch interval:
 

@@ -1,13 +1,15 @@
 """The interpreter: one process per session, hosting one kernel per agent.
 
-Started by `podman exec -i` inside the session container, with the primary agent's id as its
-one argument, and spoken to in NDJSON: requests on stdin, replies on stdout, every message in
-both directions naming the agent it concerns. Each agent is a **kernel** -- a session module,
-an event loop on a thread of its own, an execution slot, a bounded backlog of background output,
-and the endpoints of its channels, bound as `runtime.channels`. The process owns what they
-share: the protocol descriptors, the reader thread that routes messages by agent id, and the
-descriptors executed code writes to. The primary agent's kernel runs on the main thread, because
-that is the only thread a signal handler runs on.
+Started by `podman exec -i` inside the session container, with OutRig's package directory as its
+argument -- and RPyC's after it, for a session with bindings -- and spoken to in NDJSON: requests
+on stdin, replies on stdout, every message about an agent naming the agent it concerns. It starts
+with no agent, greets, and builds one only when the host opens it. Each agent is a **kernel** --
+a session module, an event loop on a thread of its own, an execution slot, a bounded backlog of
+background output, and the endpoints of its channels, bound as `runtime.channels`. The process
+owns what they share: the protocol descriptors, the reader thread that routes messages by agent
+id, and the descriptors executed code writes to. The kernel the host opens onto the main thread
+-- the primary agent's, in a session that has one -- runs there, because that is the only thread a
+signal handler runs on.
 
 Five things here are load-bearing rather than incidental:
 
@@ -60,6 +62,7 @@ import mmap
 import multiprocessing.pool
 import operator
 import os
+import queue
 import resource
 import select
 import shlex
@@ -2961,8 +2964,9 @@ def _connection_class(rpyc):
 
 _kernels = {}
 
-# Agents whose takes the host has asked to be told of, by id.
-_observed = set()
+# Whether the host has asked to be told of every take, which it asks once, before any kernel
+# exists (`_observe`), so a kernel opened later is told as one opened first is.
+_observing = False
 
 
 def _module_name(agent):
@@ -3486,7 +3490,7 @@ class Endpoint:
         `.body` is the message itself. Receiving removes it: no later receive sees it again.
         """
         message, delivery = await self._when(self._receivers, self._take)
-        if self._agent in _observed:
+        if _observing:
             # Taken already, so nothing here may raise and lose it: what the host is told is a
             # record of the take, and a take it never hears of is one the record lacks.
             try:
@@ -3828,7 +3832,7 @@ class Kernel:
         self._holder = None
         self.running = None
         # The thread the loop runs on, for its CPU clock and, for the primary, for aiming a
-        # signal. Set before the thread starts.
+        # signal: its own, or the main thread. Set before the loop runs (`_open`).
         self.thread = None
         # `(exec_id, runaway)` while an interrupt is on its way to the handler, which consumes
         # it: one signal, one attempt. Then what the handler raised, the task it raised in, and
@@ -4359,8 +4363,12 @@ class Kernel:
 
 # ---------------------------------------------------------------------------- interrupts
 
-# The kernel on the main thread, the only thread Python runs a signal handler on.
+# The kernel on the main thread, the only thread Python runs a signal handler on: the primary
+# agent's, once the host opens one there (`_open`), and `None` in a session that has none.
 _primary = None
+
+# Where `_open` hands the main thread its kernel, which `main` waits for.
+_onto_main = queue.SimpleQueue()
 
 
 def _on_sigint(signum, frame):
@@ -4397,6 +4405,10 @@ def _on_sigint(signum, frame):
     it is dropped, and the host's next interrupt reaches the code.
     """
     kernel = _primary
+    if kernel is None:
+        # No kernel is on the main thread, so there is no agent code here to interrupt: the
+        # thread is waiting for one (`main`).
+        return
     armed, kernel._interrupting = kernel._interrupting, None
     if armed is None:
         return
@@ -4554,20 +4566,36 @@ def _unbind(message):
 
 # ---------------------------------------------------------------------------- routing
 
-def _open(agent):
+def _open(agent, main):
+    """Build `agent`'s kernel, which says it is ready. Every kernel is built here, on the reader
+    thread, and none exists until the host asks for it.
+
+    With `main`, the main thread serves it: the only thread Python runs a signal handler on, so the
+    one kernel a signal can interrupt, which the host gives its primary agent. Every other kernel
+    is served on a thread of its own.
+    """
+    global _primary
     if not _valid_agent(agent):
         raise ValueError(f"{agent!r} cannot name an agent")
     if agent in _kernels:
         raise ValueError(f"agent {agent!r} is already open")
+    if main and _primary is not None:
+        raise ValueError(f"agent {_primary.agent!r} already has the main thread")
     kernel = Kernel(agent)
-    kernel.thread = threading.Thread(target=kernel.serve, name=f"kernel-{agent}", daemon=True)
-    try:
-        kernel.thread.start()
-    except BaseException:
-        sys.modules.pop(kernel.module.__name__, None)
-        kernel.loop.close()
-        raise
+    if main:
+        kernel.thread = threading.main_thread()
+    else:
+        kernel.thread = threading.Thread(target=kernel.serve, name=f"kernel-{agent}", daemon=True)
+        try:
+            kernel.thread.start()
+        except BaseException:
+            sys.modules.pop(kernel.module.__name__, None)
+            kernel.loop.close()
+            raise
     _kernels[agent] = kernel
+    if main:
+        _primary = kernel
+        _onto_main.put(kernel)
     kernel.announce()
 
 
@@ -4664,13 +4692,15 @@ def _tasks(kernel, request_id, _message):
     kernel.loop.call_soon_threadsafe(kernel.tasks, request_id)
 
 
-def _observe(kernel, _request_id, _message):
-    """Say from now on when the agent's code takes a message from one of its channels.
+def _observe():
+    """Say from now on when any agent's code takes a message from one of its channels.
 
     Nothing needs to know that to deliver one -- the host is told only because it records what the
-    agent does -- so nothing says it until the host asks.
+    agents do -- so nothing says it until the host asks. Asked of the whole interpreter rather than
+    of a kernel, since the host asks before it opens any.
     """
-    _observed.add(kernel.agent)
+    global _observing
+    _observing = True
 
 
 def _pending(kernel, request_id, _):
@@ -4738,7 +4768,6 @@ _ROUTES = {
     "pending": _pending,
     "received": _received,
     "turn": _turn,
-    "observe": _observe,
     "inv": _inventory,
     "tasks": _tasks,
     "rpc": _rpc,
@@ -4757,7 +4786,20 @@ def _route(line):
         raise ValueError(f"not an object: {type(message).__name__}")
     kind, agent = message.get("t"), message.get("agent")
     if kind == "open":
-        _open(agent)
+        try:
+            _open(agent, message.get("main") is True)
+        except MemoryError:
+            # `_with_room` tries once more, and answers nothing it might yet open.
+            raise
+        except Exception as e:
+            # Answered, so a host waiting for the kernel hears why rather than waiting out its
+            # bound; and reported, as every message this ignores is.
+            if isinstance(agent, str):
+                _send({"t": "ready", "agent": agent, "error": str(e)})
+            raise
+        return
+    if kind == "observe":
+        _observe()
         return
     if kind == "bindings":
         _bindings(message)
@@ -4818,38 +4860,35 @@ def _read():
 
 
 def main():
-    if len(sys.argv) not in (3, 4) or not _valid_agent(sys.argv[1]):
-        _diag(
-            "usage: python3 -I -c <program> <agent-id> <outrig-dir> [<rpyc-dir>]; "
-            f"got {sys.argv[1:]!r}"
-        )
+    if len(sys.argv) not in (2, 3):
+        _diag(f"usage: python3 -I -c <program> <outrig-dir> [<rpyc-dir>]; got {sys.argv[1:]!r}")
         os._exit(2)
-    global _primary, _reader_thread
+    global _reader_thread
     # Before any agent exists, and every process it starts inherits it.
     _set_ceiling()
     # Straight after the standard library, and before anything agent code can write joins
     # `sys.path`, for the reason RPyC is: what `import outrig` finds is this process's own.
     try:
-        _load_outrig(sys.argv[2])
+        _load_outrig(sys.argv[1])
     except Exception as e:
-        _diag(f"OutRig's package could not be imported from {sys.argv[2]}: {e!r}")
+        _diag(f"OutRig's package could not be imported from {sys.argv[1]}: {e!r}")
         os._exit(2)
     # Before the workspace joins `sys.path`, so a module there named `rpyc` is not what this
     # process imports, and before any agent code runs, so `sys.modules` holds this copy for the
     # interpreter's life: a later `pip install rpyc` changes nothing in here.
-    if len(sys.argv) == 4:
-        _load_rpyc(sys.argv[3])
+    if len(sys.argv) == 3:
+        _load_rpyc(sys.argv[2])
     _open_imports()
-    primary = Kernel(sys.argv[1])
-    primary.thread = threading.current_thread()
-    _kernels[primary.agent] = primary
-    _primary = primary
     # Before the reader starts, so no interrupt can arrive with nothing to handle it.
     signal.signal(signal.SIGINT, _on_sigint)
-    primary.announce()
+    # The greeting names no agent: there is none yet, and there may never be one on this thread.
+    _send({"t": "ready", "version": _VERSION})
     _reader_thread = threading.Thread(target=_read, name="reader", daemon=True)
     _reader_thread.start()
-    primary.serve()
+    # The main thread serves the kernel the host opens onto it, and until then -- in a session
+    # with no primary agent, for good -- waits, still taking signals, for the reader to end the
+    # process.
+    _onto_main.get().serve()
 
 
 if __name__ == "__main__":

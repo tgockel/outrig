@@ -319,21 +319,7 @@ pub(crate) fn resolve_agent(
     // parallel code path, so every fallback below is written once.
     let empty;
     let agent = match agent_name {
-        Some(name) => cfg.agents.get(name).ok_or_else(|| {
-            let known = if cfg.agents.is_empty() {
-                "(none)".to_string()
-            } else {
-                cfg.agents
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            LlmResolveError::UnknownAgent {
-                name: name.to_string(),
-                known,
-            }
-        })?,
+        Some(name) => find_agent(cfg, name)?,
         None => {
             empty = Agent::default();
             &empty
@@ -410,6 +396,27 @@ pub(crate) fn resolve_agent(
             .tool_result_max
             .or(cfg.tool_result_max)
             .unwrap_or(DEFAULT_TOOL_RESULT_MAX_BYTES) as usize,
+    })
+}
+
+/// The `[agents.<name>]` block `cfg` defines as `name`, or an error naming
+/// every agent it does define.
+pub(crate) fn find_agent<'a>(cfg: &'a Config, name: &str) -> Result<&'a Agent, AgentError> {
+    cfg.agents.get(name).ok_or_else(|| {
+        let known = if cfg.agents.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.agents
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        LlmResolveError::UnknownAgent {
+            name: name.to_string(),
+            known,
+        }
+        .into()
     })
 }
 

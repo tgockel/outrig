@@ -59,7 +59,7 @@ pub(crate) use self::history::rig_json;
 use self::history::{History, Window};
 use self::ledger::Ledger;
 use self::resolve::LlmResolveError;
-pub(crate) use self::resolve::ResolvedAgent;
+pub(crate) use self::resolve::{ResolvedAgent, find_agent};
 use self::round::Finished;
 use self::tool::{Interrupts, SubmitPython};
 
@@ -94,8 +94,6 @@ pub(crate) struct Agent {
     /// which the chain holds.
     pub(crate) budget: Arc<Budget>,
     tool_call_max: usize,
-    python_version: String,
-    container_name: String,
     /// Shared with the tool and each round's hook; what
     /// [`Agent::interrupter`] presses.
     interrupts: Interrupts,
@@ -119,14 +117,6 @@ impl Agent {
     /// The `[models.<name>]` row every model call is tried against first.
     pub(crate) fn model(&self) -> &str {
         &self.budget.model
-    }
-
-    pub(crate) fn python_version(&self) -> &str {
-        &self.python_version
-    }
-
-    pub(crate) fn container_name(&self) -> &str {
-        &self.container_name
     }
 
     /// What stops the Python the current round waits on: see
@@ -197,7 +187,6 @@ impl Agent {
         ledger: Ledger,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
-        let python_version = interpreter.version().to_string();
         let announcer = Announcer::new(interpreter.clone());
         let user = UserChannel::new(interpreter.clone());
         let window = Window::DEFAULT;
@@ -244,7 +233,7 @@ impl Agent {
         let events = history.events();
         events.emit(Payload::AgentStarted {
             model: budget.model.clone(),
-            python: python_version.clone(),
+            python: interpreter.version().to_string(),
             container: container_name.to_string(),
             tool_call_max: resolved.tool_call_max as u64,
             tool_result_max: resolved.tool_result_max_bytes as u64,
@@ -264,8 +253,6 @@ impl Agent {
             history,
             budget: Arc::new(budget),
             tool_call_max: resolved.tool_call_max,
-            python_version,
-            container_name: container_name.to_string(),
             interrupts,
             user,
             announcer,

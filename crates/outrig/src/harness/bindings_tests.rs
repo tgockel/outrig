@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::event::{Event, HostedOutcome, HostedReason, Payload, Received, Subscription};
+use super::event::{
+    Event, HostedOutcome, HostedReason, Operation, Payload, Received, Subscription,
+};
 use super::{
     Approval, ApprovalRequest, DEFAULT_DRAIN, HostedCall, Session, SessionBuilder, SessionError,
     ShutdownReport, Stopped, Verdict,
@@ -710,6 +712,130 @@ async fn agent_code_reaches_its_binding_by_name() {
     assert_eq!(
         kinds,
         ["hosted.received", "hosted.dispatched", "hosted.ended"]
+    );
+}
+
+/// An event naming a request: its kind, the agent it names, and how the request ended when it is
+/// its end.
+type Named = (&'static str, String, Option<HostedOutcome>);
+
+/// Each `call` request `events` hold: the agent that made it, and each event naming its id, in
+/// order.
+fn calls_by_agent(events: &[Arc<Event>]) -> Vec<(String, Vec<Named>)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            Payload::HostedReceived {
+                request,
+                agent,
+                operation: Operation::Call,
+                ..
+            } => Some((*request, agent.clone())),
+            _ => None,
+        })
+        .map(|(id, agent)| {
+            let named = events.iter().filter_map(|event| match &event.payload {
+                Payload::HostedReceived { request, agent, .. }
+                | Payload::HostedDispatched { request, agent, .. }
+                    if *request == id =>
+                {
+                    Some((event.kind(), agent.clone(), None))
+                }
+                Payload::HostedEnded {
+                    request,
+                    agent,
+                    outcome,
+                    ..
+                } if *request == id => Some((event.kind(), agent.clone(), Some(*outcome))),
+                _ => None,
+            });
+            (agent, named.collect())
+        })
+        .collect()
+}
+
+/// A session with no primary agent serves each kernel the host opens alike: a kernel reaches the
+/// fixture through the production relay, every event of its call names that kernel and shares
+/// the call's id, and a second kernel does the same beside it. The report then has the bindings'
+/// group empty, and no execution.
+#[tokio::test]
+async fn kernels_a_session_with_no_primary_opens_reach_its_bindings() {
+    let bed = Bed::new();
+    bed.write(FIXTURE, "");
+    let mut builder = bed.builder(bed.load()).no_primary();
+    let mut events = builder.subscribe();
+    let session = start(builder).await;
+    let interpreter = session.interpreter();
+    for agent in ["a", "b"] {
+        within(interpreter.open(agent))
+            .await
+            .unwrap_or_else(|e| panic!("{agent}: {e}"));
+    }
+    for agent in ["a", "b"] {
+        // The host drives no kernel's work but the primary's, so the test speaks for it.
+        interpreter.send_line(json!({
+            "t": "exec", "agent": agent, "id": 1, "src": "fx.thread_name()",
+        }));
+    }
+    let mut seen = Vec::new();
+    within(async {
+        loop {
+            seen.extend(taken(&mut events));
+            let ended = calls_by_agent(&seen)
+                .iter()
+                .filter(|(_, named)| {
+                    named
+                        .last()
+                        .is_some_and(|(kind, ..)| *kind == "hosted.ended")
+                })
+                .count();
+            if ended == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let report = stop(session).await;
+    seen.extend(taken(&mut events));
+
+    let mut calls = calls_by_agent(&seen);
+    calls.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let named = |agent: &str| {
+        let agent = agent.to_string();
+        vec![
+            ("hosted.received", agent.clone(), None),
+            ("hosted.dispatched", agent.clone(), None),
+            ("hosted.ended", agent, Some(HostedOutcome::Returned)),
+        ]
+    };
+    assert_eq!(
+        calls,
+        [("a".to_string(), named("a")), ("b".to_string(), named("b"))]
+    );
+    for event in &seen {
+        let agent = match &event.payload {
+            Payload::HostedReceived { agent, .. }
+            | Payload::HostedDispatched { agent, .. }
+            | Payload::HostedEnded { agent, .. }
+            | Payload::HostedCallback { agent, .. } => Some(agent),
+            _ => None,
+        };
+        let subject = event.subject.as_ref().map(|subject| subject.as_str());
+        assert_eq!(
+            subject,
+            agent.map(|agent| format!("agent/{agent}")).as_deref(),
+            "{event:?}"
+        );
+    }
+    assert_eq!(report.stopped, Stopped::Proven, "{report:?}");
+    assert!(report.executions.is_empty(), "{report:?}");
+    assert!(
+        report
+            .bindings
+            .as_ref()
+            .is_some_and(|stop| stop.group_empty),
+        "{report:?}"
     );
 }
 

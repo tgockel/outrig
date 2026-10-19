@@ -455,11 +455,11 @@ a token from text.
 
 Every kernel -- the primary and every child -- gets each binding's name bound to RPyC's proxy of
 the binding's root, resolved at first use on the thread that uses it. **Building a kernel resolves
-nothing.** The primary kernel is built before the reader thread starts, every other kernel is
-built on the reader thread itself, by `_open`, and the reader thread, which delivers every reply,
-never waits for one; the first operation on a binding's name opens the kernel's first connection
-and fetches the root, on the kernel's own thread or on the worker a `to_thread` call runs on
-(`0003-23`, fork 1).
+nothing.** Every kernel, the primary's included, is built on the reader thread itself, by `_open`,
+when the host opens it (`0003-28`) -- the primary's is then served on the main thread -- and the
+reader thread, which delivers every reply, never waits for one; the first operation on a binding's
+name opens the kernel's first connection and fetches the root, on the kernel's own thread or on
+the worker a `to_thread` call runs on (`0003-23`, fork 1).
 
 The agent learns its bindings three ways, and none crosses the boundary:
 

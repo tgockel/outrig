@@ -1,11 +1,12 @@
 //! The session an owner holds: its rounds, its user channel, its interrupter,
 //! and how it stops.
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use super::bindings::Bindings;
-use super::builder::SessionBuilder;
+use super::builder::{self, SessionBuilder};
 use super::event::{Payload, SessionState};
 use super::lifecycle::Lifecycle;
 use super::report::{
@@ -13,8 +14,10 @@ use super::report::{
 };
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
-use crate::agent::{Agent, AgentError};
+use crate::agent::ledger::Ledger;
+use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::Config;
+use crate::python::host::{Interpreter, PRIMARY};
 use crate::python::supervisor::STOP_GRACE;
 
 /// How long an execution an interrupt reached has to end of its own accord --
@@ -26,7 +29,8 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(1);
 /// an exiting interpreter, and a second.
 const EXIT_WAIT: Duration = Duration::from_secs(6);
 
-/// A running session: a container, the Python interpreter in it, and the
+/// A running session: a container, the Python interpreter in it, and --
+/// unless it was started with [`SessionBuilder::no_primary`] -- the primary
 /// agent that acts by writing Python there, driven one round at a time.
 ///
 /// Its owner drives rounds ([`Session::round`]), talks to the agent through
@@ -35,29 +39,97 @@ const EXIT_WAIT: Duration = Duration::from_secs(6);
 /// [`Session::shutdown`], whose report says whether everything it started has
 /// stopped. A round ending is not the work being done: Python a round started
 /// can still be running, which its outcome names.
+///
+/// A session with no primary agent has everything else a session has -- its
+/// container and interpreter, its bindings, admission, events and report --
+/// and no rounds: [`Session::round`] returns [`SessionError::NoPrimary`], and
+/// [`Session::user_channel`], [`Session::interrupter`] and [`Session::model`]
+/// return `None`. It is idle from its start until it closes.
 pub struct Session {
     id: String,
-    pub(crate) agent: Agent,
+    /// The primary agent, when the session has one.
+    agent: Option<Agent>,
+    interpreter: Interpreter,
     container: Option<Outrig>,
+    container_name: String,
     lifecycle: Arc<Lifecycle>,
     bindings: Bindings,
+    /// Every model call the session makes, whichever agent makes it.
+    ledger: Ledger,
 }
 
 impl Session {
+    /// A session over what its start launched: `interpreter`, in `container`
+    /// when there is one, moving through `lifecycle`, beside `bindings`. The
+    /// interpreter's admission is the session's, and its exit closes it. It
+    /// has no primary agent until [`Session::build_primary`] builds one.
     pub(crate) fn new(
         id: String,
-        agent: Agent,
+        interpreter: Interpreter,
         container: Option<Outrig>,
+        container_name: String,
         lifecycle: Arc<Lifecycle>,
         bindings: Bindings,
     ) -> Self {
+        lifecycle.attach(interpreter.gate());
+        // Weak: the interpreter outlives nothing the session holds, and a strong
+        // reference from it back to the session would.
+        let weak: Weak<Lifecycle> = Arc::downgrade(&lifecycle);
+        interpreter.on_exit(move || {
+            if let Some(lifecycle) = weak.upgrade() {
+                lifecycle.exited();
+            }
+        });
+        let ledger = Ledger::new(lifecycle.events().clone());
         Self {
             id,
-            agent,
+            agent: None,
+            interpreter,
             container,
+            container_name,
             lifecycle,
             bindings,
+            ledger,
         }
+    }
+
+    /// Open the primary agent's kernel, on the interpreter's main thread, and
+    /// build the agent `resolved` names over it, in a container whose
+    /// workspace is `workspace`: its spend recorded in the session's ledger,
+    /// and its rounds moving the session's state.
+    pub(crate) async fn build_primary(
+        &mut self,
+        resolved: &ResolvedAgent,
+        workspace: Option<&Path>,
+    ) -> Result<(), AgentError> {
+        self.interpreter.open(PRIMARY).await?;
+        let agent = Agent::build(
+            resolved,
+            self.interpreter.clone(),
+            &self.container_name,
+            workspace,
+            &self.bindings.briefs(),
+            self.ledger.clone(),
+            Arc::clone(&self.lifecycle),
+        )?;
+        self.agent = Some(agent);
+        Ok(())
+    }
+
+    /// The session has started: idle.
+    pub(crate) fn idle(&self) {
+        self.lifecycle.set(SessionState::Idle);
+    }
+
+    /// Stop what the start launched, which failed after the session was put
+    /// together: its bindings, then its container. Nothing is reported.
+    pub(crate) async fn abandon(self) {
+        let Self {
+            container,
+            mut bindings,
+            ..
+        } = self;
+        builder::stop(container, &mut bindings).await;
     }
 
     /// Start a session of `agent` over `config`, with every default: keys from
@@ -86,31 +158,33 @@ impl Session {
         &self.id
     }
 
-    /// The `[models.<name>]` row every model call is tried against first. An
+    /// The `[models.<name>]` row every model call of the primary agent is
+    /// tried against first, or `None` for a session with no primary agent. An
     /// alias has already been resolved to its models, so this never names an
     /// alias: it is the first of them this build can reach. A call that fails
     /// there moves to the next, and the session's events name the model that
     /// answered each call.
-    pub fn model(&self) -> &str {
-        self.agent.model()
+    pub fn model(&self) -> Option<&str> {
+        self.agent.as_ref().map(Agent::model)
     }
 
     /// The Python version the interpreter reported when it started, such as
     /// `3.13.15`.
     pub fn python_version(&self) -> &str {
-        self.agent.python_version()
+        self.interpreter.version()
     }
 
     /// The name of the container the interpreter runs in.
     pub fn container_name(&self) -> &str {
-        self.agent.container_name()
+        &self.container_name
     }
 
-    /// The user's end of the agent's `user` channel: how what the user types
-    /// reaches the agent, and how what the agent sends reaches them. Every
-    /// call hands out the same channel.
-    pub fn user_channel(&self) -> UserChannel {
-        self.agent.user_channel()
+    /// The user's end of the primary agent's `user` channel: how what the
+    /// user types reaches the agent, and how what the agent sends reaches
+    /// them. Every call hands out the same channel. `None` for a session with
+    /// no primary agent, which has no user channel.
+    pub fn user_channel(&self) -> Option<UserChannel> {
+        self.agent.as_ref().map(Agent::user_channel)
     }
 
     /// A function that stops the Python the current round is waiting on --
@@ -129,8 +203,11 @@ impl Session {
     /// future is how to stop one there. Python left holding the interpreter
     /// with nothing waiting on it, after a second call or a dropped round, is
     /// [`Session::stop_held`]'s, between rounds.
-    pub fn interrupter(&self) -> impl Fn() -> Option<String> + Send + Sync + 'static {
-        self.agent.interrupter()
+    ///
+    /// `None` for a session with no primary agent, which has no rounds to wait
+    /// on Python.
+    pub fn interrupter(&self) -> Option<impl Fn() -> Option<String> + Send + Sync + 'static> {
+        self.agent.as_ref().map(Agent::interrupter)
     }
 
     /// Stop the execution left holding the interpreter with nothing waiting
@@ -146,9 +223,9 @@ impl Session {
     /// as a first [`Session::interrupter`] call's would, and ending it is what
     /// lets the execution start. Code that catches both keeps the interpreter:
     /// call again, or end the session. How it ended reaches the model with the
-    /// next call's result.
+    /// next call's result. A session with no primary agent holds none.
     pub fn stop_held(&self) -> Option<String> {
-        self.agent.stop_held()
+        self.agent.as_ref().and_then(Agent::stop_held)
     }
 
     /// Close the session to new work, at once: from now on [`Session::round`]
@@ -207,11 +284,17 @@ impl Session {
     /// before it and its completed tool calls the same way. Python it was
     /// waiting on keeps running, and holds the interpreter until it ends;
     /// [`Session::stop_held`] stops it.
+    ///
+    /// A session with no primary agent runs no round, open or closed:
+    /// [`SessionError::NoPrimary`].
     pub async fn round(&mut self) -> Result<RoundOutcome, SessionError> {
+        let Some(agent) = &mut self.agent else {
+            return Err(SessionError::NoPrimary);
+        };
         if let Some(by) = self.lifecycle.closed() {
             return Err(Closed::from(by).into());
         }
-        match self.agent.round().await {
+        match agent.round().await {
             Ok(None) => Ok(RoundOutcome::NothingNew),
             Ok(Some((finished, tasks))) => Ok(RoundOutcome::Ended(RoundEnd {
                 reply: finished.reply,
@@ -254,14 +337,16 @@ impl Session {
         let Self {
             id: _,
             agent,
+            interpreter,
             container,
+            container_name: _,
             lifecycle,
             mut bindings,
+            ledger: _,
         } = self;
         lifecycle.close(ClosedBy::Owner);
         let until = tokio::time::Instant::now() + deadline;
         let events = lifecycle.events();
-        let interpreter = agent.interpreter.clone();
         let gate = interpreter.gate();
         {
             // What the drain waits for: the executions running at the close,
@@ -336,8 +421,10 @@ impl Session {
             })
             .collect();
         let closed_by = gate.closed().unwrap_or(ClosedBy::Owner);
-        drop(agent);
-        events.emit(Payload::AgentStopped {});
+        if let Some(agent) = agent {
+            drop(agent);
+            events.emit(Payload::AgentStopped {});
+        }
         events.emit(Payload::SessionReport {
             closed_by: closed_by.clone(),
             stopped: stopped.clone(),
@@ -369,8 +456,24 @@ impl Session {
 
     /// The session's interpreter, for a test.
     #[cfg(test)]
-    pub(crate) fn interpreter(&self) -> &crate::python::host::Interpreter {
-        &self.agent.interpreter
+    pub(crate) fn interpreter(&self) -> &Interpreter {
+        &self.interpreter
+    }
+
+    /// The session's primary agent, for a test of a session that has one.
+    #[cfg(test)]
+    pub(crate) fn primary(&self) -> &Agent {
+        self.agent
+            .as_ref()
+            .expect("the session has a primary agent")
+    }
+
+    /// [`Session::primary`], to change.
+    #[cfg(test)]
+    pub(crate) fn primary_mut(&mut self) -> &mut Agent {
+        self.agent
+            .as_mut()
+            .expect("the session has a primary agent")
     }
 
     /// The session's bindings, for a test.
