@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A build's temporary tag is no longer stranded when the working container's removal is
+  refused.** When stamping labels failed and buildah refused the removal of the `outrig-label-*`
+  working container, the tag's removal retried alongside it, was refused as in use, and could give
+  up before the container went, leaving the whole built image under an `outrig-tmp-*` tag. The two
+  removals are now retried in order before the build returns, container first, so the tag's gets
+  its full retries after the container is gone; only what still will not go is detached.
+
 - **A `Container` handle addresses its container by the engine's id, not its name.** Since 0002-40
   only `stop` did; `exec_stdio`, `exec_capture`, the PID and network probes, `podman init`, an MCP
   server started with `podman start --attach`, and a `view = "primary"` sidecar's

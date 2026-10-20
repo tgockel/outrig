@@ -135,14 +135,14 @@ fn ended_by_our_kill(kill: Kill, status: &std::process::ExitStatus) -> bool {
 /// that reports it as an error -- and retrying that forever would spend
 /// processes on it forever. Two retries covers a transient lock; a third
 /// attempt failing says the answer is not going to change.
-const CLEANUP_RETRIES: u8 = 2;
+pub(crate) const CLEANUP_RETRIES: u8 = 2;
 
 /// Delay before the first retry; doubled for each one after it.
 ///
 /// Long enough that a retry is not simply the same contended instant again,
 /// short enough that the whole sequence is over well inside a session
 /// teardown.
-const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Most *arrivals* the reaper accepts in one pass before it scans.
 ///
@@ -830,6 +830,29 @@ impl CleanupGuard {
     pub(crate) fn release(mut self) {
         self.0 = None;
     }
+
+    /// Hand the removals `guards` owe to the reaper as one ordered obligation.
+    ///
+    /// For removals where a later one cannot succeed until an earlier one has:
+    /// dropped separately they run side by side, and the later one can spend
+    /// its whole retry budget while the earlier is still being refused. The
+    /// chain starts each after the last has finished, with a budget of its own.
+    ///
+    /// The chain is reissued only if every removal in it may be.
+    pub(crate) fn detach_chain(guards: Vec<CleanupGuard>) {
+        let mut reissue = Reissue::Safe;
+        let cmds = guards
+            .into_iter()
+            .filter_map(|mut guard| guard.0.take())
+            .map(|(cmd, each)| {
+                if each == Reissue::Once {
+                    reissue = Reissue::Once;
+                }
+                cmd
+            })
+            .collect();
+        detach_cleanup_chain(cmds, reissue);
+    }
 }
 
 impl Drop for CleanupGuard {
@@ -1481,6 +1504,35 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!marker.exists(), "a released guard still ran its cleanup");
+    }
+
+    /// Guards detached together run in the order given, and none of them
+    /// discharges on its own afterward.
+    #[test]
+    fn detached_guards_run_as_one_ordered_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+
+        CleanupGuard::detach_chain(vec![
+            CleanupGuard::arm(
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("sleep 0.4; : > {}", first.display())),
+                Reissue::Safe,
+            ),
+            CleanupGuard::arm(
+                Cmd::new("/bin/sh").arg("-c").arg(format!(
+                    "test -e {} && : > {}",
+                    first.display(),
+                    second.display()
+                )),
+                Reissue::Safe,
+            ),
+        ]);
+
+        wait_for(&second, Duration::from_secs(10), "the chain to finish");
+        assert!(first.exists(), "the first removal must have run");
     }
 
     /// Kills the blocked cleanups however the test ends, so a failed assertion

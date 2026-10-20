@@ -62,7 +62,9 @@ outrig build [--image <name>]
      [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
      The temporary tag is then removed, whether or not the build succeeded. If buildah refuses
      the removal, outrig warns and reissues it in the background rather than leaving the tag
-     behind; the build's own result stands either way.
+     behind; the build's own result stands either way. When the label-stamping working container
+     could not be removed either, the tag is removed after it, since buildah refuses to remove an
+     image a container was made from.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 

@@ -26,7 +26,7 @@ use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_t
 use crate::engine_env;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
-use crate::supervise::{CleanupGuard, Reissue};
+use crate::supervise::{CLEANUP_RETRIES, CleanupGuard, RETRY_BACKOFF, Reissue};
 
 /// Repository used for build-type images that have no image-config name (the
 /// nameless library path: [`crate::Outrig::launch`] with a raw build spec).
@@ -525,14 +525,28 @@ pub async fn build_image_for(
 /// because a cancellation landing inside that cleanup is the case the guard is
 /// for. Three call sites got that right independently; one is easier to keep
 /// right.
+///
+/// `build` is handed a list for removals it could not finish and that the
+/// tag's removal has to wait for: buildah will not remove an image a working
+/// container was made from. Those are retried here, awaited and in order, ahead
+/// of the tag's own, so they finish before this returns -- a CLI that exits on
+/// the build's error would take a background reaper, and the `rmi` queued
+/// behind the `rm`, with it. Only what the retries cannot clear is detached.
 async fn into_temp_tag<F>(tag: &ImageTag, transcript: Option<&Transcript>, build: F) -> Result<()>
 where
-    F: AsyncFnOnce(&ImageTag) -> Result<()>,
+    F: AsyncFnOnce(&ImageTag, &mut Vec<Owed>) -> Result<()>,
 {
     let temp_tag = temporary_build_tag(tag);
     let temp_owned = temp_tag_guard(&temp_tag);
-    let result = build(&temp_tag).await;
-    discharge(temp_owned, "image not known", transcript).await;
+    let mut first = Vec::new();
+    let result = build(&temp_tag, &mut first).await;
+    if first.is_empty() {
+        discharge(temp_owned, "image not known", transcript).await;
+    } else {
+        // No lone `rmi` first: it would be refused as in use.
+        first.push((temp_owned, "image not known"));
+        discharge_in_order(first, transcript).await;
+    }
     result
 }
 
@@ -544,14 +558,14 @@ async fn build_image_with_build_args(
     no_cache: bool,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
-    into_temp_tag(tag, None, async |temp_tag| {
+    into_temp_tag(tag, None, async |temp_tag, owed_first| {
         process::run_streamed_checked(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, None).await
+        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, None, owed_first).await
     })
     .await
 }
@@ -567,7 +581,7 @@ async fn build_image_logged_with_build_args(
     build_args: &BTreeMap<String, ResolvedEnvValue>,
     output: BuildOutput,
 ) -> Result<()> {
-    into_temp_tag(tag, transcript, async |temp_tag| {
+    into_temp_tag(tag, transcript, async |temp_tag, owed_first| {
         run_shown_or_captured(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
@@ -576,7 +590,7 @@ async fn build_image_logged_with_build_args(
             output,
         )
         .await?;
-        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, transcript).await
+        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, transcript, owed_first).await
     })
     .await
 }
@@ -759,7 +773,7 @@ pub async fn build_standalone(
     // removing the temporary one leaves the image under the caller's. On the
     // path where the build never reached the tag, it is a real delete --
     // which is what the guard is for.
-    into_temp_tag(tag, None, async |temp_tag| {
+    into_temp_tag(tag, None, async |temp_tag, _owed_first| {
         // `--label` stays on the build. The cached path commits its labels
         // afterwards because it has to merge the Dockerfile's own against the
         // config's; a standalone project has its whole label set up front.
@@ -1087,10 +1101,11 @@ async fn stamp_repo_image_labels(
     final_tag: &ImageTag,
     config_mcp: &BTreeMap<String, McpServerSpec>,
     transcript: Option<&Transcript>,
+    owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
     let labels = merged_mcp_config_to_labels(image, &inherited, config_mcp)?;
-    commit_image_with_labels(source_tag, final_tag, &labels, transcript).await
+    commit_image_with_labels(source_tag, final_tag, &labels, transcript, owed_first).await
 }
 
 async fn commit_image_with_labels(
@@ -1098,6 +1113,7 @@ async fn commit_image_with_labels(
     final_tag: &ImageTag,
     labels: &BTreeMap<String, String>,
     transcript: Option<&Transcript>,
+    owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let builder = temporary_builder_name();
     // `outrig-label-<pid>-<nonce>`, so likewise this build's alone.
@@ -1136,14 +1152,19 @@ async fn commit_image_with_labels(
     }
     .await;
 
-    // `commit --rm` takes the working container on the success path, and
-    // `discharge` on the failure path. A reissue that leaves races the
-    // caller's `rmi` of the image this container was made from, which buildah
-    // refuses as in use if it loses -- so that guard stays armed too, and its
-    // backed-off retries land once the container is gone.
+    // `commit --rm` takes the working container on the success path, and the
+    // awaited removal on the failure path. One buildah refuses is handed to
+    // the caller still armed rather than reissued here: the caller's `rmi` of
+    // the image this container was made from is refused as in use until the
+    // container is gone, so the two are detached as one chain, `rm` first,
+    // and the `rmi` gets its whole retry budget after the `rm` is done.
     match result {
         Ok(()) => builder_owned.release(),
-        Err(_) => discharge(builder_owned, "container not known", transcript).await,
+        Err(_) => owed_first.extend(
+            try_remove(builder_owned, "container not known", transcript)
+                .await
+                .map(|(guard, _)| (guard, "container not known")),
+        ),
     }
     result
 }
@@ -1165,11 +1186,66 @@ async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Resul
 /// failure is warned about rather than returned: the caller is holding the
 /// build's own result, which a cleanup failure must not replace.
 async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transcript>) {
+    if let Some((guard, failure)) = try_remove(guard, absent, transcript).await {
+        warn_left_behind(&failure);
+        drop(guard);
+    }
+}
+
+/// A removal that is owed, and the stderr [`left_nothing`] reads as its target
+/// already being gone.
+type Owed = (CleanupGuard, &'static str);
+
+/// Run each removal in `owed` awaited, in order, retrying a refused one on the
+/// schedule [`supervise`](crate::supervise) gives a detached cleanup, and only
+/// then move on to the next.
+///
+/// What still will not go after its retries is detached, still in order, so a
+/// later one is not raced against an earlier one that is still owed.
+async fn discharge_in_order(owed: Vec<Owed>, transcript: Option<&Transcript>) {
+    let mut left = Vec::new();
+    for (guard, absent) in owed {
+        let mut guard = Some(guard);
+        let mut backoff = RETRY_BACKOFF;
+        for attempt in 0..=CLEANUP_RETRIES {
+            let Some(owed) = guard.take() else { break };
+            match try_remove(owed, absent, transcript).await {
+                None => {}
+                Some((still_owed, failure)) => {
+                    if attempt == CLEANUP_RETRIES {
+                        warn_left_behind(&failure);
+                    } else {
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                    guard = Some(still_owed);
+                }
+            }
+        }
+        left.extend(guard);
+    }
+    CleanupGuard::detach_chain(left);
+}
+
+fn warn_left_behind(failure: &OutrigError) {
+    tracing::warn!(
+        target: "outrig::image",
+        "a build cleanup left its target behind; reissuing it in the background: {failure}"
+    );
+}
+
+/// One awaited attempt at `guard`'s removal: `None` once it left nothing
+/// behind, otherwise the guard still armed, with why it did.
+async fn try_remove(
+    guard: CleanupGuard,
+    absent: &str,
+    transcript: Option<&Transcript>,
+) -> Option<(CleanupGuard, OutrigError)> {
     let cmd = guard.removal().clone();
     let failure = match process::try_capture_logged(cmd.clone(), "buildah", transcript).await {
         Ok(output) if left_nothing(&output, absent) => {
             guard.release();
-            return;
+            return None;
         }
         Ok(output) => cmd.process_error(
             output.status.code(),
@@ -1177,10 +1253,7 @@ async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transc
         ),
         Err(e) => e,
     };
-    tracing::warn!(
-        target: "outrig::image",
-        "a build cleanup left its target behind; reissuing it in the background: {failure}"
-    );
+    Some((guard, failure))
 }
 
 /// Whether a removal's output shows its target gone: removed now, or never
