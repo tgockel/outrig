@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
+
+The second patch release since 0.2.0. Most of it is fixes, and the `outrig run` prompt becomes a
+line editor on a terminal (see **Added**). Several fixes refuse a config that used to load,
+because it could give an agent your credentials or write access to the global config. A repo
+config, or an image's `org.outrig.mcp` label, may reference only the host variables the global
+config's `[repo] env-allow` lists, and that list is empty by default. A repo config may not
+declare a provider that carries an `api-key`. A workspace outrig picks may not contain the global
+config, and the walk up from the current directory takes only a config you own. A container no
+longer inherits the host's proxy variables, and a `--global-config` path that does not exist is
+an error. One known issue: at the line editor, a byte that is not UTF-8 ends the session (#516).
+Piped and redirected input is unaffected.
 
 ### Added
 
@@ -399,12 +410,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that ends outrig sweeps them now. No panic that reaches this is known; the path is closed
   rather than a crash fixed. (#349)
 
-- **A line of input that is not valid UTF-8 no longer ends `outrig run`.** One byte that was
-  not UTF-8 failed the read with `error: stream did not contain valid UTF-8`, exit 1, and the
-  containers were torn down, so `outrig run < prompts.txt` with a single Latin-1 byte never ran
-  the prompts after it. The line is now sent with U+FFFD in place of each bad sequence, and the
-  session goes on. See
-  [Line editing and history](../../doc/usage/run.md#line-editing-and-history). (#344)
+- **A line of piped or redirected input that is not valid UTF-8 no longer ends `outrig run`.**
+  One byte that was not UTF-8 failed the read with `error: stream did not contain valid UTF-8`,
+  exit 1, and the containers were torn down, so `outrig run < prompts.txt` with a single Latin-1
+  byte never ran the prompts after it. The line is now sent with U+FFFD in place of each bad
+  sequence, and the session goes on. The line editor, which reads when stdin is the terminal you
+  are typing at, is not covered: the `rustyline` release it is built on fails the read at the
+  first byte that is not UTF-8, from an `Alt` key that sets the eighth bit or a paste from a
+  Latin-1 source, and the session ends with an error. Redirect stdin to send such input. See
+  [Line editing and history](../../doc/usage/run.md#line-editing-and-history). (#344, #516)
 
 - **`outrig config init` asks again for an answer the config would refuse.** An API key variable
   that was not a variable name -- `openai_api_key`, `${OPENAI_API_KEY}` as the prompt's help

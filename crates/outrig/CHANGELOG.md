@@ -5,7 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
+
+The second patch release since 0.2.0. Every change to the public surface is additive, and no
+requirement moves. Several fixes change what a consumer sees without asking. `Outrig::launch`
+refuses an image label's `${VAR}` that `LaunchSpec::embedded_mcp_env_allow` does not list, so a
+`LaunchSpec` built by hand needs `with_embedded_mcp_env_allow`, or `EmbeddedMcpPolicy::Ignore`.
+`LaunchSpec::from_config` now pulls or builds the primary image. A container no longer carries
+the host's proxy variables, `Config::validate_as_repo` refuses a repo provider that carries an
+`api-key`, and `load_project` takes only a config its process's user owns. The rest are fixes,
+each described below.
+
+### Added
+
+- **`Container::selector`**: what to hand podman to address a container -- the engine's id for one
+  outrig created, else its name. `PrimaryView::new` takes it for `--userns=container:`.
+
+- **`ImageConfig::set_image_name` turns an image-config into a pull source in place.** It is the
+  counterpart of `set_build_paths` and mirrors `from_image_name`: it sets `image_name`, clears
+  both build paths, and drops the recorded `ConfigSource`. Converting a build source to a pull
+  source had no way to clear the private build paths before. `build_args` is left alone, as
+  `set_build_paths` leaves it, and validation still reports `ImageNameWithBuildArgs` if any
+  remain. `image_name` is still a public field, so assigning it directly can still leave the
+  build paths set and reach the `source` panic; closing that takes a breaking release. (#270)
+- **`Workspace::config_source` names the file that declared `host-path`**, as
+  `MountConfig::config_source` does for a mount (#445).
+- **`Config::warnings` reports what a config load set aside rather than failing on.** Each
+  `ConfigWarning` names the file (`None` from `load_from_str`), the 1-based line, the key as a
+  dotted TOML path such as `models."opus-4.8".context-window` or `workspace.mounts[1].acess`, and
+  a `ConfigWarningKind`: `UnknownKey`, or `InvalidValue { reason }` for a value the global config
+  could not read. `Display` is one line, ``<file>:<line>: unknown key `events`, ignored``, and
+  `merge` keeps both sides' warnings, global first. `Config::load_unvalidated` and
+  `load_file_unvalidated` stop where `load` and `load_file` would validate, and
+  `validate_for_run` and `validate_for_build` are now public, so a caller can show the warnings
+  before a validation error they explain: a misspelled `provider` is set aside, and its model is
+  then refused for having none. (#507)
+
+- **`image::ensure_local_image_requested_by` names who asked for a ref that is not local.** It is
+  `ensure_local_image` with a `requester` -- `--image`, `[sidecars.tools]` -- that a miss names
+  as `image "<ref>" (from <requester>)`. `SidecarPlan::image_declared_by` supplies the phrase for
+  a sidecar: its `[sidecars.<name>]` block, or the MCP server whose inline `image` key implied
+  it. `ensure_local_image` keeps its signature and leaves the parenthetical out. (#355)
+
+- **`container::with_panic_sweep` sweeps for a panic that ends the process, and for no other.**
+  It runs a closure -- `main`'s body -- and, if a panic unwinds out of it, detaches the
+  label-scoped removal of every attempt still owed before the panic carries on. By then the
+  unwind has dropped every `Container` the closure held, so the sweep finds only what `Drop`
+  could not reach. A panic caught anywhere inside, including by a tokio task's `JoinHandle`, is
+  not swept. (#349)
+
+- **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
+  It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
+  (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
+  `buildah build` or `podman pull` to the process's stderr as `[buildah]` / `[podman]` lines
+  while it runs -- once, since a `Transcript` that already mirrors to stderr is left to do it --
+  and a failure then carries no tail, because the lines are already above it. The cache probe,
+  the label commit, and the `$ <cmd>` echo are unaffected. (#478)
+
+- **`Config::load_global` reads a global config on its own.** It parses the file, resolves
+  `session-root` and `model-cache-root` beside it, and stamps every path entry with its origin, but
+  neither merges nor validates: a global file's `default-model` may name a model only a repo
+  declares. A missing file loads as empty, as it does for `Config::load`. This is the read for a
+  caller that wants a machine-level key and has no repo.
+
+- **A `tools/call` deadline you can set per server and per session.** `McpServerSpec` gains a
+  `call-timeout-secs` table key (`call_timeout_secs()`, `with_call_timeout_secs`), and `Config` a
+  top-level `mcp_call_timeout_secs`, merged repo over global. The most specific wins, read after
+  every merge: a server's own key, then the session's, then `DEFAULT_MCP_CALL_TIMEOUT_SECS` (600).
+  Both are validated to 1..=`MCP_CALL_TIMEOUT_SECS_CEILING` (3600) as
+  `ConfigValidationError::McpCallTimeoutSecsZero` / `McpCallTimeoutSecsTooLarge`, including by
+  `load_for_build`. An `org.outrig.mcp` label and a standalone `image.toml` may carry the key and
+  are held to the same range (`EmbeddedImageConfigError::CallTimeoutOutOfRange`,
+  `StandaloneImageTomlError::CallTimeoutOutOfRange`). The value travels through
+  `SidecarServerSpec::with_call_timeout_secs`, `LaunchSpec::mcp_call_timeout_secs` /
+  `with_mcp_call_timeout_secs`, and `SessionMcpPlan::mcp_call_timeout_secs` /
+  `call_timeout(&PlacedServer)`, and reaches a client through `McpClient::with_call_timeout`;
+  `Outrig::launch` and `add_sidecar` apply it to every server they connect. An unset key
+  serializes as before, so existing labels and cache keys are unchanged. (#338)
+
+- **`NetworkInterceptor::drop_attachment` lets go of one container without awaiting.** It does
+  to one attachment what dropping the interceptor does to all of them: the container's loops are
+  aborted, its resolver is put back before the call returns, and its redirect table is deleted
+  in the background. Nothing is reported, and the name is free to `attach` again. It is for code
+  that cannot await, such as a destructor unwinding an attach that was never committed. `detach`
+  is still the form that confirms the undo. (#345)
+
+### Changed
+
+- **A key a config file does not know is set aside with a warning instead of failing the load.**
+  `load_from_str` and every `Config::load*` drop the key, record it in `Config::warnings`, and
+  read the rest, so a config written for a newer outrig loads -- the 0.3 line's `[events]`, a
+  model's `context-window`, a provider's `role-alternation`. The global config, which every
+  outrig on a machine reads, also sets aside a value that does not deserialize -- a wrong type,
+  an unknown `style`, a missing required key -- with the smallest entry holding it: the key, or
+  one mount of a mount list, but never one element of any other list, so no argv runs short. A
+  repo or `--config` file still fails on one, and names a misspelled required key rather than
+  the key it stood for. Nothing in `[network]` or a `security` table is ever set
+  aside, since leaving a key out there can give a container more than the file allows, and a
+  TOML syntax error and an unquoted dotted name such as `[models.opus-4.7]` still fail. A dropped
+  value's warning never quotes an `api-key`. Only the loader changed: every config type is still
+  `deny_unknown_fields`, so the JSON schema, an `org.outrig.mcp` label, a standalone
+  `image.toml`, and a bare `toml::from_str::<Config>` still refuse the key. The quoting hint
+  `ConfigDottedKey` carries now needs the unknown key to follow an unquoted `.` in a header, so
+  an unknown key in a `[providers.<name>]` table, whose error lands on the whole header, and a
+  `[section.sub]` header for a section this build does not know no longer draw it. (#507)
 
 ### Fixed
 
@@ -125,102 +228,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documents it, and validation refuses a malformed entry -- more than three fields, a relative
   container path, permissions outside `r`, `w`, `m` (or repeating one) -- with the new
   `ConfigValidationError::DevicePathMalformed` instead of leaving it to fail at `podman run`. (#263)
-
-### Added
-
-- **`Container::selector`**: what to hand podman to address a container -- the engine's id for one
-  outrig created, else its name. `PrimaryView::new` takes it for `--userns=container:`.
-
-- **`ImageConfig::set_image_name` turns an image-config into a pull source in place.** It is the
-  counterpart of `set_build_paths` and mirrors `from_image_name`: it sets `image_name`, clears
-  both build paths, and drops the recorded `ConfigSource`. Converting a build source to a pull
-  source had no way to clear the private build paths before. `build_args` is left alone, as
-  `set_build_paths` leaves it, and validation still reports `ImageNameWithBuildArgs` if any
-  remain. `image_name` is still a public field, so assigning it directly can still leave the
-  build paths set and reach the `source` panic; closing that takes a breaking release. (#270)
-- **`Workspace::config_source` names the file that declared `host-path`**, as
-  `MountConfig::config_source` does for a mount (#445).
-- **`Config::warnings` reports what a config load set aside rather than failing on.** Each
-  `ConfigWarning` names the file (`None` from `load_from_str`), the 1-based line, the key as a
-  dotted TOML path such as `models."opus-4.8".context-window` or `workspace.mounts[1].acess`, and
-  a `ConfigWarningKind`: `UnknownKey`, or `InvalidValue { reason }` for a value the global config
-  could not read. `Display` is one line, ``<file>:<line>: unknown key `events`, ignored``, and
-  `merge` keeps both sides' warnings, global first. `Config::load_unvalidated` and
-  `load_file_unvalidated` stop where `load` and `load_file` would validate, and
-  `validate_for_run` and `validate_for_build` are now public, so a caller can show the warnings
-  before a validation error they explain: a misspelled `provider` is set aside, and its model is
-  then refused for having none. (#507)
-
-- **`image::ensure_local_image_requested_by` names who asked for a ref that is not local.** It is
-  `ensure_local_image` with a `requester` -- `--image`, `[sidecars.tools]` -- that a miss names
-  as `image "<ref>" (from <requester>)`. `SidecarPlan::image_declared_by` supplies the phrase for
-  a sidecar: its `[sidecars.<name>]` block, or the MCP server whose inline `image` key implied
-  it. `ensure_local_image` keeps its signature and leaves the parenthetical out. (#355)
-
-- **`container::with_panic_sweep` sweeps for a panic that ends the process, and for no other.**
-  It runs a closure -- `main`'s body -- and, if a panic unwinds out of it, detaches the
-  label-scoped removal of every attempt still owed before the panic carries on. By then the
-  unwind has dropped every `Container` the closure held, so the sweep finds only what `Drop`
-  could not reach. A panic caught anywhere inside, including by a tokio task's `JoinHandle`, is
-  not swept. (#349)
-
-- **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
-  It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
-  (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
-  `buildah build` or `podman pull` to the process's stderr as `[buildah]` / `[podman]` lines
-  while it runs -- once, since a `Transcript` that already mirrors to stderr is left to do it --
-  and a failure then carries no tail, because the lines are already above it. The cache probe,
-  the label commit, and the `$ <cmd>` echo are unaffected. (#478)
-
-- **`Config::load_global` reads a global config on its own.** It parses the file, resolves
-  `session-root` and `model-cache-root` beside it, and stamps every path entry with its origin, but
-  neither merges nor validates: a global file's `default-model` may name a model only a repo
-  declares. A missing file loads as empty, as it does for `Config::load`. This is the read for a
-  caller that wants a machine-level key and has no repo.
-
-- **A `tools/call` deadline you can set per server and per session.** `McpServerSpec` gains a
-  `call-timeout-secs` table key (`call_timeout_secs()`, `with_call_timeout_secs`), and `Config` a
-  top-level `mcp_call_timeout_secs`, merged repo over global. The most specific wins, read after
-  every merge: a server's own key, then the session's, then `DEFAULT_MCP_CALL_TIMEOUT_SECS` (600).
-  Both are validated to 1..=`MCP_CALL_TIMEOUT_SECS_CEILING` (3600) as
-  `ConfigValidationError::McpCallTimeoutSecsZero` / `McpCallTimeoutSecsTooLarge`, including by
-  `load_for_build`. An `org.outrig.mcp` label and a standalone `image.toml` may carry the key and
-  are held to the same range (`EmbeddedImageConfigError::CallTimeoutOutOfRange`,
-  `StandaloneImageTomlError::CallTimeoutOutOfRange`). The value travels through
-  `SidecarServerSpec::with_call_timeout_secs`, `LaunchSpec::mcp_call_timeout_secs` /
-  `with_mcp_call_timeout_secs`, and `SessionMcpPlan::mcp_call_timeout_secs` /
-  `call_timeout(&PlacedServer)`, and reaches a client through `McpClient::with_call_timeout`;
-  `Outrig::launch` and `add_sidecar` apply it to every server they connect. An unset key
-  serializes as before, so existing labels and cache keys are unchanged. (#338)
-
-- **`NetworkInterceptor::drop_attachment` lets go of one container without awaiting.** It does
-  to one attachment what dropping the interceptor does to all of them: the container's loops are
-  aborted, its resolver is put back before the call returns, and its redirect table is deleted
-  in the background. Nothing is reported, and the name is free to `attach` again. It is for code
-  that cannot await, such as a destructor unwinding an attach that was never committed. `detach`
-  is still the form that confirms the undo. (#345)
-
-### Changed
-
-- **A key a config file does not know is set aside with a warning instead of failing the load.**
-  `load_from_str` and every `Config::load*` drop the key, record it in `Config::warnings`, and
-  read the rest, so a config written for a newer outrig loads -- the 0.3 line's `[events]`, a
-  model's `context-window`, a provider's `role-alternation`. The global config, which every
-  outrig on a machine reads, also sets aside a value that does not deserialize -- a wrong type,
-  an unknown `style`, a missing required key -- with the smallest entry holding it: the key, or
-  one mount of a mount list, but never one element of any other list, so no argv runs short. A
-  repo or `--config` file still fails on one, and names a misspelled required key rather than
-  the key it stood for. Nothing in `[network]` or a `security` table is ever set
-  aside, since leaving a key out there can give a container more than the file allows, and a
-  TOML syntax error and an unquoted dotted name such as `[models.opus-4.7]` still fail. A dropped
-  value's warning never quotes an `api-key`. Only the loader changed: every config type is still
-  `deny_unknown_fields`, so the JSON schema, an `org.outrig.mcp` label, a standalone
-  `image.toml`, and a bare `toml::from_str::<Config>` still refuse the key. The quoting hint
-  `ConfigDottedKey` carries now needs the unknown key to follow an unquoted `.` in a header, so
-  an unknown key in a `[providers.<name>]` table, whose error lands on the whole header, and a
-  `[section.sub]` header for a section this build does not know no longer draw it. (#507)
-
-### Fixed
 
 - **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.**
   glibc's loader opens that file on every start by its absolute name, and no loader option turns

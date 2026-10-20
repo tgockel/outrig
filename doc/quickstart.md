@@ -38,7 +38,7 @@ Install the CLI package to get the `outrig` command:
 ```sh
 $ cargo install outrig-cli
 $ outrig --version
-outrig 0.2.1
+outrig 0.2.2
 ```
 
 ## Try it before configuring anything

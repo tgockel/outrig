@@ -82,8 +82,8 @@ reqwest            = { version = "0.13.4",  default-features = false }
 rig                = { version = "0.40.0",  default-features = false, package = "rig-core" }
 rmcp               = { version = "3.4.1",   default-features = false }
 # Carries kkawakam/rustyline#985, unmerged, so invalid UTF-8 input does not end a `readline`.
-# `cargo publish` drops `git` and resolves `version` from crates.io, which lacks the fix, so
-# this must not be released (#516).
+# `cargo publish` drops `git` and resolves `version` from crates.io, which lacks the fix, so a
+# published build's line editor ends the session on such input, as 0.2.2's does (#516).
 rustyline          = { version = "18.0.0",  default-features = false, git = "https://github.com/tgockel/rustyline", branch = "invalid-utf8-lossy" }
 schemars           = { version = "1.2.2",   default-features = false }
 serde              = { version = "1.0.229", default-features = false }
