@@ -496,3 +496,196 @@ async fn ctrl_c_at_the_terminal_reaches_the_program() {
     assert_eq!(status.code(), Some(0), "{seen}");
     assert!(seen.contains("got SIGINT"), "{seen:?}");
 }
+
+// ------------------------------------------------------------------------- the grace and sessions
+
+/// Start `outrig run` with `args`, wait for the program to raise `ready`, and send `outrig` each
+/// of `signals`, a fifth of a second apart. How it ended, and how long after the first signal.
+async fn signalled(
+    case: &Case,
+    args: &[&str],
+    ready: &Path,
+    signals: &[Signal],
+) -> (Output, Duration) {
+    let child = case.outrig(args).spawn().expect("outrig starts");
+    appears(ready).await;
+    let pid = Pid::from_raw(child.id().unwrap() as i32);
+    let first = Instant::now();
+    for (n, signal) in signals.iter().enumerate() {
+        if n > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        kill(pid, *signal).unwrap();
+    }
+    let ran = timeout(TEST_TIMEOUT, child.wait_with_output())
+        .await
+        .expect("outrig timed out")
+        .unwrap();
+    (ran, first.elapsed())
+}
+
+/// A program that ignores `SIGINT` is stopped once its grace has passed -- `SIGTERM`, which ends
+/// it -- and the grace is `--grace`, else `[host] grace-secs`, else five seconds; the flag wins
+/// over the configuration. `--grace` is the program's, and a bare `outrig run` refuses it.
+#[tokio::test]
+async fn the_grace_is_the_flags_else_the_configurations() {
+    let case = Case::new();
+    case.write(
+        "ignores.py",
+        "import signal, sys, time\n\
+         signal.signal(signal.SIGINT, signal.SIG_IGN)\n\
+         open(sys.argv[1], 'w').close()\n\
+         time.sleep(60)\n",
+    );
+    let ready = case.path().join("ready");
+    let ready_arg = ready.to_str().unwrap();
+    for (config, flag, at_least, below) in [
+        ("", Some("1"), 1, 4),
+        ("[host]\ngrace-secs = 2\n", None, 2, 5),
+        ("[host]\ngrace-secs = 30\n", Some("1"), 1, 4),
+    ] {
+        let _ = std::fs::remove_file(&ready);
+        case.write(".agents/outrig/config.toml", config);
+        let mut args = vec!["run"];
+        if let Some(flag) = flag {
+            args.extend(["--grace", flag]);
+        }
+        args.extend(["ignores.py", ready_arg]);
+        let (ran, waited) = signalled(&case, &args, &ready, &[Signal::SIGINT]).await;
+        assert_eq!(
+            ran.status.code(),
+            Some(143),
+            "{config:?} {flag:?}: {}",
+            text(&ran.stderr)
+        );
+        assert!(
+            waited >= Duration::from_secs(at_least) && waited < Duration::from_secs(below),
+            "{config:?} {flag:?}: {waited:?}"
+        );
+    }
+
+    let refused = case.run(&["run", "--grace", "1"]).await;
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("<SCRIPT>"),
+        "{}",
+        text(&refused.stderr)
+    );
+}
+
+/// A second signal ends the grace at once: a program that ignores `SIGINT` is stopped at the
+/// second, well inside a minute's grace.
+#[tokio::test]
+async fn a_second_signal_ends_the_grace_at_once() {
+    let case = Case::new();
+    case.write(
+        "ignores.py",
+        "import signal, sys, time\n\
+         signal.signal(signal.SIGINT, signal.SIG_IGN)\n\
+         open(sys.argv[1], 'w').close()\n\
+         time.sleep(60)\n",
+    );
+    let ready = case.path().join("ready");
+    let (ran, waited) = signalled(
+        &case,
+        &[
+            "run",
+            "--grace",
+            "60",
+            "ignores.py",
+            ready.to_str().unwrap(),
+        ],
+        &ready,
+        &[Signal::SIGINT, Signal::SIGINT],
+    )
+    .await;
+    assert_eq!(ran.status.code(), Some(143), "{}", text(&ran.stderr));
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}
+
+/// Making an `outrig.Session` asks the container runtime for nothing; entering it does. With the
+/// runtime's stubs failing every call, the entry fails, saying so, and the program goes on.
+#[tokio::test]
+async fn a_session_asks_the_runtime_for_nothing_until_it_is_entered() {
+    let case = Case::new();
+    case.write(
+        ".agents/outrig/config.toml",
+        "default-image = \"alpine\"\n\n[images.alpine]\nimage-name = \"docker.io/library/alpine:latest\"\n",
+    );
+    case.write(
+        "enters.py",
+        "import asyncio, os, outrig, sys, time\n\
+         async def main():\n\
+         \x20   session = outrig.Session()\n\
+         \x20   open(sys.argv[1], 'w').close()\n\
+         \x20   while not os.path.exists(sys.argv[2]):\n\
+         \x20       await asyncio.sleep(0.01)\n\
+         \x20   try:\n\
+         \x20       async with session:\n\
+         \x20           print('entered')\n\
+         \x20   except RuntimeError:\n\
+         \x20       print('refused')\n\
+         asyncio.run(main())\n",
+    );
+    let (made, go) = (case.path().join("made"), case.path().join("go"));
+    let child = case
+        .outrig(&[
+            "run",
+            "enters.py",
+            made.to_str().unwrap(),
+            go.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("outrig starts");
+    appears(&made).await;
+    assert_eq!(
+        case.runtime_calls(),
+        "",
+        "made, and nothing asked of the runtime"
+    );
+    std::fs::write(&go, "").unwrap();
+    let ran = timeout(TEST_TIMEOUT, child.wait_with_output())
+        .await
+        .expect("outrig timed out")
+        .unwrap();
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    assert_eq!(text(&ran.stdout), "refused\n");
+    assert!(
+        case.runtime_calls().starts_with("podman "),
+        "{}",
+        case.runtime_calls()
+    );
+}
+
+/// A host directory mounted twice fails the entry before anything is asked of the runtime.
+#[tokio::test]
+async fn a_repeated_mount_fails_entry_before_the_runtime_is_asked() {
+    let case = Case::new();
+    std::fs::create_dir(case.path().join("data")).unwrap();
+    case.write(
+        "twice.py",
+        "import asyncio, outrig\n\
+         async def main():\n\
+         \x20   try:\n\
+         \x20       async with outrig.Session(mounts=[outrig.Mount('data', '/a'), outrig.Mount('data', '/b')]):\n\
+         \x20           print('entered')\n\
+         \x20   except RuntimeError as e:\n\
+         \x20       print(e)\n\
+         asyncio.run(main())\n",
+    );
+    let ran = case.run(&["run", "twice.py"]).await;
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    let data = case.path().join("data");
+    assert!(
+        text(&ran.stdout).starts_with(&format!(
+            "workspace mount host-path \"{}\" is mounted more than once",
+            data.canonicalize().unwrap_or(data.clone()).display()
+        )) || text(&ran.stdout).starts_with(&format!(
+            "workspace mount host-path \"{}\" is mounted more than once",
+            data.display()
+        )),
+        "{}",
+        text(&ran.stdout)
+    );
+    assert_eq!(case.runtime_calls(), "");
+}

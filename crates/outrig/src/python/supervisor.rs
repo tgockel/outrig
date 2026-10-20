@@ -78,6 +78,7 @@ use tokio::time::Instant;
 
 use super::host::{STDERR_LINE_MAX, STDERR_TAIL_LINES, next_line};
 use crate::error::{OutrigError, Result};
+use crate::supervise::{Debt, Owed, owe};
 
 /// The binding program as the payload's `-c` argument, staged by `build.rs` as `host.rs`'s
 /// `PROGRAM` is.
@@ -107,6 +108,9 @@ const GRACE_POLL: Duration = Duration::from_millis(20);
 const KILL_POLL: Duration = Duration::from_millis(10);
 /// How long after `SIGKILL` the group has to empty before `stop` gives up on proving it.
 const KILL_WAIT: Duration = Duration::from_secs(2);
+/// How long the group of a [`Supervised`] dropped unsettled has to empty before its cleanup
+/// counts as failed.
+const DROPPED_GROUP_WAIT: Duration = Duration::from_secs(10);
 /// The signal the owner's death delivers to the process, which it catches.
 const DEATH_SIGNAL: Signal = Signal::SIGHUP;
 
@@ -612,9 +616,26 @@ impl Drop for Supervised {
     fn drop(&mut self) {
         // Unsettled, the group dies now -- with its leader reaped or not: survivors hold its id.
         // The process itself is then killed once more and reaped by `kill_on_drop` and tokio's
-        // orphan queue; the group is what only this knows about.
+        // orphan queue; the group is what only this knows about, and it is cleanup owed to
+        // whoever dropped this until `kill` proves it empty.
         if !self.settled {
             let _ = kill(group(self.pid), Signal::SIGKILL);
+            let (pid, killed) = (self.pid, std::time::Instant::now());
+            owe(move || {
+                if group_empty(group(pid)) {
+                    Some(Ok(()))
+                } else if killed.elapsed() < DROPPED_GROUP_WAIT {
+                    None
+                } else {
+                    let left: Vec<String> =
+                        group_members(pid).iter().map(Member::to_string).collect();
+                    Some(Err(format!(
+                        "the process group {pid} was not proven empty within \
+                         {DROPPED_GROUP_WAIT:?}; it still holds {}",
+                        left.join(", ")
+                    )))
+                }
+            });
         }
     }
 }
@@ -650,12 +671,18 @@ fn parent_thread() -> io::Result<std_mpsc::Sender<Job>> {
 /// Spawn `cmd`, which [`supervise`] armed, from the parent thread, under the calling runtime.
 pub(crate) async fn spawn_supervised(mut cmd: Command) -> io::Result<Supervised> {
     let handle = Handle::current();
+    // The job may drop the child on the requester's behalf, so it runs under the requester's
+    // owner, and is owed to that owner until it has run.
+    let owner = Owed::current();
+    let owed = Debt::new();
     let (tx, rx) = oneshot::channel();
     let job: Job = Box::new(move || {
         let _runtime = handle.enter();
+        let _owner = owner.as_ref().map(Owed::enter);
         // A reply nobody reads -- the requester's start dropped meanwhile -- drops the
         // `Supervised` value, which ends the group.
         let _ = tx.send(cmd.spawn().map(Supervised::new));
+        drop(owed);
     });
     parent_thread()?
         .send(job)
@@ -791,6 +818,6 @@ fn tail_text(tail: &Mutex<VecDeque<String>>) -> String {
 }
 
 /// The start of `line`, as a diagnostic quotes it.
-pub(super) fn quoted(line: &[u8]) -> String {
+pub(crate) fn quoted(line: &[u8]) -> String {
     String::from_utf8_lossy(&line[..line.len().min(QUOTED)]).into_owned()
 }

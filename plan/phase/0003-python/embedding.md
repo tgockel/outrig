@@ -221,9 +221,12 @@ print(session.shutdown_report)
   (`agent-classes.md`, "From the host program"; `0003-35`).
 
 The engine survives the program (`0003-29`): a program that exits or dies with a session open has
-its sessions shut down and their reports printed; one that does not respond to a forwarded SIGINT or
-SIGTERM gets a configurable cooperative grace, then SIGTERM and SIGKILL to its group
-(`lifecycle.md`, "The host program"). What a program does not have in this phase: rounds and a user
+its sessions shut down and their reports printed, and a start still running has it interrupted and
+what it made removed, waited for; one that does not respond to a forwarded SIGINT or SIGTERM gets
+a configurable cooperative grace, then SIGTERM and SIGKILL to its group (`lifecycle.md`, "The host
+program"). A program's session directory, `<session-root>/<id>/logs`, holds its `events.jsonl` and
+no `session.json`, so `outrig ls` does not list it yet
+(`plan/next/host-program-sessions-are-listed.md`). What a program does not have in this phase: rounds and a user
 channel, since it has no primary; an approver, which is a `plan/next/` entry; skill sources of its
 own; and the explicit child API. The Python API is fixed at the 0.3.0 release with the Rust one.
 
@@ -361,7 +364,6 @@ thread that reads the environment, and every process started meanwhile inherits 
   Today only errors are kept free, by rendering them to text (`AgentError`).
 - CocoClaw's report of retries hidden below its service methods was not checked against its code
   in this design work.
-- That one process can hold several sessions at once. Each session's container, interpreter and
-  bindings process are its own, but process-wide state -- the container panic hook, the cleanup
-  reaper thread -- has only run with one session in a process. `0003-29`'s acceptance runs two
-  at once for a host program.
+- ~~That one process can hold several sessions at once.~~ Run by `0003-29`'s tests: a host
+  program held two sessions at once, in containers and on the host with a binding each, and each
+  stopped with its own report. The container panic hook's sweep was not exercised with two.

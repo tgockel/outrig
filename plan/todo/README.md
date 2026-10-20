@@ -98,12 +98,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**A host program**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-29` | A host program owns a session, and the engine survives it          |
-
 **Children**
 
 | Task      | What it settles                                                    |

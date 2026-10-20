@@ -8,7 +8,8 @@ In an agent's kernel, `outrig.runtime` is the runtime of the execution reading i
 execution's own proxy of a binding, whatever the kernel's globals now hold under its name.
 
 In a program `outrig run <script.py>` runs on the host, `outrig.config()` is a read-only view of
-the configuration it loaded: see `help(outrig.config)`.
+the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
+`help(outrig.config)` and `help(outrig.Session)`.
 """
 
 from . import schema
@@ -20,7 +21,18 @@ __all__ = ["schema"]
 _KERNEL_ONLY = frozenset({"runtime", "bindings"})
 # What only a program on the host has, bound by `outrig._host`. Absent anywhere else, so that
 # `hasattr` answers rather than raises.
-_HOST_ONLY = frozenset({"config"})
+_HOST_ONLY = frozenset(
+    {
+        "config",
+        "Session",
+        "Mount",
+        "Event",
+        "Missed",
+        "ShutdownReport",
+        "ShutdownException",
+        "current_session",
+    }
+)
 
 
 def __getattr__(name):

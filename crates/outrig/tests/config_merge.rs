@@ -8,10 +8,11 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    BuildImageNameError, Config, ConfigSource, ConfigValidationError, EventsMode, ImageConfig,
-    LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction,
-    NetworkEntry, NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView,
-    SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
+    BuildImageNameError, Config, ConfigSource, ConfigValidationError, DEFAULT_HOST_GRACE_SECS,
+    EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig, LlmProvider, McpServerSpec, MountAccess,
+    MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
+    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
+    check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -2065,6 +2066,60 @@ allow = ["github.com:443"]
             .expect_err("an unknown mode")
             .to_string();
         assert!(err.contains("record"), "{err}");
+    }
+
+    /// `[host] grace-secs` merges as the top-level keys do: a repo's value
+    /// wins, a global one stands where the repo is silent, and with neither it
+    /// is five seconds.
+    #[test]
+    fn the_repo_host_grace_wins_and_silence_inherits() {
+        let grace = |secs: u64| parse(&format!("[host]\ngrace-secs = {secs}\n"));
+        assert_eq!(parse("").host.grace_secs(), DEFAULT_HOST_GRACE_SECS);
+        assert_eq!(DEFAULT_HOST_GRACE_SECS, 5);
+        assert_eq!(merge(grace(30), grace(2)).host.grace_secs(), 2, "repo wins");
+        assert_eq!(
+            merge(grace(30), parse("")).host.grace_secs(),
+            30,
+            "global stands"
+        );
+        assert_eq!(
+            merge(grace(30), parse("[host]\n")).host.grace_secs(),
+            30,
+            "a bare table declares nothing"
+        );
+        assert_eq!(
+            merge(parse(""), grace(0)).host.grace_secs(),
+            0,
+            "0 is a value"
+        );
+
+        let mut repo = Config::default();
+        repo.host.set_grace_secs(9);
+        assert_eq!(merge(grace(30), repo).host.grace_secs(), 9, "built in code");
+    }
+
+    /// `[host]` refuses a key it does not know, and a grace past the hour.
+    #[test]
+    fn host_block_refuses_an_unknown_key_and_an_absurd_grace() {
+        let err = Config::load_from_str("[host]\ngrace = 5\n")
+            .expect_err("an unknown key")
+            .to_string();
+        assert!(err.contains("grace"), "{err}");
+
+        let cfg = parse(&format!(
+            "[host]\ngrace-secs = {}\n",
+            HOST_GRACE_SECS_CEILING + 1
+        ));
+        assert!(matches!(
+            expect_validation_err(&cfg, None),
+            ConfigValidationError::HostGraceSecsTooLarge {
+                value: 3601,
+                max: 3600
+            }
+        ));
+        parse(&format!("[host]\ngrace-secs = {HOST_GRACE_SECS_CEILING}\n"))
+            .validate(None)
+            .expect("the ceiling itself is allowed");
     }
 
     /// `merge` is public and infallible, so it cannot reject a repo value that

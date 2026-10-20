@@ -89,6 +89,8 @@ fn outrig_schema_imports_on_the_host_and_runtime_says_it_is_a_kernels() {
         except Exception as e:
             print('from-import', type(e).__name__)
         print(hasattr(outrig, 'config'))
+        print([name for name in ('Session', 'Mount', 'Event', 'Missed', 'ShutdownReport',
+                                 'ShutdownException', 'current_session') if hasattr(outrig, name)])
         "#);
     assert_eq!(
         out,
@@ -98,7 +100,8 @@ fn outrig_schema_imports_on_the_host_and_runtime_says_it_is_a_kernels() {
          RuntimeError outrig.bindings exists only in an agent's kernel, where OutRig runs agent \
          code, and this Python is not one\n\
          from-import RuntimeError\n\
-         False\n"
+         False\n\
+         []\n"
     );
 }
 

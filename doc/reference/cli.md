@@ -262,12 +262,16 @@ See [Usage -> outrig run](../usage/run.md) for REPL details.
 
 Run a trusted Python program on the host (preview): the script as `__main__` under the Python
 OutRig carries, with every argument after it as its own. It starts no container and calls no
-model.
+model until the program enters a session with `outrig.Session`.
 
 ```
 outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--verbose]
-       run <script.py> [args...]
+       run [--grace <secs>] <script.py> [args...]
 ```
+
+| Flag             | Default             | Description                                           |
+|------------------|---------------------|-------------------------------------------------------|
+| `--grace <secs>` | `[host] grace-secs` | How long the program has to end after a first signal. |
 
 - The global flags apply before the script, wherever they are written there. The session flags
   above -- `--agent`, `--model`, `--image`, `--session-dir`, `--max-tool-calls`,
@@ -277,11 +281,18 @@ outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--ver
   spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
 - The configuration is loaded and validated once, from the invocation's directory as for every
   command, before the program starts. The program reads it as `outrig.config()`.
-- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group.
-- The exit status is the program's, or 128 plus the number of the signal that ended it. A script
-  that cannot be opened as a file, a configuration that does not load, or a declared workspace
-  whose path is not UTF-8, which `outrig.config()` cannot show, is an `error:` line and status
-  `1`, with nothing started.
+- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group. The
+  first starts the program's grace, `--grace` seconds -- else `[host] grace-secs`, else 5, at
+  most 3600 -- not counting time spent shutting down a session the program asked to shut down.
+  Past it, or at a second signal, the program's group gets `SIGTERM`, then `SIGKILL` five seconds
+  later; a further signal sends `SIGKILL` at once. `--grace` is refused without a script.
+- Each session the program leaves open -- it exits, raises, is killed or is stopped -- is shut
+  down, its report printed on stderr under a line naming it; one it was still entering has its
+  start stopped, with one line saying so. `outrig` exits once each is stopped.
+- The exit status is the program's, or 128 plus the number of the signal that ended it, or `3`
+  when a session it left open is not proven stopped. A script that cannot be opened as a file, a
+  configuration that does not load, or a declared workspace whose path is not UTF-8, which
+  `outrig.config()` cannot show, is an `error:` line and status `1`, with nothing started.
 
 A later release makes `outrig run` the command of the sessions whose agents write Python. See
 [Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program

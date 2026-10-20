@@ -922,18 +922,21 @@ fn outrig_imports_in_every_kernel_as_that_kernels_runtime() {
     );
 }
 
-/// `outrig.config` is a host program's: in a kernel it is absent, so `hasattr`
-/// answers, and reading it says where it exists. No kernel holds the view.
+/// `outrig.config`, `outrig.Session` and the rest of a host program's names are
+/// absent in a kernel, so `hasattr` answers, and reading one says where it
+/// exists. No kernel holds the view, or owns a session.
 #[test]
-fn outrig_config_is_absent_in_a_kernel() {
+fn a_host_programs_names_are_absent_in_a_kernel() {
     let mut k = Interpreter::start();
     let probe = "import outrig\n\
-                 print(hasattr(outrig, 'config'))\n\
-                 try:\n    outrig.config\n\
+                 names = ('config', 'Session', 'Mount', 'Event', 'Missed', 'ShutdownReport',\n\
+                          'ShutdownException', 'current_session')\n\
+                 print([name for name in names if hasattr(outrig, name)])\n\
+                 try:\n    outrig.Session\n\
                  except AttributeError as e:\n    print(e)";
     assert_eq!(
         k.output(1, probe),
-        "False\noutrig.config exists only in a program `outrig run` runs on the host, \
+        "[]\noutrig.Session exists only in a program `outrig run` runs on the host, \
          and this Python is not one\n"
     );
 }

@@ -25,18 +25,24 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::ffi::OsString;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use regex::Regex;
 
 use super::payload;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::tail_string;
+use crate::supervise;
 
 /// How much of pip's output an error carries.
 const PIP_TAIL: usize = 4 * 1024;
+
+/// How often a running pip is checked for its exit, and the install for being dropped.
+const PIP_POLL: Duration = Duration::from_millis(20);
 
 /// pip, run as a program of its own so that its source-distribution step is disabled for the
 /// run. `--only-binary=:all:` constrains what pip resolves from an index and nothing else: a
@@ -99,9 +105,11 @@ pub(crate) async fn install(root: &Path, install: Install<'_>) -> Result<PathBuf
     let python = install.python.to_path_buf();
     let env = install.env.to_vec();
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || {
+    // Dropped part way, the install ends pip and removes its stage, as cleanup owed to whoever
+    // dropped it.
+    supervise::blocking(move |dropped| {
         payload::locked_once(&target, || {
-            install_into(&root, &target, &python, &set, &env)
+            install_into(&root, &target, &python, &set, &env, dropped)
         })
     })
     .await
@@ -194,13 +202,15 @@ fn hash(set: &[String]) -> String {
 }
 
 /// Install `set` into `target`, through a stage beside it that is renamed into place once
-/// complete, so `target` either holds a whole install or does not exist.
+/// complete, so `target` either holds a whole install or does not exist. Once `dropped` says
+/// nothing awaits the install, pip is ended and the stage removed.
 fn install_into(
     root: &Path,
     target: &Path,
     python: &Path,
     set: &[String],
     env: &[(OsString, OsString)],
+    dropped: &dyn Fn() -> bool,
 ) -> Result<()> {
     let stage = tempfile::Builder::new()
         .prefix(".install-")
@@ -212,7 +222,7 @@ fn install_into(
             .suffix(".json")
             .tempfile_in(root)
             .path_ctx("create a file in", root)?;
-        run_pip(python, stage.path(), report.path(), set, env)?;
+        run_pip(python, stage.path(), report.path(), set, env, dropped)?;
         let dists = dists(stage.path())?;
         check_reported(&dists, report.path(), set)?;
         check_pure(stage.path(), &dists, set)?;
@@ -230,8 +240,12 @@ fn run_pip(
     report: &Path,
     set: &[String],
     env: &[(OsString, OsString)],
+    dropped: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let output = Command::new(python)
+    // Its output goes to a file rather than pipes, so nothing has to read it while pip runs and
+    // this is free to watch for the install being dropped.
+    let mut output = tempfile::tempfile()?;
+    let mut pip = Command::new(python)
         .args([
             "-I",
             "-c",
@@ -259,16 +273,29 @@ fn run_pip(
         .env("PIP_ROOT", "/")
         .env("PIP_NO_DEPS", "0")
         .envs(env.iter().map(|(k, v)| (k, v)))
-        .output()
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(output.try_clone()?)
+        .spawn()
         .path_ctx("run pip with", python)?;
-    if output.status.success() {
+    let status = loop {
+        if let Some(status) = pip.try_wait()? {
+            break status;
+        }
+        if dropped() {
+            let _ = pip.kill();
+            let _ = pip.wait();
+            return Err(std::io::Error::other("nothing awaits the install any more").into());
+        }
+        std::thread::sleep(PIP_POLL);
+    };
+    if status.success() {
         return Ok(());
     }
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let mut said = Vec::new();
+    output.rewind()?;
+    output.read_to_end(&mut said)?;
+    let said = String::from_utf8_lossy(&said);
     let unmet = said
         .lines()
         .rev()
@@ -467,6 +494,7 @@ mod tests {
 
     use super::super::testing::{pip_env, python, wheel_links};
     use super::*;
+    use crate::supervise::Tracked;
 
     fn installed(root: &Path, requires: &[&str], env: &[(OsString, OsString)]) -> Result<PathBuf> {
         let requires: Vec<String> = requires.iter().map(|req| req.to_string()).collect();
@@ -708,7 +736,8 @@ mod tests {
         };
         // The first session's install, done while the waiter holds for the lock.
         let real = pip_env(wheel_links());
-        install_into(root.path(), &dir, python(), &set, &real).expect("the first install");
+        install_into(root.path(), &dir, python(), &set, &real, &|| false)
+            .expect("the first install");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!waiter.is_finished(), "the waiter waited for the lock");
         drop(held);
@@ -721,6 +750,67 @@ mod tests {
         assert_eq!(answer(&dir, "pure"), "42\n");
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(entries(root.path()), [name]);
+    }
+
+    /// An install dropped while pip runs ends pip -- killed and reaped -- and leaves no stage,
+    /// and is owed to whoever dropped it until it has. The python here is a stand-in that writes
+    /// its pid and sleeps, so pip is the process to end.
+    #[tokio::test]
+    async fn a_dropped_install_ends_pip_and_leaves_no_stage() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a root");
+        let bin = tempfile::tempdir().expect("a directory for the stand-in");
+        let pid_file = bin.path().join("pid");
+        let fake = bin.path().join("python3");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("make it runnable");
+
+        let requires = ["pure==1.0".to_string()];
+        let mut running = Tracked::new(install(
+            root.path(),
+            Install {
+                python: &fake,
+                requires: &requires,
+                env: &[],
+            },
+        ));
+        let pid = loop {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut running)
+                    .await
+                    .is_err(),
+                "the stand-in never ends on its own"
+            );
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+        };
+
+        assert_eq!(
+            running.owed().settled(Duration::from_secs(10)).await,
+            Ok(())
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "pip outlived its install"
+        );
+        assert!(
+            entries(root.path()).is_empty(),
+            "the stage is left: {:?}",
+            entries(root.path())
+        );
     }
 
     #[test]

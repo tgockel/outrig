@@ -18,12 +18,14 @@ use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::program::{self, Program, Spec};
+use super::program;
 use super::testing::{
     Flag, alive, eventually, host_home, package, py, python, wait_group_gone, within,
 };
 use crate::config::Config;
-use crate::harness::program::view;
+use crate::harness::{HostProgram, RunningProgram};
+use crate::owner::tests::Testing;
+use crate::owner::view;
 
 /// A directory a program runs in: its scripts, its working directory, and its captured streams.
 struct Case {
@@ -56,17 +58,18 @@ impl Case {
         path
     }
 
-    /// Start `script`, as given, with `args`, `config` as the view, working in `cwd` -- the
-    /// directory when `None` -- and `adjust` applied after the defaults: the test `HOME`, stdin
-    /// from `stdin` in the directory when it exists, and stdout and stderr to files there.
+    /// Start `script`, as given, with `args`, `config` as the configuration of a repository at
+    /// the directory, working in `cwd` -- the directory when `None` -- and `adjust` applied
+    /// after the defaults: the test `HOME`, stdin from `stdin` in the directory when it exists,
+    /// and stdout and stderr to files there.
     async fn start_with(
         &self,
         script: &str,
         args: &[&str],
-        config: Value,
+        config: Config,
         cwd: Option<&Path>,
         adjust: impl FnOnce(&mut Command) + Send + 'static,
-    ) -> Program {
+    ) -> RunningProgram {
         let dir = self.path().to_path_buf();
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let defaults = move |cmd: &mut Command| {
@@ -80,25 +83,30 @@ impl Case {
                 .stderr(file("stderr"));
             adjust(cmd);
         };
-        within(program::start(Spec {
-            script: Path::new(script),
-            args: &args,
-            config,
-            cwd: Some(cwd.unwrap_or(self.path())),
+        let testing = Testing {
+            cwd: Some(cwd.unwrap_or(self.path()).to_path_buf()),
             adjust: Some(Box::new(defaults)),
-        }))
+            ..Testing::default()
+        };
+        within(
+            HostProgram::new(config, script)
+                .args(args)
+                .repo_root(self.path())
+                .testing(testing)
+                .start(),
+        )
         .await
         .unwrap_or_else(|e| panic!("{e}"))
     }
 
-    async fn start(&self, script: &str, args: &[&str]) -> Program {
-        self.start_with(script, args, empty_view(), None, |_| {})
+    async fn start(&self, script: &str, args: &[&str]) -> RunningProgram {
+        self.start_with(script, args, Config::default(), None, |_| {})
             .await
     }
 
     /// Wait for `program`, and read what it wrote.
-    async fn finish(&self, mut program: Program) -> Ran {
-        let status = within(program.wait()).await.expect("wait");
+    async fn finish(&self, mut program: RunningProgram) -> Ran {
+        let status = within(program.wait()).await.expect("wait").status();
         let read = |name: &str| std::fs::read_to_string(self.path().join(name)).unwrap_or_default();
         Ran {
             status,
@@ -111,10 +119,6 @@ impl Case {
         let program = self.start(script, args).await;
         self.finish(program).await
     }
-}
-
-fn empty_view() -> Value {
-    view(&Config::default(), Path::new("/")).unwrap()
 }
 
 /// The one JSON line a probe printed.
@@ -172,7 +176,7 @@ async fn imports_follow_the_script_and_nothing_in_the_environment() {
         .start_with(
             "../elsewhere/prog.py",
             &[],
-            empty_view(),
+            Config::default(),
             Some(&cwd),
             move |cmd| {
                 cmd.env("PYTHONPATH", root.join("pythonpath"))
@@ -297,15 +301,10 @@ async fn a_script_that_is_not_a_file_is_refused() {
         (case.path().join("missing.py"), "No such file or directory"),
         (case.path().join("adir"), "it is not a file"),
     ] {
-        let err = program::start(Spec {
-            script: &script,
-            args: &[],
-            config: empty_view(),
-            cwd: None,
-            adjust: None,
-        })
-        .await
-        .expect_err("refused");
+        let err = HostProgram::new(Config::default(), &script)
+            .start()
+            .await
+            .expect_err("refused");
         let text = err.to_string();
         assert!(
             text.starts_with(&format!("cannot run the program {}: ", script.display()))
@@ -477,7 +476,7 @@ async fn a_forwarded_signal_reaches_the_programs_group() {
         );
         let program = case.start("handles.py", &[]).await;
         ready.wait();
-        program.signal(signal);
+        forward(&program, signal);
         let ran = case.finish(program).await;
         assert_eq!(ran.status.code(), Some(0), "{signal}: {}", ran.stderr);
         let mut lines = ran.stdout.lines();
@@ -505,10 +504,36 @@ async fn a_program_without_handlers_ends_by_the_forwarded_signal() {
         );
         let program = case.start("sleeps.py", &[]).await;
         ready.wait();
-        program.signal(signal);
+        forward(&program, signal);
         let ran = case.finish(program).await;
         assert_eq!(ran.status.signal(), Some(signal as i32), "{}", ran.stderr);
     }
+}
+
+/// Forward `signal`, as an owner forwards the one it received.
+fn forward(program: &RunningProgram, signal: Signal) {
+    match signal {
+        Signal::SIGINT => program.interrupt(),
+        Signal::SIGTERM => program.terminate(),
+        other => panic!("{other} is not forwarded"),
+    }
+}
+
+/// Answer the greeting of a bootstrap started by hand, over the engine's ends of its pipes, as
+/// the engine would, so the script runs.
+fn greet(
+    engine_reads: &mut std::io::BufReader<std::io::PipeReader>,
+    engine_writes: &mut std::io::PipeWriter,
+) {
+    use std::io::{BufRead as _, Write as _};
+    let mut hello = String::new();
+    engine_reads
+        .read_line(&mut hello)
+        .expect("the program's greeting");
+    let hello: Value = serde_json::from_str(&hello).expect("a greeting");
+    assert_eq!(hello["t"], "hello", "{hello}");
+    let answer = json!({"t": "hello", "id": hello["id"], "protocol": hello["protocol"]});
+    writeln!(engine_writes, "{answer}").expect("answer the greeting");
 }
 
 // ----------------------------------------------------------------------------- the engine's end
@@ -527,8 +552,9 @@ fn the_connections_end_ends_the_program_and_its_group() {
             ready.py()
         ),
     );
-    let (program_reads, engine_writes) = std::io::pipe().unwrap();
-    let (_engine_reads, program_writes) = std::io::pipe().unwrap();
+    let (program_reads, mut engine_writes) = std::io::pipe().unwrap();
+    let (engine_reads, program_writes) = std::io::pipe().unwrap();
+    let mut engine_reads = std::io::BufReader::new(engine_reads);
     let inherited = [program_reads.as_raw_fd(), program_writes.as_raw_fd()];
     let stderr = std::fs::File::create(case.path().join("stderr")).unwrap();
     let mut child = program::bootstrap(python(), package(), inherited, "waits.py".as_ref(), &[])
@@ -541,6 +567,7 @@ fn the_connections_end_ends_the_program_and_its_group() {
         .spawn()
         .expect("the bootstrap starts");
     drop((program_reads, program_writes));
+    greet(&mut engine_reads, &mut engine_writes);
     ready.wait();
     let pgid = Pid::from_raw(child.id() as i32);
 
@@ -587,8 +614,9 @@ fn the_connections_end_ends_the_program_whatever_its_stderr_holds() {
                 ready = ready.py(),
             ),
         );
-        let (program_reads, engine_writes) = std::io::pipe().unwrap();
-        let (_engine_reads, program_writes) = std::io::pipe().unwrap();
+        let (program_reads, mut engine_writes) = std::io::pipe().unwrap();
+        let (engine_reads, program_writes) = std::io::pipe().unwrap();
+        let mut engine_reads = std::io::BufReader::new(engine_reads);
         let (_undrained, stderr) = std::io::pipe().unwrap();
         let inherited = [program_reads.as_raw_fd(), program_writes.as_raw_fd()];
         let args = [OsString::from(handler)];
@@ -603,6 +631,7 @@ fn the_connections_end_ends_the_program_whatever_its_stderr_holds() {
                 .spawn()
                 .expect("the bootstrap starts");
         drop((program_reads, program_writes));
+        greet(&mut engine_reads, &mut engine_writes);
         ready.wait();
         let pgid = Pid::from_raw(child.id() as i32);
 
@@ -722,7 +751,6 @@ async fn the_view_holds_the_configuration_and_no_secret() {
     let case = Case::new();
     std::fs::create_dir(case.path().join("ws")).unwrap();
     let config = Config::load_from_str(CONFIG).unwrap();
-    let view = view(&config, case.path()).unwrap();
     case.write(
         "views.py",
         r#"
@@ -746,7 +774,7 @@ async fn the_view_holds_the_configuration_and_no_secret() {
         "#,
     );
     let program = case
-        .start_with("views.py", &[], view, None, |cmd| {
+        .start_with("views.py", &[], config, None, |cmd| {
             cmd.env("OUTRIG_TEST_PROGRAM_KEY", "sk-the-secret-value");
         })
         .await;

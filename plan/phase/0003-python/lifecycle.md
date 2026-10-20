@@ -282,10 +282,18 @@ the session.
   admission, runs this sequence with the default drain, and prints the report, since nothing is
   left to read it; the exit status is the program's unless a report is not proven stopped.
   Invoked: not a boundary request. Effects: whatever its sessions' calls did stands.
-- *Alive and not responding after a forwarded signal.* Outcome: the cooperative grace passes,
-  then SIGTERM to its process group, a termination grace, then SIGKILL, then the row above.
-  Cleanup covers the program's group, each session's bindings group and each container -- what
-  the engine started -- and no unrelated process.
+- *Exited, or killed, while a session starts.* Outcome: the start is interrupted where it stands.
+  What it had made -- the container, the bindings process, the interpreter's client -- is removed
+  by the cleanup each step arms before it creates anything, and the engine waits for that
+  cleanup to finish before it reports the session as never started, proven stopped or not. An
+  entry the program gives up on, cancelling its `__aenter__`, interrupts the start the same way.
+  Invoked: nothing of the session ran. Effects: none beyond what the start made.
+- *Alive and not responding after a forwarded signal.* Outcome: the cooperative grace passes --
+  `[host] grace-secs`, five seconds by default, not counting time the engine spends on a
+  shutdown the program asked for -- then SIGTERM to its process group, the bindings process's
+  five-second grace, then SIGKILL, then the rows above. A further signal moves to the next step at
+  once. Cleanup covers the program's group, each session's bindings group and each container --
+  what the engine started -- and no unrelated process.
 
 A release closes one child's subtree the same way while the rest of the session runs on
 ("Releasing a child", below).
@@ -408,7 +416,10 @@ than by Rust. `0003-18` proved the arrangement and built its supervisor
   ends the bindings process, and its sessions' containers remain, as below.
 - **Containers keep the existing cleanup** (`crates/outrig/src/container/mod.rs`): an explicit stop
   on the normal path, a detached `podman rm -f` from `Drop` when the future that was to run the
-  stop is dropped, and a sweep from the panic hook.
+  stop is dropped, and a sweep from the panic hook. The detached removal is a process of its own,
+  which finishes even if the owner exits first, and an owner that drops a start part way can wait
+  for it: `supervise` tracks each removal a drop hands over, and a supervised process group a drop
+  kills until it is proven empty (`0003-29`).
 - **The interpreter ends with the owner.** Its `podman exec` client runs in a process group of its
   own (`runtime-protection.md`), and when the owner dies the interpreter reads end of input and
   exits -- unless native code holding the GIL keeps its reader thread from running, in which case
@@ -564,8 +575,11 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - Whether anything but the owner's argument may change the grace between SIGTERM and SIGKILL for
   a binding's group. `0003-18` made it 5 s, counted after the drain deadline rather than against
   it, which `0003-19` and `0003-22` do the counting for.
-- The `[host]` key for a host program's cooperative grace, its default, and whether the grace
-  between SIGTERM and SIGKILL for the program's group is the bindings process's 5 s (`0003-29`).
+- ~~The `[host]` key for a host program's cooperative grace, its default, and whether the grace
+  between SIGTERM and SIGKILL for the program's group is the bindings process's 5 s.~~ Settled by
+  `0003-29`: `[host] grace-secs`, five seconds by default and an hour at most, which `outrig run
+  --grace` overrides; it does not count a shutdown the program asked for, and the termination
+  grace is the bindings process's five seconds.
 - ~~Whether a round still being driven at the close ends at once.~~ Settled by `0003-19`: it runs
   on, each submission refused with the closing reason as its result, until the model yields or
   the owner drops it.
@@ -588,10 +602,12 @@ its session runs. The only continuation is a fresh interpreter with a reset noti
 - That a group kill reaches everything a binding starts holds only for descendants that stay in
   the group. Which programs a hosted library starts that leave it was not surveyed.
 - The time `shutdown` takes after the deadline was not measured. The container stop is the largest
-  known part: about ten seconds today, because the primary's `sleep` is PID 1 and discards
-  SIGTERM, so podman waits out its grace (#255).
+  known part: about two seconds, because the primary's `sleep` is PID 1 and discards SIGTERM, so
+  podman waits out the grace the stop passes (#255). Since `0003-29` the primary's own stop
+  timeout is the same two seconds, so a removal that names none -- a cleanup's `podman rm -f` --
+  no longer waits out podman's default of ten.
 - The rows for executions, the interpreter and the container run, in `0003-19`'s tests; the rest
   of the close table has not, and neither has a release. Each row's behavior is acceptance for the
   task that adds it; a release's is `0003-30`'s, and an instance's release, the finalizer path
-  included, is `0003-34`'s. The host-program rows are `0003-29`'s and the live-call rows
-  `0003-36`'s.
+  included, is `0003-34`'s. The host-program rows run in `0003-29`'s tests, in containers and
+  on the host; the live-call rows are `0003-36`'s.

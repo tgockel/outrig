@@ -14,7 +14,7 @@ use super::event::{ExecId, HostedOutcome, HostedReason, RequestId};
 /// deciding anything about the work the session did: it is the first point at
 /// which nothing the session started is still running, if
 /// [`ShutdownReport::verdict`] says so.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct ShutdownReport {
     /// What closed admission. It is closed, whatever closed it.
@@ -146,7 +146,7 @@ pub enum Verdict {
 }
 
 /// How the session's events reached its subscribers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct EventDelivery {
     /// The id of the last event published.
@@ -159,9 +159,10 @@ pub struct EventDelivery {
 }
 
 /// Events the session's log did not get.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct LogLoss {
+    #[serde(serialize_with = "lossy")]
     pub path: PathBuf,
     pub records: u64,
     /// Why the first was lost.
@@ -169,6 +170,11 @@ pub struct LogLoss {
     /// When the writer could not prove its rollback: why the file may hold a
     /// partial record.
     pub integrity: Option<String>,
+}
+
+/// A path as text, any byte that is not UTF-8 replaced: a report's path is for reading.
+fn lossy<S: serde::Serializer>(path: &std::path::Path, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
 }
 
 impl fmt::Display for LogLoss {

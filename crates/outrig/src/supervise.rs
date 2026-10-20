@@ -30,10 +30,23 @@
 //! See [`crate::process`] for the other half of the story -- the child
 //! processes outrig itself is waiting on, and what dropping their future
 //! guarantees.
+//!
+//! An owner that drops a future part way can wait for the cleanup that drop
+//! started, and for no other. [`Tracked`] makes its [`Owed`] the owner of the
+//! cleanup this thread starts while it polls or drops the future, and each
+//! piece started then counts against it: a detached command until the reaper
+//! is done with it, a killed process group ([`owe`]) until it is proven
+//! empty, and blocking work that outlived its future ([`blocking`]) until it
+//! returns. Cleanup started on other threads, or on this one outside those
+//! polls, belongs to whoever started it.
 
+use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::{Child, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crate::process::Cmd;
@@ -193,6 +206,10 @@ pub(crate) fn detach_cleanup_chain(cmds: Vec<Cmd>, reissue: Reissue) {
     // thread to put back in order. That matters because the paths that lose
     // the reaper are the ones out of threads.
     if !cmds.is_empty() && reaper().is_none() {
+        Debt::new().fail(format!(
+            "cleanup `{}` ran where nothing supervised it",
+            cmd.program
+        ));
         let mut whole = std::collections::VecDeque::from(vec![cmd]);
         whole.extend(cmds);
         spawn_orphaned_chain(whole);
@@ -269,6 +286,10 @@ fn hand_back(unqueued: Wait, program: &'static str) {
     let Some(waiting) = handed.lock().ok().and_then(|mut held| held.take()) else {
         return;
     };
+    // Whatever happens below runs unreaped, or not at all, so nothing proves it.
+    waiting.owed.fail(format!(
+        "cleanup `{program}` ran where nothing supervised it"
+    ));
 
     let Some(mut head) = waiting.child else {
         // Nothing is running at all: the first attempt hit a transient spawn
@@ -578,6 +599,8 @@ struct Wait {
     retries_left: u8,
     /// When the next attempt may start, while `child` is `None`.
     retry_at: Option<Instant>,
+    /// The owner this obligation is owed to, if it was started under one.
+    owed: Debt,
 }
 
 impl Wait {
@@ -598,6 +621,7 @@ impl Wait {
             then,
             retries_left: Self::budget(reissue),
             retry_at: None,
+            owed: Debt::new(),
         }
     }
 
@@ -613,6 +637,10 @@ impl Wait {
     ) -> Option<Self> {
         let retries_left = Self::budget(reissue);
         if retries_left == 0 || !spawn_failure_is_transient(e) {
+            Debt::new().fail(format!(
+                "cleanup `{}` could not be started: {e}",
+                cmd.program
+            ));
             // The rest of the chain is still owed even though this one never
             // started, so it is handed back rather than dropped with it.
             if !then.is_empty() {
@@ -630,6 +658,7 @@ impl Wait {
             then,
             retries_left: retries_left - 1,
             retry_at: Some(Instant::now() + RETRY_BACKOFF),
+            owed: Debt::new(),
         })
     }
 
@@ -708,6 +737,10 @@ impl Wait {
                     program = self.cmd.program,
                     "cleanup command was killed for wedging; the resource is abandoned"
                 );
+                self.owed.fail(format!(
+                    "cleanup `{}` was killed for wedging",
+                    self.cmd.program
+                ));
                 self.advance()
             }
             Ok(Some(_)) if self.retries_left == 0 => {
@@ -718,6 +751,10 @@ impl Wait {
                     "cleanup command failed with no attempts left; the \
                      resource is abandoned"
                 );
+                self.owed.fail(format!(
+                    "cleanup `{}` failed with no attempts left",
+                    self.cmd.program
+                ));
                 self.advance()
             }
             // Everything else that did not exit zero, signals included. A
@@ -749,6 +786,10 @@ impl Wait {
                          chain is abandoned rather than run beside it"
                     );
                 }
+                self.owed.fail(format!(
+                    "cleanup `{}` could not be collected",
+                    self.cmd.program
+                ));
                 false
             }
         }
@@ -780,6 +821,10 @@ impl Wait {
                 // an initial one would have kept.
                 Err(e) => {
                     if self.retries_left == 0 || !spawn_failure_is_transient(&e) {
+                        self.owed.fail(format!(
+                            "cleanup `{}` could not be started: {e}",
+                            self.cmd.program
+                        ));
                         return false;
                     }
                     let backoff =
@@ -843,6 +888,194 @@ impl Drop for CleanupGuard {
             detach_cleanup(cmd, reissue);
         }
     }
+}
+
+/// The cleanup one owner's future started, which the owner can wait for.
+#[derive(Clone, Default)]
+pub(crate) struct Owed(Arc<Mutex<Ledger>>);
+
+#[derive(Default)]
+struct Ledger {
+    /// Pieces whose [`Debt`] has not been dropped yet.
+    held: usize,
+    /// Pieces the wait asks whether they have ended; see [`owe`].
+    checks: Vec<Check>,
+    /// Why each piece that ended is not proven done.
+    failed: Vec<String>,
+}
+
+/// One piece of owed work, asked whether it has ended: `None` while it runs,
+/// then whether it is proven done.
+type Check = Box<dyn FnMut() -> Option<Result<(), String>> + Send>;
+
+thread_local! {
+    /// The owner of the cleanup this thread starts: set while a [`Tracked`]
+    /// polls or drops its future, and by a thread that drops something on that
+    /// future's behalf.
+    static OWNER: RefCell<Option<Owed>> = const { RefCell::new(None) };
+}
+
+impl Owed {
+    /// The owner of the cleanup this thread starts now, if there is one.
+    pub(crate) fn current() -> Option<Owed> {
+        OWNER
+            .try_with(|owner| owner.borrow().clone())
+            .ok()
+            .flatten()
+    }
+
+    /// Make this the owner of the cleanup this thread starts until the guard
+    /// is dropped.
+    pub(crate) fn enter(&self) -> Entered {
+        Entered(OWNER.replace(Some(self.clone())))
+    }
+
+    /// Wait up to `within` for every piece to end. `Ok` once all of them are
+    /// proven done; otherwise why not, one reason per piece, and last how many
+    /// were still running when `within` passed.
+    pub(crate) async fn settled(&self, within: Duration) -> Result<(), Vec<String>> {
+        let deadline = Instant::now() + within;
+        while self.running() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(REAP_POLL).await;
+        }
+        let running = self.running();
+        let mut why = self.ledger().failed.clone();
+        if running > 0 {
+            why.push(format!("{running} still running after {within:?}"));
+        }
+        if why.is_empty() { Ok(()) } else { Err(why) }
+    }
+
+    /// How many pieces are still running, once every check has been asked.
+    fn running(&self) -> usize {
+        let ledger = &mut *self.ledger();
+        ledger.checks.retain_mut(|check| match check() {
+            None => true,
+            Some(Ok(())) => false,
+            Some(Err(why)) => {
+                ledger.failed.push(why);
+                false
+            }
+        });
+        ledger.held + ledger.checks.len()
+    }
+
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What [`Owed::enter`] replaced, put back when this is dropped.
+pub(crate) struct Entered(Option<Owed>);
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        let _ = OWNER.try_with(|owner| owner.replace(self.0.take()));
+    }
+}
+
+/// Owe `check` to the owner of the cleanup this thread starts, if there is
+/// one: work nothing else reports the end of, which the owner's wait asks
+/// whether it has ended. Synchronous and runtime-free, for `Drop`.
+pub(crate) fn owe(check: impl FnMut() -> Option<Result<(), String>> + Send + 'static) {
+    if let Some(owner) = Owed::current() {
+        owner.ledger().checks.push(Box::new(check));
+    }
+}
+
+/// A piece of cleanup owed to the owner of the cleanup this thread starts, if
+/// there is one, held by whatever does the work: owed until this is dropped,
+/// and not proven done once [`Debt::fail`] has said why.
+pub(crate) struct Debt(Option<Owed>);
+
+impl Debt {
+    pub(crate) fn new() -> Self {
+        let owner = Owed::current();
+        if let Some(owner) = &owner {
+            owner.ledger().held += 1;
+        }
+        Self(owner)
+    }
+
+    pub(crate) fn fail(&self, why: String) {
+        if let Some(owner) = &self.0 {
+            owner.ledger().failed.push(why);
+        }
+    }
+}
+
+impl Drop for Debt {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.0 {
+            let mut ledger = owner.ledger();
+            ledger.held -= 1;
+            // Work that panicked has not proven it finished.
+            if std::thread::panicking() {
+                ledger.failed.push("a cleanup panicked".to_string());
+            }
+        }
+    }
+}
+
+/// `F`, with the cleanup started while it is polled or dropped owed to
+/// [`Tracked::owed`]: what its own failure paths dropped as it ran, and what
+/// dropping it part way released.
+pub(crate) struct Tracked<F> {
+    /// `None` only inside `drop`, which drops it under the owner.
+    future: Option<Pin<Box<F>>>,
+    owed: Owed,
+}
+
+impl<F> Tracked<F> {
+    pub(crate) fn new(future: F) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+            owed: Owed::default(),
+        }
+    }
+
+    /// The cleanup this future started, to wait for: what it started as it ran,
+    /// and, as this drops the future, what that releases. Taking `self` makes
+    /// the drop come before any wait.
+    pub(crate) fn owed(self) -> Owed {
+        self.owed.clone()
+    }
+}
+
+impl<F: Future> Future for Tracked<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let _owner = self.owed.enter();
+        let future = self.future.as_mut().expect("only `drop` takes the future");
+        future.as_mut().poll(cx)
+    }
+}
+
+impl<F> Drop for Tracked<F> {
+    fn drop(&mut self) {
+        let _owner = self.owed.enter();
+        self.future = None;
+    }
+}
+
+/// Run `work` on tokio's blocking pool, as `spawn_blocking` does, owed to the
+/// owner it is started under until it returns -- which, once this future is
+/// dropped, makes it cleanup. `work` is passed a check that answers whether
+/// this future is gone, for work that should stop early once nothing awaits
+/// its result.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce(&dyn Fn() -> bool) -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let owed = Debt::new();
+    let awaited = Arc::new(());
+    let watched = Arc::downgrade(&awaited);
+    tokio::task::spawn_blocking(move || {
+        let result = work(&|| watched.strong_count() == 0);
+        drop(owed);
+        result
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1267,6 +1500,7 @@ mod tests {
             then: std::collections::VecDeque::new(),
             retries_left: 1,
             retry_at: None,
+            owed: Debt::new(),
         };
 
         assert!(owed.start_retry(), "a retry with budget left is still owed");
@@ -1745,5 +1979,121 @@ mod tests {
     #[test]
     fn missing_cleanup_binary_does_not_panic() {
         detach_cleanup(Cmd::new("/nonexistent/outrig-cleanup-probe"), Reissue::Safe);
+    }
+
+    /// An owner that drops a future waits for the cleanup that drop started
+    /// -- a removal, and a supervised process group until it is proven empty
+    /// -- and not for cleanup started outside it, here one that does not end
+    /// until the test says so.
+    #[tokio::test]
+    async fn an_owner_waits_for_the_cleanup_its_drop_started_and_no_other() {
+        use std::os::unix::process::CommandExt;
+
+        use crate::python::supervisor::{Supervision, spawn_supervised, supervise};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let removed = dir.path().join("removed");
+        let release = dir.path().join("release");
+        drop(CleanupGuard::arm(
+            Cmd::new("/bin/sh").arg("-c").arg(format!(
+                "until [ -e {} ]; do sleep 0.05; done",
+                release.display()
+            )),
+            Reissue::Once,
+        ));
+        let removal = CleanupGuard::arm(
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("sleep 1; : > {}", removed.display())),
+            Reissue::Safe,
+        );
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        supervise(&mut cmd, Supervision::default());
+        let child = spawn_supervised(cmd).await.expect("a supervised child");
+        // A member of the group whose parent is this test: once killed, it
+        // stays in the group until the test reaps it.
+        let mut member = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(child.pid().as_raw())
+            .spawn()
+            .expect("a member of the group");
+
+        let owed = Tracked::new(async move {
+            let _held = (removal, child);
+            std::future::pending::<()>().await;
+        })
+        .owed();
+
+        let early = owed.settled(Duration::from_millis(500)).await;
+        member.wait().expect("reap the member");
+        let settled = owed.settled(Duration::from_secs(10)).await;
+        std::fs::write(&release, b"").expect("end the other cleanup");
+        assert_eq!(early, Err(vec!["2 still running after 500ms".to_string()]));
+        assert_eq!(settled, Ok(()));
+        assert!(removed.exists(), "the wait ended before the removal");
+    }
+
+    /// Cleanup a future's own failure path started while it ran is owed too,
+    /// and the wait says why what it waited for is not proven done: a removal
+    /// that failed with no attempts left, and one still running at the timeout.
+    #[tokio::test]
+    async fn a_failed_futures_cleanup_is_owed_and_its_failures_reported() {
+        let mut future = Tracked::new(async {
+            drop(CleanupGuard::arm(
+                Cmd::new("/bin/sh").arg("-c").arg("exit 1"),
+                Reissue::Once,
+            ));
+            drop(CleanupGuard::arm(
+                Cmd::new("/bin/sleep").arg("5"),
+                Reissue::Once,
+            ));
+            Err::<(), _>("the launch failed")
+        });
+        assert!((&mut future).await.is_err());
+        let owed = future.owed();
+
+        let why = owed.settled(Duration::from_secs(1)).await;
+        assert_eq!(
+            why.expect_err("nothing here is proven done"),
+            [
+                "cleanup `/bin/sh` failed with no attempts left",
+                "1 still running after 1s"
+            ]
+        );
+    }
+
+    /// Blocking work whose future is dropped is owed until it returns, and
+    /// learns that nothing awaits its result.
+    #[tokio::test]
+    async fn blocking_work_outliving_its_future_is_owed_until_it_returns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let told = Arc::new(AtomicBool::new(false));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let mut work = Tracked::new(blocking({
+            let told = Arc::clone(&told);
+            move |dropped| {
+                let _ = started.send(());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !dropped() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Long enough that a wait not held for the work ends first.
+                std::thread::sleep(Duration::from_millis(200));
+                told.store(dropped(), Ordering::SeqCst);
+            }
+        }));
+        tokio::select! {
+            _ = &mut work => panic!("the work returned while it was awaited"),
+            _ = running => {}
+        }
+        let owed = work.owed();
+
+        assert_eq!(owed.settled(Duration::from_secs(10)).await, Ok(()));
+        assert!(
+            told.load(Ordering::SeqCst),
+            "the wait ended before the work returned, or the work was never told"
+        );
     }
 }

@@ -113,6 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the program's process group, and the program and what it started end if `outrig` dies. The
   program does not read the terminal: a read from it fails with `EIO`. The exit status is the
   program's, or 128 plus the signal that ended it. Bare `outrig run` is unchanged.
+- **A program's sessions: `outrig.Session`.** A program `outrig run` runs enters a session with no
+  agent of its own, in the image `default-image` names or the built-in default, its directory
+  under the session root (`--session-root` applies). `outrig run --grace <secs>`, before the
+  script, and `[host] grace-secs` set how long the program has to end after the first forwarded
+  signal, 5 by default; past it, or at a second signal, its group gets `SIGTERM` and then
+  `SIGKILL`, not counting time spent shutting down a session the program asked to shut down.
+  Each session the program leaves open, `outrig` shuts down and reports on stderr under a line
+  naming it, and exits once each has stopped: with the program's status, or 3 when one is not
+  proven stopped.
 
 ### Removed
 

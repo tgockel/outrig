@@ -99,6 +99,12 @@ pub struct SessionBuilder {
     /// The stream a test built itself, in place of the builder's.
     #[cfg(test)]
     events: Option<Events>,
+    /// A host session's id, in place of `test`.
+    #[cfg(test)]
+    host_id: Option<String>,
+    /// Why the session's shutdown is to say it is not proven stopped.
+    #[cfg(test)]
+    fail_stop: Option<String>,
     /// Whether the session has a primary agent: until
     /// [`SessionBuilder::no_primary`], it does.
     primary: bool,
@@ -134,6 +140,10 @@ impl SessionBuilder {
             host_log: None,
             #[cfg(test)]
             events: None,
+            #[cfg(test)]
+            host_id: None,
+            #[cfg(test)]
+            fail_stop: None,
             primary: true,
         }
     }
@@ -383,6 +393,8 @@ impl SessionBuilder {
             .map(Path::to_path_buf);
         let name = primary.name().to_string();
         let session = Session::new(id, interpreter, Some(outrig), name, lifecycle, bindings);
+        #[cfg(test)]
+        let session = session.failing(self.fail_stop.take());
         assemble(session, resolved.as_ref(), workspace.as_deref()).await
     }
 
@@ -471,6 +483,22 @@ impl SessionBuilder {
         self
     }
 
+    /// Name a host session `id`, in place of `test`.
+    #[cfg(test)]
+    pub(crate) fn host_id(mut self, id: impl Into<String>) -> Self {
+        self.host_id = Some(id.into());
+        self
+    }
+
+    /// Make the session's shutdown report it not proven stopped, for
+    /// `reason`, as a container stop that failed would: the report, its
+    /// verdict and its `session.report` event all say so.
+    #[cfg(test)]
+    pub(crate) fn fail_stop(mut self, reason: impl Into<String>) -> Self {
+        self.fail_stop = Some(reason.into());
+        self
+    }
+
     /// Install the session's requirement sets under `root`, with `pip_env`
     /// added to pip's environment, and remember approvals in `approvals`, in
     /// place of the user's cache, index and state directory.
@@ -498,7 +526,7 @@ impl SessionBuilder {
         let resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
-        let id = "test".to_string();
+        let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
         let log_dir = self.host_log.clone().unwrap_or_default();
         let (events, lifecycle) = self.open_stream(&id, &log_dir).await?;
         let mut bindings = self
@@ -511,7 +539,8 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         self.report(Progress::Finished(Step::Python));
-        let session = Session::new(id, interpreter, None, "(host)".into(), lifecycle, bindings);
+        let session = Session::new(id, interpreter, None, "(host)".into(), lifecycle, bindings)
+            .failing(self.fail_stop.take());
         assemble(session, resolved.as_ref(), None).await
     }
 }
@@ -666,7 +695,7 @@ pub struct ContainerSpec {
 /// The repository root an owner gave, made absolute against the current
 /// directory, or the current directory: what a session's, and a host
 /// program's, configuration resolves against.
-pub(super) fn chosen_repo_root(root: Option<&Path>) -> Result<PathBuf, OutrigError> {
+pub(crate) fn chosen_repo_root(root: Option<&Path>) -> Result<PathBuf, OutrigError> {
     match root {
         // Before anything keys on it: a relative root names another
         // repository from another directory, under the same approval.

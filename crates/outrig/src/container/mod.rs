@@ -1668,6 +1668,14 @@ pub fn force_remove_detached(name: &str) {
     );
 }
 
+/// How long podman lets `sleep infinity` -- PID 1 of every container started
+/// with `podman run` here -- ignore `SIGTERM` before `SIGKILL`, when a stop
+/// names no grace of its own: a cleanup guard's `podman rm -f`, or the panic
+/// sweep. `sleep` as PID 1 ignores `SIGTERM`, so podman's default of ten
+/// seconds is always waited out in full; this is the two seconds the orderly
+/// stop passes explicitly.
+const STOP_TIMEOUT_SECS: &str = "2";
+
 fn build_podman_run_cmd(
     image: &ImageTag,
     name: &str,
@@ -1677,7 +1685,8 @@ fn build_podman_run_cmd(
 ) -> Cmd {
     let cmd = Cmd::new("podman")
         .args(["run", "-d", "--rm", "--name"])
-        .arg(name);
+        .arg(name)
+        .args(["--stop-timeout", STOP_TIMEOUT_SECS]);
     // After the caller's labels, so podman's last-wins parsing cannot let one
     // of theirs displace the value cleanup removes by.
     append_launch_flags(cmd, launch, selinux)
@@ -2553,6 +2562,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "-v",
                 "/host/repo:/workspace:rw",
                 "-v",
@@ -2611,6 +2622,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-20260711T000000-abcd-tools",
+                "--stop-timeout",
+                "2",
                 "--label",
                 "org.outrig.session=20260711T000000-abcd",
                 "--label",
@@ -2664,6 +2677,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "-v",
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
@@ -3013,6 +3028,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
@@ -3058,6 +3075,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--cap-drop=ALL",
                 "--cap-drop=MKNOD",
@@ -3098,6 +3117,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--device=/dev/kvm",
@@ -3139,6 +3160,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
@@ -3188,6 +3211,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
@@ -3232,6 +3257,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--image-volume=ignore",
                 "--pull=never",
@@ -3274,6 +3301,8 @@ mod tests {
                 "--rm",
                 "--name",
                 "outrig-test",
+                "--stop-timeout",
+                "2",
                 "--userns=keep-id",
                 "--cap-drop=ALL",
                 "--cap-add=SYS_ADMIN",

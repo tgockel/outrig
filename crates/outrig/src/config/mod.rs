@@ -25,7 +25,7 @@ pub use validate::{
 };
 pub(crate) use validate::{
     check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
-    is_valid_mcp_server_name, mcp_command_is_empty, validate_binding,
+    is_valid_mcp_server_name, mcp_command_is_empty, validate_binding, validate_session_paths,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
@@ -148,6 +148,17 @@ pub const RETRY_BUDGET_SECS_CEILING: u64 = 3600;
 /// be answered. A `0` on the budget means "do not retry" and stays legal; the
 /// keys differ because one counts attempts and the other bounds a single one.
 pub const REQUEST_TIMEOUT_SECS_CEILING: u64 = 3600;
+
+/// How long a program `outrig run <script.py>` runs on the host has to end on its own after the
+/// first `SIGINT` or `SIGTERM` forwarded to it, before the engine stops its process group. Five
+/// seconds: long enough for a program that handles the signal to leave its sessions, short
+/// enough that one that ignores it is not waited on for long. The engine's own shutdown of a
+/// session the program asked it to shut down does not count against it.
+pub const DEFAULT_HOST_GRACE_SECS: u64 = 5;
+/// Upper bound accepted for `[host] grace-secs`: the same hour as
+/// [`RETRY_BUDGET_SECS_CEILING`], so a mistyped value cannot leave a program that ignores signals
+/// running for days.
+pub const HOST_GRACE_SECS_CEILING: u64 = 3600;
 
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
@@ -338,6 +349,9 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default, skip_serializing_if = "EventsConfig::is_default")]
     pub events: EventsConfig,
+    /// How a program `outrig run <script.py>` runs on the host is treated. See [`HostConfig`].
+    #[serde(default, skip_serializing_if = "HostConfig::is_default")]
+    pub host: HostConfig,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -1947,6 +1961,51 @@ impl EventsConfig {
     /// session, so a cloned project can neither turn it on nor off.
     fn inherit_from_repo(&mut self, repo: &Self) {
         self.mode = self.mode.or(repo.mode);
+    }
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// The `[host]` block: how a program `outrig run <script.py>` runs on the host is treated.
+///
+/// `grace-secs` is how long the program has to end on its own after the first `SIGINT` or
+/// `SIGTERM` forwarded to it. Past it, or at a second signal, the engine stops the program's
+/// process group -- `SIGTERM`, five seconds, then `SIGKILL` -- and shuts down every session it
+/// left open. Time the engine spends shutting down a session the program asked it to shut down
+/// does not count: the grace bounds the program's own response, not the shutdown. `0` stops the
+/// group at the first signal. A repo's value replaces the global one, as the top-level keys do.
+///
+/// The field is private and `None` when the config did not declare it; read the effective value
+/// with [`grace_secs`](Self::grace_secs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct HostConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace_secs: Option<u64>,
+}
+
+impl HostConfig {
+    /// The declared `grace-secs`, or [`DEFAULT_HOST_GRACE_SECS`].
+    pub fn grace_secs(&self) -> u64 {
+        self.grace_secs.unwrap_or(DEFAULT_HOST_GRACE_SECS)
+    }
+
+    /// Declare `grace-secs`, as a config file's `[host] grace-secs` does.
+    pub fn set_grace_secs(&mut self, secs: u64) {
+        self.grace_secs = Some(secs);
+    }
+
+    /// The declared value, for validation to name.
+    pub(crate) fn declared_grace_secs(&self) -> Option<u64> {
+        self.grace_secs
+    }
+
+    /// A repo's declaration wins, as the top-level keys' do; otherwise the global one stands.
+    fn inherit_from_global(&mut self, global: &Self) {
+        self.grace_secs = self.grace_secs.or(global.grace_secs);
     }
 
     fn is_default(&self) -> bool {

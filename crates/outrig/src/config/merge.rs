@@ -22,6 +22,7 @@ use super::Config;
 ///   its own policy cannot widen or inject one, whatever built it.
 /// - `[events].mode` is the global config's when it declares one; a repo's
 ///   applies only when the global config is silent.
+/// - `[host]` merges per key, like the scalars above: a repo declaration wins.
 /// - `[workspace]` primary fields merge per key, like the scalars above: a
 ///   repo declaration wins, otherwise a global one is inherited, otherwise the
 ///   key stays `None` and [`Workspace`](super::Workspace)'s accessors apply
@@ -67,6 +68,9 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut events = global.events;
     events.inherit_from_repo(&repo.events);
 
+    let mut host = repo.host;
+    host.inherit_from_global(&global.host);
+
     Config {
         default_image: repo.default_image.or(global.default_image),
         default_agent: repo.default_agent.or(global.default_agent),
@@ -79,6 +83,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         network,
         events,
+        host,
         providers,
         models,
         agents,

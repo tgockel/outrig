@@ -558,7 +558,7 @@ $ outrig run worker.py ./workspace "Fix the tests"
 
 runs `worker.py` on the host as `python3 worker.py ./workspace "Fix the tests"` would, under the
 Python OutRig carries rather than any on your system. Starting it starts no container and calls
-no model.
+no model; a [session](#sessions) the program enters does.
 
 - **What it sees.** `sys.argv` is the script as you gave it and every argument after it,
   unchanged -- `--help` and OutRig's own flag names included -- and `__name__` is `"__main__"`,
@@ -574,21 +574,102 @@ no model.
   model with its provider, the identifier OutRig sends and its declared window, each alias with
   its candidates in order, each provider's style and base URL, `default-model`, the resolved
   `[workspace] host-path`, and `[events] mode`. No API key and no `${VAR}` value is in it.
-- **Flags.** `--config`, `--global-config`, `--session-root` and `-v` go before the script. The
-  interactive session's flags -- `--agent`, `--model` and the rest -- are refused there, since
-  the program chooses its own session's inputs; written after the script, they are the program's
-  arguments.
-- **Signals.** The program runs in a process group of its own. Ctrl-C, and `SIGINT` or `SIGTERM`
-  sent to `outrig`, are forwarded to that group, so the program sees them as it would from a
-  terminal. If `outrig` itself dies, the program and everything it started end with it.
+- **Flags.** `--config`, `--global-config`, `--session-root` and `-v` go before the script, and
+  so does `--grace`, which is the program's alone (see [Signals and the
+  grace](#signals-and-the-grace)). The interactive session's flags -- `--agent`, `--model` and
+  the rest -- are refused there, since the program chooses its own session's inputs; written after
+  the script, they are the program's arguments.
 - **The terminal.** The program does not read the terminal: because its process group is not the
   terminal's foreground group, a read from it fails at once with `EIO` (`input()` raises
   `EOFError`). Input piped or redirected into `outrig run` reads as usual, and writing to the
   terminal works.
 - **The exit status** is the program's: `0` off the end, `sys.exit`'s value, `1` with Python's
-  traceback for an uncaught exception, and 128 plus the signal's number for one a signal ended.
-  A script that cannot be opened as a file, or a configuration that does not load, is an
-  `error:` line and status `1`, with nothing started.
+  traceback for an uncaught exception, and 128 plus the signal's number for one a signal ended. A
+  session OutRig had to stop for the program that is not proven stopped makes it `3`, whatever the
+  program's was: something may still be running (see [What OutRig stops for the
+  program](#what-outrig-stops-for-the-program)). A script that cannot be opened as a file, or a
+  configuration that does not load, is an `error:` line and status `1`, with nothing started.
+
+### Sessions
+
+A program enters a session with `outrig.Session`, and OutRig starts it then: a container, the
+Python interpreter in it, and the bindings the configuration declares, with no agent of its own.
+OutRig owns each of those and stops them; the program owns its own control flow.
+
+```python
+async with outrig.Session(workspace="./repo") as session:
+    ...                         # outrig.current_session() is session here
+
+print(session.shutdown_report)
+```
+
+- **Making one starts nothing.** `outrig.Session(workspace=None, mounts=(), grace=None)` checks
+  its inputs and returns. `workspace` replaces the configured `[workspace] host-path`; when it is
+  `None` the configured one is mounted if one is declared, and otherwise no workspace is.
+  `mounts`, each an `outrig.Mount` or a path, are added to `[[workspace.mounts]]`; a host or
+  container path mounted twice fails the entry, and so, with a binding configured, does a
+  directory mounted anywhere but at its host path, as in a configuration. Relative paths are taken
+  from the program's working directory when the session is made.
+- **Entering it starts it.** It runs in the image `default-image` names -- or OutRig's built-in
+  default, as for `outrig run-new` -- with the configured bindings; one a repository's config
+  declares is refused, since no one is there to approve it. An entry that fails raises
+  `RuntimeError` saying why, once what the start had made is stopped, and the body does not run.
+- **Its events.** `session.events()` is the session's event stream, read with `async for`: each
+  `outrig.Event` has the `type`, `subject`, `time` and `data` that [the event
+  log](../reference/events.md) records, and an `outrig.Missed` says how many a slow reader lost.
+  Reading is never required and never slows the session. With `[events] mode = "record"` the
+  stream is also written to `logs/events.jsonl` in the session's directory under the session
+  root, `<session-root>/<id>/`. That directory holds no `session.json`, so `outrig ls` does not
+  list it.
+- **Closing it.** `await session.close_admission()` returns once the session refuses new work: a
+  call an agent makes of a binding from then on is refused. The `async with` exit closes
+  admission, lets what is running finish for `grace` seconds -- five when it is `None`, an hour at
+  most -- and stops the rest. It then sets `session.shutdown_report`, whose `verdict` is `"clean"`,
+  `"stopped_with_unknown"` or `"not_proven_stopped"`. For the last, the exit raises
+  `outrig.ShutdownException`, its `report` the same report and an exception the body raised its
+  `__context__`: something the session started may still be running.
+
+### Signals and the grace
+
+The program runs in a process group of its own. Ctrl-C, and `SIGINT` or `SIGTERM` sent to
+`outrig`, are forwarded to that group, so the program sees them as it would from a terminal. If
+`outrig` itself dies, the program and everything it started end with it.
+
+The first signal also starts the program's grace: the time it has to end on its own, five seconds
+unless `--grace <SECS>` or `[host] grace-secs` says otherwise. Time OutRig spends shutting down a
+session the program asked it to shut down does not count against it, so a program that leaves its
+sessions when signaled is not cut short by their shutdown. Past the grace, or at a second signal,
+OutRig stops the program's process group -- `SIGTERM`, five seconds, `SIGKILL` -- and a further
+signal sends `SIGKILL` at once. The grace bounds the program's own response, not the whole
+shutdown: OutRig still stops whatever the program left open afterward.
+
+A program that leaves its session when interrupted, and prints the report itself:
+
+```python
+import asyncio, signal
+import outrig
+
+async def main():
+    leave = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGINT, leave.set)
+    async with outrig.Session() as session:
+        print(f"session {session.id} started", flush=True)
+        await leave.wait()
+    print(f"session {session.id}: {session.shutdown_report.verdict}")
+
+asyncio.run(main())
+```
+
+Ctrl-C ends it with status `0`, once its session is shut down.
+
+### What OutRig stops for the program
+
+A program can end with a session still open: it returns, raises, is killed, or is stopped after
+its grace. OutRig then closes the session's admission, shuts it down with the default five-second
+drain, and prints its report on stderr, under a line naming the session. A session the program
+was still entering has its start stopped where it stood, and what that start had made removed;
+OutRig says so in one line. Either way `outrig` exits only once each of them is stopped. If
+`outrig` itself is killed, none of this runs, and the sessions' containers remain.
 
 The program is trusted code running with your authority, not a sandbox: it reads your files,
 holds your environment, and runs host commands. Keep its imports and any credentials it reads

@@ -30,7 +30,10 @@
 //! - **A host program.** [`HostProgram`] runs a trusted Python program on the
 //!   host as `outrig run <script.py>` does: its own `__main__`, argv, streams
 //!   and exit status, with `outrig.config()` a view of the configuration
-//!   holding no secret. It starts no session of its own.
+//!   holding no secret. Its `outrig.Session` enters a session with no primary
+//!   agent, which this process starts and owns for it; whatever the program
+//!   leaves open when it ends, this process stops, and reports in
+//!   [`ProgramExit`].
 //!
 //! No type of the model-provider library this is built on appears here, so a
 //! release of it cannot break this surface.
@@ -41,7 +44,6 @@ mod builder;
 mod error;
 pub mod event;
 pub(crate) mod lifecycle;
-pub(crate) mod program;
 mod report;
 mod session;
 
@@ -49,9 +51,9 @@ use std::time::Duration;
 
 pub use self::approval::{Approval, ApprovalRequest, Approver};
 pub use self::bindings::BindingSpec;
+pub(crate) use self::builder::chosen_repo_root;
 pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container_spec};
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
-pub use self::program::{HostProgram, ProgramExit, RunningProgram};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
     ShutdownReport, Stopped, Verdict,
@@ -59,6 +61,7 @@ pub use self::report::{
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
+pub use crate::owner::{HostProgram, LeftOpen, ProgramExit, RunningProgram, SessionEnd};
 
 #[cfg(test)]
 #[path = "bindings_tests.rs"]

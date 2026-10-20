@@ -13,9 +13,16 @@ use std::path::PathBuf;
 
 use outrig::LaunchSpec;
 use outrig::config::Config;
-use outrig::harness::{Session, SessionBuilder};
+use outrig::harness::{DEFAULT_DRAIN, Session, SessionBuilder};
 
 fn spawnable<F: Future + Send + 'static>(_: F) {}
+
+/// A session stops on whatever task its owner chooses too: the engine shuts down the sessions a
+/// host program leaves open on tasks of their own. Never called; that it compiles is the check.
+#[expect(dead_code, reason = "compiled, not run")]
+fn a_shutdown_can_be_spawned(session: Session) {
+    spawnable(session.shutdown(DEFAULT_DRAIN));
+}
 
 #[test]
 fn every_way_to_start_a_session_can_be_spawned() {

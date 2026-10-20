@@ -1953,7 +1953,7 @@ async fn exit_cause(
 /// bytes and discarding the rest of a longer one. Returns how many bytes were
 /// discarded, or `None` at end of stream. A final line without a newline
 /// counts.
-pub(super) async fn next_line<R: AsyncBufRead + Unpin>(
+pub(crate) async fn next_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
     max: usize,

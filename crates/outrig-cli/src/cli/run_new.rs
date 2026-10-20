@@ -35,15 +35,13 @@ use clap::Parser;
 use nix::fcntl::{Flock, FlockArg};
 use outrig::config::{Config, EnvSecrets, EventsMode, ImageConfig};
 use outrig::error::IoPathExt;
-use outrig::harness::{
-    self, DEFAULT_DRAIN, ExecutionStatus, Progress, SessionBuilder, ShutdownReport, Step,
-    Stopped, Verdict,
-};
+use outrig::harness::{self, DEFAULT_DRAIN, Progress, SessionBuilder, Step, Verdict};
 use outrig::image::{self, ImageTag};
 use outrig::LaunchSpec;
 
 use crate::builtin_image;
 use crate::cli::eprint_best_effort;
+use crate::cli::report::{Summary, render_report, summarize};
 use crate::cli::session_setup::ProgressSpan;
 use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
@@ -260,108 +258,6 @@ fn exit_status(summary: &Summary) -> i32 {
     }
 }
 
-/// What the terminal says of a report.
-#[derive(Debug)]
-struct Summary {
-    verdict: Verdict,
-    /// What closed the session, when it was not its owner: the interpreter
-    /// exiting.
-    closed: Option<String>,
-    /// Why it is not proven stopped, when it is not.
-    not_stopped: Option<String>,
-    executions: Vec<(u64, ExecutionStatus)>,
-    /// Each call into a binding whose outcome came after the close, as a line.
-    hosted: Vec<String>,
-    last_sequence: u64,
-    /// What the terminal's own subscription missed.
-    missed: u64,
-    /// What the event log did not get.
-    log: Option<String>,
-}
-
-fn summarize(report: &ShutdownReport) -> Summary {
-    Summary {
-        verdict: report.verdict(),
-        closed: match &report.closed_by {
-            harness::ClosedBy::Owner => None,
-            by => Some(by.to_string()),
-        },
-        not_stopped: match &report.stopped {
-            Stopped::NotProven { reason, .. } => Some(reason.clone()),
-            _ => None,
-        },
-        executions: report
-            .executions
-            .iter()
-            .map(|execution| (execution.id.get(), execution.status))
-            .collect(),
-        hosted: report
-            .hosted
-            .iter()
-            .map(|call| {
-                let outcome = serde_json::to_value(call.outcome)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                let reason = call
-                    .reason
-                    .and_then(|reason| serde_json::to_value(reason).ok())
-                    .and_then(|v| v.as_str().map(|r| format!(" ({})", r.replace('_', " "))))
-                    .unwrap_or_default();
-                format!(
-                    "call {} to binding {}: {outcome}{reason}",
-                    call.request, call.binding
-                )
-            })
-            .collect(),
-        last_sequence: report.events.last_sequence,
-        missed: report.events.missed.first().copied().unwrap_or(0),
-        log: report.events.log.as_ref().map(ToString::to_string),
-    }
-}
-
-/// The report, on stderr: whether the session is stopped, how each execution
-/// running at the close ended, how each binding call that ended after the
-/// close ended, and anything its events lost.
-fn render_report(summary: &Summary) -> String {
-    let mut text = String::from(match summary.verdict {
-        Verdict::Clean => "[outrig] session closed: stopped, every outcome known\n",
-        Verdict::StoppedWithUnknown => {
-            "[outrig] session closed: stopped, but some Python or binding call was cut off -- what \
-             it did may or may not have happened\n"
-        }
-        _ => "[outrig] session closed: NOT proven stopped -- something it started may still be \
-              running\n",
-    });
-    if let Some(by) = &summary.closed {
-        text.push_str(&format!("[outrig]   closed because {by}\n"));
-    }
-    if let Some(reason) = &summary.not_stopped {
-        text.push_str(&format!("[outrig]   not proven stopped: {reason}\n"));
-    }
-    for (id, status) in &summary.executions {
-        let status = match status {
-            ExecutionStatus::Ok => "ok",
-            ExecutionStatus::Error => "error",
-            _ => "unknown",
-        };
-        text.push_str(&format!("[outrig]   execution {id}: {status}\n"));
-    }
-    for call in &summary.hosted {
-        text.push_str(&format!("[outrig]   {call}\n"));
-    }
-    if summary.missed > 0 {
-        text.push_str(&format!(
-            "[outrig]   events: {} published; {} were not shown here\n",
-            summary.last_sequence, summary.missed
-        ));
-    }
-    if let Some(log) = &summary.log {
-        text.push_str(&format!("[outrig] warning: {log}\n"));
-    }
-    text
-}
-
 /// The two lines the start prints for each of its steps, as each begins and
 /// ends.
 fn progress_lines() -> impl FnMut(Progress) + Send + 'static {
@@ -404,15 +300,9 @@ fn image_config_name(
         .or_else(|| agent.and_then(|name| cfg.agents.get(name)?.image.as_deref()))
         .or(cfg.default_image.as_deref())
         .map(str::to_string);
-    // One of the built-in's own names means the built-in, as it does to
-    // `outrig run` and `outrig build`, unless the config declares it.
-    if let Some(name) = chosen
-        .as_ref()
-        .filter(|name| !builtin_image::is_reserved(name) || cfg.images.contains_key(*name))
-    {
-        return Ok((name.clone(), false));
-    }
-    let injection = builtin_image::inject_primary(cfg);
+    let Some(injection) = builtin_image::primary_for(cfg, chosen.as_deref()) else {
+        return Ok((chosen.expect("a block of the user's was chosen"), false));
+    };
     if chosen.is_none() && injection.applied {
         eprintln!(
             "[outrig] no --image, agent image, or default-image configured; using outrig's \
@@ -724,50 +614,6 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             assert_eq!(err.exit_status(), 1, "{other:?}");
             assert_eq!(err.to_string(), text);
         }
-    }
-
-    /// What the terminal says of each kind of report.
-    #[test]
-    fn the_report_says_what_stopped_and_what_was_cut_off() {
-        assert_eq!(
-            render_report(&Summary {
-                last_sequence: 40,
-                ..summary(Verdict::Clean)
-            }),
-            "[outrig] session closed: stopped, every outcome known\n"
-        );
-
-        let cut = render_report(&Summary {
-            executions: vec![(7, ExecutionStatus::Unknown), (9, ExecutionStatus::Ok)],
-            hosted: vec!["call 4 to binding repo: unknown (killed)".to_string()],
-            last_sequence: 80,
-            missed: 3,
-            ..summary(Verdict::StoppedWithUnknown)
-        });
-        assert!(cut.starts_with(
-            "[outrig] session closed: stopped, but some Python or binding call was cut off"
-        ));
-        assert!(cut.contains("[outrig]   execution 7: unknown\n"), "{cut}");
-        assert!(
-            cut.contains("[outrig]   call 4 to binding repo: unknown (killed)\n"),
-            "{cut}"
-        );
-        assert!(cut.contains("[outrig]   execution 9: ok\n"), "{cut}");
-        assert!(cut.contains("80 published; 3 were not shown here"), "{cut}");
-
-        let stuck = render_report(&Summary {
-            closed: Some("the Python interpreter exited (exit status: 1)".to_string()),
-            not_stopped: Some("the primary container: timed out".to_string()),
-            log: Some("2 agent event(s) could not be written".to_string()),
-            ..summary(Verdict::NotProvenStopped)
-        });
-        assert!(stuck.starts_with("[outrig] session closed: NOT proven stopped"), "{stuck}");
-        assert!(
-            stuck.contains("closed because the Python interpreter exited (exit status: 1)"),
-            "{stuck}"
-        );
-        assert!(stuck.contains("not proven stopped: the primary container: timed out"));
-        assert!(stuck.contains("[outrig] warning: 2 agent event(s)"), "{stuck}");
     }
 
     /// What a person needs before typing: the model, and that Python is ready

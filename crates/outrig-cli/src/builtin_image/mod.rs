@@ -124,6 +124,18 @@ pub(crate) fn inject(cfg: &mut Config) -> Injection {
     }
 }
 
+/// What a session that starts no MCP server runs in, `chosen` the image-config the user's
+/// configuration names for it: `None` when that names a block of the user's, and otherwise the
+/// built-in's primary injected into `cfg` by [`inject_primary`] -- when `chosen` names nothing,
+/// or one of the built-in's own names the configuration does not declare, which means the
+/// built-in, as it does to `outrig run` and `outrig build`.
+pub(crate) fn primary_for(cfg: &mut Config, chosen: Option<&str>) -> Option<Injection> {
+    match chosen {
+        Some(name) if !is_reserved(name) || cfg.images.contains_key(name) => None,
+        _ => Some(inject_primary(cfg)),
+    }
+}
+
 /// [`inject`] for a session that starts no MCP server: the built-in's primary
 /// image-config alone, with no servers and no sidecars. So nothing is
 /// materialized, and there is no launcher note about servers that would not

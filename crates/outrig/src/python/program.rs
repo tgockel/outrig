@@ -11,42 +11,35 @@
 //! - **Supervised.** Started through [`supervise`] from the one parent thread, so it leads a
 //!   process group of its own and ends with the engine as a bindings process does. Being in a
 //!   group of its own also makes it a background group on a terminal: Ctrl-C reaches the engine,
-//!   which forwards it ([`Program::signal`]), and a read from the terminal would stop it. A host
+//!   which forwards it to the group, and a read from the terminal would stop it. A host
 //!   program does not read the terminal, so it starts with SIGTTIN and SIGTTOU ignored, and such
 //!   a read fails at once with `EIO` rather than stopping it.
 //! - **The connection.** Two pipes, one each way, whose program ends are its only inherited
-//!   descriptors beyond stdio and are named on its command line. Each line is one JSON object;
-//!   the program asks, and [`serve`] answers. The program marks both close-on-exec once it has
-//!   them, so what it starts holds neither, and the engine learns of its exit from the process
-//!   ([`Program::wait`]), never from a pipe a grandchild still holds.
+//!   descriptors beyond stdio and are named on its command line. Each line is one JSON object.
+//!   The program marks both close-on-exec once it has them, so what it starts holds neither, and
+//!   the engine learns of its exit from the process, never from a pipe a grandchild still holds.
+//!   What travels on them is the owner protocol, the `owner` module's.
 //! - **The engine's end stays open** for as long as the program runs: the program reads its
-//!   end's EOF as the engine's death and ends its group. So [`Program`] holds the write end
-//!   itself, whatever becomes of the task serving it.
+//!   end's EOF as the engine's death and ends its group. So [`Launched::held`] is a second write
+//!   end, which its owner keeps for the program's life, whatever becomes of the one it writes on.
 
 use std::ffi::OsString;
 use std::io::PipeWriter;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::ExitStatus;
 
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::unix::pipe;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 
-use super::host::next_line;
 use super::payload;
-use super::supervisor::{Supervised, Supervision, quoted, spawn_supervised, supervise};
+use super::supervisor::{Supervised, Supervision, spawn_supervised, supervise};
 use crate::error::{OutrigError, Result};
 
 /// The bootstrap as the payload's `-c` argument, staged by `build.rs` as `binding.py` is.
 pub(crate) const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/program.bootstrap"));
-/// The longest request line the engine reads from the program; a longer one is discarded with a
-/// warning. Requests are a kind and an id.
-const LINE_MAX: usize = 64 << 10;
 
 /// How to start a host program.
 pub(crate) struct Spec<'a> {
@@ -55,27 +48,31 @@ pub(crate) struct Spec<'a> {
     pub(crate) script: &'a Path,
     /// Everything after the script, which is the program's own.
     pub(crate) args: &'a [OsString],
-    /// What `outrig.config()` answers with.
-    pub(crate) config: Value,
     /// Its working directory, which a relative script is found from; this process's when
     /// `None`.
     pub(crate) cwd: Option<&'a Path>,
     /// A test's adjustments to the command before it is spawned: its environment, its stdio.
     #[cfg(test)]
     pub(crate) adjust: Option<Adjust>,
+    /// The `outrig` package the bootstrap imports, in place of this build's, for a test.
+    #[cfg(test)]
+    pub(crate) package: Option<std::path::PathBuf>,
 }
 
 /// A test's adjustment to the program's command; see [`Spec::adjust`].
 #[cfg(test)]
 pub(crate) type Adjust = Box<dyn FnOnce(&mut Command) + Send>;
 
-/// A running host program.
+/// A host program just started, before its greeting: the supervised child, and the engine's
+/// ends of its connection.
 #[derive(Debug)]
-pub(crate) struct Program {
-    child: Supervised,
-    /// The engine's write end, held open while the program runs; see the module doc.
-    _held: PipeWriter,
-    serving: JoinHandle<()>,
+pub(crate) struct Launched {
+    pub(crate) child: Supervised,
+    pub(crate) reads: BufReader<pipe::Receiver>,
+    pub(crate) writes: pipe::Sender,
+    /// A second write end of the engine's pipe, to hold while the program runs; see the module
+    /// doc.
+    pub(crate) held: PipeWriter,
 }
 
 /// The bootstrap's command line, `python3 -I -c PROGRAM <package> <fd-in> <fd-out> <script>
@@ -111,7 +108,7 @@ pub(crate) fn bootstrap(
 
 /// Start the program `spec` describes. A script that cannot be read as a file is refused before
 /// the payload is unpacked or anything starts.
-pub(crate) async fn start(spec: Spec<'_>) -> Result<Program> {
+pub(crate) async fn launch(spec: Spec<'_>) -> Result<Launched> {
     readable(
         &spec
             .cwd
@@ -119,6 +116,8 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Program> {
     )?;
     let python = payload::host_python().await?;
     let package = payload::package_dir().await?;
+    #[cfg(test)]
+    let package = spec.package.clone().unwrap_or(package);
 
     let (program_reads, engine_writes) = std::io::pipe()?;
     let (engine_reads, program_writes) = std::io::pipe()?;
@@ -158,34 +157,12 @@ pub(crate) async fn start(spec: Spec<'_>) -> Result<Program> {
     let held = engine_writes.try_clone()?;
     let reads = pipe::Receiver::from_owned_fd(OwnedFd::from(engine_reads))?;
     let writes = pipe::Sender::from_owned_fd(OwnedFd::from(engine_writes))?;
-    let serving = tokio::spawn(serve(reads, writes, spec.config));
-    Ok(Program {
+    Ok(Launched {
         child,
-        _held: held,
-        serving,
+        reads: BufReader::new(reads),
+        writes,
+        held,
     })
-}
-
-impl Program {
-    /// Send `signal` to its process group: what a terminal's key would reach had the program been
-    /// in the foreground. Nothing once it has been reaped, when the group's id may name another.
-    pub(crate) fn signal(&self, signal: Signal) {
-        self.child.signal(signal);
-    }
-
-    /// Wait for the program to exit, and reap it. Cancel-safe. What it left running in its group
-    /// is not waited for, and keeps running.
-    pub(crate) async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.child.wait().await
-    }
-}
-
-impl Drop for Program {
-    fn drop(&mut self) {
-        // The child's own drop ends the group of a program never reaped: the engine is leaving
-        // with it still running, which its own death detectors would see a moment later.
-        self.serving.abort();
-    }
 }
 
 /// Refuse a script that is not a file this process can open: nothing could run it. A directory
@@ -201,58 +178,7 @@ fn readable(script: &Path) -> Result<()> {
 }
 
 /// Why the program at `script` did not start, as the launcher says it.
-fn cannot_run(script: &Path, e: std::io::Error) -> OutrigError {
+pub(crate) fn cannot_run(script: &Path, e: std::io::Error) -> OutrigError {
     let why = format!("cannot run the program {}: {e}", script.display());
     OutrigError::Io(std::io::Error::new(e.kind(), why))
-}
-
-/// Answer the program's requests, one line each, until it closes its end.
-async fn serve(reads: pipe::Receiver, mut writes: pipe::Sender, config: Value) {
-    let mut reads = BufReader::new(reads);
-    let mut line = Vec::new();
-    loop {
-        match next_line(&mut reads, &mut line, LINE_MAX).await {
-            Ok(Some(0)) => {}
-            Ok(Some(cut)) => {
-                tracing::warn!(
-                    "ignored a line of more than {LINE_MAX} bytes from the host program ({cut} over)"
-                );
-                continue;
-            }
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!("reading from the host program failed: {e}");
-                return;
-            }
-        }
-        let Some(reply) = answer(&line, &config) else {
-            continue;
-        };
-        let mut reply = reply.to_string();
-        reply.push('\n');
-        if let Err(e) = writes.write_all(reply.as_bytes()).await {
-            tracing::warn!("writing to the host program failed: {e}");
-            return;
-        }
-    }
-}
-
-/// The reply to one request line, or `None` for a line that is not a request.
-fn answer(line: &[u8], config: &Value) -> Option<Value> {
-    let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(line) else {
-        tracing::warn!(
-            "ignored a line from the host program that is not a request: {:?}",
-            quoted(line)
-        );
-        return None;
-    };
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
-    Some(match request.get("t").and_then(Value::as_str) {
-        Some("config") => json!({"t": "config", "id": id, "config": config}),
-        kind => json!({
-            "t": "error",
-            "id": id,
-            "error": format!("the engine has no request {kind:?}"),
-        }),
-    })
 }

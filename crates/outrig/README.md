@@ -13,7 +13,9 @@ library crate. It does two things:
   the agent, such as a GitPython `Repo` -- which the agent's Python uses under their names as their
   libraries document, each request checked on the host and recorded; they start before the
   interpreter and stop with the session, and one a repository's config declares only once its
-  operator approves it. `outrig run-new` is built on it and nothing else of the loop.
+  operator approves it. `outrig run-new` is built on it and nothing else of the loop. A Python
+  program on the host, run by [`harness::HostProgram`], owns sessions with no agent of their own
+  through `outrig.Session`, and whatever sessions it leaves open the engine stops and reports.
 
 The `outrig` command-line tool lives in the companion
 [`outrig-cli`](https://crates.io/crates/outrig-cli) crate.

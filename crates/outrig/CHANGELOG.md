@@ -338,6 +338,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider, effective identifier and declared window, each alias's candidates in order, each
   provider's style and base URL, `default-model`, the resolved workspace and the events mode --
   holding no key and no `${VAR}`. In a kernel, `outrig.config` is absent.
+- **A host program owns sessions, and the engine stops what it leaves open.** In a program
+  `HostProgram` runs, `async with outrig.Session(workspace=..., mounts=..., grace=...)` has the
+  engine start a session with no primary agent from the program's `Config`: the image
+  `default-image` names, ensured as `outrig run-new` ensures one, the configured factory bindings
+  (a repository's refused, for want of an approver), and `events.jsonl` in
+  `<session-root>/<id>/logs` under `[events] mode = "record"`. Making one starts nothing, and
+  checks its `grace`, an hour at most. Its paths are checked before anything starts, a binding's
+  rule that each directory appear at its host path included. Entering it sets
+  `outrig.current_session()`; `session.events()` yields `outrig.Event` records and
+  `outrig.Missed` counts, losing the oldest rather than slowing the session; `await
+  session.close_admission()` returns once the gate is closed; and the exit shuts the session down,
+  sets `session.shutdown_report`, a frozen mirror of `ShutdownReport` with its `verdict`, and
+  raises `outrig.ShutdownException` in the program's task when the stop is not proven, an
+  exception of the body kept as its `__context__`. Every control is acknowledged only once the
+  engine applied it. The program and the engine greet each other with the protocol's version
+  first, and a program that speaks another is refused before its script runs.
+
+  A session the program leaves open -- it returns, raises, is killed, or ignores a signal past its
+  grace -- the engine shuts down with `DEFAULT_DRAIN`; one it was still starting has its start
+  interrupted where it stood. `RunningProgram::wait` returns once each has stopped, and
+  `ProgramExit::left_open` lists them, as a `LeftOpen` with its `SessionEnd`: the report of one
+  shut down, or whether what an interrupted start had made is proven stopped; a start that
+  failed, or that the program gave up on, is listed only when that is not proven.
+  `ProgramExit::code` is 3 when one is not. `RunningProgram::interrupt` and `terminate` now also
+  start the program's grace, `HostProgram::grace` or `[host] grace-secs` (`Config::host`,
+  `HostConfig`, default 5, at most 3600): past it, or at a second signal, the program's group is
+  stopped -- `SIGTERM`, five seconds, `SIGKILL` -- and a further signal sends `SIGKILL` at once.
+  Time the engine spends on a shutdown the program asked for, or cleaning up after an entry it
+  gave up on, does not count. `ProgramExit` is no longer `Copy` or `Eq`.
+- **A start interrupted part way has its cleanup waited for.** Each step of a session's start
+  already armed the removal of what it creates before creating it; the engine now tracks each
+  removal a dropped start hands over, a supervised process group dropped before it was stopped
+  until it is proven empty, and blocking work a dropped future leaves running, and waits for all
+  of it before it says the start is stopped. A binding's package install that nothing awaits any
+  more stops pip and removes its stage. A container `podman run` starts gives `sleep infinity` a
+  stop timeout of two seconds, which its orderly stop already passed, so a removal that names
+  none no longer waits out podman's ten. `ConfigValidationError::WorkspaceMountHostDuplicate`
+  refuses a host directory mounted twice in one session.
 - **A session with no primary agent: `SessionBuilder::no_primary`.** It resolves no model and asks
   its `Secrets` resolver for nothing as it starts, and has no rounds: `Session::round` returns
   `SessionError::NoPrimary`, and `Session::user_channel`, `Session::interrupter` and

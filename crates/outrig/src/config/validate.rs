@@ -19,10 +19,11 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Binding, Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, Model,
-    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
-    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
-    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
+    Binding, Config, HOST_GRACE_SECS_CEILING, ImageConfig, ImageSourceRef, LlmProvider,
+    McpServerSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
+    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, lexical,
+    normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -251,6 +252,19 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    /// A host directory mounted twice in one session, the workspace's
+    /// included: what a program `outrig run` runs asks for is checked against
+    /// the configured mounts.
+    #[error(
+        "workspace mount host-path {path:?} is mounted more than once{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountHostDuplicate {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
     #[error("image {image:?}: `{field}` capability name must not be empty")]
     CapabilityNameEmpty { image: String, field: &'static str },
 
@@ -342,6 +356,9 @@ pub enum ConfigValidationError {
 
     #[error("{path} must be at most {max} seconds (0 disables retries); got {value}")]
     RetryBudgetSecsTooLarge { path: String, value: u64, max: u64 },
+
+    #[error("[host] grace-secs must be at most {max} seconds; got {value}")]
+    HostGraceSecsTooLarge { value: u64, max: u64 },
 
     #[error("{path} must be between 1 and {max} seconds; got {value}")]
     RequestTimeoutSecsTooLarge { path: String, value: u64, max: u64 },
@@ -746,6 +763,14 @@ pub(super) fn validate_with_options(
     }
     if let Some(value) = cfg.subagent_width_max {
         validate_subagent_width_max("top-level subagent-width-max", value)?;
+    }
+    if let Some(value) = cfg.host.declared_grace_secs()
+        && value > HOST_GRACE_SECS_CEILING
+    {
+        return Err(ConfigValidationError::HostGraceSecsTooLarge {
+            value,
+            max: HOST_GRACE_SECS_CEILING,
+        });
     }
     if let Some(value) = cfg.retry_budget_secs {
         validate_retry_budget_secs("top-level retry-budget-secs", value)?;
@@ -1406,14 +1431,60 @@ pub(super) fn validate_workspace_mounts(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    // With a binding, the workspace appears at its host path rather than at
-    // its container path (`validate_bindings`).
-    let workspace = match cfg.bindings.is_empty() {
+    check_workspace_mounts(cfg, repo_root, workspace_container_path(cfg, repo_root))
+}
+
+/// Where the workspace appears in the container: its container path, or with
+/// a binding its host path (`validate_bindings`), when that can be known.
+fn workspace_container_path(cfg: &Config, repo_root: Option<&Path>) -> Option<PathBuf> {
+    match cfg.bindings.is_empty() {
         true => Some(cfg.workspace.container_path().to_path_buf()),
         false => cfg.workspace.known_host_path(repo_root),
-    };
-    let reserved = workspace.into_iter().collect();
+    }
+}
 
+/// The paths of a session a program `outrig run` runs enters, checked before
+/// anything of it starts. The workspace, when `mounted`, must be a directory.
+/// Each mount's container path must be absolute, not `/`, and its own -- the
+/// workspace's is reserved only when the workspace is mounted, so a session
+/// without one can mount a directory at `/workspace`. No host directory, the
+/// workspace's included, may be mounted twice. And with a binding, each
+/// directory mounted must appear in the container at its host path, as a
+/// configuration's must at its load: checked here too, since the program's
+/// paths join after it, and the session's start finds out only once its
+/// bindings' factories have run.
+pub(crate) fn validate_session_paths(
+    cfg: &Config,
+    repo_root: &Path,
+    mounted: bool,
+) -> Result<(), ConfigValidationError> {
+    if mounted {
+        validate_workspace_host_path(cfg, Some(repo_root))?;
+    }
+    let reserved = workspace_container_path(cfg, Some(repo_root)).filter(|_| mounted);
+    check_workspace_mounts(cfg, Some(repo_root), reserved)?;
+    let workspace = mounted.then(|| lexical(&cfg.workspace.resolved_host_path(repo_root)));
+    let mut hosts: BTreeSet<PathBuf> = workspace.into_iter().collect();
+    for mount in &cfg.workspace.mounts {
+        if !hosts.insert(lexical(&mount.resolved_host_path(repo_root))) {
+            return Err(ConfigValidationError::WorkspaceMountHostDuplicate {
+                path: mount.host_path().to_path_buf(),
+                declared_in: mount.declared_in(),
+            });
+        }
+    }
+    check_binding_paths(cfg, Some(repo_root), mounted)
+}
+
+/// [`check_mount_list`] over the workspace's mounts, with `workspace` -- the
+/// workspace's own container path, when it has one -- reserved, and each
+/// violation stated in workspace terms.
+fn check_workspace_mounts(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+    workspace: Option<PathBuf>,
+) -> Result<(), ConfigValidationError> {
+    let reserved = workspace.into_iter().collect();
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {
             MountRuleViolation::ContainerNotAbsolute { path, declared_in } => {
@@ -1562,6 +1633,17 @@ fn validate_bindings(cfg: &Config, repo_root: Option<&Path>) -> Result<(), Confi
     for (name, binding) in &cfg.bindings {
         validate_binding(name, binding)?;
     }
+    check_binding_paths(cfg, repo_root, true)
+}
+
+/// With a binding, that every directory a session mounts can appear in the
+/// container at its host path: the workspace, when `workspace` says it is
+/// mounted, and each mount.
+fn check_binding_paths(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+    workspace: bool,
+) -> Result<(), ConfigValidationError> {
     if cfg.bindings.is_empty() {
         return Ok(());
     }
@@ -1576,7 +1658,7 @@ fn validate_bindings(cfg: &Config, repo_root: Option<&Path>) -> Result<(), Confi
         }
         _ => Ok(()),
     };
-    if let Some(container) = cfg.workspace.declared_container_path() {
+    if workspace && let Some(container) = cfg.workspace.declared_container_path() {
         same(
             "workspace.container-path".to_string(),
             container,

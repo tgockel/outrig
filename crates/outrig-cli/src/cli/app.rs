@@ -55,10 +55,11 @@ enum Cmd {
     /// Without a script, `outrig run` starts the interactive agent session, and `outrig
     /// run-legacy` is the same command. With one, it runs the script on the host under the Python
     /// OutRig carries, as `python3 <script> [args...]` would run it, with `import outrig`
-    /// available. That starts no container and calls no model. The program chooses its own
-    /// session's inputs, so `--agent`, `--model` and the session's other flags are refused before
-    /// the script, while `--config`, `--global-config`, `--session-root` and `-v` apply as for
-    /// every command. Everything after the script is the program's own. A later release makes
+    /// available. That starts no container and calls no model until the program enters a session
+    /// with `outrig.Session`. The program chooses its own session's inputs, so `--agent`,
+    /// `--model` and the session's other flags are refused before the script, while `--config`,
+    /// `--global-config`, `--session-root` and `-v` apply as for every command, and `--grace` to
+    /// the program alone. Everything after the script is the program's own. A later release makes
     /// `outrig run` the command of the sessions whose agents write Python.
     Run(RunCommandArgs),
     /// Start an interactive agent session.
@@ -190,7 +191,13 @@ fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.cmd {
         Cmd::Run(args) if !args.program.is_empty() => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(program::execute(&repo_config, &global_config, &args.program))
+            runtime.block_on(program::execute(
+                &repo_config,
+                &global_config,
+                cli.session_root.as_deref(),
+                args.grace,
+                &args.program,
+            ))
         }
         Cmd::Run(RunCommandArgs { session: args, .. }) | Cmd::RunLegacy(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;

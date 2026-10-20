@@ -32,6 +32,7 @@ use nix::sys::statvfs::{FsFlags, statvfs};
 use super::stack::{THREAD_STACK, stack_field};
 use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError, Result};
+use crate::supervise;
 
 /// The directory OutRig claims inside a session's primary container. Nothing
 /// the caller mounts may land at or under it.
@@ -113,7 +114,7 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
     // The blocking task, not this future, holds the lock through the unpack,
     // so a launch cancelled while it waits cannot let another start a second.
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || {
+    supervise::blocking(move |_| {
         let parent = target.parent().expect("the payload directory has a parent");
         std::fs::create_dir_all(parent).path_ctx("create", parent)?;
         runnable_from(parent)?;
@@ -142,7 +143,7 @@ pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
         return Ok(dir);
     }
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || unpack_once(RPYC_ARCHIVE, &target, RPYC))
+    supervise::blocking(move |_| unpack_once(RPYC_ARCHIVE, &target, RPYC))
         .await
         .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
     Ok(dir)
@@ -164,7 +165,7 @@ pub(crate) async fn package_dir() -> Result<PathBuf> {
         return Ok(dir);
     }
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || locked_once(&target, || write_package(&target)))
+    supervise::blocking(move |_| locked_once(&target, || write_package(&target)))
         .await
         .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
     Ok(dir)

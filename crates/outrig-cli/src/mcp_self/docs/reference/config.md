@@ -41,6 +41,9 @@ deny  = ["*:22"]                                      # optional; global only
 
 [events]
 mode = "off"                                          # optional: off or record
+
+[host]
+grace-secs = 5                                        # optional; defaults to 5
 ```
 
 | Key                  | Type    | Required               | Where  | Description               |
@@ -59,6 +62,7 @@ mode = "off"                                          # optional: off or record
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
 | `network.deny`       | array   | no                     | global | Filter deny entries.      |
 | `events.mode`        | string  | no                     | either | Agent event log.          |
+| `host.grace-secs`    | integer | no                     | either | Host program grace (s).   |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -78,7 +82,8 @@ A `[network]` table that declares no `mode` declares nothing, so it inherits. Ne
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
 `[events].mode` can live in either file too, but when the global config sets it, that value
-stands.
+stands. `[host].grace-secs` can live in either file, and the repo value wins, as for the
+top-level keys.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -259,6 +264,22 @@ applies only when the global config says nothing. The record is your own of your
 so a cloned project can neither start recording it nor stop it. `outrig run` reads the key and
 records nothing, and with `record` set it says so at startup. There is no command-line flag for
 it yet.
+
+## `[host]`
+
+How `outrig run <script.py>` treats the Python program it runs on the host:
+
+```toml
+[host]
+grace-secs = 5
+```
+
+- `grace-secs`: how many seconds the program has to end on its own after the first `SIGINT` or
+  `SIGTERM` that `outrig` forwards to it. Past it, or at a second signal, `outrig` stops the
+  program's process group: `SIGTERM`, then `SIGKILL` five seconds later. Time spent shutting down
+  a session the program asked to shut down does not count. `0` stops the group at the first
+  signal; at most `3600`. `outrig run --grace <secs>` overrides it for one invocation. See
+  [Usage -> outrig run](https://tgockel.github.io/outrig/usage/run.html#signals-and-the-grace).
 
 ## `[providers.<name>]`
 
@@ -1365,6 +1386,7 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `subagent-depth-max`, if set at the top level or on an agent, must be between `1` and `16`
   (`1` disables subagents).
 - `subagent-width-max`, if set at the top level or on an agent, must be between `1` and `16`.
+- `[host] grace-secs`, if set, must be at most `3600`.
 - `retry-budget-secs`, if set at the top level or on a remote provider, must be at most `3600`
   seconds. `0` is legal and disables retries.
 - `request-timeout-secs`, if set on a remote provider, must be between `1` and `3600` seconds.

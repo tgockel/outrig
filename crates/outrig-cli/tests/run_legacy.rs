@@ -187,7 +187,8 @@ async fn run_legacy_behaves_as_run() {
     }
 }
 
-/// `run-legacy` takes exactly the session's flags `run` takes, and no script.
+/// `run-legacy` takes exactly the session's flags `run` takes, and neither a script nor the
+/// script's `--grace`.
 #[tokio::test]
 async fn run_legacy_has_run_s_session_flags() {
     let dir = tempfile::tempdir().expect("a dir");
@@ -198,6 +199,7 @@ async fn run_legacy_has_run_s_session_flags() {
     let options = |help: &str| -> Vec<String> {
         help.lines()
             .filter(|line| line.trim_start().starts_with('-'))
+            .filter(|line| !line.trim_start().starts_with("--grace"))
             .map(str::to_string)
             .collect()
     };
@@ -205,6 +207,10 @@ async fn run_legacy_has_run_s_session_flags() {
     assert!(
         run.contains("[SCRIPT]...") && !legacy.contains("SCRIPT"),
         "{legacy}"
+    );
+    assert!(
+        run.contains("--grace <SECS>") && !legacy.contains("--grace"),
+        "{run}\n---\n{legacy}"
     );
 }
 

@@ -47,6 +47,7 @@ pub mod mcp_proxy;
 pub mod network;
 mod nsfork;
 mod outrig_;
+mod owner;
 mod process;
 mod python;
 mod repo;

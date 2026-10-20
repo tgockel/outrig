@@ -539,32 +539,41 @@ async fn write_events(mut events: Subscription, sink: LineSink<()>, source: Stri
     }
 }
 
-/// One record: the CloudEvents context attributes, then `data`, on a line.
-fn envelope(event: &Event, source: &str) -> serde_json::Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Record<'a> {
-        specversion: &'static str,
-        id: String,
-        source: &'a str,
-        #[serde(rename = "type")]
-        kind: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        subject: Option<&'a str>,
-        time: String,
-        datacontenttype: &'static str,
-        data: &'a Payload,
+/// One event as `events.jsonl` records it: the CloudEvents context attributes, then `data`.
+#[derive(Serialize)]
+pub(crate) struct Record<'a> {
+    specversion: &'static str,
+    id: String,
+    source: &'a str,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<&'a str>,
+    time: String,
+    datacontenttype: &'static str,
+    data: &'a Payload,
+}
+
+impl<'a> Record<'a> {
+    /// `event`, of the session `source` names.
+    pub(crate) fn of(event: &'a Event, source: &'a str) -> Self {
+        let time = jiff::Timestamp::try_from(event.time).unwrap_or_else(|_| jiff::Timestamp::now());
+        Self {
+            specversion: "1.0",
+            id: event.id.to_string(),
+            source,
+            kind: format!("{TYPE_PREFIX}{}", event.kind()),
+            subject: event.subject.as_ref().map(Subject::as_str),
+            time: time.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            datacontenttype: "application/json",
+            data: &event.payload,
+        }
     }
-    let time = jiff::Timestamp::try_from(event.time).unwrap_or_else(|_| jiff::Timestamp::now());
-    let mut line = serde_json::to_vec(&Record {
-        specversion: "1.0",
-        id: event.id.to_string(),
-        source,
-        kind: format!("{TYPE_PREFIX}{}", event.kind()),
-        subject: event.subject.as_ref().map(Subject::as_str),
-        time: time.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-        datacontenttype: "application/json",
-        data: &event.payload,
-    })?;
+}
+
+/// One record, on a line.
+fn envelope(event: &Event, source: &str) -> serde_json::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(&Record::of(event, source))?;
     line.push(b'\n');
     Ok(line)
 }

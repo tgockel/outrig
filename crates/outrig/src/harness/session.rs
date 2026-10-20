@@ -56,6 +56,9 @@ pub struct Session {
     bindings: Bindings,
     /// Every model call the session makes, whichever agent makes it.
     ledger: Ledger,
+    /// Why its shutdown is to say it is not proven stopped, for a test.
+    #[cfg(test)]
+    fail_stop: Option<String>,
 }
 
 impl Session {
@@ -90,7 +93,17 @@ impl Session {
             lifecycle,
             bindings,
             ledger,
+            #[cfg(test)]
+            fail_stop: None,
         }
+    }
+
+    /// The session, whose shutdown says it is not proven stopped for
+    /// `reason`, when one is given.
+    #[cfg(test)]
+    pub(crate) fn failing(mut self, reason: Option<String>) -> Self {
+        self.fail_stop = reason;
+        self
     }
 
     /// Open the primary agent's kernel, on the interpreter's main thread, and
@@ -343,6 +356,8 @@ impl Session {
             lifecycle,
             mut bindings,
             ledger: _,
+            #[cfg(test)]
+            fail_stop,
         } = self;
         lifecycle.close(ClosedBy::Owner);
         let until = tokio::time::Instant::now() + deadline;
@@ -403,6 +418,8 @@ impl Session {
                 }
             }
         }
+        #[cfg(test)]
+        failed.extend(fail_stop);
         // Last, once the interpreter has stopped too, so the calls it never
         // sent are in: nothing hosted is published after.
         let hosted = bindings.report();
