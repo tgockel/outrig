@@ -770,3 +770,35 @@ async fn a_client_cancel_drops_the_backing_call() {
     client.cancel().await.expect("client shutdown");
     let _ = server.await;
 }
+
+#[test]
+fn the_shared_assignment_names_what_the_proxy_advertises() {
+    // `outrig run` calls `assign_tool_names` directly; it must agree with the
+    // names `outrig mcp` advertises for the same tools, positionally -- the
+    // proxy's listing is in `tools/list` order, and so is the assignment.
+    let tools = ["read/file", "read_file_5d2270", "echo", "echo"];
+    let fs = tools
+        .iter()
+        .fold(FakeClient::new("fs"), |c, t| c.with_tool(t));
+    let (names, _) = with_captured_tracing(async move {
+        let proxy = ProxyServer::build(vec![Arc::new(fs)]).await.expect("build");
+        advertised(&proxy).await.0
+    });
+
+    let identities: Vec<(&str, &str)> = tools.iter().map(|t| ("fs", *t)).collect();
+    let assigned: Vec<String> = crate::assign_tool_names(&identities, &[])
+        .into_iter()
+        .map(|n| n.expect("every tool finds a name"))
+        .collect();
+
+    assert_eq!(assigned, names);
+    let distinct: std::collections::HashSet<_> = assigned.iter().collect();
+    assert_eq!(distinct.len(), tools.len());
+}
+
+#[test]
+fn a_reserved_name_stays_put_and_the_tool_widens() {
+    let assigned = crate::assign_tool_names(&[("fs", "echo")], &["fs__echo"]);
+    let name = assigned[0].as_deref().expect("a wider name is free");
+    assert_ne!(name, "fs__echo");
+}

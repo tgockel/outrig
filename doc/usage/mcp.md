@@ -419,7 +419,9 @@ Sixty-four characters cannot encode every possible pair, so two tools can still 
 name. outrig widens one side's suffix rather than dropping either, and picks which side
 moves from the two tools' identities rather than from listing order. A widened name does
 depend on the rest of the session's tool set, so it is the one kind of name worth re-reading
-instead of caching when the servers in play change.
+instead of caching when the servers in play change. `outrig run` applies the same rule, so a
+tool set gets the same names on either surface. The one difference is `/sidecar add`: names the
+model has already seen cannot move, so a tool added mid-session is the one widened.
 
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md#tool-name-prefixing) for the
 collision and sanitization rules.
