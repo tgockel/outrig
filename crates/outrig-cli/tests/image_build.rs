@@ -327,14 +327,17 @@ async fn sigint_during_the_probe_removes_the_validation_container() {
         "stderr",
     ));
 
-    // The probe is waiting on the handshake once its client exists.
-    let container = timeout(LIGHT_TIMEOUT, async {
+    // The probe is waiting on the handshake once its client exists. The id is
+    // read here, while the container is alive: nothing resolves it once the
+    // container is removed, and the closing check needs it.
+    let (container, id) = timeout(LIGHT_TIMEOUT, async {
         loop {
             let names = podman_names(&format!("ancestor={tag}")).await;
             if let [name] = names.as_slice()
-                && probe_client_running(name).await
+                && let Some(id) = podman_id(name).await
+                && probe_client_running(&id).await
             {
-                return name.clone();
+                return (name.clone(), id);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -362,15 +365,31 @@ async fn sigint_during_the_probe_removes_the_validation_container() {
     );
     wait_until_gone(std::slice::from_ref(&container)).await;
     assert!(
-        !probe_client_running(&container).await,
+        !probe_client_running(&id).await,
         "the probe's podman exec client outlived outrig"
     );
 }
 
-/// Whether a `podman exec` client into `container` is running on this host.
-async fn probe_client_running(container: &str) -> bool {
+/// The engine's full id for `container`, or `None` once it is gone. `podman ps`
+/// prints a short one; the full one is what outrig puts in the `podman exec` it
+/// starts.
+async fn podman_id(container: &str) -> Option<String> {
+    let out = Command::new("podman")
+        .args(["inspect", "--format", "{{.Id}}", container])
+        .output()
+        .await
+        .expect("podman inspect");
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !id.is_empty()).then_some(id)
+}
+
+/// Whether a `podman exec` client into the container whose full id is `id` is
+/// running on this host. outrig addresses a container it created by its id
+/// rather than its name (`Container::selector`), so the name is not in the
+/// client's argv.
+async fn probe_client_running(id: &str) -> bool {
     Command::new("pgrep")
-        .args(["-f", &format!("podman exec .*{container} ")])
+        .args(["-f", &format!("podman exec .*{id} ")])
         .stdout(Stdio::null())
         .status()
         .await
