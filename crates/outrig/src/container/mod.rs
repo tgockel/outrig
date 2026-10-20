@@ -2136,13 +2136,10 @@ fn append_bind_mount(
 /// possibly start a thread -- while still holding the registry, from a
 /// panicking thread.
 ///
-/// `try_lock` rather than `lock`, for both of the sweep's triggers. The hook
-/// runs at the panic site before unwinding, so a thread that panics while
-/// holding the registry would re-lock a non-reentrant mutex on itself and hang
-/// there. [`with_panic_sweep`] runs once the unwind has let go of anything this
-/// thread held, but a forked child ([`crate::nsfork`]) can reach either, and it
-/// inherits a lock held by a thread it does not have. A sweep that gives up is
-/// a leak; one that deadlocks is a process that never finishes dying.
+/// `try_lock` rather than `lock`. The hook runs at the panic site before
+/// unwinding, so a thread that panics while holding the registry would re-lock
+/// a non-reentrant mutex on itself and hang there. A sweep that gives up is a
+/// leak; one that deadlocks is a process that never finishes dying.
 ///
 /// A registry that will not come free is left alone. Giving up costs a sweep;
 /// waiting would cost the panic report, or the exit, itself.
@@ -2169,6 +2166,24 @@ fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
 fn sweep() {
     for removal in pending_removals() {
         removal.detach();
+    }
+}
+
+/// `sweep`, armed for the calling process and no other (#272). A forked child
+/// ([`crate::nsfork`]) inherits the registry and every trigger armed before its
+/// fork, but the containers are its parent's: a sweep from the child would
+/// remove them all out from under the parent. The pid is taken here, when the
+/// trigger is armed, and compared when it fires; `getpid` is async-signal-safe,
+/// so that is as safe to ask in a child that has just panicked as anywhere.
+///
+/// `sweep` is supplied, as it is to [`on_unwind`], so a test can watch for it
+/// without spawning `podman`.
+fn arm(sweep: impl Fn()) -> impl Fn() {
+    let owner = std::process::id();
+    move || {
+        if std::process::id() == owner {
+            sweep();
+        }
     }
 }
 
@@ -2201,6 +2216,10 @@ fn sweep() {
 /// had. The sweep runs after the catch, not from a guard's `Drop` during the
 /// unwind, so a fault inside it is an ordinary panic rather than an abort.
 ///
+/// It sweeps only in the process that called it. A forked child inherits this
+/// frame and the registry, but the containers are its parent's, so a panic that
+/// reaches the sweep there removes nothing.
+///
 /// # Where to put it
 ///
 /// Around the outermost frame that can panic: `main`'s body, after
@@ -2226,7 +2245,7 @@ fn sweep() {
 /// }
 /// ```
 pub fn with_panic_sweep<T>(f: impl FnOnce() -> T) -> T {
-    on_unwind(f, sweep)
+    on_unwind(f, arm(sweep))
 }
 
 /// [`with_panic_sweep`] with the sweep supplied, so a test can watch for it
@@ -2257,6 +2276,10 @@ fn on_unwind<T>(f: impl FnOnce() -> T, sweep: impl FnOnce()) -> T {
 /// anyway is what removed the containers of a session that survived a task's
 /// panic (#349).
 ///
+/// The hook sweeps only in the process that installed it, as
+/// [`with_panic_sweep`] does. A forked child inherits the hook, but the
+/// containers are its parent's.
+///
 /// Not to be installed from a test. It is process-wide and `OnceLock`-guarded,
 /// so in an abort build one test installing it makes every *other* failing
 /// test in that binary sweep obligations it does not own.
@@ -2269,8 +2292,9 @@ pub fn install_panic_hook() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
+        let armed = arm(sweep);
         std::panic::set_hook(Box::new(move |info| {
-            sweep();
+            armed();
             prev(info);
         }));
     });
@@ -3026,6 +3050,33 @@ mod tests {
 
         assert!(!fired);
         assert_eq!(outcome.ok(), Some(42));
+    }
+
+    /// #272. A forked child inherits the registry and every trigger armed
+    /// before its fork, so a sweep it ran would remove the containers of the
+    /// parent that is waiting on it. The child reports whether the armed sweep
+    /// fired in it.
+    #[test]
+    fn a_forked_child_never_sweeps() {
+        use crate::nsfork::{Status, fork_collect, send_failure};
+
+        let fired = std::cell::Cell::new(false);
+        let armed = arm(|| fired.set(true));
+
+        armed();
+        assert!(fired.get(), "the process that armed the sweep runs it");
+
+        fired.set(false);
+        let (reply, _) = fork_collect(|sock| {
+            armed();
+            send_failure(sock, u32::from(fired.get()), 0);
+        })
+        .expect("fork_collect");
+        assert_eq!(
+            reply,
+            Status::OK,
+            "a forked child swept its parent's obligations"
+        );
     }
 
     #[test]

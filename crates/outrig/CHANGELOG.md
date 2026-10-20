@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A panic in a forked namespace helper ends the helper and touches nothing of its parent's.** The
+  user-database and home-directory passes of `Container::bootstrap_user`, and the listener binds
+  and resolver edits of network attach and detach, each run a closure in a forked child. A panic
+  there unwound out of the closure into the frames that forked: every `Container` the forking task
+  held detached a `podman rm -f` of its own container, and wherever a runtime caught the unwind
+  the child lived on as a copy of the process, with the parent waiting for its reply for as long
+  as it did. In the CLI the unwind could also reach `with_panic_sweep`, and in a `panic = "abort"`
+  build `install_panic_hook`'s hook ran in the child; each removed every container the parent
+  owned. The child now catches the panic and exits at once, and the parent fails with `namespace
+  helper panicked before reporting a status`. `with_panic_sweep` and the hook sweep only in the
+  process that called them. No helper has a panic site today, so nothing changes where they run
+  to completion. (#272)
+
 - **A build's temporary tag is no longer stranded when the working container's removal is
   refused.** When stamping labels failed and buildah refused the removal of the `outrig-label-*`
   working container, the tag's removal retried alongside it, was refused as in use, and could give

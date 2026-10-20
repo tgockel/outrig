@@ -87,15 +87,28 @@ impl From<CollectError> for io::Error {
     }
 }
 
+/// The exit status of a child whose closure panicked -- the one Rust gives a
+/// process whose `main` panics -- so [`silent_child`] can tell it from one that
+/// simply returned.
+const PANIC_EXIT: libc::c_int = 101;
+
 /// Run `child` in a forked child process and collect the message it sends back
 /// over the socketpair, plus any descriptors attached to it. `child` receives
 /// its end of the socket, must send exactly one message (see [`send_status`]),
-/// and must stay async-signal-safe. Its exit code carries nothing: the parent
+/// and must stay async-signal-safe. Its exit code carries no result: the parent
 /// reads the [`Status`], or an error if the child died without one.
+///
+/// A panic in `child` ends the child on the spot, exiting with [`PANIC_EXIT`].
+/// Unwinding on would drop the caller's values in this copy of the parent -- a
+/// `Container` among them -- and carry the copy on wherever the unwind lands,
+/// with the socket still open and the parent waiting on it. (A build with
+/// `panic = "abort"` has nothing to catch: the child is aborted, and the
+/// parent's error names the signal.)
 ///
 /// Errors only when the fork machinery itself failed or the child never
 /// replied -- a child that reports a failure through its [`Status`] still
-/// returns `Ok`. A child killed before replying is named by its signal.
+/// returns `Ok`. A child killed before replying is named by its signal, and one
+/// that panicked by the panic.
 pub(crate) fn fork_collect<F>(child: F) -> Result<(Status, Vec<OwnedFd>), CollectError>
 where
     F: FnOnce(RawFd),
@@ -115,9 +128,10 @@ where
 
     if pid == 0 {
         close_fd(sv[0]);
-        child(sv[1]);
-        // `_exit` diverges, so nothing in this frame is ever dropped.
-        unsafe { libc::_exit(0) };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| child(sv[1])));
+        // `_exit` diverges, so nothing in this frame is ever dropped -- not even
+        // the payload of a panic.
+        unsafe { libc::_exit(if outcome.is_ok() { 0 } else { PANIC_EXIT }) };
     }
 
     close_fd(sv[1]);
@@ -136,7 +150,8 @@ where
 }
 
 /// The error for a child that closed its socket without replying, naming the
-/// signal that killed it when its `wait_status` says one did.
+/// signal that killed it, or the panic that ended it, when its `wait_status`
+/// says so.
 fn silent_child(wait_status: libc::c_int) -> io::Error {
     let message = if libc::WIFSIGNALED(wait_status) {
         let sig = libc::WTERMSIG(wait_status);
@@ -144,6 +159,8 @@ fn silent_child(wait_status: libc::c_int) -> io::Error {
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|_| format!("signal {sig}"));
         format!("namespace helper was killed by {name} before reporting a status")
+    } else if libc::WIFEXITED(wait_status) && libc::WEXITSTATUS(wait_status) == PANIC_EXIT {
+        "namespace helper panicked before reporting a status".to_string()
     } else {
         "namespace helper exited without reporting a status".to_string()
     };
@@ -343,6 +360,8 @@ const fn cmsg_len(data_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+
     use super::*;
 
     #[test]
@@ -401,5 +420,57 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(err.to_string().contains("killed by SIGKILL"), "{err}");
+    }
+
+    /// Writes a byte to its pipe when dropped in any process but the one that
+    /// made it: a stand-in for a destructor of the frames that forked, such as
+    /// `Drop for Container`.
+    struct DropsInTheChild {
+        owner: u32,
+        pipe: io::PipeWriter,
+    }
+
+    impl Drop for DropsInTheChild {
+        fn drop(&mut self) {
+            if std::process::id() != self.owner {
+                let _ = self.pipe.write_all(b"x");
+            }
+        }
+    }
+
+    /// #272. A panic in the child used to unwind out of `fork_collect` there,
+    /// running the caller's destructors in a copy of the process and, where a
+    /// runtime caught it, leaving the copy running with the parent waiting on
+    /// it.
+    ///
+    /// The unwind is raised with `resume_unwind`, which does not run the panic
+    /// hook: a forked child of this multi-threaded binary can wait forever on a
+    /// lock (stderr, the backtrace printer) that another test's thread held at
+    /// the fork.
+    #[test]
+    fn fork_collect_ends_a_child_that_panics_and_names_the_panic() {
+        let (mut escaped, pipe) = io::pipe().expect("pipe");
+        let caller = DropsInTheChild {
+            owner: std::process::id(),
+            pipe,
+        };
+
+        let err = fork_collect(|_sock| std::panic::resume_unwind(Box::new("injected")))
+            .expect_err("a child that panicked sent no reply");
+        let CollectError::Reply(err) = err else {
+            panic!("a panicked child is a reply failure: {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("panicked"), "{err}");
+
+        // The child is reaped, so dropping this process's end leaves nothing
+        // that can still write, and the read ends at whatever the child did.
+        drop(caller);
+        let mut written = Vec::new();
+        escaped.read_to_end(&mut written).expect("read");
+        assert!(
+            written.is_empty(),
+            "the child unwound into the frames of its caller"
+        );
     }
 }
