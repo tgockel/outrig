@@ -719,7 +719,7 @@ impl Container {
         // is released: a container this cannot name is not one to go on with.
         let id = engine_id(&created.stdout)
             .ok_or_else(|| unidentified_container(&options.name, &created.stdout))?;
-        let init = Cmd::new("podman").arg("init").arg(&options.name);
+        let init = Cmd::new("podman").arg("init").arg(id.as_str());
         process::run_capture_logged(init, "podman", options.transcript.as_ref()).await?;
 
         let workspace = match &options.launch.workspace {
@@ -909,6 +909,27 @@ impl Container {
         &self.name
     }
 
+    /// What to hand podman to address this container: the engine's id for one
+    /// outrig created, which is never granted to another container, else the
+    /// name. Fits anywhere podman takes a container, such as
+    /// `--userns=container:<selector>`. Prefer it to [`name`](Self::name) for
+    /// anything that acts on the container, since a name can be granted again
+    /// once the container is gone.
+    ///
+    /// Podman looks a selector up as a name too, so this is not proof of
+    /// identity: another container *named* with this id would answer to it.
+    /// Reads that need that proof, such as the PID, check the id podman
+    /// reports back.
+    pub fn selector(&self) -> &str {
+        self.id.as_ref().map_or(&*self.name, ContainerId::as_str)
+    }
+
+    fn inspect_cmd(&self, format: &str) -> Cmd {
+        Cmd::new("podman")
+            .args(["inspect", "--format", format])
+            .arg(self.selector())
+    }
+
     /// The container's init PID via `podman inspect --format {{.State.Pid}}`.
     /// Errors when the container is not running (`State.Pid == 0`): a created
     /// but unstarted container has no namespaces to join or intercept. Shared
@@ -978,16 +999,30 @@ impl Container {
     }
 
     /// `podman inspect --format <format>` of this container, trimmed.
+    ///
+    /// Podman resolves a selector as a name as well as an id, so an owned
+    /// handle also reads back the id of what answered and refuses a different
+    /// one: a container named with this one's full id is not this container.
     async fn inspect_format(&self, format: &str) -> Result<String> {
         let output = process::run_capture_logged(
-            Cmd::new("podman")
-                .args(["inspect", "--format", format])
-                .arg(&self.name),
+            self.inspect_cmd(&format!("{{{{.Id}}}} {format}")),
             "podman",
             self.transcript.as_ref(),
         )
         .await?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (answered, rest) = text.trim().split_once(' ').unwrap_or((text.trim(), ""));
+        if let Some(id) = &self.id
+            && answered != id.as_str()
+        {
+            return Err(OutrigError::Configuration(format!(
+                "podman inspect {} answered for container {answered}, not the {} this handle \
+                 created",
+                self.name,
+                id.as_str()
+            )));
+        }
+        Ok(rest.trim().to_string())
     }
 
     /// Whether the interceptor's resolver was baked in at create time; see
@@ -1236,7 +1271,7 @@ impl Container {
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
         }
-        c = c.arg(&self.name);
+        c = c.arg(self.selector());
         for arg in cmd {
             c = c.arg(arg);
         }
@@ -1324,7 +1359,7 @@ impl Container {
         Cmd::new("podman")
             .args(["stop", "--ignore", "-t"])
             .arg(secs)
-            .arg(self.id.as_ref().map_or(&*self.name, ContainerId::as_str))
+            .arg(self.selector())
     }
 
     /// The command to actually run for `real`. Itself outside tests.
@@ -2414,6 +2449,41 @@ mod tests {
         // stop either, since stopping one is a no-op it returns early from.
         let borrowed = Container::stops_cleanly();
         assert_eq!(borrowed.id, None);
+    }
+
+    /// Every verb that acts on the container names the id, for the reason the
+    /// stop does: a handle that outlives its container must reach nothing
+    /// rather than whatever is granted the name next.
+    #[test]
+    fn exec_and_inspect_name_the_id_for_an_owned_handle_and_the_name_for_a_borrowed_one() {
+        let id = "2f8b1c0d".repeat(8);
+        let mut owned = Container::unstoppable();
+        owned.name = "outrig-a-name-that-can-come-round-again".to_string();
+        owned.id = engine_id(id.as_bytes());
+        owned.user_name = Some("tester".to_string());
+
+        assert_eq!(owned.selector(), id);
+        for argv in [
+            owned.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
+            owned.inspect_cmd("{{.State.Pid}}"),
+        ] {
+            let asked = argv.render();
+            assert!(asked.contains(&id), "must name the engine's id: {asked}");
+            assert!(
+                !asked.contains("come-round-again"),
+                "and not a name that can come round again: {asked}"
+            );
+        }
+
+        let mut borrowed = Container::stops_cleanly();
+        borrowed.user_name = Some("tester".to_string());
+        assert_eq!(borrowed.selector(), "outrig-test-borrowed");
+        for argv in [
+            borrowed.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
+            borrowed.inspect_cmd("{{.State.Pid}}"),
+        ] {
+            assert!(argv.render().contains("outrig-test-borrowed"));
+        }
     }
 
     /// An id is what podman prints for a `create`, and nothing else counts as

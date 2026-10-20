@@ -21,7 +21,9 @@ use outrig::image::ImageTag;
 /// A `podman` whose containers log where `--log-opt=path=` says and whose `start --attach`
 /// client never relays a byte: the shape of the loss.
 ///
-/// State is per container name, so concurrent tests in this binary cannot read each other's.
+/// State is per container name, so concurrent tests in this binary cannot read each other's. The
+/// `start` is told the id the `create` printed rather than the name, so the log path is kept under
+/// that too.
 const FAKE_PODMAN: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 name=
@@ -39,13 +41,15 @@ case "$1" in
     printf '%s\n' "$*" > "$dir/$name.create.argv"
     printf '%s' "$log" > "$dir/$name.log.path"
     # What `podman create` prints: the container's id, 64 hex digits.
-    printf '%064x\n' "$$"
+    id=$(printf '%064x' "$$")
+    printf '%s' "$log" > "$dir/$id.log.path"
+    printf '%s\n' "$id"
     ;;
   start)
     # The container ran and wrote what conmon logs: a line of protocol on stdout, and the
     # launcher's diagnostic on stderr, in two pieces as an unbuffered `eprintln!` makes it.
-    name=$(eval echo "\${$#}")
-    log=$(cat "$dir/$name.log.path" 2>/dev/null)
+    id=$(eval echo "\${$#}")
+    log=$(cat "$dir/$id.log.path" 2>/dev/null)
     if [ -n "$log" ]; then
       ts=2026-10-13T14:30:00.123456789-06:00
       printf '%s stdout F %s\n' "$ts" '{"jsonrpc":"2.0","id":0}' >> "$log"

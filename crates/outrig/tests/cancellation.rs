@@ -804,11 +804,15 @@ async fn a_cancel_between_create_and_init_removes_the_container() {
     // outrig-cancel-init-...` contains the word too, and a fragment match
     // would park this test in `create` and quietly retire the boundary it
     // exists for. The name keeps the collision rather than dodging it, so the
-    // matcher stays honest.
-    let initializing = [name.as_str()];
+    // matcher stays honest. The `init` names the id the fake `create` printed,
+    // which is its pid in hex, since a name is not what it is given.
     let client = tokio::select! {
         _ = &mut create => panic!("the fake `podman init` should not have returned"),
-        pid = invocation_pid(journal, "init", &initializing) => pid,
+        pid = async {
+            let created = invocation_pid(journal, "create", &[name.as_str()]).await;
+            let id = format!("{created:064x}");
+            invocation_pid(journal, "init", &[id.as_str()]).await
+        } => pid,
     };
     drop(create);
 

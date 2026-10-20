@@ -194,7 +194,7 @@ impl McpClient {
     ) -> Result<Self> {
         let cmd = Cmd::new("podman")
             .args(["start", "--attach", "--interactive"])
-            .arg(container.name());
+            .arg(container.selector());
         // Derived from the one Cmd so failure diagnostics can't drift from
         // what actually ran.
         let argv: Vec<String> = std::iter::once(cmd.program.to_string())

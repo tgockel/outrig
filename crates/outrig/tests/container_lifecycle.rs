@@ -316,3 +316,71 @@ async fn attached_handle_does_not_stop_or_cleanup_container() {
         "owned stop should remove the container"
     );
 }
+
+/// A handle whose container is gone reaches nothing: a container created under
+/// its name afterward is not where its exec runs, and its stop leaves it be.
+#[tokio::test]
+async fn stale_handle_does_not_reach_a_container_that_took_its_name() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let tag = ImageTag::new(ALPINE);
+    let mut container = Container::start(
+        &tag,
+        ContainerLaunchSpec::workspace(host_ws.path(), Path::new("/workspace")),
+    )
+    .await
+    .expect("start");
+    container.bootstrap_user().await.expect("bootstrap_user");
+    let name = container.name().to_string();
+    let hostname = ["cat".to_string(), "/etc/hostname".to_string()];
+
+    let before = container
+        .exec_capture(&hostname, &outrig::container::ExecOptions::new())
+        .await
+        .expect("exec before");
+    assert!(before.status.success());
+
+    run_capture(Command::new("podman").args(["kill", &name]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while podman_ps_lists(&name, true).await {
+        assert!(Instant::now() < deadline, "the name never freed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    run_capture(Command::new("podman").args([
+        "run",
+        "-d",
+        "--rm",
+        "--pull=never",
+        "--name",
+        &name,
+        "--hostname",
+        "replacement",
+        ALPINE,
+        "sleep",
+        "infinity",
+    ]));
+
+    let after = container
+        .exec_capture(&hostname, &outrig::container::ExecOptions::new())
+        .await;
+    let ran_in_replacement = after
+        .as_ref()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("replacement"));
+    let stopped = container.stop(Duration::from_secs(2)).await;
+    let replacement_survived = podman_ps_lists(&name, false).await;
+    // Clean up before asserting, so a failure leaves nothing running.
+    try_capture(Command::new("podman").args(["rm", "-f", "-t", "0", &name]));
+
+    assert!(!ran_in_replacement, "the stale exec ran in the replacement");
+    assert!(
+        after.map(|out| !out.status.success()).unwrap_or(true),
+        "the stale exec should fail: no such container"
+    );
+    stopped.expect("stale stop");
+    assert!(
+        replacement_survived,
+        "the stale stop removed the replacement"
+    );
+}

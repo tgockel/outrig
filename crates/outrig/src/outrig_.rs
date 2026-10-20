@@ -1258,7 +1258,7 @@ impl Outrig {
                 )
             })?;
             launch.primary_view = Some(PrimaryView::new(
-                self.container.name(),
+                self.container.selector(),
                 pid,
                 enter::materialize(&self.log_dir)?,
                 payload_home,

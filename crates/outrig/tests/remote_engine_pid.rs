@@ -24,7 +24,9 @@ use common::{ALPINE, init_tracing, pull_alpine, root_stdout, run_capture, start_
 
 /// Put a `podman` on `PATH` that answers `inspect` of `{{.State.Pid}}` with
 /// `pid` -- a remote engine's number, standing in for a PID that happens to be
-/// taken locally -- and forwards everything else to the real one.
+/// taken locally -- and forwards everything else to the real one. The answer
+/// leads with the container's real id, which the inspect also asks for: only
+/// the PID is the lie.
 fn install_lying_podman(dir: &Path, pid: &str) {
     let real = String::from_utf8(run_capture(Command::new("which").arg("podman")).stdout)
         .expect("utf-8 path")
@@ -36,7 +38,10 @@ fn install_lying_podman(dir: &Path, pid: &str) {
         format!(
             "#!/bin/sh\n\
              case \"$*\" in\n\
-             *'inspect --format {{{{.State.Pid}}}}'*) echo '{pid} 1'; exit 0;;\n\
+             *'inspect --format'*'{{{{.State.Pid}}}}'*)\n\
+             for last; do :; done\n\
+             id=$({real} inspect --format '{{{{.Id}}}}' \"$last\")\n\
+             echo \"$id {pid} 1\"; exit 0;;\n\
              esac\n\
              exec {real} \"$@\"\n"
         ),

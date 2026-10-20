@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `Container` handle addresses its container by the engine's id, not its name.** Since 0002-40
+  only `stop` did; `exec_stdio`, `exec_capture`, the PID and network probes, `podman init`, an MCP
+  server started with `podman start --attach`, and a `view = "primary"` sidecar's
+  `--userns=container:` named the container, so a handle whose container had exited could run a
+  command in, or join the namespaces of, whatever container was created under the same name next.
+  A handle that only borrowed its container (`Container::attach`) has no id and still uses the name
+  it was given.
+
 - **A repo config file may reference only the host variables the global config allows.** `${VAR}` in
   `[images.<n>].build-args` and in an MCP server's `env` resolved any variable in the operator's
   environment, so a committed `.agents/outrig/config.toml` -- or one the agent edited through the
@@ -76,6 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConfigValidationError::DevicePathMalformed` instead of leaving it to fail at `podman run`. (#263)
 
 ### Added
+
+- **`Container::selector`**: what to hand podman to address a container -- the engine's id for one
+  outrig created, else its name. `PrimaryView::new` takes it for `--userns=container:`.
 
 - **`ImageConfig::set_image_name` turns an image-config into a pull source in place.** It is the
   counterpart of `set_build_paths` and mirrors `from_image_name`: it sets `image_name`, clears

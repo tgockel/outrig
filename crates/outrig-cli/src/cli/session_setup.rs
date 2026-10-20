@@ -1072,7 +1072,7 @@ async fn start_auto_sidecars(
         })?;
         (
             Some(PrimaryView::new(
-                containers.primary.name(),
+                containers.primary.selector(),
                 containers.primary.pid().await?,
                 helper_host,
                 payload_home,
