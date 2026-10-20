@@ -612,61 +612,61 @@ fn an_interrupted_serialize_waiter_is_cancelled() {
     assert_eq!(relay.output(2, &with_stub("print(stub.calls)")), "0\n");
 }
 
-/// A callback's own request, interrupted while it waits for a serialized binding's turn, is
-/// cancelled at its depth, and only it: the host calls the callback from a worker thread while the
-/// call it is inside holds the turn, so the request waits there. The callback catches the
-/// interrupt and returns, and the outer call, which was not cancelled with it, returns too.
+/// A callback the library calls from a thread of its own, which the call it is inside joins while
+/// it holds the binding's turn: the callback's request to the same binding is refused at once,
+/// saying why, where it would wait for a turn that call gives up only when the thread ends. No
+/// interrupt is sent: the callback catches the refusal and returns, the outer call returns with it,
+/// and another kernel's call to the binding then runs.
 #[test]
-fn an_interrupted_nested_request_waiting_for_the_turn_is_cancelled_alone() {
+fn a_nested_request_from_a_worker_thread_is_refused_at_once() {
     let mut relay = Relay::start();
     relay.bind_serialized("fx", FACTORY);
+    relay.open("b");
     relay.output(1, &with_stub("stub.public"));
-    relay.submit_in(
-        "primary",
+    relay.output_in("b", 1, &with_stub_in("b", "stub.public"));
+    let out = relay.output(
         2,
         &with_stub(
             r#"
             def callback():
                 try:
                     return stub.noted()
-                except KeyboardInterrupt:
-                    return "interrupted"
+                except Exception as e:
+                    return type(e).__name__ + " " + str(e).split("\n")[0]
             print(stub.call_in_thread(callback))
             "#,
         ),
     );
-    // Its receipt says it reached the binding, where it waits for the turn.
-    relay.hosted_events_until(TIMEOUT, |events| {
-        events.iter().any(|event| {
-            matches!(&event.payload, Payload::HostedReceived { member, .. }
-                if member.as_deref() == Some("noted"))
-        })
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    relay.interrupt("primary", 2, false);
-    assert_eq!(
-        relay.result_from("primary", 2, TIMEOUT)["output"],
-        "interrupted\n"
+    assert!(
+        out.starts_with("outrig.Refused") && out.contains("thread of its own"),
+        "{out}"
     );
     let requests = by_request(&relay.hosted_events());
+    let (outer, call) = requests
+        .iter()
+        .find(|(_, events)| asked(events).0 == Operation::Call)
+        .expect("the outer call");
+    assert_eq!(ended(call).0, HostedOutcome::Returned);
     let noted = requests
         .values()
-        .find(|events| {
-            matches!(&events[0].payload, Payload::HostedReceived { member, .. }
-                if member.as_deref() == Some("noted"))
-        })
+        .find(|events| asked(events).1.as_deref() == Some("noted"))
         .expect("the callback's request");
+    assert_eq!(shape(noted), ["hosted.received", "hosted.ended"]);
     assert_eq!(
         ended(noted),
-        (HostedOutcome::Cancelled, Some(HostedReason::Interrupted))
+        (HostedOutcome::Refused, Some(HostedReason::Interception))
     );
-    // Nothing else was cancelled with it: the call it was inside ran to its end.
-    let cancelled = requests
-        .values()
-        .filter(|events| ended(events).0 == HostedOutcome::Cancelled)
-        .count();
-    assert_eq!(cancelled, 1, "{requests:?}");
-    assert_eq!(relay.output(3, &with_stub("print(stub.calls)")), "0\n");
+    assert!(
+        matches!(&noted[0].payload, Payload::HostedReceived { parent, .. }
+            if *parent == Some(*outer)),
+        "{noted:?}"
+    );
+    // The refused call never ran, and the turn is free: another kernel's call runs, and is the first
+    // the library counts.
+    assert_eq!(
+        relay.output_in("b", 2, &with_stub_in("b", "print(stub.noted())")),
+        "1\n"
+    );
 }
 
 /// A call interrupted while it waits for a free connection never reaches the binding, and is

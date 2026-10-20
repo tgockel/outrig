@@ -588,8 +588,13 @@ order they reached it. A call made inside a callback of the call in progress run
 call waits for the callback, and the callback waits for its request. Nothing special identifies it
 -- the callback's request arrives on the outer call's connection and is served on the thread running
 the outer call, which holds the binding's lock, and the lock is re-entrant. The lock is taken just
-before the target is invoked. The cost is the one the default avoids: under `serialize = true`, a
-call that blocks for an hour holds every other call to that binding for an hour, from every kernel.
+before the target is invoked. That is so for a callback the library calls on the thread running the
+outer call. A library that calls it from a thread of its own, and joins that thread, makes the
+request away from the lock's holder, and waiting there would be for ever: the holder keeps the lock
+until the thread ends. Letting the request through instead would run two threads in a library
+declared not thread-safe, so the binding refuses it at once, saying why, and the callback may catch
+the refusal (#614). The cost is the one the default avoids: under `serialize = true`, a call that
+blocks for an hour holds every other call to that binding for an hour, from every kernel.
 `0003-20` delivers the setting; `0003-17` proved both modes, starting the binding program with
 `--serialize`, which is how the setting reaches it. The lock is granted in arrival order and is
 re-entrant for the thread holding it. A waiter stops waiting, and its request is recorded

@@ -1868,7 +1868,7 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
                 if time.monotonic() > deadline:
                     raise TimeoutError("a waiter never queued")
                 time.sleep(0.001)
-        outer.__exit__(None, None, None)  # depth 1 -> 0: the head of the queue takes it
+        outer.__exit__(None, None, None)  # the last holder leaves: the head of the queue takes it
         for t in threads:
             t.join(20)
         print(json.dumps({"queued_by_holder": queued_by_holder, "order": order,
@@ -1887,6 +1887,85 @@ fn the_serialize_lock_is_reentrant_and_fifo() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("a JSON report");
     assert_eq!(report["queued_by_holder"], 0, "{report}");
     assert_eq!(report["order"], json!([0, 1, 2, 3]), "{report}");
+    assert_eq!(report["waiting"], 0, "{report}");
+    assert!(report["owner"].is_null(), "{report}");
+}
+
+/// A request made inside a callback the library called from a thread of its own, while the request
+/// whose callback it is holds the turn, is refused at once and never queued: the holder may be
+/// joining that thread. One whose parent holds nothing, or that names none, waits like any other.
+#[test]
+fn a_request_nested_in_the_holder_is_refused_on_any_other_thread() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("binding.py");
+    std::fs::write(&source, BINDING_SOURCE).expect("write the binding program");
+    let driver = py(r#"
+        import json, sys, threading, time
+        source = sys.argv[1]
+        ns = {"__name__": "outrig_binding"}
+        exec(compile(open(source).read(), source, "exec"), ns)
+        turn, Refused = ns["Turn"](), ns["Refused"]
+        def request():
+            return ns["Request"](0, False, turn)
+        def on_thread(parent):
+            """A request nested in `parent`, served on a thread of its own: the thread, and what it
+            did -- `took` the turn, or was `refused`."""
+            did = {}
+            def run():
+                try:
+                    with turn.taking(request(), parent):
+                        did["took"] = True
+                except Refused as e:
+                    did["refused"] = str(e)
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            return thread, did
+        def queued(n):
+            deadline = time.monotonic() + 20
+            while len(turn._waiters) < n:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("a waiter never queued")
+                time.sleep(0.001)
+        report = {}
+        outer, inner = request(), request()
+        with turn.taking(outer):
+            with turn.taking(inner, outer):  # on the holder's own thread: runs at once
+                # a request nested in the nested one's callback is refused as well
+                thread, did = on_thread(inner)
+                thread.join(20)
+                report["nested_deeper"] = "refused" in did and not thread.is_alive()
+            thread, did = on_thread(outer)
+            thread.join(20)
+            report["refused_at_once"] = "refused" in did and not thread.is_alive()
+            report["reason"] = did.get("refused")
+            # one that names no parent, or one that is not holding, waits its turn
+            unrelated, took = on_thread(None)
+            queued(1)
+        unrelated.join(20)
+        report["unrelated_took"] = took.get("took")
+        # `outer` has returned: a request that still names it holds nothing against it
+        thread, did = on_thread(outer)
+        thread.join(20)
+        report["returned_parent_took"] = did.get("took")
+        print(json.dumps({**report, "waiting": len(turn._waiters), "owner": turn._owner}))
+    "#);
+    let output = Command::new(python())
+        .args(["-I", "-c", &driver])
+        .arg(&source)
+        .output()
+        .expect("the payload's Python runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("a JSON report");
+    assert_eq!(report["nested_deeper"], true, "{report}");
+    assert_eq!(report["refused_at_once"], true, "{report}");
+    let reason = report["reason"].as_str().expect("a reason");
+    assert!(reason.contains("on a thread of its own"), "{report}");
+    assert_eq!(report["unrelated_took"], true, "{report}");
+    assert_eq!(report["returned_parent_took"], true, "{report}");
     assert_eq!(report["waiting"], 0, "{report}");
     assert!(report["owner"].is_null(), "{report}");
 }

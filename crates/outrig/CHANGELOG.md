@@ -277,7 +277,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process waits for; and `hosted.ended` with a `HostedOutcome` -- `returned`, `raised` with the type
   and the host's traceback text, `refused`, `cancelled`, or `unknown` -- and a `HostedReason`.
   Bookkeeping is recorded only when refused. A callback a library makes is `hosted.callback`, and a
-  request made inside one names its parent. An interrupt ends the caller's wait; a call already
+  request made inside one names its parent. Under `serialize` such a request runs at once when the
+  library called the callback on the thread running the call it belongs to, and is refused at once,
+  saying why, when it called it from a thread of its own, since the call holds the binding's turn
+  and may be waiting for that thread; the callback can catch the refusal. An interrupt ends the
+  caller's wait; a call already
   running runs on, and its outcome notes the interrupt, while one still waiting for its binding's
   turn or for a connection is `cancelled` -- a callback's own call too, and not the call the
   callback runs inside. One that arrives while the answer is being read is raised

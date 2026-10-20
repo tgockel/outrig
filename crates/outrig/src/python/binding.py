@@ -13,8 +13,9 @@ The bindings share what a process has: its environment, its `sys.path` -- where 
 packages hold different versions of one library, the first binding's is the one imported, as in the
 container -- and its life. A binding declared to serialize is a library that is not thread-safe: it
 then runs one request at a time across all its connections, in the order they arrived, except that
-a callback's nested request runs at once on the thread whose turn it is, and that `ping` and
-`close` never wait. Each serializing binding has a turn of its own, so it never waits for another.
+a callback's nested request runs at once on the thread whose turn it is -- and is refused, rather
+than left to wait for the call it is inside, on any other -- and that `ping` and `close` never
+wait. Each serializing binding has a turn of its own, so it never waits for another.
 
 Its stdin and stdout carry NDJSON, one kind of line at a time: RPyC frames tagged by binding, agent
 and connection, split into bounded parts (`rpc` lines), both ways; from the owner first, a `start`
@@ -715,6 +716,11 @@ class Turn:
     callback's nested request, served on that thread, runs at once. A binding that does not
     serialize has a turn nothing waits for.
 
+    A request a callback made names the request it was made inside, its `parent`. When the parent
+    holds the turn and this is another thread -- the library called the callback from a thread of
+    its own -- `taking` refuses at once: the parent keeps the turn until the library returns, which
+    may be waiting for this very thread, so the wait could be for ever.
+
     A waiter is the record `taking` is given, or one of its own; `drop` takes it out of the line,
     and it raises the exception `drop` gave instead of taking its turn.
     """
@@ -723,20 +729,24 @@ class Turn:
         self._serialize = serialize
         self._cond = threading.Condition()
         self._owner = None  # the ident of the thread whose turn it is
-        self._depth = 0  # how many times that thread has taken it
+        self._holders = []  # the waiters that took it, all that thread's, the first outermost
         self._waiters = collections.deque()  # in arrival order
 
     @contextlib.contextmanager
-    def taking(self, waiter=None):
+    def taking(self, waiter=None, parent=None):
         if not self._serialize:
             yield
             return
         me = threading.get_ident()
+        waiter = waiter or types.SimpleNamespace(dropped=None)
         with self._cond:
-            if self._owner == me:
-                self._depth += 1
-            else:
-                waiter = waiter or types.SimpleNamespace(dropped=None)
+            if self._owner != me:
+                if parent in self._holders:
+                    raise Refused(
+                        "a call made inside a callback that the library called on a thread of its "
+                        "own is refused: the call the callback belongs to holds this binding's "
+                        "turn, and may be waiting for this thread"
+                    )
                 self._waiters.append(waiter)
                 try:
                     self._cond.wait_for(
@@ -749,13 +759,14 @@ class Turn:
                 if waiter.dropped is not None:
                     self._cond.notify_all()  # the next in line may be first now
                     raise waiter.dropped
-                self._owner, self._depth = me, 1
+                self._owner = me
+            self._holders.append(waiter)
         try:
             yield
         finally:
             with self._cond:
-                self._depth -= 1
-                if not self._depth:
+                self._holders.pop()
+                if not self._holders:
                     self._owner = None
                     self._cond.notify_all()
 
@@ -1133,8 +1144,10 @@ def connection_class(rpyc):
                             check_member(handler, args)
                         if handler not in unserialized:
                             # Once the request is checked, so a refused one waits for nobody; held
-                            # until its exception, if any, is rendered below.
-                            turn.enter_context(self._turn.taking(request))
+                            # until its exception, if any, is rendered below. The parent is the
+                            # request whose callback this thread is calling, if it still runs.
+                            parent = _requests.get((*self._key, self._context.parent))
+                            turn.enter_context(self._turn.taking(request, parent))
                         with request.lock:
                             if request.dropped is not None:
                                 raise request.dropped
