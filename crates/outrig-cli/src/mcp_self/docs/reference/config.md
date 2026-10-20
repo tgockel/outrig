@@ -96,8 +96,8 @@ A `[network]` table that declares no `mode` declares nothing, so it inherits. Ne
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
 `[repo].env-allow` is global-only too: it says which host variables a repo config's `${VAR}`
-references may name, so a repo file cannot answer for itself. A repo config that declares it is
-rejected at load. See [`[repo]`](#repo).
+references, and an image label's, may name, so a repo file cannot answer for itself. A repo
+config that declares it is rejected at load. See [`[repo]`](#repo).
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). A relative value resolves against the global config's
@@ -365,8 +365,8 @@ interceptor.
 
 ## `[repo]`
 
-Global config only. `[repo]` says what a repo config may take from your machine. Today that is
-one key, `env-allow`:
+Global config only. `[repo]` says what a repo may take from your machine, through its config or
+through the labels of the images it builds or names. Today that is one key, `env-allow`:
 
 ```toml
 [repo]
@@ -389,16 +389,30 @@ may therefore name only the variables `env-allow` lists, and the list is empty b
 - **Every image a repo config file declares is checked**, used or not, because loading does not
   know which one a session will select. A `--config` file is a repo config for this rule, so a
   profile of your own loaded that way needs its variables listed here too.
-- **One list covers both places** -- build-args and MCP `env` -- and applies to every repo this
-  machine runs. An entry is an exact variable name, `^[A-Z_][A-Z0-9_]*$` as in a `${VAR}`
-  reference. There are no patterns.
+- **An image's label is held to it too.** The `org.outrig.mcp` label is not a config file, but it
+  is text the image's author wrote -- a Dockerfile in the repo, which the agent can edit, or an
+  image the repo names -- and a `${VAR}` in a server's `env` there is resolved from your
+  environment just the same. Once the label has merged in, a reference to a variable that is not
+  listed is refused when the session starts, by `outrig run`, `outrig mcp`, and
+  `outrig mcp show-merged` alike. The error names the server, the `env` key, the variable, and
+  the image, and it comes before any sidecar starts or any server runs, so the variable is never
+  read. This covers the primary image's label and each named sidecar's, whoever named the image:
+  your global config and `--image` too. A server your config declares by name replaces the
+  label's entry whole and follows the rules above instead. An image of your own that references
+  a variable -- an `outrig image build` image whose `image.toml` has `${DB_TOKEN}` -- needs it
+  listed here to start. `outrig image build` itself is not held: it runs the servers of a
+  directory you chose.
+- **One list covers all of these places** -- build-args, MCP `env`, and a label's `env` -- and
+  applies to every repo this machine runs. An entry is an exact variable name,
+  `^[A-Z_][A-Z0-9_]*$` as in a `${VAR}` reference. There are no patterns.
 
 **A variable on the list is the repo's to route.** The repo decides which build-arg or server
-environment receives it, and the Dockerfile `RUN` step or MCP server that gets it can do anything
-the container may with it: print it, write it into the workspace, or send it wherever the
-session's [network policy](#network) lets traffic out. A build-arg is also recorded in the
-image's history (`podman history --no-trunc`). List a variable only if you would hand it to
-everyone who can change that repo's config, the agent included.
+environment receives it, in its config or in a label it controls, and the Dockerfile `RUN` step
+or MCP server that gets it can do anything the container may with it: print it, write it into the
+workspace, or send it wherever the session's [network policy](#network) lets traffic out. A
+build-arg is also recorded in the image's history (`podman history --no-trunc`). List a variable
+only if you would hand it to everyone who can change that repo's config or the images it builds
+or names, the agent included.
 
 A repo config may not declare `env-allow`, even as an empty list, any more than it may set
 `session-root` or the `[network]` policy keys: it would be answering for itself. The load
@@ -407,8 +421,8 @@ rejects the file and names the key.
 The global config is read leniently (see [What a load sets aside](#what-a-load-sets-aside)), so
 an `env-allow` that is misspelled, is not a list, or holds an entry that is not a variable name
 is set aside with a warning instead of stopping every repo on the machine. That leaves the list
-empty and every reference refused: a mistake here narrows what a repo may read and never widens
-it. The warning is printed before the refusal it causes.
+empty and every reference refused, an image label's included: a mistake here narrows what a repo
+may read and never widens it. The warning is printed before the refusal it causes.
 
 ## `[providers.<name>]`
 
@@ -1124,8 +1138,9 @@ image, or declare any other MCP command that should run inside the container.
   invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env`, which
   stores them in the container's config, visible to `podman inspect` on the host. A `${VAR}`
   value reaches podman by name rather than on its command line; see the
-  [value syntax](#mcp-env-value-syntax). In a repo config a reference may name only a variable
-  the global config lists in [`[repo]`](#repo) `env-allow`.
+  [value syntax](#mcp-env-value-syntax). In a repo config, or in an image's `org.outrig.mcp`
+  label, a reference may name only a variable the global config lists in [`[repo]`](#repo)
+  `env-allow`.
 - `sidecar` (string, optional): run this server in the named
   [`[sidecars.<sc>]`](#sidecarssc) container instead of the primary.
   With `command`, the server is exec-stdio in that container; *without* `command`, that
@@ -1182,8 +1197,9 @@ Notes:
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#long-server-names).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
   resolved from the host environment at MCP startup and shown only as the reference -- see the
-  subsection below. A reference in a repo config file is refused at load unless the global
-  config's [`[repo]`](#repo) `env-allow` lists the variable.
+  subsection below. A reference in a repo config file is refused at load, and one in an image
+  label when the session starts, unless the global config's [`[repo]`](#repo) `env-allow` lists
+  the variable.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
   repo-config-only and rejected in labels; `call-timeout-secs` is allowed). Repo config entries
   override image entries by server name, wholesale -- a label's `call-timeout-secs` does not
@@ -1291,8 +1307,9 @@ start, MCP startup fails with an error naming the variable, the server, and the 
 
 In a repo config file a reference is first held to the global config's [`[repo]`](#repo)
 `env-allow`: a variable that is not listed there is refused when the config loads, whether or
-not it is set. A literal is not a reference and needs no entry, and neither does a value you
-type with `--env`.
+not it is set. A reference in an image's `org.outrig.mcp` label is held to it too, when the
+session starts and the label has merged in. A literal is not a reference and needs no entry, and
+neither does a value you type with `--env`.
 
 A reference's value stays out of what outrig prints and off podman's command line, which any
 local user can read with `ps` for as long as the command runs -- for an exec-stdio server, the
@@ -1355,7 +1372,10 @@ way `fast` does above. And an image a repo config declares may reference a host 
 `build-args` or an MCP `env`, only if the global config's [`[repo]`](#repo) `env-allow` lists
 it. A repo image replaces a global one of the same name whole, references included, so the
 restriction follows whichever file's entry wins: the references in an image you declare in the
-global config are yours, and are not held to the list.
+global config are yours, and are not held to the list. A server an image's label declares is
+held to it wherever the image was declared, since the label is the image author's text; the
+entry your config declares for the server by name replaces the label's, and follows the rule
+above.
 
 `outrig run` walks the chain at startup: agent -> model (explicit or `default-model`) -> provider
 -> resolved api-key from env. Anything that fails to resolve is an error printed to stderr
@@ -1577,8 +1597,8 @@ for each thing it set aside, and goes on:
 Validation then runs on what is left, so an entry something else needed is still an error --
 printed after the warning that explains it. A misspelled `provider` is warned about, and then
 its model is refused for having no provider. Likewise an `env-allow` that is set aside leaves
-the [`[repo]`](#repo) list empty, so a repo config's references are refused, after the warning
-that says why. Some things are never set aside:
+the [`[repo]`](#repo) list empty, so a repo config's references, and an image label's, are
+refused, after the warning that says why. Some things are never set aside:
 
 - anything in `[network]`, `[images.<name>.security]`, or `[sidecars.<sc>.security]`, where
   leaving a key out could give a container more access than the file asks for;
@@ -1669,6 +1689,12 @@ image-config in the merged config but does not require agent/model/provider wiri
   lists. The load is refused otherwise, naming the image, the build-arg or the server and its
   `env` key, the variable, and the file. Images the global config declares, literal values, and
   `--env` values are not held to the list.
+- Every `${VAR}` in the `env` of a server an image's `org.outrig.mcp` label declares must name a
+  variable the global config's `[repo].env-allow` lists, whoever declared the image. It is the
+  session start that is refused, naming the server, the `env` key, the variable, and the image,
+  because the label is read off the image rather than from a config file. A server the config
+  declares by name replaces the label's entry whole and is not held here, and `outrig image
+  build` does not hold the `image.toml` it is pointed at.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.

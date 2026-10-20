@@ -484,6 +484,22 @@ pub struct LaunchSpec {
     pub security: SecuritySpec,
     pub network: NetworkSpec,
     pub embedded_mcp_policy: EmbeddedMcpPolicy,
+    /// The host variables a server the primary image's `org.outrig.mcp` label
+    /// declares may reference in its `env` as `${VAR}`, under
+    /// [`EmbeddedMcpPolicy::Merge`].
+    ///
+    /// A label is text the image's author wrote, and a reference in it is read
+    /// from this process's environment and handed to the server, so
+    /// [`Outrig::launch`] refuses a label entry that names a variable not
+    /// listed here ([`OutrigError::EmbeddedMcpEnvRef`]). Empty by default,
+    /// which allows no reference, as the global config's `[repo] env-allow`
+    /// does; [`LaunchSpec::from_config`] fills it from that list. An entry that
+    /// is not a variable name (`^[A-Z_][A-Z0-9_]*$`) allows nothing, since no
+    /// reference can match it. Entries in [`mcp`](Self::mcp) are the caller's
+    /// own and are not held to it, and neither is a label entry `mcp` replaces
+    /// by name. Set it with
+    /// [`with_embedded_mcp_env_allow`](Self::with_embedded_mcp_env_allow).
+    pub embedded_mcp_env_allow: Vec<String>,
     pub mcp: BTreeMap<String, McpServerSpec>,
     /// Names of the servers the config placed outside the primary: in a
     /// sidecar, including a `start = "manual"` one that `from_config` does not
@@ -532,6 +548,7 @@ impl LaunchSpec {
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: Vec::new(),
             mcp,
             placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
@@ -554,6 +571,7 @@ impl LaunchSpec {
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: Vec::new(),
             mcp,
             placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
@@ -598,6 +616,9 @@ impl LaunchSpec {
     ///   abort-only here, per [`LaunchSpec::with_sidecar`].
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
     ///   servers come only from the repo config's placement entries.
+    /// - The config's `[repo].env-allow` is carried into
+    ///   [`LaunchSpec::embedded_mcp_env_allow`], which holds the primary
+    ///   image's label entries to it, as `outrig run` does.
     ///
     /// Like `outrig run`, this acquires the primary image before it returns:
     /// an `image-name` is pulled when absent, and a Dockerfile image-config is
@@ -657,6 +678,7 @@ impl LaunchSpec {
             security: SecuritySpec::from(&cfg.security),
             network: NetworkSpec::from(&config.network),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: config.repo.env_allow().to_vec(),
             mcp,
             // Every sidecar-placed name, a manual sidecar's included: the
             // primary map and `sidecars` above leave all of them out.
@@ -715,6 +737,19 @@ impl LaunchSpec {
 
     pub fn with_embedded_mcp_policy(mut self, policy: EmbeddedMcpPolicy) -> Self {
         self.embedded_mcp_policy = policy;
+        self
+    }
+
+    /// Set the host variables a server the primary image's label declares may
+    /// reference; see [`embedded_mcp_env_allow`](Self::embedded_mcp_env_allow).
+    /// Replaces what the spec held, as
+    /// [`RepoPolicy::set_env_allow`](crate::config::RepoPolicy::set_env_allow)
+    /// does.
+    pub fn with_embedded_mcp_env_allow(
+        mut self,
+        vars: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.embedded_mcp_env_allow = vars.into_iter().map(Into::into).collect();
         self
     }
 
@@ -895,6 +930,13 @@ impl Outrig {
     /// resolve MCP config according to `spec.embedded_mcp_policy`, connect every
     /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
+    ///
+    /// Under [`EmbeddedMcpPolicy::Merge`], a server the image's
+    /// `org.outrig.mcp` label declares is held to
+    /// [`spec.embedded_mcp_env_allow`](LaunchSpec::embedded_mcp_env_allow)
+    /// before any server connects: a `${VAR}` in its `env` that the list omits
+    /// fails the launch with [`OutrigError::EmbeddedMcpEnvRef`], and nothing is
+    /// read from this process's environment on its account.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
         // Before anything starts: a deadline out of range is a spec error,
         // not a server that fails every call once the session is up.
@@ -1005,6 +1047,23 @@ impl Outrig {
                 embedded::mcp_with_source(&spec.mcp, McpDeclarationSource::LaunchSpec)
             }
         };
+
+        // The label is its author's text, and a reference in it is resolved
+        // from this process's environment when the server connects, so what
+        // the image declared is held to the list first. `spec.mcp` is the
+        // caller's own. Past the policy match, so an entry the config placed
+        // in a sidecar is already gone, and whatever puts a label entry in the
+        // map is held.
+        for (name, server) in &mcp {
+            if server.source == McpDeclarationSource::ImageLabel {
+                embedded::check_label_server_env(
+                    image_tag.as_str(),
+                    name,
+                    &server.spec,
+                    &spec.embedded_mcp_env_allow,
+                )?;
+            }
+        }
 
         // The effective MCP map runs in the primary; a placement-bearing
         // entry would silently run there otherwise. `LaunchSpec::from_config`
@@ -1801,6 +1860,37 @@ mod tests {
             .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
 
         assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
+    }
+
+    /// A spec nobody listed anything on allows a label no reference, as the
+    /// global config's `[repo] env-allow` does by default.
+    #[test]
+    fn a_hand_built_spec_lists_no_variable_a_label_may_reference() {
+        let from_image = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir());
+        let built = LaunchSpec::build(
+            PathBuf::from("Dockerfile"),
+            PathBuf::from("."),
+            BTreeMap::new(),
+            WorkspaceSpec::new("/host", "/workspace"),
+            BTreeMap::new(),
+            log_dir(),
+        );
+
+        assert!(from_image.embedded_mcp_env_allow.is_empty());
+        assert!(built.embedded_mcp_env_allow.is_empty());
+    }
+
+    #[test]
+    fn builder_sets_the_variables_a_label_may_reference() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir())
+            .with_embedded_mcp_env_allow(["GITHUB_TOKEN", "HTTPS_PROXY"])
+            .with_embedded_mcp_env_allow(["GITHUB_TOKEN"]);
+
+        assert_eq!(
+            spec.embedded_mcp_env_allow,
+            vec!["GITHUB_TOKEN".to_string()],
+            "the second call replaces the first"
+        );
     }
 
     fn tools_sidecar() -> SidecarSpec {

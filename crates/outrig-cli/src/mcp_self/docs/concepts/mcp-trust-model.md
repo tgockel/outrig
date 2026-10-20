@@ -49,6 +49,11 @@ the same reason, a session whose workspace would contain the global config is re
 repo config declared that workspace or outrig picked it; the global config's own `[workspace]` and
 `--volume` are the operator's choice.
 
+A repo can also reach the host through an image. An `org.outrig.mcp` label is not a config file,
+but a reference in a server's `env` there is read from the host the same way, so the label is held
+to the same `env-allow` list. It is text the image's author wrote, whether that is a Dockerfile in
+the repo, which the agent can edit, or an image the repo names.
+
 [Subagents](subagents.md) do not bend this. An agent can launch one with `outrig__subagent`, but a
 subagent runs in the container that is already there, over the MCP connections that are already
 open. It starts no container, connects no server, and can call nothing the operator did not

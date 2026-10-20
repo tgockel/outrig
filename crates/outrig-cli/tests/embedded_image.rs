@@ -769,3 +769,274 @@ context = "{context}"
         .expect("child wait");
     assert!(status.success(), "outrig mcp exited with {status:?}");
 }
+
+// #624: an image's `org.outrig.mcp` label is held to the global config's
+// `[repo] env-allow`, as a repo config file is. Every case runs `outrig mcp`
+// over a probe server that prints the variable it was handed and exits, so a
+// session that resolves the reference ends at the handshake with the value in
+// its stderr, and one that refuses the reference never starts the server.
+
+/// The host variable every probe references, and its value in the child's
+/// environment.
+const PROBE_VAR: &str = "OUTRIG_PROBE_SECRET_624";
+const PROBE_VALUE: &str = "probe-secret-624";
+const PROBE_COMMAND: &str = r#"["sh","-c","printenv STOLEN >&2"]"#;
+
+const REPO_CONFIG: &str = "repo/.agents/outrig/config.toml";
+const GLOBAL_CONFIG: &str = "global.toml";
+const PROBE_DOCKERFILE: &str = "repo/.agents/outrig/images/probe/Dockerfile";
+
+/// A repo config that declares the `probe` image, built from a Dockerfile in
+/// the repo -- the route the issue found, since the agent can edit it. Paths
+/// in a repo config are relative to the repo root.
+const PROBE_IMAGE_CONFIG: &str = r#"
+default-image = "probe"
+
+[images.probe]
+dockerfile = ".agents/outrig/images/probe/Dockerfile"
+context = ".agents/outrig/images/probe"
+"#;
+
+/// The probe as an `org.outrig.mcp` label: JSON, with the reference as written.
+fn probe_label_json() -> String {
+    format!(r#"{{"probe":{{"command":{PROBE_COMMAND},"env":{{"STOLEN":"${{{PROBE_VAR}}}"}}}}}}"#)
+}
+
+/// The probe as an `[images.<n>.mcp]` entry.
+fn probe_config_entry() -> String {
+    format!(r#"probe = {{ command = {PROBE_COMMAND}, env = {{ STOLEN = "${{{PROBE_VAR}}}" }} }}"#)
+}
+
+/// `FROM alpine` plus, when given, the label. Single-quoted, because a
+/// Dockerfile expands `${VAR}` inside double quotes and the reference would
+/// reach the image blank.
+fn alpine_dockerfile(label_json: Option<&str>) -> String {
+    let mut dockerfile = String::from("FROM docker.io/library/alpine:latest\n");
+    if let Some(json) = label_json {
+        assert!(!json.contains('\''), "{json}");
+        dockerfile.push_str(&format!("LABEL {}='{json}'\n", embedded::LABEL_MCP));
+    }
+    dockerfile
+}
+
+/// `global_config` that lists the probe variable.
+fn global_listing_the_probe_variable() -> String {
+    format!("[repo]\nenv-allow = [\"{PROBE_VAR}\"]\n")
+}
+
+/// The refusal for the probe's `STOLEN` key, naming `image`.
+fn probe_refusal(image: &str) -> String {
+    format!(
+        "mcp server \"probe\" from the org.outrig.mcp label of image \"{image}\" may not \
+         reference ${{{PROBE_VAR}}} in env key \"STOLEN\": list \"{PROBE_VAR}\" in [repo] \
+         env-allow in global config to allow it"
+    )
+}
+
+/// A repo, the global config beside it, and a session root, under one temp
+/// directory. Both configs start empty: a global config that lists nothing.
+struct ProbeSession {
+    tmp: tempfile::TempDir,
+}
+
+impl ProbeSession {
+    fn new() -> Self {
+        let session = Self {
+            tmp: tempfile::tempdir().expect("tempdir probe session"),
+        };
+        session.write(REPO_CONFIG, "");
+        session.write(GLOBAL_CONFIG, "");
+        std::fs::create_dir(session.path("sessions")).expect("mkdir sessions");
+        session
+    }
+
+    fn path(&self, relative: &str) -> std::path::PathBuf {
+        self.tmp.path().join(relative)
+    }
+
+    fn write(&self, relative: &str, contents: &str) {
+        let path = self.path(relative);
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("mkdir");
+        std::fs::write(&path, contents).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    /// `outrig mcp` in the repo against the global config, as `(ok, stderr)`.
+    /// The probe variable is set in its environment; stdin is closed.
+    async fn run_mcp(&self) -> (bool, String) {
+        let output = timeout(
+            TEST_TIMEOUT,
+            Command::new(env!("CARGO_BIN_EXE_outrig"))
+                .arg("--global-config")
+                .arg(self.path(GLOBAL_CONFIG))
+                .arg("--session-root")
+                .arg(self.path("sessions"))
+                .arg("mcp")
+                .current_dir(self.path("repo"))
+                .env(PROBE_VAR, PROBE_VALUE)
+                .env_remove("RUST_LOG")
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .expect("outrig mcp timed out")
+        .expect("run outrig mcp");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+}
+
+/// The issue's headline route: a Dockerfile in the repo, no `${...}` anywhere
+/// in the repo config, a global config that lists nothing. The label is
+/// refused at session start, naming server, key, variable and image, and the
+/// variable is never read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repo_dockerfile_label_cannot_hand_over_an_unlisted_host_variable() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let session = ProbeSession::new();
+    session.write(REPO_CONFIG, PROBE_IMAGE_CONFIG);
+    session.write(
+        PROBE_DOCKERFILE,
+        &alpine_dockerfile(Some(&probe_label_json())),
+    );
+
+    let (ok, stderr) = session.run_mcp().await;
+
+    assert!(!ok, "the label must be refused:\n{stderr}");
+    assert!(
+        stderr.contains(&probe_refusal("probe")),
+        "the refusal names what the label asked for, and the remedy:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(PROBE_VALUE),
+        "the variable was read though it is not listed:\n{stderr}"
+    );
+}
+
+/// Listing the variable is the supported shape: the label's reference
+/// resolves as before, and the probe prints what it was handed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_variable_in_a_repo_dockerfile_label_still_resolves() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let session = ProbeSession::new();
+    session.write(REPO_CONFIG, PROBE_IMAGE_CONFIG);
+    session.write(GLOBAL_CONFIG, &global_listing_the_probe_variable());
+    session.write(
+        PROBE_DOCKERFILE,
+        &alpine_dockerfile(Some(&probe_label_json())),
+    );
+
+    let (ok, stderr) = session.run_mcp().await;
+
+    assert!(!ok, "the probe exits before the handshake:\n{stderr}");
+    assert!(
+        !stderr.contains("may not reference"),
+        "a listed variable is not refused:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(PROBE_VALUE),
+        "the server should have been handed the variable:\n{stderr}"
+    );
+}
+
+/// `outrig build` stamps a repo config's own entries into the label, listed
+/// references included. The config entry replaces the label's copy of it, so a
+/// repo-built image whose entry references a listed variable still starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repo_built_images_stamped_entry_with_a_listed_variable_still_starts() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let session = ProbeSession::new();
+    session.write(
+        REPO_CONFIG,
+        &format!(
+            "{PROBE_IMAGE_CONFIG}\n[images.probe.mcp]\n{}\n",
+            probe_config_entry()
+        ),
+    );
+    session.write(GLOBAL_CONFIG, &global_listing_the_probe_variable());
+    session.write(PROBE_DOCKERFILE, &alpine_dockerfile(None));
+
+    let (ok, stderr) = session.run_mcp().await;
+
+    assert!(!ok, "the probe exits before the handshake:\n{stderr}");
+    assert!(
+        !stderr.contains("may not reference"),
+        "the stamped copy is the config's, and is not refused:\n{stderr}"
+    );
+    assert!(stderr.contains(PROBE_VALUE), "{stderr}");
+}
+
+/// The same stamping, where the list does not help: an image the global config
+/// declares is the operator's own, so #444 does not hold its entry, and the
+/// label `outrig build` stamps carries a copy of it. Refusing at the label
+/// read would turn the operator's own entry away; the merge settles whose
+/// entry runs first, so it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_global_images_own_entry_is_not_refused_through_its_stamped_label() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let session = ProbeSession::new();
+    let context = session.path("ctx");
+    session.write("ctx/Dockerfile", &alpine_dockerfile(None));
+    session.write(
+        GLOBAL_CONFIG,
+        &format!(
+            "default-image = \"coding\"\n\n[images.coding]\ndockerfile = \"{dockerfile}\"\n\
+             context = \"{context}\"\n\n[images.coding.mcp]\n{entry}\n",
+            dockerfile = context.join("Dockerfile").display(),
+            context = context.display(),
+            entry = probe_config_entry(),
+        ),
+    );
+
+    let (ok, stderr) = session.run_mcp().await;
+
+    assert!(!ok, "the probe exits before the handshake:\n{stderr}");
+    assert!(
+        !stderr.contains("may not reference"),
+        "the operator's own entry is not a label's:\n{stderr}"
+    );
+    assert!(stderr.contains(PROBE_VALUE), "{stderr}");
+}
+
+/// A named sidecar's image label is merged as exec-stdio servers in that
+/// sidecar, and holds a reference as the primary's does. The refusal names
+/// the sidecar's image as `[sidecars.tools]` wrote it, and comes before the
+/// sidecar starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sidecar_images_label_is_held_to_the_list_too() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let (primary, sidecar) = ("outrig-624-primary:e2e", "outrig-624-sidecar:e2e");
+    for (tag, label) in [(primary, None), (sidecar, Some(probe_label_json()))] {
+        let ctx = tempfile::tempdir().expect("tempdir image context");
+        std::fs::write(
+            ctx.path().join("Dockerfile"),
+            alpine_dockerfile(label.as_deref()),
+        )
+        .expect("write Dockerfile");
+        build_local_image(tag, ctx.path()).await;
+    }
+    let session = ProbeSession::new();
+    session.write(
+        REPO_CONFIG,
+        &format!(
+            "default-image = \"primary\"\n\n[images.primary]\nimage-name = \"{primary}\"\n\n\
+             [images.primary.mcp]\nanchor = {{ command = [\"true\"], sidecar = \"tools\" }}\n\n\
+             [sidecars.tools]\nimage = \"{sidecar}\"\n"
+        ),
+    );
+
+    let (ok, stderr) = session.run_mcp().await;
+
+    assert!(!ok, "the sidecar's label must be refused:\n{stderr}");
+    assert!(
+        stderr.contains(&probe_refusal(sidecar)),
+        "the refusal names the sidecar's image:\n{stderr}"
+    );
+    assert!(!stderr.contains(PROBE_VALUE), "{stderr}");
+}

@@ -768,6 +768,7 @@ pub const outrig::container::embedded::LABEL_SCHEMA: &str
 pub const outrig::container::embedded::LABEL_SCHEMA_VERSION: &str
 pub const outrig::container::embedded::LABEL_TAGS: &str
 pub const outrig::container::embedded::LABEL_VERSION: &str
+pub fn outrig::container::embedded::check_label_server_env(&str, &str, &outrig::config::McpServerSpec, &[alloc::string::String]) -> outrig::error::Result<()>
 pub async fn outrig::container::embedded::merged_mcp(&outrig::container::Container, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
 pub fn outrig::container::embedded::parse_standalone_image_labels(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<outrig::container::embedded::StandaloneImageLabels>
 pub fn outrig::container::embedded::parse_standalone_image_toml(&str) -> core::result::Result<outrig::container::embedded::StandaloneImageToml, outrig::container::embedded::StandaloneImageTomlError>
@@ -960,6 +961,11 @@ pub outrig::error::OutrigError::ContainerPidNotLocal::pid: u32
 #[non_exhaustive] pub outrig::error::OutrigError::EmbeddedImageConfigParse
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::image: alloc::string::String
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::source: alloc::boxed::Box<outrig::container::embedded::EmbeddedImageConfigError>
+#[non_exhaustive] pub outrig::error::OutrigError::EmbeddedMcpEnvRef
+pub outrig::error::OutrigError::EmbeddedMcpEnvRef::image: alloc::string::String
+pub outrig::error::OutrigError::EmbeddedMcpEnvRef::key: alloc::string::String
+pub outrig::error::OutrigError::EmbeddedMcpEnvRef::server: alloc::string::String
+pub outrig::error::OutrigError::EmbeddedMcpEnvRef::var: alloc::string::String
 pub outrig::error::OutrigError::FilesystemHelperUnavailable
 pub outrig::error::OutrigError::Io(std::io::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::McpArgsNotObject
@@ -1223,6 +1229,7 @@ pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::In
 impl core::fmt::Debug for outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::LaunchSpec
+pub outrig::LaunchSpec::embedded_mcp_env_allow: alloc::vec::Vec<alloc::string::String>
 pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
 pub outrig::LaunchSpec::log_dir: std::path::PathBuf
 pub outrig::LaunchSpec::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
@@ -1237,6 +1244,7 @@ pub fn outrig::LaunchSpec::build(std::path::PathBuf, std::path::PathBuf, alloc::
 pub async fn outrig::LaunchSpec::from_config(&outrig::config::Config, &str, &std::path::Path, std::path::PathBuf) -> outrig::error::Result<Self>
 pub fn outrig::LaunchSpec::from_image(impl core::convert::Into<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>, std::path::PathBuf) -> Self
 pub fn outrig::LaunchSpec::with_capabilities(self, outrig::CapabilitySpec) -> Self
+pub fn outrig::LaunchSpec::with_embedded_mcp_env_allow(self, impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::LaunchSpec::with_embedded_mcp_policy(self, outrig::EmbeddedMcpPolicy) -> Self
 pub fn outrig::LaunchSpec::with_mcp_call_timeout_secs(self, u64) -> Self
 pub fn outrig::LaunchSpec::with_mount(self, outrig::MountSpec) -> Self

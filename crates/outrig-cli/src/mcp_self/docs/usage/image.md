@@ -307,6 +307,13 @@ without repo-local MCP config. See
 [Concepts -> Containers](../concepts/containers.md#using-a-pre-built-image) for the
 `image-name` shape.
 
+A `${VAR}` in a `[mcp]` entry's `env` is read from the machine that runs the image, not the one
+that built it, and only if that machine's global config lists the variable in
+[`[repo]` `env-allow`](../reference/config.md#repo): a session refuses an image whose label
+references an unlisted one, naming the server, the key, the variable, and the image.
+`outrig image build` does not hold the `image.toml` it is pointed at -- you chose that directory,
+and the live test runs its servers with their references resolved.
+
 ### Re-running
 
 Without `--force`, `init` refuses if any of the three files already exists, naming the

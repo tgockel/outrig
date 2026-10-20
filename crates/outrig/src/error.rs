@@ -186,6 +186,34 @@ pub enum OutrigError {
         source: Box<EmbeddedImageConfigError>,
     },
 
+    /// A server an image's `org.outrig.mcp` label declares has an `env` value
+    /// that references a host variable the operator did not list in `[repo]
+    /// env-allow`, so it was refused rather than resolved. A label is text its
+    /// image's author wrote, and a reference in it is read from the operator's
+    /// environment and handed to the server, so it is held to the list as one
+    /// in a repo config file is ([`ConfigValidationError::RepoMcpEnvRef`]).
+    ///
+    /// For a library caller the list is
+    /// [`LaunchSpec::embedded_mcp_env_allow`](crate::LaunchSpec::embedded_mcp_env_allow);
+    /// `image` is then the image tag, and for the CLI the name the operator
+    /// wrote.
+    // The first three come from outside -- an image's label, a config file --
+    // so they print with `{:?}`: a control character in one would otherwise
+    // reach the operator's terminal. `var` matched the reference grammar and
+    // cannot hold one.
+    #[error(
+        "mcp server {server:?} from the org.outrig.mcp label of image {image:?} may not \
+         reference ${{{var}}} in env key {key:?}: list {var:?} in [repo] env-allow in global \
+         config to allow it"
+    )]
+    #[non_exhaustive]
+    EmbeddedMcpEnvRef {
+        image: String,
+        server: String,
+        key: String,
+        var: String,
+    },
+
     // Transparent for the same reason as the network pair below: its payload
     // carries the failure that actually stopped the server, and that is the
     // link a consumer wants. Left inconsistent with them for a while, which

@@ -198,6 +198,41 @@ allow = ["evil.example:443"]
     );
 }
 
+/// The list the primary image's label is held to is the operator's: a global
+/// `[repo] env-allow` reaches the spec through `merge`, a config that lists
+/// nothing leaves it empty, and a repo file cannot add to it -- the same repo
+/// file is rejected outright at load time.
+#[tokio::test]
+async fn lowering_carries_the_global_env_allow_to_the_spec() {
+    let global = parse("[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"HTTPS_PROXY\"]\n");
+    let repo = config_with_network("");
+
+    let spec = lower(&merge(global, repo)).await;
+
+    assert_eq!(spec.embedded_mcp_env_allow, ["GITHUB_TOKEN", "HTTPS_PROXY"]);
+
+    let nothing_listed = lower(&config_with_network("")).await;
+    assert!(nothing_listed.embedded_mcp_env_allow.is_empty());
+
+    let repo = parse(
+        r#"
+[repo]
+env-allow = ["AWS_SECRET_ACCESS_KEY"]
+
+[images.primary]
+image-name = "docker.io/library/alpine:latest"
+"#,
+    );
+    repo.validate_as_repo()
+        .expect_err("a repo config declaring the list is rejected on load");
+    let spec = lower(&merge(
+        parse("[repo]\nenv-allow = [\"GITHUB_TOKEN\"]\n"),
+        repo,
+    ))
+    .await;
+    assert_eq!(spec.embedded_mcp_env_allow, ["GITHUB_TOKEN"]);
+}
+
 /// `from_config` resolves repo-relative paths against `repo_root`; the network
 /// lowering must not have disturbed that. Cheap regression guard on the
 /// neighbors of the line this task changed.

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image's `org.outrig.mcp` label may reference only the host variables the global config
+  allows.** A `${VAR}` in the `env` of a server a label declares resolved any variable in the
+  operator's environment, past the `[repo] env-allow` list that holds a repo config file to it.
+  The label comes from a Dockerfile in the repo, which the agent can edit through the read-write
+  workspace, or from an image the repo names, and neither is a config file, so a repo could hand
+  `GITHUB_TOKEN` or a cloud credential to a server of its own choosing. The list now holds the
+  label too. Once the label has merged into the session plan, an entry that still came from it
+  and references an unlisted variable is refused, before any sidecar starts or any server runs, as
+  the new `OutrigError::EmbeddedMcpEnvRef`, naming the server, the key, the variable and the
+  image. A config entry of the same name has already replaced the label's by then, which is what
+  lets a repo-built image through: `outrig build` stamps a copy of every config entry into its
+  label. A refusal is a startup error whatever a sidecar's `on-failure` says.
+  `Outrig::launch` holds the primary image's label under `EmbeddedMcpPolicy::Merge` to the new
+  `LaunchSpec::embedded_mcp_env_allow`. `LaunchSpec::from_config` fills it from the config's
+  `[repo].env-allow`; it is empty otherwise, so a hand-built spec (`LaunchSpec::build`,
+  `from_image`) whose image's label references a variable has to list it with
+  `with_embedded_mcp_env_allow`, or take `EmbeddedMcpPolicy::Ignore`. Entries in `LaunchSpec::mcp`
+  are the caller's own and are not held. `embedded::merged_mcp` still returns a label's entries as
+  written, for a caller driving a `Container` itself; `embedded::check_label_server_env` is the
+  check both the CLI and `Outrig::launch` apply, for such a caller to apply to each entry. New
+  public items: `OutrigError::EmbeddedMcpEnvRef`, `embedded::check_label_server_env`,
+  `LaunchSpec::embedded_mcp_env_allow`, `LaunchSpec::with_embedded_mcp_env_allow`. (#624)
+
 - **A panic in a forked namespace helper ends the helper and touches nothing of its parent's.** The
   user-database and home-directory passes of `Container::bootstrap_user`, and the listener binds
   and resolver edits of network attach and detach, each run a closure in a forked child. A panic

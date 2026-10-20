@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use outrig::McpClient;
-use outrig::config::{ImageConfig, McpServerSpec};
+use outrig::config::{EnvValue, ImageConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec, embedded};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
+use outrig::{EmbeddedMcpPolicy, LaunchSpec, McpClient, Outrig};
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -353,4 +353,142 @@ async fn extra_labels_do_not_disturb_mcp_read() {
     );
 
     container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// Alpine plus an `org.outrig.mcp` label, nothing installed: the refusals under
+/// test come before any server runs. The label is single-quoted because a
+/// Dockerfile expands `${VAR}` inside double quotes, and the reference would
+/// reach the image blank.
+async fn ensure_label_only_image(label_json: &str) -> ImageTag {
+    assert!(!label_json.contains('\''), "{label_json}");
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\nLABEL {}='{label_json}'\n",
+        embedded::LABEL_MCP,
+    );
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    try_ensure_built_image(ctx.path())
+        .await
+        .expect("ensure label-only fixture image")
+}
+
+/// The variable the probe label references, and what it is set to when a test
+/// wants the reference to resolve.
+const LABEL_REF_VAR: &str = "OUTRIG_E2E_LABEL_ENV_624";
+const LABEL_REF_VALUE: &str = "label-value-624";
+
+/// A label declaring `probe`, which prints `STOLEN` to stderr and exits. A
+/// launch that gets past the policy fails at the handshake with the value in
+/// the server's stderr, which is how a test sees the reference was resolved.
+fn probe_label() -> String {
+    format!(
+        r#"{{"probe":{{"command":["sh","-c","printenv STOLEN >&2"],"env":{{"STOLEN":"${{{LABEL_REF_VAR}}}"}}}}}}"#
+    )
+}
+
+/// What `Outrig::launch` fails with. `Outrig` is not `Debug`, so there is no
+/// `expect_err`.
+async fn launch_err(spec: &LaunchSpec) -> OutrigError {
+    match Outrig::launch(spec).await {
+        Err(err) => err,
+        Ok(_) => panic!("the launch was expected to fail"),
+    }
+}
+
+fn label_spec(image: &ImageTag, log_dir: &Path) -> LaunchSpec {
+    LaunchSpec::from_image(image.as_str(), BTreeMap::new(), log_dir.join("logs"))
+}
+
+/// The issue's case: a label names a variable the spec lists nothing for, and
+/// `launch` refuses it before a server is started or the variable is read.
+#[tokio::test]
+async fn launch_refuses_a_label_reference_the_spec_does_not_list() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let image = ensure_label_only_image(&probe_label()).await;
+    let log_dir = tempfile::tempdir().expect("tempdir log dir");
+
+    let err = launch_err(&label_spec(&image, log_dir.path())).await;
+
+    let OutrigError::EmbeddedMcpEnvRef {
+        image: named,
+        server,
+        key,
+        var,
+        ..
+    } = &err
+    else {
+        panic!("expected EmbeddedMcpEnvRef, got {err:?}");
+    };
+    assert_eq!(named, image.as_str());
+    assert_eq!((server.as_str(), key.as_str()), ("probe", "STOLEN"));
+    assert_eq!(var, LABEL_REF_VAR);
+}
+
+#[tokio::test]
+async fn launch_resolves_a_label_reference_the_spec_lists() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let image = ensure_label_only_image(&probe_label()).await;
+    let log_dir = tempfile::tempdir().expect("tempdir log dir");
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(LABEL_REF_VAR, LABEL_REF_VALUE) };
+    let spec = label_spec(&image, log_dir.path()).with_embedded_mcp_env_allow([LABEL_REF_VAR]);
+
+    let err = launch_err(&spec).await;
+
+    let OutrigError::McpStartupFailed(failure) = &err else {
+        panic!("a listed reference gets past the policy to the handshake, got {err:?}");
+    };
+    assert!(
+        failure.stderr_tail.contains(LABEL_REF_VALUE),
+        "the probe server should have been handed the variable: {}",
+        failure.stderr_tail,
+    );
+}
+
+/// A spec entry replaces the label's of that name whole, so the label's
+/// reference is never read; and the caller's own entry is not held to the list
+/// either, though it references a variable the list omits.
+#[tokio::test]
+async fn a_spec_entry_replaces_the_label_entry_and_is_not_held_itself() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let image = ensure_label_only_image(&probe_label()).await;
+    let log_dir = tempfile::tempdir().expect("tempdir log dir");
+    let own =
+        McpServerSpec::exec(["sh", "-c", "printenv STOLEN >&2"]).with_env(BTreeMap::from([(
+            "STOLEN".to_string(),
+            EnvValue::EnvRef("PATH".to_string()),
+        )]));
+    let spec = LaunchSpec::from_image(
+        image.as_str(),
+        BTreeMap::from([("probe".to_string(), own)]),
+        log_dir.path().join("logs"),
+    );
+
+    let err = launch_err(&spec).await;
+
+    assert!(
+        matches!(err, OutrigError::McpStartupFailed(_)),
+        "the caller's own entry runs, and its failure is the handshake's: {err:?}"
+    );
+}
+
+/// `Ignore` never reads the label, so there is nothing to hold.
+#[tokio::test]
+async fn ignoring_the_label_ignores_its_references() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let image = ensure_label_only_image(&probe_label()).await;
+    let log_dir = tempfile::tempdir().expect("tempdir log dir");
+    let spec =
+        label_spec(&image, log_dir.path()).with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+
+    let outrig = Outrig::launch(&spec)
+        .await
+        .expect("a label that is not merged cannot be refused");
+
+    outrig.shutdown().await.expect("shutdown");
 }

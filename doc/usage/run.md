@@ -44,10 +44,10 @@ outrig run [--agent <name>]
   Values take the same `${VAR}` host-env-reference syntax config files use, described in
   [Reference -> Config](../reference/config.md#mcp-env-value-syntax). You typed them, so
   they are not held to the global config's [`[repo]` `env-allow`](../reference/config.md#repo)
-  list, which governs a repo config's references. Within a scope the last
-  value given for a key wins; across scopes the per-key precedence is config-file env < global
-  `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not declare
-  is an error.
+  list, which governs the references in a repo config and in an image's label. Within a scope
+  the last value given for a key wins; across scopes the per-key precedence is config-file env <
+  global `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not
+  declare is an error.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
   per-turn tool-call max for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
@@ -217,8 +217,10 @@ tools) and `shell` is unavailable. Full details in
 6. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp` label,
    then overlay `[images.<name>.mcp]` from config by server name. Each declared sidecar's image is
    ensured and its label merged, and the `start = "auto"` sidecars are started. A sidecar failure
-   follows the block's `on-failure` key; a malformed label, or two labels claiming one server
-   name, is a startup error. See [Config -> sidecars](../reference/config.md#sidecarssc).
+   follows the block's `on-failure` key; a malformed label, two labels claiming one server
+   name, or a label whose `env` references a host variable the global config's
+   [`[repo]` `env-allow`](../reference/config.md#repo) does not list, is a startup error. See
+   [Config -> sidecars](../reference/config.md#sidecarssc).
 7. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.

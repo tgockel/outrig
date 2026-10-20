@@ -85,6 +85,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image's `org.outrig.mcp` label may reference only the host variables the global config
+  allows.** A server a label declares can put `${VAR}` in its `env`, and any variable in your
+  environment resolved: the label comes from a Dockerfile in the repo, which the agent can edit,
+  or from an image the repo names, and the `[repo] env-allow` list that holds a repo config file
+  did not see it. `outrig run` and `outrig mcp`, `mcp show-merged` included, now refuse a label
+  entry that references a variable the list omits when the session starts, naming the server, the
+  `env` key, the variable and the image. That is before any sidecar starts or any server runs, so
+  the variable is never read. It covers the primary image's label and each named sidecar's,
+  whoever named the image: your global config and `--image` too. A server your config declares by
+  name still replaces the label's whole entry, so a repo-built image -- whose label `outrig build`
+  stamps with a copy of every config entry -- starts as before. If an image of your own
+  references a variable, such as one built by `outrig image build` from an `image.toml` with
+  `${DB_TOKEN}`, list it once:
+
+  ```toml
+  [repo]
+  env-allow = ["DB_TOKEN"]
+  ```
+
+  `--env` values and the live test of `outrig image build` are not held to the list. Fixed in
+  `outrig`; see that crate's changelog. (#624)
 - **A repo config file may reference only the host variables the global config allows.**
   `outrig run`, `outrig mcp`, and `outrig build` refuse a `${VAR}` in `build-args` or in an MCP
   server's `env` that `.agents/outrig/config.toml`, or a `--config` file, declares, naming the

@@ -244,9 +244,9 @@ outrig run [--agent <name>]
   applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
   the `${VAR}` host-env-reference syntax described in
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax); you typed them, so they are
-  not held to the global config's [`[repo]` `env-allow`](config.md#repo) list. Within a scope,
-  last wins on duplicate keys. Precedence per key: config-file env < global `--env` <
-  per-server `--env`.
+  not held to the global config's [`[repo]` `env-allow`](config.md#repo) list, which governs
+  the references in a repo config and in an image's label. Within a scope, last wins on
+  duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   **deprecated** with the in-process backend it selects hardware for; override the in-process
   mistralrs model device for this run. Rejected for OpenAI-style models, and

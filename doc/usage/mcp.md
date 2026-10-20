@@ -144,7 +144,9 @@ container Dockerfile just as you would for `outrig run`. In the example above,
 
 An image can also carry the same `[mcp]` table in its `org.outrig.mcp` OCI label.
 Use that when a shared image owns the default tool set, then keep only repo-specific
-overrides in `.agents/outrig/config.toml`. See
+overrides in `.agents/outrig/config.toml`. A `${VAR}` in a label entry's `env` is held to the
+global config's [`[repo]` `env-allow`](../reference/config.md#repo) list, as a repo config's
+references are, and a session whose label names an unlisted variable is refused. See
 [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
 
 To inspect the effective table without serving MCP:
@@ -156,7 +158,8 @@ outrig mcp show-merged --image coding
 In fresh mode this starts the selected container, reads the `org.outrig.mcp` label off the
 primary image and every named sidecar image, applies `config.toml` overrides, prints the merged
 `[mcp]` table to stdout, then stops the container. Sidecar containers are not launched for the
-read. Each server carries a comment naming its placement and provenance:
+read. A label that names an unlisted host variable is refused here too, as at a session start.
+Each server carries a comment naming its placement and provenance:
 
 ```toml
 [mcp]
@@ -306,7 +309,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
    label if present, then overlay `[images.<name>.mcp]` from config by server name. Each
    declared sidecar's image is resolved, its label merged (scoped to that sidecar), and
-   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. An entrypoint-stdio
+   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. A label whose `env`
+   references a host variable the global config's `[repo]` `env-allow` does not list is a
+   startup error, before any sidecar starts. An entrypoint-stdio
    sidecar (inline `image`, no `command`) is instead created and initialized with its
    ENTRYPOINT held un-executed, env baked in via `podman create --env` (a `${VAR}` value by
    name, from podman's own environment). Sidecar failures follow the block's `on-failure`

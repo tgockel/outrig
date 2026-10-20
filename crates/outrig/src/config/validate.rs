@@ -1014,7 +1014,10 @@ pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError
 /// Dockerfile, a server command it chose -- so a repo file may name only the
 /// variables the operator listed. The two places are the only ones the schema
 /// holds an [`EnvValue`] in. An image's own `org.outrig.mcp` label can carry
-/// such references too, and this does not see them (#624).
+/// such references too, but it is not a config file and this does not see it:
+/// a session holds a label's references to the same list once the label has
+/// merged in, through `embedded::check_label_server_env` -- from the CLI's
+/// session setup, and from `Outrig::launch` for the library.
 ///
 /// This is a rule of the merged value, not of [`validate_as_repo`], because it
 /// needs the global config's list as well as the repo file. The CLI also
@@ -1034,12 +1037,7 @@ fn validate_repo_env_refs(
     if !image.repo_declared {
         return Ok(());
     }
-    // Matched without a `_` arm, like the provider styles: a new way to name a
-    // host variable has to say here whether it needs listing.
-    let unlisted = |value: &EnvValue| match value {
-        EnvValue::EnvRef(var) if !cfg.repo.env_allow().contains(var) => Some(var.clone()),
-        EnvValue::EnvRef(_) | EnvValue::Literal(_) => None,
-    };
+    let unlisted = |value: &EnvValue| value.unlisted_ref(cfg.repo.env_allow()).map(str::to_string);
     for (key, value) in &image.build_args {
         if let Some(var) = unlisted(value) {
             return Err(ConfigValidationError::RepoBuildArgRef {

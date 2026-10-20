@@ -60,7 +60,10 @@ Issues that bear on **host integrity** are in scope, for example:
   server's `env` hands the variable's value to code the repo controls, so a repo config file --
   committed, or edited by the agent through the read-write workspace -- may name only the
   variables the global config lists in `[repo] env-allow`, and one that names another must be
-  refused rather than resolved.
+  refused rather than resolved. So must a server an image's `org.outrig.mcp` label declares: the
+  label is the image author's text -- a Dockerfile in the repo, or an image the repo names --
+  and not a config file, but a reference in its `env` is read from the host and handed to that
+  server all the same.
 - Capability handling that is more permissive than the selected capability profile
   (`default` / `no-net-raw` / `drop-all`).
 - A container launched more permissively than its `[images.<name>.security]` block asks for --
@@ -91,9 +94,10 @@ Issues that bear on **host integrity** are in scope, for example:
   included, and a filter policy that allows it allows whatever it will reach. See
   [Containers](doc/concepts/containers.md#the-containers-environment).
 - A variable listed in `[repo] env-allow` is the repo's to route. The repo picks which build-arg
-  or MCP server environment receives it, and whatever runs there can use it as far as the
-  container allows. List only variables you would hand to everyone who can change that repo's
-  config, the agent included. See [Config reference](doc/reference/config.md#repo).
+  or MCP server environment receives it -- in its config, or through an image label it controls
+  -- and whatever runs there can use it as far as the container allows. List only variables you
+  would hand to everyone who can change that repo's config or the images it builds or names, the
+  agent included. See [Config reference](doc/reference/config.md#repo).
 - Network filtering is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
 - Hostname **deny** rules are best-effort against a hostile client. A container that resolves a

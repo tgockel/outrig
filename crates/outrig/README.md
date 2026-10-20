@@ -51,8 +51,11 @@ outrig.shutdown().await?;
 `LaunchSpec` also has `LaunchSpec::build` (build an image from a `Dockerfile`) and
 `LaunchSpec::from_config` (drive it from a parsed config), plus builder methods for mounts,
 capability profiles, network policy, and embedded MCP handling. By default, OutRig merges MCP
-servers from an image's `org.outrig.mcp` label with the launch spec. Library callers that want the
-launch spec's MCP map to be authoritative can opt out:
+servers from an image's `org.outrig.mcp` label with the launch spec. A `${VAR}` in a label entry's
+`env` is read from the launching process's environment, so `Outrig::launch` refuses one the spec
+does not list: `LaunchSpec::with_embedded_mcp_env_allow` names the variables a label may
+reference, and `LaunchSpec::from_config` takes them from the config's `[repo].env-allow`. Library
+callers that want the launch spec's MCP map to be authoritative can opt out of the label:
 
 ```rust,no_run
 # use outrig::{EmbeddedMcpPolicy, LaunchSpec};

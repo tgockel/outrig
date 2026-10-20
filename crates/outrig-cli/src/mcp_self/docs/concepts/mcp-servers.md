@@ -326,6 +326,14 @@ A label entry may carry `call-timeout-secs`, since the image's author knows how 
 run (see [What if a server hangs?](#what-if-a-server-hangs)). The placement keys and `args` are
 rejected in a label.
 
+A `${VAR}` in a label entry's `env` is read from your environment and handed to the server. The
+label is text the image's author wrote -- a Dockerfile in the repo, or an image the repo names --
+so it is held to the same [`[repo]` `env-allow`](../reference/config.md#repo) list as a repo
+config's references. A reference to a variable the list omits is refused when the session
+starts, naming the server, the key, the variable, and the image; the variable is never read. A
+server your config declares by name replaces the label's entry and is not held by this. An image
+of your own that references a variable needs it listed to start.
+
 For build-from-Dockerfile repo images, `outrig build` also stamps the cache image with the same
 merged `org.outrig.mcp` label it would use at startup. The startup overlay still runs, but is
 idempotent for those repo-local entries. This means `outrig image inspect <name>:<hash>` can show

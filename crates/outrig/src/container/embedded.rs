@@ -337,6 +337,15 @@ pub async fn read_embedded_mcp(
 /// This is the read-side counterpart to the label writers above, and the entry
 /// point a caller driving a `Container` directly wants -- the merge stages
 /// beneath it are crate-private.
+///
+/// The label's entries come back as the image wrote them, a `${VAR}` in an
+/// `env` included, and are not held to `[repo] env-allow`: whether to resolve
+/// one is the caller's decision. [`Outrig::launch`](crate::Outrig::launch)
+/// refuses a reference its
+/// [`LaunchSpec::embedded_mcp_env_allow`](crate::LaunchSpec::embedded_mcp_env_allow)
+/// does not list, and a caller that resolves a label's references itself
+/// should hold each entry whose name it did not pass in `config_mcp` to a list
+/// of its own with [`check_label_server_env`].
 pub async fn merged_mcp(
     container: &Container,
     config_mcp: &BTreeMap<String, McpServerSpec>,
@@ -356,6 +365,41 @@ pub(crate) async fn merged_mcp_with_source(
             .await?;
     let image_mcp = embedded_mcp_from_labels(container.image_tag().as_str(), &labels)?;
     Ok(merge_mcp_with_source(image_mcp, config_mcp, config_source))
+}
+
+/// Refuse a server an image's `org.outrig.mcp` label declared when its `env`
+/// references a host variable `env_allow` does not list
+/// ([`OutrigError::EmbeddedMcpEnvRef`]). The first such reference in key order
+/// is the one reported.
+///
+/// A label is text its image's author wrote -- a Dockerfile in a repo the agent
+/// can edit, or an image the operator pulled -- and a `${VAR}` in a server's
+/// `env` is read from the operator's environment and handed to that server. So
+/// it is held to the same `[repo] env-allow` as a reference in a repo config
+/// file. [`Outrig::launch`](crate::Outrig::launch) and the CLI's session setup
+/// apply this to each entry of the label that survives the merge; the caller
+/// decides which entries those are, since one the config replaced by name is the
+/// config's, and the copy of it that `outrig build` stamps into the label is
+/// never read.
+///
+/// `image` names the image in the error, as the caller knows it.
+pub fn check_label_server_env(
+    image: &str,
+    server: &str,
+    spec: &McpServerSpec,
+    env_allow: &[String],
+) -> Result<()> {
+    for (key, value) in spec.env() {
+        if let Some(var) = value.unlisted_ref(env_allow) {
+            return Err(OutrigError::EmbeddedMcpEnvRef {
+                image: image.to_string(),
+                server: server.to_string(),
+                key: key.clone(),
+                var: var.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn mcp_with_source(
@@ -1252,5 +1296,79 @@ mod tests {
         let labels = standalone_config_to_labels(&cfg).expect("stamp labels");
         let read = parse_mcp_table(&labels[LABEL_MCP]).expect("read the label back");
         assert_eq!(read["build"].call_timeout_secs(), Some(1800));
+    }
+
+    fn env_ref(var: &str) -> EnvValue {
+        EnvValue::EnvRef(var.to_string())
+    }
+
+    fn allow(vars: &[&str]) -> Vec<String> {
+        vars.iter().map(|var| var.to_string()).collect()
+    }
+
+    /// The refusal for a label's server names everything an operator needs to
+    /// find and fix it, in the words the CLI prints.
+    #[test]
+    fn a_label_reference_the_list_omits_is_refused_naming_where_it_came_from() {
+        let spec = full(&["probe"], &[("STOLEN", env_ref("SECRET"))]);
+
+        let err = check_label_server_env("img:1", "probe", &spec, &[])
+            .expect_err("an unlisted reference is refused");
+
+        let OutrigError::EmbeddedMcpEnvRef {
+            image,
+            server,
+            key,
+            var,
+            ..
+        } = &err
+        else {
+            panic!("expected EmbeddedMcpEnvRef, got {err:?}");
+        };
+        assert_eq!(
+            (&**image, &**server, &**key, &**var),
+            ("img:1", "probe", "STOLEN", "SECRET")
+        );
+        assert_eq!(
+            err.to_string(),
+            "mcp server \"probe\" from the org.outrig.mcp label of image \"img:1\" may not \
+             reference ${SECRET} in env key \"STOLEN\": list \"SECRET\" in [repo] env-allow in \
+             global config to allow it"
+        );
+    }
+
+    #[test]
+    fn a_listed_reference_a_literal_and_no_env_pass() {
+        let listed = full(&["srv"], &[("TOKEN", env_ref("SECRET"))]);
+        let literal = full(
+            &["srv"],
+            &[("CARGO_HOME", EnvValue::Literal("/workspace/.cargo".into()))],
+        );
+
+        check_label_server_env("img:1", "listed", &listed, &allow(&["OTHER", "SECRET"]))
+            .expect("a listed reference is the supported shape");
+        check_label_server_env("img:1", "literal", &literal, &[])
+            .expect("a literal reads nothing from the host");
+        check_label_server_env("img:1", "plain", &short(&["srv"]), &[])
+            .expect("a server with no env has nothing to hold");
+    }
+
+    /// Keys are walked in order, so what an operator is told to list first does
+    /// not depend on how the label was written.
+    #[test]
+    fn the_first_unlisted_reference_in_key_order_is_the_one_reported() {
+        let spec = full(
+            &["srv"],
+            &[("B_KEY", env_ref("B_VAR")), ("A_KEY", env_ref("A_VAR"))],
+        );
+
+        let err = check_label_server_env("img:1", "srv", &spec, &allow(&["A_VAR"]))
+            .expect_err("B_VAR is not listed");
+
+        assert!(
+            matches!(&err, OutrigError::EmbeddedMcpEnvRef { key, var, .. }
+                if key == "B_KEY" && var == "B_VAR"),
+            "{err:?}"
+        );
     }
 }

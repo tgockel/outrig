@@ -849,9 +849,10 @@ pub(crate) async fn launch_declared_sidecar(
 ///
 /// Failure routing: image-ensure / start / bootstrap / interceptor-attach
 /// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
-/// sidecar, and continues; `abort` propagates). Label-merge collisions and
-/// malformed labels are startup errors regardless of `on-failure`, as are
-/// all primary-container failures.
+/// sidecar, and continues; `abort` propagates). Label-merge collisions,
+/// malformed labels, and a label entry whose `env` references a host variable
+/// `[repo] env-allow` does not list are startup errors regardless of
+/// `on-failure`, as are all primary-container failures.
 async fn setup_sidecars_and_network(
     args: SidecarPhaseArgs<'_>,
     containers: &mut SessionContainers,
@@ -910,9 +911,12 @@ async fn setup_sidecars_and_network(
     }
 
     // Every label has merged, so the plan is complete. Checked here rather
-    // than after `setup` returns so an undeclared name takes `setup`'s abort
-    // path, which stops the containers and finalizes the session record.
+    // than after `setup` returns so a refusal -- an undeclared name, a label
+    // reference no list allows -- takes `setup`'s abort path, which stops the
+    // containers and finalizes the session record, and before Phase C starts a
+    // sidecar on the strength of a label that is about to be refused.
     check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
+    check_label_env_refs(&plan, args.image_cfg_name, args.cfg.repo.env_allow())?;
     let server_count = plan.servers.len();
     let server_word = plural(server_count, "server", "servers");
     span.done(format!(
@@ -1035,6 +1039,30 @@ fn check_env_servers(
                 "--env {name}:...: image '{image_cfg_name}' has no MCP server '{name}'"
             ))
             .into());
+        }
+    }
+    Ok(())
+}
+
+/// Hold every server an image's label declared to `env_allow`, the global
+/// config's `[repo] env-allow` (#624): a `${VAR}` in its `env` that the list
+/// omits is refused, naming the image the label came from -- the primary's as
+/// the operator wrote it, a sidecar's as `[sidecars.<sc>]` did. A server the
+/// config declared by name replaced the label's at the merge, so it is no
+/// longer label-sourced and is not held here; that is what lets a repo-built
+/// image through, whose label carries a stamped copy of every config entry.
+fn check_label_env_refs(
+    plan: &SessionMcpPlan,
+    image_cfg_name: &str,
+    env_allow: &[String],
+) -> Result<()> {
+    for (name, placed) in &plan.servers {
+        if placed.source == embedded::McpDeclarationSource::ImageLabel {
+            let image = match placed.placement.sidecar_name() {
+                Some(sidecar) => plan.sidecars[sidecar].image.as_str(),
+                None => image_cfg_name,
+            };
+            embedded::check_label_server_env(image, name, &placed.spec, env_allow)?;
         }
     }
     Ok(())
@@ -1894,5 +1922,141 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         check_env(&["fs:A=1", "lint:B=2"]).expect("a manual sidecar's server is declared");
         check_env(&["GLOBAL=1"]).expect("a global entry names no server");
         check_env(&[]).expect("an empty overlay names no server");
+    }
+
+    /// A plan of `[images.x]` over `config`, as `setup_sidecars_and_network`
+    /// starts one before the labels merge in.
+    fn label_plan(config: &str) -> SessionMcpPlan {
+        let cfg: Config = toml::from_str(&format!(
+            "[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n{config}"
+        ))
+        .expect("config parses");
+        sidecar::plan_from_config(&cfg, &cfg.images["x"])
+    }
+
+    /// An exec server with one `env` entry, written as a config file writes
+    /// it: exactly `${VAR}` is a reference, anything else a literal.
+    fn with_env(key: &str, raw: &str) -> McpServerSpec {
+        McpServerSpec::exec(["srv"]).with_env(BTreeMap::from([(
+            key.to_string(),
+            outrig::config::EnvValue::from_raw(raw.to_string()),
+        )]))
+    }
+
+    fn secret_label(server: &str) -> BTreeMap<String, McpServerSpec> {
+        BTreeMap::from([(server.to_string(), with_env("TOKEN", "${SECRET}"))])
+    }
+
+    fn allow(vars: &[&str]) -> Vec<String> {
+        vars.iter().map(|var| var.to_string()).collect()
+    }
+
+    /// The refusal the issue asked for: the label named a variable the
+    /// operator did not list, so it says where, and what to list.
+    #[test]
+    fn a_primary_label_reference_the_list_omits_is_refused() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([("probe".to_string(), with_env("STOLEN", "${SECRET}"))]),
+        );
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "mcp server \"probe\" from the org.outrig.mcp label of image \"x\" may not \
+             reference ${SECRET} in env key \"STOLEN\": list \"SECRET\" in [repo] env-allow in \
+             global config to allow it"
+        );
+    }
+
+    #[test]
+    fn a_listed_reference_a_literal_and_no_env_pass_the_label_check() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([
+                ("listed".to_string(), with_env("TOKEN", "${SECRET}")),
+                ("literal".to_string(), with_env("HOME", "/workspace")),
+                ("plain".to_string(), McpServerSpec::exec(["srv"])),
+            ]),
+        );
+
+        check_label_env_refs(&plan, "x", &allow(&["OTHER", "SECRET"]))
+            .expect("a listed reference is the supported shape");
+
+        plan.servers.remove("listed");
+        check_label_env_refs(&plan, "x", &[])
+            .expect("a literal and a server with no env read nothing from the host");
+    }
+
+    /// A named sidecar's label is held the same way, and the refusal names the
+    /// sidecar's image as `[sidecars.tools]` wrote it, not the primary's.
+    #[test]
+    fn a_sidecar_label_reference_is_refused_naming_the_sidecars_image() {
+        let mut plan = label_plan(
+            "\n[sidecars.tools]\nimage = \"mcp-tools\"\n\n[images.x.mcp]\n\
+             anchor = { command = [\"anchor\"], sidecar = \"tools\" }\n",
+        );
+        sidecar::merge_sidecar_labels(&mut plan, "tools", secret_label("fs"))
+            .expect("merge succeeds");
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert!(
+            err.to_string().starts_with(
+                "mcp server \"fs\" from the org.outrig.mcp label of image \"mcp-tools\""
+            ),
+            "{err}"
+        );
+        check_label_env_refs(&plan, "x", &allow(&["SECRET"]))
+            .expect("listing the variable allows it in a sidecar's label too");
+    }
+
+    /// Only the label is held here. A config entry is #444's when a repo file
+    /// declared it, and the operator's own when the global config did.
+    #[test]
+    fn a_config_entry_is_not_held_as_a_label() {
+        let mut plan = label_plan(
+            "\n[images.x.mcp]\nfs = { command = [\"srv\"], env = { TOKEN = \"${SECRET}\" } }\n",
+        );
+        sidecar::merge_primary_labels(&mut plan, BTreeMap::new());
+
+        check_label_env_refs(&plan, "x", &[])
+            .expect("a config-declared reference is not a label's");
+    }
+
+    /// `outrig build` stamps the config's own entries into the label, so a
+    /// repo-built image carries a copy of each, references included. The config
+    /// entry replaced the label's of that name at the merge, so the copy is
+    /// never read and is not refused.
+    #[test]
+    fn a_label_entry_the_config_replaced_is_not_refused() {
+        let mut plan = label_plan(
+            "\n[images.x.mcp]\nfs = { command = [\"srv\"], env = { TOKEN = \"${SECRET}\" } }\n",
+        );
+        sidecar::merge_primary_labels(&mut plan, secret_label("fs"));
+
+        check_label_env_refs(&plan, "x", &[])
+            .expect("the config's entry is what runs, and the label's copy never does");
+    }
+
+    /// Entries are walked in name order, so what an operator is told to list
+    /// first does not depend on how the label was written.
+    #[test]
+    fn the_first_unlisted_reference_in_name_order_is_the_one_reported() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([
+                ("zeta".to_string(), with_env("K", "${Z_VAR}")),
+                ("alpha".to_string(), with_env("K", "${A_VAR}")),
+            ]),
+        );
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert!(err.to_string().starts_with("mcp server \"alpha\""), "{err}");
     }
 }
