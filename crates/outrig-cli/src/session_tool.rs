@@ -23,6 +23,8 @@ use rig::tool::{ToolCallExtensions, ToolDyn, ToolError, ToolExecutionResult};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::Value;
 
+use crate::rig_tool::McpToolAdapter;
+
 /// A reference-counted handle to one tool the agent can call.
 #[derive(Clone)]
 pub struct SessionTool(Arc<dyn ToolDyn>);
@@ -110,6 +112,45 @@ impl SharedTools {
     }
 }
 
+/// Give every tool its advertised name through [`outrig::assign_tool_names`],
+/// the rule `outrig mcp` applies, and drop any tool left without one. `identity`
+/// is the tool's `(server, tool)` pair as the upstream knows it, which is
+/// gone once the tool is erased into a [`SessionTool`], so this runs before.
+///
+/// `reserved` are names that cannot move: the built-ins, and on `/sidecar add`
+/// every name the model has already seen. A tool landing on one is the one
+/// widened, so unlike `outrig mcp` the outcome there can depend on arrival
+/// rather than on the canonical `(server, tool)` order.
+pub fn assign_names<T>(
+    tools: Vec<T>,
+    identity: impl Fn(&T) -> (&str, &str),
+    rename: impl Fn(&mut T, String),
+    reserved: &[String],
+) -> Vec<T> {
+    let identities: Vec<(&str, &str)> = tools.iter().map(&identity).collect();
+    let reserved: Vec<&str> = reserved.iter().map(String::as_str).collect();
+    let names = outrig::assign_tool_names(&identities, &reserved);
+    tools
+        .into_iter()
+        .zip(names)
+        .filter_map(|(mut tool, name)| {
+            rename(&mut tool, name?);
+            Some(tool)
+        })
+        .collect()
+}
+
+/// [`assign_names`] over MCP adapters, identified by their server and the
+/// upstream tool name.
+pub fn name_adapters(adapters: Vec<McpToolAdapter>, reserved: &[String]) -> Vec<McpToolAdapter> {
+    assign_names(
+        adapters,
+        |a| (a.client.name(), a.mcp_tool_name.as_str()),
+        |a, name| a.openai_name = name,
+        reserved,
+    )
+}
+
 /// Erase a list of concrete tools into the shared form.
 pub fn erase<T: ToolDyn + 'static>(tools: impl IntoIterator<Item = T>) -> Vec<SessionTool> {
     tools.into_iter().map(SessionTool::new).collect()
@@ -121,4 +162,52 @@ pub fn boxed(tools: &[SessionTool]) -> Vec<Box<dyn ToolDyn>> {
         .iter()
         .map(|t| Box::new(t.clone()) as Box<dyn ToolDyn>)
         .collect()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// A `(server, tool)` identity and the name it ends up advertised under.
+    type Fake = ((&'static str, &'static str), String);
+
+    fn name(tools: Vec<(&'static str, &'static str)>, reserved: &[&str]) -> Vec<Fake> {
+        let reserved: Vec<String> = reserved.iter().map(|s| s.to_string()).collect();
+        assign_names(
+            tools.into_iter().map(|id| (id, String::new())).collect(),
+            |t: &Fake| t.0,
+            |t, name| t.1 = name,
+            &reserved,
+        )
+    }
+
+    fn names(named: &[Fake]) -> Vec<&str> {
+        named.iter().map(|t| t.1.as_str()).collect()
+    }
+
+    fn distinct(names: &[&str]) -> bool {
+        let set: std::collections::HashSet<_> = names.iter().collect();
+        set.len() == names.len()
+    }
+
+    #[test]
+    fn a_literal_suffixed_name_does_not_replace_its_lookalike() {
+        let named = name(vec![("fs", "read/file"), ("fs", "read_file_5d2270")], &[]);
+        assert_eq!(named.len(), 2);
+        assert!(distinct(&names(&named)));
+    }
+
+    #[test]
+    fn one_name_listed_twice_keeps_both() {
+        let named = name(vec![("fs", "echo"), ("fs", "echo")], &[]);
+        assert_eq!(named.len(), 2);
+        assert!(distinct(&names(&named)));
+    }
+
+    #[test]
+    fn a_reserved_name_is_kept_and_the_tool_moves() {
+        let named = name(vec![("fs", "echo")], &["fs__echo"]);
+        assert_eq!(named.len(), 1);
+        assert_ne!(named[0].1, "fs__echo");
+    }
 }

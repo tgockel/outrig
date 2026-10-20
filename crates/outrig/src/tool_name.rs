@@ -38,8 +38,11 @@
 //! which is why the golden vectors pin the long-server cases too.
 //!
 //! Both `outrig run` (through the companion `outrig-cli` crate) and the
-//! [`mcp_proxy`](crate::mcp_proxy) server share this so they advertise
-//! identical public names for the same upstream tool.
+//! [`mcp_proxy`](crate::mcp_proxy) server share this, and share
+//! [`assign_tool_names`] for clashes, so they advertise identical public names
+//! for the same upstream tools.
+
+use std::collections::HashMap;
 
 /// Server name reserved for OutRig's own built-in tools, which reach the model
 /// as `outrig__<tool>` through the same [`sanitize`] path as MCP tools. A
@@ -80,7 +83,7 @@ pub(crate) fn sanitize_at(server: &str, tool: &str, hex_len: usize) -> String {
     suffixed(server, tool, hex_len)
 }
 
-/// The suffixed form, whether or not the pair needed one. [`crate::mcp_proxy`]
+/// The suffixed form, whether or not the pair needed one. [`assign_at`]
 /// calls this rather than [`sanitize_at`] when re-deriving a name that is
 /// already taken: a faithful pair ignores `hex_len`, so widening through
 /// `sanitize_at` would hand back the same name it was asked to move off.
@@ -109,6 +112,93 @@ pub(crate) fn suffixed(server: &str, tool: &str, hex_len: usize) -> String {
     name.push('_');
     name.push_str(&hex.as_str()[..hex_len]);
     name
+}
+
+/// Assign one advertised name per `(server, tool)` identity, positionally:
+/// `None` means the tool is not advertised. Both `outrig mcp` and `outrig run`
+/// call this, so the same set of tools gets the same names on either surface.
+///
+/// Names are handed out in a canonical order -- sorted by `(server, tool)`,
+/// not the order `tools/list` happened to return -- so the whole map is a
+/// function of the *set* of tools rather than of their arrival. Two tools
+/// contesting a name would otherwise settle it by position, and a backing
+/// server that relisted in a different order would bind that name to the
+/// other tool: a client replaying a cached name would reach a different
+/// backend and get a plausible answer instead of an error. Listing order is
+/// separate and stays the caller's.
+///
+/// `reserved` holds names something else already owns and that cannot move --
+/// the built-in tools, or names a model has already seen. They count as taken
+/// before any tool is placed, so a tool that lands on one is the one widened.
+///
+/// A clash is logged at ERROR naming both identities (a reserved name has no
+/// identity and is reported as such). Widening goes through `suffixed`
+/// rather than `sanitize_at` because a clash is not always a digest
+/// collision -- a tool whose own name ends in `_<hex>` can land on a name the
+/// suffix produced, and `sanitize_at` returns such a name unchanged at every
+/// width, handing back the very name it was asked to move off.
+pub fn assign_tool_names(tools: &[(&str, &str)], reserved: &[&str]) -> Vec<Option<String>> {
+    assign_at(tools, reserved, HASH_HEX_LEN)
+}
+
+/// [`assign_tool_names`] with the starting suffix width spelled out, so a test
+/// can drive a digest narrow enough to collide on purpose.
+pub(crate) fn assign_at(
+    tools: &[(&str, &str)],
+    reserved: &[&str],
+    hex_len: usize,
+) -> Vec<Option<String>> {
+    let mut order: Vec<usize> = (0..tools.len()).collect();
+    order.sort_by(|&a, &b| tools[a].cmp(&tools[b]));
+
+    // `None` marks a reserved name: held, but by no tool in this call.
+    let mut taken: HashMap<String, Option<usize>> =
+        HashMap::with_capacity(tools.len() + reserved.len());
+    for name in reserved {
+        taken.insert((*name).to_string(), None);
+    }
+
+    let mut names = vec![None; tools.len()];
+    for i in order {
+        let (server, tool) = tools[i];
+        let mut name = sanitize_at(server, tool, hex_len);
+
+        if let Some(&prev) = taken.get(&name) {
+            let holder = match prev {
+                Some(p) => format!("({:?}, {:?})", tools[p].0, tools[p].1),
+                None => "a reserved name".to_string(),
+            };
+            let clash = format!(
+                "advertised name {name:?} is claimed by both {holder} and ({server:?}, {tool:?})"
+            );
+            // The first width nobody holds. The starting width is in the
+            // range because the clash may have been with a *faithful* name,
+            // in which case the suffixed form at that width is itself free.
+            let free = (hex_len..=MAX_HASH_HEX_LEN)
+                .map(|width| suffixed(server, tool, width))
+                .find(|candidate| !taken.contains_key(candidate));
+            match free {
+                Some(renamed) => {
+                    tracing::error!(
+                        target: "outrig::mcp_proxy",
+                        "{clash}; advertising the second as {renamed:?} instead"
+                    );
+                    name = renamed;
+                }
+                None => {
+                    tracing::error!(
+                        target: "outrig::mcp_proxy",
+                        "{clash}, and no wider suffix is free; the second is not advertised"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        taken.insert(name.clone(), Some(i));
+        names[i] = Some(name);
+    }
+    names
 }
 
 fn in_charset(c: char) -> bool {

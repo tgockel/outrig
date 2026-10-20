@@ -1430,6 +1430,7 @@ impl outrig::WorkspaceSpec
 pub fn outrig::WorkspaceSpec::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub const outrig::PUBLIC_DOC_BASE_URL: &str
 pub const outrig::RESERVED_SERVER: &str
+pub fn outrig::assign_tool_names(&[(&str, &str)], &[&str]) -> alloc::vec::Vec<core::option::Option<alloc::string::String>>
 pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
 pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub fn outrig::resolve_mcp_env_values(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>

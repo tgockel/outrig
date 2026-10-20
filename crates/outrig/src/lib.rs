@@ -67,7 +67,7 @@ pub use outrig_::{
     SidecarServerSpec, SidecarSpec, ToolHandle, WorkspaceSpec,
 };
 pub use process::Transcript;
-pub use tool_name::{RESERVED_SERVER, sanitize as sanitize_tool_name};
+pub use tool_name::{RESERVED_SERVER, assign_tool_names, sanitize as sanitize_tool_name};
 
 /// Base URL of the published book. User-facing messages must link here rather
 /// than to a `doc/` path -- the repo tree isn't present in an installed

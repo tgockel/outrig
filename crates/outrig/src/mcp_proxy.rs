@@ -188,76 +188,18 @@ impl<C> Clone for ProxyServer<C> {
     }
 }
 
-/// Assign one advertised name per upstream tool, positionally: `None` means
-/// the tool is not advertised.
-///
-/// Names are handed out in a canonical order -- sorted by `(server, tool)`,
-/// not the order `tools/list` happened to return -- so the whole map is a
-/// function of the *set* of tools rather than of their arrival. Two tools
-/// contesting a name would otherwise settle it by position, and a backing
-/// server that relisted in a different order would bind that name to the
-/// other tool: a client replaying a cached name would reach a different
-/// backend and get a plausible answer instead of an error. Listing order is
-/// separate and stays the caller's.
-///
-/// Widening goes through [`tool_name::suffixed`] rather than
-/// [`tool_name::sanitize_at`] because a clash is not always a digest
-/// collision -- a tool whose own name ends in `_<hex>` can land on a name the
-/// suffix produced, and `sanitize_at` returns such a name unchanged at every
-/// width, handing back the very name it was asked to move off.
+/// Positional advertised names for the proxy's flattened tool list; the rule
+/// itself lives in [`tool_name::assign_at`] so `outrig run` applies it too.
 fn assign_public_names<C: BackingClient>(
     clients: &[C],
     upstream: &[(usize, McpTool)],
     hex_len: usize,
 ) -> Vec<Option<String>> {
-    let identity = |i: usize| {
-        let (client_idx, tool) = &upstream[i];
-        (clients[*client_idx].name(), tool.name.as_str())
-    };
-
-    let mut order: Vec<usize> = (0..upstream.len()).collect();
-    order.sort_by(|&a, &b| identity(a).cmp(&identity(b)));
-
-    let mut names = vec![None; upstream.len()];
-    let mut taken: HashMap<String, usize> = HashMap::with_capacity(upstream.len());
-    for i in order {
-        let (server, tool) = identity(i);
-        let mut name = tool_name::sanitize_at(server, tool, hex_len);
-
-        if let Some(&prev) = taken.get(&name) {
-            let (prev_server, prev_tool) = identity(prev);
-            let clash = format!(
-                "mcp_proxy: advertised name {name:?} is claimed by both \
-                 ({prev_server:?}, {prev_tool:?}) and ({server:?}, {tool:?})"
-            );
-            // The first width nobody holds. The starting width is in the
-            // range because the clash may have been with a *faithful* name,
-            // in which case the suffixed form at that width is itself free.
-            let free = (hex_len..=tool_name::MAX_HASH_HEX_LEN)
-                .map(|width| tool_name::suffixed(server, tool, width))
-                .find(|candidate| !taken.contains_key(candidate));
-            match free {
-                Some(renamed) => {
-                    tracing::error!(
-                        target: "outrig::mcp_proxy",
-                        "{clash}; advertising the second as {renamed:?} instead"
-                    );
-                    name = renamed;
-                }
-                None => {
-                    tracing::error!(
-                        target: "outrig::mcp_proxy",
-                        "{clash}, and no wider suffix is free; the second is not advertised"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        taken.insert(name.clone(), i);
-        names[i] = Some(name);
-    }
-    names
+    let identities: Vec<(&str, &str)> = upstream
+        .iter()
+        .map(|(client_idx, tool)| (clients[*client_idx].name(), tool.name.as_str()))
+        .collect();
+    tool_name::assign_at(&identities, &[], hex_len)
 }
 
 impl<C: BackingClient> ProxyServer<C> {

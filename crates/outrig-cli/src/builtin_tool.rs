@@ -54,6 +54,25 @@ pub(crate) fn name_of(tool: &str) -> String {
     outrig::sanitize_tool_name(outrig::RESERVED_SERVER, tool)
 }
 
+/// Every name the built-ins can advertise, whether or not this session turned a
+/// given one on. MCP tools are named around these so none can take one, which
+/// is what the reserved `outrig` server name promises but cannot enforce for a
+/// tool whose lossy name happens to land on one.
+pub(crate) fn reserved_names() -> Vec<String> {
+    const OWN: [&str; 6] = [
+        "subagent",
+        "subagent_send",
+        "wait_results",
+        "get_result",
+        "subagent_release",
+        "set_result",
+    ];
+    OWN.iter()
+        .map(|t| name_of(t))
+        .chain(crate::self_tool::self_tools().iter().map(ToolDyn::name))
+        .collect()
+}
+
 // ---------------------------------------------------------------- launch ---
 
 #[derive(Deserialize)]
