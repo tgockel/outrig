@@ -4297,6 +4297,9 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
          project(index, 'extyank', tag=COMPILED)\n\
          project(index, 'extmix', tag=COMPILED)\n\
          project(index, 'extpre', tag=COMPILED)\n\
+         # One source seen twice: the directory holds extdup's source distribution as a file, and a\n\
+         # page in it links the same file as yanked. pip reads the page's link first.\n\
+         project(index, 'extdup', tag=COMPILED, build='pure')\n\
          linked = os.path.join(index, 'linked')\n\
          os.makedirs(linked)\n\
          project(linked, 'extyank', build='pure')\n\
@@ -4310,7 +4313,8 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
              '<a href=\"linked/extyank-1.0.tar.gz\" data-yanked=\"withdrawn\">extyank-1.0.tar.gz</a>'\
              '<a href=\"linked/extmix-1.0.tar.gz\" data-yanked=\"withdrawn\">extmix-1.0.tar.gz</a>'\
              '<a href=\"linked/extmix-2.0rc1.tar.gz\">extmix-2.0rc1.tar.gz</a>'\
-             '<a href=\"linked/extpre-2.0rc1.tar.gz\">extpre-2.0rc1.tar.gz</a>')\n\
+             '<a href=\"linked/extpre-2.0rc1.tar.gz\">extpre-2.0rc1.tar.gz</a>'\
+             '<a href=\"extdup-1.0.tar.gz\" data-yanked=\"withdrawn\">extdup-1.0.tar.gz</a>')\n\
          # A wheel for Python 2 does not fit either, and is not compiled.\n\
          project(index, 'py2only', tag='py2-none-any', build='fails')\n\
          project(index, 'buildable', build='pure')\n\
@@ -4412,6 +4416,16 @@ fn pip_says_why_a_package_with_compiled_parts_failed_and_builds_one_that_is_pure
          'retry': {'yanked': True, 'mixed': True, 'yanked pinned': True, 'mixed --pre': True, \
          'mixed pinned': True, 'pre only': True}}\n"
     );
+    // A release pip sees twice, as a file in the directory and as a link on a page in it that marks
+    // the same file yanked, is one it takes: it passes over the sighting that is yanked for the
+    // one that is not. So its source is one the flag left out, and the note names the flag and
+    // leaves out the image's Python, as it does for a source pip sees once. The last of these
+    // is pip without the flag, which builds and installs it.
+    let duplicated = "code, text = said('extdup', '--only-binary=:all:')\n\
+                      (code != 0, '--only-binary' in text, 'published only as wheels' in text, \
+                       'Code that needs a compiled package can run with' in text, \
+                       said('extdup')[0])";
+    assert_eq!(k.output(10, duplicated), "(True, True, False, False, 0)\n");
     // A wheel for another Python is not compiled, and a build that works needs no note.
     let pure = "code, text = said('py2only')\n\
                 code2, text2 = said('extpure')\n\

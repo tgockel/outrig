@@ -1114,7 +1114,10 @@ def guard():
     # project -> the versions, as pip reads them, that have a candidate pip could install
     usable = {}
     # project -> the source distributions that would be candidates but for the format control,
-    # which `--only-binary` sets to allow no sources, as pip makes a candidate of a link
+    # which `--only-binary` sets to allow no sources, as pip makes a candidate of a link. A list of
+    # sightings, not a set: a `Link` compares and hashes by its URL and ignores whether it is
+    # yanked, so a file a directory holds and a page in it marks yanked would be one element, and
+    # the one kept would be the page's, which pip reads first. pip takes the one not yanked.
     left_out = {}
     # a source distribution's URL -> (project as named, version as written)
     sources = {}
@@ -1149,7 +1152,7 @@ def guard():
                 fit, version = evaluate_link(allowing, link)
                 if fit is LinkType.candidate:
                     candidate = InstallationCandidate(self.project_name, version, link)
-                    left_out.setdefault(name, set()).add(candidate)
+                    left_out.setdefault(name, []).append(candidate)
         except Exception:
             pass
         return result
@@ -1191,7 +1194,7 @@ def guard():
         Nothing that fits is usable where this is asked, so those left out are all there would
         be. Hashes are not asked of pip, so a source whose hash does not match still counts."""
         evaluator = finder.make_candidate_evaluator(name, specifier=specifier)
-        applicable = evaluator.get_applicable_candidates(list(left_out.get(name, ())))
+        applicable = evaluator.get_applicable_candidates(left_out.get(name, []))
         yanked = [candidate.link.is_yanked for candidate in applicable]
         pinned = any(
             s.operator == "===" or (s.operator == "==" and not s.version.endswith(".*"))
