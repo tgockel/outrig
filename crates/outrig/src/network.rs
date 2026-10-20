@@ -42,7 +42,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
@@ -518,6 +518,11 @@ struct NameBindings {
 
 type Bindings = Arc<Mutex<NameBindings>>;
 
+/// Where the accept loop leaves the connections that panicked, for teardown to
+/// report: a connection's `JoinError` has no other way out of the loop, which
+/// returns `()` for them.
+type ConnPanics = Arc<Mutex<Vec<JoinError>>>;
+
 impl NameBindings {
     /// Records that `ip` answered for `name`. One address can hold several
     /// names, so an allowed and a denied name behind one address of shared
@@ -626,6 +631,9 @@ struct Attachment {
     /// This container's handle on the session's audit sink, kept so teardown
     /// can collect the records its connections could not write.
     audit: AuditSink,
+    /// The connections that panicked, as the accept loop collected them.
+    /// Complete once that loop has been joined.
+    panics: ConnPanics,
     /// Answers once no connection task is still running.
     ///
     /// The accept loop normally drains its own connections before it returns,
@@ -796,6 +804,7 @@ impl NetworkInterceptor {
         // answers exactly when the last one has gone. One is enough: nothing
         // is ever queued on it.
         let (live, idle) = mpsc::channel(1);
+        let panics = ConnPanics::default();
         tasks.spawn(tcp_accept_loop(
             sockets.tcp,
             self.audit.for_attachment(name, generation),
@@ -804,6 +813,7 @@ impl NetworkInterceptor {
             host_alias,
             cancel.clone(),
             live,
+            panics.clone(),
         ));
         let (resolvers_tcp, bindings_tcp) = (resolvers.clone(), bindings.clone());
         tasks.spawn(dns_loop(
@@ -827,6 +837,7 @@ impl NetworkInterceptor {
             name.to_string(),
             Attachment {
                 idle,
+                panics,
                 cancel,
                 tasks,
                 rollback,
@@ -930,6 +941,7 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
         mut rollback,
         transcript,
         audit,
+        panics,
     } = attachment;
     cancel.cancel();
     let mut failures = stop_tasks(&mut tasks).await;
@@ -951,6 +963,15 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
             grace: SHUTDOWN_GRACE,
         });
     }
+    // Complete now: the accept loop collects every connection it started, and
+    // `idle` says none is still running. A connection that panicked never
+    // wrote its record, so this is also the only place its loss is visible.
+    let panicked = std::mem::take(&mut *panics.lock().unwrap_or_else(|e| e.into_inner()));
+    failures.extend(
+        panicked
+            .into_iter()
+            .map(|source| OutrigError::NetworkTaskPanicked { source }),
+    );
     // After the join, and then drained. Joining makes "every record this
     // attachment owed is queued" true; the drain makes it "written". Without
     // the second half a `detach` could return while the writer still had the
@@ -986,7 +1007,8 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// that was supposed to have ended it.
 ///
 /// This covers these tasks and not what they spawned. The accept loop keeps
-/// its connections in a set of its own and drains it before returning, so on
+/// its connections in a set of its own, hands the ones that panicked to
+/// `Attachment::panics`, and drains it before returning, so on
 /// every path but this one they are joined with it -- but aborting the loop
 /// drops that set, which requests their abort and does not wait. The caller
 /// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
@@ -2325,6 +2347,7 @@ fn zeek_uid() -> String {
 ///
 /// Returns an error when the listener stopped taking connections before it
 /// was asked to; see [`after_listener_failure`].
+#[allow(clippy::too_many_arguments)]
 async fn tcp_accept_loop<L: Accept>(
     listener: L,
     audit: AuditSink,
@@ -2333,6 +2356,7 @@ async fn tcp_accept_loop<L: Accept>(
     host_alias: Option<HostAlias>,
     cancel: CancellationToken,
     live: mpsc::Sender<()>,
+    panics: ConnPanics,
 ) -> Result<()> {
     // A child of the attachment's token. Connections are still cancelled when
     // the attachment is, but the listener-failure path below can end them
@@ -2350,6 +2374,7 @@ async fn tcp_accept_loop<L: Accept>(
         &conn_cancel,
         &mut conns,
         &live,
+        &panics,
     )
     .await;
     // Every connection watches `conn_cancel`. On the detach path its parent
@@ -2359,7 +2384,9 @@ async fn tcp_accept_loop<L: Accept>(
     // reports the failure. Either way their records are all written before
     // this task, and therefore the detach joining it, returns.
     conn_cancel.cancel();
-    while conns.join_next().await.is_some() {}
+    while let Some(joined) = conns.join_next().await {
+        note_joined(joined, &panics);
+    }
     accepted.map_err(|source| OutrigError::NetworkListenerFailed {
         listener: "tcp",
         source,
@@ -2413,6 +2440,7 @@ async fn accept_into<L: Accept>(
     conn_cancel: &CancellationToken,
     conns: &mut JoinSet<()>,
     live: &mpsc::Sender<()>,
+    panics: &ConnPanics,
 ) -> io::Result<()> {
     loop {
         let (stream, peer) = tokio::select! {
@@ -2421,9 +2449,12 @@ async fn accept_into<L: Accept>(
             // than when the next one arrives: a loop parked in `accept` has no
             // other reason to wake for it. An empty set does not match, which
             // leaves this arm out of the iteration. A connection that
-            // panicked is dropped here as it is in `reap_finished` and the
-            // drain after this loop.
-            Some(_) = conns.join_next() => continue,
+            // panicked is kept for teardown, as it is in `reap_finished` and
+            // the drain after this loop.
+            Some(joined) = conns.join_next() => {
+                note_joined(joined, panics);
+                continue;
+            }
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
                 Err(e) => match after_listener_failure("tcp", e, cancel).await {
@@ -2460,7 +2491,7 @@ async fn accept_into<L: Accept>(
         // `accept` can win the race with it: one that finished meanwhile is
         // not one this is still carrying, and the limit below must not count
         // it.
-        reap_finished(conns);
+        reap_finished(conns, panics);
         if conns.len() >= TCP_CONNECTIONS {
             drop(stream);
             record_refused(audit, bindings, peer, dst, CONNECTION_LIMIT_RULE, cancel).await;
@@ -2640,8 +2671,21 @@ async fn record_refused(
 /// What keeps a `JoinSet` only ever spawned into from holding one handle per
 /// connection the attachment has ever served is [`accept_into`]'s `join_next`
 /// arm, which takes each one back as it finishes.
-fn reap_finished(conns: &mut JoinSet<()>) {
-    while conns.try_join_next().is_some() {}
+fn reap_finished(conns: &mut JoinSet<()>, panics: &ConnPanics) {
+    while let Some(joined) = conns.try_join_next() {
+        note_joined(joined, panics);
+    }
+}
+
+/// Keeps what a finished connection joined with if it panicked. The loop never
+/// aborts a connection itself -- only dropping the set does -- so a failed
+/// join is a panic; the check is for the next reader.
+fn note_joined(joined: std::result::Result<(), JoinError>, panics: &ConnPanics) {
+    if let Err(e) = joined
+        && e.is_panic()
+    {
+        panics.lock().unwrap_or_else(|e| e.into_inner()).push(e);
+    }
 }
 
 /// Whether the server on `port` is expected to write first. Sniffing such a
@@ -5527,6 +5571,7 @@ mod tests {
                 rollback: Rollback::new(std::process::id()).expect("a namespace"),
                 transcript: None,
                 audit: audit_sink(dir.path()).await,
+                panics: ConnPanics::default(),
             },
         )
         .await;
@@ -7635,6 +7680,105 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    /// A connection that panicked is handed to the sink by `reap_finished`,
+    /// and one that finished cleanly is not.
+    #[tokio::test]
+    async fn a_panicked_connection_reaches_the_panic_sink() {
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async {});
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        // Bounded, so a reap that reaps nothing fails below rather than spinning.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            reap_finished(&mut conns, &panics);
+            if conns.is_empty() {
+                break;
+            }
+        }
+        assert!(conns.is_empty(), "{} connections still held", conns.len());
+        let kept = panics.lock().unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].is_panic());
+    }
+
+    /// The accept loop's `join_next` arm, which takes a connection back while
+    /// the loop is parked in `accept`, keeps a panic as well.
+    #[tokio::test]
+    async fn the_accept_loop_keeps_a_panic_it_takes_back_while_parked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = Redirected::elsewhere(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        let (live, _idle) = mpsc::channel(1);
+
+        let watched = panics.clone();
+        let token = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            let _ends_the_loop = token.drop_guard();
+            for _ in 0..1000 {
+                if !watched.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        run_accept_loop_collecting(
+            &listener,
+            &audit,
+            &cancel,
+            &conn_cancel,
+            &mut conns,
+            &live,
+            &panics,
+        )
+        .await
+        .expect("only the cancel ends the loop");
+        watcher.await.expect("watcher");
+
+        assert_eq!(panics.lock().unwrap().len(), 1);
+    }
+
+    /// Teardown turns each connection panic into a `NetworkTaskPanicked`
+    /// cause, so `detach` no longer returns `Ok(())` over a dead connection.
+    #[tokio::test]
+    async fn teardown_reports_a_panicked_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        let joined = conns.join_next().await.expect("one task");
+        note_joined(joined, &panics);
+        let (live, idle) = mpsc::channel::<()>(1);
+        drop(live);
+
+        let causes = teardown_attachment(
+            "outrig-test",
+            Attachment {
+                cancel: CancellationToken::new(),
+                tasks: JoinSet::new(),
+                idle,
+                rollback: Rollback::new(std::process::id()).expect("a namespace"),
+                transcript: None,
+                audit: audit_sink(dir.path()).await,
+                panics,
+            },
+        )
+        .await;
+
+        assert_eq!(causes.len(), 1, "{causes:#?}");
+        assert!(
+            matches!(*causes[0].source, OutrigError::NetworkTaskPanicked { .. }),
+            "{causes:#?}"
+        );
+        assert!(teardown_result(causes).is_err());
+    }
+
     /// `reap_finished` takes every finished connection out of the set the
     /// accept loop keeps them in, so a count of it is a count of the ones
     /// still running.
@@ -7649,7 +7793,7 @@ mod tests {
         // rather than spinning here.
         for _ in 0..64 {
             tokio::task::yield_now().await;
-            reap_finished(&mut conns);
+            reap_finished(&mut conns, &ConnPanics::default());
             if conns.is_empty() {
                 break;
             }
@@ -8000,6 +8144,29 @@ mod tests {
         conns: &mut JoinSet<()>,
         live: &mpsc::Sender<()>,
     ) -> io::Result<()> {
+        run_accept_loop_collecting(
+            listener,
+            audit,
+            cancel,
+            conn_cancel,
+            conns,
+            live,
+            &ConnPanics::default(),
+        )
+        .await
+    }
+
+    /// [`run_accept_loop_holding`] with the sink the loop leaves connection
+    /// panics in kept by the test.
+    async fn run_accept_loop_collecting(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+        live: &mpsc::Sender<()>,
+        panics: &ConnPanics,
+    ) -> io::Result<()> {
         accept_into(
             listener,
             audit,
@@ -8010,6 +8177,7 @@ mod tests {
             conn_cancel,
             conns,
             live,
+            panics,
         )
         .await
     }
@@ -8161,6 +8329,7 @@ mod tests {
             None,
             CancellationToken::new(),
             mpsc::channel(1).0,
+            ConnPanics::default(),
         ));
         tokio::task::yield_now().await;
 
@@ -8335,6 +8504,7 @@ mod tests {
                 None,
                 cancel.clone(),
                 mpsc::channel(1).0,
+                ConnPanics::default(),
             ));
             tasks.spawn(dns_loop(
                 dns,
@@ -8564,6 +8734,7 @@ mod tests {
             None,
             cancel.clone(),
             mpsc::channel(1).0,
+            ConnPanics::default(),
         ));
         (dir, cancel, tasks)
     }

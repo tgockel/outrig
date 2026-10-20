@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Config::repo`, `RepoPolicy`. If a repo config of yours references a host variable, list it under
   `[repo]` in `~/.outrig/config.toml` or a file passed as `--global-config`. An outrig release
   before 0.2.2 does not know `[repo]` and refuses a global config that has it. (#444)
+- **A panicked interceptor connection is reported by `detach` and `shutdown`.** The accept loop
+  threw away what it joined each finished connection with, so a connection task that panicked left
+  `detach` returning `Ok(())` and its audit record unwritten, where a panicked loop task was already
+  a typed failure. Each such connection is now a `NetworkTaskPanicked` cause of the
+  `NetworkTeardown` error. No panic site in a connection is known today, so nothing changes where
+  none occurs. (#273)
 - **Attaching network interception checks that nft committed all of the redirect script.** It took
   a zero exit and the table's handle in nft's echo as proof the ruleset was in, so a commit that
   made the table and not its chains or rules -- nft 1.0.9 did exactly that to a nested script --
