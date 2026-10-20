@@ -1757,12 +1757,42 @@ def _inert_error(text):
     return (("builtins", "RuntimeError"), (text,), (), "<traceback not sent>")
 
 
+def _named_as_host(exc, raw):
+    """`exc`, which RPyC's `vinegar.load` rebuilt from `raw`, with its class named as the host's.
+
+    `load` returns a subclass of the class `raw` names that has the base's `__name__` and
+    `__module__` but not its `__qualname__`, and `traceback` prints a type by those two: the error
+    that ended an execution read `_get_exception_class.<locals>.Derived`. The subclass takes the
+    base's `__qualname__`, and where the base is RPyC's generic class, whose module reads
+    `rpyc.core.vinegar/<module>`, the host's module and class too. `__name__` stays, since the
+    result's `raised` reports it.
+
+    Only RPyC's own subclass is renamed. What else `load` returns is left as it is: `StopIteration`,
+    a string, and whatever the class's `__new__` made in the subclass's place, which is the
+    library's -- an instance of its own class, or an object that is no exception. The subclass is
+    told by identity against those RPyC has made, never by asking the object its class or hashing
+    a class to look it up: that runs the library's code, and nothing here can be interrupted.
+    """
+    vinegar = _rpyc.core.vinegar
+    derived = type(exc)
+    # A snapshot, which another thread's `_get_exception_class` cannot change as it is read.
+    if not any(derived is made for made in tuple(vinegar._exception_classes_cache.values())):
+        return exc
+    base = _type_bases(derived)[0]
+    qualname = _type_qualname(base)
+    if issubclass(base, vinegar.GenericException):
+        modname, qualname = raw[0]
+        type.__setattr__(derived, "__module__", modname)
+    type.__setattr__(derived, "__qualname__", qualname)
+    return exc
+
+
 def _closed(text):
     """`outrig.Closed(text)`, for a call the close kept from running: the class the bindings
     process's own `Closed` arrives as through RPyC -- RPyC's generic class for the name, made
     without importing anything, since the reader thread makes one too."""
     raw = (("outrig", "Closed"), (), (), "")
-    return type(_rpyc.core.vinegar.load(raw, False, False, False))(text)
+    return type(_named_as_host(_rpyc.core.vinegar.load(raw, False, False, False), raw))(text)
 
 
 class FrameChannel:
@@ -2341,9 +2371,8 @@ def _attribute_error(e):
     """The binding's refusal `e` of an attribute's name, as an `AttributeError` of the same class
     name, text and `name`."""
     cls = type(e)
-    error = type(_type_name(cls), (cls, AttributeError), {"__module__": cls.__module__})(
-        *e.args, name=e.name
-    )
+    namespace = {"__module__": cls.__module__, "__qualname__": _type_qualname(cls)}
+    error = type(_type_name(cls), (cls, AttributeError), namespace)(*e.args, name=e.name)
     error.__dict__.update(e.__dict__)
     return error
 
@@ -2698,7 +2727,7 @@ def _connection_class(rpyc):
 
         def _unbox_exc(self, raw):
             try:
-                return super()._unbox_exc(raw)
+                return _named_as_host(super()._unbox_exc(raw), raw)
             except Exception as e:
                 return vinegar.GenericException(
                     f"an exception from {self.names} could not be rebuilt: {e!r}"
@@ -3124,6 +3153,7 @@ _MISSING = object()
 # A type's own name, read without consulting its metaclass, which could run agent code.
 _type_name = type.__dict__["__name__"].__get__
 _type_qualname = type.__dict__["__qualname__"].__get__
+_type_bases = type.__dict__["__bases__"].__get__
 
 
 def _raised(exc):

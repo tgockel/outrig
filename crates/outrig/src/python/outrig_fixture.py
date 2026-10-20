@@ -162,6 +162,60 @@ class CommandError(Exception):
         return f"command {self._cmdline!r} failed with status {self.status}"
 
 
+class Replaced(Exception):
+    """An exception whose `__new__`, asked for a subclass of a class that has a `replacement` --
+    as RPyC does where it rebuilds the exception in the container -- returns what that makes."""
+
+    def __new__(cls, *args):
+        return super().__new__(cls) if "replacement" in vars(cls) else cls.replacement()
+
+
+class CachedError(Replaced):
+    """Replaced by its own cached instance, as a class that caches its errors would."""
+
+    replacement = staticmethod(lambda: CACHED)
+
+
+CACHED = CachedError()
+
+
+class Classless:
+    """An object whose `__class__` never answers."""
+
+    @property
+    def __class__(self):
+        while True:
+            time.sleep(0.01)
+
+
+class NoException(Replaced):
+    """Replaced by an object that is no exception, and holds its tongue when asked its class."""
+
+    replacement = staticmethod(Classless)
+
+
+class Unhashable(type):
+    """A metaclass that defines `__eq__` and so, as Python has it, no `__hash__`: a class of it
+    cannot be hashed."""
+
+    def __eq__(cls, other):
+        return cls is other
+
+
+class Foreign(Exception, metaclass=Unhashable):
+    pass
+
+
+class ForeignChild(Foreign):
+    pass
+
+
+class Handed(Replaced):
+    """Replaced by an instance of a class whose base cannot be hashed."""
+
+    replacement = staticmethod(ForeignChild)
+
+
 class Nested:
     def __init__(self):
         self.value = 7
@@ -573,6 +627,15 @@ class Root(Records):
 
     def raise_command(self):
         raise CommandError(["git", "push"], 128)
+
+    def raise_cached(self):
+        raise CachedError("cached")
+
+    def raise_no_exception(self):
+        raise NoException("none")
+
+    def raise_handed(self):
+        raise Handed("handed")
 
     def unpickled(self):
         return unpickled

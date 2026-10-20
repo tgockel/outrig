@@ -880,9 +880,9 @@ fn what_the_owner_still_holds_at_the_close_invokes_nothing() {
         closed.elapsed()
     );
     assert!(
-        result["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("the session is closed to new work")),
+        result["error"].as_str().is_some_and(
+            |error| error.contains("\noutrig.Closed: the session is closed to new work")
+        ),
         "{result}"
     );
     let marker = Flag::new();

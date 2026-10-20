@@ -916,10 +916,88 @@ fn exceptions_arrive_typed_where_their_module_imports() {
     );
     assert_eq!(
         out,
-        "generic: outrig_fixture.FixtureError rpyc.core.vinegar/outrig_fixture ('fixture failed',) \
-         3 False False\n\
+        "generic: outrig_fixture.FixtureError outrig_fixture ('fixture failed',) 3 False False\n\
          typed: ('fixture failed',) 3 False\n"
     );
+}
+
+/// The line of an execution's `error` that names the exception's type: the last before RPyC's
+/// "Remote Traceback" heading, whose own text repeats the host's report of it.
+fn type_line(result: &Value) -> &str {
+    let error = result["error"].as_str().expect("an error");
+    error
+        .split("\n\n========= Remote Traceback")
+        .next()
+        .and_then(|reported| reported.lines().last())
+        .expect("a type line")
+}
+
+/// What the model reads of a host exception that the agent's code does not catch names the host's
+/// class, whether RPyC rebuilds it as the library's own or as a class of its own, and for a
+/// builtin as for any other: not the subclass RPyC makes to carry the host's traceback.
+#[test]
+fn an_uncaught_host_exception_is_reported_under_the_hosts_class() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    // In order: the library's module is not yet importable here, so RPyC's generic class stands
+    // for it; then it is, and the class is the library's own.
+    let cases = [
+        (
+            with_stub("stub.raise_fixture()"),
+            "outrig_fixture.FixtureError",
+            "outrig_fixture.FixtureError: fixture failed",
+        ),
+        (
+            with_stub_and_fixture("stub.raise_fixture()"),
+            "FixtureError",
+            "outrig_fixture.FixtureError: fixture failed",
+        ),
+        (with_stub("stub.poll(999)"), "KeyError", "KeyError: 999"),
+        (
+            with_stub("stub._private"),
+            "outrig.Refused",
+            "outrig.Refused: '_private' is not a public name, and it is not on RPyC's safe list",
+        ),
+    ];
+    for (id, (source, raised, line)) in (1..).zip(cases) {
+        let result = relay.exec(id, &source);
+        assert_eq!(result["status"], "error", "{result}");
+        assert_eq!(result["raised"], raised, "{result}");
+        assert_eq!(type_line(&result), line, "{result}");
+    }
+}
+
+/// The class a host exception is rebuilt from can hand back anything from `__new__` in place of
+/// the instance RPyC asks for, and what it hands back is the library's own, and is told from RPyC's
+/// subclass without running any of its code: an instance of a class that is not RPyC's wrapper
+/// keeps its name, and so does one whose base cannot be hashed, and an object that is no exception
+/// is never asked its class, which may not answer, so the call raises the `TypeError` it always did.
+#[test]
+fn what_a_new_hands_back_for_a_host_exception_is_left_as_it_is() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub_and_fixture(
+            r#"
+            try:
+                stub.raise_cached()
+            except outrig_fixture.CachedError as e:
+                print("caught", e.args, outrig_fixture.CachedError.__qualname__)
+            try:
+                stub.raise_handed()
+            except Exception as e:
+                print("handed", type(e).__name__, e.args)
+            "#,
+        ),
+    );
+    assert_eq!(
+        out,
+        "caught ('cached',) CachedError\nhanded ForeignChild ('handed',)\n"
+    );
+    let result = relay.exec(2, &with_stub_and_fixture("stub.raise_no_exception()"));
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["raised"], "TypeError", "{result}");
 }
 
 #[test]

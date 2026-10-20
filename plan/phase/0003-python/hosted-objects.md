@@ -439,6 +439,13 @@ import the type's module from the package mount, so `except git.GitCommandError 
 and `e.status` reads as it would on the host. A type the container cannot import arrives as RPyC's
 generic exception class, carrying the same name, args, and attributes.
 
+One the agent's code does not catch ends its execution, and the error the model reads names the
+host's class on its type line -- `outrig_fixture.FixtureError: fixture failed`, or `KeyError: 999`
+for a builtin -- whether or not the type's module imports in the container (#598). For RPyC's
+generic class, `type(e).__module__` is the host's module, `outrig_fixture`, rather than the
+`rpyc.core.vinegar/outrig_fixture` RPyC gives it; `type(e).__name__` is still the dotted
+`outrig_fixture.FixtureError`, which is what the result's `raised` reports.
+
 The host's traceback text is kept in the request's outcome event (`boundary-policy.md`) and dropped
 from the error the agent sees. It describes the library's internals rather than the agent's code,
 and it costs the model context; whoever reads the event has it. In its place the host sends its
