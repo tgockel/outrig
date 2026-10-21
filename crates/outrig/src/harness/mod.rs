@@ -56,7 +56,7 @@ pub use self::builder::{ContainerSpec, Progress, SessionBuilder, Step, container
 pub use self::error::{Closed, ClosedBy, Failure, SessionError};
 pub use self::report::{
     BindingStop, EventDelivery, ExecutionOutcome, ExecutionStatus, HostedCall, LogLoss,
-    ShutdownReport, Stopped, Verdict,
+    RequestOutcome, ShutdownReport, Stopped, Verdict,
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
 pub use crate::agent::UserChannel;

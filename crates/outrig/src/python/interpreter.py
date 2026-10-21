@@ -50,6 +50,7 @@ import collections
 import concurrent.futures.thread
 import contextlib
 import contextvars
+import copy
 import dataclasses
 import datetime
 import functools
@@ -58,6 +59,7 @@ import inspect
 import io
 import itertools
 import json
+import keyword
 import mmap
 import multiprocessing.pool
 import operator
@@ -77,6 +79,7 @@ import time
 import traceback
 import types
 import typing
+import weakref
 
 # ---------------------------------------------------------------------------- limits
 
@@ -2390,13 +2393,15 @@ def _coroutine_function(fn):
 def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
     `outrig.runtime` and `outrig.bindings` are those of the execution reading them."""
-    global _schema
+    global _schema, _agents
     sys.path.append(directory)
+    import outrig._agents
     import outrig._kernel
     import outrig.schema
 
     outrig._kernel.install(_calling)
     _schema = outrig.schema
+    _agents = outrig._agents
 
 
 def _calling():
@@ -3418,13 +3423,39 @@ class _Refused(Exception):
 class Delivery:
     """One message taken from an endpoint.
 
-    `body` is the message itself, `sender` who sent it -- `"user"` on the user channel -- and
-    `received_at` when it arrived, in UTC.
+    `id` names the message -- on a request channel, the request it carries, which its handle's
+    `id` names too -- `body` is the message itself, `sender` who sent it -- `"user"` on the user
+    channel, an agent's id between agents -- and `received_at` when it arrived, in UTC.
     """
 
+    id: int
     body: object
     sender: str
     received_at: datetime.datetime
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestDelivery(Delivery):
+    """A request taken from one of a request child's channels: answer it with
+    `await delivery.reply(value)`, or end it unanswered with `await delivery.fail(message)`.
+
+    `reply` checks `value` against the channel's reply type -- an instance of it, or its JSON form
+    -- and returns once it is accepted; one that is not raises what is wrong, with each problem's
+    path, and counts one of the request's attempts. Past the last, the request ends
+    `outrig.CompletionRejected`. A request that has already ended -- answered, cancelled, released
+    -- takes no answer: `reply` and `fail` raise.
+    """
+
+    _work: object = dataclasses.field(default=None, repr=False, compare=False)
+
+    async def reply(self, value):
+        """Answer the request with `value`; see `help(type(delivery))`."""
+        await self._work.answer(value)
+
+    async def fail(self, message):
+        """End the request unanswered, its sender's handle raising `outrig.AgentRequestFailed`
+        carrying `message`, a str saying why."""
+        await self._work.fail(message)
 
 
 class MessageAvailable(BaseException):
@@ -3527,17 +3558,20 @@ class Endpoint:
             # Taken already, so nothing here may raise and lose it: what the host is told is a
             # record of the take, and a take it never hears of is one the record lacks.
             try:
-                _write_line(
-                    _encode(
-                        {"t": "took", "agent": self._agent, "channel": self._name, "message": message}
-                    )
-                )
+                line = self._took(message)
+                if line is not None:
+                    _write_line(_encode(line))
             except BaseException as e:
                 try:
                     _diag(f"took a message on {self._name!r}, but saying so failed: {e!r}")
                 except BaseException:
                     pass
         return delivery
+
+    def _took(self, message):
+        """The line telling the host this endpoint's code took `message`, or `None` when the
+        host keeps no record of takes here."""
+        return {"t": "took", "agent": self._agent, "channel": self._name, "message": message}
 
     def _take(self):
         return self._queue.popleft() if self._queue else None
@@ -3652,7 +3686,7 @@ class Endpoint:
                 f"channel {self._name!r} receives {_describe_all(self._receives)}, not "
                 f"{_type_name(type(body))}"
             )
-        delivery = Delivery(copy, sender, datetime.datetime.now(datetime.timezone.utc))
+        delivery = Delivery(message, copy, sender, datetime.datetime.now(datetime.timezone.utc))
         with self._lock:
             if len(self._queue) >= QUEUE_MAX:
                 raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
@@ -3693,6 +3727,9 @@ class Runtime:
     `runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
     each is; asking makes no request to any of them.
 
+    `await runtime.spawn(name, prompt=...)` launches a child agent to give work to, and
+    `await runtime.release([child])` ends it: see `help(runtime.spawn)`.
+
     Code in a module reaches the same runtime after `import outrig`, as `outrig.runtime`, and
     each binding as `outrig.bindings[name]`; `outrig.schema` declares types, decodes JSON into
     them strictly, and renders their JSON Schema.
@@ -3700,11 +3737,144 @@ class Runtime:
 
     MessageAvailable = MessageAvailable
 
-    def __init__(self, channels, held, history, context):
+    def __init__(self, channels, held, history, context, kernel):
         self._channels = types.MappingProxyType(channels)
         self._held = held
         self._history = history
         self._context = context
+        self._kernel = kernel
+
+    def __getattr__(self, name):
+        if name == "complete":
+            child = self._kernel.child
+            if child is None:
+                raise AttributeError(
+                    "runtime.complete is a work child's, which completes the submission its parent "
+                    "gave it; this agent is no child"
+                )
+            raise AttributeError(
+                "this child answers requests, and has no runtime.complete: take one with "
+                "`d = await runtime.channels[name].receive()`, then answer it with "
+                "`await d.reply(value)`, or end it with `await d.fail(message)`"
+            )
+        raise AttributeError(f"'runtime' has no attribute {name!r}")
+
+    async def spawn(self, name, *, prompt, model=None, inputs=None, requests=None):
+        """Launch a child agent, and return its `Child` once it exists.
+
+        The child is a kernel of its own in this interpreter -- its own names, the session's
+        bindings, no user channel -- and the host runs its rounds, each model call one of the
+        session's. `prompt` is the first part of its instructions. `model` names a configured
+        model or alias; without it, the child runs on yours. `inputs`, a dict of names to values,
+        is bound in its namespace as variables, copies, before it starts: each must be data.
+
+        Without `requests`, it is a work child: give it work with `child.submit(inputs,
+        result=T)`, and it completes each with `runtime.complete`. With `requests`, a dict of
+        channel names to `outrig.Request(request_type, reply_type, doc=...)` or a bare
+        `(request_type, reply_type)`, it is a request child, answering requests on those
+        channels: `child.channels[name].request(body)` sends one. Either way you get a handle
+        to await.
+
+        A spawn past the session's `children-max`, or from an agent at `subagent-depth-max`,
+        raises `outrig.AgentLimitReached` at once rather than waiting; an unknown model raises
+        `ValueError`, naming the configured ones, and so does a prompt that with the rest of the
+        spawn comes to more than 1 MiB.
+        """
+        kernel = self._kernel
+        if type(name) is not str or not name or len(name) > 64:
+            raise ValueError(f"a child's name is a non-empty str of at most 64 characters, "
+                             f"not {name!r}")
+        if type(prompt) is not str:
+            raise TypeError(f"prompt is a str, not {_type_qualname(type(prompt))}")
+        if model is not None and type(model) is not str:
+            raise TypeError(f"model names a configured model, a str, not "
+                            f"{_type_qualname(type(model))}")
+        _refuse_closing()
+        manifest, copies, classes, _ = _inputs(inputs, "spawn")
+        channels, said, bound = {}, [], []
+        if requests is not None:
+            if type(requests) is not dict or not requests:
+                raise TypeError("requests is a non-empty dict of channel names to "
+                                "outrig.Request(request_type, reply_type)")
+            for channel, declared in requests.items():
+                if type(channel) is not str or not channel:
+                    raise ValueError(f"a request channel is named by a non-empty str, "
+                                     f"not {channel!r}")
+                if channel == "user":
+                    raise ValueError("'user' is the user channel's name, which no request channel "
+                                     "may take")
+                if type(declared) is tuple and len(declared) == 2:
+                    declared = _agents.Request(*declared)
+                if type(declared) is not _agents.Request:
+                    raise TypeError(f"channel {channel!r} is declared by outrig.Request or a "
+                                    f"(request_type, reply_type) tuple, not {declared!r}")
+                request, used = _agents.declared_with_classes(
+                    declared.request_type, f"channel {channel!r}'s requests cannot be")
+                reply, also = _agents.declared_with_classes(
+                    declared.reply_type, f"channel {channel!r}'s replies cannot be")
+                bound += used + also
+                channels[channel] = _Channel(declared.request_type, declared.reply_type, request,
+                                             reply, declared.doc)
+                said.append({"name": channel, "doc": declared.doc,
+                             "request_type": _schema._describe(declared.request_type),
+                             "reply_type": _schema._describe(declared.reply_type),
+                             "request": request.text(), "reply": reply.text()})
+        bound = list(dict.fromkeys(bound))
+        _agents.one_name_each(bound, copies)
+        _agents.one_name_each(bound + sorted(classes, key=_type_qualname))
+        kind = "request" if requests is not None else "work"
+        spawn = next(_ids)
+        line = {"t": "agent.spawn", "agent": kernel.agent, "id": spawn, "name": name,
+                "prompt": prompt, "model": model, "kind": kind, "manifest": manifest,
+                "channels": said}
+        _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
+        _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
+                            "inputs": copies, "classes": bound}
+        try:
+            # Inside the `try`, so a line that could not be written leaves no entry behind.
+            ask = kernel.ask(line)
+            answer = await asyncio.shield(ask)
+        except asyncio.CancelledError:
+            # Given up on: a child the host launches anyway is released, since nothing holds it.
+            ask.add_done_callback(functools.partial(_release_unheld, kernel))
+            raise
+        finally:
+            _spawning.pop(spawn, None)
+        error = answer.get("error")
+        if error is not None:
+            text = error.get("message", "the host refused the spawn")
+            raise {
+                "limit": _agents.AgentLimitReached,
+                "closed": _agents.SessionClosing,
+                "released": _agents.AgentReleased,
+                "model": ValueError,
+            }.get(error.get("kind"), RuntimeError)(text)
+        return Child(_children[answer["child"]])
+
+    async def release(self, children):
+        """Release each of `children`, the `Child` objects of agents you spawned, all of them or
+        none: a list naming one twice, or one you did not spawn or have released, is refused
+        whole with `ValueError`.
+
+        Releasing a child ends what it holds: every request still open on it ends
+        `outrig.AgentReleased`, its own children are released the same way, its tasks are
+        cancelled and its kernel removed. A child whose code never yields cannot be stopped, and
+        stays, `wedged`, until the session ends. Returns once each has ended or been found wedged.
+        """
+        ids = []
+        for child in children:
+            if type(child) is not Child:
+                raise TypeError(f"release() takes the Child objects runtime.spawn returned, "
+                                f"not {_type_qualname(type(child))}")
+            ids.append(child.id)
+        if not ids:
+            return
+        line = {"t": "agent.release", "agent": self._kernel.agent, "id": next(_ids),
+                "children": ids}
+        _refuse_long(line, "release", "release fewer children at once")
+        answer = await asyncio.shield(self._kernel.ask(line))
+        if answer.get("error") is not None:
+            raise ValueError(answer["error"])
 
     @property
     def channels(self):
@@ -3778,6 +3948,12 @@ class Runtime:
         # An iterator is not known to be empty until it is read. asyncio trips an assertion here.
         if not fs:
             raise ValueError("Set of Tasks/Futures is empty.")
+        # A handle is waited on through its view, and comes back as itself.
+        handles = {}
+        for f in [f for f in fs if type(f) is Handle]:
+            handles[f.future] = f
+            fs.discard(f)
+            fs.add(f.future)
         loop = asyncio.get_running_loop()
         # Woken for asyncio's reasons, as the waiter in `asyncio.tasks._wait` is: by the timer, or
         # by the one callback each future gets, which counts completions as they come. So `N`
@@ -3820,7 +3996,9 @@ class Runtime:
                         raise MessageAvailable(waiting)
                     if finished.done():
                         done = {f for f in fs if f.done()}
-                        return done, fs - done
+                        pending = fs - done
+                        return ({handles.get(f, f) for f in done},
+                                {handles.get(f, f) for f in pending})
                     await asyncio.wait({finished, arrived}, return_when=asyncio.FIRST_COMPLETED)
                 finally:
                     for _, endpoint in endpoints:
@@ -3835,25 +4013,755 @@ class Runtime:
         return f"<runtime: channels {', '.join(map(repr, self._channels))}>"
 
 
+class WorkRuntime(Runtime):
+    """A work child's runtime: `runtime`'s, and `complete`, how it answers the submission its
+    parent gave it. See `help(Runtime)` for the rest."""
+
+    async def complete(self, value):
+        """Complete the submission you were given with `value`, an instance of its result type --
+        bound in your namespace under its name -- or that instance's JSON form.
+
+        It returns once the value is accepted, and the submission is then done. One that does not
+        check raises what is wrong, each problem with its path, and counts one of the
+        submission's attempts: correct it and complete again. Past the last attempt the
+        submission ends rejected. A submission that has ended -- completed already, cancelled --
+        takes no answer, and this raises.
+        """
+        work = self._kernel.child.last
+        if work is None:
+            raise RuntimeError("no submission has been given to you yet, so there is nothing to "
+                               "complete")
+        await work.answer(value)
+
+
+# ---------------------------------------------------------------------------- child agents
+#
+# Agent code launches a child with `runtime.spawn`: a kernel of this interpreter, with a thread and
+# a loop of its own, which the host drives through rounds as it drives the primary. Its parent gives
+# it work -- a submission, to a work child, or a request on one of a request child's channels --
+# and each piece of work is a `_Work` both kernels hold: the sender's handle reads it, the child
+# answers it, and its lock decides how it ends, whichever reaches it first of an answer, a cancel,
+# the child's release, the session's close.
+#
+# What moves between the two is Python objects, never JSON: each crosses as a deep copy, so the two
+# agents share no state, and is checked against its declared type by whoever sends it. The host
+# hears of each step as a notice -- what its record of the session, and its rule for when a child
+# gets a round, are made of -- and never carries the objects.
+
+_ids = itertools.count(1)  # every id the interpreter gives: a request, an ask, a message
+_works = {}  # each request not yet ended, by id
+_works_lock = threading.Lock()
+# Each child agent's record, by its agent id, for as long as anything holds it: its parent's `Child`,
+# a request made of it, its kernel. The host says what each is doing for as long as its parent can
+# ask, its release included.
+_children = weakref.WeakValueDictionary()
+_spawning = {}  # what a spawn waiting on the host holds for its child, by the spawn's id
+_ENDED = ("accepted", "failed")
+# Names an input cannot take: the child's own runtime and what every kernel binds at boot.
+_RESERVED = frozenset({"runtime", "asyncio"})
+_agents = None  # `outrig._agents`, once the package is loaded
+
+
+def _notify(message):
+    """Tell the host one step of an agent's work with a child. Nothing here raises: the step has
+    happened, and a record that lacks it is the cost of a host that could not be told."""
+    try:
+        _write_line(_encode(message))
+    except BaseException as e:
+        try:
+            _diag(f"telling the host of {message.get('t')!r} failed: {e!r}")
+        except BaseException:
+            pass
+
+
+def _refuse_long(message, what, how):
+    """Raise `ValueError`, saying `how` to shorten it, if `message` -- a `what` agent code sends
+    the host -- would be a protocol line longer than `MESSAGE_MAX`, which bounds a channel message
+    too. The host drops a line past its own bound unread, and answers nothing to it."""
+    size = len(_encode(message))
+    if size > MESSAGE_MAX:
+        raise ValueError(f"this {what} is {size} bytes as sent, past the {MESSAGE_MAX} allowed; "
+                         f"{how}")
+
+
+def _loose_preview(value):
+    """A preview of `value`, which may not be data: what has no JSON form is named by its type."""
+    try:
+        text = json.dumps(value, default=lambda o: f"<{_type_qualname(type(o))}>")
+    except (TypeError, ValueError, RecursionError):
+        text = json.dumps(f"<{_type_qualname(type(value))}>")
+    return _agents.preview(json.loads(text))
+
+
+def _answered(declared, value):
+    """`(accepted, problems)`: `value`, an answer, as the value it is accepted as -- a copy of an
+    instance of the declared type, or what its JSON form decodes into -- or what is wrong with it,
+    each with its path."""
+    _, problems = declared._encoding(value)
+    if not problems:
+        return copy.deepcopy(value), ()
+    if not _holds_instances(value):
+        try:
+            return declared.decode(value), ()
+        except _schema.DecodeError as e:
+            return None, e.problems
+    return None, tuple(problems.found)
+
+
+def _holds_instances(value, depth=0):
+    """Whether `value` holds a dataclass instance anywhere: it is then an instance, not a JSON
+    form, and is checked as one."""
+    if depth > 100:
+        return False
+    if dataclasses.is_dataclass(type(value)):
+        return True
+    if type(value) is list:
+        return any(_holds_instances(item, depth + 1) for item in value)
+    if type(value) is dict:
+        return any(_holds_instances(item, depth + 1) for item in value.values())
+    return False
+
+
+def _copy_or_none(value):
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return None
+
+
+def _hosted_name(value):
+    """What `value` is, when a binding holds it on the host: for the message refusing it."""
+    kind = type(value)
+    if kind is HostedRoot or (_rpyc is not None and issubclass(kind, _rpyc.core.netref.BaseNetref)):
+        return (
+            "an object a binding holds on the host; a child reaches the session's bindings itself, "
+            "by name, so give it the name, or the data you read from the object"
+        )
+    return None
+
+
+def _inputs(inputs, where):
+    """`(manifest, copies, classes, encoded)` for `inputs`, the dict of names to values one agent
+    gives another: each checked to be data, previewed, copied for the child, and as JSON."""
+    if inputs is None:
+        return [], {}, set(), {}
+    if type(inputs) is not dict:
+        raise TypeError(f"{where} takes its inputs as a dict of names to values, not "
+                        f"{_type_qualname(type(inputs))}")
+    manifest, copies, classes, encodings = [], {}, set(), {}
+    for name, value in inputs.items():
+        if (
+            type(name) is not str
+            or not name.isidentifier()
+            or keyword.iskeyword(name)
+            or name.startswith("__")
+            or name in _RESERVED
+        ):
+            raise ValueError(f"{where}: input {name!r} cannot name a variable in the child")
+        encoded, shape, found = _agents.walk(value, name, _hosted_name)
+        manifest.append({"name": name, "type": shape, "preview": _agents.preview(encoded)})
+        copies[name] = copy.deepcopy(value)
+        classes |= found
+        encodings[name] = encoded
+    return manifest, copies, classes, encodings
+
+
+def _attempts(attempts):
+    if type(attempts) is not int:
+        raise TypeError(f"attempts is an int, not {_type_qualname(type(attempts))}")
+    if attempts < 1:
+        raise ValueError(f"attempts must be at least 1, not {attempts}")
+    return attempts
+
+
+def _refuse_closing():
+    if _closing is not None:
+        raise _agents.SessionClosing(f"the session is closing -- {_closing} -- so nothing was sent")
+
+
+def _release_unheld(kernel, ask):
+    """Release the child a spawn nobody waited for launched, if it launched one."""
+    if ask.cancelled():
+        return
+    child = ask.result().get("child")
+    if child is not None:
+        _notify({"t": "agent.release", "agent": kernel.agent, "id": next(_ids), "children": [child]})
+
+
+def _sending_kernel(what):
+    """The kernel of the code sending `what`: the one whose loop its handle settles on."""
+    kernel = _calling()
+    if kernel is None:
+        raise RuntimeError(f"{what} is sent from agent code, and this runs outside every execution")
+    return kernel
+
+
+@dataclasses.dataclass(frozen=True)
+class _Channel:
+    """One of a request child's channels, as its spawn declared it."""
+
+    request_type: object
+    reply_type: object
+    request: object  # the request type's Schema
+    reply: object  # the reply type's Schema
+    doc: object
+
+
+class _Child:
+    """What a child agent's parent and its kernel share: its queue of submissions, its limit on
+    requests, and the state the host last said it was in."""
+
+    def __init__(self, agent, name, kind, parent, channels, requests_max):
+        self.id = agent
+        self.name = name
+        self.kind = kind  # "work" or "request"
+        self.parent = parent  # the parent's kernel
+        self.channels = channels  # name -> _Channel, for a request child
+        self.requests_max = requests_max
+        self.lock = threading.Lock()
+        self.state = "idle"
+        self.unsettled = 0
+        self.queue = collections.deque()  # submissions not yet given to it
+        self.last = None  # the submission given to it last
+        self.kernel = None
+        self.released = False
+
+    def __str__(self):
+        return f"child {self.name!r} ({self.id})"
+
+    def take(self, what):
+        """Count one more request unsettled on it, or raise why it takes none."""
+        with self.lock:
+            if self.released:
+                raise _agents.AgentReleased(f"{self} was released, so it takes no {what}")
+            if self.unsettled >= self.requests_max:
+                raise _agents.AgentLimitReached(
+                    f"{self} already holds {self.requests_max} unsettled requests, its "
+                    f"requests-max, so nothing was sent; cancel one, or wait for an answer"
+                )
+            self.unsettled += 1
+
+    def settled(self, work):
+        with self.lock:
+            self.unsettled -= 1
+
+    def withdraw(self, work):
+        """Take `work`, not yet received, back out of the child's reach. Whether it was there:
+        one that is not was received already."""
+        if work.kind == "submission":
+            with self.lock:
+                try:
+                    self.queue.remove(work)
+                except ValueError:
+                    return False
+                return True
+        endpoint = None if self.kernel is None else self.kernel.channels.get(work.channel)
+        return type(endpoint) is RequestEndpoint and endpoint._withdraw(work)
+
+
+class _Work:
+    """One request an agent made of a child: a submission, or a request on one of its channels.
+
+    Both kernels hold it. Its state changes under its lock, so it ends once, with whatever reached
+    it first, and nothing after changes that.
+    """
+
+    def __init__(self, child, sender, kind, channel, body, declared, attempts_max):
+        self.id = next(_ids)
+        self.child = child
+        self.sender = sender  # the sending kernel, whose loop its handle settles on
+        self.kind = kind  # "submission" or "request"
+        self.channel = channel  # None for a submission
+        self.body = body  # what the child is given: the request, or the inputs and classes
+        self.declared = declared  # the answer's Schema
+        self.attempts_max = attempts_max
+        self.attempts = 0
+        self.lock = threading.Lock()
+        self.state = "queued" if kind == "submission" else "waiting"
+        self.reason = None
+        self.value = None
+        self.error = None
+        self.final = None
+        self.future = sender.loop.create_future()
+        self.progress = None  # a submission's progress, as its sender reads it
+
+    def __str__(self):
+        if self.channel is None:
+            return f"submission {self.id} to {self.child}"
+        return f"request {self.id} on {self.child}'s channel {self.channel!r}"
+
+    def status(self):
+        with self.lock:
+            if self.final is not None:
+                return self.final
+            return _agents.Status(self.state, None, self.child.state)
+
+    def end(self, reason, *, value=None, error=None, **said):
+        """End the request: accepted with `value` when `reason` is `None`, failed with `error` for
+        `reason` otherwise. Whether this ended it: one that had ended is left as it was. Any
+        thread."""
+        with self.lock:
+            if self.state in _ENDED:
+                return False
+            self.state = "accepted" if reason is None else "failed"
+            self.reason = reason
+            self.value, self.error = value, error
+            self.final = _agents.Status(self.state, reason, self.child.state)
+        with _works_lock:
+            _works.pop(self.id, None)
+        self.child.settled(self)
+        _notify({"t": "agent.ended", "agent": self.child.id, "request": self.id,
+                 "outcome": reason or "accepted", **said})
+        try:
+            self.sender.loop.call_soon_threadsafe(self._settle)
+        except RuntimeError:
+            pass  # the sender's loop has closed with its kernel: nothing waits on this
+        return True
+
+    def _settle(self):
+        if self.future.done():
+            return
+        if self.reason is None:
+            self.future.set_result(self.value)
+        else:
+            self.future.set_exception(self.error)
+            # Read here: how it failed is the handle's to report, and a handle nobody awaits is not
+            # a mistake in the code that dropped it.
+            self.future.exception()
+
+    def view(self):
+        """A future of the sender's loop that settles as the request ends, and whose cancelling
+        cancels nothing else."""
+        view = self.sender.loop.create_future()
+
+        def settle(future):
+            if view.done():
+                return
+            error = future.exception()
+            if error is None:
+                view.set_result(future.result())
+            else:
+                view.set_exception(error)
+                view.exception()
+
+        if self.future.done():
+            settle(self.future)
+        else:
+            self.future.add_done_callback(settle)
+        return view
+
+    def refused(self):
+        """What an answer to this request, which has ended, raises; the host is told."""
+        reason = self.reason
+        _notify({"t": "agent.refused", "agent": self.child.id, "request": self.id,
+                 "ended": reason or "accepted"})
+        if reason == "cancelled":
+            return _agents.RequestCancelled(f"{self} was cancelled by its sender; it takes no answer")
+        return _agents.RequestSettled(
+            f"{self} has already ended ({reason or 'answered'}), so it takes no further answer",
+            reason or "accepted",
+        )
+
+    async def answer(self, value):
+        """Answer the request with `value`: what `runtime.complete` and `delivery.reply` do."""
+        with self.lock:
+            ended = self.state in _ENDED
+            attempt = self.attempts + 1
+        if ended:
+            raise self.refused()
+        accepted, problems = _answered(self.declared, value)
+        said = None
+        if _observing:
+            said = (_agents.preview(self.declared.encode(accepted)) if not problems
+                    else _loose_preview(value))
+        _notify({"t": "agent.answered", "agent": self.child.id, "request": self.id,
+                 "attempt": attempt, "problems": [str(p) for p in problems], "value": said})
+        with self.lock:
+            ended = self.state in _ENDED
+            if not ended:
+                self.attempts = attempt
+        if ended:
+            raise self.refused()
+        if problems:
+            listing = "\n".join(f"  {problem}" for problem in problems)
+            if attempt >= self.attempts_max:
+                text = (f"the answer to {self} was not accepted, and that was attempt {attempt} of "
+                        f"{self.attempts_max}: it has ended rejected, and takes no answer now:\n"
+                        f"{listing}")
+                rejected = _agents.CompletionRejected(text, _copy_or_none(value), problems)
+                if not self.end("rejected", error=rejected):
+                    raise self.refused()
+                raise _agents.CompletionRejected(text, value, problems)
+            raise _schema.DecodeError(
+                f"the answer to {self} was not accepted (attempt {attempt} of "
+                f"{self.attempts_max}); correct what is listed and answer again:\n{listing}",
+                problems,
+            )
+        if not self.end(None, value=accepted):
+            raise self.refused()
+
+    async def fail(self, message):
+        if type(message) is not str:
+            raise TypeError(f"fail() takes a str saying why, not {_type_qualname(type(message))}")
+        if not self.end("failed", error=_agents.AgentRequestFailed(message),
+                        message=_agents.cut(message)):
+            raise self.refused()
+
+    def cancel(self):
+        with self.lock:
+            if self.state in _ENDED:
+                return False
+        # Out of the child's reach first, so it never takes what was cancelled before it did.
+        received = not self.child.withdraw(self)
+        return self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"),
+                        received=received)
+
+
+class Handle:
+    """One submission or request an agent made of a child: what `child.submit(...)` and
+    `child.channels[name].request(...)` return, at once, the work already sent.
+
+    `await handle` gives the accepted answer, an instance of the declared type, or raises how the
+    request ended -- an `outrig.AgentError` -- and awaiting again gives the same. Cancelling the
+    code awaiting it cancels that wait and never the request; `handle.cancel()` cancels the
+    request: one the child has not received never reaches it, and one it has ends so that its
+    answer raises `outrig.RequestCancelled`. `done()` and `result()` answer without waiting, as a
+    future's do, and `status` says what it is doing (see `help(outrig.Status)`). `future` is a
+    view `asyncio.wait` takes; `runtime.wait` and `asyncio.gather` take the handle itself. A
+    submission's `progress` is an endpoint of what the child reports while it works on it.
+    """
+
+    __slots__ = ("_work", "_future")
+
+    def __init__(self, work):
+        self._work = work
+        self._future = None
+
+    @property
+    def id(self):
+        """The request's id: what the child's delivery of it, and the session's events, name."""
+        return self._work.id
+
+    def __await__(self):
+        return self._work.view().__await__()
+
+    @property
+    def future(self):
+        """A future that settles as the request ends; cancelling it cancels nothing else."""
+        future = self._future
+        if future is None or future.cancelled():
+            future = self._future = self._work.view()
+        return future
+
+    def done(self):
+        """Whether the request has ended."""
+        return self._work.state in _ENDED
+
+    def result(self):
+        """The accepted answer, or the exception the request ended with, raised; raises
+        `asyncio.InvalidStateError` while it has not ended."""
+        work = self._work
+        with work.lock:
+            state, value, error = work.state, work.value, work.error
+        if state not in _ENDED:
+            raise asyncio.InvalidStateError(f"{work} has not ended")
+        if error is not None:
+            raise error
+        return value
+
+    def cancel(self):
+        """Cancel the request; whether this ended it. Not the child, which takes more work."""
+        return self._work.cancel()
+
+    @property
+    def status(self):
+        """What the request is doing, and its child: see `help(outrig.Status)`."""
+        return self._work.status()
+
+    @property
+    def progress(self):
+        """An endpoint of what the child reports on its `progress` channel while it works on this
+        submission: `await receive()` takes the next, as a `Delivery`. Only a submission has one."""
+        if self._work.progress is None:
+            raise AttributeError("a request on a channel has no progress; a submission's handle does")
+        return self._work.progress
+
+    def __repr__(self):
+        return f"<handle of {self._work}: {self._work.status()}>"
+
+
+class ChildChannel:
+    """A parent's end of one of a request child's channels: `request(body)` sends a request and
+    returns its handle, and `pending()` counts those the child has not taken yet."""
+
+    __slots__ = ("_child", "_name")
+
+    def __init__(self, child, name):
+        self._child = child
+        self._name = name
+
+    @property
+    def request_type(self):
+        """What a request on this channel carries."""
+        return self._child.channels[self._name].request_type
+
+    @property
+    def reply_type(self):
+        """What the child's reply to one is."""
+        return self._child.channels[self._name].reply_type
+
+    def request(self, body, *, attempts=3):
+        """Send `body`, of the channel's request type, as a request, and return its handle at once.
+
+        The child receives a copy. Its reply is checked against the reply type, and one that fails
+        counts one of `attempts`: past them the request ends `outrig.CompletionRejected`. A child
+        holding its `requests-max` unsettled requests takes none: this raises
+        `outrig.AgentLimitReached`, sending nothing.
+        """
+        child, channel = self._child, self._child.channels[self._name]
+        _refuse_closing()
+        attempts = _attempts(attempts)
+        encoded, problems = channel.request._encoding(body)
+        if problems:
+            raise TypeError(f"channel {self._name!r} takes {_describe_all((channel.request_type,))}, "
+                            f"and this request is not one:\n{problems.listing()}")
+        kernel = _sending_kernel("a request")
+        body = copy.deepcopy(body)
+        child.take("request")
+        work = _Work(child, kernel, "request", self._name, body, channel.reply, attempts)
+        with _works_lock:
+            _works[work.id] = work
+        _notify({"t": "agent.request", "agent": kernel.agent, "request": work.id, "child": child.id,
+                 "channel": self._name, "attempts": attempts,
+                 "body": _agents.preview(encoded) if _observing else None})
+        endpoint = None if child.kernel is None else child.kernel.channels.get(self._name)
+        if type(endpoint) is not RequestEndpoint or not endpoint._put(work):
+            work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+        return Handle(work)
+
+    def pending(self):
+        """How many requests on this channel the child has not taken yet."""
+        endpoint = None if self._child.kernel is None else self._child.kernel.channels.get(self._name)
+        return endpoint.pending() if type(endpoint) is RequestEndpoint else 0
+
+    def __repr__(self):
+        return f"<{self._child}'s channel {self._name!r}: {self.pending()} pending>"
+
+
+class Child:
+    """A child agent `runtime.spawn` launched, from its parent's side.
+
+    `id` names it in the session -- its events' subject is `agent/<id>` -- and `name` is what the
+    spawn called it. A work child (`kind` "work") takes submissions: `submit(inputs, result=T)`
+    gives it one and returns its handle. A request child ("request") answers requests on its
+    channels: `channels[name].request(body)` sends one and returns its handle. `status` is what the
+    host last said of it: `running`, `idle`, `wedged` or `released`. Release it with
+    `await runtime.release([child])`.
+    """
+
+    __slots__ = ("_child", "channels")
+
+    def __init__(self, child):
+        self._child = child
+        self.channels = types.MappingProxyType(
+            {name: ChildChannel(child, name) for name in child.channels}
+        )
+
+    @property
+    def id(self):
+        return self._child.id
+
+    @property
+    def name(self):
+        return self._child.name
+
+    @property
+    def kind(self):
+        return self._child.kind
+
+    @property
+    def status(self):
+        return self._child.state
+
+    def submit(self, inputs, *, result, attempts=3):
+        """Give this work child `inputs`, a dict of names to values, to work on, its answer a
+        `result`; returns the submission's handle at once.
+
+        Each input is bound in the child as a variable of its name, a copy: it must be data --
+        `None`, a str, int, bool or float, a list or str-keyed dict of them, or a dataclass
+        instance -- so an object a binding holds is refused, and the child reaches the session's
+        bindings itself. `result` is declared with `outrig.schema`, and it and the dataclasses it
+        uses are bound in the child under their names. The child completes with
+        `await runtime.complete(value)`; an answer that fails its check counts one of `attempts`,
+        and past them the submission ends `outrig.CompletionRejected`. The child works on one
+        submission at a time, so a later one waits, `queued`. One whose inputs and result type
+        take more than 1 MiB to describe raises `ValueError`, sending nothing.
+        """
+        child = self._child
+        if child.kind != "work":
+            raise TypeError(f"{child} answers requests on its channels and takes no submissions; "
+                            f"send one with child.channels[name].request(body)")
+        _refuse_closing()
+        attempts = _attempts(attempts)
+        manifest, copies, classes, encoded = _inputs(inputs, "submit")
+        declared, used = _agents.declared_with_classes(result, "the result of a submission cannot be")
+        _agents.one_name_each(used, copies)
+        _agents.one_name_each(list(used) + sorted(classes, key=_type_qualname))
+        kernel = _sending_kernel("a submission")
+        work = _Work(child, kernel, "submission", None, {"inputs": copies, "classes": used},
+                     declared, attempts)
+        notice = {"t": "agent.request", "agent": kernel.agent, "request": work.id,
+                  "child": child.id, "channel": None, "attempts": attempts, "manifest": manifest,
+                  "result": {"type": _schema._describe(result), "schema": declared.text()},
+                  "body": _agents.preview(encoded) if _observing else None}
+        _refuse_long(notice, "submission", "submit fewer inputs, or a smaller result type")
+        child.take("submission")
+        work.progress = _Progress(kernel.agent, child.id, work.id)
+        with _works_lock:
+            _works[work.id] = work
+        _notify(notice)
+        with child.lock:
+            if child.released:
+                queued = False
+            else:
+                child.queue.append(work)
+                queued = True
+        if not queued:
+            work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+        return Handle(work)
+
+    def __repr__(self):
+        return f"<{self._child}, a {self._child.kind} child, {self._child.state}>"
+
+
+class _Progress(Endpoint):
+    """A submission's progress, from its sender's side: what the child sends on its `progress`
+    channel while it works on the submission, as `Delivery` envelopes. Reading it never ends the
+    submission."""
+
+    def __init__(self, agent, child, request):
+        super().__init__(agent, "progress", receives=str, sends=())
+        self._child = child
+        self._request = request
+
+    def _took(self, message):
+        # Recorded as the child sent it, on its request; when its sender reads it is its own.
+        return None
+
+
+class _ProgressOut(Endpoint):
+    """A work child's `progress` channel: text sent on it goes to the handle of the submission it
+    is working on, which its parent reads as `handle.progress`. It ends nothing, and nothing comes
+    back on it."""
+
+    def __init__(self, agent, child):
+        super().__init__(agent, "progress", receives=(), sends=str)
+        self._child = child
+
+    async def send(self, message):
+        """Report `message`, a str, on the submission you are working on."""
+        if type(message) is not str:
+            raise TypeError(f"channel 'progress' sends str, not {_type_name(type(message))}")
+        work = self._child.last
+        if work is None or work.state in _ENDED:
+            raise RuntimeError("no submission is open, so progress has nowhere to go")
+        number = next(_ids)
+        _notify({"t": "agent.progress", "agent": self._agent, "request": work.id,
+                 "body": _agents.cut(message) if _observing else None})
+        try:
+            work.progress._deliver(message, self._agent, number)
+        except _Refused as e:
+            raise RuntimeError(f"progress was not delivered: {e}") from None
+
+
+class RequestEndpoint(Endpoint):
+    """A request child's end of one of its channels: `await receive()` takes the next request, as
+    a `RequestDelivery` to answer with `reply(value)` or end with `fail(message)`, and `pending()`
+    counts those waiting. Nothing is sent on it -- a reply names its request -- so `send` raises.
+    `request_type` is what a request carries, and `reply_type` what a reply must be."""
+
+    def __init__(self, agent, name, channel):
+        super().__init__(agent, name, receives=channel.request_type, sends=())
+        self._channel = channel
+
+    @property
+    def request_type(self):
+        return self._channel.request_type
+
+    @property
+    def reply_type(self):
+        return self._channel.reply_type
+
+    async def receive(self):
+        """Take the next request on this channel, waiting until there is one, as a
+        `RequestDelivery`; see `help(type(delivery))` for answering it."""
+        work = await self._when(self._receivers, self._take)
+        with work.lock:
+            if work.state == "waiting":
+                work.state = "received"
+        _notify({"t": "agent.received", "agent": self._agent, "request": work.id})
+        return RequestDelivery(work.id, work.body, work.sender.agent,
+                               datetime.datetime.now(datetime.timezone.utc), work)
+
+    async def send(self, message):
+        raise TypeError(f"channel {self._name!r} carries requests to you, and nothing back: answer "
+                        f"a request with `await delivery.reply(value)` on the delivery receive() "
+                        f"gave you")
+
+    def _put(self, work):
+        """Queue `work` for a receive, from its sender's thread. Whether it was: not once this
+        child's kernel has ended."""
+        with self._lock:
+            if _kernels.get(self._agent) is None or _kernels[self._agent].ended:
+                return False
+            self._queue.append(work)
+            self._delivered += 1
+            wake = iter(self._receivers.copy())
+        _wake_all(wake, self._name)
+        return True
+
+    def _withdraw(self, work):
+        with self._lock:
+            try:
+                self._queue.remove(work)
+            except ValueError:
+                return False
+            return True
+
+
 class Kernel:
     """One agent's execution environment: its namespace, its loop, its slot, its backlog."""
 
-    def __init__(self, agent):
+    def __init__(self, agent, child=None):
         self.agent = agent
+        # A child's record, which its parent shares; `None` for an agent that is no child.
+        self.child = child
+        # Set once the host has ended this kernel: it takes no more work, and is going.
+        self.ended = False
+        # What this kernel's code waits on the host to answer, by the id it asked under.
+        self.asks = {}
         self.loop = _Loop()
         self.loop.set_exception_handler(_attributed_exception)
         self.module = types.ModuleType(_module_name(agent))
         self.globals = self.module.__dict__
         self.globals["__builtins__"] = builtins
         self.globals["asyncio"] = asyncio
-        # The user's channel carries text both ways. Every agent has one, and the host is at the
-        # other end of it.
-        self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
+        if child is None:
+            # The user's channel carries text both ways, and the host is at the other end of it.
+            # A child has none: what it is given comes from its parent.
+            self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
+        elif child.kind == "request":
+            self.channels = {
+                name: RequestEndpoint(agent, name, channel) for name, channel in child.channels.items()
+            }
+        else:
+            self.channels = {"progress": _ProgressOut(agent, child)}
         self.history = History()
         # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
         # global comes to hold.
-        self.runtime = self.globals["runtime"] = Runtime(
-            self.channels, self.held, self.history, Context(agent, self.history)
+        runtime = WorkRuntime if child is not None and child.kind == "work" else Runtime
+        self.runtime = self.globals["runtime"] = runtime(
+            self.channels, self.held, self.history, Context(agent, self.history), self
         )
         sys.modules[self.module.__name__] = self.module
         # Names bound at boot are infrastructure, not the model's work. Hidden by identity, so a
@@ -3918,6 +4826,9 @@ class Kernel:
         """This kernel's pool of connections to `binding`, made anew once the last has closed."""
         if _Hosted is None:
             raise RuntimeError(_rpyc_missing)
+        if self.ended:
+            raise RuntimeError(f"agent {self.agent!r} was released, and its connections to the "
+                               f"session's bindings closed with it")
         if not isinstance(binding, str) or not binding:
             raise TypeError("a binding is named by a non-empty str")
         with self._hosted_lock:
@@ -3966,7 +4877,8 @@ class Kernel:
         return _Hosted(channel, agent=agent, binding=binding, number=number, pool=pool)
 
     def serve(self):
-        """Run this kernel's loop on the calling thread for the life of the process."""
+        """Run this kernel's loop on the calling thread for the life of the process, or until the
+        host ends it."""
         asyncio.set_event_loop(self.loop)
         while not self.loop.is_closed():
             try:
@@ -3982,7 +4894,75 @@ class Kernel:
                         _diag(f"agent {self.agent!r}: {type(e).__name__} escaped its event loop")
                 except MemoryError:
                     pass
+            if self.ended:
+                self._gone()
+                return
         _diag(f"agent {self.agent!r}: its event loop was closed")
+
+    def ask(self, line):
+        """Send `line`, which the host answers under its `id`, and return the future of this
+        kernel's loop the answer settles. Called on that loop."""
+        future = self.loop.create_future()
+        self.asks[line["id"]] = future
+        try:
+            _write_line(_encode(line))
+        except BaseException:
+            self.asks.pop(line["id"], None)
+            raise
+        return future
+
+    def end(self):
+        """End this child's kernel, on the reader thread: every request it holds ends
+        `AgentReleased`, its connections to the bindings close, and its loop cancels every task
+        and stops once they finish, or after a second, after which its thread says so and is gone.
+        A loop that never turns -- code that never yields -- never stops, and its thread runs on.
+        """
+        if self.ended:
+            return
+        self.ended = True
+        child = self.child
+        if child is not None:
+            with child.lock:
+                child.released = True
+            with _works_lock:
+                held = [work for work in _works.values() if work.child is child]
+            for work in held:
+                work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+        self.close_hosted(reason="its agent was released")
+        try:
+            self.loop.call_soon_threadsafe(self._stop)
+        except RuntimeError:
+            pass
+
+    def _stop(self):
+        """Cancel every task on this loop, and stop it once they have finished, or after a
+        second."""
+        tasks = [task for task in asyncio.all_tasks(self.loop) if not task.done()]
+        if not tasks:
+            self.loop.stop()
+            return
+        left = len(tasks)
+
+        def finished(_):
+            nonlocal left
+            left -= 1
+            if left == 0:
+                self.loop.stop()
+
+        for task in tasks:
+            task.cancel()
+            task.add_done_callback(finished)
+        self.loop.call_later(1.0, self.loop.stop)
+
+    def _gone(self):
+        """This ended kernel's loop has stopped: close it, forget the kernel, and say so."""
+        with contextlib.suppress(Exception):
+            self.loop.close()
+        _kernels.pop(self.agent, None)
+        sys.modules.pop(self.module.__name__, None)
+        for key in [key for key in list(_rpc_channels) if key[0] == self.agent]:
+            _rpc_channels.pop(key, None)
+        _notify({"t": "ended", "agent": self.agent})
 
     def _interrupted_task(self, exc):
         """Report `exc` if it is an interrupt that ended a task rather than an execution's body.
@@ -4575,7 +5555,8 @@ def _bindings(message):
 def _close(message):
     """The session has closed to new work. A boundary call is refused here from now on, and each
     one still waiting for a free connection, so never sent, raises the closing error now; what was
-    sent is the binding's to finish."""
+    sent is the binding's to finish. Every request made of a child and not yet answered ends with
+    the closing error, and no request or submission is sent from now on."""
     global _closing
     _closing = text = message["reason"]
     for kernel in list(_kernels.values()):
@@ -4588,6 +5569,11 @@ def _close(message):
                         wait.exc = _closed(text)
                 pool.cond.notify_all()
             _say(said)
+    with _works_lock:
+        open_works = list(_works.values())
+    for work in open_works:
+        work.end("closed", error=_agents.SessionClosing(
+            f"the session closed before {work} was answered: {text}"))
 
 
 def _unbind(message):
@@ -4599,13 +5585,16 @@ def _unbind(message):
 
 # ---------------------------------------------------------------------------- routing
 
-def _open(agent, main):
+def _open(agent, main, child=None):
     """Build `agent`'s kernel, which says it is ready. Every kernel is built here, on the reader
     thread, and none exists until the host asks for it.
 
     With `main`, the main thread serves it: the only thread Python runs a signal handler on, so the
     one kernel a signal can interrupt, which the host gives its primary agent. Every other kernel
     is served on a thread of its own.
+
+    `child`, for a child agent's kernel, names the spawn waiting for it -- whose parent's inputs
+    are bound in its namespace, and whose classes under their names -- and its `requests_max`.
     """
     global _primary
     if not _valid_agent(agent):
@@ -4614,7 +5603,21 @@ def _open(agent, main):
         raise ValueError(f"agent {agent!r} is already open")
     if main and _primary is not None:
         raise ValueError(f"agent {_primary.agent!r} already has the main thread")
-    kernel = Kernel(agent)
+    record = spec = None
+    if child is not None:
+        spec = _spawning.get(child.get("spawn")) if isinstance(child, dict) else None
+        requests_max = child.get("requests_max") if isinstance(child, dict) else None
+        if main or spec is None or type(requests_max) is not int or requests_max < 1:
+            raise ValueError(f"no spawn is waiting for agent {agent!r} as {child!r} names it")
+        record = _Child(agent, spec["name"], spec["kind"], spec["parent"], spec["channels"],
+                        requests_max)
+    kernel = Kernel(agent, child=record)
+    if record is not None:
+        record.kernel = kernel
+        for name, value in spec["inputs"].items():
+            kernel.globals[name] = value
+        for cls in spec["classes"]:
+            kernel.globals[cls.__name__] = cls
     if main:
         kernel.thread = threading.main_thread()
     else:
@@ -4626,6 +5629,8 @@ def _open(agent, main):
             kernel.loop.close()
             raise
     _kernels[agent] = kernel
+    if record is not None:
+        _children[agent] = record
     if main:
         _primary = kernel
         _onto_main.put(kernel)
@@ -4725,6 +5730,71 @@ def _tasks(kernel, request_id, _message):
     kernel.loop.call_soon_threadsafe(kernel.tasks, request_id)
 
 
+def _answer_ask(kernel, ask_id, message):
+    """The host's answer to what `kernel`'s code asked under `ask_id`, handed to its loop."""
+    future = kernel.asks.pop(ask_id, None)
+    if future is not None:
+        kernel.loop.call_soon_threadsafe(_resolve, future, message)
+
+
+def _resolve(future, message):
+    if not future.done():
+        future.set_result(message)
+
+
+def _assign(kernel, assign_id, _message):
+    """Give the work child the next submission waiting for it, between its rounds: its inputs
+    bound under their names, and its result's classes under theirs. Answered with the
+    submission's id, or none when none is waiting."""
+    child, work = kernel.child, None
+    if child is not None:
+        with child.lock:
+            while child.queue and work is None:
+                candidate = child.queue.popleft()
+                with candidate.lock:
+                    if candidate.state == "queued":
+                        candidate.state = "running"
+                        work = candidate
+            if work is not None:
+                child.last = work
+    if work is not None:
+        for name, value in work.body["inputs"].items():
+            kernel.globals[name] = value
+        for cls in work.body["classes"]:
+            kernel.globals[cls.__name__] = cls
+        _notify({"t": "agent.received", "agent": kernel.agent, "request": work.id})
+    _notify({"t": "agent.assigned", "agent": kernel.agent, "id": assign_id,
+             "request": None if work is None else work.id})
+
+
+# What a request the host ends ends with: a work child's rounds ended without completing it, the
+# token budget was spent first, or the child's model failed for good.
+_HOST_ENDS = {
+    "rejected": "CompletionRejected",
+    "budget": "BudgetExhausted",
+    "failed": "AgentRequestFailed",
+}
+
+
+def _settle_work(kernel, work_id, message):
+    """End request `work_id` as the host decided."""
+    with _works_lock:
+        work = _works.get(work_id)
+    outcome = message.get("outcome")
+    if work is None or outcome not in _HOST_ENDS:
+        return
+    text = message.get("message") or f"{work} ended {outcome}"
+    work.end(outcome, error=getattr(_agents, _HOST_ENDS[outcome])(text), message=text)
+
+
+def _child_state(kernel, _, message):
+    """What the host now says a child of `kernel`'s is doing."""
+    child = _children.get(message.get("child"))
+    state = message.get("state")
+    if child is not None and state in ("running", "idle", "wedged", "released"):
+        child.state = state
+
+
 def _observe():
     """Say from now on when any agent's code takes a message from one of its channels.
 
@@ -4809,6 +5879,12 @@ _ROUTES = {
     "interrupt": lambda kernel, request_id, message: kernel.interrupt(
         request_id, message.get("runaway") is True
     ),
+    "spawned": _answer_ask,
+    "released": _answer_ask,
+    "assign": _assign,
+    "settle": _settle_work,
+    "child": _child_state,
+    "end": lambda kernel, _, __: kernel.end(),
 }
 
 
@@ -4820,7 +5896,7 @@ def _route(line):
     kind, agent = message.get("t"), message.get("agent")
     if kind == "open":
         try:
-            _open(agent, message.get("main") is True)
+            _open(agent, message.get("main") is True, message.get("child"))
         except MemoryError:
             # `_with_room` tries once more, and answers nothing it might yet open.
             raise

@@ -129,6 +129,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each session the program leaves open, `outrig` shuts down and reports on stderr under a line
   naming it, and exits once each has stopped: with the program's status, or 3 when one is not
   proven stopped.
+- **Child agents in `run-new`.** The agent's Python can launch child agents with
+  `runtime.spawn`, give them work, and await their typed results (see `outrig`'s changelog). Four
+  keys bound them, at the top level or under `[agents.<name>]`: `children-max`,
+  `model-concurrency-max`, `requests-max`, and `token-budget`, which caps the tokens every agent of
+  the session spends, the main agent's included, and is unset by default. A value outside a key's
+  range fails the config's load, naming the key and the range. `run` ignores them, with a line at
+  startup for each one set. The REPL shows only the main agent's submissions; a child's code is in
+  the event log, under the child's own subject. The page `scripts/render-session.py` renders keeps
+  the main agent's model, max tokens and instructions as a child starts, and lists each agent's
+  instructions under its subject.
 
 ### Changed
 

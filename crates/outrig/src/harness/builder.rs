@@ -324,6 +324,16 @@ impl SessionBuilder {
         ))
     }
 
+    /// What the session's child agents are made from.
+    fn child_setup(&self, workspace: Option<std::path::PathBuf>) -> super::session::ChildSetup {
+        super::session::ChildSetup {
+            config: Arc::new(self.config.clone()),
+            secrets: Arc::clone(&self.secrets),
+            agent: self.agent.clone(),
+            workspace,
+        }
+    }
+
     fn report(&mut self, progress: Progress) {
         if let Some(report) = &mut self.progress {
             report(progress);
@@ -392,7 +402,16 @@ impl SessionBuilder {
             .filter(|workspace| !workspace.as_os_str().is_empty())
             .map(Path::to_path_buf);
         let name = primary.name().to_string();
-        let session = Session::new(id, interpreter, Some(outrig), name, lifecycle, bindings);
+        let setup = self.child_setup(workspace.clone());
+        let session = Session::new(
+            id,
+            interpreter,
+            Some(outrig),
+            name,
+            lifecycle,
+            bindings,
+            setup,
+        );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
         assemble(session, resolved.as_ref(), workspace.as_deref()).await
@@ -539,8 +558,17 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         self.report(Progress::Finished(Step::Python));
-        let session = Session::new(id, interpreter, None, "(host)".into(), lifecycle, bindings)
-            .failing(self.fail_stop.take());
+        let setup = self.child_setup(None);
+        let session = Session::new(
+            id,
+            interpreter,
+            None,
+            "(host)".into(),
+            lifecycle,
+            bindings,
+            setup,
+        )
+        .failing(self.fail_stop.take());
         assemble(session, resolved.as_ref(), None).await
     }
 }

@@ -38,8 +38,8 @@ pub(crate) enum LlmResolveError {
     #[error("no model selected; pass --model <name> or set default-model in config")]
     MissingModel,
 
-    #[error("model {name:?} is not defined under [models.<name>]")]
-    UnknownModel { name: String },
+    #[error("model {name:?} is not defined under [models.<name>]. Configured models: {known}")]
+    UnknownModel { name: String, known: String },
 
     #[error("provider {name:?} is not defined under [providers.<name>]")]
     UnknownProvider { name: String },
@@ -196,6 +196,10 @@ pub(crate) struct ResolvedCandidate {
 /// serialized.
 #[derive(Debug)]
 pub(crate) struct ResolvedAgent {
+    /// The `[models.<name>]` row it was resolved from, as named: an alias
+    /// stays an alias. What a child it launches runs on unless the child
+    /// names another.
+    pub(crate) model: String,
     /// The rows the agent may run against, in preference order, and never
     /// empty. One for a model named directly or an alias of one model; an
     /// alias of several keeps each this build can reach.
@@ -339,9 +343,7 @@ pub(crate) fn resolve_agent(
     let root = cfg
         .models
         .get(model_name)
-        .ok_or_else(|| LlmResolveError::UnknownModel {
-            name: model_name.to_string(),
-        })?;
+        .ok_or_else(|| unknown_model(cfg, model_name))?;
 
     // A model names either a provider that serves it or other models it stands
     // for. Read from the raw field rather than through `Model::source()`,
@@ -385,6 +387,7 @@ pub(crate) fn resolve_agent(
     }
 
     Ok(ResolvedAgent {
+        model: model_name.to_string(),
         candidates,
         preamble: agent.preamble.clone(),
         temperature: agent.temperature,
@@ -397,6 +400,23 @@ pub(crate) fn resolve_agent(
             .or(cfg.tool_result_max)
             .unwrap_or(DEFAULT_TOOL_RESULT_MAX_BYTES) as usize,
     })
+}
+
+/// That `cfg` defines no model `name`, naming every one it does.
+fn unknown_model(cfg: &Config, name: &str) -> LlmResolveError {
+    let known = if cfg.models.is_empty() {
+        "(none)".to_string()
+    } else {
+        cfg.models
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    LlmResolveError::UnknownModel {
+        name: name.to_string(),
+        known,
+    }
 }
 
 /// The `[agents.<name>]` block `cfg` defines as `name`, or an error naming
@@ -433,9 +453,7 @@ fn resolve_candidate(
     let model = cfg
         .models
         .get(model_name)
-        .ok_or_else(|| LlmResolveError::UnknownModel {
-            name: model_name.to_string(),
-        })?;
+        .ok_or_else(|| unknown_model(cfg, model_name))?;
 
     let Some(provider_name) = model.provider.as_deref() else {
         // A row that is neither shape. Say what is wrong rather than blaming a

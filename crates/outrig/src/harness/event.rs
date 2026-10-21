@@ -59,7 +59,8 @@ impl Event {
 }
 
 /// The agent an event belongs to, as the interpreter's protocol names it:
-/// `agent/primary` for the one agent a session runs.
+/// `agent/primary` for the primary agent, and `agent/<id>` for a child it
+/// launched -- `agent/c1`, say.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subject(Cow<'static, str>);
 
@@ -135,6 +136,12 @@ id_type!(
     /// about the request carries it.
     RequestId
 );
+id_type!(
+    /// One request an agent made of a child it launched -- a submission, or a
+    /// request on one of the child's request channels -- for the life of the
+    /// session's interpreter. Every event about the request carries it.
+    AgentRequestId
+);
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -182,6 +189,7 @@ pub enum Payload {
         executions: Vec<super::ExecutionOutcome>,
         hosted: Vec<super::HostedCall>,
         bindings: Option<super::BindingStop>,
+        requests: Vec<super::RequestOutcome>,
         verdict: super::Verdict,
     },
     #[non_exhaustive]
@@ -272,8 +280,103 @@ pub enum Payload {
         bindings: Vec<String>,
         cause: String,
     },
+    /// A child agent was launched, by `parent`; the event's subject is the
+    /// child's.
+    #[non_exhaustive]
+    AgentSpawned {
+        name: String,
+        parent: String,
+        kind: ChildKind,
+        model: String,
+        depth: u32,
+        inputs: Vec<InputBrief>,
+        channels: Vec<ChannelBrief>,
+    },
+    /// A request was sent to the event's subject, a child: a submission, when
+    /// `channel` is `None`, or a request on that channel. `body` is a bounded
+    /// preview of what was sent -- a submission's inputs, by name.
+    #[non_exhaustive]
+    AgentRequestSent {
+        request: AgentRequestId,
+        channel: Option<String>,
+        sender: String,
+        body: String,
+        attempts_max: u32,
+    },
+    /// The child took the request: its code received it from its channel, or
+    /// it was given the submission at the start of `round`.
+    #[non_exhaustive]
+    AgentRequestReceived {
+        request: AgentRequestId,
+        round: Option<u32>,
+    },
+    /// The child answered the request, with `value` as a bounded preview. An
+    /// answer that failed its check is followed by `agent.request.invalid`.
+    #[non_exhaustive]
+    AgentRequestReplied {
+        request: AgentRequestId,
+        attempt: u32,
+        value: String,
+    },
+    #[non_exhaustive]
+    AgentRequestInvalid {
+        request: AgentRequestId,
+        attempt: u32,
+        problems: Vec<String>,
+    },
+    /// A work child reported progress on the submission it works on, which
+    /// its sender reads from the handle. Settles nothing.
+    #[non_exhaustive]
+    AgentRequestProgress {
+        request: AgentRequestId,
+        body: String,
+    },
+    /// The child failed the request on purpose, saying why.
+    #[non_exhaustive]
+    AgentRequestFailed {
+        request: AgentRequestId,
+        message: String,
+    },
+    /// Its sender cancelled the request, before or after the child received
+    /// it.
+    #[non_exhaustive]
+    AgentRequestCancelled {
+        request: AgentRequestId,
+        received: bool,
+    },
+    /// How the request ended, how many answers it took, and the child's
+    /// rounds it spanned.
+    #[non_exhaustive]
+    AgentRequestSettled {
+        request: AgentRequestId,
+        outcome: RequestEnd,
+        attempts: u32,
+        rounds: Vec<u32>,
+    },
+    /// An answer to a request that had already ended, refused.
+    #[non_exhaustive]
+    AgentRequestRefused {
+        request: AgentRequestId,
+        ended: RequestEnd,
+    },
+    /// The event's subject released `released`; that ended `ended`, every
+    /// child in their subtrees, and settled `requests`.
+    #[non_exhaustive]
+    AgentReleased {
+        released: Vec<String>,
+        ended: Vec<String>,
+        requests: Vec<AgentRequestId>,
+    },
+    /// The event's subject, a released child, did not stop: its code never
+    /// yielded, so its thread runs on until the session ends.
+    #[non_exhaustive]
+    AgentWedged {},
 
     // Integration audit: what crossed to a provider, or across a channel.
+    /// A round ended as its model yielded, or as a limit stopped it.
+    /// `usage` and `attempts` are the round's own; `descendants` the requests
+    /// the children it launched made while it ran, and `total` what the two
+    /// used together, each attempt counted once.
     #[non_exhaustive]
     ModelRoundCompleted {
         round: u32,
@@ -282,6 +385,8 @@ pub enum Payload {
         calls: Vec<CallUsage>,
         attempts: Vec<AttemptId>,
         input_tokens_max: Option<u64>,
+        descendants: Vec<AttemptId>,
+        total: Option<Usage>,
     },
     #[non_exhaustive]
     ModelRoundFailed {
@@ -290,6 +395,8 @@ pub enum Payload {
         calls: Vec<CallUsage>,
         usage: Option<Usage>,
         attempts: Vec<AttemptId>,
+        descendants: Vec<AttemptId>,
+        total: Option<Usage>,
     },
     #[non_exhaustive]
     ModelRoundDropped {
@@ -297,6 +404,16 @@ pub enum Payload {
         calls: Vec<CallUsage>,
         usage: Option<Usage>,
         attempts: Vec<AttemptId>,
+        descendants: Vec<AttemptId>,
+        total: Option<Usage>,
+    },
+    /// Requests a child the round launched made after the round had ended:
+    /// spend added to that round's tree once its total was published.
+    #[non_exhaustive]
+    ModelRoundUsage {
+        round: u32,
+        attempts: Vec<AttemptId>,
+        usage: Option<Usage>,
     },
     /// One request a provider was sent, and how it ended.
     ModelAttempt(ModelAttempt),
@@ -450,6 +567,19 @@ impl Payload {
             Payload::MessageRefused { .. } => "message.refused",
             Payload::MessageReceived { .. } => "message.received",
             Payload::BindingExited { .. } => "binding.exited",
+            Payload::AgentSpawned { .. } => "agent.spawned",
+            Payload::AgentRequestSent { .. } => "agent.request.sent",
+            Payload::AgentRequestReceived { .. } => "agent.request.received",
+            Payload::AgentRequestReplied { .. } => "agent.request.replied",
+            Payload::AgentRequestInvalid { .. } => "agent.request.invalid",
+            Payload::AgentRequestFailed { .. } => "agent.request.failed",
+            Payload::AgentRequestCancelled { .. } => "agent.request.cancelled",
+            Payload::AgentRequestProgress { .. } => "agent.request.progress",
+            Payload::AgentRequestSettled { .. } => "agent.request.settled",
+            Payload::AgentRequestRefused { .. } => "agent.request.refused",
+            Payload::AgentReleased { .. } => "agent.released",
+            Payload::AgentWedged {} => "agent.wedged",
+            Payload::ModelRoundUsage { .. } => "model.round.usage",
             Payload::HostedReceived { .. } => "hosted.received",
             Payload::HostedDispatched { .. } => "hosted.dispatched",
             Payload::HostedEnded { .. } => "hosted.ended",
@@ -458,8 +588,9 @@ impl Payload {
     }
 
     /// The agent the event belongs to, or `None` for one about the session or
-    /// the interpreter every agent shares.
-    pub(crate) fn subject(&self) -> Option<Subject> {
+    /// the interpreter every agent shares. An event that names no agent of its
+    /// own belongs to `emitter`, the agent whose handle published it.
+    pub(crate) fn subject(&self, emitter: &Subject) -> Option<Subject> {
         match self {
             Self::SessionState { .. }
             | Self::SessionReport { .. }
@@ -472,7 +603,7 @@ impl Payload {
             | Self::HostedDispatched { agent, .. }
             | Self::HostedEnded { agent, .. }
             | Self::HostedCallback { agent, .. } => Some(Subject::agent(agent)),
-            _ => Some(Subject::PRIMARY),
+            _ => Some(emitter.clone()),
         }
     }
 }
@@ -859,6 +990,61 @@ pub struct ModelAttempt {
     pub error: Option<String>,
     /// What the provider reported it used, or `None` when it reported nothing.
     pub usage: Option<Usage>,
+}
+
+/// Which kind of child an agent launched: one that takes submissions and
+/// completes each, or one that answers requests on its channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ChildKind {
+    Work,
+    Request,
+}
+
+/// One of a child's inputs, bound as a variable before its first round: its
+/// name, its type, and a bounded preview of its value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct InputBrief {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub preview: String,
+}
+
+/// One of a request child's channels: its name, and the type of a request on
+/// it and of the reply.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct ChannelBrief {
+    pub name: String,
+    pub request: String,
+    pub reply: String,
+}
+
+/// How a request an agent made of a child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RequestEnd {
+    /// An answer passed its check, and is its result.
+    Accepted,
+    /// Its answers failed their checks past the attempt limit, or a work
+    /// child's rounds ended without completing it.
+    Rejected,
+    /// The child failed it on purpose.
+    Failed,
+    /// Its sender cancelled it.
+    Cancelled,
+    /// The child, or an agent above it, was released.
+    Released,
+    /// The session's token budget was spent before it was answered.
+    Budget,
+    /// The session closed before it was answered.
+    Closed,
+    /// The interpreter died before it was answered.
+    Terminated,
 }
 
 /// Why a usage record changed nothing.

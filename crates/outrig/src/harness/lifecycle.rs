@@ -9,6 +9,7 @@
 //! owner reads from here. A session with no primary agent runs no round, so it
 //! is idle from its start until it closes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use super::ClosedBy;
@@ -23,7 +24,14 @@ pub(crate) struct Lifecycle {
     events: Events,
     /// The interpreter's admission, once there is an interpreter.
     gate: OnceLock<Gate>,
+    /// What hears that admission has closed, each once.
+    closers: Mutex<Vec<OnClose>>,
+    /// Set once they have heard.
+    told: AtomicBool,
 }
+
+/// What hears that admission has closed, and why.
+pub(crate) type OnClose = Arc<dyn Fn(&ClosedBy) + Send + Sync>;
 
 impl Lifecycle {
     /// A session starting: the first event it publishes says so.
@@ -35,6 +43,8 @@ impl Lifecycle {
             state: Mutex::new(SessionState::Starting),
             events,
             gate: OnceLock::new(),
+            closers: Mutex::default(),
+            told: AtomicBool::new(false),
         })
     }
 
@@ -105,16 +115,54 @@ impl Lifecycle {
     /// once. When this was not the close, whatever was publishes closing:
     /// an exit already seen does as its hook runs, after its event.
     pub(crate) fn close(&self, by: ClosedBy) {
-        let mut state = self.state();
-        if self.gate.get().is_some_and(|gate| gate.close(by)) {
-            self.publish(&mut state, SessionState::Closing);
+        let closed = {
+            let mut state = self.state();
+            let closed = self.gate.get().is_some_and(|gate| gate.close(by));
+            if closed {
+                self.publish(&mut state, SessionState::Closing);
+            }
+            closed
+        };
+        if closed {
+            self.tell_closers();
         }
     }
 
     /// The interpreter has exited, which closed admission: publish closing.
     pub(crate) fn exited(&self) {
         self.set(SessionState::Closing);
+        self.tell_closers();
     }
+
+    /// Have `closer` hear that admission has closed, once: when it does, or
+    /// at once if it has.
+    pub(crate) fn on_close(&self, closer: OnClose) {
+        lock(&self.closers).push(Arc::clone(&closer));
+        if self.told.load(Ordering::SeqCst)
+            && let Some(by) = self.closed()
+        {
+            closer(&by);
+        }
+    }
+
+    /// Tell each closer why admission closed, the first time it has. Outside
+    /// the state's lock: a closer takes locks of its own.
+    fn tell_closers(&self) {
+        let Some(by) = self.closed() else {
+            return;
+        };
+        if self.told.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let closers = lock(&self.closers).clone();
+        for closer in closers {
+            closer(&by);
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A round in progress. Dropped -- the round returned, or its future was --

@@ -1637,6 +1637,114 @@ subagent-width-max = 4
         assert_eq!(merged.subagent_width_max, Some(4));
     }
 
+    /// `children-max`, `model-concurrency-max` and `requests-max` are each
+    /// refused below 1 and past their ceilings, at the top level and in an
+    /// agent's block alike, and the error names the key and the range.
+    #[test]
+    fn child_limits_out_of_range_are_refused_naming_key_and_range() {
+        for (key, ceiling) in [
+            ("children-max", 1024u64),
+            ("model-concurrency-max", 128),
+            ("requests-max", 4096),
+        ] {
+            for value in [0, ceiling + 1] {
+                for (top, agent, path) in [
+                    (true, false, format!("top-level {key}")),
+                    (false, true, format!("agents.coding.{key}")),
+                ] {
+                    let line = format!("{key} = {value}\n");
+                    let cfg = parse(&format!(
+                        "default-model = \"fast\"\n{}{PROVIDER_AND_FAST_MODEL}\n\
+                         [agents.coding]\n{}",
+                        if top { line.as_str() } else { "" },
+                        if agent { line.as_str() } else { "" },
+                    ));
+                    let err = expect_validation_err(&cfg, None);
+                    assert_eq!(
+                        err.to_string(),
+                        format!("{path} must be between 1 and {ceiling}; got {value}")
+                    );
+                    match err {
+                        ConfigValidationError::LimitOutOfRange {
+                            path: got,
+                            value: v,
+                            min,
+                            max,
+                            ..
+                        } => {
+                            assert_eq!((got, v, min, max), (path, value, 1, Some(ceiling)));
+                        }
+                        other => panic!("expected LimitOutOfRange, got: {other:?}"),
+                    }
+                }
+            }
+            for value in [1, ceiling] {
+                let cfg = parse(&format!("{key} = {value}\n"));
+                cfg.validate(None)
+                    .unwrap_or_else(|e| panic!("{key} = {value} is in range: {e}"));
+            }
+        }
+    }
+
+    /// `token-budget` has no ceiling, and no meaning at 0.
+    #[test]
+    fn a_token_budget_of_zero_is_refused() {
+        for (top, agent, path) in [
+            ("token-budget = 0\n", "", "top-level token-budget"),
+            ("", "token-budget = 0\n", "agents.coding.token-budget"),
+        ] {
+            let cfg = parse(&format!(
+                "default-model = \"fast\"\n{top}{PROVIDER_AND_FAST_MODEL}\n[agents.coding]\n{agent}"
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert_eq!(err.to_string(), format!("{path} must be at least 1; got 0"));
+        }
+        parse("token-budget = 18446744073709551615\n")
+            .validate(None)
+            .expect("no ceiling");
+    }
+
+    #[test]
+    fn child_limits_repo_override_global() {
+        let global = parse(
+            r#"
+children-max = 2
+model-concurrency-max = 2
+requests-max = 2
+token-budget = 2
+"#,
+        );
+        let repo = parse(
+            r#"
+children-max = 4
+model-concurrency-max = 4
+requests-max = 4
+token-budget = 4
+"#,
+        );
+        let merged = merge(global.clone(), repo);
+        assert_eq!(
+            (
+                merged.children_max,
+                merged.model_concurrency_max,
+                merged.requests_max,
+                merged.token_budget
+            ),
+            (Some(4), Some(4), Some(4), Some(4))
+        );
+        let merged = merge(global, Config::default());
+        assert_eq!(
+            (
+                merged.children_max,
+                merged.model_concurrency_max,
+                merged.requests_max,
+                merged.token_budget
+            ),
+            (Some(2), Some(2), Some(2), Some(2)),
+            "a silent repo inherits"
+        );
+    }
+
     #[test]
     fn top_level_retry_budget_secs_too_large_errors() {
         let cfg = parse(

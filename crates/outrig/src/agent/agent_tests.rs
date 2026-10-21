@@ -34,7 +34,7 @@ use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
 use crate::python::testing::{ok, slot_freed, start_on_host, within};
 
-const KEY: &str = "sk-ant-mock-key";
+pub(super) const KEY: &str = "sk-ant-mock-key";
 
 /// An identifier rig publishes no ceiling for.
 const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
@@ -52,7 +52,7 @@ fn with_key<T>(var: &str, f: impl FnOnce() -> T) -> T {
 }
 
 /// `toml` loaded and validated.
-fn load(toml: &str) -> Config {
+pub(super) fn load(toml: &str) -> Config {
     let cfg = Config::load_from_str(toml).expect("config parses");
     cfg.validate(None).expect("config validates");
     cfg
@@ -161,7 +161,7 @@ async fn agent_with(
 }
 
 /// A resolver holding the one key `var` names.
-fn keyed(var: &str) -> impl Fn(&str) -> Option<String> + Send + Sync + 'static {
+pub(super) fn keyed(var: &str) -> impl Fn(&str) -> Option<String> + Send + Sync + 'static {
     let var = var.to_string();
     move |name: &str| (name == var).then(|| KEY.to_string())
 }
@@ -178,7 +178,7 @@ async fn agent_of(cfg: &Config, var: &str, events: Events) -> Session {
 
 /// A session of `agent` over `cfg`, `model` overriding, publishing to
 /// `events`, to start on the host.
-fn host_session(
+pub(super) fn host_session(
     cfg: &Config,
     agent: Option<&str>,
     model: Option<&str>,
@@ -188,7 +188,7 @@ fn host_session(
 }
 
 /// A stream recording into `dir` when one is given, and a subscription to it.
-async fn watched(dir: Option<&std::path::Path>) -> (Events, Subscription) {
+pub(super) async fn watched(dir: Option<&std::path::Path>) -> (Events, Subscription) {
     let mut stream = StreamBuilder::default();
     let subscription = stream.subscribe(DEFAULT_CAPACITY);
     if let Some(dir) = dir {
@@ -228,7 +228,7 @@ fn submissions(events: &mut Subscription) -> Vec<String> {
 }
 
 /// Stop `agent`'s session, its log holding everything it was given.
-async fn shut_down(agent: Session) -> ShutdownReport {
+pub(super) async fn shut_down(agent: Session) -> ShutdownReport {
     let report = within(agent.shutdown(DEFAULT_DRAIN)).await;
     if let Some(lost) = &report.events.log {
         panic!("{lost}");
@@ -237,14 +237,14 @@ async fn shut_down(agent: Session) -> ShutdownReport {
 }
 
 /// Send `message` on the agent's user channel, as a person typing it does.
-async fn post(agent: &Session, message: &str) {
+pub(super) async fn post(agent: &Session, message: &str) {
     within(agent.user_channel().expect("a primary agent").send(message))
         .await
         .unwrap_or_else(|e| panic!("the message was not delivered: {e}"));
 }
 
 /// Send `message`, then run the round it starts, to its end.
-async fn round_end(agent: &mut Session, message: &str) -> RoundEnd {
+pub(super) async fn round_end(agent: &mut Session, message: &str) -> RoundEnd {
     post(agent, message).await;
     match within(agent.round())
         .await
@@ -257,7 +257,7 @@ async fn round_end(agent: &mut Session, message: &str) -> RoundEnd {
 
 /// [`round_end`], read as the text a round once returned: the reply, and why
 /// a limit stopped it after it.
-async fn round(agent: &mut Session, message: &str) -> String {
+pub(super) async fn round(agent: &mut Session, message: &str) -> String {
     let end = round_end(agent, message).await;
     match &end.stopped {
         None => end.reply,
@@ -293,7 +293,7 @@ async fn dropped_inside_the_second(agent: &mut Session, events: &mut Subscriptio
 
 /// The text of a message's `content`, or the system prompt, whether rig sent
 /// it as one string or as blocks. Blocks without text are skipped.
-fn text_of(content: &serde_json::Value) -> String {
+pub(super) fn text_of(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(blocks) => blocks
@@ -305,19 +305,19 @@ fn text_of(content: &serde_json::Value) -> String {
 }
 
 /// The system prompt `request` carried.
-fn system_prompt(request: &RecordedRequest) -> String {
+pub(super) fn system_prompt(request: &RecordedRequest) -> String {
     text_of(&request.body["system"])
 }
 
 /// The messages `request` carried, as the provider received them.
-fn messages(request: &RecordedRequest) -> &[serde_json::Value] {
+pub(super) fn messages(request: &RecordedRequest) -> &[serde_json::Value] {
     request.body["messages"]
         .as_array()
         .expect("a messages array")
 }
 
 /// The text of the `tool_result` for `id` in `request`, as the model reads it.
-fn tool_result(request: &RecordedRequest, id: &str) -> String {
+pub(super) fn tool_result(request: &RecordedRequest, id: &str) -> String {
     let block = messages(request)
         .iter()
         .filter_map(|message| message["content"].as_array())
@@ -2414,7 +2414,7 @@ fn tool_over(interpreter: crate::python::host::Interpreter) -> SubmitPython {
         interpreter.clone(),
         1024,
         Announcer::new(interpreter),
-        crate::harness::lifecycle::Lifecycle::starting(Events::off()),
+        Some(crate::harness::lifecycle::Lifecycle::starting(Events::off())),
     )
 }
 
@@ -3329,6 +3329,8 @@ async fn token_usage_is_what_the_provider_reported() {
             ],
             "attempts": [1, 2],
             "input_tokens_max": 300,
+            "descendants": [],
+            "total": usage(400, 30, 480, 50),
         })
     );
 }
@@ -3807,6 +3809,36 @@ async fn an_unusable_response_is_retried_without_running_python_again() {
         Some(57),
         "the session's total counts what the round's does"
     );
+}
+
+/// An unusable response that spends the session's token budget is not tried
+/// again: the provider billed it, so the retry it would have had is refused,
+/// and the round stops naming `token-budget`, as one the budget stops before a
+/// call does.
+#[tokio::test]
+async fn an_unusable_response_that_spends_the_budget_is_not_retried() {
+    let var = "OUTRIG_TEST_AGENT_UNUSABLE_SPENDS_BUDGET";
+    let (addr, mut requests) =
+        mock_http::start(vec![mock_http::unusable(), text_reply("never sent")]).await;
+    let mut cfg = config_in(
+        Style::Anthropic,
+        addr,
+        var,
+        MODEL,
+        "",
+        "max-tokens = 4096\ntoken-budget = 10",
+    );
+    retrying(&mut cfg, "claude");
+    let mut agent = agent_of(&cfg, var, Events::off()).await;
+
+    let ended = round(&mut agent, "go").await;
+    shut_down(agent).await;
+
+    assert!(
+        ended.contains("token-budget (10 tokens) is spent"),
+        "{ended}"
+    );
+    assert_eq!(mock_http::drain(&mut requests).len(), 1, "no request after");
 }
 
 /// An unusable response is counted from OpenAI's usage object too, and one

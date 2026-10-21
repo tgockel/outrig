@@ -48,8 +48,8 @@ const MODE: u32 = 0o600;
 /// The type prefix: the reverse-DNS name OutRig's labels already use.
 const TYPE_PREFIX: &str = "org.outrig.";
 
-/// The protocol's id for the one agent a session runs: the `subject` of an
-/// event that belongs to it, and the end a message to or from it names.
+/// The protocol's id for the primary agent: the `subject` of an event that
+/// belongs to it, and the end a message to or from it names.
 pub(crate) const PRIMARY_SUBJECT: &str = "agent/primary";
 
 static EVENT_LABELS: Labels = Labels {
@@ -62,9 +62,22 @@ static EVENT_LABELS: Labels = Labels {
 /// Where a session's events go. Cheap to clone; every clone publishes into
 /// the one stream. [`Events::off`] publishes nowhere, and is what a session
 /// with no subscriber holds.
-#[derive(Clone, Default)]
+///
+/// A handle speaks for one agent, the primary unless [`Events::for_agent`]
+/// made it: an event that names no agent of its own is that agent's.
+#[derive(Clone)]
 pub(crate) struct Events {
     stream: Option<Arc<Stream>>,
+    agent: Subject,
+}
+
+impl Default for Events {
+    fn default() -> Self {
+        Self {
+            stream: None,
+            agent: Subject::PRIMARY,
+        }
+    }
 }
 
 struct Stream {
@@ -102,6 +115,20 @@ impl Events {
         Self::default()
     }
 
+    /// A handle on the same stream that speaks for `agent`, as the
+    /// interpreter's protocol names it.
+    pub(crate) fn for_agent(&self, agent: &str) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            agent: Subject::agent(agent),
+        }
+    }
+
+    /// The agent this handle speaks for.
+    pub(crate) fn agent(&self) -> &Subject {
+        &self.agent
+    }
+
     /// Whether events go anywhere. Fixed when the stream is built, so a caller
     /// can skip building an event nobody will receive.
     pub(crate) fn is_on(&self) -> bool {
@@ -113,7 +140,7 @@ impl Events {
     /// dropped, there being nobody left to hand it to.
     pub(crate) fn emit(&self, payload: Payload) {
         if let Some(stream) = &self.stream {
-            stream.publish(payload, false);
+            stream.publish(payload, &self.agent, false);
         }
     }
 
@@ -121,7 +148,7 @@ impl Events {
     /// someone subscribes: for one that copies what it carries.
     pub(crate) fn emit_with(&self, build: impl FnOnce() -> Payload) {
         if let Some(stream) = &self.stream {
-            stream.publish(build(), false);
+            stream.publish(build(), &self.agent, false);
         }
     }
 
@@ -131,7 +158,7 @@ impl Events {
     pub(crate) async fn close_after(&self, last: Payload) -> std::result::Result<(), LogLoss> {
         match &self.stream {
             Some(stream) => {
-                stream.publish(last, true);
+                stream.publish(last, &self.agent, true);
                 stream.finish().await
             }
             None => Ok(()),
@@ -171,12 +198,12 @@ impl Events {
 }
 
 impl Stream {
-    /// Number `payload` and hand it to every queue; with `last`, end the stream
-    /// behind it.
-    fn publish(&self, payload: Payload, last: bool) {
+    /// Number `payload`, `emitter`'s unless it names its own agent, and hand
+    /// it to every queue; with `last`, end the stream behind it.
+    fn publish(&self, payload: Payload, emitter: &Subject, last: bool) {
         // Built before the lock every emitter shares, and given its place
         // under it.
-        let subject = payload.subject();
+        let subject = payload.subject(emitter);
         let mut event = Arc::new(Event {
             id: 0,
             time: UNIX_EPOCH,
@@ -394,6 +421,7 @@ impl StreamBuilder {
                 subscribers,
                 file: Mutex::new(file),
             })),
+            agent: Subject::PRIMARY,
         }
     }
 }

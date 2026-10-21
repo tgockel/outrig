@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::ClosedBy;
-use super::event::{ExecId, HostedOutcome, HostedReason, RequestId};
+use super::event::{AgentRequestId, ExecId, HostedOutcome, HostedReason, RequestEnd, RequestId};
 
 /// What [`Session::shutdown`](super::Session::shutdown) found. Read it before
 /// deciding anything about the work the session did: it is the first point at
@@ -30,6 +30,9 @@ pub struct ShutdownReport {
     /// How the process holding the session's bindings stopped, or `None` when the session had
     /// none.
     pub bindings: Option<BindingStop>,
+    /// Each request an agent had made of a child and not seen answered when
+    /// admission closed, and how it ended.
+    pub requests: Vec<RequestOutcome>,
     pub events: EventDelivery,
 }
 
@@ -105,6 +108,21 @@ pub struct HostedCall {
     pub binding: String,
     pub outcome: HostedOutcome,
     pub reason: Option<HostedReason>,
+}
+
+/// A request an agent made of a child -- a submission, or a request on one of
+/// the child's channels -- open when admission closed. The close ends it
+/// `closed`, unless an answer reached it first; one the interpreter's death
+/// left with no end is `terminated`. Its events say the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct RequestOutcome {
+    pub request: AgentRequestId,
+    /// The child it was made of, as the interpreter's protocol names it.
+    pub child: String,
+    /// The channel it was sent on, or `None` for a submission.
+    pub channel: Option<String>,
+    pub outcome: RequestEnd,
 }
 
 /// One execution running when admission closed.

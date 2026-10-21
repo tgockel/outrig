@@ -32,6 +32,7 @@ use super::build::RigAgent;
 use super::failover::{self, FailoverModel};
 use super::history::{self, History};
 use super::ledger::{CallSlot, Refusal};
+use super::retry::BudgetSpent;
 use super::tool::{self, Interrupts};
 use crate::config::RoleAlternation;
 use crate::harness::event::{AttemptId, CallUsage, Payload, Usage};
@@ -78,7 +79,7 @@ pub(crate) async fn round(
     interrupts: &Interrupts,
 ) -> Result<Finished, AgentError> {
     let slot = agent.model.slot().clone();
-    slot.open_round();
+    slot.open_round(history.round());
     let hook = RoundHook::new(tool_call_max, interrupts.clone(), history.clone(), slot);
     // rig's own budget is a backstop set above the hook's, so the hook -- with
     // its message the model can read -- is the limiter that fires first. As of
@@ -168,15 +169,18 @@ impl Drop for KeptIfDropped {
     fn drop(&mut self) {
         if self.armed {
             self.hook.keep_what_ran();
-            self.hook.history.events().emit_with(|| {
-                let (usage, attempts) = self.hook.spent();
-                Payload::ModelRoundDropped {
+            let spent = self.hook.close();
+            self.hook
+                .history
+                .events()
+                .emit_with(|| Payload::ModelRoundDropped {
                     round: self.hook.round,
                     calls: self.hook.calls_so_far(),
-                    usage,
-                    attempts,
-                }
-            });
+                    usage: spent.usage,
+                    attempts: spent.attempts,
+                    descendants: spent.descendants,
+                    total: spent.total,
+                });
         }
     }
 }
@@ -190,7 +194,9 @@ impl Drop for KeptIfDropped {
 /// a call the chain did not make because no model's window could hold its
 /// latest turn ([`failover::unfit`]), which ends the round as the cap does,
 /// keeping the turn: the hook committed every turn the call answers before the
-/// chain was asked. A provider's refusal of a request whose view put one role
+/// chain was asked. So does a request the session's spent token budget refused
+/// ([`BudgetSpent`]), which ends the round as the hook's own check before a
+/// call does. A provider's refusal of a request whose view put one role
 /// after itself says so, since that is the one shape of request this loop sends
 /// that a strict provider can refuse.
 ///
@@ -211,6 +217,11 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
             },
             _,
         ) => (cap_reason(max_turns), *chat_history),
+        // As for an unfit call, every turn the call answers is in the store.
+        (PromptError::CompletionError(failed), _) if BudgetSpent::of(&failed) => (
+            budget_reason(hook.slot.ledger().budget().unwrap_or_default()),
+            Vec::new(),
+        ),
         (other, _) => {
             let Some(reason) = unfit(&other) else {
                 let text = format!("{other}{}", hook.refusal_hint(&other));
@@ -261,6 +272,24 @@ fn may_clear(err: &PromptError) -> bool {
 
 fn cap_reason(max: usize) -> String {
     format!("tool-call iteration max ({max}) reached")
+}
+
+/// Why a round stopped once the session's token budget was spent: before a
+/// model call, or as the call's request was refused.
+pub(crate) fn budget_reason(budget: u64) -> String {
+    format!(
+        "token-budget ({budget} tokens) is spent: no model call is made from here on in this \
+         session"
+    )
+}
+
+/// What a round's attempts used: its own, and those of the children working
+/// under it, each counted once.
+struct Spent {
+    usage: Option<Usage>,
+    attempts: Vec<AttemptId>,
+    descendants: Vec<AttemptId>,
+    total: Option<Usage>,
 }
 
 /// What a call that had started, but not returned, reads as when a round ends
@@ -373,18 +402,33 @@ impl RoundHook {
         self.journal().calls.clone()
     }
 
-    /// What the round's attempts used, each counted once, and the attempts.
-    fn spent(&self) -> (Option<Usage>, Vec<AttemptId>) {
-        let attempts = self.slot.round_attempts();
-        (self.slot.ledger().total(&attempts), attempts)
+    /// End the round, and say what its attempts used, each counted once:
+    /// its own, and its children's while it ran. A child's attempt from here
+    /// on is published apart, naming this round.
+    fn close(&self) -> Spent {
+        let (attempts, descendants) = self.slot.close_round();
+        let ledger = self.slot.ledger();
+        let all: Vec<AttemptId> = attempts.iter().chain(&descendants).copied().collect();
+        Spent {
+            usage: ledger.total(&attempts),
+            total: ledger.total(&all),
+            attempts,
+            descendants,
+        }
     }
 
     /// Record how the round ended: each call it made, and what its attempts
     /// used.
     fn record_end(&self, ended: &Result<Finished, AgentError>) {
+        let spent = self.close();
         self.history.events().emit_with(|| {
             let calls = self.calls_so_far();
-            let (usage, attempts) = self.spent();
+            let Spent {
+                usage,
+                attempts,
+                descendants,
+                total,
+            } = spent;
             match ended {
                 Ok(Finished { stopped, .. }) => Payload::ModelRoundCompleted {
                     round: self.round,
@@ -396,6 +440,8 @@ impl RoundHook {
                         .max(),
                     calls,
                     attempts,
+                    descendants,
+                    total,
                 },
                 Err(failed) => Payload::ModelRoundFailed {
                     round: self.round,
@@ -403,6 +449,8 @@ impl RoundHook {
                     calls,
                     usage,
                     attempts,
+                    descendants,
+                    total,
                 },
             }
         });
@@ -549,6 +597,11 @@ impl AgentHook<FailoverModel> for RoundHook {
             self.journal().latest.results.push(result.to_string());
         }
         match event {
+            // Before the cap, so a round the budget stops says so whatever
+            // else it has spent.
+            StepEvent::CompletionCall { .. } if self.slot.ledger().budget_spent() => self.stop(
+                budget_reason(self.slot.ledger().budget().unwrap_or_default()),
+            ),
             StepEvent::CompletionCall { .. } if self.calls.load(Ordering::SeqCst) > self.max => {
                 self.stop(cap_reason(self.max))
             }

@@ -483,6 +483,11 @@ impl History {
         self.store().prompt().0
     }
 
+    /// The number the next round will have, while none is in progress.
+    pub(crate) fn next_round(&self) -> u32 {
+        self.store().last_round() + 1
+    }
+
     /// Start a round that `opening` opens, costed at its own size.
     #[cfg(test)]
     pub(crate) fn begin_round(&self, opening: Message) {

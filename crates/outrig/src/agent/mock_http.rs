@@ -12,10 +12,16 @@
 //! provider that requires the user's and the model's turns to alternate, which
 //! refuses a request whose roles repeat as a gateway in front of one would.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// The identifier every canned response names. Recognized by rig, with a
 /// published ceiling of 64 000.
@@ -26,7 +32,7 @@ pub(super) const SIGNATURE: &str = "signed-by-the-mock";
 
 /// One request as the mock saw it, before any client library is asked to
 /// interpret it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RecordedRequest {
     pub(super) path: String,
     /// Each header as sent, its name lowercased.
@@ -526,6 +532,151 @@ async fn serve(
         let _ = sock.flush().await;
         let _ = sock.shutdown().await;
     }
+}
+
+/// What the routed mock answers one request with: a response, ready when the
+/// future is -- at once, or once the test lets it go.
+pub(crate) type Responder = Arc<
+    dyn Fn(&RecordedRequest) -> Pin<Box<dyn Future<Output = CannedResponse> + Send>> + Send + Sync,
+>;
+
+/// A responder answering `script` in order, one each request, repeating the
+/// last past its end.
+pub(crate) fn scripted(script: Vec<CannedResponse>) -> Responder {
+    let next = Arc::new(AtomicUsize::new(0));
+    Arc::new(move |_| {
+        let n = next.fetch_add(1, Ordering::SeqCst);
+        let canned = script
+            .get(n)
+            .or(script.last())
+            .cloned()
+            .expect("a script of at least one response");
+        Box::pin(async move { canned })
+    })
+}
+
+/// How many requests the routed mock holds open at once, and the most it ever
+/// has.
+#[derive(Default)]
+pub(crate) struct Gauge {
+    open: AtomicUsize,
+    most: AtomicUsize,
+    changed: Notify,
+}
+
+impl Gauge {
+    pub(crate) fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+/// The system prompt `body` carries, whether as one string or as blocks.
+pub(crate) fn system_text(body: &Value) -> String {
+    match &body["system"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// The mock as several agents share it. Each request goes to the responder of
+/// the first route whose marker its system prompt holds -- `""` holds in any --
+/// and is answered on a task of its own, so requests overlap. With `hold`, each
+/// waits until `hold` requests are open at once, or until a second has passed
+/// with fewer, before its responder is asked.
+pub(crate) async fn routed(
+    routes: Vec<(&'static str, Responder)>,
+    hold: Option<usize>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+    Arc<Gauge>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
+    let addr = listener.local_addr().expect("mock local_addr");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let gauge = Arc::new(Gauge::default());
+    let routes = Arc::new(routes);
+    tokio::spawn({
+        let gauge = Arc::clone(&gauge);
+        async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (routes, tx, gauge) = (Arc::clone(&routes), tx.clone(), Arc::clone(&gauge));
+                tokio::spawn(answer_routed(sock, routes, tx, gauge, hold));
+            }
+        }
+    });
+    (addr, rx, gauge)
+}
+
+async fn answer_routed(
+    mut sock: TcpStream,
+    routes: Arc<Vec<(&'static str, Responder)>>,
+    tx: mpsc::UnboundedSender<RecordedRequest>,
+    gauge: Arc<Gauge>,
+    hold: Option<usize>,
+) {
+    let Some(recorded) = read_request(&mut sock).await else {
+        return;
+    };
+    let open = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
+    gauge.most.fetch_max(open, Ordering::SeqCst);
+    gauge.changed.notify_waiters();
+    if let Some(hold) = hold {
+        loop {
+            let changed = gauge.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if gauge.open() >= hold {
+                gauge.changed.notify_waiters();
+                break;
+            }
+            if tokio::time::timeout(Duration::from_secs(1), changed)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    let system = system_text(&recorded.body);
+    let responder = routes
+        .iter()
+        .find(|(marker, _)| system.contains(marker))
+        .map(|(_, responder)| Arc::clone(responder))
+        .expect("a route for every request");
+    let _ = tx.send(recorded.clone());
+    let canned = responder(&recorded).await;
+    let body = serde_json::to_string(&canned.body).expect("canned body serializes");
+    let headers: String = canned
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let response = format!(
+        "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
+        canned.status,
+        body.len(),
+        body,
+    );
+    let _ = sock.write_all(response.as_bytes()).await;
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
+    gauge.open.fetch_sub(1, Ordering::SeqCst);
+    gauge.changed.notify_waiters();
 }
 
 /// Read one HTTP/1.1 request: the request line, its headers, and a

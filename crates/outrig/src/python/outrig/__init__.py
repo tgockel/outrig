@@ -10,11 +10,40 @@ execution's own proxy of a binding, whatever the kernel's globals now hold under
 In a program `outrig run <script.py>` runs on the host, `outrig.config()` is a read-only view of
 the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
 `help(outrig.config)` and `help(outrig.Session)`.
+
+Agent code launches a child agent with `runtime.spawn`, and the work it gives one ends with a
+value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(outrig.Request)`.
 """
 
 from . import schema
+from ._agents import (
+    AgentError,
+    AgentLimitReached,
+    AgentReleased,
+    AgentRequestFailed,
+    BudgetExhausted,
+    CompletionRejected,
+    Request,
+    RequestCancelled,
+    RequestSettled,
+    SessionClosing,
+    Status,
+)
 
-__all__ = ["schema"]
+__all__ = [
+    "schema",
+    "AgentError",
+    "AgentLimitReached",
+    "AgentReleased",
+    "AgentRequestFailed",
+    "BudgetExhausted",
+    "CompletionRejected",
+    "Request",
+    "RequestCancelled",
+    "RequestSettled",
+    "SessionClosing",
+    "Status",
+]
 
 # What only a kernel has. `outrig._kernel` binds each as the interpreter starts; anywhere else,
 # asking for one says why there is none.

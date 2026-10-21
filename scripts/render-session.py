@@ -65,6 +65,9 @@ from pathlib import Path
 from jinja2 import Environment, StrictUndefined
 
 PREFIX = "org.outrig."
+# The subjects whose `agent.started` and `model.instructions` the facts table shows: the main
+# agent's, and none at all. Any other is a child's.
+MAIN = ("agent/primary", "")
 EVENTS = Path("logs") / "events.jsonl"
 NETWORK = Path("logs") / "network.jsonl"
 SESSION = Path("session.json")
@@ -365,7 +368,9 @@ class Builder:
         self.messages: dict[int | str, Msg] = {}
         self.health: list[str] = []
         self.facts: dict[str, str] = {}
-        self.instructions: list[Part] = []
+        # Each agent's instructions -- a heading naming it and its max tokens, and the parts -- by
+        # its subject, in the order they first appeared.
+        self.instructions: dict[str, tuple[str, list[Part]]] = {}
         self.agents: set[str] = set()
         self.kind = ""
         self.time = ""
@@ -475,20 +480,34 @@ class Builder:
 
     def on_model_instructions(self, d: dict) -> None:
         tools = objs(d.get("tools"))
-        self.facts["max tokens"] = text(d.get("max_tokens")) or "none sent"
-        self.instructions = [Part("system prompt", text(d.get("preamble")))] + [
+        max_tokens = text(d.get("max_tokens")) or "none sent"
+        if self.subject in MAIN:
+            self.facts["max tokens"] = max_tokens
+        parts = [Part("system prompt", text(d.get("preamble")))] + [
             Part(
                 f"tool {text(t.get('name'))}",
                 text(t.get("description")) + "\n\n" + json.dumps(t.get("parameters"), indent=2),
             )
             for t in tools
         ]
-        self.add(f"{len(tools)} tool(s)", href="#instructions")
+        heading = f"{self.subject or '(no subject)'}, max tokens {max_tokens}"
+        self.instructions[self.subject] = (heading, parts)
+        at = list(self.instructions).index(self.subject)
+        self.add(f"{len(tools)} tool(s)", href=f"#instructions-{at}")
 
     def on_agent_started(self, d: dict) -> None:
-        for name in ("model", "python", "container", "tool_call_max", "tool_result_max"):
-            self.facts[name.replace("_", " ")] = text(d.get(name))
-        self.add(f"{self.subject} on {text(d.get('model'))}")
+        facts = {
+            name.replace("_", " "): text(d.get(name))
+            for name in ("model", "python", "container", "tool_call_max", "tool_result_max")
+        }
+        parts = []
+        if self.subject in MAIN:
+            self.facts |= facts
+        else:
+            # A child's, which the facts table does not hold.
+            lines = "\n".join(f"{name}: {value}" for name, value in facts.items())
+            parts = [Part("what it started with", lines)]
+        self.add(f"{self.subject} on {facts['model']}", parts=parts)
 
     def on_agent_stopped(self, d: dict) -> None:
         self.add(self.subject)
@@ -508,6 +527,16 @@ class Builder:
             f"{text(c.get('agent'))}: {text(c.get('outcome'))}"
             + (f" ({text(c.get('reason'))})" if c.get("reason") is not None else "")
             for c in objs(d.get("hosted"))
+        ]
+        requests = [
+            f"request {text(r.get('request'))} of {text(r.get('child'))}"
+            + (
+                f" on {text(r.get('channel'))}"
+                if r.get("channel") is not None
+                else " (a submission)"
+            )
+            + f": {text(r.get('outcome'))}"
+            for r in objs(d.get("requests"))
         ]
         bindings = obj(d.get("bindings"))
         stop = (
@@ -532,6 +561,7 @@ class Builder:
             *([f"why not: {text(stopped.get('reason'))}"] if "reason" in stopped else []),
             *(outcomes or ["no execution was running at the close"]),
             *calls,
+            *requests,
             *stop,
         ]
         self.add(text(d.get("verdict")), parts=[Part("the shutdown report", "\n".join(lines))])
@@ -811,8 +841,11 @@ class Builder:
                 "The record does not end with the shutdown report: the session is still "
                 "running, or it ended without being shut down."
             )
-        if (started := types.count(PREFIX + "agent.started")) > 1:
-            self.health.append(f"The record holds {started} agent starts: logs were joined.")
+        starts = Counter(
+            text(r.get("subject")) for r, t in zip(records, types) if t == PREFIX + "agent.started"
+        )
+        if (started := max(starts.values(), default=0)) > 1:
+            self.health.append(f"The record holds {started} starts of one agent: logs were joined.")
         if len(sources := {text(r.get("source")) for r in records}) > 1:
             self.health.append(f"The records name {len(sources)} sessions as their source.")
         if versions := {text(r.get("specversion")) for r in records} - {"1.0"}:
@@ -1382,8 +1415,11 @@ nav a { margin-right: 1rem; }
 {% endfor %}
 </table>
 {% if instructions %}
-<h3 id="instructions">What every model call was sent besides the conversation</h3>
-{% for p in instructions %}{{ part(p) }}{% endfor %}
+<h3>What each agent's model calls were sent besides the conversation</h3>
+{% for heading, parts in instructions.values() %}
+<h4 id="instructions-{{ loop.index0 }}">{{ heading }}</h4>
+{% for p in parts %}{{ part(p) }}{% endfor %}
+{% endfor %}
 {% endif %}
 
 <h2 id="health">The record</h2>

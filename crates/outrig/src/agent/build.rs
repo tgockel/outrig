@@ -20,7 +20,7 @@ use super::AgentError;
 use super::budget::Budget;
 use super::failover::{Candidate, FailoverModel, ModelCandidate};
 use super::history::History;
-use super::ledger::{CallSlot, Ledger};
+use super::ledger::CallSlot;
 use super::resolve::{LlmResolveError, ResolvedAgent, ResolvedCandidate, ResolvedProvider};
 use super::retry::{self, Retries, RetryPolicy, RetryingHttpClient, RetryingModel};
 
@@ -45,9 +45,9 @@ pub(crate) const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 32_768;
 pub(crate) type RigAgent = Agent<FailoverModel>;
 
 /// Build the agent for `resolved`, with `preamble` as its system prompt and
-/// `tools` as its whole tool list, recording its calls and attempts in
-/// `ledger` and taking a moved call's view from `history`. Every call carries
-/// `overhead` besides the conversation. Does no I/O.
+/// `tools` as its whole tool list, naming its calls and attempts in `slot` and
+/// taking a moved call's view from `history`. Every call carries `overhead`
+/// besides the conversation. Does no I/O.
 ///
 /// Each candidate's [`Budget`] is settled and checked here, since its reserve
 /// is the ceiling building settles: one whose window leaves a round too little
@@ -58,7 +58,7 @@ pub(crate) fn build_agent(
     preamble: &str,
     tools: Vec<Box<dyn ToolDyn>>,
     history: &History,
-    ledger: &Ledger,
+    slot: CallSlot,
     overhead: u64,
 ) -> Result<RigAgent, AgentError> {
     // One policy for the whole chain, so its `chain_deadline` is the same
@@ -71,7 +71,6 @@ pub(crate) fn build_agent(
     // answer, and the head of a preference order is the defensible one -- it
     // is the endpoint the user said to use.
     let policy = retry_policy(resolved.head().provider.retry_budget_secs());
-    let slot = CallSlot::new(ledger.clone());
     let candidates = resolved
         .candidates
         .iter()

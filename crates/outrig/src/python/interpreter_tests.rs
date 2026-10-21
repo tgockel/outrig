@@ -2629,10 +2629,14 @@ fn a_message_waits_until_code_receives_it_once_and_in_order() {
 
     let read = py(r#"
         d = await runtime.channels['user'].receive()
-        print(d.body, d.sender, d.received_at.tzinfo, runtime.channels['user'].pending())
+        print(d.id, d.body, d.sender, d.received_at.tzinfo, runtime.channels['user'].pending())
         "#);
-    assert_eq!(k.output(6, &read), "first user UTC 1\n");
-    assert_eq!(k.output(7, &read), "second user UTC 0\n");
+    assert_eq!(
+        k.output(6, &read),
+        "1 first user UTC 1\n",
+        "named by the id it was posted under"
+    );
+    assert_eq!(k.output(7, &read), "2 second user UTC 0\n");
     // Received, but still counted as delivered: that is how a new message is
     // told from one the model has heard of.
     assert_eq!(
@@ -4591,5 +4595,459 @@ fn a_value_larger_than_the_context_stays_whole_and_only_its_observation_is_cut()
     assert_eq!(
         k.output(4, "len(big), big[-3:], big[4_000_000:4_000_003]"),
         format!("({size}, 'END', 'xxx')\n")
+    );
+}
+
+// ---------------------------------------------------------------------------- child agents
+//
+// The interpreter's half of child agents, with the test standing where the host stands: it
+// answers a spawn by opening the child's kernel, ends one, and reads the notices that tell it what
+// became of each request. The host's own half -- limits, rounds, the record -- is the agent's
+// tests'.
+
+impl Interpreter {
+    /// Submit `source` to `agent`, and return its result with every message that came first.
+    fn exec_collecting(&mut self, agent: &str, id: u64, source: &str) -> (Value, Vec<Value>) {
+        self.send(json!({"t": "exec", "agent": agent, "id": id, "src": source}));
+        let mut before = Vec::new();
+        loop {
+            let message = self.recv();
+            if message["t"] == "result" && message["agent"] == agent && message["id"] == id {
+                return (message, before);
+            }
+            before.push(message);
+        }
+    }
+
+    /// Run `source` in `agent`, which must not raise, and return what it printed and the
+    /// notices it sent.
+    fn noted(&mut self, agent: &str, id: u64, source: &str) -> (String, Vec<Value>) {
+        let (result, notices) = self.exec_collecting(agent, id, source);
+        assert_eq!(result["status"], "ok", "unexpected raise: {result}");
+        (text(&result["output"]), notices)
+    }
+
+    /// Run `spawn` in the primary -- code that awaits `runtime.spawn` -- and answer it as the
+    /// host does, by opening its kernel as `child`. Returns the spawn as the host was asked it.
+    fn spawn_as(&mut self, id: u64, spawn: &str, child: &str) -> Value {
+        self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": spawn}));
+        let asked = self.recv();
+        assert_eq!(asked["t"], "agent.spawn", "{asked}");
+        self.opened(json!({
+            "t": "open", "agent": child, "main": false,
+            "child": {"kind": asked["kind"], "spawn": asked["id"], "requests_max": 4},
+        }));
+        self.send(json!({
+            "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": child, "requests_max": 4,
+        }));
+        let result = self.recv();
+        assert!(
+            result["t"] == "result" && result["status"] == "ok",
+            "the spawn did not return: {result}"
+        );
+        asked
+    }
+}
+
+/// The notice of kind `kind` among `notices`.
+fn notice<'a>(notices: &'a [Value], kind: &str) -> &'a Value {
+    notices
+        .iter()
+        .find(|n| n["t"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} among {notices:?}"))
+}
+
+const THING: &str = "from dataclasses import dataclass\n\
+                     @dataclass\n\
+                     class Thing:\n    n: int\n";
+
+/// A child's kernel has its parent's inputs, as copies, its own namespace, and no user channel; a
+/// spawn the host refused raises the error it named, and an input that is not data is refused
+/// before anything is asked.
+#[test]
+fn a_child_kernel_holds_its_inputs_and_no_user_channel() {
+    let mut k = Interpreter::start();
+    k.output(1, &format!("{THING}rows = [Thing(1), Thing(2)]"));
+    let asked = k.spawn_as(
+        2,
+        "child = await runtime.spawn('w', prompt='p', inputs={'n': 3, 'rows': rows})",
+        "c1",
+    );
+    assert_eq!(asked["kind"], "work");
+    assert_eq!(
+        asked["manifest"],
+        json!([
+            {"name": "n", "type": "int", "preview": "3"},
+            {"name": "rows", "type": "list[Thing]", "preview": "[{\"n\": 1}, {\"n\": 2}]"},
+        ])
+    );
+    k.output(3, "rows[0].n = 99");
+    assert_eq!(
+        k.output_in(
+            "c1",
+            4,
+            "print(sorted(runtime.channels), n, [r.n for r in rows], 'rows' in dir())"
+        ),
+        "['progress'] 3 [1, 2] True\n",
+        "a copy, and no user channel"
+    );
+    assert_eq!(
+        k.output(
+            5,
+            "print(child.id, child.name, child.kind, child.status, dict(child.channels))"
+        ),
+        "c1 w work idle {}\n"
+    );
+    let error = k.exec(6, "runtime.complete");
+    assert!(
+        text(&error["error"]).contains("this agent is no child"),
+        "{error}"
+    );
+
+    let (result, asked) = k.exec_collecting(
+        PRIMARY,
+        7,
+        "await runtime.spawn('x', prompt='p', inputs={'f': open})",
+    );
+    assert!(asked.is_empty(), "nothing asked: {asked:?}");
+    assert!(
+        text(&result["error"]).contains("TypeError: f is a builtin_function_or_method"),
+        "{result}"
+    );
+
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 8,
+                  "src": "await runtime.spawn('y', prompt='p')"}));
+    let asked = k.recv();
+    k.send(json!({"t": "spawned", "agent": PRIMARY, "id": asked["id"],
+                  "error": {"kind": "limit", "message": "children-max (1) reached"}}));
+    let refused = k.recv();
+    assert!(
+        text(&refused["error"]).contains("outrig._agents.AgentLimitReached: children-max (1)"),
+        "{refused}"
+    );
+}
+
+/// A request crosses to the child as a copy of its body; a reply that fails its check raises in
+/// the child with its path and counts an attempt; one that passes settles the handle with a copy;
+/// and a reply after that is refused, as the host is told at each step.
+#[test]
+fn a_request_is_received_answered_and_settles_its_handle_once() {
+    let mut k = Interpreter::start();
+    k.output(1, &format!("{THING}import outrig"));
+    let asked = k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', \
+         requests={'fizz': outrig.Request(str, Thing, doc='counts')})",
+        "c1",
+    );
+    assert_eq!(asked["kind"], "request");
+    assert_eq!(asked["channels"][0]["name"], "fizz");
+    assert_eq!(asked["channels"][0]["doc"], "counts");
+    assert_eq!(asked["channels"][0]["reply_type"], "Thing");
+    assert_eq!(
+        k.output_in("c1", 3, "print(sorted(runtime.channels), Thing.__name__)"),
+        "['fizz'] Thing\n",
+        "the reply type is bound by its name"
+    );
+
+    let (said, notices) = k.noted(
+        PRIMARY,
+        4,
+        "h = child.channels['fizz'].request('hello')\n\
+         print(h.status, child.channels['fizz'].pending())",
+    );
+    assert_eq!(said, "waiting (child idle) 1\n");
+    let sent = notice(&notices, "agent.request");
+    assert_eq!(sent["child"], "c1");
+    assert_eq!(sent["channel"], "fizz");
+    let request = sent["request"].clone();
+
+    let (said, notices) = k.noted(
+        "c1",
+        5,
+        "d = await runtime.channels['fizz'].receive()\nprint(d.id, d.body, d.sender)",
+    );
+    assert_eq!(said, format!("{request} hello primary\n"));
+    assert_eq!(notice(&notices, "agent.received")["request"], request);
+
+    let (wrong, notices) = k.exec_collecting("c1", 6, "await d.reply({'n': 'five'})");
+    assert!(
+        text(&wrong["error"]).contains("attempt 1 of 3") && text(&wrong["error"]).contains("$.n"),
+        "{wrong}"
+    );
+    assert_eq!(notice(&notices, "agent.answered")["attempt"], 1);
+    assert_eq!(
+        k.output(7, "print(h.done(), h.status)"),
+        "False received (child idle)\n"
+    );
+
+    let (_, notices) = k.noted("c1", 8, "await d.reply(Thing(n=len(d.body)))");
+    let ended = notice(&notices, "agent.ended");
+    assert_eq!(
+        (&ended["request"], &ended["outcome"]),
+        (&request, &json!("accepted"))
+    );
+    assert_eq!(
+        k.output(
+            9,
+            "r = await h\nprint(r, type(r) is Thing, h.status, await h is r)"
+        ),
+        "Thing(n=5) True accepted (child idle) True\n"
+    );
+
+    let (late, notices) = k.exec_collecting("c1", 10, "await d.reply(Thing(n=1))");
+    assert!(
+        text(&late["error"]).contains("RequestSettled")
+            && text(&late["error"]).contains("already ended"),
+        "{late}"
+    );
+    assert_eq!(notice(&notices, "agent.refused")["ended"], "accepted");
+    let (send, _) = k.exec_collecting("c1", 11, "await runtime.channels['fizz'].send(Thing(1))");
+    assert!(text(&send["error"]).contains("TypeError"), "{send}");
+    let (complete, _) = k.exec_collecting("c1", 12, "await runtime.complete(Thing(1))");
+    assert!(
+        text(&complete["error"]).contains("d.reply(value)"),
+        "{complete}"
+    );
+    let (submit, notices) = k.exec_collecting(PRIMARY, 13, "child.submit({}, result=Thing)");
+    assert!(
+        text(&submit["error"]).contains("TypeError")
+            && text(&submit["error"]).contains("takes no submissions"),
+        "{submit}"
+    );
+    assert!(notices.is_empty(), "nothing sent: {notices:?}");
+}
+
+/// Every error a child's work ends with is an `outrig.AgentError`, so one `except` around
+/// `await h` catches each, and lets the caller's own errors through.
+#[test]
+fn every_failure_of_a_wait_is_an_agent_error() {
+    let mut k = Interpreter::start();
+    let hierarchy = py(r#"
+        import outrig
+        errors = (outrig.CompletionRejected, outrig.AgentReleased, outrig.AgentRequestFailed,
+                  outrig.AgentLimitReached, outrig.BudgetExhausted, outrig.SessionClosing,
+                  outrig.RequestCancelled, outrig.RequestSettled)
+        print(all(issubclass(e, outrig.AgentError) for e in errors), issubclass(TypeError, outrig.AgentError))
+        "#);
+    assert_eq!(k.output(1, &hierarchy), "True False\n");
+    k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c1",
+    );
+    let caught = py(r#"
+        h = child.channels['fizz'].request('a')
+        h.cancel()
+        try:
+            await h
+        except outrig.AgentError as e:
+            print('caught', type(e).__name__)
+        try:
+            try:
+                len(5)
+            except outrig.AgentError:
+                print('caught a TypeError')
+        except TypeError:
+            print('passed through')
+        "#);
+    let (said, _) = k.noted(PRIMARY, 3, &caught);
+    assert_eq!(said, "caught RequestCancelled\npassed through\n");
+}
+
+/// A spawn or a submission whose line to the host would be longer than one may be raises
+/// `ValueError` where it is made, sending nothing and keeping nothing: the host would drop the
+/// line unread, and the spawn would wait for an answer, or the submission for a round, for good.
+#[test]
+fn a_line_too_long_for_the_host_is_refused_where_it_is_made() {
+    let mut k = Interpreter::start();
+    let (spawn, notices) = k.exec_collecting(
+        PRIMARY,
+        1,
+        "await runtime.spawn('big', prompt='x' * (1 << 20))",
+    );
+    assert!(
+        text(&spawn["error"]).contains("ValueError: this spawn is")
+            && text(&spawn["error"]).contains("shorten the prompt"),
+        "{spawn}"
+    );
+    assert!(notices.is_empty(), "nothing sent: {notices:?}");
+    assert_eq!(
+        k.output(2, "import __main__\nprint(len(__main__._spawning))"),
+        "0\n"
+    );
+
+    k.spawn_as(3, "child = await runtime.spawn('w', prompt='p')", "c1");
+    let (submit, notices) = k.exec_collecting(
+        PRIMARY,
+        4,
+        "child.submit({'x' * 200 + str(n): n for n in range(6000)}, result=int)",
+    );
+    assert!(
+        text(&submit["error"]).contains("ValueError: this submission is"),
+        "{submit}"
+    );
+    assert!(notices.is_empty(), "nothing sent: {notices:?}");
+    assert_eq!(
+        k.output(5, "print(child._child.unsettled, len(child._child.queue))"),
+        "0 0\n",
+        "nothing taken, nothing queued"
+    );
+}
+
+/// Cancelled before the child receives it, a request never reaches it; after, the child's reply
+/// raises `RequestCancelled`. Either way the handle settles cancelled at once.
+#[test]
+fn a_cancelled_request_never_reaches_the_child_or_refuses_its_reply() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c1",
+    );
+    let (said, notices) = k.noted(
+        PRIMARY,
+        3,
+        "early = child.channels['fizz'].request('a')\n\
+         print(early.cancel(), child.channels['fizz'].pending(), early.status)",
+    );
+    assert_eq!(said, "True 0 failed: cancelled (child idle)\n");
+    let ended = notice(&notices, "agent.ended");
+    assert_eq!(
+        (&ended["outcome"], &ended["received"]),
+        (&json!("cancelled"), &json!(false))
+    );
+    let (raised, _) = k.exec_collecting(PRIMARY, 4, "await early");
+    assert!(
+        text(&raised["error"]).contains("RequestCancelled"),
+        "{raised}"
+    );
+
+    k.noted(PRIMARY, 5, "late = child.channels['fizz'].request('b')");
+    k.noted("c1", 6, "d = await runtime.channels['fizz'].receive()");
+    let (said, notices) = k.noted(PRIMARY, 7, "print(late.cancel())");
+    assert_eq!(said, "True\n");
+    assert_eq!(notice(&notices, "agent.ended")["received"], true);
+    let (refused, _) = k.exec_collecting("c1", 8, "await d.reply(1)");
+    assert!(
+        text(&refused["error"]).contains("RequestCancelled"),
+        "{refused}"
+    );
+    assert_eq!(
+        k.output_in("c1", 9, "print(runtime.channels['fizz'].pending())"),
+        "0\n"
+    );
+}
+
+/// A submission waits until the host gives it to the work child between rounds; its inputs are
+/// then bound, and the child completes it with the JSON form of its result, which the handle
+/// gives back as an instance. Progress arrives on the handle and settles nothing.
+#[test]
+fn a_submission_is_assigned_completed_and_reports_progress() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        "from dataclasses import dataclass\n\
+         @dataclass\n\
+         class Total:\n    total: int\n",
+    );
+    k.spawn_as(2, "child = await runtime.spawn('w', prompt='p')", "c1");
+    let (_, notices) = k.noted(
+        PRIMARY,
+        3,
+        "h = child.submit({'xs': [1, 2]}, result=Total)\nprint(h.status)",
+    );
+    let sent = notice(&notices, "agent.request");
+    assert_eq!(sent["channel"], Value::Null);
+    assert_eq!(sent["manifest"][0]["type"], "list[int]");
+    assert_eq!(sent["result"]["type"], "Total");
+    let request = sent["request"].clone();
+
+    k.send(json!({"t": "assign", "agent": "c1", "id": 50}));
+    let received = k.recv();
+    assert_eq!(
+        (&received["t"], &received["request"]),
+        (&json!("agent.received"), &request)
+    );
+    let assigned = k.recv();
+    assert_eq!(
+        (&assigned["t"], &assigned["request"]),
+        (&json!("agent.assigned"), &request)
+    );
+    assert_eq!(k.output(4, "print(h.status)"), "running (child idle)\n");
+    k.noted(
+        "c1",
+        5,
+        "await runtime.channels['progress'].send('half way')",
+    );
+    assert_eq!(
+        k.output(
+            6,
+            "d = await h.progress.receive()\nprint(d.body, d.sender, h.done())"
+        ),
+        "half way c1 False\n"
+    );
+    let (_, notices) = k.noted("c1", 7, "await runtime.complete({'total': sum(xs)})");
+    assert_eq!(notice(&notices, "agent.ended")["outcome"], "accepted");
+    assert_eq!(k.output(8, "print(await h)"), "Total(total=3)\n");
+
+    k.send(json!({"t": "assign", "agent": "c1", "id": 51}));
+    let assigned = k.recv();
+    assert_eq!(
+        (&assigned["t"], &assigned["request"]),
+        (&json!("agent.assigned"), &Value::Null)
+    );
+}
+
+/// Ending a child's kernel ends every request it holds `AgentReleased`, cancels its background
+/// tasks, and removes it, which it says; the session's close ends every open request with the
+/// closing error.
+#[test]
+fn an_ended_kernel_releases_its_requests_and_is_gone() {
+    let mut k = Interpreter::start();
+    k.spawn_as(
+        1,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c1",
+    );
+    k.output_in(
+        "c1",
+        2,
+        "import asyncio\nforever = asyncio.create_task(asyncio.sleep(3600), name='forever')",
+    );
+    k.noted(PRIMARY, 3, "h = child.channels['fizz'].request('a')");
+    k.send(json!({"t": "end", "agent": "c1", "id": 52}));
+    let ended = k.recv();
+    assert_eq!(
+        (&ended["t"], &ended["outcome"]),
+        (&json!("agent.ended"), &json!("released"))
+    );
+    let gone = k.recv();
+    assert_eq!(
+        (&gone["t"], &gone["agent"]),
+        (&json!("ended"), &json!("c1"))
+    );
+    let (raised, _) = k.exec_collecting(PRIMARY, 4, "await h");
+    assert!(text(&raised["error"]).contains("AgentReleased"), "{raised}");
+    assert_eq!(
+        k.output(5, "import __main__\nprint('c1' in __main__._kernels)"),
+        "False\n"
+    );
+
+    k.spawn_as(
+        6,
+        "other = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c2",
+    );
+    k.noted(PRIMARY, 7, "h2 = other.channels['fizz'].request('b')");
+    k.send(json!({"t": "close", "reason": "the owner closed it"}));
+    let closed = k.recv();
+    assert_eq!(closed["outcome"], "closed", "{closed}");
+    let (raised, _) = k.exec_collecting(PRIMARY, 8, "await h2");
+    assert!(
+        text(&raised["error"]).contains("SessionClosing")
+            && text(&raised["error"]).contains("owner"),
+        "{raised}"
     );
 }

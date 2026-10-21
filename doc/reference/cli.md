@@ -412,6 +412,18 @@ decides what to do next, in the same round. What the wait was on keeps running, 
 can wait on it again. Python waiting with a bare `await` is not ended by a message; Ctrl-C stops
 it.
 
+**The agent's Python can launch child agents.** `await runtime.spawn(name, prompt=...)` launches
+one: an agent on its parent's model, or the one `model=` names, whose code runs in the same
+interpreter in a namespace of its own, with no user channel. A work child takes
+submissions, `child.submit(inputs, result=T)`, and answers each with `await
+runtime.complete(value)`; a request child, launched with `requests={"fizz": outrig.Request(str,
+Thing)}`, answers what is sent on its channels. Each submission and request returns a handle at
+once, and awaiting it gives a value of the declared type or raises an `outrig.AgentError` saying
+why there is none; `help(runtime.spawn)` has the rest. `children-max`, `model-concurrency-max`,
+`requests-max`, and `token-budget` bound them (see [Top level](config.md#top-level)). A child's
+code and model calls are in the event log, under the child's own subject, and are not printed
+here.
+
 **The model is sent part of the conversation; the agent's Python holds all of it.** A round is
 the agent's work on the messages waiting when it starts. Each model call is chosen the session's
 first two rounds, the six before the current one, and the current one. Everything is in

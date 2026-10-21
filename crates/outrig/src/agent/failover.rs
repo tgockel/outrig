@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use super::budget::Budget;
 use super::history::{Adjacent, History, TooLarge};
 use super::ledger::CallSlot;
-use super::retry::RetryPolicy;
+use super::retry::{BudgetSpent, RetryPolicy};
 use crate::harness::event::{CallId, Payload};
 
 /// One candidate of a chain, behind an object-safe interface.
@@ -252,7 +252,9 @@ struct Abandoned {
 /// call, with the reason. What must not happen is a failure disappearing, so
 /// every reason is kept and reported together on exhaustion -- unless every
 /// one is a window too small, which is no failure of any model's but the call
-/// not being made ([`unfit`]).
+/// not being made ([`unfit`]). The exception is a request the session's spent
+/// token budget refused ([`BudgetSpent`]), which ends the call: every
+/// candidate would be refused the same.
 ///
 /// Every agent's model is one of these. A chain of one returns its candidate's
 /// error as it stands, and arms a deadline whose bound reproduces what the
@@ -340,7 +342,7 @@ impl FailoverModel {
     fn announce(&self, from: &str, to: &str, error: &CompletionError, call: CallId) {
         let error = error.to_string();
         tracing::warn!("model {from} failed ({error}); trying {to}");
-        self.slot.ledger().events().emit(Payload::ModelFailover {
+        self.slot.events().emit(Payload::ModelFailover {
             from: from.to_string(),
             to: to.to_string(),
             error,
@@ -608,6 +610,9 @@ impl CompletionModel for FailoverModel {
                             message_id: response.message_id,
                         });
                     }
+                    // The session's spent budget would refuse every candidate
+                    // the same.
+                    Err(spent) if BudgetSpent::of(&spent) => return Err(spent),
                     Err(error) => {
                         // What the round says of a refusal is about the view
                         // that was refused, which only this loop has.
@@ -773,6 +778,7 @@ mod tests {
     /// fixture that flattened everything to `ProviderError` could not observe.
     fn clone_error(e: &CompletionError) -> CompletionError {
         match e {
+            e if BudgetSpent::of(e) => spent(),
             CompletionError::ResponseError(m) => CompletionError::ResponseError(m.clone()),
             CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(status)) => {
                 CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(*status))
@@ -794,6 +800,11 @@ mod tests {
         CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(
             reqwest::StatusCode::from_u16(code).expect("status"),
         ))
+    }
+
+    /// What a request gets once the session's token budget is spent.
+    fn spent() -> CompletionError {
+        rig::http_client::Error::Instance(Box::new(BudgetSpent)).into()
     }
 
     /// A request as rig builds one for an agent with a preamble: the system
@@ -1190,6 +1201,25 @@ mod tests {
         );
     }
 
+    /// A request refused because the session's token budget is spent ends the
+    /// call there: every candidate would be refused the same, so none after
+    /// it is tried, and the refusal comes back as it stands.
+    #[tokio::test]
+    async fn a_spent_budget_tries_no_other_candidate() {
+        let second = Scripted::ok("anthropic");
+        let calls = Arc::clone(&second.calls);
+        let err = chain(vec![
+            Box::new(Scripted::failing("bedrock", spent())),
+            Box::new(second),
+        ])
+        .completion(request())
+        .await
+        .expect_err("the budget is spent");
+
+        assert!(BudgetSpent::of(&err), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the second is not tried");
+    }
+
     /// The load-bearing per-candidate rewrite: after a move, candidate two's own
     /// ceiling reaches the wire, not candidate one's.
     #[tokio::test]
@@ -1397,7 +1427,11 @@ mod tests {
                 Box::new(Scripted::failing("anthropic", http_status(503))),
             ],
             Arc::new(Views::default()),
-            CallSlot::new(Ledger::new(events.clone())),
+            CallSlot::new(
+                Ledger::new(events.clone(), None, None),
+                events.clone(),
+                None,
+            ),
         )
         .completion(request())
         .await

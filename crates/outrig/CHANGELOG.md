@@ -392,6 +392,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builder names, and an agent it names must still be configured, since it chooses the container's
   image. The interpreter now starts with no kernel and builds one for each agent the
   session opens, the primary's on its main thread, so a session with none has no hidden one.
+- **Child agents: an agent's code launches them, and awaits their typed results.**
+  `await runtime.spawn(name, prompt=..., model=None, inputs=None, requests=None)` launches a child
+  as a kernel of the session's interpreter, with its own namespace, model and rounds, which the
+  engine drives. A work child takes submissions, `child.submit(inputs, result=T, attempts=3)`, one
+  at a time with the rest queued, and answers each with `await runtime.complete(value)`. A request
+  child, `requests={"fizz": outrig.Request(str, Thing, doc=...)}`, answers requests sent with
+  `child.channels["fizz"].request(body)` by `await delivery.reply(value)` or `await
+  delivery.fail(message)`. Each returns a handle at once: `await handle` gives an instance of the
+  declared type or raises an `outrig.AgentError` -- `CompletionRejected`, `AgentReleased`,
+  `AgentRequestFailed`, `RequestCancelled`, `AgentLimitReached`, `BudgetExhausted`,
+  `SessionClosing` -- and `done()`, `result()`, `cancel()`, `status`, an `outrig.Status`,
+  `future`, and a submission's `progress` answer without waiting; `runtime.wait` takes handles.
+  What one agent gives another is a deep copy, checked against its declared type where it is
+  sent, and an answer that fails its check raises in the child with each problem's path and
+  counts one attempt. `await runtime.release(children)` releases children and everything below
+  them, all of a batch or none of it; a child whose code never yields is reported wedged, and a
+  spawn heard after its agent was released launches nothing. A spawn or a submission that would
+  take more than 1 MiB to tell the engine of raises `ValueError`, sending nothing. A child has no
+  user channel, and inherits its parent's tool limits but not its preamble. Every `Delivery` now
+  carries an `id`.
+
+  The engine opens a child's round when what it holds -- the requests waiting unread, and those
+  it took and has not answered -- has changed since the last round opened on it, and holds
+  something: a request to an idle child starts a round, a child that answered anything gets the
+  next, a request it took and left unanswered earns one more, and an unchanged state opens
+  nothing. A work child whose round and the one after both end without completing ends its
+  submission `CompletionRejected`. A child's round whose model call fails is tried again after a
+  wait -- as it was, when its code never ran, and otherwise on what is open then, so work its code
+  finished is not given again -- unless the failure cannot clear, a refused key say, which fails
+  what the child holds. `Config` and `Agent` gain four limits, set at the top level or under
+  `[agents.<name>]`: `children_max` (64 by default, 1 to 1024) children resident at once,
+  `model_concurrency_max` (8, 1 to 128) model requests in flight across the session, each holding
+  its place until what it used is counted, and `requests_max` (256, 1 to 4096) unsettled requests
+  per child, each refusing at once with `AgentLimitReached` rather than waiting; and
+  `token_budget`, unset by default, over every agent's model calls, the main agent's included,
+  checked as each request is sent, retries included, past which a child's open work ends
+  `BudgetExhausted` and the main agent's round stops with a reason naming `token-budget`.
+  `ConfigValidationError::LimitOutOfRange` names a key outside its range. A spawn from an agent at
+  `subagent-depth-max` is refused.
+
+  A child's events carry its own subject, `agent/c1`. New events record each launch, each
+  request's steps, releases and wedged children: `agent.spawned`, `agent.request.sent`,
+  `.received`, `.replied`, `.invalid`, `.progress`, `.failed`, `.cancelled`, `.settled` and
+  `.refused`, `agent.released`, and `agent.wedged`. The round events gain `descendants` and
+  `total`, the attempts and spend of the children a round launched, and `model.round.usage`
+  records what they spent after the round ended. `ShutdownReport::requests` lists each request
+  open at the close as a `RequestOutcome`.
 
 ### Changed
 

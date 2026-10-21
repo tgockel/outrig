@@ -1,7 +1,7 @@
 //! The session an owner holds: its rounds, its user channel, its interrupter,
 //! and how it stops.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -14,9 +14,10 @@ use super::report::{
 };
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
+use crate::agent::children::{self, Children};
 use crate::agent::ledger::Ledger;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
-use crate::config::Config;
+use crate::config::{Config, Secrets};
 use crate::python::host::{Interpreter, PRIMARY};
 use crate::python::supervisor::STOP_GRACE;
 
@@ -56,16 +57,30 @@ pub struct Session {
     bindings: Bindings,
     /// Every model call the session makes, whichever agent makes it.
     ledger: Ledger,
+    /// The child agents its agents launch.
+    children: Children,
     /// Why its shutdown is to say it is not proven stopped, for a test.
     #[cfg(test)]
     fail_stop: Option<String>,
+}
+
+/// What a session's child agents are made from: the configuration and the
+/// secrets the session was started with, the session's agent, whose limits
+/// apply, and the workspace their instructions name.
+pub(crate) struct ChildSetup {
+    pub(crate) config: Arc<Config>,
+    pub(crate) secrets: Arc<dyn Secrets>,
+    pub(crate) agent: Option<String>,
+    pub(crate) workspace: Option<PathBuf>,
 }
 
 impl Session {
     /// A session over what its start launched: `interpreter`, in `container`
     /// when there is one, moving through `lifecycle`, beside `bindings`. The
     /// interpreter's admission is the session's, and its exit closes it. It
-    /// has no primary agent until [`Session::build_primary`] builds one.
+    /// has no primary agent until [`Session::build_primary`] builds one. Its
+    /// agents' children are made from `setup`, under the limits its
+    /// configuration sets for its agent.
     pub(crate) fn new(
         id: String,
         interpreter: Interpreter,
@@ -73,6 +88,7 @@ impl Session {
         container_name: String,
         lifecycle: Arc<Lifecycle>,
         bindings: Bindings,
+        setup: ChildSetup,
     ) -> Self {
         lifecycle.attach(interpreter.gate());
         // Weak: the interpreter outlives nothing the session holds, and a strong
@@ -83,7 +99,26 @@ impl Session {
                 lifecycle.exited();
             }
         });
-        let ledger = Ledger::new(lifecycle.events().clone());
+        let limits = setup.config.limits(setup.agent.as_deref());
+        let ledger = Ledger::new(
+            lifecycle.events().clone(),
+            Some(limits.model_concurrency_max as usize),
+            limits.token_budget,
+        );
+        let children = Children::new(
+            interpreter.clone(),
+            ledger.clone(),
+            Arc::clone(&lifecycle),
+            children::Settings {
+                config: setup.config,
+                secrets: setup.secrets,
+                agent: setup.agent,
+                limits,
+                workspace: setup.workspace,
+                bindings: bindings.briefs(),
+                container: container_name.clone(),
+            },
+        );
         Self {
             id,
             agent: None,
@@ -93,6 +128,7 @@ impl Session {
             lifecycle,
             bindings,
             ledger,
+            children,
             #[cfg(test)]
             fail_stop: None,
         }
@@ -125,6 +161,8 @@ impl Session {
             self.ledger.clone(),
             Arc::clone(&self.lifecycle),
         )?;
+        self.children
+            .root(PRIMARY, &resolved.model, agent.slot().clone());
         self.agent = Some(agent);
         Ok(())
     }
@@ -197,7 +235,7 @@ impl Session {
     /// them. Every call hands out the same channel. `None` for a session with
     /// no primary agent, which has no user channel.
     pub fn user_channel(&self) -> Option<UserChannel> {
-        self.agent.as_ref().map(Agent::user_channel)
+        self.agent.as_ref().and_then(Agent::user_channel)
     }
 
     /// A function that stops the Python the current round is waiting on --
@@ -356,10 +394,14 @@ impl Session {
             lifecycle,
             mut bindings,
             ledger: _,
+            children,
             #[cfg(test)]
             fail_stop,
         } = self;
         lifecycle.close(ClosedBy::Owner);
+        // No child makes another model call; their requests end as the
+        // interpreter hears of the close.
+        children.stop();
         let until = tokio::time::Instant::now() + deadline;
         let events = lifecycle.events();
         let gate = interpreter.gate();
@@ -378,12 +420,7 @@ impl Session {
                 // runs, the execution ends `error` rather than `unknown`, and a
                 // hosted call whose coroutine callback the interrupt wakes is
                 // answered with it, so the call ends `raised`.
-                for (id, end) in gate.live_at_close() {
-                    if end.is_none() {
-                        interpreter.cancel(id);
-                        interpreter.interrupt(id, false);
-                    }
-                }
+                interpreter.stop_live();
                 let _ = tokio::time::timeout(TERMINATE_GRACE, drained()).await;
             }
         }
@@ -438,6 +475,8 @@ impl Session {
             })
             .collect();
         let closed_by = gate.closed().unwrap_or(ClosedBy::Owner);
+        let requests = children.report();
+        drop(children);
         if let Some(agent) = agent {
             drop(agent);
             events.emit(Payload::AgentStopped {});
@@ -448,6 +487,7 @@ impl Session {
             executions: executions.clone(),
             hosted: hosted.clone(),
             bindings: binding_stop.clone(),
+            requests: requests.clone(),
             verdict: report::verdict(&stopped, &executions, &hosted),
         });
         let log = events
@@ -463,6 +503,7 @@ impl Session {
             executions,
             hosted,
             bindings: binding_stop,
+            requests,
             events: EventDelivery {
                 last_sequence: tally.last,
                 missed: tally.missed,
@@ -497,6 +538,12 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn bindings(&self) -> &Bindings {
         &self.bindings
+    }
+
+    /// The session's ledger, for a test.
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> &Ledger {
+        &self.ledger
     }
 
     /// The session's container, for a test.

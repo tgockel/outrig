@@ -54,6 +54,38 @@ pub const DEFAULT_SUBAGENT_WIDTH_MAX: u32 = 8;
 /// Upper bound accepted for `subagent-width-max`, keeping fan-out finite.
 pub const SUBAGENT_WIDTH_MAX_CEILING: u32 = 16;
 
+/// How many children a `run-new` session holds at once by default, idle and
+/// wedged ones included: each is a thread and its memory in the interpreter.
+pub(crate) const DEFAULT_CHILDREN_MAX: u32 = 64;
+/// Upper bound accepted for `children-max`: past about a thousand kernels of
+/// some 16 MiB each, the interpreter's memory ceiling is the real limit.
+pub(crate) const CHILDREN_MAX_CEILING: u32 = 1024;
+/// How many model requests a session has in flight at once by default, every
+/// agent's together.
+pub(crate) const DEFAULT_MODEL_CONCURRENCY_MAX: u32 = 8;
+/// Upper bound accepted for `model-concurrency-max`, past what one provider
+/// key is likely to allow.
+pub(crate) const MODEL_CONCURRENCY_MAX_CEILING: u32 = 128;
+/// How many requests one child holds unsettled by default.
+pub(crate) const DEFAULT_REQUESTS_MAX: u32 = 256;
+/// Upper bound accepted for `requests-max`: each unsettled request holds a
+/// body, and a child answering one per round would spend that many rounds.
+pub(crate) const REQUESTS_MAX_CEILING: u32 = 4096;
+
+/// The limits a `run-new` session's agents run under, as the session's agent
+/// and the top level set them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// The deepest an agent may be and still launch a child; the primary is
+    /// at depth 1.
+    pub(crate) depth_max: u32,
+    pub(crate) children_max: u32,
+    pub(crate) model_concurrency_max: u32,
+    pub(crate) requests_max: u32,
+    /// Tokens the session's model calls may spend in all; `None` caps nothing.
+    pub(crate) token_budget: Option<u64>,
+}
+
 /// Scratch state for [`Config::model_candidates`]' depth-first walk.
 ///
 /// Four collections rather than one, because they answer four different
@@ -349,6 +381,24 @@ pub struct Config {
     /// [`DEFAULT_SUBAGENT_WIDTH_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_width_max: Option<u32>,
+    /// How many children a `run-new` session may hold at once -- launching,
+    /// working, idle, or wedged -- 64 when unset. A launch past it fails at
+    /// once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_max: Option<u32>,
+    /// How many model requests a session may have in flight at once, every
+    /// agent's together, 8 when unset. A request past it waits its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_concurrency_max: Option<u32>,
+    /// How many requests one child may have unsettled, 256 when unset. A
+    /// request or submission past it fails at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_max: Option<u32>,
+    /// How many tokens a `run-new` session's model calls may spend in all,
+    /// every agent's together. Unset, nothing caps them; once spent, no agent
+    /// makes another model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
     /// Default transient-retry budget for every remote provider, in seconds.
     /// A `[providers.<name>]` row of its own overrides this. See
     /// [`DEFAULT_RETRY_BUDGET_SECS`].
@@ -1332,6 +1382,22 @@ pub struct Agent {
     /// [`DEFAULT_SUBAGENT_WIDTH_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_width_max: Option<u32>,
+    /// Per-agent override of the top-level `children-max`, for a session this
+    /// agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_max: Option<u32>,
+    /// Per-agent override of the top-level `model-concurrency-max`, for a
+    /// session this agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_concurrency_max: Option<u32>,
+    /// Per-agent override of the top-level `requests-max`, for a session this
+    /// agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_max: Option<u32>,
+    /// Per-agent override of the top-level `token-budget`, for a session this
+    /// agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
 }
 
 impl Agent {
@@ -1339,6 +1405,31 @@ impl Agent {
     /// this agent. Defaults to enabled when the key is absent.
     pub fn subagents_enabled(&self) -> bool {
         self.subagents.unwrap_or(true)
+    }
+}
+
+impl Config {
+    /// The limits a session of `agent` runs under: for each, the agent's own
+    /// `[agents.<name>]` value, else the top level's, else the default. With
+    /// no agent, or one this config does not define, the top level's.
+    pub(crate) fn limits(&self, agent: Option<&str>) -> Limits {
+        let agent = agent.and_then(|name| self.agents.get(name));
+        let own = |key: fn(&Agent) -> Option<u32>| agent.and_then(key);
+        Limits {
+            depth_max: own(|a| a.subagent_depth_max)
+                .or(self.subagent_depth_max)
+                .unwrap_or(DEFAULT_SUBAGENT_DEPTH_MAX),
+            children_max: own(|a| a.children_max)
+                .or(self.children_max)
+                .unwrap_or(DEFAULT_CHILDREN_MAX),
+            model_concurrency_max: own(|a| a.model_concurrency_max)
+                .or(self.model_concurrency_max)
+                .unwrap_or(DEFAULT_MODEL_CONCURRENCY_MAX),
+            requests_max: own(|a| a.requests_max)
+                .or(self.requests_max)
+                .unwrap_or(DEFAULT_REQUESTS_MAX),
+            token_budget: agent.and_then(|a| a.token_budget).or(self.token_budget),
+        }
     }
 }
 
@@ -3113,6 +3204,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each limit is the agent's own, else the top level's, else the default;
+    /// the token budget has none.
+    #[test]
+    fn limits_read_the_agent_then_the_top_level_then_the_default() {
+        let cfg = Config::load_from_str(
+            "children-max = 10\nrequests-max = 20\ntoken-budget = 30\n\
+             [agents.coding]\nchildren-max = 2\nsubagent-depth-max = 5\n",
+        )
+        .expect("parses");
+        let expected = Limits {
+            depth_max: 5,
+            children_max: 2,
+            model_concurrency_max: DEFAULT_MODEL_CONCURRENCY_MAX,
+            requests_max: 20,
+            token_budget: Some(30),
+        };
+        assert_eq!(cfg.limits(Some("coding")), expected);
+        assert_eq!(
+            cfg.limits(None),
+            Limits {
+                depth_max: DEFAULT_SUBAGENT_DEPTH_MAX,
+                children_max: 10,
+                ..expected
+            }
+        );
+        assert_eq!(
+            Config::default().limits(Some("absent")),
+            Limits {
+                depth_max: DEFAULT_SUBAGENT_DEPTH_MAX,
+                children_max: DEFAULT_CHILDREN_MAX,
+                model_concurrency_max: DEFAULT_MODEL_CONCURRENCY_MAX,
+                requests_max: DEFAULT_REQUESTS_MAX,
+                token_budget: None,
+            }
+        );
+    }
 
     fn expand(path: &str) -> PathBuf {
         expand_tilde(Path::new(path), Some(Path::new("/home/you")))

@@ -330,6 +330,11 @@ impl Relay {
         self.with(|s| s.agents.insert(agent.to_string()));
     }
 
+    /// Carry no more of `agent`'s lines: its kernel has ended, having closed its connections.
+    pub(crate) fn forget(&self, agent: &str) {
+        self.with(|s| s.agents.remove(agent));
+    }
+
     /// One of `agent`'s `rpc` lines, for the process.
     pub(crate) fn rpc(&self, agent: &str, mut rpc: Rpc) {
         self.with(|s| {

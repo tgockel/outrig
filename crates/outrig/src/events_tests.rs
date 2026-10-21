@@ -11,7 +11,8 @@ use super::*;
 use crate::agent::rig_json;
 use crate::harness::event::*;
 use crate::harness::{
-    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, Stopped, Verdict,
+    BindingStop, ClosedBy, ExecutionOutcome, ExecutionStatus, HostedCall, RequestOutcome, Stopped,
+    Verdict,
 };
 
 const SOURCE: &str = "/outrig/session/20260921T103000-a1b2";
@@ -243,6 +244,12 @@ fn each_event_has_exactly_its_data_fields() {
                     survivors: Vec::new(),
                     exited: None,
                 }),
+                requests: vec![RequestOutcome {
+                    request: AgentRequestId::new(7),
+                    child: text("c1"),
+                    channel: Some(text("fizz")),
+                    outcome: RequestEnd::Closed,
+                }],
                 verdict: Verdict::StoppedWithUnknown,
             },
             "session.report",
@@ -252,6 +259,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "executions",
                 "hosted",
                 "bindings",
+                "requests",
                 "verdict",
             ],
         ),
@@ -492,6 +500,8 @@ fn each_event_has_exactly_its_data_fields() {
                 calls: calls(),
                 attempts: vec![attempt],
                 input_tokens_max: Some(12),
+                descendants: vec![AttemptId::new(5)],
+                total: Some(usage),
             },
             "model.round.completed",
             &[
@@ -501,6 +511,8 @@ fn each_event_has_exactly_its_data_fields() {
                 "calls",
                 "attempts",
                 "input_tokens_max",
+                "descendants",
+                "total",
             ],
         ),
         (
@@ -510,9 +522,19 @@ fn each_event_has_exactly_its_data_fields() {
                 calls: calls(),
                 usage: None,
                 attempts: vec![attempt],
+                descendants: Vec::new(),
+                total: None,
             },
             "model.round.failed",
-            &["round", "error", "calls", "usage", "attempts"],
+            &[
+                "round",
+                "error",
+                "calls",
+                "usage",
+                "attempts",
+                "descendants",
+                "total",
+            ],
         ),
         (
             Payload::ModelRoundDropped {
@@ -520,10 +542,140 @@ fn each_event_has_exactly_its_data_fields() {
                 calls: calls(),
                 usage: None,
                 attempts: vec![attempt],
+                descendants: Vec::new(),
+                total: None,
             },
             "model.round.dropped",
-            &["round", "calls", "usage", "attempts"],
+            &[
+                "round",
+                "calls",
+                "usage",
+                "attempts",
+                "descendants",
+                "total",
+            ],
         ),
+        (
+            Payload::ModelRoundUsage {
+                round: 1,
+                attempts: vec![attempt],
+                usage: Some(usage),
+            },
+            "model.round.usage",
+            &["round", "attempts", "usage"],
+        ),
+        (
+            Payload::AgentSpawned {
+                name: text("audit"),
+                parent: text("agent/primary"),
+                kind: ChildKind::Request,
+                model: text("fast"),
+                depth: 2,
+                inputs: vec![InputBrief {
+                    name: text("repo_path"),
+                    type_name: text("str"),
+                    preview: text("\"/workspace\""),
+                }],
+                channels: vec![ChannelBrief {
+                    name: text("fizz"),
+                    request: text("str"),
+                    reply: text("Thing"),
+                }],
+            },
+            "agent.spawned",
+            &[
+                "name", "parent", "kind", "model", "depth", "inputs", "channels",
+            ],
+        ),
+        (
+            Payload::AgentRequestSent {
+                request: AgentRequestId::new(7),
+                channel: Some(text("fizz")),
+                sender: text("agent/primary"),
+                body: text("\"Hello\""),
+                attempts_max: 3,
+            },
+            "agent.request.sent",
+            &["request", "channel", "sender", "body", "attempts_max"],
+        ),
+        (
+            Payload::AgentRequestReceived {
+                request: AgentRequestId::new(7),
+                round: Some(1),
+            },
+            "agent.request.received",
+            &["request", "round"],
+        ),
+        (
+            Payload::AgentRequestReplied {
+                request: AgentRequestId::new(7),
+                attempt: 1,
+                value: text("{}"),
+            },
+            "agent.request.replied",
+            &["request", "attempt", "value"],
+        ),
+        (
+            Payload::AgentRequestInvalid {
+                request: AgentRequestId::new(7),
+                attempt: 1,
+                problems: vec![text("$.name: missing")],
+            },
+            "agent.request.invalid",
+            &["request", "attempt", "problems"],
+        ),
+        (
+            Payload::AgentRequestFailed {
+                request: AgentRequestId::new(7),
+                message: text("no such file"),
+            },
+            "agent.request.failed",
+            &["request", "message"],
+        ),
+        (
+            Payload::AgentRequestCancelled {
+                request: AgentRequestId::new(7),
+                received: true,
+            },
+            "agent.request.cancelled",
+            &["request", "received"],
+        ),
+        (
+            Payload::AgentRequestProgress {
+                request: AgentRequestId::new(7),
+                body: text("half way"),
+            },
+            "agent.request.progress",
+            &["request", "body"],
+        ),
+        (
+            Payload::AgentRequestSettled {
+                request: AgentRequestId::new(7),
+                outcome: RequestEnd::Accepted,
+                attempts: 1,
+                rounds: vec![1, 2],
+            },
+            "agent.request.settled",
+            &["request", "outcome", "attempts", "rounds"],
+        ),
+        (
+            Payload::AgentRequestRefused {
+                request: AgentRequestId::new(7),
+                ended: RequestEnd::Cancelled,
+            },
+            "agent.request.refused",
+            &["request", "ended"],
+        ),
+        (
+            Payload::AgentReleased {
+                released: vec![text("c1")],
+                ended: vec![text("c1"), text("c2")],
+                requests: vec![AgentRequestId::new(7)],
+            },
+            "agent.released",
+            &["released", "ended", "requests"],
+        ),
+        (Payload::AgentWedged {}, "agent.wedged", &[]),
         (
             Payload::ModelAttempt(ModelAttempt {
                 call_id: call,
@@ -735,6 +887,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "survivors": [],
                 "exited": null,
             },
+            "requests": [{"request": 7, "child": "c1", "channel": "fizz", "outcome": "closed"}],
             "verdict": "stopped_with_unknown",
         })
     );

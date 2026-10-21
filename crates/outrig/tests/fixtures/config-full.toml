@@ -11,6 +11,10 @@ tool-call-max      = 100
 tool-result-max    = 524288
 subagent-depth-max = 4
 subagent-width-max = 6
+children-max       = 32
+model-concurrency-max = 4
+requests-max       = 128
+token-budget       = 20000000
 retry-budget-secs  = 300
 mcp-call-timeout-secs = 900
 
@@ -80,6 +84,10 @@ tool-call-max      = 300
 tool-result-max    = 1048576
 subagent-depth-max = 2
 subagent-width-max = 3
+children-max       = 16
+model-concurrency-max = 2
+requests-max       = 64
+token-budget       = 5000000
 
 [agents.review]
 model    = "smart"

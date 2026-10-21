@@ -401,6 +401,9 @@ fn decode_line(bytes: &[u8]) -> String {
     String::from_utf8_lossy(line).into_owned()
 }
 
+/// The subject of the main agent's events (`doc/reference/events.md`).
+const MAIN_AGENT: &str = "agent/primary";
+
 /// What the session shows, rendered and queued on [`Output`], which writes it.
 /// Nothing here waits on the terminal.
 struct Terminal<'a> {
@@ -422,12 +425,16 @@ impl Terminal<'_> {
         self.out.line(text);
     }
 
-    /// What the terminal shows of one of the session's events: each
-    /// submission as it starts, and a note when some were not shown.
+    /// What the terminal shows of one of the session's events: each of the
+    /// main agent's submissions as it starts, and a note when some were not
+    /// shown. A child's code runs under the child's own subject, and is left
+    /// to the event log.
     fn event(&self, received: Received) {
         match received {
             Received::Event(event) => {
-                if let Payload::ExecSubmitted { source, .. } = &event.payload {
+                if let Payload::ExecSubmitted { source, .. } = &event.payload
+                    && event.subject.as_ref().map(|s| s.as_str()) == Some(MAIN_AGENT)
+                {
                     self.out.text(render_submission(source));
                 }
             }

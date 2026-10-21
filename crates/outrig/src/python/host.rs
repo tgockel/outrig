@@ -99,8 +99,8 @@ use tokio::task::JoinHandle;
 
 use crate::container::{Container, ExecOptions};
 use crate::error::OutrigError;
-use crate::events::{Events, PRIMARY_SUBJECT};
-use crate::harness::event::{self, ExecStatus, Payload, Refusal};
+use crate::events::Events;
+use crate::harness::event::{self, ExecStatus, Payload, Refusal, Subject};
 use crate::harness::{Closed, ClosedBy, ExecutionStatus};
 
 use super::hosted::{Notice, Relay, Rpc};
@@ -313,8 +313,9 @@ pub(crate) struct Tasks {
     pub(crate) more: usize,
 }
 
-/// A handle on a session's interpreter, addressing its primary agent. Cheap
-/// to clone; every clone drives the one interpreter.
+/// A handle on a session's interpreter, addressing one of its kernels: the
+/// primary agent's, unless [`Interpreter::for_agent`] made it. Cheap to clone;
+/// every clone drives the one interpreter.
 #[derive(Clone)]
 pub(crate) struct Interpreter {
     table: Arc<Mutex<Table>>,
@@ -324,8 +325,10 @@ pub(crate) struct Interpreter {
     /// The Python version the interpreter greeted with, as `sys.version`'s
     /// first word.
     version: Arc<str>,
-    /// Where what this interpreter's agent does is recorded.
+    /// Where what this handle's agent does is recorded.
     events: Events,
+    /// The kernel this handle addresses, as the protocol names it.
+    agent: Arc<str>,
 }
 
 /// The writer's queue, held by a handle either strongly or weakly. A strong
@@ -363,6 +366,8 @@ impl Lines {
 /// later interrupt or cancellation targets.
 pub(crate) struct Execution {
     id: ExecId,
+    /// The kernel it was submitted to.
+    agent: Arc<str>,
     /// Whether the source went to the interpreter, rather than being refused
     /// because the slot was taken.
     queued: bool,
@@ -379,21 +384,19 @@ pub(crate) struct Execution {
 #[derive(Default)]
 struct Table {
     last_id: u64,
-    /// The agent's outstanding execution, answered or not. One at a time.
-    slot: Option<Slot>,
+    /// Each kernel the host addresses, by agent: its outstanding execution,
+    /// what it has not reported, and what takes its changes of context. Made
+    /// on first use, or when the kernel is opened.
+    kernels: HashMap<Arc<str>, KernelState>,
     /// Requests other than executions, by id, until answered.
     queries: HashMap<ExecId, Query>,
-    late: Vec<Late>,
-    /// Where the agent's messages to the user go, once someone subscribed,
-    /// each under the id the event log knows it by.
+    /// Where the primary agent's messages to the user go, once someone
+    /// subscribed, each under the id the event log knows it by.
     outbox: Option<mpsc::UnboundedSender<(ExecId, String)>>,
-    /// Where the agent's promotions and demotions go, once something
-    /// registered for them.
-    on_context: Option<ContextChanged>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
-    /// Where what crosses the protocol is recorded, for what is recorded
-    /// under this lock.
+    /// Where what crosses the protocol is recorded, for what concerns the
+    /// interpreter rather than one kernel.
     events: Events,
     /// The session's close, once admission has closed.
     closing: Option<Closing>,
@@ -416,6 +419,39 @@ struct Table {
     /// Who waits for each kernel being opened: its `ready`, or why it was not
     /// built.
     opening: HashMap<String, oneshot::Sender<Result<(), String>>>,
+    /// Who waits for each kernel being ended: its `ended`.
+    ending: HashMap<String, oneshot::Sender<()>>,
+    /// Where the lines about child agents go, once the session listens.
+    children: Option<ChildLines>,
+    /// The writer's queue, held weakly, for the close's own line to the
+    /// interpreter when no relay carries it.
+    lines: Option<Lines>,
+}
+
+/// What hears the lines a kernel sends about child agents -- a spawn, a
+/// release, what became of a request -- with the agent that sent each.
+pub(crate) type ChildLines = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+/// What the host holds for one kernel.
+struct KernelState {
+    /// Where what the kernel's agent does is recorded.
+    events: Events,
+    /// Its outstanding execution, answered or not. One at a time.
+    slot: Option<Slot>,
+    late: Vec<Late>,
+    /// Where its promotions and demotions go, once something registered.
+    on_context: Option<ContextChanged>,
+}
+
+impl KernelState {
+    fn new(events: Events) -> Self {
+        Self {
+            events,
+            slot: None,
+            late: Vec::new(),
+            on_context: None,
+        }
+    }
 }
 
 /// What an exit is told.
@@ -549,6 +585,9 @@ enum Reply {
     Rpc(Rpc),
     /// A hosted call the interpreter never sent: the relay records it.
     Hosted(Notice),
+    /// A kernel the host asked to end has ended: its loop has stopped and its
+    /// thread is done.
+    Ended {},
     #[serde(other)]
     Other,
 }
@@ -663,11 +702,12 @@ impl Interpreter {
                 return Err(InterpreterError::Startup(format!("{problem}; {cause}")));
             }
         };
+        let (lines, queued) = mpsc::unbounded_channel();
         let table = Arc::new(Mutex::new(Table {
             events: events.clone(),
+            lines: Some(Lines::Open(lines.clone()).downgrade()),
             ..Table::default()
         }));
-        let (lines, queued) = mpsc::unbounded_channel();
         if events.is_on() {
             let _ = lines.send(format!("{}\n", json!({"t": "observe"})));
         }
@@ -684,6 +724,7 @@ impl Interpreter {
             lines,
             version: version.into(),
             events,
+            agent: PRIMARY.into(),
         })
     }
 
@@ -697,6 +738,19 @@ impl Interpreter {
             lines: self.lines.downgrade(),
             version: Arc::clone(&self.version),
             events: self.events.clone(),
+            agent: Arc::clone(&self.agent),
+        }
+    }
+
+    /// A handle on the same interpreter addressing `agent`'s kernel, whose
+    /// events are that agent's.
+    pub(crate) fn for_agent(&self, agent: &str) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            lines: self.lines.clone(),
+            version: Arc::clone(&self.version),
+            events: self.events.for_agent(agent),
+            agent: agent.into(),
         }
     }
 
@@ -717,7 +771,7 @@ impl Interpreter {
         &self.version
     }
 
-    /// Where this interpreter's agent's events are recorded.
+    /// Where this handle's agent's events are recorded.
     pub(crate) fn events(&self) -> &Events {
         &self.events
     }
@@ -730,15 +784,45 @@ impl Interpreter {
     /// One the interpreter could not build fails with why, and one it never
     /// answers for fails once [`READY_TIMEOUT`] has passed.
     pub(crate) async fn open(&self, agent: &str) -> Result<(), InterpreterError> {
+        self.opened(
+            agent,
+            json!({"t": "open", "agent": agent, "main": agent == PRIMARY}),
+        )
+        .await
+    }
+
+    /// [`Interpreter::open`] a child agent's kernel, on a thread of its own,
+    /// with `child` saying what kind of child it is and where what its parent
+    /// gave it waits in the interpreter.
+    pub(crate) async fn open_child(
+        &self,
+        agent: &str,
+        child: Value,
+    ) -> Result<(), InterpreterError> {
+        self.opened(
+            agent,
+            json!({"t": "open", "agent": agent, "main": false, "child": child}),
+        )
+        .await
+    }
+
+    /// Send `open`, the line that opens `agent`'s kernel, and wait until it
+    /// is built.
+    async fn opened(&self, agent: &str, open: Value) -> Result<(), InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
         {
             let mut table = lock(&self.table);
             table.open()?;
             table.opening.insert(agent.to_string(), waiter);
+            let events = self.events.for_agent(agent);
+            table
+                .kernels
+                .entry(agent.into())
+                .or_insert_with(|| KernelState::new(events));
             if let Some(relay) = &table.relay {
                 relay.opened(agent);
             }
-            self.send(json!({"t": "open", "agent": agent, "main": agent == PRIMARY}))?;
+            self.send(open)?;
         }
         let not_opened = |reason| InterpreterError::Open {
             agent: agent.to_string(),
@@ -752,6 +836,74 @@ impl Interpreter {
             )));
         };
         answered?.map_err(not_opened)
+    }
+
+    /// Tell `agent`'s kernel to end -- its requests, its tasks, its loop, its
+    /// thread -- and wait for it to say it has, at most `within`. Whether it
+    /// did: one that did not is still running code that never yields, and is
+    /// left to the session's end. A kernel that ended is forgotten here, and
+    /// by the relay.
+    pub(crate) async fn end(&self, agent: &str, within: Duration) -> bool {
+        let (waiter, receiver) = oneshot::channel();
+        {
+            let mut table = lock(&self.table);
+            if table.open().is_err() {
+                return true;
+            }
+            let id = table.next_id();
+            table.ending.insert(agent.to_string(), waiter);
+            if self
+                .send(json!({"t": "end", "agent": agent, "id": id}))
+                .is_err()
+            {
+                return true;
+            }
+        }
+        // A closed sender is an interpreter gone, with every kernel in it.
+        tokio::time::timeout(within, receiver).await.is_ok()
+    }
+
+    /// Cancel and interrupt each execution still holding a kernel's slot that
+    /// was live at the close: the terminating step, for every agent. An
+    /// interrupt reaches only the primary's thread; another kernel's execution
+    /// ends at the cancel, or not at all.
+    pub(crate) fn stop_live(&self) {
+        let live: Vec<(Arc<str>, ExecId)> = {
+            let table = lock(&self.table);
+            let Some(closing) = &table.closing else {
+                return;
+            };
+            table
+                .kernels
+                .iter()
+                .filter_map(|(agent, kernel)| Some((Arc::clone(agent), kernel.slot.as_ref()?.id)))
+                .filter(|(_, id)| {
+                    closing
+                        .live
+                        .iter()
+                        .any(|(live, end)| live == id && end.is_none())
+                })
+                .collect()
+        };
+        for (agent, id) in live {
+            let handle = self.for_agent(&agent);
+            handle.cancel(id);
+            handle.interrupt(id, false);
+        }
+    }
+
+    /// Hand each line a kernel sends about child agents to `lines`, from now
+    /// on.
+    pub(crate) fn attach_children(&self, lines: ChildLines) {
+        lock(&self.table).children = Some(lines);
+    }
+
+    /// Queue `line` for the kernel it names, as it is: one the session sends
+    /// about child agents. Dropped once nothing more can be sent.
+    pub(crate) fn tell(&self, line: Value) {
+        if lock(&self.table).open().is_ok() {
+            self.lines.send(format!("{line}\n"));
+        }
     }
 
     /// Submit `source` to run in the agent's namespace.
@@ -773,14 +925,16 @@ impl Interpreter {
         // either running at the close or refused by it, never both.
         if let Some(closing) = &table.closing {
             let by = closing.by.clone();
-            table.events.emit(Payload::ExecRefused {
+            self.events.emit(Payload::ExecRefused {
                 execid: id.public(),
                 holder: None,
                 reason: Refusal::Closed,
             });
             return Err(Closed::from(by).into());
         }
-        let queued = match &table.slot {
+        let timings = table.timings;
+        let kernel = table.kernel(&self.agent, &self.events);
+        let queued = match &kernel.slot {
             Some(slot) => {
                 let holder = slot.id;
                 // Read here, under the lock, rather than asked for: a
@@ -790,7 +944,7 @@ impl Interpreter {
                     .abandoned()
                     .then(|| slot.watched.borrow().verdict)
                     .flatten();
-                table.events.emit(Payload::ExecRefused {
+                self.events.emit(Payload::ExecRefused {
                     execid: id.public(),
                     holder: Some(holder.public()),
                     reason: Refusal::Held,
@@ -801,14 +955,14 @@ impl Interpreter {
             None => {
                 // Recorded before it is sent, so nothing the execution does
                 // can be recorded ahead of it.
-                table.events.emit_with(|| Payload::ExecSubmitted {
+                self.events.emit_with(|| Payload::ExecSubmitted {
                     execid: id.public(),
                     source: source.to_string(),
                 });
                 // Queued under the lock, so the wire order is the order the
                 // slot was claimed in.
-                self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}))?;
-                table.slot = Some(Slot {
+                self.send(json!({"t": "exec", "agent": &*self.agent, "id": id, "src": source}))?;
+                kernel.slot = Some(Slot {
                     id,
                     waiter,
                     submitted: Instant::now(),
@@ -817,7 +971,7 @@ impl Interpreter {
                 tokio::spawn(recovery::watch(
                     self.downgrade(),
                     id,
-                    table.timings,
+                    timings,
                     watched.clone(),
                 ));
                 true
@@ -826,6 +980,7 @@ impl Interpreter {
         drop(table);
         Ok(Execution {
             id,
+            agent: Arc::clone(&self.agent),
             queued,
             receiver,
             settled: None,
@@ -879,12 +1034,12 @@ impl Interpreter {
         let receiver = self.request(
             json!({"t": "msg", "channel": channel, "body": body}),
             Query::Post,
-            |table, id| {
-                table.events.emit_with(|| Payload::MessageSent {
+            |_, id| {
+                self.events.emit_with(|| Payload::MessageSent {
                     message: id.message(),
                     channel: channel.to_string(),
                     from: USER_END.to_string(),
-                    to: PRIMARY_SUBJECT.to_string(),
+                    to: self.events.agent().to_string(),
                     body: body.to_string(),
                 });
             },
@@ -1003,14 +1158,14 @@ impl Interpreter {
     /// on `channel`, which makes room for the agent to send another.
     fn received(&self, channel: &str, message: ExecId) {
         let mut table = lock(&self.table);
-        table.events.emit(Payload::MessageReceived {
+        self.events.emit(Payload::MessageReceived {
             message: message.message(),
             channel: channel.to_string(),
-            from: PRIMARY_SUBJECT.to_string(),
+            from: self.events.agent().to_string(),
             to: USER_END.to_string(),
         });
         if table.open().is_ok() {
-            acknowledge(&mut table, &self.lines, channel);
+            acknowledge(&mut table, &self.lines, &self.agent, channel);
         }
     }
 
@@ -1025,9 +1180,10 @@ impl Interpreter {
         answer(&self.table, receiver).await
     }
 
-    /// Queue the request `fields`, addressed to the primary under an id of its
-    /// own, and register `waiting` for its answer. `before` is called with the
-    /// id under the lock the request is sent under, before it is sent.
+    /// Queue the request `fields`, addressed to this handle's kernel under an
+    /// id of its own, and register `waiting` for its answer. `before` is
+    /// called with the id under the lock the request is sent under, before it
+    /// is sent.
     fn request<T>(
         &self,
         mut fields: Value,
@@ -1039,7 +1195,7 @@ impl Interpreter {
         table.open()?;
         let id = table.next_id();
         before(&mut table, id);
-        fields["agent"] = json!(PRIMARY);
+        fields["agent"] = json!(&*self.agent);
         fields["id"] = json!(id);
         self.send(fields)?;
         table.queries.insert(id, waiting(waiter));
@@ -1057,7 +1213,7 @@ impl Interpreter {
         self.stop(
             id,
             None,
-            json!({"t": "cancel", "agent": PRIMARY, "id": id}),
+            json!({"t": "cancel", "agent": &*self.agent, "id": id}),
             Payload::ExecCancelSent {
                 execid: id.public(),
             },
@@ -1101,7 +1257,7 @@ impl Interpreter {
         self.stop(
             id,
             since,
-            json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}),
+            json!({"t": "interrupt", "agent": &*self.agent, "id": id, "runaway": runaway}),
             Payload::ExecInterruptSent {
                 execid: id.public(),
                 runaway,
@@ -1128,10 +1284,10 @@ impl Interpreter {
     ) -> bool {
         let table = lock(&self.table);
         if table.open().is_ok()
-            && let Some(slot) = table.slot.as_ref().filter(|slot| slot.id == id)
+            && let Some(slot) = table.slot_of(&self.agent).filter(|slot| slot.id == id)
             && since.is_none_or(|seen| slot.watched.borrow().interrupts == seen)
         {
-            table.events.emit(sent);
+            self.events.emit(sent);
             let _ = self.send(message);
             slot.watched.send_modify(noted);
             return true;
@@ -1144,7 +1300,7 @@ impl Interpreter {
     /// [`Interpreter::found`] holds its verdict to it.
     pub(crate) fn interrupts(&self, id: ExecId) -> Option<u32> {
         let table = lock(&self.table);
-        let slot = table.slot.as_ref().filter(|slot| slot.id == id)?;
+        let slot = table.slot_of(&self.agent).filter(|slot| slot.id == id)?;
         let interrupts = slot.watched.borrow().interrupts;
         Some(interrupts)
     }
@@ -1161,7 +1317,7 @@ impl Interpreter {
     /// spinning, and interrupting it again would skip the cleanup.
     pub(crate) fn found(&self, id: ExecId, seen: u32, verdict: Verdict) -> Found {
         let table = lock(&self.table);
-        let Some(slot) = table.slot.as_ref().filter(|slot| slot.id == id) else {
+        let Some(slot) = table.slot_of(&self.agent).filter(|slot| slot.id == id) else {
             return Found::Freed;
         };
         if matches!(verdict, Verdict::Blocked | Verdict::Spinning)
@@ -1170,7 +1326,7 @@ impl Interpreter {
             return Found::Stale;
         }
         if let Some(verdict) = verdict.failed() {
-            table.events.emit(Payload::ExecProbeFailed {
+            self.events.emit(Payload::ExecProbeFailed {
                 execid: id.public(),
                 verdict,
             });
@@ -1183,7 +1339,10 @@ impl Interpreter {
     /// Change what the host has noted of `id`'s execution, if `id` still holds
     /// the slot.
     pub(crate) fn note(&self, id: ExecId, update: impl FnOnce(&mut Watched)) {
-        if let Some(slot) = lock(&self.table).slot.as_ref().filter(|slot| slot.id == id) {
+        if let Some(slot) = lock(&self.table)
+            .slot_of(&self.agent)
+            .filter(|slot| slot.id == id)
+        {
             slot.watched.send_modify(update);
         }
     }
@@ -1193,8 +1352,7 @@ impl Interpreter {
     /// dropped.
     pub(crate) fn abandoned(&self) -> Option<ExecId> {
         lock(&self.table)
-            .slot
-            .as_ref()
+            .slot_of(&self.agent)
             .filter(|slot| slot.abandoned())
             .map(|slot| slot.id)
     }
@@ -1202,13 +1360,20 @@ impl Interpreter {
     /// Keep `late` to be reported with a later result, as a reply that arrived
     /// with nobody waiting for it is.
     pub(crate) fn keep_late(&self, late: Late) {
-        lock(&self.table).late.push(late);
+        lock(&self.table)
+            .kernel(&self.agent, &self.events)
+            .late
+            .push(late);
     }
 
     /// Results that arrived after their callers stopped waiting, oldest first.
     /// Each is reported once.
     pub(crate) fn take_late(&self) -> Vec<Late> {
-        std::mem::take(&mut lock(&self.table).late)
+        lock(&self.table)
+            .kernels
+            .get_mut(&self.agent)
+            .map(|kernel| std::mem::take(&mut kernel.late))
+            .unwrap_or_default()
     }
 
     /// Mirror turn `id` of the agent's conversation into the interpreter, as
@@ -1217,7 +1382,7 @@ impl Interpreter {
         let table = lock(&self.table);
         if table.open().is_ok() {
             fields["t"] = json!("turn");
-            fields["agent"] = json!(PRIMARY);
+            fields["agent"] = json!(&*self.agent);
             fields["id"] = json!(id);
             let _ = self.send(fields);
         }
@@ -1228,7 +1393,9 @@ impl Interpreter {
     /// handle's lock, so `changed` may take locks of its own that are held
     /// around a [`Interpreter::push_turn`]. Registering again replaces it.
     pub(crate) fn on_context(&self, changed: impl Fn(ContextChange) + Send + Sync + 'static) {
-        lock(&self.table).on_context = Some(Arc::new(changed));
+        lock(&self.table)
+            .kernel(&self.agent, &self.events)
+            .on_context = Some(Arc::new(changed));
     }
 
     fn send(&self, message: Value) -> Result<(), InterpreterError> {
@@ -1404,8 +1571,10 @@ impl Drop for Execution {
     /// caller cancelled just as its reply landed does not lose it.
     fn drop(&mut self) {
         self.receiver.close();
-        if let Ok(outcome @ (Outcome::Ok(_) | Outcome::Error { .. })) = self.receiver.try_recv() {
-            lock(&self.table).late.push(Late {
+        if let Ok(outcome @ (Outcome::Ok(_) | Outcome::Error { .. })) = self.receiver.try_recv()
+            && let Some(kernel) = lock(&self.table).kernels.get_mut(&self.agent)
+        {
+            kernel.late.push(Late {
                 id: self.id,
                 outcome,
             });
@@ -1417,6 +1586,19 @@ impl Table {
     fn next_id(&mut self) -> ExecId {
         self.last_id += 1;
         ExecId(self.last_id)
+    }
+
+    /// What the host holds for `agent`'s kernel, made with `events` on first
+    /// use.
+    fn kernel(&mut self, agent: &Arc<str>, events: &Events) -> &mut KernelState {
+        self.kernels
+            .entry(Arc::clone(agent))
+            .or_insert_with(|| KernelState::new(events.clone()))
+    }
+
+    /// `agent`'s outstanding execution, if it has one.
+    fn slot_of(&self, agent: &str) -> Option<&Slot> {
+        self.kernels.get(agent)?.slot.as_ref()
     }
 
     /// Whether anything more can be sent.
@@ -1436,17 +1618,18 @@ impl Table {
             .unwrap_or_else(|| "the host stopped reading its replies".into())
     }
 
-    /// Record how `slot`'s execution ended: `status`, what it reported, its
-    /// traceback, and the type of what it raised.
+    /// Record how `slot`'s execution ended in `events`, its agent's:
+    /// `status`, what it reported, its traceback, and the type of what it
+    /// raised.
     fn record_ended(
-        &self,
+        events: &Events,
         slot: &Slot,
         status: ExecStatus,
         report: &Report,
         error: Option<&str>,
         raised: Option<&str>,
     ) {
-        self.events.emit_with(|| Payload::ExecCompleted {
+        events.emit_with(|| Payload::ExecCompleted {
             execid: slot.id.public(),
             status,
             duration: slot.submitted.elapsed(),
@@ -1456,25 +1639,38 @@ impl Table {
             background: report.background.iter().map(Background::public).collect(),
         });
         if raised == Some("MemoryError") {
-            self.events.emit(Payload::MemoryExhausted {
+            events.emit(Payload::MemoryExhausted {
                 execid: slot.id.public(),
             });
         }
     }
 
-    /// Close admission, `by` what closed it, recording the execution holding the slot
-    /// as live at the close. Whether this was the close: only the first one
-    /// is, and none is while an exit already seen waits for its cause.
+    /// Close admission, `by` what closed it, recording the execution holding
+    /// each kernel's slot as live at the close. Whether this was the close:
+    /// only the first one is, and none is while an exit already seen waits
+    /// for its cause.
     fn close(&mut self, by: ClosedBy) -> bool {
         if self.closing.is_some() || self.exiting.is_some() {
             return false;
         }
-        let live: Vec<_> = self.slot.iter().map(|slot| (slot.id, None)).collect();
+        let mut live: Vec<_> = self
+            .kernels
+            .values()
+            .filter_map(|kernel| kernel.slot.as_ref())
+            .map(|slot| (slot.id, None))
+            .collect();
+        live.sort_by_key(|(id, _)| id.0);
         let drained = watch::channel(live.is_empty()).0;
         // Under this lock, so a hosted request and an execution are ordered against the one
-        // close alike.
-        if let Some(relay) = &self.relay {
-            relay.close(&Closed::from(by.clone()).to_string());
+        // close alike. The relay tells the interpreter; without one, this does, so the work its
+        // agents gave each other ends with the close too.
+        let closing = Closed::from(by.clone()).to_string();
+        match (&self.relay, &self.lines) {
+            (Some(relay), _) => relay.close(&closing),
+            (None, Some(lines)) => {
+                lines.send(format!("{}\n", json!({"t": "close", "reason": closing})));
+            }
+            (None, None) => {}
         }
         self.closing = Some(Closing { by, live, drained });
         true
@@ -1495,22 +1691,28 @@ impl Table {
         }
     }
 
-    /// Settle the outstanding execution with its result. A result for any
-    /// other id is not this execution's, whatever is running now.
-    fn settle(&mut self, result: WireResult) {
-        let Some(slot) = self.slot.take_if(|slot| slot.id == result.id) else {
+    /// Settle `agent`'s outstanding execution with its result. A result for
+    /// any other id is not this execution's, whatever is running now.
+    fn settle(&mut self, agent: &str, result: WireResult) {
+        let Some(kernel) = self.kernels.get_mut(agent) else {
+            tracing::warn!("ignored a result for agent {agent:?}, which the host never opened");
+            return;
+        };
+        let Some(slot) = kernel.slot.take_if(|slot| slot.id == result.id) else {
             tracing::warn!(
                 "ignored a result for execution {}, which is not outstanding",
                 result.id
             );
             return;
         };
+        let events = kernel.events.clone();
         let (status, error) = match &result.status {
             Status::Ok => (ExecStatus::Ok, None),
             Status::Error { error } => (ExecStatus::Error, Some(error.as_str())),
             Status::Refused { .. } => (ExecStatus::Refused, None),
         };
-        self.record_ended(
+        Self::record_ended(
+            &events,
             &slot,
             status,
             &result.report,
@@ -1545,11 +1747,39 @@ impl Table {
                 }
             }
         };
-        if let Err(outcome) = slot.waiter.send(outcome) {
-            self.late.push(Late {
+        if let Err(outcome) = slot.waiter.send(outcome)
+            && let Some(kernel) = self.kernels.get_mut(agent)
+        {
+            kernel.late.push(Late {
                 id: slot.id,
                 outcome,
             });
+        }
+    }
+
+    /// `agent`'s kernel has ended: forget it, settling an execution it left
+    /// holding its slot as the interpreter's exit would.
+    fn forget(&mut self, agent: &str) {
+        let Some(kernel) = self.kernels.remove(agent) else {
+            return;
+        };
+        if let Some(slot) = kernel.slot {
+            Self::record_ended(
+                &kernel.events,
+                &slot,
+                ExecStatus::Lost,
+                &Report::default(),
+                None,
+                None,
+            );
+            self.ended_live(slot.id, ExecutionStatus::Unknown);
+            let _ = slot.waiter.send(Outcome::Unknown(Unknown::Exited {
+                id: slot.id,
+                cause: "its agent's kernel ended".into(),
+            }));
+        }
+        if let Some(waiter) = self.ending.remove(agent) {
+            let _ = waiter.send(());
         }
     }
 }
@@ -1558,11 +1788,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Queue the line telling the interpreter a message the agent sent on
-/// `channel` was received.
-fn acknowledge(table: &mut Table, lines: &Lines, channel: &str) {
+/// Queue the line telling `agent`'s kernel a message it sent on `channel` was
+/// received.
+fn acknowledge(table: &mut Table, lines: &Lines, agent: &str, channel: &str) {
     let id = table.next_id();
-    let received = json!({"t": "received", "agent": PRIMARY, "id": id, "channel": channel});
+    let received = json!({"t": "received", "agent": agent, "id": id, "channel": channel});
     lines.send(format!("{received}\n"));
 }
 
@@ -1681,7 +1911,7 @@ where
     let cause: Arc<str> = ended.await.into();
     // Recorded, and admission closed, before anyone waiting hears of it, so
     // whoever does finds both done.
-    let (slot, exited) = {
+    let (slots, exited) = {
         let mut table = lock(&table);
         table.ended = Some(Arc::clone(&cause));
         // A session's death is a close: what was running is live at it, and
@@ -1690,10 +1920,22 @@ where
         table.close(ClosedBy::InterpreterExited {
             cause: cause.to_string(),
         });
-        let slot = table.slot.take();
-        if let Some(slot) = &slot {
-            table.record_ended(slot, ExecStatus::Lost, &Report::default(), None, None);
-        }
+        let slots: Vec<Slot> = table
+            .kernels
+            .values_mut()
+            .filter_map(|kernel| {
+                let slot = kernel.slot.take()?;
+                Table::record_ended(
+                    &kernel.events,
+                    &slot,
+                    ExecStatus::Lost,
+                    &Report::default(),
+                    None,
+                    None,
+                );
+                Some(slot)
+            })
+            .collect();
         // Whatever was live at an earlier close and had not ended is over now,
         // however it ended.
         if let Some(closing) = &mut table.closing {
@@ -1706,7 +1948,7 @@ where
             cause: cause.to_string(),
             expected,
         });
-        (slot, table.on_exit.clone())
+        (slots, table.on_exit.clone())
     };
     // Outside the lock, as a context change is handed over: whoever it is may
     // ask the interpreter something.
@@ -1714,21 +1956,42 @@ where
         exited();
     }
     let mut table = lock(&table);
-    if let Some(slot) = slot {
+    for slot in slots {
         // An exit is not a reply, so a caller no longer waiting gets no `Late`.
-        let _ = slot
-            .waiter
-            .send(Outcome::Unknown(Unknown::Exited { id: slot.id, cause }));
+        let _ = slot.waiter.send(Outcome::Unknown(Unknown::Exited {
+            id: slot.id,
+            cause: Arc::clone(&cause),
+        }));
     }
     // Dropping the waiters fails each query, and each kernel being opened, with
-    // the cause just recorded.
+    // the cause just recorded; each being ended has ended with the rest.
     table.queries.clear();
     table.opening.clear();
+    table.ending.clear();
     table.gone.send_replace(true);
 }
 
 fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
-    let Envelope { agent, reply } = match serde_json::from_slice(line) {
+    let value: Value = match serde_json::from_slice(line) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!("ignored an unreadable line from the Python interpreter: {e}");
+            return;
+        }
+    };
+    // A line about child agents is the session's to read, whichever kernel
+    // sent it.
+    if let (Some(kind), Some(agent)) = (value["t"].as_str(), value["agent"].as_str())
+        && kind.starts_with("agent.")
+    {
+        let agent = agent.to_string();
+        match lock(table).children.clone() {
+            Some(children) => children(&agent, value),
+            None => tracing::warn!("ignored a {kind} line from agent {agent:?}: nothing reads it"),
+        }
+        return;
+    }
+    let Envelope { agent, reply } = match serde_json::from_value(value) {
         Ok(envelope) => envelope,
         Err(e) => {
             tracing::warn!("ignored an unreadable line from the Python interpreter: {e}");
@@ -1751,21 +2014,36 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         return;
     }
     if let Reply::Ready { error, .. } = reply {
-        match lock(table).opening.remove(&agent) {
+        let mut table = lock(table);
+        match table.opening.remove(&agent) {
             Some(waiter) => {
+                // A kernel that was not built leaves nothing to hold.
+                if error.is_some() {
+                    table.kernels.remove(agent.as_str());
+                }
                 let _ = waiter.send(error.map_or(Ok(()), Err));
             }
             None => tracing::warn!("ignored a ready from agent {agent:?}, which nothing opened"),
         }
         return;
     }
-    if agent != PRIMARY {
-        // Any other kernel the host opened is reached through its bindings alone.
-        tracing::warn!("ignored a message for agent {agent:?}: only the primary's are read here");
+    if let Reply::Ended {} = reply {
+        let children = {
+            let mut table = lock(table);
+            table.forget(&agent);
+            if let Some(relay) = &table.relay {
+                relay.forget(&agent);
+            }
+            table.children.clone()
+        };
+        if let Some(children) = children {
+            children(&agent, json!({"t": "agent.gone", "agent": agent}));
+        }
         return;
     }
+    let from = Subject::agent(&agent).to_string();
     match reply {
-        Reply::Result(result) => lock(table).settle(result),
+        Reply::Result(result) => lock(table).settle(&agent, result),
         Reply::Inv { id, inventory } => match lock(table).queries.remove(&id) {
             Some(Query::Inventory(waiter)) => {
                 let _ = waiter.send(inventory);
@@ -1788,13 +2066,16 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                         (None, None) => Err("the interpreter answered without saying".to_string()),
                     };
                     if let Err(reason) = &answer {
-                        table.events.emit(Payload::MessageRefused {
-                            message: id.message(),
-                            channel: USER.to_string(),
-                            from: USER_END.to_string(),
-                            to: PRIMARY_SUBJECT.to_string(),
-                            reason: reason.clone(),
-                        });
+                        table
+                            .events
+                            .for_agent(&agent)
+                            .emit(Payload::MessageRefused {
+                                message: id.message(),
+                                channel: USER.to_string(),
+                                from: USER_END.to_string(),
+                                to: from.clone(),
+                                reason: reason.clone(),
+                            });
                     }
                     let _ = waiter.send(answer);
                 }
@@ -1816,45 +2097,52 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         Reply::Sent { channel, body } => {
             let mut table = lock(table);
             let id = table.next_id();
-            table.events.emit_with(|| Payload::MessageSent {
+            let events = table.events.for_agent(&agent);
+            events.emit_with(|| Payload::MessageSent {
                 message: id.message(),
                 channel: channel.clone(),
-                from: PRIMARY_SUBJECT.to_string(),
+                from: from.clone(),
                 to: USER_END.to_string(),
                 body: body.clone(),
             });
+            // Only the primary agent has a user on the other end.
             let held = channel == USER
+                && agent == PRIMARY
                 && table
                     .outbox
                     .as_ref()
                     .is_some_and(|outbox| outbox.send((id, body)).is_ok());
             if !held {
-                table.events.emit(Payload::MessageRefused {
+                events.emit(Payload::MessageRefused {
                     message: id.message(),
                     channel: channel.clone(),
-                    from: PRIMARY_SUBJECT.to_string(),
+                    from: from.clone(),
                     to: USER_END.to_string(),
                     reason: "nothing on the host reads this channel".to_string(),
                 });
                 tracing::warn!(
-                    "dropped a message the agent sent on {channel:?}: nothing on the host reads it"
+                    "dropped a message agent {agent:?} sent on {channel:?}: nothing on the host \
+                     reads it"
                 );
                 // Acknowledged all the same: no receive is coming, and the
                 // agent must not wait for one.
-                acknowledge(&mut table, lines, &channel);
+                acknowledge(&mut table, lines, &agent, &channel);
             }
         }
-        Reply::Promote { turns } => context_changed(table, ContextChange::Promote(turns)),
-        Reply::Demote { turns } => context_changed(table, ContextChange::Demote(turns)),
+        Reply::Promote { turns } => context_changed(table, &agent, ContextChange::Promote(turns)),
+        Reply::Demote { turns } => context_changed(table, &agent, ContextChange::Demote(turns)),
         Reply::Took { channel, message } => {
-            lock(table).events.emit(Payload::MessageReceived {
-                message: message.message(),
-                channel,
-                from: USER_END.to_string(),
-                to: PRIMARY_SUBJECT.to_string(),
-            });
+            lock(table)
+                .events
+                .for_agent(&agent)
+                .emit(Payload::MessageReceived {
+                    message: message.message(),
+                    channel,
+                    from: USER_END.to_string(),
+                    to: from,
+                });
         }
-        Reply::Ready { .. } | Reply::Rpc(_) | Reply::Hosted(_) => {}
+        Reply::Ready { .. } | Reply::Ended {} | Reply::Rpc(_) | Reply::Hosted(_) => {}
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
             String::from_utf8_lossy(line)
@@ -1862,13 +2150,14 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
     }
 }
 
-/// Record `change`, and hand it to whatever registered for it.
-fn context_changed(table: &Mutex<Table>, change: ContextChange) {
+/// Record `change`, which `agent` made, and hand it to whatever registered
+/// for that agent's.
+fn context_changed(table: &Mutex<Table>, agent: &str, change: ContextChange) {
     // Taken out first: whoever it is may take a lock held around a push,
     // which takes this one.
     let changed = {
         let table = lock(table);
-        table.events.emit(match &change {
+        table.events.for_agent(agent).emit(match &change {
             ContextChange::Promote(turns) => Payload::ContextPromoted {
                 turns: turns.clone(),
             },
@@ -1876,7 +2165,10 @@ fn context_changed(table: &Mutex<Table>, change: ContextChange) {
                 turns: turns.clone(),
             },
         });
-        table.on_context.clone()
+        table
+            .kernels
+            .get(agent)
+            .and_then(|kernel| kernel.on_context.clone())
     };
     match changed {
         Some(changed) => changed(change),

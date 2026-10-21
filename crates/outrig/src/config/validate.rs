@@ -23,9 +23,10 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Binding, Config, EnvValue, HOST_GRACE_SECS_CEILING, ImageConfig, ImageSourceRef, LlmProvider,
-    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, Model, ModelSourceRef, NetworkMode,
-    REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
+    Agent, Binding, CHILDREN_MAX_CEILING, Config, EnvValue, HOST_GRACE_SECS_CEILING, ImageConfig,
+    ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING, MODEL_CONCURRENCY_MAX_CEILING,
+    McpServerSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
+    REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
     SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
     TOOL_RESULT_MAX_FLOOR_BYTES, lexical, normalize_capability_name,
 };
@@ -372,6 +373,19 @@ pub enum ConfigValidationError {
 
     #[error("{path} must be between 1 and {max}; got {value}")]
     SubagentWidthMaxOutOfRange { path: String, value: u32, max: u32 },
+
+    /// A limit on a `run-new` session's children or model calls --
+    /// `children-max`, `model-concurrency-max`, `requests-max` or
+    /// `token-budget` -- outside its range. `max` is `None` for one with no
+    /// ceiling.
+    #[error("{path} must be {}; got {value}", range_text(*.min, *.max))]
+    #[non_exhaustive]
+    LimitOutOfRange {
+        path: String,
+        value: u64,
+        min: u64,
+        max: Option<u64>,
+    },
 
     #[error("{path} must be at least {min} bytes; got {value}")]
     ToolResultMaxTooSmall { path: String, value: u32, min: u32 },
@@ -871,6 +885,7 @@ pub(super) fn validate_with_options(
     if let Some(value) = cfg.subagent_width_max {
         validate_subagent_width_max("top-level subagent-width-max", value)?;
     }
+    validate_limits("top-level ", &Limited::of_config(cfg))?;
     if let Some(value) = cfg.host.declared_grace_secs()
         && value > HOST_GRACE_SECS_CEILING
     {
@@ -968,6 +983,7 @@ pub(super) fn validate_with_options(
                     value,
                 )?;
             }
+            validate_limits(&format!("agents.{agent_name}."), &Limited::of_agent(agent))?;
         }
 
         for (model_name, model) in &cfg.models {
@@ -2192,6 +2208,78 @@ fn validate_subagent_depth_max(path: &str, value: u32) -> Result<(), ConfigValid
         });
     }
     Ok(())
+}
+
+/// The children's and model calls' limits one table sets, top level or an
+/// `[agents.<name>]` block.
+struct Limited {
+    children_max: Option<u32>,
+    model_concurrency_max: Option<u32>,
+    requests_max: Option<u32>,
+    token_budget: Option<u64>,
+}
+
+impl Limited {
+    fn of_config(cfg: &Config) -> Self {
+        Self {
+            children_max: cfg.children_max,
+            model_concurrency_max: cfg.model_concurrency_max,
+            requests_max: cfg.requests_max,
+            token_budget: cfg.token_budget,
+        }
+    }
+
+    fn of_agent(agent: &Agent) -> Self {
+        Self {
+            children_max: agent.children_max,
+            model_concurrency_max: agent.model_concurrency_max,
+            requests_max: agent.requests_max,
+            token_budget: agent.token_budget,
+        }
+    }
+}
+
+/// Each limit `limited` sets, held to its range; `prefix` is where the table
+/// is -- `top-level ` or `agents.<name>.` -- for the key the error names.
+fn validate_limits(prefix: &str, limited: &Limited) -> Result<(), ConfigValidationError> {
+    let ranged = [
+        ("children-max", limited.children_max, CHILDREN_MAX_CEILING),
+        (
+            "model-concurrency-max",
+            limited.model_concurrency_max,
+            MODEL_CONCURRENCY_MAX_CEILING,
+        ),
+        ("requests-max", limited.requests_max, REQUESTS_MAX_CEILING),
+    ];
+    for (key, value, ceiling) in ranged {
+        if let Some(value) = value
+            && !(1..=ceiling).contains(&value)
+        {
+            return Err(ConfigValidationError::LimitOutOfRange {
+                path: format!("{prefix}{key}"),
+                value: value.into(),
+                min: 1,
+                max: Some(ceiling.into()),
+            });
+        }
+    }
+    if limited.token_budget == Some(0) {
+        return Err(ConfigValidationError::LimitOutOfRange {
+            path: format!("{prefix}token-budget"),
+            value: 0,
+            min: 1,
+            max: None,
+        });
+    }
+    Ok(())
+}
+
+/// How [`ConfigValidationError::LimitOutOfRange`] words its range.
+fn range_text(min: u64, max: Option<u64>) -> String {
+    match max {
+        Some(max) => format!("between {min} and {max}"),
+        None => format!("at least {min}"),
+    }
 }
 
 fn validate_subagent_width_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {

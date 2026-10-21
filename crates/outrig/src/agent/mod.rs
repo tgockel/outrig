@@ -26,6 +26,7 @@
 mod budget;
 mod build;
 mod channel;
+pub(crate) mod children;
 mod failover;
 mod history;
 pub(crate) mod ledger;
@@ -33,6 +34,7 @@ mod orientation;
 mod resolve;
 mod retry;
 pub(crate) mod round;
+mod runner;
 mod tool;
 
 use std::path::Path;
@@ -57,7 +59,7 @@ use self::channel::Announcer;
 #[cfg(test)]
 pub(crate) use self::history::rig_json;
 use self::history::{History, Window};
-use self::ledger::Ledger;
+use self::ledger::{CallSlot, Ledger};
 use self::resolve::LlmResolveError;
 pub(crate) use self::resolve::{ResolvedAgent, find_agent};
 use self::round::Finished;
@@ -97,11 +99,12 @@ pub(crate) struct Agent {
     /// Shared with the tool and each round's hook; what
     /// [`Agent::interrupter`] presses.
     interrupts: Interrupts,
-    /// The user's end of the agent's `user` channel.
-    user: UserChannel,
+    /// The user's end of the agent's `user` channel; a child has none.
+    user: Option<UserChannel>,
     /// What the model has been told of what waits there. Shared with the tool.
     announcer: Announcer,
-    /// The interpreter itself, for what is asked of it between rounds.
+    /// The interpreter itself, addressing this agent's kernel, for what is
+    /// asked of it between rounds.
     pub(crate) interpreter: Interpreter,
     /// The session's state, which a round moves through.
     lifecycle: Arc<Lifecycle>,
@@ -131,8 +134,38 @@ impl Agent {
         self.interrupts.stop_held(&self.interpreter)
     }
 
-    pub(crate) fn user_channel(&self) -> UserChannel {
+    pub(crate) fn user_channel(&self) -> Option<UserChannel> {
         self.user.clone()
+    }
+
+    /// Where this agent's calls are named, and what it spends is recorded.
+    pub(crate) fn slot(&self) -> &CallSlot {
+        self.agent.model.slot()
+    }
+
+    /// The announcer, which says what arrives while one of its rounds runs.
+    pub(crate) fn announcer(&self) -> &Announcer {
+        &self.announcer
+    }
+
+    /// Run one round of a child's, opening on what `opening` makes of how
+    /// many earlier turns its calls are not sent. The runner decides when.
+    pub(crate) async fn opened(
+        &self,
+        opening: impl Fn(usize) -> String,
+    ) -> Result<Finished, AgentError> {
+        let opening = self.history.open_round(&self.budget, opening);
+        self.history.events().emit(Payload::RoundStarted {
+            round: self.history.round(),
+        });
+        round::round(
+            &self.agent,
+            opening,
+            &self.history,
+            self.tool_call_max,
+            &self.interrupts,
+        )
+        .await
     }
 
     /// Drive one round, if anything was sent on the user channel since the
@@ -187,19 +220,69 @@ impl Agent {
         ledger: Ledger,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
-        let announcer = Announcer::new(interpreter.clone());
-        let user = UserChannel::new(interpreter.clone());
         let window = Window::DEFAULT;
-        let history = History::new(interpreter.clone(), window);
+        let preamble =
+            orientation::preamble(workspace, bindings, resolved.preamble.as_deref(), window);
+        let slot = CallSlot::new(ledger, interpreter.events().clone(), None);
+        let user = UserChannel::new(interpreter.clone());
+        Self::assemble(
+            resolved,
+            interpreter.clone(),
+            container_name,
+            preamble,
+            slot,
+            Announcer::new(interpreter),
+            Some(user),
+            lifecycle,
+        )
+    }
+
+    /// A child agent over `interpreter`, its own kernel's handle, with
+    /// `preamble` as its system prompt, naming its calls in `slot`, and
+    /// counting what waits on its channels through `announcer`. Its rounds and
+    /// tool calls move no session state: the session's is the primary's.
+    pub(crate) fn build_child(
+        resolved: &ResolvedAgent,
+        interpreter: Interpreter,
+        container_name: &str,
+        preamble: String,
+        slot: CallSlot,
+        announcer: Announcer,
+        lifecycle: Arc<Lifecycle>,
+    ) -> Result<Self, AgentError> {
+        Self::assemble(
+            resolved,
+            interpreter,
+            container_name,
+            preamble,
+            slot,
+            announcer,
+            None,
+            lifecycle,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        resolved: &ResolvedAgent,
+        interpreter: Interpreter,
+        container_name: &str,
+        preamble: String,
+        slot: CallSlot,
+        announcer: Announcer,
+        user: Option<UserChannel>,
+        lifecycle: Arc<Lifecycle>,
+    ) -> Result<Self, AgentError> {
+        let history = History::new(interpreter.clone(), Window::DEFAULT);
+        // A child's calls move nothing of the session's state, which is the
+        // primary's: its own rounds say what it is doing.
         let tool = SubmitPython::new(
             interpreter.clone(),
             resolved.tool_result_max_bytes,
             announcer.clone(),
-            Arc::clone(&lifecycle),
+            user.is_some().then(|| Arc::clone(&lifecycle)),
         );
         let interrupts = tool.interrupts();
-        let preamble =
-            orientation::preamble(workspace, bindings, resolved.preamble.as_deref(), window);
         let definition = ToolDefinition {
             name: tool.name(),
             description: tool.description(),
@@ -221,7 +304,7 @@ impl Agent {
             &preamble,
             vec![Box::new(tool) as Box<dyn ToolDyn>],
             &history,
-            &ledger,
+            slot,
             overhead,
         )?;
         let budget = agent
@@ -347,3 +430,7 @@ pub(crate) mod mock_http;
 #[cfg(test)]
 #[path = "agent_tests.rs"]
 mod agent_tests;
+
+#[cfg(test)]
+#[path = "children_tests.rs"]
+mod children_tests;

@@ -335,6 +335,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
     }
     calls = [{"index": 0, "model": "m", "call_id": 1, "attempt_id": 2, "usage": usage}]
     a = "agent/primary"
+    c = "agent/c1"
     message = {"role": "user", "content": [{"type": "text", "text": "opening"}]}
     return [
         ("session.state", {"state": "starting"}, None),
@@ -538,9 +539,78 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "calls": calls,
                 "attempts": [1, 2],
                 "input_tokens_max": 1,
+                "descendants": [5],
+                "total": usage,
             },
             a,
         ),
+        ("model.round.usage", {"round": 1, "attempts": [6], "usage": usage}, a),
+        (
+            "agent.spawned",
+            {
+                "name": "n",
+                "parent": a,
+                "kind": "request",
+                "model": "m",
+                "depth": 2,
+                "inputs": [{"name": "xs", "type": "list[int]", "preview": "[1]"}],
+                "channels": [{"name": "fizz", "request": "str", "reply": "Thing"}],
+            },
+            c,
+        ),
+        (
+            "agent.started",
+            {
+                "model": "m",
+                "python": "3.13",
+                "container": "c",
+                "tool_call_max": 1,
+                "tool_result_max": 1,
+            },
+            c,
+        ),
+        (
+            "model.instructions",
+            {
+                "model": "m",
+                "preamble": "p",
+                "max_tokens": 1,
+                "tools": [{"name": "submit_python", "description": "d", "parameters": {}}],
+            },
+            c,
+        ),
+        (
+            "agent.request.sent",
+            {"request": 7, "channel": "fizz", "sender": a, "body": '"b"', "attempts_max": 3},
+            c,
+        ),
+        ("agent.request.received", {"request": 7, "round": 1}, c),
+        (
+            "agent.request.replied",
+            {"request": 7, "attempt": 1, "value": '{"n": "five"}'},
+            c,
+        ),
+        (
+            "agent.request.invalid",
+            {"request": 7, "attempt": 1, "problems": ["$.n: expected an integer"]},
+            c,
+        ),
+        ("agent.request.failed", {"request": 7, "message": "why"}, c),
+        (
+            "agent.request.settled",
+            {"request": 7, "outcome": "failed", "attempts": 1, "rounds": [1]},
+            c,
+        ),
+        ("agent.request.refused", {"request": 7, "ended": "failed"}, c),
+        (
+            "agent.request.sent",
+            {"request": 8, "channel": None, "sender": a, "body": '{"xs": [1]}', "attempts_max": 3},
+            c,
+        ),
+        ("agent.request.progress", {"request": 8, "body": "p"}, c),
+        ("agent.request.cancelled", {"request": 8, "received": True}, c),
+        ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
+        ("agent.wedged", {}, "agent/c2"),
         ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
         (
             "model.usage.refused",
@@ -550,13 +620,28 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("round.started", {"round": 2}, a),
         (
             "model.round.failed",
-            {"round": 2, "error": "e", "calls": calls, "usage": None, "attempts": [3]},
+            {
+                "round": 2,
+                "error": "e",
+                "calls": calls,
+                "usage": None,
+                "attempts": [3],
+                "descendants": [],
+                "total": None,
+            },
             a,
         ),
         ("round.started", {"round": 2}, a),
         (
             "model.round.dropped",
-            {"round": 2, "calls": calls, "usage": usage, "attempts": [4]},
+            {
+                "round": 2,
+                "calls": calls,
+                "usage": usage,
+                "attempts": [4],
+                "descendants": [],
+                "total": usage,
+            },
             a,
         ),
         (
@@ -620,6 +705,10 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                     "survivors": [],
                     "exited": "it was killed by SIGKILL",
                 },
+                "requests": [
+                    {"request": 9, "child": "c1", "channel": "fizz", "outcome": "closed"},
+                    {"request": 10, "child": "c1", "channel": None, "outcome": "terminated"},
+                ],
                 "verdict": "not_proven_stopped",
             },
             None,
@@ -936,6 +1025,20 @@ class RenderSession(unittest.TestCase):
         note = "The interpreter exited while the session ran"
         self.assertNotIn(note, self.page(closed(True)))
         self.assertIn(note, self.page(closed(False)))
+
+    def test_a_childs_start_and_instructions_are_its_own(self) -> None:
+        started = {"model": "haiku", "python": "3.13.15", "container": "outrig-x"}
+        instructions = {"model": "haiku", "preamble": "CHILD", "tools": [], "max_tokens": 99}
+        events, c = ordinary(), "agent/c1"
+        child = [("agent.started", started, c), ("model.instructions", instructions, c)]
+        html = self.page(events[:2] + child + events[2:])
+        self.assertIn("<th>model</th><td>sonnet</td>", html)
+        self.assertIn("<th>max tokens</th><td>4096</td>", html)
+        self.assertIn('<h4 id="instructions-1">agent/c1, max tokens 99</h4>', html)
+        self.assertIn('<a href="#instructions-1">0 tool(s)</a>', html)
+        self.assertIn("CHILD", html)
+        self.assertNotIn("logs were joined", html)
+        self.assertIn("2 starts of one agent: logs were joined", self.page(events[:1] + events))
 
     def test_missing_ids_are_reported(self) -> None:
         self.write(ordinary())

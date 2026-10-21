@@ -115,8 +115,9 @@ pub(crate) struct SubmitPython {
     /// and lead the next result rather than being lost.
     unreported: Mutex<Vec<Late>>,
     interrupts: Interrupts,
-    /// The session's state, which a submission moves to executing and back.
-    lifecycle: Arc<Lifecycle>,
+    /// The session's state, which a submission moves to executing and back:
+    /// the primary agent's, and no child's.
+    lifecycle: Option<Arc<Lifecycle>>,
     /// What the model has been told of what waits on the agent's channels.
     announcer: Announcer,
 }
@@ -126,7 +127,7 @@ impl SubmitPython {
         interpreter: Interpreter,
         result_max_bytes: usize,
         announcer: Announcer,
-        lifecycle: Arc<Lifecycle>,
+        lifecycle: Option<Arc<Lifecycle>>,
     ) -> Self {
         Self {
             interpreter,
@@ -223,13 +224,14 @@ impl ToolDyn for SubmitPython {
             // is what a person interrupts.
             let queued = execution.queued();
             let waiting = queued.then(|| self.interrupts.presses.waiting_on(id));
-            if queued {
-                self.lifecycle.set(SessionState::Executing);
+            let lifecycle = self.lifecycle.as_ref().filter(|_| queued);
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.set(SessionState::Executing);
             }
             let settled =
                 recovery::settle(&self.interpreter, execution, &self.interrupts.presses).await;
-            if queued {
-                self.lifecycle.set(SessionState::RoundRunning);
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.set(SessionState::RoundRunning);
             }
             // From what was done rather than from the press, which may have
             // lost the race to the outcome and done nothing.

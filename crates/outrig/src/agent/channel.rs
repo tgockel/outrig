@@ -13,6 +13,11 @@
 //! been told -- provisionally within a round, and for good once a round ends
 //! well. So an announcement a failed or dropped round made, which the model may
 //! never have read, is made again.
+//!
+//! A child agent's channels carry requests, and the host keeps their record
+//! itself, so a child's announcer counts from that ([`Announcer::of_requests`])
+//! and says "requests". When a child's round opens is the runner's to decide;
+//! its announcer only says what arrives while one runs.
 
 use std::error::Error;
 use std::future::Future;
@@ -34,8 +39,17 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(2);
 /// channels. Shared by each round and the tool.
 #[derive(Clone)]
 pub(crate) struct Announcer {
-    interpreter: Interpreter,
+    source: Source,
     told: Arc<Told>,
+}
+
+/// Where an announcer's counts come from.
+#[derive(Clone)]
+enum Source {
+    /// The interpreter's own, for the primary's channels.
+    Interpreter(Interpreter),
+    /// The host's record of a child's requests, by channel.
+    Requests(Arc<dyn Fn() -> Channels + Send + Sync>),
 }
 
 /// How many deliveries, summed over the agent's channels, the model has been
@@ -51,8 +65,26 @@ struct Told {
 impl Announcer {
     pub(crate) fn new(interpreter: Interpreter) -> Self {
         Self {
-            interpreter,
+            source: Source::Interpreter(interpreter),
             told: Arc::default(),
+        }
+    }
+
+    /// A child's announcer, counting its requests by channel as `counts`
+    /// gives them.
+    pub(crate) fn of_requests(counts: Arc<dyn Fn() -> Channels + Send + Sync>) -> Self {
+        Self {
+            source: Source::Requests(counts),
+            told: Arc::default(),
+        }
+    }
+
+    /// A child's round opens, telling the model what waits: only what arrives
+    /// from here on is news within it.
+    pub(crate) fn opened(&self) {
+        if let Source::Requests(counts) = &self.source {
+            let delivered = counts().values().map(|counts| counts.delivered).sum();
+            self.told.announced.store(delivered, Ordering::SeqCst);
         }
     }
 
@@ -81,32 +113,47 @@ impl Announcer {
     /// What waits unread, if anything was delivered past `seen`, counted as
     /// announced.
     async fn news(&self, seen: &AtomicU64) -> Result<Option<String>, AgentError> {
-        let channels = tokio::time::timeout(PENDING_TIMEOUT, self.interpreter.pending())
-            .await
-            .map_err(|_| AgentError::Unanswered(PENDING_TIMEOUT))??;
+        let (channels, noun) = match &self.source {
+            Source::Interpreter(interpreter) => (
+                tokio::time::timeout(PENDING_TIMEOUT, interpreter.pending())
+                    .await
+                    .map_err(|_| AgentError::Unanswered(PENDING_TIMEOUT))??,
+                Noun::Message,
+            ),
+            Source::Requests(counts) => (counts(), Noun::Request),
+        };
         let delivered = channels.values().map(|counts| counts.delivered).sum();
         if delivered <= seen.load(Ordering::SeqCst) {
             return Ok(None);
         }
         self.told.announced.fetch_max(delivered, Ordering::SeqCst);
-        Ok(announcement(&channels))
+        Ok(announcement(&channels, noun))
     }
 }
 
+/// What waits on a channel: a message, or a request.
+#[derive(Clone, Copy)]
+pub(crate) enum Noun {
+    Message,
+    Request,
+}
+
 /// What waits, by channel and count: `2 messages are waiting on
-/// runtime.channels["user"]`. `None` when nothing does.
-fn announcement(channels: &Channels) -> Option<String> {
+/// runtime.channels["user"]`, or requests on a child's. `None` when nothing
+/// does.
+pub(crate) fn announcement(channels: &Channels, noun: Noun) -> Option<String> {
     let waiting: Vec<String> = channels
         .iter()
         .filter(|(_, counts)| counts.pending > 0)
         .map(|(channel, counts)| {
-            let messages = if counts.pending == 1 {
-                "message is"
-            } else {
-                "messages are"
+            let words = match (noun, counts.pending) {
+                (Noun::Message, 1) => "message is",
+                (Noun::Message, _) => "messages are",
+                (Noun::Request, 1) => "request is",
+                (Noun::Request, _) => "requests are",
             };
             format!(
-                "{} {messages} waiting on runtime.channels[{channel:?}]",
+                "{} {words} waiting on runtime.channels[{channel:?}]",
                 counts.pending
             )
         })

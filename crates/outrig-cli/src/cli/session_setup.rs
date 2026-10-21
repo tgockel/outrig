@@ -431,7 +431,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         // Keys only `run-new` reads; delete with `run_new_only_keys` once `run`
         // is retargeted at the Python loop.
         let models = resolved.candidates.iter().map(|c| c.model_name.as_str());
-        for line in run_new_only_keys::warnings(&cfg, models) {
+        for line in run_new_only_keys::warnings(&cfg, resolved.agent_name.as_deref(), models) {
             eprintln!("{line}");
         }
         (resolved.agent_name.clone(), resolved.image.clone())

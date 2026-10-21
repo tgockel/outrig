@@ -61,6 +61,8 @@
 //!   `model.attempt` event ([`super::ledger`]): this loop records those that
 //!   fail, and [`RetryingModel`] those that came back `2xx`, since only it
 //!   learns whether the body was usable.
+//! - Once the session's token budget is spent, neither layer sends another
+//!   request, and what it returns instead ([`BudgetSpent`]) neither retries.
 //! - The predicates the CLI's REPL classifies a failed turn with are not here.
 //!   A round's failure ends the round whatever it was, so nothing reads them;
 //!   [`is_recoverable`] remains: what a loop resends, which a chain's verdict
@@ -325,7 +327,7 @@ impl Retries {
     }
 
     fn events(&self) -> &Events {
-        self.slot.ledger().events()
+        self.slot.events()
     }
 
     /// Record that try `attempt`, counted from 1, of `call` -- the request
@@ -604,6 +606,12 @@ impl<M: CompletionModel> RetryingModel<M> {
             let Some(delay) = delay else {
                 return (Err(CompletionError::ResponseError(message)), ids);
             };
+            // The re-roll would be a request, which a spent budget refuses,
+            // and the usage this attempt's body reported may have spent it.
+            // A refusal needs no wait.
+            if self.retries.slot.ledger().budget_spent() {
+                return (Err(HttpError::Instance(Box::new(BudgetSpent)).into()), ids);
+            }
 
             tracing::warn!(
                 "{} returned an unusable response ({message}); retry in {:.1}s (attempt {}/{})",
@@ -627,6 +635,29 @@ impl<M: CompletionModel> RetryingModel<M> {
 pub(crate) fn unusable(message: &str) -> String {
     format!("unusable response ({message})")
 }
+
+/// What either layer returns in place of a request it did not send because
+/// the session's token budget is spent. Every request after it would be
+/// refused the same, so it is the call's result: no loop retries it, a chain
+/// does not move on from it, and the round stops on it as on its own check
+/// before a call.
+#[derive(Debug)]
+pub(crate) struct BudgetSpent;
+
+impl BudgetSpent {
+    /// Whether `err` is this refusal.
+    pub(crate) fn of(err: &CompletionError) -> bool {
+        matches!(err, CompletionError::HttpError(HttpError::Instance(inner)) if inner.is::<Self>())
+    }
+}
+
+impl fmt::Display for BudgetSpent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not sent: the session's token-budget is spent")
+    }
+}
+
+impl std::error::Error for BudgetSpent {}
 
 /// What a `200`'s body says it used, for a body rig made no completion of and
 /// so took no usage from: `None` when it carries no `usage`, or one of neither
@@ -751,6 +782,19 @@ where
     // was never right, so the full budget applies for the rest of the request.
     let mut answered = false;
     loop {
+        // A place among the session's requests in flight, held from here until
+        // the attempt has been recorded -- a `2xx`'s by the model layer, with
+        // its usage -- or has failed, and never through a backoff. Taken
+        // before the attempt is named, so a request still waiting its turn is
+        // no attempt yet, and one dropped while it waits leaves the queue
+        // having held nothing.
+        let place = retries.slot.ledger().place().await;
+        // Checked once the place is held, so the budget is as the attempt that
+        // held it last left it. A refused request is no attempt: nothing was
+        // sent.
+        if retries.slot.ledger().budget_spent() {
+            return Err(HttpError::Instance(Box::new(BudgetSpent)));
+        }
         // An attempt from here: one that is dropped in flight -- its round
         // dropped -- records itself as cancelled.
         let pending = retries.slot.sending();
@@ -763,7 +807,10 @@ where
 
         let (err, retry_after) = match sent {
             Ok(response) if response.status().is_success() => {
-                return into_lazy_response(response, pending.map(Pending::answered));
+                // Outside a call nothing records the attempt, and nothing
+                // holds the place past here.
+                let answered = pending.map(|pending| pending.answered(place));
+                return into_lazy_response(response, answered);
             }
             Ok(response) => {
                 answered = true;
@@ -814,6 +861,9 @@ where
             }
         };
 
+        // The attempt is over, its error body read: the wait before the next
+        // holds no place.
+        drop(place);
         let label = failure_label(&err);
         let ids = pending.map(|pending| pending.failed(label.clone()));
         let elapsed = started.elapsed();
@@ -1104,7 +1154,7 @@ mod tests {
         ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(sent) = self.1.sending() {
-                sent.answered();
+                sent.answered(None);
             }
             Err(CompletionError::ResponseError(
                 "Response contained no message or tool call (empty)".into(),
@@ -1176,7 +1226,11 @@ mod tests {
     async fn each_retry_is_recorded() {
         let dir = tempfile::tempdir().expect("a log dir");
         let events = crate::events::opened(dir.path()).await;
-        let slot = CallSlot::new(crate::agent::ledger::Ledger::new(events.clone()));
+        let slot = CallSlot::new(
+            crate::agent::ledger::Ledger::new(events.clone(), None, None),
+            events.clone(),
+            None,
+        );
         slot.begin_call();
         slot.candidate("sonnet", "claude-sonnet-4-6", Some(4096));
         let model = RetryingModel::new(

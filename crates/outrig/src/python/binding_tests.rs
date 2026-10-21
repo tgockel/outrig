@@ -3925,6 +3925,26 @@ fn sent(relay: &Relay, agent: &str) -> usize {
     relay.stats.between(agent, "fx").to_binding.lines()
 }
 
+/// A binding's object is not data, so it is never an input a child is given: the spawn refuses it
+/// before it asks the host for anything, saying the child reaches the binding by name.
+#[test]
+fn a_hosted_object_is_refused_as_a_childs_input() {
+    let mut relay = Relay::start();
+    relay.bind("fx", FACTORY);
+    let out = relay.output(
+        1,
+        &with_stub(
+            "try:\n    await runtime.spawn('w', prompt='p', inputs={'repo': stub})\n\
+             except TypeError as e:\n    print(e)",
+        ),
+    );
+    assert!(
+        out.contains("repo is an object a binding holds on the host")
+            && out.contains("reaches the session's bindings itself"),
+        "{out}"
+    );
+}
+
 /// Making a stub sends nothing; its first use opens the kernel's first connection and fetches the
 /// root there, on the thread using it, and the name is a `HostedRoot`.
 #[test]

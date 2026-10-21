@@ -236,9 +236,12 @@ including when the session closes.
   review.
 - **Three config keys for them**, top-level with `[agents.<name>]` overrides as
   `subagent-depth-max` has, read when the session starts; their validation ranges per fork 14.
-- **A per-tree token budget**, a new config key whose name is this task's, covering what fork 5
-  settles. A child that has spent it starts no further model call, and its work settles with a
-  typed budget error -- never an empty result.
+- **A token budget over the whole tree**, `token-budget`, with no default (fork 5, revised
+  2026-10-21): one per session, counting every model call of every agent, the main agent's
+  included, and read with `[agents.<name>]` overrides as the three limits are. Once it is spent no
+  agent starts a further model call: a child's work settles with a typed budget error -- never an
+  empty result -- and the main agent's round ends with a stop reason naming the key, as the
+  tool-call cap ends one. Unset, nothing caps spend.
 - **`outrig.AgentError`**, the base class of every error this machinery raises in agent code:
   `CompletionRejected`, `AgentReleased`, `AgentRequestFailed`, `RequestCancelled`,
   `AgentLimitReached`, the budget error and the closing error, whose spellings other than
@@ -309,7 +312,8 @@ including when the session closes.
   code awaits a child whose code awaits a grandchild completes, each level's execution waiting
   while holding no permit, and the record shows the three rounds' requests one after another.
 - **An exhausted token budget raises a typed error** in the waiter, and the child makes no model
-  call after the budget is spent.
+  call after the budget is spent; the main agent's next round stops with a reason naming
+  `token-budget`, making no model call either.
 - **Cancelling a waiter leaves the work running**: the work settles later, and a new await
   returns its result.
 - `h.cancel()` ends the work item and not the child, which then takes another submission.
@@ -449,9 +453,16 @@ including when the session closes.
 4. **A second submission to a busy child -- Recommended: queued in submission order**, with a
    status that says so, since a child has one execution slot. Refusing would make every parent
    write the queue itself. `h.cancel()` on a queued item removes it.
-5. **What the token budget covers -- Recommended: one budget per session, counting every model
-   call of every child and their descendants, and not the main agent's rounds**, which the user
-   starts and can stop. A budget per `spawn` would not bound a loop that spawns.
+5. **What the token budget covers -- Decided 2026-10-21 (the maintainer): one budget per session
+   over the whole tree, the main agent's calls included, with no default.** The recommendation of
+   planning left the main agent's rounds out, since the user starts and can stop them, and it
+   assumed a cap on by default, under which an interactive session would stop answering once its
+   own conversation had spent it. With no default that reason is gone: an operator who sets a cap
+   wants the session's spend capped, and the main agent's calls are usually the largest share.
+   No default, because a cap cannot tell work that needs many calls from code that is wrong, and
+   a child's rounds are already bounded without one -- the one-shot end, the end-of-round rule,
+   `tool-call-max`, depth and `children-max`; what stays unbounded is code launching new work,
+   which the work may need. A budget per `spawn` would not bound a loop that spawns.
 6. **How a child builds its result -- Recommended: the result type and the dataclasses it uses
    are bound into the child's namespace by their class names, beside the inputs, and the
    completion call takes an instance or its JSON form.** `typed-agents.md` leaves this to this
@@ -588,3 +599,121 @@ including when the session closes.
 - `plan/phase/0003-python/potential/resource-scheduling.md` -- the scheduler for children working
   at once that this task does not build.
 - `plan/next/children-have-a-user-channel.md` -- the user channel children do not get.
+
+## Decisions
+
+Forks 1-4 and 6-14 were taken as recommended, and fork 5 as the maintainer revised it above. What
+no doc settled is recorded here.
+
+- **Messages between agents stay in the interpreter, as Python objects** (the maintainer's
+  correction during planning). What one agent gives another -- inputs, a request, an answer,
+  progress -- goes from the sender's kernel to the receiver's as a `copy.deepcopy`: the same
+  classes, and no state shared. Nothing is encoded to JSON and decoded again between two kernels.
+  JSON appears only in the previews the events carry, which the sender builds and only while the
+  host observes, and, from `0003-35`, across the process boundary to a host program, where the
+  sender encodes and the receiver decodes. The sender checks what it sends against its declared
+  type, as `Endpoint.send` already did: a request body at `request()`, inputs at `spawn` and
+  `submit`, an answer at `reply` and `complete`, where an instance or its JSON form is taken.
+  Channel traffic is described by sender and receiver; parent and child name only the tree --
+  spawn, release, depth.
+- **The request object decides how a request ends.** `_Work` holds a request's state under a lock,
+  and the first of an answer, `h.cancel()`, the release and the close to reach it is the outcome;
+  the others raise. The host ends a request only by telling the interpreter: `settle` for what it
+  decides -- a work child's second round without completing, a spent budget, a model that failed
+  in a way that does not recover -- `end` for a released kernel's, and the admission close for
+  every one open.
+- **The host keeps a record built from the interpreter's notices, never the bodies**: per request
+  its id, child, channel, state, attempts and the child's rounds it spanned. The end-of-round
+  rule, the announcement's counts, the events and the shutdown report read it.
+- **Ids.** Children are `c1`, `c2`, ... in launch order, the subject `agent/c1`. A request's id
+  comes from the interpreter's counter as `submit` or `request` makes it, so a handle has its `id`
+  at once, and the delivery of it carries the same. A user-channel delivery's `id` is the one the
+  host posted the message under.
+- **Spellings.** `await runtime.spawn(name, *, prompt, model=None, inputs=None, requests=None)`
+  returns a `Child` (`id`, `name`, `kind`, `status`, `channels`, `submit`);
+  `child.submit(inputs, *, result, attempts=3)`; `child.channels[name].request(body, *,
+  attempts=3)` and `.pending()`; `await runtime.release(children)`; `await
+  runtime.complete(value)`, which a work child's runtime has and a request child's raises naming
+  `reply`; `RequestDelivery(Delivery)` with `await d.reply(value)` and `await d.fail(message)`;
+  `outrig.Request(request_type, reply_type, *, doc=None)`, or a bare `(request_type, reply_type)`.
+  An answer that fails its check raises `outrig.schema.DecodeError` naming the attempt; one after
+  the request ended raises `RequestCancelled` if it was cancelled and `RequestSettled`, carrying
+  `ended`, otherwise. An unknown `model=` and a refused release batch are the caller's mistakes,
+  `ValueError`; the depth refusal is `AgentLimitReached`, as the other limits' are.
+- **`Status(state, reason, child)`** is frozen and fixed once the request ends. The child's state
+  is what the host last pushed: `running` as its runner opens a round, `idle` only as the runner
+  waits, so a round that follows another at once is never seen apart from it, `wedged`, and
+  `released`.
+- **Progress carries `str`** in 0.3, and is evented as `agent.request.progress` on its submission
+  rather than as `message.sent` and `message.received`. Those take their `message` ids from the
+  host's counter, a progress message is numbered by the interpreter's, and the two could repeat
+  an id, which `scripts/render-session.py` pairs messages by. When the sender reads progress is
+  not recorded.
+- **No orienting round at `spawn`.** A request child is idle once launched; its first request
+  opens its first round. `0003-34` adds the orienting round and `ready()`.
+- **Release (fork 9).** The subtree ends deepest first. The host waits two seconds for each
+  kernel's `ended`, and a child that does not answer is `wedged`, keeps its place under
+  `children-max`, and is reported by `agent.wedged`. A child still launching when its parent is
+  released is left to its launch, which ends its kernel on finding it released, rather than
+  waited on before it has a kernel. A spawn whose waiter was cancelled releases the child the
+  host launches anyway, since nothing holds it.
+- **A child's failed round is opened again with what it opened with**, after a wait of two seconds
+  doubling to sixty, so an outage does not spin the runner. Its opening may never have reached the
+  model, and a work child's submission was given to it as the round opened, so a round opened anew
+  from the summary would ask for the result of a submission the model was never shown. A failure
+  that does not recover, such as a key every model refuses, ends what the child holds `failed`
+  with the error, and anything sent to it later the same way, with no further round. When a
+  work child is given another submission than the one its summary counted -- that one cancelled
+  meanwhile -- the round opens on the one given.
+- **The session's lifecycle state stays the main agent's.** A child's rounds and executions do
+  not move `session.state`, and admission still refuses them once closed.
+- **`token-budget` (fork 5).** One per session, counting the `total_tokens` providers report for
+  every attempt of every agent. It is checked before each model call, and again before each
+  request is sent, once the request has its place: a retry, and a re-roll of an unusable `200`,
+  included. A request refused there is `BudgetSpent`, which no retry layer sends again and no
+  chain moves past to its next model. The count is the ledger's fold over its attempts, as every
+  other total is, never a stored sum. The main agent's round stops with
+  `token-budget (<n> tokens) is spent: ...`, as the tool-call cap stops one, whichever check
+  refused. A child idle when another agent spends the budget hears it, and ends what it holds
+  `budget` rather than leaving its waiters to time out.
+- **Places for model requests** are one session-wide FIFO semaphore, taken per HTTP attempt
+  before it is made, held until the attempt is settled and what it used recorded, and given back
+  before any retry's wait; a wait dropped by a release leaves the queue. Held through the
+  recording so the request that takes the place next is checked against a count that includes
+  the one before it.
+- **A child's failed round.** One that failed before its code ran is opened again with what it
+  opened with: the conversation kept nothing of it. One that failed after is not, since what its
+  code did stands -- a completion, a reply -- and opening it again would give that work a second
+  time. After the same backoff, the end-of-round rule decides from what is open then, against the
+  baseline from before the failed round.
+- **A launch from a released agent.** The registry refuses a spawn whose parent is released or
+  wedged, under the lock a release marks its subtree under, so a launch either comes before the
+  release, which then ends it, or is refused. The refusal is `released`, raised in the parent as
+  `AgentReleased`, as is one the release overtook while it launched.
+- **Lines to the host are bounded.** A spawn, a release, and a submission's notice longer than
+  `MESSAGE_MAX` (1 MiB) raise `ValueError` where they are made, before anything is registered:
+  the host drops a line past its own read limit unanswered, and what waited on it would wait for
+  good. Progress text and the message a request is failed with reach the events cut to 1,024
+  characters, as previews are.
+- **Spend (fork 8).** Each agent's call slot names its parent's and the round that launched it,
+  so an attempt counts toward every ancestor round still running: `descendants` and `total` on
+  the round events. One that lands after a round ended is published as `model.round.usage`
+  naming it. A round's `usage` stays its own, so summing `usage` over every agent's rounds counts
+  each attempt once.
+- **Public API.** Two additions past the acceptance's list, both needed:
+  `ConfigValidationError::LimitOutOfRange { path, value, min, max }`, `#[non_exhaustive]`, since
+  no existing variant fits four keys with different ranges and one with no ceiling, the defaults
+  and ceilings staying crate-private; and `ShutdownReport::requests` with `RequestOutcome`, which
+  the close rows' report of outstanding requests by id needs. The events bring `AgentRequestId`,
+  `ChildKind`, `RequestEnd`, `InputBrief` and `ChannelBrief`.
+- **An opening counts unread requests and names received ones.** Where the first acceptance item
+  on an unchanged state says the new arrival's opening "names both ids", the opening names the
+  received request by id and counts the new one, unread, as the deliverable renders an opening;
+  its id reaches the child's code as it receives it.
+- **`run-new` shows the main agent's submissions only.** A child's code is in the event log under
+  its own subject; `plan/next/repl-shows-children.md` is the follow-up. The session page keeps
+  the main agent's model, max tokens and instructions when a child starts, and lists each agent's
+  instructions under its subject; it shows the new events as their data, and laying out the
+  children's rounds is `plan/next/render-session-lays-out-children.md`. This task took the
+  interpreter program to 80% of its argument cap,
+  `plan/next/interpreter-program-nears-the-argument-cap.md`.

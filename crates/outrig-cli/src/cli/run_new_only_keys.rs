@@ -1,8 +1,9 @@
 //! The config keys only `outrig run-new` reads, and the startup warning
 //! `outrig run` prints when a config sets one.
 //!
-//! `[models.<name>].context-window` and `[events] mode = "record"` live on
-//! types both loops share, so `run` parses them and does nothing with them.
+//! `[models.<name>].context-window`, `[events] mode = "record"` and the
+//! limits on `run-new`'s children and model calls live on types both loops
+//! share, so `run` parses them and does nothing with them.
 //! Honoring them in `run`'s loop would be a second implementation of what
 //! `run-new` does; saying so at startup is the cheap fix. See
 //! `plan/phase/0003-python/crate-split-tradeoffs.md`.
@@ -17,7 +18,13 @@ use outrig::config::{Config, EventsMode};
 ///
 /// `models` is every row the session may run against, so a failover chain's
 /// fallback is named too: one line, naming each row that sets a window.
-pub(crate) fn warnings<'a>(cfg: &Config, models: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+/// `agent` is the session's agent, whose own limits count as the top
+/// level's do.
+pub(crate) fn warnings<'a>(
+    cfg: &Config,
+    agent: Option<&str>,
+    models: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
     let mut lines = Vec::new();
 
     let windowed: Vec<String> = models
@@ -38,6 +45,23 @@ pub(crate) fn warnings<'a>(cfg: &Config, models: impl IntoIterator<Item = &'a st
 
     if matches!(cfg.events.mode(), EventsMode::Record) {
         lines.push(ignored("[events] mode = \"record\""));
+    }
+
+    let agent = agent.and_then(|name| cfg.agents.get(name));
+    let limits = [
+        ("children-max", cfg.children_max.is_some(), agent.is_some_and(|a| a.children_max.is_some())),
+        (
+            "model-concurrency-max",
+            cfg.model_concurrency_max.is_some(),
+            agent.is_some_and(|a| a.model_concurrency_max.is_some()),
+        ),
+        ("requests-max", cfg.requests_max.is_some(), agent.is_some_and(|a| a.requests_max.is_some())),
+        ("token-budget", cfg.token_budget.is_some(), agent.is_some_and(|a| a.token_budget.is_some())),
+    ];
+    for (key, top, own) in limits {
+        if top || own {
+            lines.push(ignored(key));
+        }
     }
 
     lines
@@ -72,7 +96,7 @@ provider       = "openai"
 context-window = 32000
 "#,
         );
-        assert!(warnings(&cfg, ["fast"]).is_empty());
+        assert!(warnings(&cfg, None, ["fast"]).is_empty());
     }
 
     #[test]
@@ -87,7 +111,7 @@ provider = "openai"
 "#,
         );
         assert_eq!(
-            warnings(&cfg, ["fast"]),
+            warnings(&cfg, None, ["fast"]),
             [ignored("[events] mode = \"record\"")]
         );
     }
@@ -115,11 +139,40 @@ context-window = 64000
 "#,
         );
         assert_eq!(
-            warnings(&cfg, ["first", "second", "third"]),
+            warnings(&cfg, None, ["first", "second", "third"]),
             [
                 ignored("context-window on [models.second], [models.third]"),
                 ignored("[events] mode = \"record\""),
             ]
+        );
+    }
+
+    /// A limit on `run-new`'s children or model calls is named whether the
+    /// top level sets it or the session's agent does; another agent's is not
+    /// the session's.
+    #[test]
+    fn child_limits_are_named_for_the_top_level_and_the_sessions_agent() {
+        let cfg = config(
+            r#"
+token-budget = 1000
+
+[models.fast]
+provider = "openai"
+
+[agents.coding]
+children-max = 4
+
+[agents.other]
+requests-max = 4
+"#,
+        );
+        assert_eq!(
+            warnings(&cfg, Some("coding"), ["fast"]),
+            [ignored("children-max"), ignored("token-budget")]
+        );
+        assert_eq!(
+            warnings(&cfg, None, ["fast"]),
+            [ignored("token-budget")]
         );
     }
 }

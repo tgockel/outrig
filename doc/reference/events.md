@@ -56,7 +56,7 @@ names are lower-case letters and digits only, so everything OutRig-specific is i
 | `id`              | A decimal string counting from `"1"`: its place in the session.       |
 | `source`          | `/outrig/session/<id>`, the id `session.json` and `outrig ls` show.   |
 | `type`            | `org.outrig.` and the event's name, as listed below.                  |
-| `subject`         | `agent/primary` for an event of the agent's; absent otherwise.        |
+| `subject`         | The agent it concerns: `agent/primary`, or a child's; else absent.    |
 | `time`            | When the session published it: RFC 3339, UTC, to the millisecond.     |
 | `datacontenttype` | `"application/json"`.                                                 |
 | `data`            | The event's fields, listed below.                                     |
@@ -73,10 +73,18 @@ and neither do the session's own, `session.state` and `session.report`, or those
 holding its bindings, `binding.refused` and `binding.exited`. A request to a binding is the
 agent's that made it.
 
+A child agent, which an agent's code launches with `runtime.spawn`, is named `c1`, `c2`, and so on
+in launch order, and its events carry its own subject, `agent/c1`: its `agent.started`,
+`model.instructions`, rounds, executions, and model calls, as the main agent's carry
+`agent/primary`. `agent.spawned` and each event about a request made of a child carry the child's
+subject; `agent.released` carries the subject of the agent that released it.
+
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
 them means nothing. Turns and calls are each counted from 0 on their own, and requests to
-bindings from 1.
+bindings from 1. A request made of a child agent has a `request` id from the interpreter's own
+counter, which does not run in sequence either: the id its handle and the child's delivery of it
+carry in agent code.
 
 ## Three categories
 
@@ -92,9 +100,12 @@ category says what it may hold.
   16 KiB of output and of traceback per execution, 4 KiB per line of stderr, 200 names in an
   inventory, and names and types only, never values. An execution's full output is never
   recorded.
-- **Integration audit** -- what crossed to a provider, across a channel, or to a binding.
-  Provider calls are recorded as their token counts, never their bodies, which are model view.
-  Channel messages are recorded with their bodies, at most 1 MiB each as a channel carries them.
+- **Integration audit** -- what crossed to a provider, across a channel, between agents, or to a
+  binding. Provider calls are recorded as their token counts, never their bodies, which are model
+  view. Channel messages are recorded with their bodies, at most 1 MiB each as a channel carries
+  them. What one agent gave another -- a child's inputs, a request, an answer -- is recorded as a
+  preview of its JSON form, cut to 1,024 characters; a child's progress, and the message it fails
+  a request with, are cut the same.
   A message the user types can hold a secret; this category is why the file is its owner's alone.
   A request to a binding is recorded with a preview of each argument, built from what crossed by
   value and cut to 200 characters, 16 items of a container, and 3 levels deep; an object of the
@@ -103,7 +114,7 @@ category says what it may hold.
 
 ## Model view
 
-- `model.instructions` -- once, as the agent starts: what every call is sent besides the
+- `model.instructions` -- once, as an agent starts: what every call is sent besides the
   conversation.
   - `model`: the `[models.<name>]` row every call is tried against first. For an alias, that is
     the first of its models this build can reach.
@@ -187,6 +198,9 @@ the same call, and records no new `model.call`.
     the grace, what was still in the group when it could not be proven empty, each as
     `<pid> <command> <state>`, and how the process ended when it ended before the stop, as its
     `binding.exited` says, or `null`. A group not proven empty makes `stopped` `not_proven`.
+  - `requests`: each request made of a child agent that was open at the close, as `{request,
+    child, channel, outcome}`: `channel` is `null` for a submission, and `outcome` is how it
+    ended -- `closed` by the close, or `terminated` when the interpreter died first.
   - `verdict`: `clean`, `stopped_with_unknown`, or `not_proven_stopped`.
 - `binding.refused` -- a binding a repository's config declared did not start, and the session
   runs without it: `binding`, its name; `declared_in`, the config file, or `null`; and
@@ -197,12 +211,19 @@ the same call, and records no new `model.call`.
   on without them: each request the process was running ends `unknown`, and a later one raises an
   error saying how the process ended.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
-  and `tool_result_max`.
+  and `tool_result_max`. A child's is recorded as it is launched.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the
-  container, before `session.report`. A session with no primary agent records neither this nor
-  `agent.started`.
+  container, before `session.report`, or for a child as its kernel ends after its release. A
+  session with no primary agent records neither this nor `agent.started` for one.
+- `agent.released` -- an agent's code released children: `released`, the ids it named; `ended`,
+  those and every child below them, each ended or found wedged; and `requests`, the requests that
+  ended `released` with them.
+- `agent.wedged` -- no fields. The subject, a released child, did not stop within two seconds:
+  its code holds its thread and never yields, so the thread runs until the session ends, and the
+  child counts against `children-max` until then.
 - `round.started` -- `round`. A round is numbered as its first turn commits, so a round that
-  fails or is interrupted before committing one leaves its number to the next.
+  fails or is interrupted before committing one leaves its number to the next. Each agent counts
+  its own.
 - `exec.completed` -- how an execution ended, when its result arrived.
   - `execid`, and `status`: `ok`, `error`, `lost` when the interpreter exited first, or
     `refused` when the interpreter refused it.
@@ -269,10 +290,17 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   - `attempts`: every request the round sent, failed ones included.
   - `input_tokens_max`: the largest `input_tokens` any call reported, or `null`. Providers differ
     on whether cached input counts there: Anthropic's does not, OpenAI's does.
-- `model.round.failed` -- a round ended by an error: `round`, `error`, and `calls`, `usage`, and
-  `attempts` so far.
+  - `descendants`: the requests sent while it ran for the child agents its code launched, and
+    theirs below them; `total`: its own usage and theirs, each attempt once, or `null` when none
+    reported any.
+- `model.round.failed` -- a round ended by an error: `round`, `error`, and `calls`, `usage`,
+  `attempts`, `descendants`, and `total` so far.
 - `model.round.dropped` -- a round ended by a Ctrl-C while no Python ran: `round`, and `calls`,
-  `usage`, and `attempts` so far.
+  `usage`, `attempts`, `descendants`, and `total` so far.
+- `model.round.usage` -- requests a round's descendants sent after it ended, such as a child still
+  working in a background task: `round`, `attempts`, and `usage`, their sum. Its subject is the
+  agent whose round it was, and what it adds belongs to that round's `total`. One that lands as
+  the round ends can come before the round's own event.
 - `model.retry` -- a model call that failed and will be made again, after a wait.
   - `model`: the `[models.<name>]` row being retried.
   - `attempt`: the try that failed, counted from 1 among this call's retries.
@@ -289,6 +317,32 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
 - `model.usage.refused` -- a usage report that changed nothing: `call_id` (`null` for an attempt
   the session has no record of), `attempt_id`, `usage`, and `reason`: `unknown`, `reported` when
   the attempt's own event carried its usage, or `replaced` when an earlier report already had.
+- `agent.spawned` -- a child agent was launched; the subject is the child's. `name`, what the
+  spawn called it; `parent`, the subject of the agent that launched it; `kind`, `work` or
+  `request`; `model`, the `[models.<name>]` row as the spawn named it, or as its parent runs;
+  `depth`, the main agent's being 1; `inputs`, each `{name, type, preview}`; and `channels`, a
+  request child's, each `{name, request, reply}`, its types as text.
+- `agent.request.sent` -- a request was made of the subject, a child: `request`; `channel`, or
+  `null` for a submission; `sender`, the subject of the agent that made it; `body`, a preview of
+  what was sent, a submission's inputs by name; and `attempts_max`, how many answers that fail
+  their check it takes before it ends rejected.
+- `agent.request.received` -- the child took it: its code received it, or a submission was given
+  to it as a round began. `request`, and `round`, the child's round then, or `null`.
+- `agent.request.replied` -- the child answered it: `request`; `attempt`, counted from 1; and
+  `value`, a preview of the answer.
+- `agent.request.invalid` -- that answer failed its check: `request`, `attempt`, and `problems`,
+  each with its path.
+- `agent.request.progress` -- a work child reported progress on the submission: `request` and
+  `body`, its text, cut to 1,024 characters. Progress settles nothing.
+- `agent.request.failed` -- `request`, and `message`, why, cut to 1,024 characters: the child's
+  code failed it, or its model failed in a way that does not recover.
+- `agent.request.cancelled` -- its sender cancelled it: `request`, and `received`, whether the
+  child had taken it.
+- `agent.request.settled` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
+  `failed`, `cancelled`, `released`, `budget`, `closed`, or `terminated`; `attempts`, the answers
+  it took; and `rounds`, the child's rounds it was open during.
+- `agent.request.refused` -- an answer to a request that had already ended, refused: `request`,
+  and `ended`, how it had ended.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
   `from` and `to`, each `user` or `agent/primary`; and `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,
@@ -337,7 +391,9 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
 counted once, with a `model.usage.replaced` taking the place of its attempt's `null` and a
 `model.usage.refused` changing nothing. A round's `usage` already includes the calls beneath it,
 so adding a round's total to its `calls` counts each attempt twice; a round's members are its
-`attempts`.
+`attempts`. A round's `total` holds its descendants' attempts beside its own, so adding the totals
+of a round and of its child's round counts the child's attempts twice; summing `usage` over every
+agent's rounds counts each once.
 
 ## Durability and loss
 

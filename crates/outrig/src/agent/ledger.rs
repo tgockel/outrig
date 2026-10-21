@@ -20,6 +20,14 @@
 //! [`Book`] is the one fold. The live session feeds it as it records, and a
 //! reader of the event log feeds it the same records back, so the two cannot
 //! disagree about which record counted.
+//!
+//! The ledger also holds what bounds a session's model calls as a whole: its
+//! places for requests in flight, which every request takes one of from just
+//! before it is sent until its attempt is recorded, and its token budget,
+//! which every request checks once it holds its place. Each agent's
+//! [`CallSlot`] reaches both, and a child's slot knows the round of its
+//! parent's it was launched in, so what the child spends is added to that
+//! round's tree.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use rig::completion::{CompletionError, CompletionResponse};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use super::budget::Budget;
 use super::history::Adjacent;
@@ -61,6 +70,18 @@ struct Inner {
     calls: AtomicU64,
     attempts: AtomicU64,
     book: Mutex<Book>,
+    /// How many model requests the session may have in flight at once, every
+    /// agent's together, and its places for them: a request holds one from
+    /// just before it is sent until its attempt has been recorded with what it
+    /// used, or has failed, and never through a backoff or while an agent's
+    /// code runs. So a request that takes a place given back sees the budget
+    /// as the attempt that held it left it. `None` bounds nothing.
+    places: Option<(usize, Arc<Semaphore>)>,
+    /// What the session may spend, when it has a budget.
+    budget: Option<u64>,
+    /// Whether the budget is spent: set once, as the attempts recorded reach
+    /// it, and heard by whoever waits for it.
+    out: watch::Sender<bool>,
 }
 
 /// The fold every total is derived from: each attempt once, by its id.
@@ -132,7 +153,6 @@ impl Book {
     }
 
     /// What every attempt of the session used.
-    #[cfg(test)]
     pub(crate) fn session_total(&self) -> Option<Usage> {
         Self::sum(self.attempts.values())
     }
@@ -148,18 +168,67 @@ impl Book {
 }
 
 impl Ledger {
-    /// A ledger recording its attempts in `events`.
-    pub(crate) fn new(events: Events) -> Self {
+    /// A ledger recording its attempts in `events`, with at most `places`
+    /// model requests in flight and `budget` tokens to spend, when each is
+    /// given.
+    pub(crate) fn new(events: Events, places: Option<usize>, budget: Option<u64>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 events,
+                places: places.map(|max| (max, Arc::new(Semaphore::new(max)))),
+                budget,
                 ..Inner::default()
             }),
         }
     }
 
-    pub(crate) fn events(&self) -> &Events {
-        &self.inner.events
+    /// A place for one model request, held until it is dropped, waiting in
+    /// turn while every place is held: a wait dropped leaves its turn having
+    /// taken nothing. `None` at once when the session bounds nothing.
+    pub(crate) async fn place(&self) -> Option<OwnedSemaphorePermit> {
+        let (_, places) = self.inner.places.as_ref()?;
+        // Never closed, so never refused.
+        Arc::clone(places).acquire_owned().await.ok()
+    }
+
+    /// How many places for model requests are held now.
+    #[cfg(test)]
+    pub(crate) fn places_held(&self) -> usize {
+        self.inner
+            .places
+            .as_ref()
+            .map_or(0, |(max, places)| max - places.available_permits())
+    }
+
+    /// The session's token budget, when it has one.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        self.inner.budget
+    }
+
+    /// Whether the session has spent its token budget: no model call may be
+    /// made from here on.
+    pub(crate) fn budget_spent(&self) -> bool {
+        *self.inner.out.borrow()
+    }
+
+    /// Whether the budget is spent, as it changes: `true` from the moment it
+    /// is, for every receiver.
+    pub(crate) fn budget_watch(&self) -> watch::Receiver<bool> {
+        self.inner.out.subscribe()
+    }
+
+    /// Mark the budget spent once what `book`, just changed, totals reaches
+    /// it.
+    fn count(&self, book: &Book) {
+        let reached = self.inner.budget.is_some_and(|budget| {
+            book.session_total()
+                .is_some_and(|spent| spent.total_tokens >= budget)
+        });
+        if reached {
+            self.inner
+                .out
+                .send_if_modified(|spent| !std::mem::replace(spent, true));
+        }
     }
 
     fn mint_call(&self) -> CallId {
@@ -177,13 +246,15 @@ impl Ledger {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Record `attempt`, and publish it. Both under the book's lock, so the
-    /// order the log holds the records in is the order they were applied in,
-    /// and a replay of it applies them the same way.
-    fn record(&self, attempt: ModelAttempt) {
+    /// Record `attempt`, and publish it through `events`, its agent's. Both
+    /// under the book's lock, so the order the log holds the records in is the
+    /// order they were applied in, and a replay of it applies them the same
+    /// way.
+    fn record(&self, attempt: ModelAttempt, events: &Events) {
         let mut book = self.book();
         book.attempt(attempt.call_id, attempt.attempt_id, attempt.usage);
-        self.inner.events.emit(Payload::ModelAttempt(attempt));
+        self.count(&book);
+        events.emit(Payload::ModelAttempt(attempt));
     }
 
     /// Take `usage` as attempt `attempt`'s, arriving after its event: it
@@ -199,6 +270,7 @@ impl Ledger {
     pub(crate) fn late_usage(&self, attempt: AttemptId, usage: Usage) -> Late {
         let mut book = self.book();
         let late = book.late(attempt, usage);
+        self.count(&book);
         self.inner.events.emit(match late {
             Late::Replaced { call } => Payload::ModelUsageReplaced {
                 call_id: call,
@@ -284,13 +356,18 @@ pub(crate) fn replay(records: &[serde_json::Value]) -> Book {
 /// Where a chain's calls and attempts are named, shared by the round, the
 /// chain, and every candidate's retry loops beneath it -- the way
 /// [`ChainDeadline`] reaches into a `'static` request future. A chain's calls
-/// are made one at a time, so one call is in flight at most.
+/// are made one at a time, so one call is in flight at most. One per agent.
 ///
 /// [`ChainDeadline`]: super::retry::ChainDeadline
 #[derive(Clone, Default)]
 pub(crate) struct CallSlot {
     ledger: Ledger,
     state: Arc<Mutex<SlotState>>,
+    /// Where the agent's model events go.
+    events: Events,
+    /// For a child: its parent's slot, and the round of its parent's it was
+    /// launched in, whose tree its spend is added to.
+    parent: Option<Arc<(CallSlot, Option<u32>)>>,
 }
 
 #[derive(Default)]
@@ -299,6 +376,13 @@ struct SlotState {
     /// The attempts the round in progress has made, failed ones included: its
     /// members, which its total is the sum over.
     round: Vec<AttemptId>,
+    /// The attempts children made under the round in progress, at any depth,
+    /// while it ran.
+    descendants: Vec<AttemptId>,
+    /// The round in progress, by its number in the conversation.
+    open: Option<u32>,
+    /// The latest round begun, in progress or not.
+    last: Option<u32>,
 }
 
 struct InFlight {
@@ -335,6 +419,9 @@ struct AnsweredAttempt {
     ///
     /// [`body_usage`]: super::retry::body_usage
     body: Arc<OnceLock<Bytes>>,
+    /// The request's place among those in flight, given back as the attempt
+    /// is settled, once its usage is in the book.
+    _place: Option<OwnedSemaphorePermit>,
 }
 
 /// What a request was sent with: its candidate's row, the identifier it named,
@@ -347,10 +434,19 @@ struct Settings {
 }
 
 impl CallSlot {
-    pub(crate) fn new(ledger: Ledger) -> Self {
+    /// The slot of an agent whose model events go to `events`; for a child,
+    /// `parent` is its parent's slot and the round of it the child was
+    /// launched in.
+    pub(crate) fn new(
+        ledger: Ledger,
+        events: Events,
+        parent: Option<(CallSlot, Option<u32>)>,
+    ) -> Self {
         Self {
             ledger,
             state: Arc::default(),
+            events,
+            parent: parent.map(Arc::new),
         }
     }
 
@@ -358,18 +454,60 @@ impl CallSlot {
         &self.ledger
     }
 
+    /// Where the agent's model events go.
+    pub(crate) fn events(&self) -> &Events {
+        &self.events
+    }
+
     fn state(&self) -> MutexGuard<'_, SlotState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A round begins: the attempts from here on are its.
-    pub(crate) fn open_round(&self) {
-        self.state().round.clear();
+    /// Round `round` begins: the attempts from here on are its, and so are
+    /// those its children make while it runs.
+    pub(crate) fn open_round(&self, round: u32) {
+        let mut state = self.state();
+        state.round.clear();
+        state.descendants.clear();
+        state.open = Some(round);
+        state.last = Some(round);
     }
 
-    /// The attempts the round in progress has made.
-    pub(crate) fn round_attempts(&self) -> Vec<AttemptId> {
-        self.state().round.clone()
+    /// The round ends: the attempts it made, and those its children made
+    /// under it while it ran. An attempt a child makes under it from here on
+    /// is published apart, naming it.
+    pub(crate) fn close_round(&self) -> (Vec<AttemptId>, Vec<AttemptId>) {
+        let mut state = self.state();
+        state.open = None;
+        (
+            std::mem::take(&mut state.round),
+            std::mem::take(&mut state.descendants),
+        )
+    }
+
+    /// The round a child launched now is launched in: the one in progress, or
+    /// the latest, for code a round left running.
+    pub(crate) fn current_round(&self) -> Option<u32> {
+        let state = self.state();
+        state.open.or(state.last)
+    }
+
+    /// A child under this slot's agent made `attempt`, under its round
+    /// `round`: counted into that round while it runs, and published as spend
+    /// added to it once it has ended.
+    fn descendant(&self, round: u32, attempt: AttemptId, usage: Option<Usage>) {
+        {
+            let mut state = self.state();
+            if state.open == Some(round) {
+                state.descendants.push(attempt);
+                return;
+            }
+        }
+        self.events.emit(Payload::ModelRoundUsage {
+            round,
+            attempts: vec![attempt],
+            usage,
+        });
     }
 
     /// The call in flight and the request that answered it, once one has.
@@ -462,22 +600,36 @@ impl CallSlot {
         error: Option<String>,
         usage: Option<Usage>,
     ) {
-        self.ledger.record(ModelAttempt {
-            call_id: call,
-            attempt_id: attempt,
-            model: settings.model.clone(),
-            identifier: settings.identifier.clone(),
-            max_tokens: settings.max_tokens,
-            error,
-            usage,
-        });
-        let mut state = self.state();
-        if let Some(in_flight) = &mut state.call
-            && in_flight.call == call
+        self.ledger.record(
+            ModelAttempt {
+                call_id: call,
+                attempt_id: attempt,
+                model: settings.model.clone(),
+                identifier: settings.identifier.clone(),
+                max_tokens: settings.max_tokens,
+                error,
+                usage,
+            },
+            self.events(),
+        );
         {
-            in_flight.last = Some(attempt);
+            let mut state = self.state();
+            if let Some(in_flight) = &mut state.call
+                && in_flight.call == call
+            {
+                in_flight.last = Some(attempt);
+            }
+            state.round.push(attempt);
         }
-        state.round.push(attempt);
+        // Up the tree, outside this slot's lock: each round above this agent's
+        // that it was launched under counts what it spent.
+        let mut link = self.parent.as_deref();
+        while let Some((parent, round)) = link {
+            if let Some(round) = *round {
+                parent.descendant(round, attempt, usage);
+            }
+            link = parent.parent.as_deref();
+        }
     }
 }
 
@@ -502,9 +654,10 @@ impl Pending {
     }
 
     /// A `2xx` came back: the model layer, which learns whether its body was
-    /// usable, records it. The HTTP layer reports the body through what this
-    /// returns, once it has read it.
-    pub(crate) fn answered(mut self) -> AnsweredBody {
+    /// usable, records it, and `place`, the request's place among those in
+    /// flight, is held until then. The HTTP layer reports the body through
+    /// what this returns, once it has read it.
+    pub(crate) fn answered(mut self, place: Option<OwnedSemaphorePermit>) -> AnsweredBody {
         self.done = true;
         let body = Arc::new(OnceLock::new());
         if let Some(call) = &mut self.slot.state().call
@@ -513,6 +666,7 @@ impl Pending {
             call.answered = Some(AnsweredAttempt {
                 attempt: self.attempt,
                 body: Arc::clone(&body),
+                _place: place,
             });
         }
         AnsweredBody(body)
@@ -585,6 +739,8 @@ impl Settling {
         };
         self.slot
             .record(call, answered.attempt, &settings, error, usage);
+        // `answered` gives its request's place back as it drops, after this
+        // record.
         Some((call, answered.attempt))
     }
 }
@@ -696,7 +852,7 @@ mod tests {
 
     /// A slot with a call in flight, and the attempt it was just sent.
     fn sent() -> (CallSlot, Pending) {
-        let slot = CallSlot::new(Ledger::default());
+        let slot = CallSlot::default();
         slot.begin_call();
         slot.candidate("sonnet", MODEL, Some(4096));
         let pending = slot.sending().expect("a call is in flight");
@@ -710,7 +866,7 @@ mod tests {
     #[test]
     fn an_answered_attempt_rig_could_not_use_records_its_bodys_usage() {
         let (slot, pending) = sent();
-        pending.answered().arrived(&bytes(serde_json::json!({
+        pending.answered(None).arrived(&bytes(serde_json::json!({
             "usage": { "input_tokens": 12, "output_tokens": 7 },
         })));
 
@@ -719,13 +875,13 @@ mod tests {
             .settle(&unusable_outcome())
             .expect("an answered attempt");
         assert_eq!(slot.ledger().usage_of(attempt), Some(plain(12, 7)));
-        assert_eq!(slot.round_attempts(), [attempt]);
+        assert_eq!(slot.close_round().0, [attempt]);
     }
 
     #[test]
     fn an_error_that_is_not_an_unusable_response_keeps_the_usage_too() {
         let (slot, pending) = sent();
-        pending.answered().arrived(&bytes(serde_json::json!({
+        pending.answered(None).arrived(&bytes(serde_json::json!({
             "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
         })));
         let outcome: Result<CompletionResponse<()>, _> = Err(CompletionError::ProviderError(
@@ -739,7 +895,7 @@ mod tests {
     #[test]
     fn an_attempt_whose_body_was_never_read_or_reported_nothing_is_null() {
         let (slot, pending) = sent();
-        let _unread = pending.answered();
+        let _unread = pending.answered(None);
         let (_, unread) = slot
             .awaiting()
             .settle(&unusable_outcome())
@@ -748,7 +904,7 @@ mod tests {
 
         let pending = slot.sending().expect("the retry");
         pending
-            .answered()
+            .answered(None)
             .arrived(&bytes(serde_json::json!({ "content": [] })));
         let (_, empty) = slot
             .awaiting()
@@ -761,7 +917,7 @@ mod tests {
     #[test]
     fn a_completion_keeps_the_usage_rig_gave_it_over_its_bodys() {
         let (slot, pending) = sent();
-        pending.answered().arrived(&bytes(serde_json::json!({
+        pending.answered(None).arrived(&bytes(serde_json::json!({
             "usage": { "input_tokens": 100, "output_tokens": 100 },
         })));
         let mut given = rig::completion::Usage::new();
@@ -786,5 +942,166 @@ mod tests {
         assert_eq!(first.mint_attempt(), AttemptId::new(2));
         assert_eq!(second.mint_attempt(), AttemptId::new(1));
         assert_eq!(second.mint_call(), CallId::new(1));
+    }
+
+    /// An attempt `slot` sent, answered with a body reporting `usage`, and
+    /// settled: what the ledger records for it.
+    fn spend_through(slot: &CallSlot, usage: Usage) -> AttemptId {
+        slot.begin_call();
+        slot.candidate("sonnet", MODEL, Some(4096));
+        let pending = slot.sending().expect("a call is in flight");
+        pending.answered(None).arrived(&bytes(serde_json::json!({
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            },
+        })));
+        let (_, attempt) = slot
+            .awaiting()
+            .settle(&unusable_outcome())
+            .expect("an answered attempt");
+        attempt
+    }
+
+    /// One place: a second request waits for it, a waiter whose caller gives
+    /// up leaves nothing held and nothing queued, and the next waiter takes
+    /// the place the moment it is given back.
+    #[tokio::test]
+    async fn a_place_bounds_requests_in_flight_and_a_cancelled_wait_leaks_nothing() {
+        let ledger = Ledger::new(Events::off(), Some(1), None);
+        let held = ledger.place().await.expect("a bounded ledger gives places");
+        assert_eq!(ledger.places_held(), 1);
+
+        let mut waiting = Box::pin(ledger.place());
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "the only place is held"
+        );
+        drop(waiting);
+        assert_eq!(ledger.places_held(), 1, "the cancelled wait took nothing");
+
+        let next = tokio::spawn({
+            let ledger = ledger.clone();
+            async move { ledger.place().await }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .expect("the place passes on at once")
+            .expect("the waiter ran");
+        assert_eq!(ledger.places_held(), 1);
+        drop(next);
+        assert_eq!(ledger.places_held(), 0);
+
+        assert!(
+            Ledger::default().place().await.is_none(),
+            "an unbounded ledger hands out none"
+        );
+    }
+
+    /// A request answered `2xx` keeps its place past the reading of its body,
+    /// until its attempt is settled and what it used recorded: a request that
+    /// takes the place after it finds the budget that use spent.
+    #[tokio::test]
+    async fn an_answered_request_keeps_its_place_until_what_it_used_is_recorded() {
+        let ledger = Ledger::new(Events::off(), Some(1), Some(19));
+        let slot = CallSlot::new(ledger.clone(), Events::off(), None);
+        slot.begin_call();
+        slot.candidate("sonnet", MODEL, Some(4096));
+        let place = ledger.place().await;
+        let settling = slot.awaiting();
+        let answered = slot.sending().expect("a call is in flight").answered(place);
+        answered.arrived(&bytes(serde_json::json!({
+            "usage": { "input_tokens": 12, "output_tokens": 7 },
+        })));
+        drop(answered);
+        assert_eq!(ledger.places_held(), 1, "read, and not yet counted");
+        assert!(!ledger.budget_spent());
+
+        settling
+            .settle(&unusable_outcome())
+            .expect("an answered attempt");
+        assert_eq!(ledger.places_held(), 0, "given back once counted");
+        assert!(ledger.budget_spent());
+    }
+
+    /// The budget is spent once the attempts recorded reach it, whichever
+    /// agent's slot recorded them.
+    #[test]
+    fn the_budget_is_spent_once_the_attempts_reach_it() {
+        let ledger = Ledger::new(Events::off(), None, Some(30));
+        let primary = CallSlot::new(ledger.clone(), Events::off(), None);
+        let child = CallSlot::new(ledger.clone(), Events::off().for_agent("c1"), None);
+        let out = ledger.budget_watch();
+        spend_through(&primary, plain(12, 7));
+        assert!(!ledger.budget_spent() && !*out.borrow());
+        spend_through(&child, plain(5, 6));
+        assert!(ledger.budget_spent(), "19 + 11 is 30");
+        assert!(*out.borrow(), "whoever waits hears it");
+        assert!(!Ledger::default().budget_spent(), "no budget, never spent");
+    }
+
+    /// A child's attempt counts in the round of its parent's it was launched
+    /// in while that round runs, a grandchild's in both rounds above it; once
+    /// a round has ended, an attempt under it is published apart, naming it.
+    #[test]
+    fn a_childs_spend_is_added_to_each_round_above_it() {
+        let mut stream = crate::events::StreamBuilder::default();
+        let mut seen = stream.subscribe(64);
+        let events = stream.build();
+        let ledger = Ledger::new(events.clone(), None, None);
+        let primary = CallSlot::new(ledger.clone(), events.clone(), None);
+        primary.open_round(3);
+        let child = CallSlot::new(
+            ledger.clone(),
+            events.for_agent("c1"),
+            Some((primary.clone(), primary.current_round())),
+        );
+        child.open_round(1);
+        let grandchild = CallSlot::new(
+            ledger.clone(),
+            events.for_agent("c2"),
+            Some((child.clone(), child.current_round())),
+        );
+
+        let own = spend_through(&primary, plain(1, 1));
+        let by_child = spend_through(&child, plain(2, 2));
+        let by_grandchild = spend_through(&grandchild, plain(3, 3));
+        assert_eq!(
+            primary.close_round(),
+            (vec![own], vec![by_child, by_grandchild])
+        );
+        assert_eq!(primary.current_round(), Some(3), "the latest round, ended");
+
+        let late = spend_through(&grandchild, plain(4, 4));
+        assert_eq!(
+            child.close_round(),
+            (vec![by_child], vec![by_grandchild, late]),
+            "the child's round still ran"
+        );
+        let usage_events: Vec<_> = std::iter::from_fn(|| seen.try_recv().ok())
+            .filter_map(|received| match received {
+                crate::harness::event::Received::Event(event)
+                    if event.kind() == "model.round.usage" =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events.len(), 1, "only the round that had ended");
+        assert_eq!(
+            usage_events[0].subject.as_ref().map(|s| s.as_str()),
+            Some("agent/primary")
+        );
+        assert_eq!(
+            usage_events[0].payload,
+            Payload::ModelRoundUsage {
+                round: 3,
+                attempts: vec![late],
+                usage: Some(plain(4, 4)),
+            }
+        );
     }
 }

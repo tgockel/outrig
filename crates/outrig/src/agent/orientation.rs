@@ -26,9 +26,16 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use super::history::Window;
 use crate::harness::bindings::Brief;
+use crate::harness::event::InputBrief;
+
+/// What every agent is told first: how it acts.
+const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
+                   code in a persistent interpreter inside the project's container; it is the \
+                   only way to read a file, run a command, or change anything.\n\n";
 
 /// The orientation, then `configured` after a blank line when there is one.
 ///
@@ -43,11 +50,9 @@ pub(crate) fn preamble(
     configured: Option<&str>,
     window: Window,
 ) -> String {
-    let mut text = String::from(
-        "You act on this project by writing Python. Your one tool, `submit_python`, runs code in \
-         a persistent interpreter inside the project's container; it is the only way to read a \
-         file, run a command, or change anything.\n\n\
-         The user reaches you through messages on `runtime.channels[\"user\"]`. You are told how \
+    let mut text = String::from(ACT);
+    text.push_str(
+        "The user reaches you through messages on `runtime.channels[\"user\"]`. You are told how \
          many are waiting there, not what they say: `await runtime.channels[\"user\"].receive()` \
          takes the next one, whose `.body` is its text, and `.pending()` counts them. `await \
          runtime.channels[\"user\"].send(text)` sends the user a message. What you write \
@@ -60,17 +65,34 @@ pub(crate) fn preamble(
          running. A bare `await` is not ended by a message, and when the user interrupts your \
          code, what it awaits is cancelled; `runtime.wait` leaves those tasks running.\n\n",
     );
+    text.push_str(&rest(
+        workspace,
+        bindings,
+        window,
+        "each time you are told messages are waiting",
+    ));
+    if let Some(configured) = configured {
+        text.push_str("\n\n");
+        text.push_str(configured);
+    }
+    text
+}
+
+/// What every agent is told after how it is reached: its conversation, a
+/// round beginning `begins`, its working directory, the interpreter, and the
+/// session's bindings.
+fn rest(workspace: Option<&Path>, bindings: &[Brief], window: Window, begins: &str) -> String {
     let Window { first, recent } = window;
-    text.push_str(&format!(
+    let mut text = format!(
         "Your whole conversation is in `runtime.history.turns`, a `Turn` for each of your model \
          calls, holding what you wrote and each call's source and result. Reading it from code \
          costs no context: only what you print is seen. Each call is sent less than all of it: \
          the first {first} rounds, the {recent} before this one, this one, and any turn you name \
          with `runtime.context.promote(turn)` until `runtime.context.demote(turn)`. Each call is \
          also held to the model's context window, which can leave out more, never your latest \
-         call. A round begins each time you are told messages are waiting, and its opening line \
-         says how many earlier turns are left out.\n\n"
-    ));
+         call. A round begins {begins}, and its opening line says how many earlier turns are \
+         left out.\n\n"
+    );
     if let Some(workspace) = workspace {
         text.push_str(&format!(
             "Your working directory is {}, which holds the project's files; its Python modules \
@@ -89,11 +111,119 @@ pub(crate) fn preamble(
     if !bindings.is_empty() {
         text.push_str(&hosted(bindings));
     }
-    if let Some(configured) = configured {
-        text.push_str("\n\n");
-        text.push_str(configured);
-    }
     text
+}
+
+/// What a child agent is: the one that works on submissions, or the one that
+/// answers requests on its channels, each with what its instructions say of
+/// them.
+pub(crate) enum ChildBrief<'a> {
+    Work,
+    Request(&'a [ChannelText]),
+}
+
+/// One of a request child's channels, as its instructions describe it.
+pub(crate) struct ChannelText {
+    pub(crate) name: String,
+    pub(crate) doc: Option<String>,
+    pub(crate) request_type: String,
+    pub(crate) reply_type: String,
+    pub(crate) request: String,
+    pub(crate) reply: String,
+}
+
+/// A child agent's system prompt: how it acts, what it is, `prompt` -- the
+/// first part of its instructions, which its parent wrote -- what it was
+/// given, and how it answers; then what every agent is told. No user reaches
+/// a child, and none of the session's own preamble applies to it.
+pub(crate) fn child_preamble(
+    workspace: Option<&Path>,
+    bindings: &[Brief],
+    window: Window,
+    prompt: &str,
+    inputs: &[InputBrief],
+    brief: &ChildBrief<'_>,
+) -> String {
+    let mut text = String::from(ACT);
+    text.push_str(
+        "You are a child agent: another agent's code launched you to do work for it, and that \
+         code is who you answer. No user reaches you, and you have no \
+         `runtime.channels[\"user\"]`.\n\n",
+    );
+    text.push_str(prompt.trim());
+    text.push_str("\n\n");
+    if !inputs.is_empty() {
+        text.push_str("These names were bound for you before you began:\n");
+        for input in inputs {
+            let _ = writeln!(
+                text,
+                "- `{}` ({}): {}",
+                input.name, input.type_name, input.preview
+            );
+        }
+        text.push('\n');
+    }
+    let begins = match brief {
+        ChildBrief::Work => {
+            text.push_str(
+                "Your work arrives as submissions. A round opens on each one, naming it, binding \
+                 its inputs as variables, and giving the type of the result it asks for, whose \
+                 class -- and every dataclass it uses -- is bound under its name. Complete it with \
+                 `await runtime.complete(value)`, `value` an instance of that type or its JSON \
+                 form. It returns once the value is accepted, which ends the submission; one that \
+                 is not accepted raises what is wrong, each problem with its path, so correct it \
+                 and complete again. A round that ends with the submission open is followed by \
+                 one more, and if that one ends with it open too, the submission fails. `await \
+                 runtime.channels[\"progress\"].send(text)` tells your caller how far you have \
+                 got, and settles nothing.\n\n\
+                 `runtime.wait` is `asyncio.wait`: the same arguments, the same `(done, pending)` \
+                 back, and a timeout that cancels nothing.\n\n",
+            );
+            "each time a submission is given to you, or one stays open"
+        }
+        ChildBrief::Request(channels) => {
+            text.push_str("You answer requests, which arrive on these channels:\n");
+            for channel in *channels {
+                let _ = write!(text, "\n- `runtime.channels[{:?}]`", channel.name);
+                if let Some(doc) = &channel.doc {
+                    let _ = write!(text, ": {}", doc.trim());
+                }
+                let _ = write!(
+                    text,
+                    "\n  A request is a `{}`:\n{}\n  Its reply is a `{}`:\n{}\n",
+                    channel.request_type,
+                    indented(&channel.request),
+                    channel.reply_type,
+                    indented(&channel.reply)
+                );
+            }
+            text.push_str(
+                "\nTake a request with `d = await runtime.channels[name].receive()`: `d.body` is \
+                 the request and `d.id` its id. Answer it with `await d.reply(value)`, `value` an \
+                 instance of the reply type -- bound under its name, with every dataclass it \
+                 uses -- or its JSON form. It returns once the reply is accepted; one that is not \
+                 raises what is wrong, each problem with its path, so correct it and reply again. \
+                 A request you cannot answer you end with `await d.fail(message)`, saying why. \
+                 You have no `runtime.complete`.\n\n\
+                 `runtime.wait` is `asyncio.wait` -- the same arguments, the same `(done, pending)` \
+                 back, and a timeout that cancels nothing -- except that while a request waits \
+                 unread, it raises `runtime.MessageAvailable`, which `except Exception` does not \
+                 catch. The request stays queued and the tasks keep running.\n\n",
+            );
+            "when requests are waiting, or one you took is unanswered"
+        }
+    };
+    text.push_str(&rest(workspace, bindings, window, begins));
+    text
+}
+
+/// `schema`, each line indented to sit under a list item.
+fn indented(schema: &str) -> String {
+    schema
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What the agent is told of the session's bindings, of which there is at
@@ -127,6 +257,83 @@ fn hosted(bindings: &[Brief]) -> String {
          and keeps the loop turning. `runtime.bindings` lists them."
     );
     text
+}
+
+/// The text that opens a child's round: `lead`, what the round is for, with
+/// how many earlier turns its model calls are not sent, then `detail`.
+pub(crate) fn child_opening(lead: &str, detail: &str, omitted: usize) -> String {
+    let mut text = opening(lead, omitted);
+    if !detail.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(detail);
+    }
+    text
+}
+
+/// What a work child is told as a submission is given to it.
+pub(crate) fn submission(
+    id: u64,
+    inputs: &[InputBrief],
+    result_type: &str,
+    schema: &str,
+) -> (String, String) {
+    let lead = format!("submission {id} is yours to complete");
+    let mut detail = String::new();
+    if inputs.is_empty() {
+        detail.push_str("It has no inputs.\n");
+    } else {
+        detail.push_str("Its inputs are bound as variables:\n");
+        for input in inputs {
+            let _ = writeln!(
+                detail,
+                "- `{}` ({}): {}",
+                input.name, input.type_name, input.preview
+            );
+        }
+    }
+    let _ = write!(
+        detail,
+        "Complete it with `await runtime.complete(value)`, `value` a `{result_type}`:\n{schema}"
+    );
+    (lead, detail)
+}
+
+/// What a work child is told when its submission's round ended without
+/// completing it: the one more round it gets.
+pub(crate) fn nudge(id: u64, result_type: &str) -> String {
+    format!(
+        "submission {id} is still open: your last round ended without completing it. Complete \
+         it now with `await runtime.complete(value)`, `value` a `{result_type}`; if this round \
+         ends without that too, the submission fails"
+    )
+}
+
+/// What a request child is told as a round opens on its requests: how many
+/// wait unread on each channel, in the announcer's words, and each it took
+/// and has not answered, with how long ago.
+pub(crate) fn requests(unread: &str, taken: &[(u64, String, Duration)]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !unread.is_empty() {
+        parts.push(unread.to_string());
+    }
+    for (id, channel, waited) in taken {
+        parts.push(format!(
+            "you took request {id} from runtime.channels[{channel:?}] {} ago and have not \
+             answered it",
+            human(*waited)
+        ));
+    }
+    parts.join("; ")
+}
+
+/// `duration`, to the second, as a person reads it.
+fn human(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 /// The line that opens a round: what waits, told by `announcement`, and how

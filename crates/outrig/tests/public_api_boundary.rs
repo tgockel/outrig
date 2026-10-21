@@ -191,6 +191,7 @@ fn the_harness_is_public_and_python_agent_is_gone() {
 #[test]
 fn every_harness_event_type_grows_without_a_break() {
     const PRIVATE_FIELDS: &[&str] = &[
+        "outrig::harness::event::AgentRequestId",
         "outrig::harness::event::AttemptId",
         "outrig::harness::event::CallId",
         "outrig::harness::event::ExecId",
