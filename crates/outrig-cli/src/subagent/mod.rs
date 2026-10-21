@@ -963,7 +963,7 @@ async fn run_rounds(
     chain: Vec<ModelLabel>,
 ) {
     let mut history = Vec::new();
-    let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref()).await;
+    let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref());
     // What every trace below calls this subagent; `name` alone is ambiguous
     // between parents (#305).
     let path = subagent_path(&ancestry, &name);
@@ -971,7 +971,7 @@ async fn run_rounds(
     loop {
         let prompt = shared.next_round().await;
         shared.begin_round();
-        log.record_prompt(&prompt).await;
+        log.record_prompt(&prompt);
 
         // Each steer goes out once, on a tool result rig then keeps -- see
         // `injection`. The turn takes the delivery back if its history ends up
@@ -1051,16 +1051,15 @@ async fn run_rounds(
         let steers = shared.close_injections(failure.is_none());
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
-        log.record_answered(&chain, &answered).await;
-        log.record_reply(&reply).await;
+        log.record_answered(&chain, &answered);
+        log.record_reply(&reply);
         if shared.gave_up() == Some(GaveUp::KeptReport) {
             // The give-up goes beside the report rather than over it (#350), as
             // a failure after reporting does.
             let note = "a later report was cut off at the output-token limit; the earlier one \
                         was kept";
             eprintln!("[outrig]   [{path}] {note}");
-            log.record_outcome("report cut off after reporting", note)
-                .await;
+            log.record_outcome("report cut off after reporting", note);
         }
         if let Some(reason) = &failure {
             if shared.published_this_round() && !shared.steered_since_publish() {
@@ -1072,8 +1071,7 @@ async fn run_rounds(
                 // though: the report cannot answer that, and a parent waiting
                 // for the answer would wait forever.
                 eprintln!("[outrig]   [{path}] round failed after reporting: {reason}");
-                log.record_outcome("round failed after reporting", reason)
-                    .await;
+                log.record_outcome("round failed after reporting", reason);
             } else {
                 publish_round_failure(&shared, &path, reason);
             }
@@ -1089,12 +1087,9 @@ async fn run_rounds(
             None
         };
         match reported {
-            Some(Outcome::Result(text)) => log.record_outcome("result", &text).await,
-            Some(Outcome::Error(text)) => log.record_outcome("error", &text).await,
-            None => {
-                log.record_outcome("no result", "round ended without outrig__set_result")
-                    .await;
-            }
+            Some(Outcome::Result(text)) => log.record_outcome("result", &text),
+            Some(Outcome::Error(text)) => log.record_outcome("error", &text),
+            None => log.record_outcome("no result", "round ended without outrig__set_result"),
         }
     }
 }
@@ -4095,6 +4090,61 @@ mod tests {
                 "{file} must hold its own prompt: {text}"
             );
         }
+    }
+
+    /// #307: a subagent's last record is in its transcript by the time the
+    /// parent can release it, so the header of a relaunch under its name lands
+    /// below it. The record is the `error` block a round writes after it goes
+    /// idle, when a parent may already read the result and release. A
+    /// `tokio::fs` write is a job on the blocking pool that outlives the task
+    /// which issued it, so a release in that gap let the relaunch's header
+    /// land first.
+    ///
+    /// The pool's one thread is held from the model call on, which is what a
+    /// stalled thread or a slow disk looks like to the runtime: a record that
+    /// goes through the pool stays out of the file until the hold ends.
+    #[test]
+    fn a_released_subagents_last_record_is_in_the_file_before_a_relaunch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        // Declared after the runtime, so it is dropped first -- also when an
+        // assertion unwinds, which would otherwise wait on the held thread.
+        let (_end_hold, held) = std::sync::mpsc::channel::<()>();
+
+        runtime.block_on(async {
+            let mut provider = ScriptedProvider::start().await;
+            let (registry, log_dir) = launch_probe(&provider, 4).await;
+            // Not `probe_transcript`: it reads through `tokio::fs`, which would
+            // wait on the held thread.
+            let read = || {
+                std::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
+                    .expect("transcript exists")
+            };
+            let call = provider.next_call().await;
+
+            tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            call.fail(StatusCode::BAD_REQUEST);
+            probe_went_idle(&registry).await;
+            registry.release(&["probe".to_string()]).expect("release");
+            let released = read();
+            assert!(released.contains("\n--- error ---\n"), "got: {released}");
+
+            registry
+                .launch("probe", None, None, "again".to_string())
+                .await
+                .expect("relaunch under the freed name");
+            // The round records its prompt before its first model call.
+            let _call = provider.next_call().await;
+            assert_eq!(
+                read().strip_prefix(&released),
+                Some("=== subagent probe ===\n\n=== prompt ===\nagain\n")
+            );
+        });
     }
 
     /// The label a trace carries is the whole path, so the same `audit` under

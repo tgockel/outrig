@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A released subagent's last transcript record cannot land under its relaunch's header.**
+  Records were written through `tokio::fs`, which hands the bytes to a blocking thread and leaves
+  only `flush` to wait for them. Releasing a subagent aborts its task, which dropped that wait and
+  not the write, so a name launched again in the same registry before the write landed appended
+  its header to the same `subagent-<name>.log` first, and the released subagent's record read as
+  the relaunch's. Nothing is known to have triggered this: it takes a release and a same-name
+  relaunch while the write is still waiting for a thread, and only the transcript was affected,
+  not what the parent reads. Each record is now written in the call that issues it, so a release
+  cannot separate the two. (#307)
 - **`outrig clean` leaves a stray container whose creation time it cannot read.** The stray sweep
   gave such a container the Unix epoch for a creation time, so it counted as older than any
   `--older-than` and `podman rm -f` removed it, even one created a second ago. A creation time it
