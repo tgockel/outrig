@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose `receive` yields what the agent's code sends back -- including from a task still running
   after its round ended. `round` takes no prompt: it tells the model how many messages wait,
   never what they say, and returns `RoundOutcome::NothingNew` without calling the model when
-  nothing new has arrived. A message arriving mid-round is announced at the head of the next tool result, and one
-  a failed round announced is announced again. In the interpreter, `runtime.channels["user"]`
+  nothing new has arrived. A message arriving mid-round is announced at the head of the next tool
+  result, and one a failed round announced is announced again. In the interpreter,
+  `runtime.channels["user"]`
   offers `receive()`, which returns a `Delivery` with `.body`, `.sender`, and `.received_at`;
   `send(text)`; and `pending()`. A channel's contract is checked against the serializable subset
   when it is made, a channel holds 256 unread messages and refuses the next, and a message is at
@@ -252,6 +253,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding.refused` event says why. With any binding, the workspace and every mount appear in the
   container at their host paths, and each binding's packages are mounted read-only under
   `/outrig/bindings/`. `Step::Packages` and `Step::Bindings` report the two new start steps.
+  `[bindings]` is held to every key and value even in the global config, which otherwise sets
+  aside what it cannot use: a binding is code the host runs, and one short an argument or no
+  longer serialized would run something other than what the file declares.
 
 - **Agent code calls its bindings, and every call is recorded.** Each binding is bound under its
   name in every kernel -- the primary and every one opened later -- as RPyC's proxy of its root,
@@ -369,13 +373,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gave up on, does not count. `ProgramExit` is no longer `Copy` or `Eq`.
 - **A start interrupted part way has its cleanup waited for.** Each step of a session's start
   already armed the removal of what it creates before creating it; the engine now tracks each
-  removal a dropped start hands over, a supervised process group dropped before it was stopped
-  until it is proven empty, and blocking work a dropped future leaves running, and waits for all
-  of it before it says the start is stopped. A binding's package install that nothing awaits any
-  more stops pip and removes its stage. A container `podman run` starts gives `sleep infinity` a
-  stop timeout of two seconds, which its orderly stop already passed, so a removal that names
-  none no longer waits out podman's ten. `ConfigValidationError::WorkspaceMountHostDuplicate`
-  refuses a host directory mounted twice in one session.
+  removal a dropped start hands over, a supervised process group dropped before it was stopped until
+  it is proven empty, blocking work a dropped future leaves running, and a child process a dropped
+  future owned until it is reaped -- a `buildah build` asked to stop, once it has removed its
+  working containers -- and waits for all of it before it says the start is stopped. `Abandonable`
+  is that wait for any caller about to exit: poll it in place of a future, and `abandon` it to drop
+  the future and wait, a little longer than a stopped build's grace at most, for what that set
+  going. A binding's package install that nothing awaits any more stops pip and removes its stage.
+  `ConfigValidationError::WorkspaceMountHostDuplicate` refuses a host directory mounted twice in one
+  session.
 - **A session with no primary agent: `SessionBuilder::no_primary`.** It resolves no model and asks
   its `Secrets` resolver for nothing as it starts, and has no rounds: `Session::round` returns
   `SessionError::NoPrimary`, and `Session::user_channel`, `Session::interrupter` and
@@ -414,7 +420,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target, and caches the download under `$XDG_CACHE_HOME/outrig/downloads`. The first launch on a
   machine unpacks it under `$XDG_CACHE_HOME/outrig/python`, and a cache on a `noexec` filesystem
   is refused with a message naming `XDG_CACHE_HOME`. There is no opt-out: on this line a session
-  is a Python session.
+  is a Python session. Its threads, child interpreters' included, get an 8 MiB default stack, so
+  deep recursion on one raises `RecursionError` rather than crashing with `SIGSEGV` (#464).
 - **Building `outrig` needs network once, or `OUTRIG_PYTHON_ARCHIVE`.** A build that cannot fetch
   the archive warns and embeds nothing (`OUTRIG_REQUIRE_PYTHON=1` makes that an error), and every
   `Outrig::launch` in the result fails with `OutrigError::Configuration` saying why. The embedded
@@ -458,7 +465,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An entry a caller replaces in `env` is whatever its new `ResolvedEnvValue` says.
 
 - **`ConfigValidationError::BuildImageNameInvalid` carries the `BuildImageNameError` it reports,
-  and is `#[non_exhaustive]`.** The variant gained a `reason` field, so 0.2.1's one-field shape
+  and is `#[non_exhaustive]`.** The variant gained a `reason` field, so 0.2's one-field shape
   no longer matches or constructs. Match it with `BuildImageNameInvalid { image, reason, .. }`
   and read `reason` for the cause, instead of calling `check_build_image_name(&image)` again. To
   build one, use `ConfigValidationError::build_image_name_invalid(image, reason)`, since a
@@ -482,14 +489,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ensure_image_for` and `ensure_tagged_image_for` then panicked inside the library.
 
   To migrate, an `image.image_name` read becomes `image.image_name()`, an `Option<&str>`, and a
-  write becomes `image.set_image_name(name)`. Each of `build_args`, `security` and `mcp` becomes a
-  getter, `x()`, and an in-place writer, `x_mut()`: `image.mcp_mut().insert(..)`, or
-  `*image.security_mut() = security`.
-
-  `set_image_name` replaces the whole source shape, clearing `dockerfile`, `context` and the
-  recorded `ConfigSource`. `set_build_paths` now clears `image_name` too, which changes behavior
-  only on a config that named an image, where it used to leave a state that could be neither
-  validated nor launched. The TOML and JSON Schema keys are unchanged.
+  write becomes `image.set_image_name(name)`, which 0.2.2 added. Each of `build_args`, `security`
+  and `mcp` becomes a getter, `x()`, and an in-place writer, `x_mut()`:
+  `image.mcp_mut().insert(..)`, or `*image.security_mut() = security`. The TOML and JSON Schema
+  keys are unchanged.
 
 ### Removed
 
@@ -501,15 +504,661 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RemoteModelHasMistralrsField`, `ModelCacheRootNotAbsolute`). Every type involved is
   `#[non_exhaustive]`, but code naming a removed item stops compiling.
 
-  A config that still carries any of it fails to parse rather than to validate: `LlmProvider`,
-  `Model`, and `Config` all reject a tag or key they do not know, so `Config::load_from_str` returns
-  `OutrigError::Config` naming the offending tag or key, on every load path. That includes
-  `Config::load_for_build`, which skips the model rules and so used to accept a weight key on a
-  remote model; it now refuses one like any other unknown key.
+  A config that still carries any of it loads, as one written for any other outrig does: each
+  weight key and `model-cache-root` is a key this build does not know, set aside with a
+  `ConfigWarning`. A `style = "mistralrs"` provider is a value it cannot use, which the global
+  config sets aside with a warning, leaving any model that names it without a provider, and any
+  other file refuses with `OutrigError::Config`. A strict parse of the types, `toml::from_str`
+  included, still refuses all of it.
+
+  With it goes the one provider a repo config could declare. Every remaining style carries an
+  `api-key`, which 0.2.2 keeps to the global config, so a repo config declares none and
+  `Config::validate_as_repo` refuses any with `ConfigValidationError::RepoProviderApiKey`.
 
   Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
   its `localhost` `base-url` -- see
   [Local models](../../doc/concepts/llm-providers.md#local-models).
+
+## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
+
+The second patch release since 0.2.0. Every change to the public surface is additive, and no
+requirement moves. Several fixes change what a consumer sees without asking. `Outrig::launch`
+refuses an image label's `${VAR}` that `LaunchSpec::embedded_mcp_env_allow` does not list, so a
+`LaunchSpec` built by hand needs `with_embedded_mcp_env_allow`, or `EmbeddedMcpPolicy::Ignore`.
+`LaunchSpec::from_config` now pulls or builds the primary image. A container no longer carries
+the host's proxy variables, `Config::validate_as_repo` refuses a repo provider that carries an
+`api-key`, and `load_project` takes only a config its process's user owns. The rest are fixes,
+each described below.
+
+### Added
+
+- **`Container::selector`**: what to hand podman to address a container -- the engine's id for one
+  outrig created, else its name. `PrimaryView::new` takes it for `--userns=container:`.
+
+- **`ImageConfig::set_image_name` turns an image-config into a pull source in place.** It is the
+  counterpart of `set_build_paths` and mirrors `from_image_name`: it sets `image_name`, clears
+  both build paths, and drops the recorded `ConfigSource`. Converting a build source to a pull
+  source had no way to clear the private build paths before. `build_args` is left alone, as
+  `set_build_paths` leaves it, and validation still reports `ImageNameWithBuildArgs` if any
+  remain. `image_name` is still a public field, so assigning it directly can still leave the
+  build paths set and reach the `source` panic; closing that takes a breaking release. (#270)
+- **`Workspace::config_source` names the file that declared `host-path`**, as
+  `MountConfig::config_source` does for a mount (#445).
+- **`Config::warnings` reports what a config load set aside rather than failing on.** Each
+  `ConfigWarning` names the file (`None` from `load_from_str`), the 1-based line, the key as a
+  dotted TOML path such as `models."opus-4.8".context-window` or `workspace.mounts[1].acess`, and
+  a `ConfigWarningKind`: `UnknownKey`, or `InvalidValue { reason }` for a value the global config
+  could not read. `Display` is one line, ``<file>:<line>: unknown key `events`, ignored``, and
+  `merge` keeps both sides' warnings, global first. `Config::load_unvalidated` and
+  `load_file_unvalidated` stop where `load` and `load_file` would validate, and
+  `validate_for_run` and `validate_for_build` are now public, so a caller can show the warnings
+  before a validation error they explain: a misspelled `provider` is set aside, and its model is
+  then refused for having none. (#507)
+
+- **`image::ensure_local_image_requested_by` names who asked for a ref that is not local.** It is
+  `ensure_local_image` with a `requester` -- `--image`, `[sidecars.tools]` -- that a miss names
+  as `image "<ref>" (from <requester>)`. `SidecarPlan::image_declared_by` supplies the phrase for
+  a sidecar: its `[sidecars.<name>]` block, or the MCP server whose inline `image` key implied
+  it. `ensure_local_image` keeps its signature and leaves the parenthetical out. (#355)
+
+- **`container::with_panic_sweep` sweeps for a panic that ends the process, and for no other.**
+  It runs a closure -- `main`'s body -- and, if a panic unwinds out of it, detaches the
+  label-scoped removal of every attempt still owed before the panic carries on. By then the
+  unwind has dropped every `Container` the closure held, so the sweep finds only what `Drop`
+  could not reach. A panic caught anywhere inside, including by a tokio task's `JoinHandle`, is
+  not swept. (#349)
+
+- **`image::ensure_tagged_image_for_with_output` shows a cache-miss build or pull as it runs.**
+  It takes an `image::BuildOutput`: `Captured` is the behavior `ensure_tagged_image_for` keeps
+  (output held in memory, a failure carries a stderr tail); `Stderr` writes each line of the
+  `buildah build` or `podman pull` to the process's stderr as `[buildah]` / `[podman]` lines
+  while it runs -- once, since a `Transcript` that already mirrors to stderr is left to do it --
+  and a failure then carries no tail, because the lines are already above it. The cache probe,
+  the label commit, and the `$ <cmd>` echo are unaffected. (#478)
+
+- **`Config::load_global` reads a global config on its own.** It parses the file, resolves
+  `session-root` and `model-cache-root` beside it, and stamps every path entry with its origin, but
+  neither merges nor validates: a global file's `default-model` may name a model only a repo
+  declares. A missing file loads as empty, as it does for `Config::load`. This is the read for a
+  caller that wants a machine-level key and has no repo.
+
+- **A `tools/call` deadline you can set per server and per session.** `McpServerSpec` gains a
+  `call-timeout-secs` table key (`call_timeout_secs()`, `with_call_timeout_secs`), and `Config` a
+  top-level `mcp_call_timeout_secs`, merged repo over global. The most specific wins, read after
+  every merge: a server's own key, then the session's, then `DEFAULT_MCP_CALL_TIMEOUT_SECS` (600).
+  Both are validated to 1..=`MCP_CALL_TIMEOUT_SECS_CEILING` (3600) as
+  `ConfigValidationError::McpCallTimeoutSecsZero` / `McpCallTimeoutSecsTooLarge`, including by
+  `load_for_build`. An `org.outrig.mcp` label and a standalone `image.toml` may carry the key and
+  are held to the same range (`EmbeddedImageConfigError::CallTimeoutOutOfRange`,
+  `StandaloneImageTomlError::CallTimeoutOutOfRange`). The value travels through
+  `SidecarServerSpec::with_call_timeout_secs`, `LaunchSpec::mcp_call_timeout_secs` /
+  `with_mcp_call_timeout_secs`, and `SessionMcpPlan::mcp_call_timeout_secs` /
+  `call_timeout(&PlacedServer)`, and reaches a client through `McpClient::with_call_timeout`;
+  `Outrig::launch` and `add_sidecar` apply it to every server they connect. An unset key
+  serializes as before, so existing labels and cache keys are unchanged. (#338)
+
+- **`NetworkInterceptor::drop_attachment` lets go of one container without awaiting.** It does
+  to one attachment what dropping the interceptor does to all of them: the container's loops are
+  aborted, its resolver is put back before the call returns, and its redirect table is deleted
+  in the background. Nothing is reported, and the name is free to `attach` again. It is for code
+  that cannot await, such as a destructor unwinding an attach that was never committed. `detach`
+  is still the form that confirms the undo. (#345)
+
+### Changed
+
+- **A key a config file does not know is set aside with a warning instead of failing the load.**
+  `load_from_str` and every `Config::load*` drop the key, record it in `Config::warnings`, and
+  read the rest, so a config written for a newer outrig loads -- the 0.3 line's `[events]`, a
+  model's `context-window`, a provider's `role-alternation`. The global config, which every
+  outrig on a machine reads, also sets aside a value that does not deserialize -- a wrong type,
+  an unknown `style`, a missing required key -- with the smallest entry holding it: the key, or
+  one mount of a mount list, but never one element of any other list, so no argv runs short. A
+  repo or `--config` file still fails on one, and names a misspelled required key rather than
+  the key it stood for. Nothing in `[network]` or a `security` table is ever set
+  aside, since leaving a key out there can give a container more than the file allows, and a
+  TOML syntax error and an unquoted dotted name such as `[models.opus-4.7]` still fail. A dropped
+  value's warning never quotes an `api-key`. Only the loader changed: every config type is still
+  `deny_unknown_fields`, so the JSON schema, an `org.outrig.mcp` label, a standalone
+  `image.toml`, and a bare `toml::from_str::<Config>` still refuse the key. The quoting hint
+  `ConfigDottedKey` carries now needs the unknown key to follow an unquoted `.` in a header, so
+  an unknown key in a `[providers.<name>]` table, whose error lands on the whole header, and a
+  `[section.sub]` header for a section this build does not know no longer draw it. (#507)
+
+### Fixed
+
+- **An image's `org.outrig.mcp` label may reference only the host variables the global config
+  allows.** A `${VAR}` in the `env` of a server a label declares resolved any variable in the
+  operator's environment, past the `[repo] env-allow` list that holds a repo config file to it.
+  The label comes from a Dockerfile in the repo, which the agent can edit through the read-write
+  workspace, or from an image the repo names, and neither is a config file, so a repo could hand
+  `GITHUB_TOKEN` or a cloud credential to a server of its own choosing. The list now holds the
+  label too. Once the label has merged into the session plan, an entry that still came from it
+  and references an unlisted variable is refused, before any sidecar starts or any server runs, as
+  the new `OutrigError::EmbeddedMcpEnvRef`, naming the server, the key, the variable and the
+  image. A config entry of the same name has already replaced the label's by then, which is what
+  lets a repo-built image through: `outrig build` stamps a copy of every config entry into its
+  label. A refusal is a startup error whatever a sidecar's `on-failure` says.
+  `Outrig::launch` holds the primary image's label under `EmbeddedMcpPolicy::Merge` to the new
+  `LaunchSpec::embedded_mcp_env_allow`. `LaunchSpec::from_config` fills it from the config's
+  `[repo].env-allow`; it is empty otherwise, so a hand-built spec (`LaunchSpec::build`,
+  `from_image`) whose image's label references a variable has to list it with
+  `with_embedded_mcp_env_allow`, or take `EmbeddedMcpPolicy::Ignore`. Entries in `LaunchSpec::mcp`
+  are the caller's own and are not held. `embedded::merged_mcp` still returns a label's entries as
+  written, for a caller driving a `Container` itself; `embedded::check_label_server_env` is the
+  check both the CLI and `Outrig::launch` apply, for such a caller to apply to each entry. New
+  public items: `OutrigError::EmbeddedMcpEnvRef`, `embedded::check_label_server_env`,
+  `LaunchSpec::embedded_mcp_env_allow`, `LaunchSpec::with_embedded_mcp_env_allow`. (#624)
+
+- **A panic in a forked namespace helper ends the helper and touches nothing of its parent's.** The
+  user-database and home-directory passes of `Container::bootstrap_user`, and the listener binds
+  and resolver edits of network attach and detach, each run a closure in a forked child. A panic
+  there unwound out of the closure into the frames that forked: every `Container` the forking task
+  held detached a `podman rm -f` of its own container, and wherever a runtime caught the unwind
+  the child lived on as a copy of the process, with the parent waiting for its reply for as long
+  as it did. In the CLI the unwind could also reach `with_panic_sweep`, and in a `panic = "abort"`
+  build `install_panic_hook`'s hook ran in the child; each removed every container the parent
+  owned. The child now catches the panic and exits at once, and the parent fails with `namespace
+  helper panicked before reporting a status`. `with_panic_sweep` and the hook sweep only in the
+  process that called them. No helper has a panic site today, so nothing changes where they run
+  to completion. (#272)
+
+- **A build's temporary tag is no longer stranded when the working container's removal is
+  refused.** When stamping labels failed and buildah refused the removal of the `outrig-label-*`
+  working container, the tag's removal retried alongside it, was refused as in use, and could give
+  up before the container went, leaving the whole built image under an `outrig-tmp-*` tag. The two
+  removals are now retried in order before the build returns, container first, so the tag's gets
+  its full retries after the container is gone; only what still will not go is detached.
+
+- **A `Container` handle addresses its container by the engine's id, not its name.** Since 0002-40
+  only `stop` did; `exec_stdio`, `exec_capture`, the PID and network probes, `podman init`, an MCP
+  server started with `podman start --attach`, and a `view = "primary"` sidecar's
+  `--userns=container:` named the container, so a handle whose container had exited could run a
+  command in, or join the namespaces of, whatever container was created under the same name next.
+  A handle that only borrowed its container (`Container::attach`) has no id and still uses the name
+  it was given.
+
+- **A repo config file may reference only the host variables the global config allows.** `${VAR}` in
+  `[images.<n>].build-args` and in an MCP server's `env` resolved any variable in the operator's
+  environment, so a committed `.agents/outrig/config.toml` -- or one the agent edited through the
+  read-write workspace for the next session -- could hand `AWS_SECRET_ACCESS_KEY` or `GITHUB_TOKEN`
+  to a build of its own Dockerfile or to a server command of its choosing. A new global-only
+  `[repo] env-allow = [...]` lists the variables a repo config file may name, and is empty by
+  default. `Config::validate` -- so every `Config::load*` -- refuses a reference to any other
+  variable in an image that `.agents/outrig/config.toml` or a `--config` file declares, as the new
+  `ConfigValidationError::RepoBuildArgRef` or `RepoMcpEnvRef`, naming the image, the key, the
+  variable and the file. The rule is a validation rule rather than part of `validate_as_repo`
+  because it needs the global config's list as well as the repo file, and because a global
+  `env-allow` set aside with a warning is the reason a reference is then refused, which the warning
+  has to precede. `validate_as_repo` refuses a repo file that declares `[repo].env-allow`, even
+  empty. A variable on the list is the repo's to route: the repo picks which build-arg or server
+  environment receives it. The global config's own images, literal values, and `--env` overlays are
+  unchanged, and so is `merge`, which reads `[repo]` from the global side only. Each image records
+  whether a repo file declared it, as `ImageConfig::config_source` records which file, but
+  `set_build_paths` and `set_image_name` do not clear it. A `Config` read by `Config::load_from_str`
+  or built by hand declares no file, so it is not held to the list. New public items:
+  `Config::repo`, `RepoPolicy`. If a repo config of yours references a host variable, list it under
+  `[repo]` in `~/.outrig/config.toml` or a file passed as `--global-config`. An outrig release
+  before 0.2.2 does not know `[repo]` and refuses a global config that has it. (#444)
+- **A panicked interceptor connection is reported by `detach` and `shutdown`.** The accept loop
+  threw away what it joined each finished connection with, so a connection task that panicked left
+  `detach` returning `Ok(())` and its audit record unwritten, where a panicked loop task was already
+  a typed failure. Each such connection is now a `NetworkTaskPanicked` cause of the
+  `NetworkTeardown` error. No panic site in a connection is known today, so nothing changes where
+  none occurs. (#273)
+- **Attaching network interception checks that nft committed all of the redirect script.** It took
+  a zero exit and the table's handle in nft's echo as proof the ruleset was in, so a commit that
+  made the table and not its chains or rules -- nft 1.0.9 did exactly that to a nested script --
+  was accepted: nothing was redirected, `audit` recorded no connection, and `filter` allowed all of
+  them, with every status saying interception was in place. It now counts the objects the commit
+  echoed against the ones the script declares, and a shortfall fails the attach and removes the
+  table that was made. No supported nft is known to commit short today, so nothing changes where
+  the script installs whole. (#271)
+- **`ImageConfig::set_build_paths` replaces the source shape whole.** On a pull-source config it
+  wrote the build paths and left `image_name` set, so the config had both shapes at once:
+  `ImageConfig::source` panicked, and with it `LaunchSpec::from_config` and image acquisition,
+  while `Config::validate` reported a conflict between `image-name` and `dockerfile` the caller
+  never wrote. It now clears `image_name` as well. Nothing changes on a config that was already a
+  build source, and `outrig-cli` never called it. (#270)
+- **The interceptor's accept loop takes a finished connection back when it finishes.** It took
+  them back only when the next connection arrived, so a container that opened a burst of
+  connections and went quiet left the attachment holding one completed task per connection until
+  it was next used or detached. Memory only, and bounded by the size of the burst. (#267)
+- **The tool-name prefix is no longer promised for a server name too long to carry it.** A name
+  outrig rewrites to fit 64 characters is cut at a fixed length without regard for where the
+  server name ends, so on a server name of 55 characters or more a rewritten name had none of
+  the tool's name, and from 57 no `__` -- while the `outrig mcp` instructions and the docs said
+  the prefix always names the server. The instructions now say a rewritten name ends in a hash
+  and may be cut inside a long server name, and to call each tool by exactly the name listed;
+  the docs state the 54-character limit. No advertised name changes, and routing was never
+  affected, since a name is looked up whole. (#266)
+- **DNS over TCP works under network interception.** A truncated UDP answer's TCP retry, `dig
+  +tcp`, and `options use-vc` were refused at the container's `127.0.0.1` resolver, and a TCP
+  lookup sent to another resolver was carried as an opaque connection that bound no name. The
+  interceptor now serves port 53 over TCP beside UDP and redirects `tcp dport 53` to it, so a TCP
+  lookup is decided, audited, forwarded to the host's resolvers over TCP, and bound as a UDP one
+  is. A zone transfer (`AXFR`, `IXFR`) over TCP is refused under the rule `dns-transfer`. (#264)
+- **`devices` accepts podman's `<host>[:<container>][:<permissions>]` form, as it always did.** The
+  reference said the colon form was refused while validation passed it to podman. The reference now
+  documents it, and validation refuses a malformed entry -- more than three fields, a relative
+  container path, permissions outside `r`, `w`, `m` (or repeating one) -- with the new
+  `ConfigValidationError::DevicePathMalformed` instead of leaving it to fail at `podman run`. (#263)
+
+- **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.**
+  glibc's loader opens that file on every start by its absolute name, and no loader option turns
+  that off. `outrig-enter` runs the payload through the sidecar's own loader inside the primary's
+  mount namespace, where `/etc` is the primary's, so every object the file listed was loaded into
+  the sidecar's server before `main`, with the server's environment and network, and nothing in
+  the session said so. An object built for a newer glibc than the sidecar's stopped the server from
+  starting, with a loader error naming a file the sidecar never had. When the payload's loader is
+  not musl's, the launcher now mounts `/dev/null` over the file, in the mount namespace it already
+  unshares for the graft, so the loader finds it empty and the primary keeps its own. The mask holds
+  for everything the payload starts, so the primary's own binaries it runs no longer preload what
+  the primary configured, until the primary replaces the file after the start (`sed -i`, or
+  deleting it and writing another), which takes the mask with it. A file the primary creates after
+  the start is never masked. A musl payload, whose loader has no such file, and a static one are
+  unchanged. A directory at that path, which glibc ignores, now fails the start with `Not a
+  directory`. The loader still finds some files in the primary: an absolute-symlink `DT_NEEDED`
+  library, its built-in search directories, and the entries of musl's path file (#595). (#268)
+- **A build-arg value holding a newline no longer shares an image's cache key with separate build
+  args.** The key hashed each build arg as a `KEY=value` line with nothing escaped, so
+  `{ A = "1\nB=2" }` and `{ A = "1", B = "2" }` fed it the same bytes while buildah got
+  `--build-arg A=1\nB=2` in one case and `--build-arg A=1 --build-arg B=2` in the other. Whichever
+  built second reported a cache hit on the image built with the other set, and since a tag is
+  `<name>:<key>` and host-wide, so did another checkout. A newline reaches a value through a TOML
+  escape or through `${VAR}`, as a multi-line certificate would. The key now writes a backslash
+  and a newline in a build-arg key or value as `\\` and `\n`, and does the same for the labels it
+  covers, so a line holds one pair. An image whose build args and labels hold neither character
+  keeps its key and its tags. One that holds either gets a new key and rebuilds once. That key
+  cannot equal one an earlier release wrote, so a `${VAR}` that gains a newline does not reuse the
+  image built for a literal `\n`. (#322)
+- **`max-tokens = 0` is refused at load.** On a model or an agent it used to validate, and every
+  request then carried an output ceiling of zero, which surfaced only at the first prompt.
+  `ConfigValidationError::MaxTokensZero` names the key and says to leave it unset for the default;
+  `outrig config init` refuses 0 at its `max-tokens` prompt the same way.
+- **A container path spelled with `..` is checked as podman will see it.** `/workspace/../workspace`
+  collided with `/workspace` and `/a/..` was `/`, but validation compared the path as written, so
+  podman refused the launch after the image was acquired, naming a path the config never held. The
+  root and duplicate checks for `[workspace]`, its mounts, sidecar mounts, and `--volume` now fold
+  `.` and `..` first; diagnostics still print the path as written. `/resources/../res` still
+  validates. (#262)
+- **Stopping a primary or exec-stdio sidecar no longer waits out its grace.** Their PID 1 is
+  `sleep infinity`, which installs no SIGTERM handler, so every `podman stop -t 2` ran its full 2 s
+  and every detached `podman rm -f` podman's default 10 s before the SIGKILL that ended it anyway.
+  `podman run` now passes `--stop-signal=SIGKILL`, so both return in about 0.3 s. Entrypoint-stdio
+  sidecars are unchanged: their server is PID 1 and may handle SIGTERM.
+- **`Outrig::launch` no longer re-imports an embedded server the config moved into a sidecar.**
+  When the primary image's `org.outrig.mcp` label declared a server and the config placed a server
+  of that name in a sidecar (`sidecar = "tools"`), `LaunchSpec::from_config` rightly left it out of
+  `LaunchSpec::mcp`, but `launch` then merged the label into the primary's map and could not tell
+  a name the config never mentioned from one it had moved elsewhere. The primary connected the
+  image's own entry, `add_sidecar` refused the sidecar's server of that name as already connected,
+  and the launch aborted. A server in a `start = "manual"` sidecar, which `from_config` neither
+  starts nor carries, was imported into the primary the same way, and the `add_sidecar` that later
+  started that sidecar failed likewise. `from_config` now records the names the config placed
+  outside the primary, and `launch` skips a label entry under any of them, so the config's
+  placement wins as it does for `outrig run`, which was not affected. Label servers the config
+  does not mention still merge. A `LaunchSpec` built by hand records no names and merges as
+  before. (#557)
+
+- **A sidecar whose entrypoint exits at once no longer reports an empty stderr.** The launcher's
+  `outrig-enter: open <program>: ... (not found in PATH=...)`, or any server that prints a line and
+  exits within milliseconds, arrived as `stderr (...): (empty)` beside `exit: code 1`. outrig starts
+  the MCP handshake when it spawns `podman start --attach`, so the client always has a request to
+  forward; if conmon closes the attach socket with that request unread, the kernel reports
+  `ECONNRESET` on podman's end ahead of the stderr conmon had queued there, and podman reads the
+  reset as the end of the stream. The exit code comes back and the output does not, on every podman
+  through 6.1. No wait recovers it, and the five-second wait for it that `McpClient` made ran out
+  for nothing. `Container::create_initialized` now gives the container a log of its own --
+  `--log-driver=json-file`, an empty `--log-opt=tag=`, `--log-opt=path=` a private file under
+  `$XDG_RUNTIME_DIR` (else the temporary directory), `--log-opt=max-size=1mb` -- which conmon
+  writes before it writes any attach socket. When `connect_via_podman_start` fails with an empty
+  stderr file and an exited client, it copies the container's stderr from that log into
+  `<name>.stderr`, so the error, the file and `outrig logs` agree, and logs a warning. The
+  container no longer logs to the host's default driver (`journald` on most systemd hosts);
+  `podman logs` still works while it runs, and the file goes with the `Container`. The driver and
+  the empty tag keep the host's `containers.conf` `log_tag` off the container: conmon exits on a
+  tag with a file log, so a host with `log_tag` set would otherwise fail every `podman init`, and
+  podman 6 fails the `podman create`. Neither is enough alone. `json-file`, podman's alias of
+  `k8s-file`, is not given the host's tag through podman 5.8 but is on podman 6, and an empty tag
+  counts as one already given only from podman 5.5.1. Where SELinux is enforcing, or the log's
+  path holds a `,`, `"` or `:` (podman and conmon split on them), there is no log and nothing
+  changes. An exec'd server (`podman exec -i`) is not affected. (#422)
+
+- **A podman engine outside this machine's PID namespace is refused before any namespace is
+  entered.** The container's init PID comes from `podman inspect`, and the user bootstrap, the
+  network interceptor, and `view = "primary"` read it through the local `/proc`. Against a
+  remote engine that is some other process: the bootstrap failed with a bare errno, or, when a
+  same-user rootless container held that PID, wrote the session user into it and reported
+  success. `Container::pid` now requires the process's parent to be the conmon the engine
+  names, and otherwise returns the new `OutrigError::ContainerPidNotLocal { container, pid }`.
+  A socket on this host still works. The bootstrap's step labels now carry the PID. (#254)
+
+- **A build image's name over 237 characters is refused where names are checked.** The name is
+  the repository of its `<name>:<hash>` tag, and buildah refuses a repository over 255
+  characters once it prepends `docker.io/library/`, so such a name used to pass `Config::validate`
+  and `outrig image add`, then fail at `outrig build`. `check_build_image_name` now returns the
+  new `BuildImageNameError::TooLong { len, max }`, and `image add`'s suggested default falls back
+  to `standard` rather than cross the limit. (#242)
+
+- **`LaunchSpec::from_config` now pulls or builds the primary image.** It used to hand `launch` a
+  bare source: an `image-name` that was not already local failed with podman's `image not known`
+  (the create runs `--pull=never`), and a Dockerfile image-config was built under `outrig-cache`
+  with a key `outrig run` never uses. `from_config` now ensures the primary under the
+  image-config's name, as it already did each sidecar, so a pull or build happens inside it and
+  `run`, `build`, and `launch` share one tag. (#456)
+
+- **Network interception is refused for a container that holds `NET_ADMIN`.** `CAP_NET_ADMIN` in a
+  container's own network namespace is control of its nftables, so a root process in a container
+  started with `cap-add = ["NET_ADMIN"]` could delete the redirect table that audit and filter
+  mode install, and the egress policy and the audit log went with it, silently. A container holds
+  it when its `cap-add` lists `NET_ADMIN` -- in any case, with or without `CAP_` -- or `ALL`
+  without `NET_ADMIN` in `cap-drop`; `SYS_ADMIN` does not, and is still accepted.
+  `NetworkInterceptor::attach`, which `start` and `start_with_policy` call, now returns
+  `OutrigError::Configuration` naming `cap-add` before it changes anything. The check is on the
+  launch, not the mode's source, so it holds for a config, `--network`, and `LaunchSpec`'s
+  `with_network_mode`, and for sidecars and `Outrig::add_sidecar`. A container outrig only
+  borrowed (`Container::attach`) is not inspected and is never refused. A session that asked for
+  `NET_ADMIN` and for interception now has to give up one: run it under `mode = "default"`. See
+  [`[network]`](../../doc/reference/config.md#network). To keep that check from being read around,
+  `Container::start_named` and `Container::create_initialized`, and so everything that launches,
+  now reject a `ContainerCapabilities` entry that is not one capability name: podman splits a
+  flag value on commas and strips quotes, so `"SYS_ADMIN,NET_ADMIN"` used to grant `NET_ADMIN`
+  from a hand-built spec. Config validation already allowed only names, and now also rejects a
+  doubled `CAP_CAP_` prefix: podman refuses that spelling, but one prefix was stripped on the way
+  to it, leaving `CAP_NET_ADMIN`, which it grants. (#363)
+
+- **Under `[network] mode = "filter"` and a deny default, a container resolves only the names an
+  `allow` hostname entry could match, and every lookup is recorded.** The interceptor's DNS
+  listener forwarded every lookup to the host's resolvers whatever the policy, and wrote nothing
+  to `network.jsonl`, so a container under `default = "deny"` could send data out as the labels of
+  names in any zone -- `<data>.attacker.example` reaches that zone's name servers -- with no
+  record of it, and `deny = ["*:53"]` only ever covered TCP. A lookup is now decided by its
+  name. A portless hostname `deny` entry refuses the lookups it matches under either default. Under `default = "deny"` a name resolves
+  only when an `allow` hostname entry matches it, whatever that entry's port, or when an `allow`
+  entry matches every address (`*`, `0.0.0.0/0`, `::/0`); `*.example.com` does not match
+  `example.com`. A refused lookup is answered REFUSED and never reaches a resolver. A query that
+  is not a plain question for one name -- not a query, extra records beyond one EDNS record, a
+  compressed or over-long name -- is refused wherever a lookup could be, under rule
+  `dns-unparsed`. Every lookup writes a record, in audit mode too, with `proto` `udp`, `service`
+  `dns`, and the name asked for in `outrig.host`, before its query is forwarded. Two behaviors
+  change: under a deny default, a name that resolved only because it fell in an allowed address
+  or CIDR now needs an `allow` entry of its own, and under an allow default a name a hostname
+  `deny` entry matches stops resolving, where its connection used to be denied. See
+  [Name lookups](../../doc/reference/config.md#name-lookups). (#361)
+
+- **The names a network attachment holds for one address are capped at 64.** The table of what
+  the attachment's DNS listener validated bounded the addresses it held (4096) but not the names
+  behind each, so a container resolving `n1.wild.example`, `n2.wild.example`, ... against a
+  wildcard zone grew it for the whole session, and every later connection to that address cloned
+  and policy-scanned every name. Binding a new name now drops that address's expired names, and
+  past 64 live ones drops the name that expires soonest; the name just resolved is never the one
+  dropped, and re-resolving a held name evicts nothing. A dropped name stops granting a hostname
+  allow until it is resolved again. (#360)
+
+- **`exec_capture` no longer reads the embedder's stdin.** It ran `podman exec -i` with outrig's
+  own stdin inherited, and the client forwards what it reads into the container, so a library
+  embedder that read its own stdin -- a REPL, an MCP-over-stdio server -- lost bytes to the
+  command for as long as the capture ran. A command that read stdin, `cat` for one, waited on the
+  embedder's instead of finding it empty. The command's stdin is now empty, on
+  `Outrig::exec_capture` and `Container::exec_capture` alike: it reads end-of-file at once.
+  `exec_stdio` is the form that takes input. (#359)
+
+- **A repo-built image whose inherited `org.outrig.mcp` label cannot be decoded fails naming its
+  image-config, and says how to replace the label.** The build merges the label it inherits --
+  from the base image, or a `LABEL` in the Dockerfile -- with `[images.<name>.mcp]` before it
+  commits the final tag, so a label that is invalid JSON, or carries a placement key, `args`, a
+  reserved or invalid name, or an empty command, fails the build after buildah has succeeded.
+  The error named the temporary `outrig-tmp-...` tag the label was read from, which is removed
+  before the error is returned, and offered no way forward; the one
+  (`LABEL org.outrig.mcp='{}'` in the Dockerfile) was not discoverable from it. It now reads
+  `image "<image-config>" embedded config: ...` (`"<image>"` through `ensure_image`, which has no
+  name) and ends with a `help:` line giving that override. The build still fails, and
+  `OutrigError::EmbeddedImageConfigParse` is still the error; its `help:` line also ends the
+  message where the variant is raised for a runtime read or `image inspect`. (#356)
+
+- **An image rebuilds when a build context gains an empty directory or has a directory's
+  permissions changed.** For a context in a git repo, the cache key came from git's file
+  listing, which names no empty directory and carries no directory's mode, though `COPY .`
+  copies both. Adding an empty directory, or running `chmod` on one, left the key alone, and
+  `outrig build` and `outrig run` reported a cache hit on an image that lacked the directory or
+  had its old mode. The key now also covers every directory in the context that no ignore rule
+  excludes, empty ones and the context itself included, by path and permission bits. A
+  directory `.gitignore` excludes still does not count, empty or not. One the build user cannot
+  open, or cannot reach through a directory it cannot search, is left unread rather than failing
+  the key. Every build image whose context is in a git repo gets a new key, so each rebuilds
+  once after upgrading. (#217)
+
+- **A raw image ref that is not local no longer reads as a problem with `--image`.**
+  `ensure_local_image` hard-wired `--image` and "did not match any `[images.<name>]`" into the
+  error for every ref it refused, so a `[sidecars.<sc>]` or inline `image` that was never pulled
+  was reported as a flag nobody passed, and the pull that fixes it went unmentioned. The error is
+  now `image "<ref>" is not an [images.<name>] and is not in podman's local image store; outrig
+  does not pull a raw image ref, so run `podman pull <ref>` (or build and tag it) first`, and
+  `LaunchSpec::from_config` adds `(from [sidecars.<sc>])` -- or the inline entry's MCP server --
+  after the ref. The `podman pull` is written to be pasted, so a ref with a character a shell
+  would act on is single-quoted. (#355)
+
+- **A connection made straight to the interceptor's listener is no longer dialed from the host.**
+  The redirect leaves loopback alone, so a process in the container that connected to the
+  listener's own port -- which `/proc/net/tcp` gives it -- was never redirected, and the
+  destination the interceptor read for it was the listener's own address. Policy admitted it
+  wherever it admits loopback, audit mode included, and the interceptor dialed it from the host's
+  network namespace: whatever the host had on `127.0.0.1` at that port answered. On a bridge
+  network the host reaches, a connection to the container's own address looped the same way, the
+  host's dial arriving at the listener as another connection to be dialed. A connection that
+  reaches the listener without the redirect, or whose destination is in loopback, is now closed
+  as it is accepted and recorded with `outrig.action = "deny"` and
+  `outrig.rule = "not-redirected"`, in audit mode as in filter. A connection redirected to
+  another host that happens to use the listener's port is carried as before. (#352)
+
+- **A panic a tokio task survives no longer removes every container the process owns.**
+  `install_panic_hook` swept every outstanding obligation on every panic, from the panic site,
+  where a hook cannot tell a panic the process dies of from one a task's `JoinHandle` contains --
+  so a panic in one task would have force-removed the containers of a session that went on
+  without them. It now sweeps only in a `panic = "abort"` build, where every panic is fatal and
+  no destructor runs; in an unwinding build it installs nothing. A caller that installed it also
+  wraps `main`'s body in `with_panic_sweep`. (#349)
+
+- **`Config::validate` refuses a provider `base-url` that is not an `http://` or `https://`
+  URL.** The key took any string, so a typo'd scheme such as `htps://` loaded, and every request
+  to the provider then failed -- in `outrig run`, only after ten minutes of retries. A remote
+  provider's `base-url` must now parse as a URI with an `http` or `https` scheme. A new
+  `ConfigValidationError` variant reports it: `BaseUrlInvalid`, carrying the `path` and a
+  `detail` that says what is wrong without quoting the value, which can carry credentials. It is
+  a provider rule, so `load_for_build` skips it as it skips the others. (#343)
+
+- **A container no longer carries the host's proxy variables.** podman's `--http-proxy` is on
+  unless turned off, and it copied `http_proxy`, `https_proxy`, `ftp_proxy`, `no_proxy`, and
+  their uppercase forms from outrig's environment into every container `Container::start`,
+  `start_named`, and `create_initialized` made -- so into `Outrig::launch`'s primary and every
+  `add_sidecar` -- where a proxy URL's `user:password@` was readable by everything run there.
+  Every container now gets `--http-proxy=false`. A process that needs the proxy names it, through
+  `ExecOptions::with_resolved_env` or `ContainerCreateOptions::with_resolved_env` with
+  `EnvValue::EnvRef("HTTPS_PROXY")`: the route an MCP server's `env` takes. (#455)
+
+- **A namespace helper that dies before replying fails the bootstrap with the reason.**
+  `Container::bootstrap_user` reported a helper killed before it replied (the OOM killer, a
+  signal) as `OutrigError::BootstrapNamespace` failing at `fork` with `Success (os error 0)`: the
+  error kept only an errno, and a helper that never replied has none. The error now keeps its
+  message and names the step as `receive the helper's reply`, and that message names the signal
+  that killed the helper. A `fork` failure still names `fork` and its errno. The same message
+  reaches network attach and detach, whose helpers already passed the error through. (#357)
+
+- **`Config::validate` holds the primary `[workspace].container-path` to the mount rule.** Every
+  `[[workspace.mounts]]` `container-path` had to be absolute and not `/`, but nothing read the
+  primary one. A relative value validated, and the session failed when podman created the
+  container -- after the image build and the session record -- with podman's `invalid container
+  path` error, which names neither the key nor the file. Podman takes `/`, and the workspace then
+  covers the image's whole root filesystem. Both are now refused, so `Config::load`,
+  `load_for_run`, and `load_for_build` refuse them -- the last though a build never mounts the
+  workspace. Two new `ConfigValidationError` variants report it: `WorkspaceContainerNotAbsolute`,
+  carrying the `path` as written, and `WorkspaceContainerRoot`. Neither carries a `declared_in`,
+  since a `container-path` records no source. The rule is structural, so `Config::validate(None)`
+  applies it too, and a `Workspace` built with a relative `container-path` now fails there rather
+  than at launch.
+
+- **A name a client sends in more than one read is still read.** The network interceptor read a
+  client's opening bytes once, so a TLS `ClientHello` or HTTP request head that arrived in pieces
+  was never parsed. Under `default = "allow"`, `deny = ["*.evil.example"]` then let the connection
+  through, and its `network.jsonl` record carried `service = "-"` and no `server_name` or
+  `outrig.host`. No attacker is needed: a client may write its opening in pieces, and a
+  post-quantum key share takes a current `ClientHello` past 1500 bytes. The interceptor now keeps
+  reading until the TLS record or the request head is complete, for at most 750 ms after its
+  first bytes and 16 KiB in all, both in the window it gives a new connection and when a client
+  speaks only after that window; in the second case nothing is forwarded until the name has been
+  judged. A `Host:` line now counts only once it is finished and only in the head, so a read that
+  ended in `Host: www.evil.exa` no longer claims `www.evil.exa`, a `Host:` line in a request body
+  claims nothing, and bytes that are not UTF-8 elsewhere in the request -- a binary body sent
+  with the head -- no longer hide it. A client whose first bytes start a request head it never
+  finishes, such as an inline `GET key` to Redis, now waits up to 750 ms before they are
+  forwarded. (#353)
+
+- **`McpServerSpec` rejects a table key it does not know, and names it.** The enum was
+  `#[serde(untagged)]` without `deny_unknown_fields`, so a table-form entry dropped unknown keys:
+  `enviroment = {...}` started the server with no env, and `comand` beside `sidecar` or `image`
+  left no command, making the entry entrypoint-stdio. `Deserialize` is now written by hand and
+  dispatches on type -- an array is `Short`, a table `Full` -- so a stray key fails with
+  ``unknown field `comand`, expected one of ...`` at that key's span. A bare untagged
+  `deny_unknown_fields` would only have said no variant matched. This holds wherever a spec is
+  deserialized, an `org.outrig.mcp` label (`EmbeddedImageConfigError::Json`) and a standalone
+  `image.toml`'s `[mcp]` included; a config file's load sets the key aside with a warning naming
+  it instead (#507). The derived JSON schema's table branch now carries
+  `additionalProperties: false`. Serialization is unchanged. (#340)
+
+- **A `tools/list` whose pages never end fails at once instead of paging until its deadline.**
+  `McpClient::list_tools` paged through rmcp's `list_all_tools`, which follows `nextCursor` until
+  the server omits it and keeps every page, so a server that echoed the cursor it was sent was
+  paged -- its tools appended each time -- until the 120-second `tools/list` bound. It now pages
+  the listing itself: a `nextCursor` any earlier page already sent, or a listing still paging
+  after 1000 pages, fails at once as `OutrigError::McpToolsListFailed` whose source is an
+  `McpSessionError` of kind `McpFailureKind::Protocol`, with the server's stderr tail. (#339)
+
+- **A lookup the network interceptor cannot forward is answered SERVFAIL, and one unusable
+  resolver no longer ends the list.** When no host resolver answered, the DNS listener logged the
+  failure at debug and sent the container nothing, so every lookup waited out the client's own
+  timeouts -- by glibc's defaults, 5 seconds a try and two tries. It now replies SERVFAIL (QR,
+  the query's opcode and RD, RA, RCODE 2) echoing the transaction id and question, which a stub
+  resolver matches its answer against; a query whose question did not parse gets the header
+  alone, and a datagram with QR already set gets nothing. The first such lookup per attachment is
+  logged at `warn` with every resolver's failure, and each resolver's failure at debug.
+  Each resolver is now asked over a socket connected to it, so one that refuses -- a stopped
+  systemd-resolved stub -- fails at once instead of after the 5-second forward timeout, and a
+  socket that cannot be bound for one resolver is that resolver's failure: an IPv6 `nameserver`
+  listed first on a kernel booted with `ipv6.disable=1` used to end the forward for every
+  lookup. (#354)
+
+- **Every MCP request has a deadline, and an abandoned `tools/call` is cancelled at the server.**
+  `McpClient` sent `initialize`, `tools/list`, and `tools/call` with rmcp's default of no timeout,
+  so a server that accepted stdin and never answered held startup or a call forever.
+  `initialize` and the whole of `tools/list` now get 120 seconds each: a missed `initialize` is
+  `OutrigError::McpStartupFailed` whose source is an `McpSessionError` of kind
+  `McpFailureKind::Timeout`, with the usual exit status and stderr tail, and
+  `McpToolsListFailed` gains `stderr_path` and `stderr_tail` for every listing failure.
+  `tools/call` gets the deadline set with `McpClient::with_call_timeout`; past it the server is
+  sent `notifications/cancelled` and the call fails as `McpService` of kind
+  `McpFailureKind::Timeout`. A call whose future is dropped first -- a turn abandoned with Ctrl-C,
+  a proxied call its client cancelled -- now sends the same notification; rmcp's request handle
+  has no `Drop`, so before nothing did. `ProxyServer` races each `tools/call` against the
+  client's cancellation and drops the backing call when it fires. `call_tool` no longer drives
+  rmcp's `input_required` rounds: a reply other than a tool result is `McpFailureKind::Protocol`,
+  which the 2025-11-25 revision outrig negotiates never produces. (#338)
+
+- **`session-root` and `model-cache-root` are global-only, and follow the path rule.** A repo config
+  could set either, and `merge` let its value win, so a committed file chose where this machine
+  writes session records and model downloads. `validate_as_repo`, which `Config::load` and
+  `Config::load_file` apply to the repo side, now refuses both with the new
+  `ConfigValidationError::RepoGlobalOnlyKey`, and `merge` never reads them from the repo side. In
+  the global config a relative value now resolves against that file's directory and a leading `~` is
+  the home directory, where both used to be refused as not absolute. Unlike other config paths they
+  are resolved as the file is read rather than stored as written, so a loaded config still holds
+  both absolute and re-serializes them that way; `SessionRootNotAbsolute` and
+  `ModelCacheRootNotAbsolute` now fire only for a value no file declared. `model-cache-root` is
+  deprecated along with `style = "mistralrs"`, and 0.2.0 said the deprecated keys still validate: a
+  repo config that sets it now fails to load, and the key moves to the global config.
+
+- **A repo config may not declare a provider that carries an `api-key`.** `[providers.<name>]`
+  rows of `style = "openai"` or `"anthropic"` in `.agents/outrig/config.toml`, or in a file named
+  by `--config`, are now a load error, reported by `Config::validate_as_repo` beside the
+  `[network]` policy rule as the new `ConfigValidationError::RepoProviderApiKey`, which names
+  the provider, its style, and the variable its key references. Before, a repo entry replaced
+  the global one of the same name wholesale, so a committed file -- or one the agent edited
+  through the read-write workspace for the next session -- could restate `[providers.anthropic]`
+  with its own `base-url` and `api-key = "${ANTHROPIC_API_KEY}"`, or add a provider under a new
+  name and reach it through `default-model`, an agent's `model`, or a redeclared
+  `[models.<name>]`, and the first turn posted the operator's key to the endpoint the repo chose.
+  A repo config may still declare keyless `style = "mistralrs"` providers and may name global
+  providers from `[models.<name>]`. `merge` is unchanged and takes a repo provider as written, so
+  an embedder assembling a repo-side `Config` by hand should call `validate_as_repo`, as the
+  network rule already asked. If a repo config of yours declares a remote provider, move the
+  entry to `~/.outrig/config.toml` or a file passed as `--global-config`; the models keep
+  referencing it by name.
+- **A terminal's Ctrl-C no longer reaches an `McpClient`'s transport.** The `podman exec -i` or
+  `podman start --attach` client behind each `McpClient` was in the embedding process's group.
+  The terminal sends `SIGINT` to that whole group, and the podman client exited on it, so a
+  process that handled Ctrl-C and carried on was left with clients whose every call failed with
+  `Transport closed`. The transport now leads a process group of its own. An embedder that
+  relied on Ctrl-C to end its transports now has to call `McpClient::shutdown` or drop the
+  client. Other commands the library runs, such as image builds, stay in the caller's group and
+  still get the terminal's Ctrl-C.
+- **A listener failure no longer ends interception for the session unreported.** The TCP
+  accept loop took every `accept` error to mean its listener was gone. Running out of
+  descriptors ended TCP interception for the rest of the session, with the redirect still sending
+  the container's connections to the closed port, and `detach` and `shutdown` then returned `Ok`.
+  A container could cause that by holding a few hundred connections open, at two of outrig's
+  descriptors each. Failures that are not about the socket itself -- `EMFILE`, `ENFILE`,
+  `ENOBUFS`, `ENOMEM`, and errors outrig does not recognize -- are now retried after a second, and
+  a connection gone before it was accepted is passed over at once. An attachment carries at most
+  256 connections at once, in audit mode as in filter: past that, a connection is closed as soon
+  as it is accepted and recorded with `outrig.action = "deny"` and
+  `outrig.rule = "connection-limit"`. A listener whose socket can no longer be used, or that was
+  still failing when it was stopped, makes teardown return the new
+  `OutrigError::NetworkListenerFailed` naming the container. The DNS listener had the same flaw:
+  any receive error ended it. It now skips a datagram it cannot answer, retries the same failures,
+  and is reported the same way.
+- **A `deny` glob covers every name under its zone.** A filter-mode host glob looked for the
+  literal after its last `*` at that literal's first occurrence in the name, then required the
+  name to end there, so `deny = ["*.evil.example"]` missed `x.evil.example.evil.example`. Whoever
+  runs `evil.example`'s DNS can answer for that name with a wildcard record, and the connection
+  was allowed and recorded as `allow`. That literal is now matched against the end of the name.
+  `allow` globs had the same miss in the safe direction -- `*.npmjs.org` refused a resolved
+  `registry.npmjs.org.npmjs.org` -- and now match those names too.
+- **`load_project` takes only a config this process's user owns.** Its walk up from `dir` took
+  the first `.agents/outrig/config.toml` it found, so a config another user planted in a shared
+  ancestor such as `/tmp` was loaded as the project's. It now returns
+  `OutrigError::Configuration` naming the file unless the effective user owns it, the
+  `.agents/` and `outrig/` directories above it, and the directory they sit in. `Config::load`,
+  given a root outright, is unchanged.
+- **Network attach and detach run nothing from the container's image.** Under audit and filter,
+  `NetworkInterceptor::attach` pointed a container's `/etc/resolv.conf` at its DNS listener, and
+  `detach` put it back, by running a shell through `nsenter` in the container's mount namespace
+  -- which made that shell, and the `cat` and `printf` it ran, the image's own binaries. They ran
+  with outrig's whole environment, API keys included, in the host's network and pid namespaces,
+  before the redirect rules existed and again after they were removed: a sidecar image could
+  read the host's secrets and send them anywhere, in the mode that exists to stop that. outrig
+  now opens the file from a child that joins the container's user and mount namespaces as its
+  root and hands the descriptor back, and reads, rewrites, and restores it through that
+  descriptor, so no binary from the image runs. The restore is still byte for byte. An
+  `/etc/resolv.conf` that is not a regular file -- a FIFO, a device, a directory -- now refuses
+  the attach instead of being read, as does one larger than the file-size limit (`RLIMIT_FSIZE`)
+  outrig runs under, which writing back would have ended outrig with `SIGXFSZ`; one holding a NUL
+  byte no longer does. An install that failed partway, leaving the resolver empty or half
+  written, read that as someone else's change and retired its own undo; the original now goes
+  back. An interceptor dropped without `shutdown` has put the resolver back by the time the drop
+  returns.
+- **`host.containers.internal` reaches the host under audit and filter on podman 5.** Rootless
+  podman 5 networks a container with pasta and maps the alias, and `host.docker.internal`, to
+  `169.254.1.2`, which pasta's `--map-guest-addr` sends to the address it assigned the container
+  -- by default the host's own. The interceptor dialed that address as written from the host's
+  namespace, where it means nothing, so the connection waited out the 20-second connect timeout
+  and was recorded as allowed with zero bytes. `NetworkInterceptor::attach` now reads the
+  container's network mode from podman and, for a `pasta` container, measures where pasta sends
+  `169.254.1.2` by having pasta carry one connection there before interception is installed. A
+  connection to `169.254.1.2` is dialed at that host address -- pasta's own choice, which on a
+  host with several addresses need not be the container's source address. Policy and the
+  `network.jsonl` record still see `169.254.1.2`. A host service bound
+  only to loopback stays unreachable through the alias, as it is without interception. Other
+  network modes are unchanged; under podman 4 the alias is the host's own address and always
+  worked.
 
 ## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.1) - 2026-10-04
 
@@ -574,9 +1223,6 @@ home directory. The rest are fixes, each described below.
   absolute home directory `~` keeps its old meaning.
 
 ### Fixed
-
-- The embedded Python now gives threads an 8 MiB default stack, including in child interpreters.
-  Deep recursion on a thread raises `RecursionError` instead of crashing with `SIGSEGV` (#464).
 
 - **`filter` mode with `default = "deny"` now stops what the interceptor cannot carry.** The
   nftables table interception installs held one nat chain, which can only rewrite: TCP was

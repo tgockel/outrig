@@ -101,7 +101,7 @@ async fn build_default_image_then_cache_hits() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -117,7 +117,7 @@ async fn build_default_image_then_cache_hits() {
     let started = Instant::now();
     let exit2 = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -153,7 +153,7 @@ async fn build_stamps_repo_mcp_labels() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -197,7 +197,7 @@ async fn build_all_iterates_every_container() {
 
     let exit = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -234,7 +234,7 @@ async fn build_all_short_circuits_on_first_failure() {
     };
     let result = build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await;
@@ -270,7 +270,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     };
     build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &args,
     )
     .await
@@ -286,7 +286,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     };
     build::execute(
         &RepoConfig::at_root(tmp.path().to_path_buf()),
-        &global_cfg,
+        Some(&global_cfg),
         &no_cache_args,
     )
     .await
@@ -337,11 +337,16 @@ async fn a_self_referencing_tmpdir_build_arg_arrives_unchanged() {
     std::fs::write(&config, text).unwrap();
     std::fs::create_dir_all(tmp.path().join("rel")).unwrap();
     let cache = tempfile::tempdir().unwrap();
+    // The repo config names `TMPDIR`, and a repo file may reference only the
+    // variables the global config lists (#444).
+    let global_dir = tempfile::tempdir().unwrap();
+    let global = global_dir.path().join("config.toml");
+    std::fs::write(&global, "[repo]\nenv-allow = [\"TMPDIR\"]\n").unwrap();
 
     let out = try_capture(
         Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .args(["--global-config"])
-            .arg(tmp.path().join("nonexistent-global.toml"))
+            .arg("--global-config")
+            .arg(&global)
             .args(["build", "--image", "coding"])
             .current_dir(tmp.path())
             .env("TMPDIR", "rel")

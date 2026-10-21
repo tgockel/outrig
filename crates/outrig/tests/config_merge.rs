@@ -8,15 +8,30 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    BuildImageNameError, Config, ConfigSource, ConfigValidationError, DEFAULT_HOST_GRACE_SECS,
-    EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig, LlmProvider, McpServerSpec, MountAccess,
-    MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
-    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
-    check_build_image_name, merge,
+    ApiKeyRef, BuildImageNameError, Config, ConfigSource, ConfigValidationError,
+    DEFAULT_HOST_GRACE_SECS, EnvValue, EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig,
+    LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction,
+    NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SidecarOnFailure, SidecarStart,
+    SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
 const FIXTURE_FULL: &str = include_str!("fixtures/config-full.toml");
+
+/// The operator's side of a two-file fixture: one keyed provider and the model
+/// it serves. Only the global file may declare a provider that carries an
+/// `api-key`, so a test that needs a resolvable model beside a repo file writes
+/// this with `write_global_cfg` and passes the path as the global config.
+const PROVIDER_AND_FAST_MODEL: &str = r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#;
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
@@ -425,6 +440,41 @@ context    = "ctx"
         }
     }
 
+    /// A name's tag is `docker.io/library/<name>` to buildah, which refuses a
+    /// repository over 255 characters, so 237 is the longest a name can be.
+    #[test]
+    fn a_build_image_name_over_237_characters_is_refused() {
+        let at_limit = "a".repeat(237);
+        assert_eq!(check_build_image_name(&at_limit), Ok(()));
+        let over = "a".repeat(238);
+        assert_eq!(
+            check_build_image_name(&over),
+            Err(BuildImageNameError::TooLong { len: 238, max: 237 })
+        );
+
+        let block = |name: &str| {
+            parse(&format!(
+                "[images.{name}]\ndockerfile = \"D\"\ncontext    = \"ctx\"\n"
+            ))
+        };
+        block(&at_limit)
+            .validate(None)
+            .expect("237 characters validates");
+        let err = expect_validation_err(&block(&over), None);
+        assert!(
+            err.to_string().contains("can't be longer than 237"),
+            "{err}"
+        );
+        assert!(matches!(
+            err,
+            ConfigValidationError::BuildImageNameInvalid {
+                image,
+                reason: BuildImageNameError::TooLong { .. },
+                ..
+            } if image == over
+        ));
+    }
+
     /// The check is written out so it can say what's wrong, and accepts
     /// exactly the grammar its docs give: every name of up to five characters
     /// from an alphabet that reaches each way to fail.
@@ -716,6 +766,130 @@ container-path = "/"
         );
     }
 
+    /// The primary `container-path` is held to the extra mounts' shape rule.
+    /// Unchecked, a relative one loaded and reached podman, which refused it
+    /// only after the image was built (#341). No repo root: the rule is
+    /// structural, so `validate(None)` applies it too.
+    #[test]
+    fn workspace_container_path_must_be_absolute() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "workspace"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::WorkspaceContainerNotAbsolute { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("workspace"));
+            }
+            other => panic!("expected WorkspaceContainerNotAbsolute, got: {other:?}"),
+        }
+    }
+
+    /// Podman takes `/`, and the workspace then covers the image's whole root
+    /// filesystem.
+    #[test]
+    fn workspace_container_path_must_not_be_root() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::WorkspaceContainerRoot { .. }),
+            "expected WorkspaceContainerRoot, got: {err:?}",
+        );
+    }
+
+    /// `..` folds before podman compares destinations, so these are `/`.
+    #[test]
+    fn workspace_container_path_folding_to_root_errors() {
+        for path in ["/..", "/workspace/..", "/a/../.."] {
+            let cfg = parse(&format!("[workspace]\ncontainer-path = \"{path}\"\n"));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(err, ConfigValidationError::WorkspaceContainerRoot { .. }),
+                "{path}: expected WorkspaceContainerRoot, got: {err:?}",
+            );
+        }
+        let cfg = parse("[workspace]\ncontainer-path = \"/workspace/../src\"\n");
+        cfg.validate(None).expect("folds to /src");
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_folds_onto_primary_workspace() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/workspace/../workspace"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/workspace/../workspace"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn primary_workspace_dotdot_folds_onto_mount() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/workspace/../workspace"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/workspace"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/workspace"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_folding_to_root_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/a/.."
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::WorkspaceMountContainerRoot { .. }
+            ),
+            "expected WorkspaceMountContainerRoot, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn workspace_mount_dotdot_that_collides_with_nothing_validates() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/../res"
+"#,
+        );
+        cfg.validate(None).expect("folds to /res");
+    }
+
     #[test]
     fn workspace_mount_duplicate_container_path_errors() {
         let cfg = parse(
@@ -784,6 +958,41 @@ cap-drop = ["net_raw"]
                 assert_eq!(capability, "net_raw");
             }
             other => panic!("expected CapabilityNameInvalid, got: {other:?}"),
+        }
+    }
+
+    /// podman rejects `CAP_CAP_NET_ADMIN`, but outrig strips one `CAP_` before
+    /// it hands a name over, which would turn this into `CAP_NET_ADMIN`.
+    #[test]
+    fn doubled_capability_prefix_errors() {
+        for (field, other) in [
+            ("cap-add", r#"cap-drop = ["NET_RAW"]"#),
+            ("cap-drop", r#"cap-add = ["ALL"]"#),
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+{field} = ["CAP_CAP_NET_ADMIN"]
+{other}
+"#
+            ));
+            let err = expect_validation_err(&cfg, None);
+            match err {
+                ConfigValidationError::CapabilityNameInvalid {
+                    image,
+                    field: reported,
+                    capability,
+                } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(reported, field);
+                    assert_eq!(capability, "CAP_CAP_NET_ADMIN");
+                }
+                other => panic!("expected CapabilityNameInvalid, got: {other:?}"),
+            }
         }
     }
 
@@ -900,6 +1109,72 @@ devices = ["dev/fuse"]
             }
             other => panic!("expected DevicePathRelative, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn colon_form_device_entries_validate() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = [
+    "/dev/null:/dev/mynull:r", "/dev/fuse:rw", "/dev/null:/dev/null",
+    "/dev/zero:", "/dev/full::rw", "/dev/dri:/dev/dri:", "/dev/dri::",
+]
+"#,
+        );
+        cfg.validate(None).expect("colon form validates");
+    }
+
+    #[test]
+    fn malformed_colon_device_entries_error() {
+        for bad in [
+            "/dev/null:relative",
+            "/dev/null:/dev/x:bogus",
+            "/dev/null:/dev/a:r:x",
+            "/dev/null:rx",
+            "/dev/null:rrw",
+            "/dev/null:/dev/x:rrw",
+        ] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["{bad}"]
+"#
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::DevicePathMalformed { image, device, .. } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(device, bad);
+                }
+                other => panic!("{bad}: expected DevicePathMalformed, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_host_with_colon_form_is_still_relative() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["dev/null:/dev/x"]
+"#,
+        );
+        assert!(matches!(
+            expect_validation_err(&cfg, None),
+            ConfigValidationError::DevicePathRelative { .. }
+        ));
     }
 
     #[test]
@@ -1505,6 +1780,52 @@ identifier = "gpt-4o-mini"
         }
     }
 
+    /// #259: a zero output ceiling leaves no room to answer, so it is refused
+    /// at load on a model and on an agent, naming the key; 1 is accepted.
+    #[test]
+    fn max_tokens_zero_errors_on_a_model_and_an_agent() {
+        let fixture = |model: &str, agent: &str| {
+            parse(&format!(
+                r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${{OPENAI_API_KEY}}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+{model}
+
+[agents.coder]
+{agent}
+"#
+            ))
+        };
+        for (model, agent, expected) in [
+            ("max-tokens = 0", "", "models.fast.max-tokens"),
+            ("", "max-tokens = 0", "agents.coder.max-tokens"),
+        ] {
+            let err = expect_validation_err(&fixture(model, agent), None);
+            let rendered = err.to_string();
+            match err {
+                ConfigValidationError::MaxTokensZero { path } => {
+                    assert_eq!(path, expected);
+                    assert!(
+                        rendered.contains("leave the key unset"),
+                        "message should say what to do instead, got: {rendered}"
+                    );
+                }
+                other => panic!("expected MaxTokensZero, got: {other:?}"),
+            }
+        }
+        fixture("max-tokens = 1", "max-tokens = 1")
+            .validate(None)
+            .expect("1 is a legal output ceiling");
+    }
+
     /// The bound is inclusive at both ends: exactly the ceiling, and the
     /// smallest legal value, both validate.
     #[test]
@@ -1527,6 +1848,104 @@ identifier = "gpt-4o-mini"
             ));
             cfg.validate(None)
                 .unwrap_or_else(|e| panic!("{secs}s is inside the bound, got: {e:?}"));
+        }
+    }
+
+    /// A config whose one provider, of `style`, sends to `base_url`.
+    fn with_base_url(style: &str, base_url: &str) -> Config {
+        parse(&format!(
+            r#"
+default-model = "fast"
+
+[providers.remote]
+style    = "{style}"
+base-url = "{base_url}"
+api-key  = "${{REMOTE_API_KEY}}"
+
+[models.fast]
+provider   = "remote"
+identifier = "some-model"
+"#
+        ))
+    }
+
+    /// A scheme reqwest will not send to loads as a string and then fails
+    /// every request, so it is refused at load, on both remote styles. The
+    /// message names the key, the scheme, and what would be accepted.
+    #[test]
+    fn provider_base_url_with_another_scheme_errors() {
+        for style in ["openai", "anthropic"] {
+            let err =
+                expect_validation_err(&with_base_url(style, "htps://127.0.0.1:18081/v1"), None);
+            let rendered = err.to_string();
+            match err {
+                ConfigValidationError::BaseUrlInvalid { path, detail, .. } => {
+                    assert_eq!(path, "providers.remote.base-url");
+                    assert!(
+                        detail.contains(r#""htps""#),
+                        "the detail should name the scheme, got: {detail}"
+                    );
+                    assert!(
+                        rendered.contains("http:// or https://"),
+                        "the message should say what is accepted, got: {rendered}"
+                    );
+                }
+                other => panic!("expected BaseUrlInvalid for {style}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// No URL at all: a host with no scheme, a scheme with no host, nothing.
+    #[test]
+    fn provider_base_url_that_is_not_a_url_errors() {
+        for base_url in ["api.openai.com/v1", "localhost:11434", "https://", ""] {
+            match expect_validation_err(&with_base_url("openai", base_url), None) {
+                ConfigValidationError::BaseUrlInvalid { path, .. } => {
+                    assert_eq!(path, "providers.remote.base-url");
+                }
+                other => panic!("expected BaseUrlInvalid for {base_url:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// A `base-url` can carry credentials in its userinfo, so the refusal says
+    /// what is wrong without quoting the value.
+    #[test]
+    fn a_refused_provider_base_url_is_not_echoed() {
+        let err = expect_validation_err(
+            &with_base_url(
+                "openai",
+                "htps://gateway-user:SECRET-PASS@gateway.example/v1",
+            ),
+            None,
+        );
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, ConfigValidationError::BaseUrlInvalid { .. }),
+            "expected BaseUrlInvalid, got: {err:?}"
+        );
+        for secret in ["SECRET-PASS", "gateway-user"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} must not be echoed: {rendered}"
+            );
+        }
+    }
+
+    /// Both schemes pass, in either case -- rig's parser and reqwest's both
+    /// match them case-insensitively -- and so does userinfo, which a gateway
+    /// may require.
+    #[test]
+    fn provider_base_url_accepts_http_and_https() {
+        for base_url in [
+            "http://localhost:11434/v1",
+            "https://api.openai.com/v1",
+            "HTTPS://API.EXAMPLE.COM/v1",
+            "https://gateway-user:secret@gateway.example/v1",
+        ] {
+            with_base_url("openai", base_url)
+                .validate(None)
+                .unwrap_or_else(|e| panic!("{base_url:?} is an http(s) URL, got: {e:?}"));
         }
     }
 
@@ -1555,6 +1974,95 @@ retry-budget-secs = 60
         );
         let merged = merge(global, parse(""));
         assert_eq!(merged.retry_budget_secs, Some(60));
+    }
+
+    /// `0` is an immediate deadline rather than none, exactly as for
+    /// `request-timeout-secs`, and the message says so for the same reason.
+    #[test]
+    fn top_level_mcp_call_timeout_secs_zero_errors() {
+        let cfg = parse("mcp-call-timeout-secs = 0\n");
+        let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
+        match err {
+            ConfigValidationError::McpCallTimeoutSecsZero { path, max } => {
+                assert_eq!(path, "top-level mcp-call-timeout-secs");
+                assert_eq!(max, 3600);
+                assert!(rendered.contains("immediate timeout"), "{rendered}");
+            }
+            other => panic!("expected McpCallTimeoutSecsZero, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_mcp_call_timeout_secs_too_large_errors() {
+        let cfg = parse("mcp-call-timeout-secs = 3601\n");
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, max } => {
+                assert_eq!(path, "top-level mcp-call-timeout-secs");
+                assert_eq!(value, 3601);
+                assert_eq!(max, 3600);
+            }
+            other => panic!("expected McpCallTimeoutSecsTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_server_call_timeout_secs_out_of_range_names_the_entry() {
+        for (secs, zero) in [(0, true), (3601, false)] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], call-timeout-secs = {secs} }}
+"#
+            ));
+            let path = match expect_validation_err(&cfg, None) {
+                ConfigValidationError::McpCallTimeoutSecsZero { path, .. } if zero => path,
+                ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, .. } if !zero => {
+                    assert_eq!(value, secs);
+                    path
+                }
+                other => panic!("{secs}: expected an out-of-range call timeout, got: {other:?}"),
+            };
+            assert_eq!(path, "images.coding.mcp.build.call-timeout-secs");
+        }
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_bounds_are_inclusive() {
+        for secs in [1, 3600] {
+            let cfg = parse(&format!(
+                r#"
+mcp-call-timeout-secs = {secs}
+
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], call-timeout-secs = {secs} }}
+"#
+            ));
+            cfg.validate(None)
+                .unwrap_or_else(|e| panic!("{secs}s is inside the bound, got: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_repo_overrides_global() {
+        let global = parse("mcp-call-timeout-secs = 60\n");
+        let repo = parse("mcp-call-timeout-secs = 1800\n");
+        assert_eq!(merge(global, repo).mcp_call_timeout_secs, Some(1800));
+    }
+
+    #[test]
+    fn mcp_call_timeout_secs_falls_back_to_global() {
+        let global = parse("mcp-call-timeout-secs = 60\n");
+        assert_eq!(merge(global, parse("")).mcp_call_timeout_secs, Some(60));
     }
 
     #[test]
@@ -1609,14 +2117,20 @@ tool-result-max = 100000000
 mod config_merge {
     use super::*;
 
+    /// `merge` replaces by name whatever the entry is, as a whole enum value
+    /// and never field by field: a repo row shadowing a global provider takes
+    /// none of its fields along. A provider never reaches `merge` from a repo
+    /// file at all -- `Config::load` refuses one first (see `config_load`), as
+    /// every style carries a key; this repo value is built here, unvalidated.
     #[test]
     fn repo_overrides_global_by_name() {
         let global = parse(
             r#"
 [providers.openai]
-style    = "openai"
-base-url = "https://global.example.com/v1"
-api-key  = "${OPENAI_API_KEY}"
+style                = "openai"
+base-url             = "https://global.example.com/v1"
+api-key              = "${OPENAI_API_KEY}"
+request-timeout-secs = 90
 "#,
         );
         let repo = parse(
@@ -1628,56 +2142,26 @@ api-key  = "${OPENAI_API_KEY}"
 "#,
         );
         let merged = merge(global, repo);
-        let LlmProvider::OpenAi { base_url, .. } = &merged.providers["openai"] else {
+        let LlmProvider::OpenAi {
+            base_url,
+            request_timeout_secs,
+            ..
+        } = &merged.providers["openai"]
+        else {
             panic!("expected OpenAi variant after merge");
         };
         assert_eq!(
             base_url, "https://repo.example.com/v1",
             "repo entry should win"
         );
-    }
-
-    /// Providers merge as whole enum values, not field by field: a repo entry
-    /// may change the style of a global name and takes none of its fields
-    /// along. Without that, a repo `anthropic` provider would inherit the
-    /// global `openai` base URL for keys it happens not to restate.
-    #[test]
-    fn repo_provider_replaces_a_global_of_a_different_style() {
-        let global = parse(
-            r#"
-[providers.claude]
-style                = "openai"
-base-url             = "https://openrouter.ai/api/v1"
-api-key              = "${OPENROUTER_API_KEY}"
-request-timeout-secs = 90
-"#,
-        );
-        let repo = parse(
-            r#"
-[providers.claude]
-style    = "anthropic"
-base-url = "https://api.anthropic.com"
-api-key  = "${ANTHROPIC_API_KEY}"
-"#,
-        );
-        let merged = merge(global, repo);
-        let LlmProvider::Anthropic {
-            base_url,
-            api_key,
-            request_timeout_secs,
-            ..
-        } = &merged.providers["claude"]
-        else {
-            panic!("repo entry should replace the global one wholesale");
-        };
-        assert_eq!(base_url, "https://api.anthropic.com");
-        assert_eq!(api_key.var_name(), "ANTHROPIC_API_KEY");
         assert_eq!(
             *request_timeout_secs, None,
-            "the global entry's timeout must not survive into the replacement"
+            "and take no field of the global one along"
         );
     }
 
+    /// A repo may add providers of its own -- keyless ones -- without
+    /// disturbing the global entries.
     #[test]
     fn repo_keeps_global_entries_with_unique_names() {
         let global = parse(
@@ -1705,6 +2189,34 @@ api-key  = "${STAGING_API_KEY}"
         assert!(merged.providers.contains_key("openai"));
         assert!(merged.providers.contains_key("anthropic"));
         assert!(merged.providers.contains_key("staging"));
+    }
+
+    /// `session-root` is global-only, so `merge` takes it from the global side
+    /// whatever the repo side carries -- including a hand-built repo value
+    /// that never met `validate_as_repo`.
+    #[test]
+    fn session_root_is_never_read_from_the_repo() {
+        let repo = || {
+            parse(
+                r#"
+session-root = "/var/lib/repo/sessions"
+"#,
+            )
+        };
+
+        let merged = merge(Config::default(), repo());
+        assert_eq!(merged.session_root, None);
+
+        let global = parse(
+            r#"
+session-root = "/var/lib/global/sessions"
+"#,
+        );
+        let merged = merge(global, repo());
+        assert_eq!(
+            merged.session_root.as_deref(),
+            Some(Path::new("/var/lib/global/sessions")),
+        );
     }
 
     #[test]
@@ -2054,12 +2566,17 @@ allow = ["github.com:443"]
         );
     }
 
-    /// `[events]` takes `mode` and nothing else, as every block refuses what it
-    /// does not know.
+    /// `[events]` takes `mode` and nothing else. A key it does not know is set
+    /// aside with a warning, as in every lenient table, and a strict parse
+    /// still refuses it; a mode it does not know is an error.
     #[test]
-    fn events_block_refuses_an_unknown_key() {
-        let err = Config::load_from_str("[events]\nmode = \"record\"\nbodies = false\n")
-            .expect_err("an unknown key")
+    fn events_block_sets_aside_an_unknown_key() {
+        let text = "[events]\nmode = \"record\"\nbodies = false\n";
+        let cfg = Config::load_from_str(text).expect("an unknown key is a warning");
+        let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+        assert_eq!(keys, ["events.bodies"]);
+        let err = toml::from_str::<Config>(text)
+            .expect_err("a strict parse refuses it")
             .to_string();
         assert!(err.contains("bodies"), "{err}");
         let err = Config::load_from_str("[events]\nmode = \"everything\"\n")
@@ -2098,11 +2615,16 @@ allow = ["github.com:443"]
         assert_eq!(merge(grace(30), repo).host.grace_secs(), 9, "built in code");
     }
 
-    /// `[host]` refuses a key it does not know, and a grace past the hour.
+    /// `[host]` sets aside a key it does not know, which a strict parse still
+    /// refuses, and refuses a grace past the hour.
     #[test]
-    fn host_block_refuses_an_unknown_key_and_an_absurd_grace() {
-        let err = Config::load_from_str("[host]\ngrace = 5\n")
-            .expect_err("an unknown key")
+    fn host_block_sets_aside_an_unknown_key_and_refuses_an_absurd_grace() {
+        let text = "[host]\ngrace = 5\n";
+        let cfg = Config::load_from_str(text).expect("an unknown key is a warning");
+        let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+        assert_eq!(keys, ["host.grace"]);
+        let err = toml::from_str::<Config>(text)
+            .expect_err("a strict parse refuses it")
             .to_string();
         assert!(err.contains("grace"), "{err}");
 
@@ -2182,6 +2704,57 @@ deny = ["github.com:443"]
         assert_eq!(merged.network.policy(), global_policy);
     }
 
+    /// `merge` is public and infallible and, unlike the network policy, has no
+    /// structural defense against a repo provider: a hand-built repo value
+    /// carrying one replaces the global entry as written. The gate is
+    /// `validate_as_repo`, which `Config::load` runs on every repo file and
+    /// which an embedder assembling a repo-side `Config` must call itself.
+    #[test]
+    fn programmatic_repo_keyed_provider_fails_validate_as_repo() {
+        let global = parse(
+            r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+"#,
+        );
+
+        let mut repo = Config::default();
+        repo.providers.insert(
+            "openai".to_string(),
+            LlmProvider::openai(
+                "https://evil.example/v1",
+                ApiKeyRef::parse("${OPENAI_API_KEY}").expect("reference parses"),
+                OpenAiOptions::new(),
+            ),
+        );
+        let err = repo
+            .validate_as_repo()
+            .expect_err("a repo provider with a key is refused");
+        assert!(
+            matches!(
+                &err,
+                OutrigError::ConfigValidation(ConfigValidationError::RepoProviderApiKey {
+                    provider,
+                    style,
+                    var,
+                    ..
+                }) if provider == "openai" && *style == "openai" && var == "OPENAI_API_KEY"
+            ),
+            "got: {err:?}",
+        );
+
+        let merged = merge(global, repo);
+        let LlmProvider::OpenAi { base_url, .. } = &merged.providers["openai"] else {
+            panic!("expected OpenAi variant after merge");
+        };
+        assert_eq!(
+            base_url, "https://evil.example/v1",
+            "merge takes the repo entry as written; the loader is the gate"
+        );
+    }
+
     /// Declaration is serialized state, not a hidden bit, so a merged config
     /// written out and read back is the same config -- and merges the same way
     /// a second time. A `#[serde(skip)]` replacement would fail the second
@@ -2254,12 +2827,16 @@ mod config_load {
     use super::*;
 
     /// End-to-end load of `tests/fixtures/config-full.toml` (acceptance criterion).
-    /// Writes the fixture to a tempdir, plus the dockerfile/context paths it
-    /// references, then drives the full disk pipeline through `Config::load`.
+    /// Writes the fixture to a tempdir as the *global* config -- it carries
+    /// keyed providers and both roots, which only that file may declare --
+    /// plus the dockerfile/context paths it references, then drives the full
+    /// disk pipeline through `Config::load`. The file sits beside the repo
+    /// root, so its relative paths resolve against the same directory a repo
+    /// config's would.
     #[test]
     fn fixture_loads_end_to_end() {
         let tmp = tempdir().unwrap();
-        write_repo_cfg(tmp.path(), FIXTURE_FULL);
+        let global = write_global_cfg(tmp.path(), FIXTURE_FULL);
 
         // The fixture's image references real paths under the repo root.
         let ctx = tmp.path().join(".agents/outrig/images/coding");
@@ -2269,10 +2846,14 @@ mod config_load {
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/docs")).unwrap();
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/cache")).unwrap();
 
-        let cfg = Config::load(tmp.path(), None).expect("fixture loads end-to-end");
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("fixture loads end-to-end");
         assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
+        assert_eq!(
+            cfg.session_root.as_deref(),
+            Some(Path::new("/var/lib/outrig/sessions")),
+        );
     }
 
     #[test]
@@ -2337,6 +2918,32 @@ mod config_load {
             repo.path().join("sub"),
         );
         assert_eq!(cfg.workspace.container_path(), Path::new("/src"));
+    }
+
+    /// A repo that declares no `container-path` inherits the global one, and the
+    /// shape rule holds it there too -- on the build path as well, since the
+    /// rule sits outside the LLM checks `outrig build` skips.
+    #[test]
+    fn inherited_global_workspace_container_path_must_be_absolute() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            "[workspace]\ncontainer-path = \"workspace\"\n",
+        );
+
+        for err in [
+            Config::load(repo.path(), Some(&global_path)).unwrap_err(),
+            Config::load_for_build(repo.path(), Some(&global_path)).unwrap_err(),
+        ] {
+            match expect_load_validation_err(err) {
+                ConfigValidationError::WorkspaceContainerNotAbsolute { path, .. } => {
+                    assert_eq!(path, std::path::PathBuf::from("workspace"));
+                }
+                other => panic!("expected WorkspaceContainerNotAbsolute, got: {other:?}"),
+            }
+        }
     }
 
     /// A workspace that never went through `Config::load` has no recorded
@@ -2414,26 +3021,18 @@ mod config_load {
     #[test]
     fn run_model_override_can_supply_selected_agents_missing_model() {
         let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
         write_repo_cfg(
             tmp.path(),
             r#"
 default-agent = "coding"
-
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
 
 [agents.coding]
 preamble = "hi"
 "#,
         );
 
-        let strict_err = Config::load(tmp.path(), None).unwrap_err();
+        let strict_err = Config::load(tmp.path(), Some(&global)).unwrap_err();
         assert!(
             matches!(
                 expect_load_validation_err(strict_err),
@@ -2442,7 +3041,7 @@ preamble = "hi"
             "strict load should still reject a model-less agent with no default-model",
         );
 
-        let cfg = Config::load_for_run(tmp.path(), None, None, Some("fast"))
+        let cfg = Config::load_for_run(tmp.path(), Some(&global), None, Some("fast"))
             .expect("run --model supplies the selected agent model");
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
     }
@@ -2450,19 +3049,11 @@ preamble = "hi"
     #[test]
     fn run_model_override_does_not_supply_other_agents_missing_model() {
         let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
         write_repo_cfg(
             tmp.path(),
             r#"
 default-agent = "coding"
-
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
 
 [agents.coding]
 preamble = "hi"
@@ -2472,7 +3063,7 @@ preamble = "review"
 "#,
         );
 
-        let err = Config::load_for_run(tmp.path(), None, None, Some("fast")).unwrap_err();
+        let err = Config::load_for_run(tmp.path(), Some(&global), None, Some("fast")).unwrap_err();
         assert!(
             matches!(
                 expect_load_validation_err(err),
@@ -2548,6 +3139,54 @@ context    = "coding"
             .expect("build load does not require default-model to resolve");
         assert_eq!(cfg.default_model.as_deref(), Some("phantom"));
         assert!(cfg.images.contains_key("coding"));
+    }
+
+    /// The `base-url` rule is a provider rule, inside the `validate_llm` gate:
+    /// a run refuses a scheme reqwest will not send to, and a build, which
+    /// sends nothing, loads the same files.
+    #[test]
+    fn build_load_allows_a_base_url_a_run_refuses() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            r#"
+[providers.remote]
+style    = "openai"
+base-url = "htps://127.0.0.1:18081/v1"
+api-key  = "${REMOTE_API_KEY}"
+"#,
+        );
+
+        let strict_err = Config::load(repo.path(), Some(&global_path)).unwrap_err();
+        match expect_load_validation_err(strict_err) {
+            ConfigValidationError::BaseUrlInvalid { path, .. } => {
+                assert_eq!(path, "providers.remote.base-url");
+            }
+            other => panic!("expected BaseUrlInvalid, got: {other:?}"),
+        }
+        Config::load_for_build(repo.path(), Some(&global_path))
+            .expect("a build sends no request, so it does not check where one would go");
+    }
+
+    /// The deadline sits outside the `validate_llm` gate `outrig build` turns
+    /// off: a build that stamps a server's entry into a label is the last
+    /// chance to refuse a deadline every session would then fail on.
+    #[test]
+    fn build_load_still_validates_mcp_call_timeouts() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "mcp-call-timeout-secs = 0\n");
+
+        let err = Config::load_for_build(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::McpCallTimeoutSecsZero { ref path, .. }
+                    if path == "top-level mcp-call-timeout-secs"
+            ),
+            "build load must still validate the call deadline",
+        );
     }
 
     #[test]
@@ -2773,6 +3412,274 @@ mode = "filter"
         }
     }
 
+    /// A provider that carries an `api-key` names a host variable and says
+    /// where the host process sends it, so only the operator's file may
+    /// declare one: a repo file carrying a remote style is refused at load by
+    /// every loader -- `build` included, since the rule is about the file and
+    /// not about whether a model resolves.
+    #[test]
+    fn repo_keyed_providers_are_rejected() {
+        for (style, base_url, var) in [
+            ("openai", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+            (
+                "anthropic",
+                "https://api.anthropic.com",
+                "ANTHROPIC_API_KEY",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(
+                tmp.path(),
+                &format!(
+                    "[providers.remote]\nstyle = \"{style}\"\nbase-url = \"{base_url}\"\n\
+                     api-key = \"${{{var}}}\"\n"
+                ),
+            );
+
+            for (loader, err) in [
+                ("load", Config::load(tmp.path(), None).unwrap_err()),
+                (
+                    "load_for_build",
+                    Config::load_for_build(tmp.path(), None).unwrap_err(),
+                ),
+            ] {
+                let message = err.to_string();
+                assert!(
+                    message.contains("[providers.remote]")
+                        && message.contains("belongs in global config"),
+                    "{style} via {loader}: got {message}",
+                );
+                let validation = expect_load_validation_err(err);
+                assert!(
+                    matches!(
+                        &validation,
+                        ConfigValidationError::RepoProviderApiKey {
+                            provider,
+                            style: got_style,
+                            var: got_var,
+                            ..
+                        } if provider == "remote" && *got_style == style && got_var == var
+                    ),
+                    "{style} via {loader}: got {validation:?}",
+                );
+            }
+        }
+    }
+
+    /// #330's shape: the global file binds `${ANTHROPIC_API_KEY}` to Anthropic's
+    /// endpoint, and a repo file restates the same name and the same variable
+    /// at its own `base-url`. The repo entry used to replace the global one
+    /// wholesale, so the first turn posted the operator's key where the repo
+    /// said. The repo file is now refused before `merge` runs, so no provider
+    /// in the session can hold a key the operator did not bind to that
+    /// endpoint.
+    #[test]
+    fn a_repo_provider_cannot_redirect_a_global_key() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+"#,
+        );
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://evil.example"
+api-key  = "${ANTHROPIC_API_KEY}"
+"#,
+        );
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoProviderApiKey { provider, var, .. }
+                    if provider == "anthropic" && var == "ANTHROPIC_API_KEY"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// The recommended split: the operator's file declares the keyed provider
+    /// and the repo file names it from a model. The merged provider is the
+    /// global one, `base-url` included.
+    #[test]
+    fn a_repo_model_may_still_name_a_global_provider() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+"#,
+        );
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-model = "claude"
+
+[models.claude]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+"#,
+        );
+
+        let cfg = Config::load(tmp.path(), Some(&global))
+            .expect("a repo model may name a global provider");
+        let LlmProvider::Anthropic { base_url, .. } = &cfg.providers["anthropic"] else {
+            panic!("expected the global Anthropic provider");
+        };
+        assert_eq!(base_url, "https://api.anthropic.com");
+    }
+
+    /// The full fixture has the shape of a *global* file: it carries
+    /// `session-root`, `[repo]`, and keyed providers, so as a repo config it is
+    /// refused. The rules run in schema order, so the root is named first;
+    /// without it, `[repo]`; without that, the first keyed provider in map
+    /// order is.
+    #[test]
+    fn the_fixture_is_refused_as_a_repo_config() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), FIXTURE_FULL);
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "session-root"
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        let without = |prefixes: &[&str]| -> String {
+            FIXTURE_FULL
+                .lines()
+                .filter(|line| !prefixes.iter().any(|prefix| line.starts_with(prefix)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        write_repo_cfg(tmp.path(), &without(&["session-root"]));
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "[repo].env-allow"
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        write_repo_cfg(
+            tmp.path(),
+            &without(&["session-root", "[repo]", "env-allow"]),
+        );
+
+        let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoProviderApiKey { provider, .. }
+                    if provider == "anthropic"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// #336: where this machine writes sessions is the operator's call, so a
+    /// repo file may not set `session-root`. The key is what is refused, not
+    /// the value: an absolute path fails like a relative one.
+    #[test]
+    fn a_repo_session_root_is_rejected() {
+        for (body, key) in [
+            ("session-root = \"sessions\"", "session-root"),
+            (
+                "session-root = \"/var/lib/outrig/sessions\"",
+                "session-root",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(tmp.path(), &format!("{body}\n"));
+
+            let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+            assert!(
+                matches!(err, ConfigValidationError::RepoGlobalOnlyKey { key: k } if k == key),
+                "{body} should be rejected, got: {err:?}",
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("{key}; it belongs in global config")),
+                "got: {err}",
+            );
+        }
+    }
+
+    /// The rule is on the repo-side value rather than on the load, so an
+    /// embedder assembling a repo `Config` by hand gets it too.
+    #[test]
+    fn validate_as_repo_rejects_a_hand_built_root() {
+        let mut cfg = Config::default();
+        cfg.validate_as_repo()
+            .expect("an empty repo config is fine");
+        cfg.session_root = Some("/var/lib/outrig/sessions".into());
+        let err = expect_load_validation_err(cfg.validate_as_repo().unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RepoGlobalOnlyKey {
+                    key: "session-root"
+                }
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// `load_global` reads the one file, resolves its root beside it, and
+    /// stops there: no merge and no validation, since a global file's
+    /// `default-model` may name a model only a repo declares.
+    #[test]
+    fn load_global_resolves_its_root_without_validating() {
+        let dir = tempdir().unwrap();
+        let path = write_global_cfg(
+            dir.path(),
+            r#"
+default-model = "declared-by-some-repo"
+session-root  = "sessions"
+"#,
+        );
+
+        let cfg = Config::load_global(&path).expect("an unvalidated global file loads");
+        assert_eq!(cfg.default_model.as_deref(), Some("declared-by-some-repo"));
+        assert_eq!(cfg.session_root, Some(dir.path().join("sessions")));
+    }
+
+    /// Missing is empty, as it is for `load`; anything else unreadable is an
+    /// error naming the path.
+    #[test]
+    fn load_global_of_a_missing_file_is_empty_and_of_a_directory_an_error() {
+        let dir = tempdir().unwrap();
+        let absent = Config::load_global(&dir.path().join("absent.toml"))
+            .expect("a missing global file loads as empty");
+        assert_eq!(absent, Config::default());
+
+        let err = Config::load_global(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "read", path, .. } if path == dir.path()),
+            "expected a read error naming the directory, got: {err:?}",
+        );
+    }
+
     /// A repo file whose `[network]` table declares no `mode` leaves the
     /// global mode in force. It used to reset it to `default`, silently
     /// turning off a global filter.
@@ -2973,9 +3880,8 @@ context    = "ctx"
     }
 
     #[test]
-    fn sidecar_unknown_key_rejected() {
-        let err = Config::load_from_str(
-            r#"
+    fn sidecar_unknown_key_is_a_warning() {
+        let with_restart = r#"
 [images.coding]
 dockerfile = "D"
 context    = "ctx"
@@ -2983,13 +3889,15 @@ context    = "ctx"
   [sidecars.tools]
   image   = "mcp-tools"
   restart = "always"
-"#,
-        )
-        .expect_err("unknown sidecar key must be rejected");
+"#;
+        let err = toml::from_str::<Config>(with_restart).expect_err("the type refuses the key");
         assert!(
             err.to_string().contains("restart"),
             "error should name the unknown key: {err}"
         );
+        let cfg = parse(with_restart);
+        assert_eq!(cfg.warnings()[0].key(), "sidecars.tools.restart");
+        assert_eq!(cfg.sidecars["tools"].image, "mcp-tools");
     }
 
     #[test]
@@ -3288,6 +4196,32 @@ context    = "ctx"
   [[sidecars.tools.mounts]]
   host-path      = "b"
   container-path = "/cache"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerDuplicate { .. },
+                    ..
+                }
+            ),
+            "expected a duplicate-container-path SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_dotdot_collides_with_enabled_workspace() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image     = "mcp-tools"
+  workspace = "ro"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/workspace/../workspace"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
@@ -3658,6 +4592,25 @@ container-path = "/shared"
         let (repo, global, global_cfg) = repo_and_global(MOUNT_BODY);
         fs::create_dir_all(global.path().join("shared")).unwrap();
         (repo, global, global_cfg)
+    }
+
+    /// #336: `session-root` follows the rule every other path does, against
+    /// the global file's directory -- the only file allowed to set it --
+    /// rather than whichever directory outrig ran from. An absolute one is
+    /// as-is.
+    #[test]
+    fn the_global_session_root_resolves_against_global_dir() {
+        let (repo, global, global_cfg) = repo_and_global("session-root = \"sessions\"\n");
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("a relative root loads");
+        assert_eq!(cfg.session_root, Some(global.path().join("sessions")));
+
+        let (repo, _global, global_cfg) = repo_and_global("session-root = \"/srv/sessions\"\n");
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("an absolute root loads");
+        assert_eq!(
+            cfg.session_root.as_deref(),
+            Some(Path::new("/srv/sessions"))
+        );
     }
 
     #[test]
@@ -4201,6 +5154,22 @@ image = "docker.io/library/alpine:3"
         });
     }
 
+    /// A `~` root is under the home directory, through the merged load and
+    /// `load_global` alike -- not a directory named `~` beside the global file
+    /// or beside wherever outrig ran (#336).
+    #[test]
+    fn a_tilde_root_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let (repo, _global, global_cfg) =
+                repo_and_global("session-root = \"~/outrig-sessions\"\n");
+            let loaded = Config::load(repo.path(), Some(&global_cfg)).expect("a ~ root loads");
+            let global = Config::load_global(&global_cfg).expect("the global file loads");
+            for cfg in [&loaded, &global] {
+                assert_eq!(cfg.session_root, Some(home.join("outrig-sessions")));
+            }
+        });
+    }
+
     /// `~` ignores the declaring file's directory the way an absolute path
     /// does, so one value means one directory from either file, and the
     /// existence check looks there.
@@ -4666,6 +5635,33 @@ mod repo_file_load {
                 .contains("[network].allow belongs in global config"),
             "got: {err:?}",
         );
+
+        let (repo, _outside, file) = repo_and_file("session-root = \"/var/lib/outrig/sessions\"\n");
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session-root; it belongs in global config"),
+            "got: {err:?}",
+        );
+    }
+
+    /// The provider rule is a repo rule too: a `--config` file may not carry
+    /// a keyed provider any more than `.agents/outrig/config.toml` may.
+    #[test]
+    fn the_file_may_not_carry_a_keyed_provider_either() {
+        let (repo, _outside, file) = repo_and_file(
+            "[providers.ci]\nstyle = \"openai\"\nbase-url = \"https://ci.example/v1\"\n\
+             api-key = \"${CI_LLM_KEY}\"\n",
+        );
+
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "repo config may not declare [providers.ci]: a style=openai provider \
+                 carries api-key ${CI_LLM_KEY}, which belongs in global config"
+            ),
+            "got: {err:?}",
+        );
     }
 
     /// Each variant reads the named file and validates as its root-taking
@@ -4673,25 +5669,17 @@ mod repo_file_load {
     /// `--model`, and is not looked at by `build`.
     #[test]
     fn each_variant_reads_the_file_with_its_own_validation() {
-        let (repo, _outside, file) = repo_and_file(
+        let (repo, outside, file) = repo_and_file(
             r#"
 default-agent = "coding"
-
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
 
 [agents.coding]
 preamble = "hi"
 "#,
         );
+        let global = write_global_cfg(outside.path(), PROVIDER_AND_FAST_MODEL);
 
-        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        let err = Config::load_file(&file, repo.path(), Some(&global)).unwrap_err();
         assert!(
             matches!(
                 expect_load_validation_err(err),
@@ -4699,10 +5687,10 @@ preamble = "hi"
             ),
             "the full load holds the agent to a model",
         );
-        let cfg = Config::load_file_for_run(&file, repo.path(), None, None, Some("fast"))
+        let cfg = Config::load_file_for_run(&file, repo.path(), Some(&global), None, Some("fast"))
             .expect("run --model supplies the selected agent's model");
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
-        let cfg = Config::load_file_for_build(&file, repo.path(), None)
+        let cfg = Config::load_file_for_build(&file, repo.path(), Some(&global))
             .expect("build skips agent cross-references");
         assert!(
             cfg.images.is_empty(),
@@ -4963,5 +5951,998 @@ serialize   = true
         // Serialized, it stays undeclared.
         let again = toml::to_string(&cfg).expect("serializes");
         assert!(!again.contains("container-path"), "{again}");
+    }
+}
+
+/// A config file's load sets aside what it cannot use, with a warning naming
+/// the file and line: a key no table has, from any file, and -- from the
+/// global file alone, which every outrig on the machine reads -- a value that
+/// does not deserialize.
+mod lenient_load {
+    use super::*;
+
+    use outrig::config::ConfigWarningKind;
+
+    fn keys(cfg: &Config) -> Vec<&str> {
+        cfg.warnings().iter().map(|w| w.key()).collect()
+    }
+
+    fn reasons(cfg: &Config) -> Vec<&str> {
+        cfg.warnings()
+            .iter()
+            .map(|w| match w.kind() {
+                ConfigWarningKind::InvalidValue { reason, .. } => reason.as_str(),
+                other => panic!("expected InvalidValue, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The shape of a global config written for a newer outrig, read by this
+    /// build: it loads and validates, with one warning per key it does not
+    /// know -- a table, a provider's key, and a model's.
+    #[test]
+    fn a_global_config_for_a_newer_outrig_loads_and_validates() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+default-model = "fast"
+
+[telemetry]
+mode = "record"
+
+[providers.openai]
+style        = "openai"
+base-url     = "https://api.openai.com/v1"
+api-key      = "${OPENAI_API_KEY}"
+prompt-cache = "auto"
+
+[models.fast]
+provider         = "openai"
+identifier       = "gpt-4o-mini"
+reasoning-effort = "high"
+"#,
+        );
+        write_repo_cfg(tmp.path(), "");
+
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("it loads and validates");
+        assert_eq!(
+            keys(&cfg),
+            [
+                "telemetry",
+                "providers.openai.prompt-cache",
+                "models.fast.reasoning-effort"
+            ],
+        );
+        for warning in cfg.warnings() {
+            assert_eq!(warning.file(), Some(global.as_path()));
+            assert_eq!(*warning.kind(), ConfigWarningKind::UnknownKey);
+        }
+        assert_eq!(
+            cfg.warnings()[0].to_string(),
+            format!("{}:4: unknown key `telemetry`, ignored", global.display()),
+        );
+    }
+
+    /// A repo file's warning names the repo file, and the merge keeps both
+    /// sides': the global file's first.
+    #[test]
+    fn each_files_warnings_name_it_and_survive_the_merge() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "from-global = 1\n");
+        write_repo_cfg(tmp.path(), "\nfrom-repo = 1\n");
+
+        let cfg = Config::load_for_build(tmp.path(), Some(&global)).expect("loads");
+        let found: Vec<_> = cfg
+            .warnings()
+            .iter()
+            .map(|w| (w.key(), w.file().map(Path::to_path_buf), w.line()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("from-global", Some(global.clone()), 1),
+                (
+                    "from-repo",
+                    Some(tmp.path().join(".agents/outrig/config.toml")),
+                    2,
+                ),
+            ],
+        );
+    }
+
+    /// From the global file, a value that does not deserialize is dropped
+    /// with the smallest entry that holds it. Here that is a whole provider:
+    /// its `style` goes first, and then the table that cannot stand without
+    /// it, whose warning says the `style` was ignored rather than missing. The
+    /// run's own provider and model are untouched, so the merged config still
+    /// validates.
+    #[test]
+    fn a_global_value_that_does_not_deserialize_is_dropped() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            &format!(
+                "default-model = \"fast\"
+{PROVIDER_AND_FAST_MODEL}
+[providers.newer]
+style    = \"openai-responses\"
+base-url = \"https://example.com/v1\"
+api-key  = \"${{KEY}}\"
+"
+            ),
+        );
+        write_repo_cfg(tmp.path(), "");
+
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("loads without the provider");
+        assert!(!cfg.providers.contains_key("newer"));
+        assert!(cfg.providers.contains_key("openai"));
+        assert_eq!(keys(&cfg), ["providers.newer", "providers.newer.style"]);
+        let reasons = reasons(&cfg);
+        assert_eq!(reasons[0], "its `style` was ignored");
+        assert!(
+            reasons[1].contains("unknown variant `openai-responses`"),
+            "{reasons:?}"
+        );
+        assert!(
+            cfg.warnings()[1]
+                .to_string()
+                .ends_with("`providers.newer.style` ignored: unknown variant `openai-responses`, expected `openai` or `anthropic`"),
+            "{}",
+            cfg.warnings()[1],
+        );
+    }
+
+    /// A literal key in the global config is refused as it always was -- the
+    /// provider is never loaded -- and its warning, printed on every run, does
+    /// not repeat the key, whatever shape it has: bare, behind a shell-style
+    /// default, or with a character the error escapes.
+    #[test]
+    fn a_dropped_api_key_is_not_repeated_in_its_warning() {
+        let tmp = tempdir().unwrap();
+        for key in [
+            "sk-secret-key-123",
+            "${KEY:-sk-secret-key-123}",
+            "sk-secret\\tkey-123",
+        ] {
+            let global = write_global_cfg(
+                tmp.path(),
+                &format!(
+                    "[providers.leaky]\nstyle    = \"openai\"\n\
+                     base-url = \"https://api.openai.com/v1\"\napi-key  = \"{key}\"\n"
+                ),
+            );
+
+            let cfg = Config::load_global(&global).expect("loads without the provider");
+            assert!(cfg.providers.is_empty());
+            let [warning] = cfg.warnings() else {
+                panic!("{key}: expected one warning, got {:?}", cfg.warnings());
+            };
+            assert_eq!(warning.key(), "providers.leaky");
+            let shown = warning.to_string();
+            assert!(!shown.contains("secret"), "{key}: {shown}");
+            assert!(
+                shown.ends_with(
+                    "`providers.leaky` ignored: api-key is not a \"${VAR}\" reference \
+                     (VAR must match ^[A-Z_][A-Z0-9_]*$)"
+                ),
+                "{shown}"
+            );
+        }
+    }
+
+    /// Only the entry whose error quotes an `api-key` gets the redacted reason:
+    /// another entry's warning keeps its own, even beside a one-letter key.
+    #[test]
+    fn another_entrys_reason_is_its_own() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[providers.p]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "x"
+
+[models.m]
+provider   = "p"
+identifier = "x"
+max-tokens = "big"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        assert_eq!(keys(&cfg), ["providers.p", "models.m.max-tokens"]);
+        assert_eq!(
+            reasons(&cfg)[1],
+            "invalid type: string \"big\", expected u32",
+        );
+    }
+
+    /// An array element is named by its index in the file, though an element
+    /// before it was dropped first, and a field missing from the file is
+    /// called missing.
+    #[test]
+    fn array_indices_are_the_files_own() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[[workspace.mounts]]
+container-path = "/a"
+
+[[workspace.mounts]]
+host-path      = "/b"
+container-path = "/b"
+
+[[workspace.mounts]]
+host-path      = "/c"
+container-path = "/c"
+acess          = "read-write"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        let found: Vec<_> = cfg.warnings().iter().map(|w| (w.key(), w.line())).collect();
+        assert_eq!(
+            found,
+            [
+                ("workspace.mounts[0]", 2),
+                ("workspace.mounts[2].acess", 12)
+            ]
+        );
+        let ConfigWarningKind::InvalidValue { reason, .. } = cfg.warnings()[0].kind() else {
+            panic!("expected InvalidValue, got {:?}", cfg.warnings()[0]);
+        };
+        assert_eq!(reason, "missing field `host-path`");
+        let hosts: Vec<_> = cfg.workspace.mounts.iter().map(|m| m.host_path()).collect();
+        assert_eq!(hosts, [Path::new("/b"), Path::new("/c")]);
+    }
+
+    /// Only a mount is a record a load drops on its own. Anywhere else a bad
+    /// element costs the whole key, a table among strings included: dropping
+    /// it alone would leave `sh -c` running the next argument as its script.
+    #[test]
+    fn a_bad_element_costs_the_whole_list_unless_it_is_a_mount() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[images.c]
+image-name = "debian"
+
+[images.c.mcp]
+sh = { command = ["/bin/sh", "-c", { env = "SCRIPT" }, "printf marker"] }
+
+[sidecars.s]
+image = "tools"
+args  = ["--a", { x = 1 }, "--b"]
+
+[[sidecars.s.mounts]]
+container-path = "/a"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        assert_eq!(
+            keys(&cfg),
+            [
+                "images.c.mcp.sh.command",
+                "sidecars.s.args",
+                "sidecars.s.mounts[0]"
+            ],
+        );
+        let McpServerSpec::Full { command, .. } = &cfg.images["c"].mcp()["sh"] else {
+            panic!(
+                "expected the full form, got {:?}",
+                cfg.images["c"].mcp()["sh"]
+            );
+        };
+        assert_eq!(*command, None);
+        assert!(cfg.sidecars["s"].args.is_empty());
+        assert!(cfg.sidecars["s"].mounts.is_empty());
+    }
+
+    /// A misspelled required key is set aside as unknown and then reported
+    /// missing. A file that fails on it names the misspelling, as a strict
+    /// parse did, rather than the key it stood for.
+    #[test]
+    fn a_failing_entry_names_its_misspelled_key() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        write_repo_cfg(
+            tmp.path(),
+            "[[workspace.mounts]]\nhost-pth       = \"/a\"\ncontainer-path = \"/a\"\n",
+        );
+        let err = Config::load_for_build(tmp.path(), Some(&global)).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `host-pth`"),
+            "got: {err}"
+        );
+
+        let err = Config::load_from_str(
+            "[providers.p]\nstyle   = \"openai\"\nbase-ur = \"https://example.com\"\n\
+             api-key = \"${KEY}\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `base-ur`"),
+            "got: {err}"
+        );
+    }
+
+    /// Every unknown key in a table is set aside in one pass, so a file with
+    /// thousands of them loads in about the time of one.
+    #[test]
+    fn a_flood_of_unknown_keys_loads() {
+        let mut text = String::from("default-agent = \"coding\"\n");
+        for i in 0..5000 {
+            text.push_str(&format!("unknown-{i} = 1\n"));
+        }
+        text.push_str("\n[workspace]\n");
+        for i in 0..2000 {
+            text.push_str(&format!("unknown-{i} = 1\n"));
+        }
+
+        let started = std::time::Instant::now();
+        let cfg = Config::load_from_str(&text).expect("loads");
+        assert_eq!(cfg.warnings().len(), 7000);
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `[[providers]]` is an array where a table of providers belongs; the
+    /// global load drops it and goes on.
+    #[test]
+    fn a_global_array_where_a_table_belongs_is_dropped() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            "session-root = \"sessions\"\n\n[[providers]]\nstyle = \"openai\"\n",
+        );
+
+        let cfg = Config::load_global(&global).expect("loads without it");
+        assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.session_root, Some(tmp.path().join("sessions")));
+        assert!(
+            cfg.warnings().iter().any(|w| w.key() == "providers"),
+            "{:?}",
+            cfg.warnings()
+        );
+    }
+
+    /// Smallest means the key when the rest of its table stands, one table of
+    /// an array of tables, and the whole key for any other array: an argv
+    /// short one argument would run something else.
+    #[test]
+    fn a_dropped_value_takes_the_smallest_entry_with_it() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            r#"
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+max-tokens = "plenty"
+
+[images.c]
+image-name = "docker.io/library/debian:stable"
+
+[images.c.mcp]
+fs = { command = ["mcp-fs", 5] }
+
+[[workspace.mounts]]
+host-path      = "/a"
+container-path = "/a"
+
+[[workspace.mounts]]
+container-path = "/b"
+"#,
+        );
+
+        let cfg = Config::load_global(&global).expect("loads");
+        assert_eq!(
+            keys(&cfg),
+            [
+                "models.fast.max-tokens",
+                "images.c.mcp.fs.command",
+                "workspace.mounts[1]"
+            ],
+        );
+        assert_eq!(
+            cfg.models["fast"].identifier.as_deref(),
+            Some("gpt-4o-mini")
+        );
+        assert_eq!(cfg.models["fast"].max_tokens, None);
+        assert_eq!(cfg.workspace.mounts.len(), 1);
+        assert_eq!(cfg.workspace.mounts[0].host_path(), Path::new("/a"));
+    }
+
+    /// A key set aside can be why a rule fails: a misspelled `provider` leaves
+    /// its model with none. The unvalidated loads hand back the warning that
+    /// explains it, for a caller to show before the validation error the
+    /// validated loads return.
+    #[test]
+    fn the_unvalidated_loads_keep_the_warning_a_validation_error_needs() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        let typo = r#"
+default-model = "typo"
+
+[models.typo]
+provder    = "openai"
+identifier = "gpt-4o-mini"
+"#;
+        write_repo_cfg(tmp.path(), typo);
+        let file = tmp.path().join("ci.toml");
+        fs::write(&file, typo).unwrap();
+
+        for cfg in [
+            Config::load_unvalidated(tmp.path(), Some(&global)).expect("parses"),
+            Config::load_file_unvalidated(&file, Some(&global)).expect("parses"),
+        ] {
+            assert_eq!(keys(&cfg), ["models.typo.provder"]);
+            let err = expect_validation_err(&cfg, Some(tmp.path()));
+            assert!(
+                matches!(&err, ConfigValidationError::ModelSourceMissing { .. }),
+                "got: {err:?}"
+            );
+        }
+        let err = Config::load(tmp.path(), Some(&global)).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::ModelSourceMissing { .. }
+            ),
+            "the validated load fails the same rule",
+        );
+    }
+
+    /// A repo file, or one named by `--config`, sets aside only unknown keys:
+    /// the same bad value fails its load, as it always has.
+    #[test]
+    fn a_repo_value_that_does_not_deserialize_still_fails() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), PROVIDER_AND_FAST_MODEL);
+        let bad = r#"
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+max-tokens = "plenty"
+"#;
+        write_repo_cfg(tmp.path(), bad);
+        let err = Config::load_for_build(tmp.path(), Some(&global)).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+
+        let file = tmp.path().join("ci.toml");
+        fs::write(&file, bad).unwrap();
+        let err = Config::load_file_for_build(&file, tmp.path(), Some(&global)).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+    }
+
+    /// `[network]` and the `security` tables set nothing aside, even from the
+    /// global file: what they leave out, a container gets.
+    #[test]
+    fn strict_tables_fail_from_the_global_file_too() {
+        let tmp = tempdir().unwrap();
+        for body in [
+            "[network]\nmode = \"filtr\"\n",
+            "[network]\nmod = \"filter\"\n",
+            "[network]\ndeny = [{ host = \"example.com\", port = \"https\" }]\n",
+            "[images.c]\nimage-name = \"debian\"\n[images.c.security]\ncap-drop = \"ALL\"\n",
+            "[sidecars.s]\nimage = \"tools\"\n[sidecars.s.security]\ncap-dorp = [\"ALL\"]\n",
+        ] {
+            let global = write_global_cfg(tmp.path(), body);
+            let err = Config::load_global(&global).expect_err(body);
+            assert!(matches!(err, OutrigError::Config(_)), "{body}: {err:?}");
+        }
+    }
+
+    /// A syntax error leaves nothing to read, so it fails even the global
+    /// file: running without it would drop every provider and any
+    /// `[network]` policy.
+    #[test]
+    fn a_syntax_error_fails_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "[providers.openai\nstyle = \"openai\"\n");
+        let err = Config::load_global(&global).unwrap_err();
+        assert!(matches!(err, OutrigError::Config(_)), "got: {err:?}");
+    }
+
+    /// A misquoted name is still the error it was, hint and all, from either
+    /// file: setting its stray key aside would leave a nameless half-entry.
+    #[test]
+    fn a_misquoted_name_still_fails_the_global_file() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(
+            tmp.path(),
+            "[models.opus-4.7]\nprovider = \"openai\"\nidentifier = \"x\"\n",
+        );
+        let err = Config::load_global(&global).unwrap_err();
+        assert!(
+            matches!(err, OutrigError::ConfigDottedKey { .. }),
+            "got: {err:?}"
+        );
+    }
+}
+
+/// #444: a repo config file may reference only the host variables the global
+/// config's `[repo] env-allow` lists. Every refusal here comes from a file
+/// load, because only a load records, on each image, the kind of file that
+/// declared it.
+mod repo_env_allow {
+    use super::*;
+
+    use outrig::config::ConfigWarningKind;
+
+    const LIST_GITHUB: &str = "[repo]\nenv-allow = [\"GITHUB_TOKEN\"]\n";
+
+    /// A build-from-Dockerfile image `dev` whose `build-args` are `build_args`
+    /// (an inline table), beside the Dockerfile it names.
+    fn write_build_arg_repo(root: &Path, build_args: &str) {
+        write_repo_cfg(
+            root,
+            &format!(
+                "[images.dev]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n\
+                 build-args = {build_args}\n"
+            ),
+        );
+        fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+    }
+
+    /// The repo config under `root` -- and `file`, which the caller has given
+    /// the same text -- through each of the six loaders, as `(name, result)`.
+    fn every_loader(
+        root: &Path,
+        file: &Path,
+        global: Option<&Path>,
+    ) -> Vec<(&'static str, outrig::error::Result<Config>)> {
+        vec![
+            ("load", Config::load(root, global)),
+            (
+                "load_for_run",
+                Config::load_for_run(root, global, None, None),
+            ),
+            ("load_for_build", Config::load_for_build(root, global)),
+            ("load_file", Config::load_file(file, root, global)),
+            (
+                "load_file_for_run",
+                Config::load_file_for_run(file, root, global, None, None),
+            ),
+            (
+                "load_file_for_build",
+                Config::load_file_for_build(file, root, global),
+            ),
+        ]
+    }
+
+    /// The issue's first case. `build-args = { X = "${VAR}" }` in a repo file,
+    /// with nothing listed, is refused by every loader -- `--config` included
+    /// -- naming the image, the key, the variable, and the file that declared
+    /// it.
+    #[test]
+    fn a_repo_build_arg_reference_off_the_list_is_refused() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let repo_file = tmp.path().join(".agents/outrig/config.toml");
+        let file = tmp.path().join("ci.toml");
+        fs::copy(&repo_file, &file).unwrap();
+
+        for (loader, result) in every_loader(tmp.path(), &file, Some(&global)) {
+            let declared = if loader.starts_with("load_file") {
+                &file
+            } else {
+                &repo_file
+            };
+            let err = result.expect_err(loader);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "repo config may not reference ${{GITHUB_TOKEN}} in image \"dev\" \
+                     build-arg \"GH\" (declared in {declared:?}): list \"GITHUB_TOKEN\" in \
+                     [repo] env-allow in global config to allow it"
+                ),
+                "{loader}",
+            );
+            let validation = expect_load_validation_err(err);
+            assert!(
+                matches!(
+                    &validation,
+                    ConfigValidationError::RepoBuildArgRef { image, key, var, declared_in, .. }
+                        if image == "dev"
+                            && key == "GH"
+                            && var == "GITHUB_TOKEN"
+                            && declared_in.as_deref() == Some(declared.as_path())
+                ),
+                "{loader}: got {validation:?}",
+            );
+        }
+    }
+
+    /// The issue's second case, in each shape an `[images.<n>.mcp]` entry with
+    /// an environment takes: exec-stdio in the primary, exec-stdio in a named
+    /// sidecar, and entrypoint-stdio in an anonymous one. The error also names
+    /// the server.
+    #[test]
+    fn a_repo_mcp_env_reference_off_the_list_is_refused() {
+        for (server, entry, key, var) in [
+            (
+                "fetch",
+                r#"{ command = ["fetch"], env = { PLAIN = "x", TOKEN = "${FETCH_TOKEN}" } }"#,
+                "TOKEN",
+                "FETCH_TOKEN",
+            ),
+            (
+                "fs",
+                r#"{ command = ["fs"], sidecar = "tools", env = { K = "${SIDE_SECRET}" } }"#,
+                "K",
+                "SIDE_SECRET",
+            ),
+            (
+                "serve",
+                r#"{ image = "ghcr.io/example/mcp-fetch:2", env = { T = "${ENTRY_SECRET}" } }"#,
+                "T",
+                "ENTRY_SECRET",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            let global = write_global_cfg(tmp.path(), "");
+            write_repo_cfg(
+                tmp.path(),
+                &format!(
+                    "[sidecars.tools]\nimage = \"mcp-tools\"\n\n\
+                     [images.dev]\nimage-name = \"docker.io/library/debian\"\n\n\
+                     [images.dev.mcp]\nshort = [\"bin\"]\n{server} = {entry}\n"
+                ),
+            );
+
+            let err =
+                expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+            assert!(
+                matches!(
+                    &err,
+                    ConfigValidationError::RepoMcpEnvRef {
+                        image, server: s, key: k, var: v, declared_in: Some(_), ..
+                    } if image == "dev" && s == server && k == key && v == var
+                ),
+                "{server}: got {err:?}",
+            );
+            assert!(
+                err.to_string().contains(&format!(
+                    "in image \"dev\" mcp server \"{server}\" env key \"{key}\""
+                )),
+                "{server}: got {err}",
+            );
+        }
+    }
+
+    /// A listed variable loads as it did before the rule, the reference kept
+    /// for the call site that resolves it; a second variable beside it that is
+    /// not listed is still refused.
+    #[test]
+    fn a_listed_variable_loads_and_an_unlisted_one_beside_it_does_not() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), LIST_GITHUB);
+
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("a listed build-arg loads");
+        assert_eq!(
+            cfg.images["dev"].build_args()["GH"],
+            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+        );
+        assert_eq!(cfg.repo.env_allow(), ["GITHUB_TOKEN"]);
+
+        write_repo_cfg(
+            tmp.path(),
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { T = \"${GITHUB_TOKEN}\" } }\n",
+        );
+        let cfg = Config::load(tmp.path(), Some(&global)).expect("a listed MCP env loads");
+        assert_eq!(
+            cfg.images["dev"].mcp()["srv"].env()["T"],
+            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+        );
+
+        write_build_arg_repo(
+            tmp.path(),
+            r#"{ GH = "${GITHUB_TOKEN}", AWS = "${AWS_SECRET_ACCESS_KEY}" }"#,
+        );
+        let err = expect_load_validation_err(Config::load(tmp.path(), Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef { key, var, .. }
+                    if key == "AWS" && var == "AWS_SECRET_ACCESS_KEY"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// A value is a reference only when it is `${VAR}` whole, so a literal
+    /// -- including one that merely looks like a reference -- names no host
+    /// variable and needs no entry.
+    #[test]
+    fn literals_and_non_references_need_no_entry() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[images.dev]
+dockerfile = "Dockerfile"
+context    = "."
+build-args = { NODE_VERSION = "20", LOWER = "${lower}", EMBEDDED = "pre-${X}-post", BARE = "$FOO" }
+
+[images.dev.mcp]
+fetch = { command = ["fetch"], env = { CARGO_HOME = "/workspace/.cargo", LOWER = "${lower}" } }
+"#,
+        );
+        fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        Config::load(tmp.path(), Some(&global)).expect("literals are not references");
+    }
+
+    /// The rule is about what a repo file may name. The operator's own global
+    /// config names what it likes -- but a repo image of the same name replaces
+    /// the whole entry, references included, so what it then holds is the
+    /// repo's.
+    #[test]
+    fn a_global_configs_own_references_need_no_entry_but_a_repo_replacement_does() {
+        let tmp = tempdir().unwrap();
+        let gdir = tmp.path().join("global");
+        fs::create_dir_all(&gdir).unwrap();
+        fs::write(gdir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let global = write_global_cfg(
+            &gdir,
+            r#"
+[images.shared]
+dockerfile = "Dockerfile"
+context    = "."
+build-args = { T = "${OPERATOR_SECRET}" }
+
+[images.shared-mcp]
+image-name = "docker.io/library/debian"
+
+[images.shared-mcp.mcp]
+srv = { command = ["srv"], env = { K = "${OPERATOR_SECRET}" } }
+"#,
+        );
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        write_repo_cfg(&repo, "");
+
+        let cfg = Config::load(&repo, Some(&global)).expect("the operator's own references load");
+        let secret = EnvValue::EnvRef("OPERATOR_SECRET".to_string());
+        assert_eq!(cfg.images["shared"].build_args()["T"], secret);
+        assert_eq!(cfg.images["shared-mcp"].mcp()["srv"].env()["K"], secret);
+
+        fs::write(repo.join("Dockerfile"), "FROM scratch\n").unwrap();
+        write_repo_cfg(
+            &repo,
+            "[images.shared]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n\
+             build-args = { T = \"${OPERATOR_SECRET}\" }\n",
+        );
+        let err = expect_load_validation_err(Config::load(&repo, Some(&global)).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef { image, .. } if image == "shared"
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// `source` says where an image's paths came from, and `set_build_paths`
+    /// and `set_image_name` clear it. Who wrote the references in `build-args`
+    /// and `mcp` is not that, so an embedder that loads, rewrites an image's
+    /// paths, and then validates does not turn the repo's references into a
+    /// hand-built entry's.
+    #[test]
+    fn rewriting_a_loaded_images_paths_does_not_exempt_it() {
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "");
+
+        write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+        let mut cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+            .expect("the load alone refuses no reference");
+        let image = cfg.images.get_mut("dev").unwrap();
+        image.set_build_paths("Dockerfile", ".");
+        assert!(
+            image.config_source().is_none(),
+            "the setter forgot the file"
+        );
+        let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoBuildArgRef {
+                    declared_in: None,
+                    ..
+                }
+            ),
+            "got: {err:?}",
+        );
+
+        write_repo_cfg(
+            tmp.path(),
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { K = \"${SECRET}\" } }\n",
+        );
+        let mut cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+            .expect("the load alone refuses no reference");
+        let image = cfg.images.get_mut("dev").unwrap();
+        image.set_image_name("ubuntu");
+        assert!(
+            image.config_source().is_none(),
+            "the setter forgot the file"
+        );
+        let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+        assert!(
+            matches!(
+                &err,
+                ConfigValidationError::RepoMcpEnvRef {
+                    declared_in: None,
+                    ..
+                }
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// The boundary, on record: an image no file declared -- read by
+    /// `Config::load_from_str`, or built by hand -- is the caller's own, so it
+    /// is not held to the list, and `validate_as_repo`, a rule of one file,
+    /// says nothing about references.
+    #[test]
+    fn an_image_no_file_declared_is_not_held_to_the_list() {
+        let cfg = parse(
+            "[images.dev]\nimage-name = \"debian\"\n\n[images.dev.mcp]\n\
+             srv = { command = [\"srv\"], env = { K = \"${SECRET}\" } }\n",
+        );
+        assert!(cfg.images["dev"].config_source().is_none());
+        cfg.validate(None).expect("an unstamped image is exempt");
+        cfg.validate_as_repo()
+            .expect("a repo file's references are validate's rule");
+
+        let mut image = ImageConfig::from_dockerfile("Dockerfile", ".");
+        image
+            .build_args_mut()
+            .insert("T".to_string(), EnvValue::EnvRef("SECRET".to_string()));
+        let mut cfg = Config::default();
+        cfg.images.insert("dev".to_string(), image);
+        cfg.validate(None)
+            .expect("a hand-built image is its builder's own");
+    }
+
+    /// Only the operator's file says what a repo file may reference, so a repo
+    /// file declaring the list is refused whatever it holds -- an empty list
+    /// too, which still touches the policy -- before any reference is read.
+    #[test]
+    fn a_repo_file_may_not_declare_the_list() {
+        for body in [
+            "[repo]\nenv-allow = [\"GITHUB_TOKEN\"]\n",
+            "[repo]\nenv-allow = []\n",
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(tmp.path(), body);
+
+            let err = expect_load_validation_err(Config::load(tmp.path(), None).unwrap_err());
+            assert!(
+                matches!(
+                    err,
+                    ConfigValidationError::RepoGlobalOnlyKey {
+                        key: "[repo].env-allow"
+                    }
+                ),
+                "{body}: got {err:?}",
+            );
+            assert_eq!(
+                err.to_string(),
+                "repo config may not set [repo].env-allow; it belongs in global config",
+            );
+        }
+
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "[repo]\n");
+        Config::load(tmp.path(), None).expect("a `[repo]` table that declares nothing is fine");
+    }
+
+    /// `merge` is infallible, so it must be unable to apply a list a repo side
+    /// carries -- a hand-built value that never met `validate_as_repo`.
+    #[test]
+    fn merge_never_reads_the_list_from_the_repo_side() {
+        let mut repo = Config::default();
+        repo.repo.set_env_allow(["GITHUB_TOKEN"]);
+        assert!(
+            repo.validate_as_repo().is_err(),
+            "the repo value really declares it",
+        );
+
+        let merged = merge(Config::default(), repo.clone());
+        assert!(merged.repo.env_allow().is_empty());
+
+        let merged = merge(parse("[repo]\nenv-allow = [\"HTTPS_PROXY\"]\n"), repo);
+        assert_eq!(merged.repo.env_allow(), ["HTTPS_PROXY"]);
+    }
+
+    /// The global file reads leniently, so an `env-allow` that does not
+    /// deserialize is set aside with a warning rather than failing every repo
+    /// on the machine. That leaves the list empty and every reference refused:
+    /// a mistake there narrows access and never widens it. The load returns the
+    /// warning and the refusal comes from the validation after it, the order
+    /// the CLI prints them in, so the warning explains the refusal.
+    #[test]
+    fn an_env_allow_that_does_not_deserialize_is_set_aside_and_refuses_everything() {
+        for (body, key) in [
+            ("[repo]\nenv-allow = \"GITHUB_TOKEN\"\n", "repo.env-allow"),
+            ("[repo]\nenv-allow = [\"github_token\"]\n", "repo.env-allow"),
+            (
+                "[repo]\nenv-allow = [\"${GITHUB_TOKEN}\"]\n",
+                "repo.env-allow",
+            ),
+            ("[repo]\nenv-allow = [\"GITHUB_*\"]\n", "repo.env-allow"),
+            (
+                "[repo]\nenv-allow = [\"GITHUB_TOKEN\", 5]\n",
+                "repo.env-allow",
+            ),
+            ("[repo]\nenv-alow = [\"GITHUB_TOKEN\"]\n", "repo.env-alow"),
+        ] {
+            let tmp = tempdir().unwrap();
+            let global = write_global_cfg(tmp.path(), body);
+            write_build_arg_repo(tmp.path(), r#"{ GH = "${GITHUB_TOKEN}" }"#);
+
+            let cfg = Config::load_unvalidated(tmp.path(), Some(&global))
+                .unwrap_or_else(|e| panic!("{body}: the load must go on: {e}"));
+            let keys: Vec<&str> = cfg.warnings().iter().map(|w| w.key()).collect();
+            assert_eq!(keys, [key], "{body}");
+            assert!(cfg.repo.env_allow().is_empty(), "{body}");
+
+            let err = expect_load_validation_err(cfg.validate(Some(tmp.path())).unwrap_err());
+            assert!(
+                matches!(err, ConfigValidationError::RepoBuildArgRef { .. }),
+                "{body}: got {err:?}",
+            );
+        }
+
+        let tmp = tempdir().unwrap();
+        let global = write_global_cfg(tmp.path(), "[repo]\nenv-allow = [\"github_token\"]\n");
+        let cfg = Config::load_global(&global).unwrap();
+        assert!(
+            matches!(
+                cfg.warnings()[0].kind(),
+                ConfigWarningKind::InvalidValue { reason, .. }
+                    if reason == "env-allow entry \"github_token\" is not a variable name \
+                                  (must match ^[A-Z_][A-Z0-9_]*$)"
+            ),
+            "got: {:?}",
+            cfg.warnings()[0],
+        );
+        assert!(
+            toml::from_str::<Config>("[repo]\nenv-allow = [\"github_token\"]\n").is_err(),
+            "the type itself stays strict",
+        );
+    }
+
+    /// The list is serialized state: a config written out and read back holds
+    /// the same one, and an absent list writes no `[repo]` table at all.
+    #[test]
+    fn the_list_round_trips_and_an_absent_one_is_not_written() {
+        let cfg = parse("[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"HTTPS_PROXY\"]\n");
+        assert_eq!(cfg.repo.env_allow(), ["GITHUB_TOKEN", "HTTPS_PROXY"]);
+
+        let text = toml::to_string(&cfg).expect("config serializes");
+        assert!(
+            text.contains("[repo]\nenv-allow = [\"GITHUB_TOKEN\", \"HTTPS_PROXY\"]"),
+            "got: {text}",
+        );
+        assert_eq!(parse(&text).repo, cfg.repo);
+
+        let text = toml::to_string(&Config::default()).expect("config serializes");
+        assert!(!text.contains("repo"), "got: {text}");
     }
 }

@@ -7,7 +7,9 @@
 //! host-side listener sockets in that namespace. The accepted sockets carry
 //! the original destination metadata; upstream connections are opened from
 //! the host namespace, so OutRig's own traffic is not routed back through the
-//! interceptor.
+//! interceptor. The one destination that names something else there is
+//! pasta's stand-in for the host, which is dialed where pasta would have sent
+//! it; see `HostAlias`.
 //!
 //! Policy evaluation keeps two kinds of evidence apart. The names an
 //! attachment's own DNS listener validated for an address (`ResolvedNames`)
@@ -17,14 +19,13 @@
 //! that name.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs::File as StdFile;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Write as _};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,7 +41,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
@@ -56,44 +57,74 @@ use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{Reissue, detach_cleanup_chain};
 
+mod resolv_conf;
+use resolv_conf::{Resolver, Restore};
+
 const NETWORK_LOG: &str = "network.jsonl";
 
 /// Resolver the interceptor requires inside every attached container: DNS to
 /// the loopback listener, `ndots:0` so bare names resolve without
-/// search-domain expansion. Installed by `podman exec` on running containers
-/// ([`install_resolv_conf`]) and baked in via `podman create --dns` for
+/// search-domain expansion. Written into running containers by attach
+/// ([`intercepted_resolv`]) and baked in via `podman create --dns` for
 /// entrypoint-stdio containers, which cannot be exec'd before start.
 pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
 pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
 const SO_ORIGINAL_DST: libc::c_int = 80;
+/// The address rootless podman 5 hands pasta as `--map-guest-addr` and maps
+/// `host.containers.internal` to; see [`HostAlias`]. Podman's constant rather
+/// than whatever the container's `/etc/hosts` says: the container can write
+/// that file, and a stand-in read from it would let the container make any
+/// address it liked the host, under a label the policy allows.
+const PASTA_HOST_STAND_IN: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
+/// How long the sniff waits for a client's first bytes, and [`read_opening`]
+/// for the rest of a TLS record or request head they begin.
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a lookup connection may sit between queries before it is closed.
+const DNS_TCP_IDLE: Duration = Duration::from_secs(10);
+/// The port a resolver answers on, which is the one the redirect carries to the
+/// DNS listener.
+const DNS_PORT: u16 = 53;
 /// How many lookups one attachment forwards at once. Each holds an ephemeral
 /// socket until its answer or its `DNS_TIMEOUT` per resolver, so this is also
 /// the attachment's bound on those. Past it the listener stops reading and
 /// the backlog waits in its receive buffer.
 const DNS_IN_FLIGHT: usize = 64;
+/// How many connections one attachment carries at once. Each holds two of the
+/// process's descriptors -- the container's end and the upstream one -- and
+/// the usual soft limit on those is 1024, so this keeps one container from
+/// taking every descriptor outrig has. Past it a connection is closed as soon
+/// as it is accepted and recorded as denied by [`CONNECTION_LIMIT_RULE`].
+const TCP_CONNECTIONS: usize = 256;
+/// The `outrig.rule` a connection refused for [`TCP_CONNECTIONS`] is recorded
+/// under. Policy rules are labelled `default`, `allow[N]` and `deny[N]`, so it
+/// cannot be read as one of them.
+const CONNECTION_LIMIT_RULE: &str = "connection-limit";
+/// The `outrig.rule` a connection no redirect carried to the listener is
+/// recorded under; see [`not_redirected`]. Labelled like
+/// [`CONNECTION_LIMIT_RULE`], and for the same reason.
+const UNREDIRECTED_RULE: &str = "not-redirected";
+/// The `outrig.rule` a lookup is refused under when it is not a plain question
+/// for one name, so there is no name to decide on; see
+/// [`CompiledNetworkPolicy::decide_lookup`]. Labelled like
+/// [`CONNECTION_LIMIT_RULE`], and for the same reason.
+const UNPARSED_LOOKUP_RULE: &str = "dns-unparsed";
+/// The rule a zone transfer over TCP is refused under: its answer is a run of
+/// messages, and the interceptor carries one.
+const TRANSFER_LOOKUP_RULE: &str = "dns-transfer";
+/// IXFR and AXFR, the query types answered by more than one message.
+const DNS_TYPES_TRANSFER: [u16; 2] = [251, 252];
+/// How long a listener waits before trying again after a failure that is not
+/// about one connection -- out of descriptors, buffers, memory. Connections
+/// finishing is what frees those, which takes time, and trying again at once
+/// would only spin. A second is what hyper and axum wait.
+const LISTENER_BACKOFF: Duration = Duration::from_secs(1);
 /// How much of a client's opening bytes is examined for an asserted name. A
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-/// Leading byte [`read_resolv_conf`] answers with when the container has a
-/// resolver file; anything else means it has none.
-const RESOLV_PRESENT: u8 = b'1';
-/// The probe's verdict for a resolver that is a symbolic link to something
-/// that does not exist. `[ -e ]` alone reports that as absent, which is the
-/// one shape whose restore would destroy the original: installing follows the
-/// link and creates its target, while `rm -f` removes the link.
-const RESOLV_DANGLING: u8 = b'L';
-/// The largest resolver a restore can promise to put back.
-///
-/// The bytes travel as one `execve` argument, and Linux caps a single argument
-/// at `MAX_ARG_STRLEN`, 128 KiB. Arming an undo whose process could never
-/// start -- and finding that out only after the resolver had been replaced --
-/// is the failure this bound exists to make impossible. A resolver file
-/// anywhere near it is not a resolver file.
-const MAX_RESOLV_SNAPSHOT: usize = 64 * 1024;
 
 /// Bounds on how long one validated answer keeps authorizing an address. The
 /// floor keeps a TTL-0 answer usable by the connection that prompted it; the
@@ -103,30 +134,48 @@ const MAX_BINDING_TTL: Duration = Duration::from_secs(60 * 60);
 /// Cap on the distinct addresses one attachment holds bindings for, so a
 /// container that resolves in a loop cannot grow the map without bound.
 const MAX_BOUND_ADDRESSES: usize = 4096;
+/// Cap on the names held for one address -- the other half of the bound
+/// [`MAX_BOUND_ADDRESSES`] starts. A wildcard zone answers every name it is
+/// asked with the same address, so without it one address grows with the
+/// container's lookups, and each connection to it clones and scans them all.
+const MAX_NAMES_PER_ADDRESS: usize = 64;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_AAAA: u16 = 28;
+const DNS_TYPE_OPT: u16 = 41;
+/// The RCODEs the interceptor answers with itself.
+const DNS_RCODE_SERVFAIL: u16 = 2;
+const DNS_RCODE_REFUSED: u16 = 5;
 /// Longest CNAME chain followed inside one answer section.
 const MAX_CNAME_DEPTH: usize = 8;
+/// How many compression pointers one name may follow before it is refused.
+const MAX_DNS_POINTERS: usize = 8;
 /// Longest single label a name may carry, per RFC 1035.
 const MAX_DNS_LABEL: usize = 63;
+/// Longest name in presentation form, without the root's trailing dot: the 255
+/// bytes a name may take on the wire, less its first length byte and its
+/// terminator.
+const MAX_DNS_NAME: usize = 253;
 /// Chunk size for the bridge's two copy directions.
 const COPY_BUFFER: usize = 8 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PolicyDecision {
     action: NetworkAction,
     rule: String,
 }
 
 impl PolicyDecision {
-    #[cfg(test)]
-    fn allow_default() -> Self {
+    fn new(action: NetworkAction, rule: impl Into<String>) -> Self {
         Self {
-            action: NetworkAction::Allow,
-            rule: "default".to_string(),
+            action,
+            rule: rule.into(),
         }
+    }
+
+    fn allow_default() -> Self {
+        Self::new(NetworkAction::Allow, "default")
     }
 }
 
@@ -161,26 +210,40 @@ impl<S: Into<String>> FromIterator<S> for ResolvedNames {
 struct ClientAssertion {
     http_host: Option<String>,
     sni: Option<String>,
+    /// The name of a DNS lookup, which is the client saying where it means to
+    /// go before it has gone. Names a lookup's record; no policy decision is
+    /// ever made on it as a claim.
+    query: Option<String>,
 }
 
 impl ClientAssertion {
     fn http(host: String) -> Self {
         Self {
             http_host: Some(host.to_ascii_lowercase()),
-            sni: None,
+            ..Self::default()
         }
     }
 
     fn tls(sni: String) -> Self {
         Self {
-            http_host: None,
             sni: Some(sni.to_ascii_lowercase()),
+            ..Self::default()
+        }
+    }
+
+    fn dns(query: String) -> Self {
+        Self {
+            query: Some(query),
+            ..Self::default()
         }
     }
 
     /// The name the client claimed, whichever parser found it.
     fn asserted_host(&self) -> Option<&str> {
-        self.http_host.as_deref().or(self.sni.as_deref())
+        self.http_host
+            .as_deref()
+            .or(self.sni.as_deref())
+            .or(self.query.as_deref())
     }
 
     fn is_empty(&self) -> bool {
@@ -225,6 +288,12 @@ impl CompiledNetworkPolicy {
     /// entries never see the claim. That asymmetry is the whole property: a
     /// client-supplied name may cost a client its own connection, and may
     /// never buy it one.
+    ///
+    /// Two limits follow, written up under "What a hostname rule matches" in
+    /// `doc/reference/config.md`. The one a "fix" would trip on: an `allow` a
+    /// resolved name earned is not re-checked against a claimed name, only
+    /// `deny` is. Narrowing that would stop little -- a client omits the name
+    /// or sends it inside TLS -- and would refuse a named forward proxy.
     fn decide(
         &self,
         dst: SocketAddr,
@@ -253,9 +322,86 @@ impl CompiledNetworkPolicy {
             rule: "default".to_string(),
         }
     }
+
+    /// Whether the container may look `name` up, which the interceptor
+    /// answers from the host's resolvers and so is a way out of the container
+    /// like any connection: the name travels to whoever serves its zone.
+    /// `None` is a query that is not a plain question for one name, whose
+    /// destination there is no telling.
+    ///
+    /// A lookup carries no port, so a port on an entry counts neither for nor
+    /// against it: an `allow` host glob opens the lookups it matches whatever
+    /// port it names, and only a `deny` host glob with no port forbids one.
+    /// `deny` wins, as it does in [`decide`](Self::decide), under either
+    /// default, so the log never calls a name `allow` that a `deny` entry
+    /// matches.
+    ///
+    /// Under `default = "allow"` everything else is open. Under
+    /// `default = "deny"` a lookup is open only to a name some `allow` entry
+    /// could grant a connection to by name: a host glob matching it, or an
+    /// entry matching every address. An `allow` entry for one address or range
+    /// opens none: a name is not an address, and the entry is evidence only of
+    /// connections to that address.
+    fn decide_lookup(&self, name: Option<&str>) -> PolicyDecision {
+        let Some(name) = name else {
+            return if self.gates_lookups() {
+                PolicyDecision::new(NetworkAction::Deny, UNPARSED_LOOKUP_RULE)
+            } else {
+                PolicyDecision::allow_default()
+            };
+        };
+        if let Some(idx) = self.deny.iter().position(|entry| {
+            entry
+                .lookup_deny_glob()
+                .is_some_and(|pattern| glob_matches(pattern, name))
+        }) {
+            return PolicyDecision::new(NetworkAction::Deny, format!("deny[{idx}]"));
+        }
+        if self.default == NetworkAction::Allow {
+            return PolicyDecision::allow_default();
+        }
+        match self
+            .allow
+            .iter()
+            .position(|entry| entry.admits_lookup_of(name))
+        {
+            Some(idx) => PolicyDecision::new(NetworkAction::Allow, format!("allow[{idx}]")),
+            None => PolicyDecision::new(NetworkAction::Deny, "default"),
+        }
+    }
+
+    /// Whether some lookup can be refused by name: when none can, a query
+    /// that cannot be read is no different from one that can, and is let
+    /// through as it always was.
+    fn gates_lookups(&self) -> bool {
+        self.default == NetworkAction::Deny
+            || self
+                .deny
+                .iter()
+                .any(|entry| entry.lookup_deny_glob().is_some())
+    }
 }
 
 impl CompiledNetworkEntry {
+    /// The host glob of this `deny` entry when it refuses the lookups it
+    /// covers: one with no port. An entry for one port forbids connections
+    /// there and no more, and an address entry has no name to forbid.
+    fn lookup_deny_glob(&self) -> Option<&str> {
+        match &self.pattern {
+            NetworkHostPattern::HostGlob(pattern) if self.port.is_none() => Some(pattern),
+            _ => None,
+        }
+    }
+
+    /// Whether this `allow` entry could grant a connection to `name`,
+    /// whatever port it asks for. See [`CompiledNetworkPolicy::decide_lookup`].
+    fn admits_lookup_of(&self, name: &str) -> bool {
+        match &self.pattern {
+            NetworkHostPattern::HostGlob(pattern) => glob_matches(pattern, name),
+            pattern => pattern.covers_every_address(),
+        }
+    }
+
     /// `claimed` is the name the client asserted, or `None` where a claim is
     /// not admissible evidence.
     fn matches(
@@ -330,36 +476,36 @@ fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u8) -> bool {
     }
 }
 
+/// Whether `value` matches `pattern`, where `*` stands for any run of
+/// characters, dots included. The literals before the first `*` and after the
+/// last are anchored to the ends of `value`.
 fn glob_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    let mut parts = pattern.split('*');
+    let Some(rest) = parts.next().and_then(|prefix| value.strip_prefix(prefix)) else {
+        return false;
+    };
+    let Some(suffix) = parts.next_back() else {
+        return rest.is_empty();
+    };
+    let Some(mut rest) = rest.strip_suffix(suffix) else {
+        return false;
+    };
+    // Taking each inner literal at its leftmost occurrence leaves the most
+    // room for the ones after it, so no match is missed by not backtracking.
+    for part in parts {
+        let Some(idx) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[idx + part.len()..];
     }
-    let mut rest = value;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            first = false;
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            let Some(stripped) = rest.strip_prefix(part) else {
-                return false;
-            };
-            rest = stripped;
-        } else {
-            let Some(idx) = rest.find(part) else {
-                return false;
-            };
-            rest = &rest[idx + part.len()..];
-        }
-        first = false;
-    }
-    pattern.ends_with('*') || rest.is_empty()
+    true
 }
 
 /// The names one attachment's DNS listener validated for each destination
 /// address, each held until the answering record's TTL runs out. Scoped to the
 /// attachment: a lookup one container made never authorizes another's traffic.
+/// Bounded both ways: [`MAX_BOUND_ADDRESSES`] addresses, each holding at most
+/// [`MAX_NAMES_PER_ADDRESS`] names.
 #[derive(Debug, Default)]
 struct NameBindings {
     by_ip: BTreeMap<IpAddr, BTreeMap<String, Instant>>,
@@ -367,10 +513,18 @@ struct NameBindings {
 
 type Bindings = Arc<Mutex<NameBindings>>;
 
+/// Where the accept loop leaves the connections that panicked, for teardown to
+/// report: a connection's `JoinError` has no other way out of the loop, which
+/// returns `()` for them.
+type ConnPanics = Arc<Mutex<Vec<JoinError>>>;
+
 impl NameBindings {
     /// Records that `ip` answered for `name`. One address can hold several
     /// names, so an allowed and a denied name behind one address of shared
-    /// hosting both survive, whichever was looked up last.
+    /// hosting both survive, whichever was looked up last -- up to
+    /// [`MAX_NAMES_PER_ADDRESS`], past which the name that expires soonest is
+    /// dropped to make room. The name just bound is never the one dropped: it
+    /// is the one the container is about to connect to.
     fn bind(&mut self, ip: IpAddr, name: &str, ttl: Duration, now: Instant) {
         let expires = now + ttl.clamp(MIN_BINDING_TTL, MAX_BINDING_TTL);
         if !self.by_ip.contains_key(&ip) && self.by_ip.len() >= MAX_BOUND_ADDRESSES {
@@ -379,12 +533,24 @@ impl NameBindings {
         let names = self.by_ip.entry(ip).or_default();
         // Probe before inserting: a container re-resolving a name it already
         // holds is the common case, and `entry` would allocate the key for it.
-        match names.get_mut(name) {
-            Some(slot) => *slot = (*slot).max(expires),
-            None => {
-                names.insert(name.to_ascii_lowercase(), expires);
+        // It adds nothing, so it is also the case that never needs room.
+        if let Some(slot) = names.get_mut(name) {
+            *slot = (*slot).max(expires);
+            return;
+        }
+        // Only a new name grows the map, so only it pays for a sweep: the
+        // expired names go before a live one is evicted in their place.
+        names.retain(|_, held_until| *held_until > now);
+        if names.len() >= MAX_NAMES_PER_ADDRESS {
+            let victim = names
+                .iter()
+                .min_by_key(|(_, held_until)| **held_until)
+                .map(|(name, _)| name.clone());
+            if let Some(victim) = victim {
+                names.remove(&victim);
             }
         }
+        names.insert(name.to_ascii_lowercase(), expires);
     }
 
     fn names(&self, ip: IpAddr, now: Instant) -> ResolvedNames {
@@ -452,13 +618,17 @@ struct Attachment {
     cancel: CancellationToken,
     /// The accept and DNS loops. A `JoinSet` rather than handles because
     /// dropping one aborts what it holds: an interceptor that is dropped
-    /// rather than shut down leaves nothing behind still moving bytes.
-    tasks: JoinSet<()>,
+    /// rather than shut down leaves nothing behind still moving bytes. Each
+    /// ends in an error if its listener stopped taking traffic first.
+    tasks: JoinSet<Result<()>>,
     rollback: Rollback,
     transcript: Option<Transcript>,
     /// This container's handle on the session's audit sink, kept so teardown
     /// can collect the records its connections could not write.
     audit: AuditSink,
+    /// The connections that panicked, as the accept loop collected them.
+    /// Complete once that loop has been joined.
+    panics: ConnPanics,
     /// Answers once no connection task is still running.
     ///
     /// The accept loop normally drains its own connections before it returns,
@@ -526,11 +696,24 @@ impl NetworkInterceptor {
     /// needs. Attaching before `podman start` is what closes the
     /// entrypoint-stdio race: policy is live in the netns before the
     /// entrypoint's first packet.
+    ///
+    /// A container launched holding `CAP_NET_ADMIN` -- `cap-add` of
+    /// `NET_ADMIN`, or of `ALL` with no `NET_ADMIN` in `cap-drop` -- is
+    /// refused before anything is changed: whatever it runs as root could
+    /// delete the table this installs and leave no record. Only the launch is
+    /// consulted, so a borrowed container is never refused.
     pub async fn attach(&mut self, container: &Container) -> Result<()> {
         let name = container.name();
         if self.attachments.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "container {name:?} is already attached to the network interceptor"
+            )));
+        }
+        if container.holds_net_admin() {
+            return Err(OutrigError::Configuration(format!(
+                "container {name:?} holds CAP_NET_ADMIN through `cap-add`, which would let it \
+                 remove the nftables redirect that network interception installs; remove \
+                 NET_ADMIN (or ALL) from `cap-add`, or run with `[network] mode = \"default\"`"
             )));
         }
 
@@ -539,12 +722,30 @@ impl NetworkInterceptor {
         let resolvers = host_resolvers()?;
         let pid = container.pid().await?;
         let sockets = bind_interceptor_sockets(pid)?;
+        // Before the redirect exists, so the probe leaves through pasta the way
+        // a client's connection does without interception.
+        let host_alias = if container.uses_pasta().await? {
+            pasta_host_alias(sockets.probe, PASTA_HOST_STAND_IN).await
+        } else {
+            None
+        };
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
+        let dns_tcp_port = sockets.dns_tcp.local_addr()?.port();
 
-        let target = Target::for_attach(name, pid, &self.session_id, container.dns_preconfigured());
+        let target = Target::for_attach(pid, &self.session_id);
         let transcript = container.transcript();
         let run = |cmd: Cmd| run_step(cmd, transcript.clone());
+        // A dns-preconfigured container had the loopback resolver baked in via
+        // `podman create --dns` (`podman exec` cannot reach it before start),
+        // so there is no resolver here to change and none to change back.
+        // Opening it changes nothing, so a resolver that could not be put back
+        // is refused here with nothing to undo.
+        let resolver = if container.dns_preconfigured() {
+            None
+        } else {
+            Some(Resolver::open(resolv_conf::Place::Container(pid), name)?)
+        };
 
         // The undo log is this frame's, so a caller that drops this future
         // while a command is in flight drops it too, and its destructor puts
@@ -556,8 +757,12 @@ impl NetworkInterceptor {
             &run,
             &mut rollback,
             &target,
-            tcp_port,
-            dns_port,
+            resolver,
+            ListenerPorts {
+                tcp: tcp_port,
+                dns: dns_port,
+                dns_tcp: dns_tcp_port,
+            },
             self.policy.default,
         )
         .await
@@ -594,20 +799,40 @@ impl NetworkInterceptor {
         // answers exactly when the last one has gone. One is enough: nothing
         // is ever queued on it.
         let (live, idle) = mpsc::channel(1);
+        let panics = ConnPanics::default();
         tasks.spawn(tcp_accept_loop(
             sockets.tcp,
             self.audit.for_attachment(name, generation),
             bindings.clone(),
             self.policy.clone(),
+            host_alias,
             cancel.clone(),
             live,
+            panics.clone(),
         ));
-        tasks.spawn(dns_loop(sockets.dns, resolvers, bindings, cancel.clone()));
+        let (resolvers_tcp, bindings_tcp) = (resolvers.clone(), bindings.clone());
+        tasks.spawn(dns_loop(
+            sockets.dns,
+            resolvers,
+            bindings,
+            self.policy.clone(),
+            self.audit.for_attachment(name, generation),
+            cancel.clone(),
+        ));
+        tasks.spawn(dns_tcp_loop(
+            sockets.dns_tcp,
+            resolvers_tcp,
+            bindings_tcp,
+            self.policy.clone(),
+            self.audit.for_attachment(name, generation),
+            cancel.clone(),
+        ));
 
         self.attachments.insert(
             name.to_string(),
             Attachment {
                 idle,
+                panics,
                 cancel,
                 tasks,
                 rollback,
@@ -637,6 +862,20 @@ impl NetworkInterceptor {
             ))
         })?;
         teardown_result(teardown_attachment(container, attachment).await)
+    }
+
+    /// Drops one container's attachment rather than detaching it: what this
+    /// interceptor's own `Drop` does to every attachment, done to one. Its
+    /// loops are aborted and its undo is handed to a detached reaper, so
+    /// nothing is awaited and nothing is reported. Returns whether `container`
+    /// was attached.
+    ///
+    /// For a caller that cannot await -- a destructor unwinding an attach that
+    /// was never committed, say. [`detach`](Self::detach) is the form to use
+    /// wherever awaiting is possible: it confirms the undo and says what it
+    /// could not discharge. Either way the name is free to attach again.
+    pub fn drop_attachment(&mut self, container: &str) -> bool {
+        self.attachments.remove(container).is_some()
     }
 
     /// Detaches every attachment, reporting what none of them could
@@ -697,6 +936,7 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
         mut rollback,
         transcript,
         audit,
+        panics,
     } = attachment;
     cancel.cancel();
     let mut failures = stop_tasks(&mut tasks).await;
@@ -718,6 +958,15 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
             grace: SHUTDOWN_GRACE,
         });
     }
+    // Complete now: the accept loop collects every connection it started, and
+    // `idle` says none is still running. A connection that panicked never
+    // wrote its record, so this is also the only place its loss is visible.
+    let panicked = std::mem::take(&mut *panics.lock().unwrap_or_else(|e| e.into_inner()));
+    failures.extend(
+        panicked
+            .into_iter()
+            .map(|source| OutrigError::NetworkTaskPanicked { source }),
+    );
     // After the join, and then drained. Joining makes "every record this
     // attachment owed is queued" true; the drain makes it "written". Without
     // the second half a `detach` could return while the writer still had the
@@ -753,20 +1002,26 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// that was supposed to have ended it.
 ///
 /// This covers these tasks and not what they spawned. The accept loop keeps
-/// its connections in a set of its own and drains it before returning, so on
+/// its connections in a set of its own, hands the ones that panicked to
+/// `Attachment::panics`, and drains it before returning, so on
 /// every path but this one they are joined with it -- but aborting the loop
 /// drops that set, which requests their abort and does not wait. The caller
 /// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
 /// need no such wait: it aborts them itself on the way out, and they owe
-/// nothing that would be lost if it were aborted first.
-async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
+/// nothing that would be lost if it were aborted first; see [`answer_dns`].
+///
+/// A task that returned an error is reported with it: that is a listener
+/// that had stopped taking traffic before it was asked to.
+async fn stop_tasks(tasks: &mut JoinSet<Result<()>>) -> Vec<OutrigError> {
     let mut failures = Vec::new();
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while let Some(joined) = tasks.join_next().await {
             // Nothing has been aborted yet, so the only way a join fails
             // inside the grace is a task that panicked.
-            if let Err(source) = joined {
-                failures.push(OutrigError::NetworkTaskPanicked { source });
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failures.push(e),
+                Err(source) => failures.push(OutrigError::NetworkTaskPanicked { source }),
             }
         }
     })
@@ -775,7 +1030,15 @@ async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
         failures.push(OutrigError::NetworkTasksAborted {
             grace: SHUTDOWN_GRACE,
         });
-        tasks.shutdown().await;
+        // Joined one by one rather than through `shutdown`, which discards
+        // what each returned: a loop that ended on a failure just as the grace
+        // ran out still owes the report.
+        tasks.abort_all();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(Err(e)) = joined {
+                failures.push(e);
+            }
+        }
     }
     failures
 }
@@ -792,24 +1055,32 @@ fn teardown_result(causes: Vec<NetworkTeardownCause>) -> Result<()> {
     }
 }
 
+/// Where the interceptor's listeners are, which the redirects are aimed at.
+#[derive(Debug, Clone, Copy)]
+struct ListenerPorts {
+    tcp: u16,
+    dns: u16,
+    dns_tcp: u16,
+}
+
 #[derive(Debug)]
 struct InterceptorSockets {
     tcp: TcpListener,
     dns: UdpSocket,
+    /// Port 53 over TCP, where a stub's retry after a truncated answer goes.
+    dns_tcp: TcpListener,
+    /// Unconnected, for [`pasta_host_alias`].
+    probe: std::net::TcpStream,
 }
 
 /// Everything the commands that install and remove interception are keyed to.
 #[derive(Debug, Clone)]
 struct Target {
-    name: String,
     pid: u32,
     table: String,
     /// What the installed resolver is stamped with. Separate from `table` on
     /// purpose: see [`resolv_marker`].
     marker: String,
-    /// A container whose resolver was baked in by `podman create --dns` has
-    /// no resolv.conf to snapshot and none to put back.
-    dns_preconfigured: bool,
 }
 
 impl Target {
@@ -821,13 +1092,11 @@ impl Target {
     /// container first. A marker that *was* the table name would tell an actor
     /// in that namespace which table to create ahead of outrig, making its
     /// `create table` fail and its rollback delete a table it never made.
-    fn for_attach(name: &str, pid: u32, session_id: &str, dns_preconfigured: bool) -> Self {
+    fn for_attach(pid: u32, session_id: &str) -> Self {
         Self {
-            name: name.to_string(),
             pid,
             table: nft_table_name(session_id),
             marker: attach_nonce(),
-            dns_preconfigured,
         }
     }
 }
@@ -837,9 +1106,10 @@ impl Target {
 /// Every mutation is armed here *before* it is made, so no instant exists at
 /// which the container is changed with nothing responsible for changing it
 /// back. The ordinary paths discharge it awaited and report what failed
-/// ([`Self::undo_now`]); a destructor cannot await, so `Drop` hands the same
-/// commands to [`crate::supervise`], which runs them as detached processes
-/// that survive this runtime being torn down.
+/// ([`Self::undo_now`]). A destructor cannot await, so `Drop` puts the
+/// resolver back itself -- that is file I/O through a descriptor, done before
+/// it returns -- and hands the commands to [`crate::supervise`], which runs
+/// them as detached processes that survive this runtime being torn down.
 #[derive(Debug)]
 struct Rollback {
     /// The container's init pid: how the commands get to the namespace, and
@@ -849,9 +1119,8 @@ struct Rollback {
     /// and inode. Compared before any undo is issued, so a pid that has been
     /// handed to another container does not carry this attach's undos into it.
     netns: (u64, u64),
-    /// Undo commands in the order their mutations were made, discharged in
-    /// reverse.
-    undo: Vec<Cmd>,
+    /// Undos in the order their mutations were made, discharged in reverse.
+    undo: Vec<Undo>,
     /// Mutations this made and then could neither undo nor keep owed: they are
     /// reported with whatever the caller is told, and nothing reissues them.
     ///
@@ -918,13 +1187,13 @@ impl Rollback {
     /// whichever mutation a cancellation landed in the middle of.
     ///
     /// Returns where it was armed, for [`narrow`](Self::narrow).
-    fn arm(&mut self, undo: Cmd) -> usize {
-        self.undo.push(undo);
+    fn arm(&mut self, undo: impl Into<Undo>) -> usize {
+        self.undo.push(undo.into());
         self.undo.len() - 1
     }
 
     /// Take an armed undo back, so nothing issues it later.
-    fn disarm(&mut self, armed: usize) -> Option<Cmd> {
+    fn disarm(&mut self, armed: usize) -> Option<Undo> {
         (armed < self.undo.len()).then(|| self.undo.remove(armed))
     }
 
@@ -943,14 +1212,15 @@ impl Rollback {
     /// unable to reach anything the command it replaces could not.
     fn narrow(&mut self, armed: usize, undo: Cmd) {
         if let Some(slot) = self.undo.get_mut(armed) {
-            *slot = undo;
+            *slot = Undo::Run(undo);
         }
     }
 
     /// Discharges every armed undo, most recent first, returning one
-    /// rendering per command that failed. A command stays armed until it has
+    /// rendering per undo that failed. A command stays armed until it has
     /// returned, so a cancellation mid-command leaves it to `Drop` rather
-    /// than dropping it on the floor.
+    /// than dropping it on the floor; the resolver's undo has no await in it
+    /// for a cancellation to land in.
     async fn undo_now<F, Fut>(&mut self, run: &F) -> Vec<OutrigError>
     where
         F: Fn(Cmd) -> Fut,
@@ -980,7 +1250,7 @@ impl Rollback {
             NamespaceAnswer::Is(_) => {}
         }
         // Walked back to front by index, and an entry leaves the list only
-        // once its command has *returned* successfully. Everything not yet
+        // once its undo has *returned* successfully. Everything not yet
         // discharged therefore stays in `self.undo` across every await,
         // including the one in flight, so a caller cancelled here drops a
         // future that owns nothing and the destructor still holds every
@@ -990,13 +1260,16 @@ impl Rollback {
         // this used to do -- got both halves wrong: a cancellation mid-command
         // lost the command, since it existed only in the dropped frame, and
         // the ones it kept came back newest-first for `Drop` to reverse a
-        // second time, undoing the resolver before the redirect that pointed
-        // at it.
+        // second time.
         let mut idx = self.undo.len();
         while idx > 0 {
             idx -= 1;
-            match run(self.undo[idx].clone()).await {
-                Ok(_) => {
+            let discharged = match &mut self.undo[idx] {
+                Undo::Run(cmd) => run(cmd.clone()).await.map(drop),
+                Undo::InProcess(restore) => restore.apply(),
+            };
+            match discharged {
+                Ok(()) => {
                     self.undo.remove(idx);
                 }
                 Err(e) => failures.push(e),
@@ -1007,7 +1280,32 @@ impl Rollback {
 
     #[cfg(test)]
     fn armed(&self) -> Vec<String> {
-        self.undo.iter().map(Cmd::render).collect()
+        self.undo
+            .iter()
+            .map(|undo| match undo {
+                Undo::Run(cmd) => cmd.render(),
+                Undo::InProcess(restore) => restore.describe(),
+            })
+            .collect()
+    }
+}
+
+/// One obligation a [`Rollback`] holds.
+#[derive(Debug)]
+enum Undo {
+    /// A command, run as a process of its own.
+    Run(Cmd),
+    /// Work this process does itself: the resolver put back through the
+    /// descriptor attach opened it with. Never a process, because the only one
+    /// that could reach the file from inside the container's mount namespace
+    /// is one of the image's own binaries, which is what [`resolv_conf`]
+    /// exists to avoid.
+    InProcess(Restore),
+}
+
+impl From<Cmd> for Undo {
+    fn from(cmd: Cmd) -> Self {
+        Undo::Run(cmd)
     }
 }
 
@@ -1019,17 +1317,37 @@ impl Drop for Rollback {
         if matches!(self.same_namespace(), NamespaceAnswer::Gone) {
             return;
         }
-        // One obligation, not one apiece. Handing the reaper each command
-        // separately hands it no ordering -- every call spawns its own child
-        // and returns -- and the resolver must not go back while the redirect
-        // aimed at it is still there, or the container resolves through a rule
-        // pointing at a listener that is gone.
+        // The resolver goes back here, before this returns, and so before the
+        // redirect the reaper is about to remove -- the reverse of the awaited
+        // path's order. It has to: no process can put it back without running
+        // one of the container's own binaries, and work left on this thread
+        // past `drop` would not survive the process exiting. The order costs
+        // nothing the other would not. Until the redirect goes, the restored
+        // resolver's port-53 traffic is carried to a listener that is
+        // stopping; with the order reversed, the loopback resolver points at
+        // that same listener until the restore lands.
+        //
+        // The commands stay one obligation, not one apiece: handing the reaper
+        // each separately hands it no ordering, since every call spawns its
+        // own child and returns.
         //
         // Issued once: these select namespaces by pid, and the kernel hands
         // pids out again. A retry landing after the container exited would
-        // enter whatever holds that pid now -- rewriting some other
-        // container's resolver, or dropping its nft table.
-        let ordered: Vec<Cmd> = self.undo.drain(..).rev().collect();
+        // enter whatever holds that pid now and drop *its* nft table.
+        let mut ordered = Vec::new();
+        for undo in self.undo.drain(..).rev() {
+            match undo {
+                Undo::Run(cmd) => ordered.push(cmd),
+                Undo::InProcess(mut restore) => {
+                    if let Err(e) = restore.apply() {
+                        tracing::warn!(
+                            target: "outrig::network",
+                            "interception dropped rather than detached could not be undone: {e}"
+                        );
+                    }
+                }
+            }
+        }
         detach_cleanup_chain(ordered, Reissue::Once);
     }
 }
@@ -1053,13 +1371,14 @@ impl Drop for Rollback {
 /// promptly and never retried (`Reissue::Once`), but "unlikely" is the claim,
 /// not "impossible".
 ///
-/// The stronger identity is an open descriptor on the namespace, which cannot
-/// be recycled while it is held. It is not used because these undos have to
-/// survive the thing that armed them: they are issued from a destructor with
-/// no runtime, through commands `supervise` spawns and may re-spawn, and an
-/// inherited descriptor does not survive an `exec` that closes it -- carrying
-/// one would mean outrig's own launcher in place of `nsenter` on the one path
-/// that must work when everything else is being torn down.
+/// The stronger identity is an open descriptor, which cannot be recycled while
+/// it is held. The resolver's undo has one -- on the file itself, which it
+/// acts through in this process -- and so does not depend on this at all. The
+/// nft undos do not: they are issued from a destructor with no runtime,
+/// through commands `supervise` spawns and may re-spawn, and an inherited
+/// descriptor does not survive an `exec` that closes it -- carrying one would
+/// mean outrig's own launcher in place of `nsenter` on the one path that must
+/// work when everything else is being torn down.
 fn namespace_id(pid: u32) -> NamespaceAnswer {
     use std::os::unix::fs::MetadataExt;
     classify_namespace(
@@ -1125,8 +1444,10 @@ async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
 /// resolver and point it at the DNS listener, then install the redirect
 /// table, whose `egress` chain gives traffic the redirects do not carry the
 /// policy's `default`. Split from the socket and task plumbing, and
-/// parameterized over how a command runs, so the ordering and the rollback
-/// are exercisable without a container.
+/// parameterized over how a command runs and where the resolver is, so the
+/// ordering and the rollback are exercisable without a container.
+///
+/// `resolver` is `None` for a container with no resolver to change.
 ///
 /// All-or-nothing rests on `rollback` belonging to the caller: a failure
 /// returns with the undos armed, and a caller who drops this future
@@ -1135,26 +1456,41 @@ async fn install_interception<F, Fut>(
     run: &F,
     rollback: &mut Rollback,
     target: &Target,
-    tcp_port: u16,
-    dns_port: u16,
+    resolver: Option<Resolver>,
+    ports: ListenerPorts,
     policy_default: NetworkAction,
 ) -> Result<()>
 where
     F: Fn(Cmd) -> Fut,
     Fut: Future<Output = Result<Vec<u8>>>,
 {
-    // A dns-preconfigured container had the loopback resolver baked in via
-    // `podman create --dns` (`podman exec` cannot reach it before start), so
-    // there is nothing here to change and nothing to change back.
-    if !target.dns_preconfigured {
-        let snapshot =
-            checked_resolv_snapshot(&target.name, run(read_resolv_conf(target.pid)).await?)?;
-        rollback.arm(restore_resolv_conf(target.pid, &target.marker, snapshot));
-        run(install_resolv_conf(target.pid, &target.marker)).await?;
+    if let Some(resolver) = resolver {
+        let mut restore = resolver
+            .stage(intercepted_resolv(&target.marker).into_bytes())
+            .map_err(|e| {
+                let resolv_conf::NotCreated { error, left } = *e;
+                if let Some(left) = left {
+                    rollback.leave_behind(left);
+                }
+                error
+            })?;
+        // Armed whether or not the write worked, since one that failed partway
+        // has still changed the file. Nothing awaits between the two, so no
+        // cancellation can land between them either.
+        let written = restore.install();
+        rollback.arm(Undo::InProcess(restore));
+        written?;
     }
 
+    let script = nft_rules(
+        &target.table,
+        ports.tcp,
+        ports.dns,
+        ports.dns_tcp,
+        policy_default,
+    );
     let mut rules = tempfile::NamedTempFile::new()?;
-    rules.write_all(nft_rules(&target.table, tcp_port, dns_port, policy_default).as_bytes())?;
+    rules.write_all(script.as_bytes())?;
     rules.as_file_mut().sync_all()?;
     // Safe to arm before the apply because the name belongs to this attach
     // alone -- see `nft_table_name`. `create table` is belt to that brace: it
@@ -1231,6 +1567,30 @@ where
         armed,
         delete_nft_table_by_handle(target.pid, rollback.netns_inode(), handle),
     );
+    // A zero exit and a table handle say the table exists, not that the
+    // transaction made what was in it: nft 1.0.9 exited zero having dropped a
+    // nested chain (see `nft_rules`), and a table with no chain redirects
+    // nothing.
+    //
+    // The echo is the commit's own account, one `# handle` per object made, so
+    // a shortfall is the commit missing part of the script. Counted, not
+    // matched: nft rewrites rule text on the way out, and a count survives
+    // that where a comparison of lines would not. Only a shortfall is refused;
+    // an extra line cannot mean something was dropped.
+    //
+    // After the narrowing on purpose: the handle came from this attach's own
+    // commit, so the undo that deletes by it is safe to leave armed, and the
+    // caller's `undo_now` removes the table that was made.
+    let committed = echoed_handles(&echo).count();
+    let declared = script.lines().count();
+    if committed < declared {
+        return Err(OutrigError::Configuration(format!(
+            "nft committed {committed} of the {declared} objects in the redirect \
+             script for table {}, so part of the redirect is not in place; the \
+             attach is undone rather than kept on that footing",
+            target.table
+        )));
+    }
     Ok(())
 }
 
@@ -1303,6 +1663,11 @@ impl AuditSink {
         }
     }
 
+    /// Whose records this handle writes, as losses are filed.
+    fn owner(&self) -> AuditOwner {
+        (self.generation, self.container.clone())
+    }
+
     #[cfg(test)]
     fn for_container(&self, container: &str) -> Self {
         self.for_attachment(container, 0)
@@ -1327,25 +1692,55 @@ impl AuditSink {
     /// has been attempted by then.
     fn take_unwritten(&self) -> Vec<OutrigError> {
         self.sink
-            .take_loss(&(self.generation, self.container.clone()))
+            .take_loss(&self.owner())
             .map(|loss| audit_unwritten(self.container.clone(), loss))
             .into_iter()
             .collect()
     }
 
-    /// Queues one record for the writer, and waits until it is in the file.
+    /// Queues one record for the writer and waits until it is in the file.
     ///
     /// A connection's task returning is what `detach` treats as proof its
     /// record landed, which is why this waits for the writer rather than only
     /// for room in its queue.
     async fn write(&self, record: &AuditRecord) -> Result<()> {
-        let mut line = serde_json::to_vec(record)
-            .map_err(|e| OutrigError::Configuration(format!("encoding network audit: {e}")))?;
-        line.push(b'\n');
-        self.sink
-            .write((self.generation, self.container.clone()), line)
-            .await
+        self.sink.write(self.owner(), encode_audit(record)?).await
     }
+
+    /// Queues one record without waiting for it to be written, unless
+    /// `cancel` comes first while the queue is full. Then the record is counted
+    /// as lost rather than waited for, so the teardown that cancelled it finds
+    /// it in this attachment's losses instead of finding it missing unsaid.
+    async fn queue_unless(&self, record: &AuditRecord, cancel: &CancellationToken) -> Result<()> {
+        tokio::select! {
+            // Queueing first: a record the writer can take now is one that
+            // does not have to be reported lost.
+            biased;
+            queued = self.queue(record) => queued.map(drop),
+            _ = cancel.cancelled() => {
+                self.sink.lose(
+                    &self.owner(),
+                    io::Error::other("teardown began before the record could be queued"),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The queueing half of [`write`](Self::write): hands the record to the
+    /// writer and returns what the writer answers on once it is in the file.
+    /// Cancellation-safe -- dropped before it returns, it queued nothing.
+    async fn queue(&self, record: &AuditRecord) -> Result<tokio::sync::oneshot::Receiver<()>> {
+        self.sink.enqueue(self.owner(), encode_audit(record)?).await
+    }
+}
+
+/// `record` as the one line of `network.jsonl` it is written as.
+fn encode_audit(record: &AuditRecord) -> Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(record)
+        .map_err(|e| OutrigError::Configuration(format!("encoding network audit: {e}")))?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 /// One attachment's audit losses, as the error the interceptor reports them
@@ -1413,7 +1808,7 @@ impl AuditRecord {
             id_orig_p: event.orig.port(),
             id_resp_h: event.dst.ip().to_string(),
             id_resp_p: event.dst.port(),
-            proto: "tcp",
+            proto: event.proto,
             service: event.service,
             duration: event.duration.as_secs_f64(),
             orig_bytes: event.bytes_tx,
@@ -1435,6 +1830,8 @@ impl AuditRecord {
 
 #[derive(Debug, Clone)]
 struct AuditEvent {
+    /// `tcp` for a connection, `udp` for a lookup.
+    proto: &'static str,
     opened: SystemTime,
     duration: Duration,
     orig: SocketAddr,
@@ -1484,114 +1881,348 @@ fn zeek_uid() -> String {
 /// in a `JoinSet` rather than detaching them is what lets a detach end them:
 /// this task is joined, and it does not return until every connection it
 /// started has.
-async fn tcp_accept_loop(
-    listener: TcpListener,
+///
+/// Returns an error when the listener stopped taking connections before it
+/// was asked to; see [`after_listener_failure`].
+#[allow(clippy::too_many_arguments)]
+async fn tcp_accept_loop<L: Accept>(
+    listener: L,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
+    host_alias: Option<HostAlias>,
     cancel: CancellationToken,
     live: mpsc::Sender<()>,
-) {
+    panics: ConnPanics,
+) -> Result<()> {
     // A child of the attachment's token. Connections are still cancelled when
-    // the attachment is, but the accept-failure path below can end them
+    // the attachment is, but the listener-failure path below can end them
     // without reaching the DNS listener, which is a separate socket in a
     // separate task and is still working.
     let conn_cancel = cancel.child_token();
     let mut conns = JoinSet::new();
-    accept_into(
+    let accepted = accept_into(
         &listener,
         &audit,
         &bindings,
         &policy,
+        host_alias,
         &cancel,
         &conn_cancel,
         &mut conns,
         &live,
+        &panics,
     )
     .await;
-    // Every connection watches `conn_cancel`, which by here has been cancelled
-    // either way -- directly on the accept-failure path, and through its
-    // parent on the detach path -- so their records are all written before
+    // Every connection watches `conn_cancel`. On the detach path its parent
+    // has already cancelled it; on the listener-failure path this does, ending
+    // them the same cooperative way -- each still writes its audit record --
+    // rather than leaving this task parked on them until the detach that
+    // reports the failure. Either way their records are all written before
     // this task, and therefore the detach joining it, returns.
     conn_cancel.cancel();
-    while conns.join_next().await.is_some() {}
+    while let Some(joined) = conns.join_next().await {
+        note_joined(joined, &panics);
+    }
+    accepted.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "tcp",
+        source,
+    })
 }
 
-/// The accepting half, with its carrier passed in.
+/// Where the accept loop takes its connections from.
+///
+/// A seam for two reasons. The failures the loop has to survive -- out of
+/// descriptors, out of memory -- cannot be had from a real listener without
+/// starving every other test in the process of the same thing. And what a
+/// redirect displaced cannot be had from one without a redirect: a test that
+/// connects straight to a listener has been handed no destination but the
+/// listener's own, which the loop refuses.
+trait Accept: Send + Sync {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+
+    /// The destination the redirect displaced on a connection this took, asked
+    /// of the family `peer` connected over.
+    fn original_dst(&self, stream: &TcpStream, peer: SocketAddr) -> io::Result<SocketAddr> {
+        original_dst(stream, peer)
+    }
+}
+
+impl Accept for TcpListener {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+        TcpListener::accept(self)
+    }
+}
+
+/// The accepting half, with its carrier passed in. Carries at most
+/// [`TCP_CONNECTIONS`] at once, refusing the rest, and refuses every connection
+/// that was [`not_redirected`] before it counts toward them.
 ///
 /// Split out for one reason: the claim that finished connections are taken
 /// back out of the set as they complete is only observable in the set itself,
 /// and a test cannot see one the loop owns privately. Removing the
-/// `reap_finished` call below otherwise fails nothing -- a finished task is
-/// not an alive task, so no task count notices the handles piling up.
+/// `join_next` arm below otherwise fails nothing -- a finished task is not an
+/// alive task, so no task count notices the handles piling up.
+///
+/// `Ok` once `cancel` ends it; an error when the listener stopped taking
+/// connections first.
 #[allow(clippy::too_many_arguments)]
-async fn accept_into(
-    listener: &TcpListener,
+async fn accept_into<L: Accept>(
+    listener: &L,
     audit: &AuditSink,
     bindings: &Bindings,
     policy: &Arc<CompiledNetworkPolicy>,
+    host_alias: Option<HostAlias>,
     cancel: &CancellationToken,
     conn_cancel: &CancellationToken,
     conns: &mut JoinSet<()>,
     live: &mpsc::Sender<()>,
-) {
+    panics: &ConnPanics,
+) -> io::Result<()> {
     loop {
-        reap_finished(conns);
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, peer)) => {
-                        // The listener takes both families, so an IPv4
-                        // client arrives v4-mapped. It is looked up and
-                        // recorded as the IPv4 connection it is.
-                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-                        let dst = match original_dst(&stream, peer) {
-                            Ok(dst) => dst,
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "outrig::network",
-                                    "SO_ORIGINAL_DST failed: {e}"
-                                );
-                                continue;
-                            }
-                        };
-                        // The connection carries a clone of `live` for as
-                        // long as it runs, so teardown can wait every one of
-                        // them out even on the path where this loop is
-                        // aborted and its carrier dropped.
-                        let held = live.clone();
-                        let (audit, bindings) = (audit.clone(), bindings.clone());
-                        let (policy, cancel) = (policy.clone(), conn_cancel.clone());
-                        conns.spawn(async move {
-                            handle_tcp(stream, peer, dst, audit, bindings, policy, cancel).await;
-                            drop(held);
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
-                        // The listener is gone, so this attachment is over.
-                        // Cancelling ends the connections it already has the
-                        // same cooperative way a detach would -- each still
-                        // writes its audit record -- rather than parking this
-                        // task on connections nothing is coming to end. The
-                        // child token, so a TCP listener failing does not take
-                        // this attachment's DNS interception down with it.
-                        conn_cancel.cancel();
-                        break;
-                    }
-                }
+        let (stream, peer) = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            // Takes each finished connection back out as it finishes, rather
+            // than when the next one arrives: a loop parked in `accept` has no
+            // other reason to wake for it. An empty set does not match, which
+            // leaves this arm out of the iteration. A connection that
+            // panicked is kept for teardown, as it is in `reap_finished` and
+            // the drain after this loop.
+            Some(joined) = conns.join_next() => {
+                note_joined(joined, panics);
+                continue;
+            }
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => match after_listener_failure("tcp", e, cancel).await {
+                    ControlFlow::Continue(()) => continue,
+                    ControlFlow::Break(e) => return Err(e),
+                },
+            },
+        };
+        // The listener takes both families, so an IPv4 client arrives
+        // v4-mapped. It is looked up and recorded as the IPv4 connection it is.
+        let peer = canonical(peer);
+        let dst = match listener.original_dst(&stream, peer) {
+            Ok(dst) => dst,
+            Err(e) => {
+                tracing::warn!(target: "outrig::network", "SO_ORIGINAL_DST failed: {e}");
+                continue;
+            }
+        };
+        let local = match stream.local_addr() {
+            Ok(local) => local,
+            Err(e) => {
+                tracing::warn!(target: "outrig::network", "local address unreadable: {e}");
+                continue;
+            }
+        };
+        // Ahead of the limit: a flood of these is not a flood of connections
+        // the attachment is carrying, and must not be recorded as one.
+        if not_redirected(dst, local) {
+            drop(stream);
+            record_refused(audit, bindings, peer, dst, UNREDIRECTED_RULE, cancel).await;
+            continue;
+        }
+        // The arm above takes finished connections back one at a time, and
+        // `accept` can win the race with it: one that finished meanwhile is
+        // not one this is still carrying, and the limit below must not count
+        // it.
+        reap_finished(conns, panics);
+        if conns.len() >= TCP_CONNECTIONS {
+            drop(stream);
+            record_refused(audit, bindings, peer, dst, CONNECTION_LIMIT_RULE, cancel).await;
+            continue;
+        }
+        // The connection carries a clone of `live` for as long as it runs, so
+        // teardown can wait every one of them out even on the path where this
+        // loop is aborted and its carrier dropped.
+        let held = live.clone();
+        let (audit, bindings) = (audit.clone(), bindings.clone());
+        let (policy, cancel) = (policy.clone(), conn_cancel.clone());
+        conns.spawn(async move {
+            handle_tcp(
+                stream, peer, dst, host_alias, audit, bindings, policy, cancel,
+            )
+            .await;
+            drop(held);
+        });
+    }
+}
+
+/// Whether a connection reached the listener without the redirect, given the
+/// destination `SO_ORIGINAL_DST` reported for it and the listener-side address
+/// it arrived on.
+///
+/// Both are compared as the IPv4 or IPv6 address they are: the listener takes
+/// both families on one socket, so an IPv4 connection's `local` is v4-mapped,
+/// while the lookup reports `dst` in the family the connection came over.
+///
+/// Such a connection has nothing to bridge. The proxy dials its destination
+/// from the host's network namespace, and what the lookup reports for a flow
+/// nothing redirected is the address the client connected to -- the
+/// listener's own, which the host then reaches as whatever it has on that
+/// port: a container that read the port from `/proc/net/tcp` and connected to
+/// `127.0.0.1` on it got the host's loopback service there, and one dialing
+/// its own bridge address got the host's dial back into this listener, again
+/// and again.
+///
+/// - `dst == local` is every such connection. It is also the second hop of
+///   that bridge loop, which arrives from the host rather than the container,
+///   and a host on the bridge that dials the container's address on this port.
+/// - A loopback `dst` is none that a redirect carried: the nat chain returns
+///   ahead of loopback, so a redirected flow never has one, and an address
+///   that means the container's own loopback means the host's when the host
+///   dials it.
+///
+/// Not the listener's port alone. A connection to some other host that
+/// happens to use it is redirected and entitled to be carried, and every
+/// connection that reached the listener by itself already has `dst == local`.
+fn not_redirected(dst: SocketAddr, local: SocketAddr) -> bool {
+    let (dst, local) = (canonical(dst), canonical(local));
+    dst == local || dst.ip().is_loopback()
+}
+
+/// `addr` as the IPv4 address it is when it is v4-mapped.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// What one failed `accept` or receive says about the socket that returned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerFailure {
+    /// About one connection or one call, and already over: try again at once.
+    Passing,
+    /// About the socket itself, which cannot be used again.
+    Broken,
+    /// Anything else -- out of descriptors, buffers, memory, or an error this
+    /// does not recognize: try again after [`LISTENER_BACKOFF`].
+    Retry,
+}
+
+/// Classifies a listener's failure by its errno.
+///
+/// Only an errno that positively says the socket is unusable ends a listener.
+/// Linux `accept` also hands back network errors belonging to the connection
+/// it was about to return, so one this does not recognize is far likelier to
+/// be about a connection than about the listener, and treating it as the end
+/// is the mistake that cost a container its egress for a whole session.
+fn listener_failure(e: &io::Error) -> ListenerFailure {
+    match e.raw_os_error() {
+        Some(libc::ECONNABORTED | libc::EINTR) => ListenerFailure::Passing,
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EFAULT) => ListenerFailure::Broken,
+        _ => ListenerFailure::Retry,
+    }
+}
+
+/// Deals with one failed accept or receive on behalf of the loop around
+/// `listener`: `Continue` once it is worth trying again, `Break` with the
+/// error the loop has to end on.
+///
+/// A loop cancelled while it waits out the back-off ends on that failure too.
+/// It was still failing when it was stopped, so it had stopped taking the
+/// container's traffic, which is what a broken socket says as well -- and the
+/// redirect pointing at it outlives both, so either way the container's
+/// traffic was refused and the detach owes it a report.
+async fn after_listener_failure(
+    listener: &str,
+    e: io::Error,
+    cancel: &CancellationToken,
+) -> ControlFlow<io::Error> {
+    match listener_failure(&e) {
+        ListenerFailure::Passing => {
+            tracing::debug!(target: "outrig::network", "{listener} listener: {e}");
+            ControlFlow::Continue(())
+        }
+        ListenerFailure::Broken => {
+            tracing::error!(
+                target: "outrig::network",
+                "{listener} listener failed, and takes no more traffic until detach: {e}"
+            );
+            ControlFlow::Break(e)
+        }
+        ListenerFailure::Retry => {
+            tracing::warn!(
+                target: "outrig::network",
+                "{listener} listener failed, retrying in {LISTENER_BACKOFF:?}: {e}"
+            );
+            tokio::select! {
+                // Cancellation first. A back-off that has also run out by the
+                // time this is polled again has shown nothing about the
+                // listener; trying again is all it was for, so a loop that was
+                // stopped meanwhile still ends on the failure, and the caller,
+                // finding itself cancelled, would otherwise end it clean.
+                biased;
+                _ = cancel.cancelled() => ControlFlow::Break(e),
+                _ = tokio::time::sleep(LISTENER_BACKOFF) => ControlFlow::Continue(()),
             }
         }
     }
 }
 
+/// Records a connection refused before it was read from: denied by `rule` --
+/// [`CONNECTION_LIMIT_RULE`] when its attachment already carries
+/// [`TCP_CONNECTIONS`], [`UNREDIRECTED_RULE`] when no redirect brought it --
+/// with nothing read and nothing moved.
+///
+/// Queued rather than waited out. The accept loop is the one doing this, and
+/// waiting for the write would hold it out of `accept` -- and deaf to its
+/// cancellation -- for as long as the writer is behind on the whole session's
+/// records. The drain teardown runs is queued behind it, so it is still in the
+/// file before a detach says it is.
+async fn record_refused(
+    audit: &AuditSink,
+    bindings: &Bindings,
+    orig: SocketAddr,
+    dst: SocketAddr,
+    rule: &str,
+    cancel: &CancellationToken,
+) {
+    let record = AuditRecord::new(
+        &audit.session_id,
+        &audit.container,
+        AuditEvent {
+            proto: "tcp",
+            opened: SystemTime::now(),
+            duration: Duration::ZERO,
+            orig,
+            dst,
+            resolved: resolved_names(bindings, dst.ip()),
+            assertion: ClientAssertion::default(),
+            service: "-",
+            bytes_tx: 0,
+            bytes_rx: 0,
+            decision: PolicyDecision {
+                action: NetworkAction::Deny,
+                rule: rule.to_string(),
+            },
+        },
+    );
+    if let Err(e) = audit.queue_unless(&record, cancel).await {
+        tracing::warn!(target: "outrig::network", "network audit record not queued: {e}");
+    }
+}
+
 /// Takes the handles of connections that have already finished out of
-/// `conns`. Without this a `JoinSet` only ever spawned into keeps one handle
-/// per connection the attachment has ever served, which is exactly the state
-/// a long-lived attachment must not accumulate.
-fn reap_finished(conns: &mut JoinSet<()>) {
-    while conns.try_join_next().is_some() {}
+/// `conns`, so a count of it is a count of the connections still running.
+/// What keeps a `JoinSet` only ever spawned into from holding one handle per
+/// connection the attachment has ever served is [`accept_into`]'s `join_next`
+/// arm, which takes each one back as it finishes.
+fn reap_finished(conns: &mut JoinSet<()>, panics: &ConnPanics) {
+    while let Some(joined) = conns.try_join_next() {
+        note_joined(joined, panics);
+    }
+}
+
+/// Keeps what a finished connection joined with if it panicked. The loop never
+/// aborts a connection itself -- only dropping the set does -- so a failed
+/// join is a panic; the check is for the next reader.
+fn note_joined(joined: std::result::Result<(), JoinError>, panics: &ConnPanics) {
+    if let Err(e) = joined
+        && e.is_panic()
+    {
+        panics.lock().unwrap_or_else(|e| e.into_inner()).push(e);
+    }
 }
 
 /// Whether the server on `port` is expected to write first. Sniffing such a
@@ -1611,9 +2242,10 @@ struct Sniffed {
 }
 
 /// Reads the client's opening bytes, giving up after [`SNIFF_TIMEOUT`] so a
-/// silent client cannot stall its own connection indefinitely. A client that
-/// waits out this window asserts nothing here; [`bridge`] re-checks whatever
-/// it says later.
+/// silent client cannot stall its own connection indefinitely. Once they
+/// begin, [`read_opening`] reads the rest of them. A client that waits out
+/// this window asserts nothing here; [`bridge`] re-checks whatever it says
+/// later.
 async fn sniff_client_stream<S: AsyncRead + Unpin>(client: &mut S) -> Sniffed {
     let mut buf = vec![0; SNIFF_BUFFER];
     let Ok(Ok(n)) = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf)).await else {
@@ -1622,12 +2254,39 @@ async fn sniff_client_stream<S: AsyncRead + Unpin>(client: &mut S) -> Sniffed {
     if n == 0 {
         return Sniffed::default();
     }
+    let Ok(n) = read_opening(client, &mut buf, n).await else {
+        return Sniffed::default();
+    };
     // Right-sized rather than truncated: these bytes are held for the life of
     // the connection, and a truncated buffer keeps its whole capacity.
     Sniffed {
         assertion: sniff_client_bytes(&buf[..n]).unwrap_or_default(),
         initial: buf[..n].to_vec(),
     }
+}
+
+/// Reads on after the `n` bytes `buf` already holds until they make up the
+/// whole TLS record or HTTP request head they begin, so a name split across
+/// reads is parsed whole. It reads no further when they begin neither, when
+/// `buf` is full, when the client closes, or [`SNIFF_TIMEOUT`] after it was
+/// called: an opening that looks unfinished may be a client waiting on the
+/// server. Returns how many bytes `buf` then holds.
+async fn read_opening<S: AsyncRead + Unpin>(
+    client: &mut S,
+    buf: &mut [u8],
+    mut n: usize,
+) -> io::Result<usize> {
+    let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
+    while n < buf.len() && opening_unfinished(&buf[..n]) {
+        // A read the deadline cancels has taken nothing from the client, and
+        // every earlier read is already counted in `n`.
+        match tokio::time::timeout_at(deadline, client.read(&mut buf[n..])).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => n += read,
+            Ok(Err(e)) => return Err(e),
+        }
+    }
+    Ok(n)
 }
 
 /// What the audit record for one connection is built from. [`proxy`] updates
@@ -1644,10 +2303,12 @@ struct ConnOutcome {
 /// Bridges one accepted connection to `dst` and records it. `dst` is the
 /// original destination the redirect displaced, read from the socket by the
 /// accept loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp(
     mut client: TcpStream,
     orig: SocketAddr,
     dst: SocketAddr,
+    host_alias: Option<HostAlias>,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
@@ -1696,6 +2357,7 @@ async fn handle_tcp(
                 proxy(
                     &mut client,
                     dst,
+                    upstream_addr(dst, host_alias),
                     &sniffed.initial,
                     &resolved,
                     &policy,
@@ -1709,6 +2371,7 @@ async fn handle_tcp(
     write_audit(
         &audit,
         AuditEvent {
+            proto: "tcp",
             opened,
             duration: started.elapsed(),
             orig,
@@ -1724,23 +2387,110 @@ async fn handle_tcp(
     .await;
 }
 
-/// Opens the upstream connection an allowed decision earned and bridges it.
+/// pasta's stand-in for the host, and the address pasta sends it to.
+///
+/// Inside a pasta container, [`PASTA_HOST_STAND_IN`] is redirected by pasta to
+/// a host address of pasta's choosing, so dialed as written from the host's
+/// namespace it reaches nothing. The interceptor dials `host` instead, which
+/// is where pasta would have sent it: a host service listening on every
+/// address answers, and one bound only to loopback stays as unreachable as it
+/// is without interception.
+///
+/// Measured once per attach, by [`pasta_host_alias`], from pasta itself.
+/// Nothing in the container says it: pasta takes the most specific of the
+/// host's addresses on its interface, so beside a `/24` a `/32` wins, while
+/// the container's routing, and with it the address a client connects from,
+/// picks the address whose subnet holds the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostAlias {
+    stand_in: Ipv4Addr,
+    host: Ipv4Addr,
+}
+
+/// How long [`pasta_host_alias`] waits for pasta to carry its probe.
+const ALIAS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Asks pasta where it sends `stand_in`, by having it carry one connection
+/// there. `probe` is an unconnected TCP socket in the container's namespace,
+/// used before the redirect is installed, so the connection leaves through
+/// pasta as a client's would. pasta opens its own from the host to wherever it
+/// maps the stand-in; a listener on every host address takes it, and the
+/// address it arrived at is the answer. The token the probe sends tells it
+/// apart from anything else that connects meanwhile. `None` when pasta
+/// carries nothing there within [`ALIAS_PROBE_TIMEOUT`].
+async fn pasta_host_alias(probe: std::net::TcpStream, stand_in: Ipv4Addr) -> Option<HostAlias> {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let mut token = [0u8; 16];
+    rand::rng().fill_bytes(&mut token);
+    probe.set_nonblocking(true).ok()?;
+    let probe = tokio::net::TcpSocket::from_std_stream(probe);
+
+    let send = async {
+        let mut sent = probe.connect(SocketAddr::from((stand_in, port))).await?;
+        sent.write_all(&token).await?;
+        // Held open until the other side has read it.
+        io::Result::Ok(sent)
+    };
+    let arrive = async {
+        loop {
+            let (mut arrived, _) = listener.accept().await?;
+            let mut heard = [0u8; 16];
+            if arrived.read_exact(&mut heard).await.is_ok() && heard == token {
+                return arrived.local_addr();
+            }
+        }
+    };
+    let (_, arrived) = tokio::time::timeout(ALIAS_PROBE_TIMEOUT, async {
+        tokio::try_join!(send, arrive)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    match arrived.ip() {
+        IpAddr::V4(host) => Some(HostAlias { stand_in, host }),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Where the upstream connection for `dst` is dialed, from the host's
+/// namespace: `dst` itself, or the alias's `host` on the same port when `dst`
+/// is its stand-in. Only the dial moves; policy and the audit record keep
+/// `dst`. Podman maps no IPv6 stand-in.
+fn upstream_addr(dst: SocketAddr, host_alias: Option<HostAlias>) -> SocketAddr {
+    match (dst.ip(), host_alias) {
+        (IpAddr::V4(to), Some(alias)) if to == alias.stand_in => {
+            SocketAddr::from((alias.host, dst.port()))
+        }
+        _ => dst,
+    }
+}
+
+/// Opens the upstream connection an allowed decision earned, at `dial`, and
+/// bridges it. `dst` is still what the connection is judged by; `dial` is
+/// where [`upstream_addr`] put it.
 async fn proxy(
     client: &mut TcpStream,
     dst: SocketAddr,
+    dial: SocketAddr,
     initial: &[u8],
     resolved: &ResolvedNames,
     policy: &CompiledNetworkPolicy,
     outcome: &mut ConnOutcome,
 ) {
-    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
+    let via = if dial == dst {
+        String::new()
+    } else {
+        format!(" via {dial}")
+    };
+    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dial)).await {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(e)) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst} failed: {e}");
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {e}");
             return;
         }
         Err(e) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst} timed out: {e}");
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} timed out: {e}");
             return;
         }
     };
@@ -1782,8 +2532,9 @@ struct LateRecheck<'a> {
 
 /// Copies both directions until either side closes. When `recheck` is set the
 /// client's first bytes -- which arrived too late for the sniff window -- are
-/// run back through the policy before any of them reach upstream, and the
-/// connection is torn down if the name they carry now denies.
+/// read whole by [`read_opening`] and run back through the policy before any
+/// of them reach upstream, and the connection is torn down if the name they
+/// carry now denies.
 async fn bridge(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
@@ -1822,7 +2573,10 @@ async fn bridge(
                 // Scoped so the sniff buffer is not held for the life of the
                 // copy loop below.
                 let mut buf = vec![0; SNIFF_BUFFER];
+                // Unbounded: the client may be waiting for the server to
+                // speak first. Only the rest of what it begins is bounded.
                 let n = client_rx.read(&mut buf).await?;
+                let n = read_opening(&mut client_rx, &mut buf, n).await?;
                 if n > 0 {
                     // `recheck` is only set when the sniff window closed with
                     // no assertion, so an empty one here re-derives the
@@ -1907,86 +2661,231 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
     }
 }
 
+/// Everything one attachment's lookups are decided and answered with, shared
+/// by the tasks that answer them.
+struct DnsContext {
+    /// Passed in rather than read where they are used, so a caller -- and a
+    /// test -- decides who lookups are forwarded to.
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
+}
+
 /// Answers the container's lookups from the host's resolvers, recording what
-/// each name validly resolved to. `resolvers` is passed in rather than read
-/// here so a caller -- and a test -- decides who this forwards to.
+/// each name validly resolved to, for the names `policy` lets it look up; a
+/// lookup it does not is refused without a resolver being asked. Every lookup
+/// is recorded in `audit` either way. See [`answer_dns`].
 ///
 /// Each lookup is forwarded in a task of its own. Every process in the
 /// container shares this listener, and a forward can wait out `DNS_TIMEOUT`
 /// per resolver, so one name a resolver is slow to answer must hold up only
 /// the client that asked for it. At most [`DNS_IN_FLIGHT`] run at once.
+///
+/// The first lookup no resolver answers is warned about; every resolver's
+/// failure is logged at debug by [`forward_dns`] regardless. A host whose
+/// resolver is down fails every lookup the container makes, and one line says
+/// so as well as a line apiece would.
+///
+/// Returns an error when the listener stopped taking queries before it was
+/// asked to; see [`after_listener_failure`].
 async fn dns_loop(
     socket: UdpSocket,
     resolvers: Vec<SocketAddr>,
     bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
     cancel: CancellationToken,
-) {
+) -> Result<()> {
     let socket = Arc::new(socket);
-    let resolvers: Arc<[SocketAddr]> = resolvers.into();
+    let context = Arc::new(DnsContext {
+        resolvers,
+        bindings,
+        policy,
+        audit,
+    });
     let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
-    loop {
+    let mut warned = false;
+    let ended = loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = cancel.cancelled() => break Ok(()),
             // Takes each finished lookup back out of the set, which is what
             // frees its slot.
-            Some(_) = lookups.join_next() => {}
+            Some(done) = lookups.join_next() => {
+                if let Ok(Err(e)) = done
+                    && !warned
+                {
+                    warned = true;
+                    tracing::warn!(
+                        target: "outrig::network",
+                        "no host resolver answered a container lookup, which got SERVFAIL \
+                         ({e}); later ones are logged at debug"
+                    );
+                }
+            }
             // With the set full, the next query stays in the socket until a
             // lookup finishes rather than being read with nowhere to go.
             received = recv_query(&socket, &mut buf), if lookups.len() < DNS_IN_FLIGHT => {
-                let Ok((n, peer, asked)) = received else {
-                    break;
+                let (n, peer, asked) = match received {
+                    Ok(Some(query)) => query,
+                    // Already read, and nothing in it can be answered.
+                    Ok(None) => continue,
+                    Err(e) => match after_listener_failure("dns", e, &cancel).await {
+                        ControlFlow::Continue(()) => continue,
+                        ControlFlow::Break(e) => break Err(e),
+                    },
                 };
                 let raw = buf[..n].to_vec();
-                let (socket, resolvers, bindings) =
-                    (socket.clone(), resolvers.clone(), bindings.clone());
+                let (socket, context) = (socket.clone(), context.clone());
                 lookups.spawn(async move {
-                    answer_dns(&socket, &raw, peer, asked, &resolvers, &bindings).await;
+                    answer_dns(&socket, &raw, peer, asked, &context).await
                 });
             }
         }
-    }
+    };
     // Aborted rather than waited out: a forward outlasts the grace a detach
-    // gives this task, and a lookup owes no record, so abandoning one loses
-    // nothing a detach has to account for.
+    // gives this task, and a lookup owes nothing; see [`answer_dns`].
     lookups.shutdown().await;
+    ended.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "dns",
+        source,
+    })
 }
 
-/// Forwards one query and sends `peer` whatever validly answers it, from
-/// `asked`, the address the query was sent to.
+/// Decides one query, records the decision, and then either refuses it or
+/// forwards it and sends `peer` whatever validly answers it, from `asked`, the
+/// address the query was sent to. When no resolver answers, `peer` is sent a
+/// SERVFAIL instead and the forward's failure is returned. See
+/// [`resolve_dns`], which does the deciding for both transports.
 async fn answer_dns(
     socket: &UdpSocket,
     raw: &[u8],
     peer: SocketAddr,
     asked: Asked,
-    resolvers: &[SocketAddr],
-    bindings: &Bindings,
-) {
+    context: &DnsContext,
+) -> io::Result<()> {
+    let dst = SocketAddr::new(asked.addr(), DNS_PORT);
+    let (reply, failure) = resolve_dns(raw, peer, dst, DnsTransport::Udp, context).await;
+    if let Some(reply) = reply {
+        let _ = send_answer(socket, &reply, peer, asked).await;
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// The transport a lookup arrived on, which is the one it is forwarded over:
+/// a client that asked over TCP gets the answer a resolver gives over TCP, not
+/// the truncated one it asked to avoid.
+#[derive(Clone, Copy)]
+enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+impl DnsTransport {
+    fn proto(self) -> &'static str {
+        match self {
+            DnsTransport::Udp => "udp",
+            DnsTransport::Tcp => "tcp",
+        }
+    }
+}
+
+/// Decides one query `peer` sent to `dst`, records the decision, and returns
+/// what `peer` is to be sent -- `None` for a query nothing can be said to --
+/// beside the forward's failure when no resolver answered.
+///
+/// A lookup is a way out of the container -- the name reaches whoever serves
+/// its zone -- so it is decided like a connection is: by
+/// [`CompiledNetworkPolicy::decide_lookup`]. What it is decided on is the
+/// question when the query is nothing but a question, and nothing otherwise: a
+/// query that carries more, or that does not parse, has no name the policy
+/// can speak for, and what a resolver would make of it is not something to
+/// find out.
+///
+/// The record is written before the decision takes effect, and waited for, so
+/// a query that reached a resolver is in the audit log. A refusal is answered
+/// REFUSED and is not a failure to forward: it has no failure. An answer that
+/// validly resolves a name is bound before it is returned, so a connection the
+/// client opens on the strength of it is decided with the name in hand.
+async fn resolve_dns(
+    raw: &[u8],
+    peer: SocketAddr,
+    dst: SocketAddr,
+    transport: DnsTransport,
+    context: &DnsContext,
+) -> (Option<Vec<u8>>, Option<io::Error>) {
     let query = dns_query(raw);
     tracing::debug!(
         target: "outrig::network",
         "dns query from {peer}: {:?}",
         query.as_ref().map(|query| &query.question.name)
     );
-    match forward_dns(raw, query.as_ref(), resolvers).await {
+    let plain = query.as_ref().filter(|query| query.is_plain_question(raw));
+    let mut decision = context
+        .policy
+        .decide_lookup(plain.map(|query| query.question.name.as_str()));
+    // A transfer's answer is several messages on one stream, and
+    // `forward_dns_tcp` carries one: what it would return is the first message
+    // as though it were all of it. Refused, and said to be, rather than cut.
+    // Read off the wire rather than from `query`: a valid name the policy's
+    // parser refuses -- an RFC 2317 `0/25.2.0.192.in-addr.arpa` -- leaves no
+    // `query`, and is forwarded all the same.
+    if matches!(transport, DnsTransport::Tcp)
+        && raw_qtype(raw).is_some_and(|qtype| DNS_TYPES_TRANSFER.contains(&qtype))
+    {
+        decision = PolicyDecision::new(NetworkAction::Deny, TRANSFER_LOOKUP_RULE);
+    }
+    let refused = decision.action == NetworkAction::Deny;
+    // `orig` and `dst` are as the dual-stack listener reports them, v4-mapped
+    // for an IPv4 client. The record describes the exchange before any
+    // resolver is asked, so it has no duration and no response: `S0`.
+    write_audit(
+        &context.audit,
+        AuditEvent {
+            proto: transport.proto(),
+            opened: SystemTime::now(),
+            duration: Duration::ZERO,
+            orig: canonical(peer),
+            dst: canonical(dst),
+            resolved: ResolvedNames::default(),
+            assertion: query
+                .as_ref()
+                .map_or_else(ClientAssertion::default, |query| {
+                    ClientAssertion::dns(query.question.name.clone())
+                }),
+            service: "dns",
+            bytes_tx: raw.len() as u64,
+            bytes_rx: 0,
+            decision,
+        },
+    )
+    .await;
+    if refused {
+        return (
+            dns_error_reply(raw, query.as_ref(), DNS_RCODE_REFUSED),
+            None,
+        );
+    }
+    let forwarded = match transport {
+        DnsTransport::Udp => forward_dns(raw, query.as_ref(), &context.resolvers).await,
+        DnsTransport::Tcp => forward_dns_tcp(raw, query.as_ref(), &context.resolvers).await,
+    };
+    match forwarded {
         Ok(response) => {
-            // Bound before the answer goes out, so a connection the client
-            // opens on the strength of it is decided with the name in hand.
             if let Some(query) = &query
                 && dns_response_is_bindable(&response)
             {
-                record_dns_bindings(bindings, &query.question.name, &response);
+                record_dns_bindings(&context.bindings, &query.question.name, &response);
             }
             tracing::debug!(
                 target: "outrig::network",
                 "dns response to {peer}: {} bytes",
                 response.len()
             );
-            let _ = send_answer(socket, &response, peer, asked).await;
+            (Some(response), None)
         }
-        Err(e) => {
-            tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
-        }
+        Err(e) => (dns_servfail(raw, query.as_ref()), Some(e)),
     }
 }
 
@@ -1998,6 +2897,16 @@ async fn answer_dns(
 enum Asked {
     V6(libc::in6_pktinfo),
     V4(libc::in_pktinfo),
+}
+
+impl Asked {
+    /// The address the query was sent to, as the packet named it.
+    fn addr(&self) -> IpAddr {
+        match self {
+            Asked::V6(info) => IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)),
+            Asked::V4(info) => IpAddr::V4(Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr))),
+        }
+    }
 }
 
 /// The DNS listener, from the socket the namespace helper bound: reporting
@@ -2019,6 +2928,10 @@ fn dns_listener(fd: OwnedFd) -> io::Result<UdpSocket> {
 /// Reads one query from a [`dns_listener`]: its length, who sent it, and the
 /// address it was sent to.
 ///
+/// `None` for a datagram that came without either of the last two, which
+/// cannot be answered. It has been read all the same, so skipping it is all
+/// there is to do; an error is about the socket, not about one datagram.
+///
 /// The last is where the answer has to come from. A query to any resolver
 /// but the container's loopback one arrives by way of the redirect, which
 /// rewrote it to loopback, and conntrack undoes that rewrite only on an
@@ -2026,7 +2939,10 @@ fn dns_listener(fd: OwnedFd) -> io::Result<UdpSocket> {
 /// the unspecified address, so an answer left to routing goes out from the
 /// container's own address instead. Nothing undoes it, and the client drops
 /// it as coming from a server it never asked.
-async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Asked)> {
+async fn recv_query(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr, Asked)>> {
     socket
         .async_io(Interest::READABLE, || {
             let mut iov = [IoSliceMut::new(buf)];
@@ -2037,20 +2953,21 @@ async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
                 Some(&mut control),
                 MsgFlags::empty(),
             )?;
-            let peer = msg
-                .address
-                .as_ref()
-                .and_then(|addr| {
-                    addr.as_sockaddr_in6()
-                        .map(|v6| SocketAddr::V6((*v6).into()))
-                        .or_else(|| addr.as_sockaddr_in().map(|v4| SocketAddr::V4((*v4).into())))
-                })
-                .ok_or_else(|| io::Error::other("a query arrived with no sender address"))?;
+            let peer = msg.address.as_ref().and_then(|addr| {
+                addr.as_sockaddr_in6()
+                    .map(|v6| SocketAddr::V6((*v6).into()))
+                    .or_else(|| addr.as_sockaddr_in().map(|v4| SocketAddr::V4((*v4).into())))
+            });
+            let Some(peer) = peer else {
+                tracing::debug!(target: "outrig::network", "dns query with no sender address");
+                return Ok(None);
+            };
             // The address alone: the interface the query came in on is not
-            // one its answer has to leave by.
-            let asked = msg
-                .cmsgs()?
-                .find_map(|cmsg| match cmsg {
+            // one its answer has to leave by. Control data the kernel had to
+            // truncate is this datagram's problem, so it is a query without
+            // the address rather than a failed socket.
+            let asked = msg.cmsgs().ok().and_then(|mut cmsgs| {
+                cmsgs.find_map(|cmsg| match cmsg {
                     ControlMessageOwned::Ipv6PacketInfo(info) => {
                         Some(Asked::V6(libc::in6_pktinfo {
                             ipi6_ifindex: 0,
@@ -2065,10 +2982,15 @@ async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
                     }
                     _ => None,
                 })
-                .ok_or_else(|| {
-                    io::Error::other("a query arrived without the address it was sent to")
-                })?;
-            Ok((msg.bytes, peer, asked))
+            });
+            let Some(asked) = asked else {
+                tracing::debug!(
+                    target: "outrig::network",
+                    "dns query from {peer} without the address it was sent to"
+                );
+                return Ok(None);
+            };
+            Ok(Some((msg.bytes, peer, asked)))
         })
         .await
 }
@@ -2116,30 +3038,219 @@ fn record_dns_bindings(bindings: &Bindings, name: &str, response: &[u8]) {
 /// the same packet already parsed, or `None` when it did not parse -- an
 /// unparsable query is still forwarded, but nothing it comes back with is
 /// accepted as an answer.
+///
+/// Whatever stops one resolver answering is that resolver's failure, and the
+/// next is tried: a host can list an IPv6 server first on a kernel with no
+/// IPv6, and the socket it would be asked from cannot even be bound. When
+/// none answers, the error names each one's failure, since the first can be
+/// the one that explains the rest.
 async fn forward_dns(
     raw: &[u8],
     query: Option<&DnsQuery>,
     resolvers: &[SocketAddr],
 ) -> io::Result<Vec<u8>> {
-    let mut last_err = None;
+    forward_each(resolvers, |resolver| ask_resolver(raw, query, resolver)).await
+}
+
+/// [`forward_dns`] over TCP, for a query that arrived that way: each resolver
+/// is asked as RFC 7766 has it, a length-prefixed message on a connection of
+/// its own.
+async fn forward_dns_tcp(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolvers: &[SocketAddr],
+) -> io::Result<Vec<u8>> {
+    forward_each(resolvers, |resolver| ask_resolver_tcp(raw, query, resolver)).await
+}
+
+async fn forward_each<F, Fut>(resolvers: &[SocketAddr], ask: F) -> io::Result<Vec<u8>>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<Vec<u8>>>,
+{
+    let mut failures = Vec::new();
     for resolver in resolvers {
-        let bind_addr = if resolver.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-        };
-        let socket = UdpSocket::bind(bind_addr).await?;
-        if let Err(e) = socket.send_to(raw, resolver).await {
-            last_err = Some(e);
-            continue;
-        }
-        match recv_dns_answer(&socket, query, *resolver).await {
+        match ask(*resolver).await {
             Ok(response) => return Ok(response),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                tracing::debug!(target: "outrig::network", "dns forward to {resolver} failed: {e}");
+                failures.push(format!("{resolver}: {e}"));
+            }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no DNS resolvers configured")))
+    Err(if failures.is_empty() {
+        io::Error::new(io::ErrorKind::NotFound, "no DNS resolvers configured")
+    } else {
+        io::Error::other(failures.join("; "))
+    })
+}
+
+/// One resolver's turn at `raw`. The socket is connected to it, which is what
+/// has the kernel report a refusal -- a stopped resolver's port answering
+/// with ICMP -- so a resolver that is not there fails now rather than after
+/// `DNS_TIMEOUT`. Connected, it also takes datagrams from nowhere else;
+/// [`recv_dns_answer`] checks the source all the same, as evidence it holds
+/// rather than a filter it assumes.
+async fn ask_resolver(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolver: SocketAddr,
+) -> io::Result<Vec<u8>> {
+    let bind_addr = if resolver.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(resolver).await?;
+    socket.send(raw).await?;
+    recv_dns_answer(&socket, query, resolver).await
+}
+
+/// One resolver's turn at `raw` over TCP, within `DNS_TIMEOUT` as a whole. The
+/// answer is held to the same evidence a datagram is, by
+/// [`DnsQuery::answered_by`]: a stream from the resolver's own address cannot
+/// be raced from elsewhere, but one that answers some other question is not
+/// this one's answer.
+async fn ask_resolver_tcp(
+    raw: &[u8],
+    query: Option<&DnsQuery>,
+    resolver: SocketAddr,
+) -> io::Result<Vec<u8>> {
+    let exchange = async {
+        let mut stream = TcpStream::connect(resolver).await?;
+        write_dns_frame(&mut stream, raw).await?;
+        read_dns_frame(&mut stream).await
+    };
+    let response = tokio::time::timeout(DNS_TIMEOUT, exchange)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))??;
+    let answers = match query {
+        Some(query) => query.answered_by(resolver, resolver, &response),
+        None => true,
+    };
+    if answers {
+        Ok(response)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the answer is not to the question asked",
+        ))
+    }
+}
+
+/// Reads one DNS message framed as RFC 7766 section 8 has it: its length as
+/// two bytes, then that many. `UnexpectedEof` at a frame boundary is how a
+/// client that has finished says so; see [`serve_dns_connection`].
+async fn read_dns_frame<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 2];
+    stream.read_exact(&mut len).await?;
+    let mut message = vec![0u8; usize::from(u16::from_be_bytes(len))];
+    stream.read_exact(&mut message).await?;
+    Ok(message)
+}
+
+async fn write_dns_frame<W: AsyncWrite + Unpin>(stream: &mut W, message: &[u8]) -> io::Result<()> {
+    let len = u16::try_from(message.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DNS message over 65535 bytes"))?;
+    // One write, so the frame leaves as one segment rather than two.
+    let mut frame = Vec::with_capacity(2 + message.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(message);
+    stream.write_all(&frame).await
+}
+
+/// Answers the container's lookups made over TCP: the stub's own retry after
+/// a truncated answer, which reaches port 53 on loopback directly, and a
+/// lookup to any other resolver, which the redirect brings here. The answer
+/// to each is decided, forwarded and bound as one made over UDP is; see
+/// [`resolve_dns`].
+///
+/// Each connection is served in a task of its own, at most [`DNS_IN_FLIGHT`]
+/// at once, which is the bound the UDP loop keeps on its lookups. With the set
+/// full the next connection waits in the listener's backlog.
+///
+/// Returns an error when the listener stopped taking connections before it
+/// was asked to; see [`after_listener_failure`].
+async fn dns_tcp_loop(
+    listener: TcpListener,
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let context = Arc::new(DnsContext {
+        resolvers,
+        bindings,
+        policy,
+        audit,
+    });
+    let mut conns = JoinSet::new();
+    let ended = loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break Ok(()),
+            // Takes each finished connection back out, which frees its slot.
+            Some(_) = conns.join_next() => {}
+            accepted = listener.accept(), if conns.len() < DNS_IN_FLIGHT => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => match after_listener_failure("dns", e, &cancel).await {
+                        ControlFlow::Continue(()) => continue,
+                        ControlFlow::Break(e) => break Err(e),
+                    },
+                };
+                let context = context.clone();
+                conns.spawn(async move {
+                    serve_dns_connection(stream, canonical(peer), &context).await;
+                });
+            }
+        }
+    };
+    // Aborted rather than waited out, as the UDP loop's lookups are.
+    conns.shutdown().await;
+    ended.map_err(|source| OutrigError::NetworkListenerFailed {
+        listener: "dns",
+        source,
+    })
+}
+
+/// Serves the queries one connection carries, one after another, until the
+/// client closes it, sends something unframeable, or stays silent for
+/// [`DNS_TCP_IDLE`] -- a client that connects and says nothing must not hold
+/// one of the loop's slots forever.
+async fn serve_dns_connection(mut stream: TcpStream, peer: SocketAddr, context: &DnsContext) {
+    // Where the client meant to send it: the resolver the redirect displaced,
+    // or this socket's own address when it connected to the loopback one
+    // directly, which no redirect touched.
+    let dst = match original_dst(&stream, peer).or_else(|_| stream.local_addr()) {
+        Ok(dst) => canonical(dst),
+        Err(e) => {
+            tracing::debug!(target: "outrig::network", "dns connection from {peer}: {e}");
+            return;
+        }
+    };
+    loop {
+        let raw = match tokio::time::timeout(DNS_TCP_IDLE, read_dns_frame(&mut stream)).await {
+            Ok(Ok(raw)) => raw,
+            // Closed, cut, or idle: the client is done either way.
+            Ok(Err(_)) | Err(_) => return,
+        };
+        let (reply, failure) = resolve_dns(&raw, peer, dst, DnsTransport::Tcp, context).await;
+        if let Some(e) = failure {
+            tracing::debug!(target: "outrig::network", "dns lookup over tcp: {e}");
+        }
+        // Bounded like the read: a client that sends queries and reads no
+        // answers would otherwise hold this slot on a full socket buffer.
+        if let Some(reply) = reply
+            && !matches!(
+                tokio::time::timeout(DNS_TCP_IDLE, write_dns_frame(&mut stream, &reply)).await,
+                Ok(Ok(()))
+            )
+        {
+            return;
+        }
+    }
 }
 
 /// Waits out the whole timeout for a datagram that actually answers `query`,
@@ -2234,139 +3345,14 @@ fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
             continue;
         };
         if let Ok(ip) = raw.parse::<IpAddr>() {
-            out.push(SocketAddr::new(ip, 53));
+            out.push(SocketAddr::new(ip, DNS_PORT));
         }
     }
     out
 }
 
-/// Reads the container's current resolver, so the undo armed against the
-/// install can put exactly that state back.
-///
-/// Answers with [`RESOLV_PRESENT`] followed by the file's bytes, or with `0`
-/// and nothing else when the container has no resolver file at all. A bare
-/// `cat` could report neither: it cannot tell an absent file from an empty
-/// one, and it fails on the absent one, which would make a container that
-/// never had a resolver impossible to attach to rather than a state to put
-/// back.
-fn read_resolv_conf(pid: u32) -> Cmd {
-    nsenter_sh(pid).args([
-        "if [ -L /etc/resolv.conf ] && [ ! -e /etc/resolv.conf ]; then printf L; \
-             elif [ -e /etc/resolv.conf ]; then printf 1; cat /etc/resolv.conf; \
-             else printf 0; fi",
-    ])
-}
-
-/// The command that puts back whatever [`read_resolv_conf`] found: the file
-/// with exactly its old bytes, or its absence.
-fn restore_resolv_conf(pid: u32, marker: &str, snapshot: Vec<u8>) -> Cmd {
-    match snapshot.split_first() {
-        Some((&RESOLV_PRESENT, original)) => write_resolv_conf(pid, marker, original.to_vec()),
-        _ => remove_resolv_conf(pid, marker),
-    }
-}
-
-/// The inverse of an absent resolver.
-///
-/// Reachable only for a container that has no resolver file at all. Podman
-/// bind-mounts one, and `rm` on a bind mount fails with `EBUSY` -- checked
-/// against podman 4.9.3 -- so for a container it created the snapshot says
-/// present and this is never the undo that gets armed. Where it is armed the
-/// file is a real one and the removal works; where it somehow is not, the
-/// failure is reported and the undo stays armed rather than being dropped.
-fn remove_resolv_conf(pid: u32, marker: &str) -> Cmd {
-    let installed = intercepted_resolv(marker);
-    let bytes = installed.len().to_string();
-    nsenter_sh(pid)
-        .args([REMOVE_RESOLV_SCRIPT, "_", ""])
-        .arg(installed)
-        .arg(bytes)
-}
-
-/// Points the resolver at the DNS listener.
-///
-/// Unguarded, unlike the undos: this is the change, and what it is replacing
-/// is whatever the snapshot just read.
-fn install_resolv_conf(pid: u32, marker: &str) -> Cmd {
-    nsenter_sh(pid)
-        .args(["printf '%s' \"$1\" > /etc/resolv.conf", "_"])
-        .arg(intercepted_resolv(marker))
-}
-
-/// Writes the bytes handed in as `$1` to the resolver file.
-///
-/// They ride in as an argument rather than interpolated into the script, so
-/// nothing between the snapshot and the file interprets them -- no quoting, no
-/// escape processing -- and `printf '%s'` adds no newline of its own. What an
-/// argument cannot carry is a NUL, and it cannot carry more than
-/// `MAX_ARG_STRLEN`; [`checked_resolv_snapshot`] refuses both before anything
-/// is mutated, because a restore that cannot be spawned is not a restore.
-///
-/// A `const` so a test can run this exact script rather than a paraphrase: the
-/// claim is that it reproduces arbitrary bytes, and a copy proves that about
-/// the copy.
-/// Acts only on a resolver carrying this attach's own marker.
-///
-/// Pure shell, deliberately. The obvious spelling is `printf ... | cmp -s -`,
-/// and `cmp` is not something a container has to have: a missing one exits
-/// 127, which `|| exit 0` reads as "not ours" -- so the undo would skip
-/// silently and `detach` would report success over a resolver still pointing
-/// at a stopped listener. `case` and `cat` are what the snapshot already
-/// needs, so this adds no dependency of its own.
-///
-/// A read that *fails* is not a mismatch. Discarding `cat`'s status made an
-/// unreadable resolver look like one that was never this attach's: the undo
-/// exited zero, teardown struck it off, and `detach` reported success over a
-/// container still pointing at a listener that has stopped. An absent file is
-/// the one case that legitimately owes nothing, and it is checked separately
-/// so it cannot be confused with a file that is there and could not be read.
-///
-/// The whole installed text, not just the marker it carries. Containment of
-/// the marker answers "did this attach install this", but not "is this still
-/// what it installed" -- a resolver manager that changed the nameservers and
-/// left the comment alone would have had its work discarded. The marker is
-/// still what makes the text unique to this attachment; comparing all of it is
-/// what keeps a later legitimate change.
-///
-/// Both sides go through command substitution with a `.` appended inside it.
-/// Command substitution strips trailing newlines, so without that a file that
-/// gained or lost a terminal newline compared equal to one that had not --
-/// byte-distinct state the undo would then have overwritten, which is the
-/// opposite of the contract. The sentinel is the last thing in each
-/// substitution, so nothing before it is stripped, and the comparison needs no
-/// external tool.
-///
-/// The byte count is checked where `wc` exists, because a shell variable is
-/// not a byte string: implementations differ on what command substitution does
-/// with an embedded NUL, and one that drops them would let a resolver with a
-/// NUL added after installation compare equal to one without. `wc -c` reads
-/// the file rather than a variable, and `-eq` rather than `=` because some
-/// `wc`s pad their output.
-///
-/// Guarded by `command -v`, a builtin, and deliberately so. A container need
-/// not ship `wc`, and an unguarded call exits 127 -- which `|| exit 0` reads
-/// as "not this attach's", retiring the undo while `detach` reports success
-/// over a resolver still pointing at a stopped listener. That is the `cmp`
-/// mistake again, and it is worse than the gap it closes: without `wc` the
-/// text comparison still stands, and what is lost is only a NUL inserted after
-/// installation on a shell that drops NULs in substitution.
-const RESTORE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
-     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
-     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
-     if command -v wc > /dev/null 2>&1; then \
-     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
-     printf '%s' \"$1\" > /etc/resolv.conf";
-
-/// The inverse of an absent resolver, under the same marker.
-const REMOVE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
-     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
-     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
-     if command -v wc > /dev/null 2>&1; then \
-     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
-     rm -f /etc/resolv.conf";
-
-/// What [`install_resolv_conf`] writes, and therefore what an undo expects to
-/// find before it acts.
+/// What attach writes into the resolver, and therefore what its undo expects
+/// to find before it acts.
 ///
 /// The trailing comment carries `marker`, which is [`attach_nonce`]'s and
 /// *not* the table's name -- the two are drawn independently, and
@@ -2377,10 +3363,9 @@ const REMOVE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; f
 /// need to create that table first and make `create table` fail.
 ///
 /// Per attach rather than per outrig, because the text is otherwise identical
-/// for every attachment: a pid reused by *another* outrig container would
-/// satisfy a shared sentinel and get the first container's resolver written
-/// into it. Resolver files ignore `#` lines, so this costs the container
-/// nothing.
+/// for every attachment, and the undo's guard is a question about this
+/// attach's install. Resolver files ignore `#` lines, so this costs the
+/// container nothing.
 fn intercepted_resolv(marker: &str) -> String {
     format!(
         "nameserver {INTERCEPT_DNS_NAMESERVER}\noptions {INTERCEPT_DNS_OPTION}\n{}\n",
@@ -2402,81 +3387,6 @@ fn resolv_marker(marker: &str) -> String {
     format!("# {marker}")
 }
 
-/// Reads the probe's verdict and refuses every resolver state this could not
-/// faithfully put back.
-///
-/// Refusing here is the whole point. Each of these describes a container whose
-/// resolver an undo could not restore, and discovering that after the resolver
-/// had already been replaced would leave exactly the state this task exists to
-/// prevent: loopback DNS with nothing listening and no way back.
-fn checked_resolv_snapshot(container: &str, snapshot: Vec<u8>) -> Result<Vec<u8>> {
-    let refuse = |why: String| {
-        Err(OutrigError::Configuration(format!(
-            "container {container:?} cannot be network-intercepted: {why}"
-        )))
-    };
-    match snapshot.split_first() {
-        Some((&RESOLV_DANGLING, _)) => refuse(
-            "/etc/resolv.conf is a symbolic link to a file that does not exist. \
-             Installing would follow the link and create its target, and undoing \
-             that would remove the link itself"
-                .to_string(),
-        ),
-        Some((&RESOLV_PRESENT, original)) if original.contains(&0) => refuse(
-            "/etc/resolv.conf contains a NUL byte, which cannot be carried in the \
-             argument a restore would put it back with"
-                .to_string(),
-        ),
-        Some((&RESOLV_PRESENT, original)) if original.len() > MAX_RESOLV_SNAPSHOT => {
-            refuse(format!(
-                "/etc/resolv.conf is {} bytes, past the {MAX_RESOLV_SNAPSHOT} a \
-                 restore can carry in one argument",
-                original.len()
-            ))
-        }
-        Some((&RESOLV_PRESENT, _)) => Ok(snapshot),
-        Some((_, _)) => Ok(snapshot),
-        None => refuse("reading /etc/resolv.conf produced no verdict".to_string()),
-    }
-}
-
-/// Puts `content` back, but only if the resolver still holds what this attach
-/// installed.
-///
-/// The guard is what keeps a delayed undo honest. These commands name a
-/// namespace by pid, and the kernel hands pids out again: an undo that runs
-/// after its container exited -- because the command before it in the chain
-/// was slow, or because a destructor fired late -- would otherwise write one
-/// container's resolver into whatever holds that pid now. Checking the content
-/// first also means an undo will not clobber a resolver that something else
-/// legitimately changed after interception was installed.
-fn write_resolv_conf(pid: u32, marker: &str, content: Vec<u8>) -> Cmd {
-    let installed = intercepted_resolv(marker);
-    let bytes = installed.len().to_string();
-    nsenter_sh(pid)
-        .args([RESTORE_RESOLV_SCRIPT, "_"])
-        .arg(OsString::from_vec(content))
-        .arg(installed)
-        .arg(bytes)
-}
-
-/// A shell inside the container's user and mount namespaces, run as a process
-/// this host owns.
-///
-/// Deliberately not `podman exec`. That starts the shell under conmon, so
-/// killing the client -- which is all a dropped future can do -- leaves the
-/// writer running: measured against podman 4.9.3, a `podman exec` whose client
-/// was killed went on to complete its write two seconds later, and a rollback
-/// racing that loses. `nsenter` execs the shell directly, so it *is* the
-/// process this owns, and killing it kills the writer -- which is what carries
-/// [`crate::process::Owned`]'s guarantee across the container boundary.
-fn nsenter_sh(pid: u32) -> Cmd {
-    Cmd::new("nsenter")
-        .arg("-t")
-        .arg(pid.to_string())
-        .args(["-U", "-m", "--", "sh", "-c"])
-}
-
 fn require_tool(name: &str) -> Result<()> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
@@ -2495,25 +3405,33 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
     let net_ns_path = format!("/proc/{pid}/ns/net");
     let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
     let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
-    let (tcp, dns) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
+    let (tcp, dns, dns_tcp, probe) =
+        bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
     let tcp = std::net::TcpListener::from(tcp);
     tcp.set_nonblocking(true)?;
+    let dns_tcp = std::net::TcpListener::from(dns_tcp);
+    dns_tcp.set_nonblocking(true)?;
 
     Ok(InterceptorSockets {
         tcp: TcpListener::from_std(tcp)?,
         dns: dns_listener(dns)?,
+        dns_tcp: TcpListener::from_std(dns_tcp)?,
+        probe: std::net::TcpStream::from(probe),
     })
 }
 
-fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(OwnedFd, OwnedFd)> {
+fn bind_interceptor_socket_fds(
+    user_ns: RawFd,
+    net_ns: RawFd,
+) -> io::Result<(OwnedFd, OwnedFd, OwnedFd, OwnedFd)> {
     let (status, fds) =
         nsfork::fork_collect(|sock| child_bind_and_send_fds(sock, user_ns, net_ns))?;
     if status != nsfork::Status::OK {
         return Err(bind_failure(status));
     }
     let mut fds = fds.into_iter();
-    match (fds.next(), fds.next()) {
-        (Some(tcp), Some(dns)) => Ok((tcp, dns)),
+    match (fds.next(), fds.next(), fds.next(), fds.next()) {
+        (Some(tcp), Some(dns), Some(dns_tcp), Some(probe)) => Ok((tcp, dns, dns_tcp, probe)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "network namespace helper did not return listener sockets",
@@ -2530,6 +3448,8 @@ enum BindStep {
     SetnsNet = 2,
     TcpListener = 3,
     DnsListener = 4,
+    AddressProbe = 5,
+    DnsTcpListener = 6,
 }
 
 impl BindStep {
@@ -2539,6 +3459,8 @@ impl BindStep {
             BindStep::SetnsNet,
             BindStep::TcpListener,
             BindStep::DnsListener,
+            BindStep::AddressProbe,
+            BindStep::DnsTcpListener,
         ]
         .into_iter()
         .find(|step| *step as u32 == code)
@@ -2550,6 +3472,8 @@ impl BindStep {
             BindStep::SetnsNet => "enter the container's network namespace",
             BindStep::TcpListener => "bind the TCP listener",
             BindStep::DnsListener => "bind the DNS listener on port 53",
+            BindStep::AddressProbe => "open the host alias probe",
+            BindStep::DnsTcpListener => "bind the DNS listener on TCP port 53",
         }
     }
 }
@@ -2566,8 +3490,7 @@ fn bind_failure(status: nsfork::Status) -> io::Error {
 
 fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
     let fail = |step: BindStep, e: io::Error| {
-        let status = nsfork::Status::failed(step as u32, e.raw_os_error().unwrap_or(0));
-        let _ = nsfork::send_status(sock, status, &[]);
+        nsfork::send_failure(sock, step as u32, e.raw_os_error().unwrap_or(0));
     };
     if let Err(e) = nsfork::setns_raw(user_ns, libc::CLONE_NEWUSER) {
         return fail(BindStep::SetnsUser, e);
@@ -2584,15 +3507,33 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
         Ok(listener) => listener,
         Err(e) => return fail(BindStep::TcpListener, e),
     };
-    let dns = match bind_any(SockType::Datagram, 53) {
+    let dns = match bind_any(SockType::Datagram, DNS_PORT) {
         Ok(socket) => socket,
         Err(e) => return fail(BindStep::DnsListener, e),
+    };
+    let dns_tcp = match bind_any(SockType::Stream, DNS_PORT) {
+        Ok(listener) => listener,
+        Err(e) => return fail(BindStep::DnsTcpListener, e),
+    };
+    let probe = match nix::sys::socket::socket(
+        nix::sys::socket::AddressFamily::Inet,
+        SockType::Stream,
+        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        None,
+    ) {
+        Ok(socket) => socket,
+        Err(e) => return fail(BindStep::AddressProbe, e.into()),
     };
 
     let _ = nsfork::send_status(
         sock,
         nsfork::Status::OK,
-        &[tcp.as_raw_fd(), dns.as_raw_fd()],
+        &[
+            tcp.as_raw_fd(),
+            dns.as_raw_fd(),
+            dns_tcp.as_raw_fd(),
+            probe.as_raw_fd(),
+        ],
     );
 }
 
@@ -2632,6 +3573,12 @@ fn bind_to(ty: SockType, addr: SocketAddr) -> nix::Result<OwnedFd> {
     let fd = socket(family, ty, SockFlag::SOCK_CLOEXEC, None)?;
     if addr.is_ipv6() {
         setsockopt(&fd, sockopt::Ipv6V6Only, &false)?;
+    }
+    // A fixed port a previous attach's connections may still hold in
+    // TIME_WAIT must be bindable again at once. It does not let a second
+    // live listener take the port.
+    if ty == SockType::Stream {
+        setsockopt(&fd, sockopt::ReuseAddr, &true)?;
     }
     bind(fd.as_raw_fd(), &SockaddrStorage::from(addr))?;
     if ty == SockType::Stream {
@@ -2679,10 +3626,8 @@ fn delete_nft_table_by_handle(pid: u32, netns: u64, handle: u64) -> Cmd {
     // The shell, `readlink` and `nft` are the *host's*: only the user and
     // network namespaces are entered, not the mount namespace, so this asks
     // nothing of the container's image.
-    Cmd::new("nsenter")
-        .arg("-t")
-        .arg(pid.to_string())
-        .args(["-U", "-n", "--", "sh", "-c"])
+    nsenter_net(pid)
+        .args(["--", "sh", "-c"])
         .arg(NFT_DELETE_IN_NAMESPACE)
         .arg("_")
         .arg(format!("net:[{netns}]"))
@@ -2706,23 +3651,45 @@ const NFT_DELETE_IN_NAMESPACE: &str = "[ \"$(readlink /proc/self/ns/net)\" = \"$
 /// Matched on the name as a whole token, so a table whose name merely starts
 /// the same is not mistaken for this one.
 fn table_handle_in(output: &[u8], table: &str) -> Option<u64> {
-    let output = std::str::from_utf8(output).ok()?;
-    output.lines().find_map(|line| {
-        let (named, handle) = line.split_once("# handle ")?;
+    echoed_handles(output).find_map(|(named, handle)| {
         let tokens: Vec<&str> = named.split_whitespace().collect();
         tokens
             .windows(3)
             .any(|w| w == ["table", "inet", table])
-            .then(|| handle.split_whitespace().next()?.parse().ok())
-            .flatten()
+            .then_some(handle)
     })
 }
 
+/// Each object an `nft --echo --handle` commit reports, as the command that
+/// made it and the handle nft gave it: one `<command> # handle N` line per
+/// object. Output that is not text reports none.
+fn echoed_handles(output: &[u8]) -> impl Iterator<Item = (&str, u64)> {
+    std::str::from_utf8(output)
+        .ok()
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| {
+            let (named, handle) = line.split_once("# handle ")?;
+            Some((named, handle.split_whitespace().next()?.parse().ok()?))
+        })
+}
+
 fn nsenter_nft(pid: u32) -> Cmd {
+    nsenter_net(pid).arg("nft")
+}
+
+/// `nsenter` into the container's user and network namespaces, and no
+/// others -- the one way this module builds an `nsenter`.
+///
+/// Never the mount namespace. Entering it makes `/` the container's, so the
+/// program `nsenter` goes on to run is the image's own binary, started from
+/// this process with its environment and outside the container's pid and
+/// network namespaces (#328). Left out, what runs is the host's.
+fn nsenter_net(pid: u32) -> Cmd {
     Cmd::new("nsenter")
         .arg("-t")
         .arg(pid.to_string())
-        .args(["-U", "-n", "nft"])
+        .args(["-U", "-n"])
 }
 
 /// A value for one attach that nothing else can have chosen.
@@ -2812,7 +3779,17 @@ fn nft_table_name(session_id: &str) -> String {
 /// neighbor discovery is dropped too, which costs nothing here: a redirected
 /// flow needs no neighbor, DAD completes on its timer, and upstream
 /// connections are made from the host's namespace.
-fn nft_rules(table: &str, tcp_port: u16, dns_port: u16, policy_default: NetworkAction) -> String {
+///
+/// One object per line: a `create` or an `add`, each of which `--echo
+/// --handle` reports with a handle of its own. [`install_interception`]
+/// counts the lines and refuses a commit that echoes fewer.
+fn nft_rules(
+    table: &str,
+    tcp_port: u16,
+    dns_port: u16,
+    dns_tcp_port: u16,
+    policy_default: NetworkAction,
+) -> String {
     let verdict = match policy_default {
         NetworkAction::Allow => "accept",
         NetworkAction::Deny => "drop",
@@ -2823,6 +3800,7 @@ create table inet {table}
 add chain inet {table} output {{ type nat hook output priority dstnat; policy accept; }}
 add rule inet {table} output ip daddr 127.0.0.0/8 return
 add rule inet {table} output ip6 daddr ::1 return
+add rule inet {table} output tcp dport 53 redirect to :{dns_tcp_port}
 add rule inet {table} output meta l4proto tcp redirect to :{tcp_port}
 add rule inet {table} output udp dport 53 redirect to :{dns_port}
 add chain inet {table} egress {{ type filter hook output priority filter; policy {verdict}; }}
@@ -2897,22 +3875,57 @@ fn sniff_client_bytes(bytes: &[u8]) -> Option<ClientAssertion> {
     tls_sni(bytes).map(ClientAssertion::tls)
 }
 
+/// The methods that open the HTTP requests [`http_host`] reads a claim from.
+const HTTP_METHODS: &[&[u8]] = &[
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"PATCH ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"CONNECT ",
+];
+
+/// Whether `bytes` begin a TLS record or an HTTP request head and do not yet
+/// hold all of it. The record's header gives its length; the head ends at its
+/// first empty line.
+fn opening_unfinished(bytes: &[u8]) -> bool {
+    match bytes {
+        [22, _, _, high, low, record @ ..] => {
+            record.len() < usize::from(u16::from_be_bytes([*high, *low]))
+        }
+        [22, ..] => true,
+        [] => false,
+        _ => {
+            HTTP_METHODS
+                .iter()
+                .any(|method| bytes.starts_with(method) || method.starts_with(bytes))
+                && !bytes
+                    .split_inclusive(|&byte| byte == b'\n')
+                    .any(|line| line == b"\n" || line == b"\r\n")
+        }
+    }
+}
+
 fn http_host(bytes: &[u8]) -> Option<String> {
-    const METHODS: &[&[u8]] = &[
-        b"GET ",
-        b"POST ",
-        b"PUT ",
-        b"PATCH ",
-        b"DELETE ",
-        b"HEAD ",
-        b"OPTIONS ",
-        b"CONNECT ",
-    ];
-    if !METHODS.iter().any(|method| bytes.starts_with(method)) {
+    if !HTTP_METHODS.iter().any(|method| bytes.starts_with(method)) {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    for line in text.lines() {
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        // Only the head's whole lines count: one the bytes end inside may
+        // hold part of a name, and the head ends at its first empty line.
+        let Some(line) = line.strip_suffix(b"\n") else {
+            break;
+        };
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        // Line by line, so bytes elsewhere that are not UTF-8 hide nothing.
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
@@ -3026,6 +4039,29 @@ fn dns_query(packet: &[u8]) -> Option<DnsQuery> {
 }
 
 impl DnsQuery {
+    /// Whether `raw`, the packet this was parsed from, is nothing but a
+    /// question: a query rather than an answer or any other opcode, with no
+    /// records in it and at most the one EDNS record a stub appends to say what
+    /// it can read. Whatever else a packet carries is something the question's
+    /// name does not account for, and so is not decided by it.
+    fn is_plain_question(&self, raw: &[u8]) -> bool {
+        // The header's counts are the answer, authority and additional ones; a
+        // question parsed, so the 12 bytes of header are all there.
+        let [_, _, flags, _, _, _, 0, 0, 0, 0, 0, additional, ..] = *raw else {
+            return false;
+        };
+        // QR clear, and the opcode QUERY.
+        if flags & 0xf8 != 0 {
+            return false;
+        }
+        let rest = &raw[self.question.end..];
+        match additional {
+            0 => rest.is_empty(),
+            1 => is_one_opt_record(rest),
+            _ => false,
+        }
+    }
+
     /// Whether `datagram` may be treated as the answer to this query.
     /// Everything checked here is evidence the interceptor holds itself: an
     /// off-path host that guesses the ephemeral port still has to come from
@@ -3052,6 +4088,69 @@ fn dns_response_is_bindable(datagram: &[u8]) -> bool {
     dns_flags(datagram).is_some_and(|flags| flags & 0x0200 == 0 && flags & 0x000f == 0)
 }
 
+/// Whether `bytes` are exactly one EDNS OPT record, whose options are framed:
+/// the root as its owner, the OPT type, the sender's payload size, flags, and
+/// RDATA that is a run of whole options, each a code and a length and that many
+/// bytes. What the options say is not read. A resolver may still be handed
+/// them.
+fn is_one_opt_record(bytes: &[u8]) -> bool {
+    opt_record_framing(bytes).is_some()
+}
+
+fn opt_record_framing(bytes: &[u8]) -> Option<()> {
+    let mut off = 0;
+    checked_skip(bytes, &mut off, 1)?;
+    let owner_is_root = bytes[0] == 0;
+    let is_opt = read_u16(bytes, &mut off)? == DNS_TYPE_OPT;
+    // The sender's payload size, then the extended RCODE and flags.
+    checked_skip(bytes, &mut off, 2 + 4)?;
+    let rdlen = usize::from(read_u16(bytes, &mut off)?);
+    if !owner_is_root || !is_opt || bytes.len() - off != rdlen {
+        return None;
+    }
+    while off < bytes.len() {
+        // The option's code, then its length and that many bytes.
+        checked_skip(bytes, &mut off, 2)?;
+        let len = usize::from(read_u16(bytes, &mut off)?);
+        checked_skip(bytes, &mut off, len)?;
+    }
+    Some(())
+}
+
+/// The reply to a query no resolver answered: SERVFAIL, so its client stops
+/// asking rather than waiting out every try its own timeout allows -- by
+/// glibc's defaults, two of 5 seconds each. See [`dns_error_reply`]; a lookup
+/// the policy refuses is answered the same way with REFUSED, which says it was
+/// declined rather than that the resolvers failed.
+fn dns_servfail(raw: &[u8], query: Option<&DnsQuery>) -> Option<Vec<u8>> {
+    dns_error_reply(raw, query, DNS_RCODE_SERVFAIL)
+}
+
+/// An answer to `raw` that carries only `rcode`. It echoes the transaction id
+/// and the question, which a stub matches an answer against (glibc discards one
+/// whose question differs from its query's). `query` is `raw` parsed, as
+/// [`forward_dns`] takes it; a query that did not parse gets the header
+/// alone, since where its question ends is not known.
+///
+/// `None` for a datagram too short to hold a header, and for one that is
+/// itself an answer: that is not a query, and is owed nothing.
+fn dns_error_reply(raw: &[u8], query: Option<&DnsQuery>, rcode: u16) -> Option<Vec<u8>> {
+    let flags = dns_flags(raw)?;
+    if raw.len() < 12 || flags & 0x8000 != 0 {
+        return None;
+    }
+    let end = query.map_or(12, |query| query.question.end);
+    let mut reply = raw[..end].to_vec();
+    // QR; the query's opcode and RD; RA; the RCODE.
+    let flags = 0x8000 | (flags & 0x7900) | 0x0080 | rcode;
+    reply[2..4].copy_from_slice(&flags.to_be_bytes());
+    // The one question echoed, or none. No answer, authority or additional
+    // records: an EDNS record the query carried is not echoed either.
+    reply[4..6].copy_from_slice(&u16::from(query.is_some()).to_be_bytes());
+    reply[6..12].fill(0);
+    Some(reply)
+}
+
 fn dns_txid(packet: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([*packet.first()?, *packet.get(1)?]))
 }
@@ -3060,11 +4159,26 @@ fn dns_flags(packet: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]))
 }
 
+/// The question a packet carries, if it carries exactly one whose name is one a
+/// policy can be asked about: written out in full, no longer than a name may
+/// be, and made of labels [`dns_label`] accepts.
+///
+/// The name is never compressed. A stub has nothing to point at when it writes
+/// the first name in a packet, so a pointer here is a packet built to be read
+/// two ways, and a resolver that follows it can be asked for a name this one
+/// decoded as another -- `bad.example` followed by a pointer to the root
+/// decodes with a dot on the end, which no `deny` glob for `bad.example`
+/// matches. An answer echoes the question as the resolver read it, and gets the
+/// same treatment.
 fn dns_question(packet: &[u8]) -> Option<DnsQuestion> {
     if packet.len() < 12 || u16::from_be_bytes([packet[4], packet[5]]) != 1 {
         return None;
     }
+    // No pointer to follow, which is what a budget of none refuses.
     let (mut name, next) = read_dns_name(packet, 12, 0)?;
+    if name.len() > MAX_DNS_NAME {
+        return None;
+    }
     name.make_ascii_lowercase();
     Some(DnsQuestion {
         name,
@@ -3139,7 +4253,7 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
         let Some(next) = skip_dns_name(packet, off) else {
             break;
         };
-        let owner = read_dns_name(packet, off, 0).map(|(owner, _)| owner);
+        let owner = read_dns_name(packet, off, MAX_DNS_POINTERS).map(|(owner, _)| owner);
         off = next;
         if off + 10 > packet.len() {
             break;
@@ -3180,7 +4294,7 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
                     });
                 }
                 (DNS_TYPE_CNAME, _) => {
-                    if let Some((mut target, _)) = read_dns_name(packet, off, 0) {
+                    if let Some((mut target, _)) = read_dns_name(packet, off, MAX_DNS_POINTERS) {
                         target.make_ascii_lowercase();
                         answers.push(DnsAnswer::Alias { owner, target });
                     }
@@ -3201,10 +4315,9 @@ fn dns_answer_records(packet: &[u8]) -> Vec<DnsAnswer> {
 /// genuinely delegated to whoever runs `attacker.example` -- would decode to
 /// `allowed.evil.attacker.example` and satisfy `allow = ["allowed.*"]`,
 /// letting that authority bind any address under a glob it does not own.
-fn read_dns_name(packet: &[u8], mut off: usize, depth: usize) -> Option<(String, usize)> {
-    if depth > 8 {
-        return None;
-    }
+///
+/// Follows at most `pointers_left` compression pointers.
+fn read_dns_name(packet: &[u8], mut off: usize, pointers_left: usize) -> Option<(String, usize)> {
     let mut name = String::new();
     let end;
     loop {
@@ -3212,7 +4325,7 @@ fn read_dns_name(packet: &[u8], mut off: usize, depth: usize) -> Option<(String,
         if len & 0b1100_0000 == 0b1100_0000 {
             let b2 = *packet.get(off + 1)?;
             let ptr = (((len & 0b0011_1111) as usize) << 8) | b2 as usize;
-            let (suffix, _) = read_dns_name(packet, ptr, depth + 1)?;
+            let (suffix, _) = read_dns_name(packet, ptr, pointers_left.checked_sub(1)?)?;
             push_dns_label(&mut name, &suffix);
             end = off + 2;
             break;
@@ -3267,6 +4380,26 @@ fn push_dns_label(name: &mut String, label: &str) {
 /// otherwise claim more than the 63 a label may hold; the charset is checked
 /// because `.` forges a label boundary and anything outside letters, digits,
 /// `-`, and `_` cannot occur in a name a rule could legitimately name.
+/// The type of the first question in `packet`, with the name skipped by its
+/// framing alone: whatever bytes the labels hold, and no pointer. `None` when
+/// the packet holds no question or the name runs off its end.
+fn raw_qtype(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 12 || u16::from_be_bytes([packet[4], packet[5]]) == 0 {
+        return None;
+    }
+    let mut at = 12;
+    loop {
+        let len = usize::from(*packet.get(at)?);
+        at += 1;
+        match len {
+            0 => break,
+            1..=MAX_DNS_LABEL => at += len,
+            _ => return None,
+        }
+    }
+    Some(u16::from_be_bytes([*packet.get(at)?, *packet.get(at + 1)?]))
+}
+
 fn dns_label(bytes: &[u8]) -> Option<&str> {
     if bytes.is_empty() || bytes.len() > MAX_DNS_LABEL {
         return None;
@@ -3283,7 +4416,6 @@ fn dns_label(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt as _;
 
     /// How many audit records may be queued ahead of the writer: the sink's
     /// bound, which a stalled log turns into backpressure on the connections
@@ -3479,13 +4611,101 @@ mod tests {
     }
 
     /// The resolver the fake container is holding before attach touches it.
-    /// The apostrophe is load-bearing: it is the one byte that can end a
-    /// single-quoted shell string, so a restore that mishandles it is a
-    /// restore that does not put the file back.
     const ORIGINAL_RESOLV: &str = "nameserver 10.0.2.3\nsearch it's.test\n";
+
+    /// A stand-in for the container's `/etc/resolv.conf`: a file in a tempdir,
+    /// holding [`ORIGINAL_RESOLV`].
+    ///
+    /// Never the real one. These tests run as whatever runs `cargo test`, and
+    /// a resolver opened by this process's own pid would, for root, be the
+    /// host's.
+    struct FakeResolver {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl FakeResolver {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("resolv.conf");
+            std::fs::write(&path, ORIGINAL_RESOLV).expect("write the fake resolver");
+            Self { _dir: dir, path }
+        }
+
+        /// The resolver, opened by the same child attach uses, entering
+        /// nothing.
+        fn open(&self) -> Resolver {
+            Resolver::open(self.place(), "outrig-test").expect("open the fake resolver")
+        }
+
+        fn place(&self) -> resolv_conf::Place {
+            resolv_conf::Place::host(&self.path)
+        }
+
+        fn read(&self) -> String {
+            std::fs::read_to_string(&self.path).expect("read the fake resolver")
+        }
+
+        /// The undo attach arms after installing over [`ORIGINAL_RESOLV`],
+        /// acting through `file`. Leaves the fake holding what the install
+        /// wrote.
+        fn installed_restore(&self, file: StdFile) -> Undo {
+            let installed = intercepted_resolv(&target().marker);
+            std::fs::write(&self.path, &installed).expect("install");
+            Undo::InProcess(Restore::new(
+                file,
+                self.place(),
+                Some(ORIGINAL_RESOLV.as_bytes().to_vec()),
+                installed.into_bytes(),
+            ))
+        }
+
+        /// [`Self::installed_restore`], able to put the resolver back.
+        fn restore(&self) -> Undo {
+            let read_write = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .expect("open read-write");
+            self.installed_restore(read_write)
+        }
+
+        /// [`Self::installed_restore`] through a descriptor that cannot write,
+        /// so the guard passes and the restore fails.
+        fn failing_restore(&self) -> Undo {
+            let read_only = StdFile::open(&self.path).expect("open read-only");
+            self.installed_restore(read_only)
+        }
+    }
 
     /// The handle [`FakeRunner`] says nft assigned the table it created.
     const FAKE_HANDLE: u64 = 7;
+
+    /// What nft echoes for a commit that made the first `objects` commands of
+    /// the redirect script: each one, with a `# handle` of its own, and the
+    /// generation line. Built from [`nft_rules`] so a complete commit is the
+    /// script's own size, whatever that comes to.
+    fn commit_echo(objects: usize) -> Vec<u8> {
+        let script = nft_rules(&target().table, 4001, 4002, 4003, NetworkAction::Allow);
+        let mut echo: String = script
+            .lines()
+            .take(objects)
+            .zip(FAKE_HANDLE..)
+            .map(|(command, handle)| format!("{command} # handle {handle}\n"))
+            .collect();
+        echo.push_str("# new generation 2 by process 111 (nft)\n");
+        echo.into_bytes()
+    }
+
+    fn complete_commit_echo() -> Vec<u8> {
+        commit_echo(usize::MAX)
+    }
+
+    /// The echo nft 1.0.9 gave for a script whose chain it dropped: the table
+    /// and nothing in it.
+    fn table_only_echo() -> Vec<u8> {
+        commit_echo(1)
+    }
 
     /// The `run` seam under test: records every command it is handed and does
     /// whatever the injected plan says that command should do. This is what
@@ -3495,6 +4715,11 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         ran: Mutex<Vec<String>>,
+        /// The resolver file a test is watching, and what it held as each
+        /// command ran -- which is how the resolver's in-process steps are
+        /// placed among the commands.
+        resolver: Option<PathBuf>,
+        resolver_seen: Mutex<Vec<String>>,
         /// Fragment of a rendered command that should fail instead of run.
         fail_on: Option<&'static str>,
         /// Fragment of a rendered command that should never complete, which
@@ -3512,6 +4737,12 @@ mod tests {
                 .lock()
                 .expect("fake runner log")
                 .push(rendered.clone());
+            if let Some(resolver) = &self.resolver {
+                self.resolver_seen
+                    .lock()
+                    .expect("fake runner log")
+                    .push(std::fs::read_to_string(resolver).unwrap_or_default());
+            }
             if self.hang_on.is_some_and(|needle| rendered.contains(needle)) {
                 std::future::pending::<()>().await;
             }
@@ -3520,54 +4751,67 @@ mod tests {
                     "injected failure: {rendered}"
                 )));
             }
-            // nft answers an `--echo --handle` apply with what it committed;
-            // every other command here is a resolver read, whose answer is the
-            // snapshot. Without this the tests would exercise only the
-            // unnarrowed undo, which is the fallback rather than the rule.
+            // nft answers an `--echo --handle` apply with what it committed.
+            // Without this the tests would exercise only the unnarrowed undo,
+            // which is the fallback rather than the rule.
             if rendered.contains("--echo --handle") {
-                return Ok(self.echo.clone().unwrap_or_else(|| {
-                    format!(
-                        "create table inet {} # handle {FAKE_HANDLE}\n",
-                        target().table
-                    )
-                    .into_bytes()
-                }));
+                return Ok(self.echo.clone().unwrap_or_else(complete_commit_echo));
             }
-            Ok(present_snapshot())
+            Ok(Vec::new())
         }
 
         fn ran(&self) -> Vec<String> {
             self.ran.lock().expect("fake runner log").clone()
         }
-    }
 
-    /// What [`read_resolv_conf`] answers for a container holding
-    /// [`ORIGINAL_RESOLV`].
-    fn present_snapshot() -> Vec<u8> {
-        let mut snapshot = vec![RESOLV_PRESENT];
-        snapshot.extend_from_slice(ORIGINAL_RESOLV.as_bytes());
-        snapshot
+        /// What the watched resolver held as each command ran.
+        fn resolver_seen(&self) -> Vec<String> {
+            self.resolver_seen.lock().expect("fake runner log").clone()
+        }
+
+        /// A runner watching `resolver`.
+        fn watching(resolver: &FakeResolver) -> Self {
+            Self {
+                resolver: Some(resolver.path.clone()),
+                ..Self::default()
+            }
+        }
     }
 
     /// `install_interception` with the ports and policy default that none of
-    /// the ordering and rollback tests here depend on.
-    async fn install<F, Fut>(run: &F, rollback: &mut Rollback, target: &Target) -> Result<()>
+    /// the ordering and rollback tests here depend on, against `resolver`.
+    async fn install<F, Fut>(
+        run: &F,
+        rollback: &mut Rollback,
+        target: &Target,
+        resolver: &FakeResolver,
+    ) -> Result<()>
     where
         F: Fn(Cmd) -> Fut,
         Fut: Future<Output = Result<Vec<u8>>>,
     {
-        install_interception(run, rollback, target, 4001, 4002, NetworkAction::Allow).await
+        install_interception(
+            run,
+            rollback,
+            target,
+            Some(resolver.open()),
+            ListenerPorts {
+                tcp: 4001,
+                dns: 4002,
+                dns_tcp: 4003,
+            },
+            NetworkAction::Allow,
+        )
+        .await
     }
 
     /// A target whose pid is this test process: `Rollback` asks whether the
     /// container is still alive before undoing anything, and this one is.
     fn target() -> Target {
         Target {
-            name: "outrig-test".to_string(),
             pid: std::process::id(),
             table: "outrig_test".to_string(),
             marker: "outrig_marker".to_string(),
-            dns_preconfigured: false,
         }
     }
 
@@ -3632,43 +4876,6 @@ mod tests {
         );
     }
 
-    /// The restore script reproduces whatever that container happened to have.
-    /// The bytes travel as `$1` so no quoting rule stands between them and the
-    /// file, but the script still has to be right: `printf '%s'` and not
-    /// `echo`, no newline of its own, and the redirect where it belongs.
-    #[tokio::test]
-    async fn the_restore_script_reproduces_arbitrary_bytes() {
-        const NASTY: &[u8] =
-            b"nameserver 10.0.0.1 # ' \"$(touch pwned)\" `id` \\ '' \n%s%d\noptions x";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        // The guard has to pass for the write to happen at all, so the file
-        // starts out holding what an install would have put there.
-        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-
-        // The production script, with only its redirect retargeted.
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(NASTY.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the restore script must run");
-
-        assert_eq!(std::fs::read(&target).expect("restored").as_slice(), NASTY);
-        assert!(
-            !dir.path().join("pwned").exists(),
-            "the snapshot is data, and must never be evaluated"
-        );
-    }
-
     /// A command whose only effect is a file a test can wait for.
     fn touch(path: &Path) -> Cmd {
         Cmd::new("/bin/sh")
@@ -3688,34 +4895,40 @@ mod tests {
         }
     }
 
-    /// Attach mutates, and detach undoes, in opposite orders: the redirect
-    /// table goes before the resolver that was pointed at it.
+    /// Attach mutates, and detach undoes, in opposite orders: the resolver is
+    /// pointed at the listener before the redirect table goes in, and the
+    /// table goes before the resolver is put back.
     #[tokio::test]
     async fn interception_is_undone_in_the_reverse_of_the_order_it_was_installed() {
-        let fake = FakeRunner::default();
+        let resolver = FakeResolver::new();
+        let fake = FakeRunner::watching(&resolver);
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
         let failures = rollback.undo_now(&run).await;
 
         assert!(failures.is_empty(), "{failures:#?}");
         let ran = fake.ran();
-        assert_eq!(ran.len(), 5, "{ran:#?}");
-        assert!(ran[0].contains("cat /etc/resolv.conf"), "{ran:#?}");
-        assert!(ran[1].contains("nameserver 127.0.0.1"), "{ran:#?}");
-        assert!(ran[2].contains("nft --echo --handle -f"), "{ran:#?}");
+        assert_eq!(ran.len(), 2, "{ran:#?}");
+        assert!(ran[0].contains("nft --echo --handle -f"), "{ran:#?}");
         assert!(
-            ran[3].contains("delete table inet handle") && ran[3].contains("nsenter"),
+            ran[1].contains("delete table inet handle") && ran[1].contains("nsenter"),
             "{ran:#?}"
         );
         assert!(
-            ran[3].contains(&FAKE_HANDLE.to_string()),
+            ran[1].contains(&FAKE_HANDLE.to_string()),
             "the handle travels as an argument: {ran:#?}"
         );
-        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+        let installed = intercepted_resolv(&target().marker);
+        assert_eq!(
+            fake.resolver_seen(),
+            [installed.clone(), installed],
+            "the resolver is installed before the apply and still installed at the delete"
+        );
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV, "and put back after it");
         assert!(rollback.armed().is_empty(), "{:#?}", rollback.armed());
     }
 
@@ -3723,6 +4936,7 @@ mod tests {
     /// whether the write landed rather than what it said.
     fn audit_event() -> AuditEvent {
         AuditEvent {
+            proto: "tcp",
             opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             duration: Duration::from_millis(1),
             orig: addr("10.0.2.100:50123"),
@@ -3877,6 +5091,7 @@ mod tests {
                 rollback: Rollback::new(std::process::id()).expect("a namespace"),
                 transcript: None,
                 audit: audit_sink(dir.path()).await,
+                panics: ConnPanics::default(),
             },
         )
         .await;
@@ -4347,7 +5562,7 @@ mod tests {
     #[test]
     fn a_resolver_marker_never_names_the_table_it_was_attached_with() {
         for _ in 0..64 {
-            let target = Target::for_attach("outrig-a", 1, "sid-1", false);
+            let target = Target::for_attach(1, "sid-1");
             assert_ne!(
                 target.marker, target.table,
                 "publishing the marker must tell nobody the table's name"
@@ -4434,8 +5649,9 @@ mod tests {
             ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
         assert_eq!(rollback.armed().len(), 2);
@@ -4466,16 +5682,14 @@ mod tests {
     }
 
     /// What survives a partial undo survives in arming order, because `Drop`
-    /// reverses it. Retained newest-first it would be reversed a second time
-    /// and put the resolver back before removing the redirect aimed at it.
+    /// walks it in reverse. Retained newest-first it would be reversed a
+    /// second time.
     #[tokio::test]
     async fn a_partly_discharged_rollback_keeps_its_arming_order() {
-        let installing = FakeRunner::default();
-        let run = |cmd: Cmd| installing.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
-            .await
-            .expect("install interception");
+        rollback.arm(resolver.failing_restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
         let undoing = FakeRunner {
             fail_on: Some("nsenter"),
@@ -4502,21 +5716,20 @@ mod tests {
     /// forgetting an obligation.
     #[tokio::test]
     async fn an_undo_that_fails_stays_armed_for_the_destructor() {
-        let installing = FakeRunner::default();
-        let run = |cmd: Cmd| installing.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
-            .await
-            .expect("install interception");
+        rollback.arm(resolver.failing_restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
-        let undoing = FakeRunner {
-            fail_on: Some("nameserver 10.0.2.3"),
-            ..FakeRunner::default()
-        };
+        let undoing = FakeRunner::default();
         let undo = |cmd: Cmd| undoing.run(cmd);
         let residue = rollback.undo_now(&undo).await;
 
         assert_eq!(residue.len(), 1, "{residue:#?}");
+        assert!(
+            residue[0].to_string().contains("/etc/resolv.conf"),
+            "the failure names what it could not put back: {residue:#?}"
+        );
         assert_eq!(
             rollback.armed().len(),
             1,
@@ -4538,17 +5751,18 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let cause = install(&run, &mut rollback, &target())
+        let resolver = FakeResolver::new();
+        let cause = install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect_err("the apply was injected to fail");
 
         let failing_undo = FakeRunner {
-            fail_on: Some("nameserver 10.0.2.3"),
+            fail_on: Some("delete table"),
             ..FakeRunner::default()
         };
         let undo = |cmd: Cmd| failing_undo.run(cmd);
         let residue = rollback.undo_now(&undo).await;
-        assert!(!residue.is_empty(), "the restore was injected to fail");
+        assert!(!residue.is_empty(), "the table delete was injected to fail");
 
         let reported = OutrigError::NetworkAttachNotUndone(Box::new(NetworkAttachFailure {
             container: "outrig-test".to_string(),
@@ -4559,391 +5773,9 @@ mod tests {
         assert!(text.contains("outrig-test"), "{text}");
         assert!(text.contains("could not be fully undone"), "{text}");
         assert!(
-            text.contains("nameserver 10.0.2.3"),
+            text.contains("delete table inet outrig_test"),
             "the residue is named, not just counted: {text}"
         );
-    }
-
-    /// A resolver that is a link to nothing. `[ -e ]` calls it absent, but
-    /// installing would follow the link and create its target, and the undo
-    /// for an absent resolver is `rm -f` -- which would take the link and
-    /// leave the file. Refused before anything is written.
-    #[tokio::test]
-    async fn a_dangling_resolver_link_refuses_the_attach() {
-        let err = checked_resolv_snapshot("outrig-test", vec![RESOLV_DANGLING])
-            .expect_err("a dangling link cannot be put back");
-        assert!(err.to_string().contains("symbolic link"), "{err}");
-    }
-
-    /// The bytes ride back as one `execve` argument, which is binary-safe
-    /// except for the two things an argument cannot be. Both are refused
-    /// before the resolver is touched, because the alternative is finding out
-    /// afterwards -- with loopback DNS installed and no way to undo it.
-    #[tokio::test]
-    async fn a_resolver_no_argument_could_carry_refuses_the_attach() {
-        let mut with_nul = vec![RESOLV_PRESENT];
-        with_nul.extend_from_slice(b"nameserver 10.0.0.1\0\n");
-        let err = checked_resolv_snapshot("outrig-test", with_nul.clone())
-            .expect_err("a NUL cannot be carried in an argument");
-        assert!(err.to_string().contains("NUL"), "{err}");
-
-        let mut oversized = vec![RESOLV_PRESENT];
-        oversized.resize(MAX_RESOLV_SNAPSHOT + 2, b'x');
-        let err = checked_resolv_snapshot("outrig-test", oversized)
-            .expect_err("an oversized resolver cannot be carried in an argument");
-        assert!(err.to_string().contains("past the"), "{err}");
-
-        // The refusal is not theoretical: the command such a snapshot would
-        // build cannot be spawned at all, which is why the check has to come
-        // before the mutation rather than after it.
-        let doomed = write_resolv_conf(std::process::id(), "outrig_test", with_nul[1..].to_vec());
-        assert!(
-            doomed.to_tokio_command().spawn().is_err(),
-            "a NUL in argv is refused by the kernel interface itself"
-        );
-    }
-
-    /// The undo only fires if the resolver still holds what this attach put
-    /// there. These commands name a namespace by pid and the kernel reuses
-    /// pids, so an undo delayed past its container's exit -- by a slow command
-    /// ahead of it in the chain, or a destructor firing late -- would
-    /// otherwise write one container's resolver into whatever holds that pid
-    /// now. The real script is run here, not a paraphrase of it.
-    #[tokio::test]
-    async fn a_restore_leaves_a_resolver_it_did_not_install_alone() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\nsearch example.test\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-        let restore = |content: &[u8]| {
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script.clone())
-                .arg("_")
-                .arg(OsString::from_vec(content.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string())
-        };
-
-        // Holding what the install wrote: the undo fires.
-        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-        run_step_gated(restore(ORIGINAL), None)
-            .await
-            .expect("the restore must run");
-        assert_eq!(std::fs::read(&target).expect("restored"), ORIGINAL);
-
-        // Holding something else -- a replacement container behind a reused
-        // pid, or a resolver something changed after interception: left alone.
-        std::fs::write(&target, b"nameserver 9.9.9.9\n").expect("third party");
-        run_step_gated(restore(ORIGINAL), None)
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            b"nameserver 9.9.9.9\n",
-            "an undo must not clobber a resolver it did not install"
-        );
-    }
-
-    /// A terminal newline added or removed is byte-distinct state, and taking
-    /// it back would overwrite it. Command substitution strips trailing
-    /// newlines, so without a sentinel inside it the two compare equal.
-    #[tokio::test]
-    async fn a_restore_sees_a_trailing_newline_added_or_removed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        for changed in [
-            format!("{}\n", intercepted_resolv("outrig_test")),
-            intercepted_resolv("outrig_test")
-                .trim_end_matches('\n')
-                .to_string(),
-        ] {
-            std::fs::write(&target, &changed).expect("write");
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script.clone())
-                    .arg("_")
-                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("untouched"),
-                changed,
-                "a file differing only in its terminal newline is still a \
-                 different file: {changed:?}"
-            );
-        }
-    }
-
-    /// A byte the shell cannot carry is still a byte in the file. Shells
-    /// differ on what command substitution does with an embedded NUL, so the
-    /// guard checks the file's own byte count as well as its text.
-    #[tokio::test]
-    async fn a_restore_sees_a_nul_added_after_it_installed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        // What the install wrote, with a NUL inserted into it.
-        let mut tampered = intercepted_resolv("outrig_test").into_bytes();
-        tampered.insert(0, 0);
-        std::fs::write(&target, &tampered).expect("tamper");
-
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the guard makes this a no-op, not a failure");
-
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            tampered,
-            "a resolver carrying bytes the install never wrote is not this attach's"
-        );
-    }
-
-    /// A resolver that cannot be read is not a resolver that belongs to
-    /// someone else. Discarding the read's status made the two look alike, so
-    /// the undo exited zero, teardown struck it off, and `detach` reported
-    /// success over a container still pointing at a stopped listener.
-    #[tokio::test]
-    async fn an_unreadable_resolver_fails_the_undo_rather_than_skipping_it() {
-        use std::os::unix::fs::PermissionsExt as _;
-        if nix::unistd::Uid::effective().is_root() {
-            // Root reads it regardless, so there is nothing to observe.
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-
-        for script in [RESTORE_RESOLV_SCRIPT, REMOVE_RESOLV_SCRIPT] {
-            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000))
-                .expect("make unreadable");
-            let script =
-                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-            let outcome = run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script)
-                    .arg("_")
-                    .arg("nameserver 10.0.2.3\n")
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await;
-
-            assert!(
-                outcome.is_err(),
-                "an unreadable resolver has to fail the undo, not retire it"
-            );
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-        }
-    }
-
-    /// An absent resolver owes nothing, and must not be confused with one that
-    /// is there and could not be read.
-    #[tokio::test]
-    async fn an_absent_resolver_retires_the_undo_quietly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg("nameserver 10.0.2.3\n")
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("an absent resolver is not a failure");
-        assert!(!target.exists(), "and nothing is written in its place");
-    }
-
-    /// Neither undo may depend on a utility a container is not required to
-    /// have. The obvious spelling used `cmp`, which a minimal image need not
-    /// ship: a missing one exits 127, `|| exit 0` reads that as "not ours",
-    /// and the undo skips while `detach` reports success -- the resolver left
-    /// pointing at a listener that has stopped.
-    #[tokio::test]
-    async fn neither_undo_needs_anything_beyond_a_shell_and_cat() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        // A PATH holding only what the undos actually declare: `cat`, which
-        // the snapshot already needs, and `rm`, which the absent-resolver undo
-        // is. `wc` and `cmp` are not declared, and an undo that quietly
-        // retires itself because one of them is missing is the failure this
-        // is for.
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("bin dir");
-        for tool in ["cat", "rm"] {
-            let real = ["/bin", "/usr/bin"]
-                .into_iter()
-                .map(|d| PathBuf::from(d).join(tool))
-                .find(|p| p.exists())
-                .unwrap_or_else(|| panic!("no {tool} to link"));
-            std::os::unix::fs::symlink(&real, bin.join(tool)).expect("link tool");
-        }
-
-        for (script, expected) in [
-            (RESTORE_RESOLV_SCRIPT, b"nameserver 10.0.2.3\n".to_vec()),
-            (REMOVE_RESOLV_SCRIPT, Vec::new()),
-        ] {
-            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-            let script =
-                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-            // Only what the snapshot already needs is on PATH: no `cmp`, no
-            // `wc`. An undo that quietly retires itself because a utility is
-            // missing is the failure this is for.
-            let pared = format!("PATH={}; {script}", bin.display());
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(pared)
-                    .arg("_")
-                    .arg(OsString::from_vec(b"nameserver 10.0.2.3\n".to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the undo must run");
-
-            if expected.is_empty() {
-                assert!(!target.exists(), "the remove must have happened");
-            } else {
-                assert_eq!(std::fs::read(&target).expect("restored"), expected);
-            }
-        }
-    }
-
-    /// A resolver something has legitimately changed since is no longer the
-    /// one this attach installed, and taking it back would discard that
-    /// change. The marker says who installed it; the rest of the text says
-    /// whether it is still what was installed, and both have to hold.
-    #[tokio::test]
-    async fn a_restore_keeps_a_change_made_after_it_was_installed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        for changed in [
-            // A resolver manager pointing somewhere else, marker untouched.
-            intercepted_resolv("outrig_test").replace("127.0.0.1", "9.9.9.9"),
-            // An option added, marker untouched.
-            format!("{}search added.test\n", intercepted_resolv("outrig_test")),
-        ] {
-            std::fs::write(&target, &changed).expect("write");
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script.clone())
-                    .arg("_")
-                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("untouched"),
-                changed,
-                "an undo must not discard a change made after it installed: {changed:?}"
-            );
-        }
-    }
-
-    /// A pid reused by *another outrig-attached container* is the case a
-    /// shared sentinel cannot see: every attachment installs the same resolver
-    /// text, so the guard would pass and write the first container's resolver
-    /// into the second. The sentinel carries the attach's own table name,
-    /// which is unique to it.
-    #[tokio::test]
-    async fn a_restore_leaves_another_outrig_containers_resolver_alone() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        // The file holds what a *different* attachment installed.
-        std::fs::write(&target, intercepted_resolv("outrig_other")).expect("other install");
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the guard makes this a no-op, not a failure");
-
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            intercepted_resolv("outrig_other").into_bytes(),
-            "one attachment's undo must not reach another's container"
-        );
-    }
-
-    /// The resolver a restore writes is the bytes the snapshot read, with
-    /// nothing in between: they travel as an argument, so no quoting rule has
-    /// to hold for the file to come back exactly as it was.
-    #[test]
-    fn a_restore_carries_the_original_resolver_bytes_verbatim() {
-        let restore = restore_resolv_conf(std::process::id(), "outrig_test", present_snapshot());
-        assert!(
-            restore
-                .exec_args()
-                .iter()
-                .any(|arg| arg.as_os_str().as_bytes() == ORIGINAL_RESOLV.as_bytes()),
-            "the snapshot travels as its own argument, whole: {:#?}",
-            restore.exec_args()
-        );
-    }
-
-    /// Having no resolver file at all is a state too, and the one a bare `cat`
-    /// could neither report nor put back: the restore for it removes the file
-    /// the install created rather than leaving an empty one behind.
-    #[test]
-    fn a_container_with_no_resolver_file_is_restored_to_having_none() {
-        let restore = restore_resolv_conf(std::process::id(), "outrig_test", b"0".to_vec());
-        let rendered = restore.render();
-        assert!(rendered.contains("rm -f /etc/resolv.conf"), "{rendered}");
     }
 
     /// A failed nft apply is a failed attach, and the resolver mutation that
@@ -4951,49 +5783,23 @@ mod tests {
     /// though the table never landed.
     #[tokio::test]
     async fn a_failed_nft_apply_still_restores_the_resolver() {
+        let resolver = FakeResolver::new();
         let fake = FakeRunner {
             fail_on: Some("--echo --handle"),
-            ..Default::default()
+            ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let installed = install(&run, &mut rollback, &target()).await;
+        let installed = install(&run, &mut rollback, &target(), &resolver).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
-        rollback.undo_now(&run).await;
+        let residue = rollback.undo_now(&run).await;
 
+        assert!(residue.is_empty(), "{residue:#?}");
         let ran = fake.ran();
-        assert_eq!(ran.len(), 5, "{ran:#?}");
-        assert!(ran[3].contains("delete table inet outrig_test"), "{ran:#?}");
-        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
-    }
-
-    /// Cancelled with the resolver install in flight. The undo log belongs to
-    /// the caller, not to the dropped future, so the restore is still armed
-    /// afterwards -- armed before the install ran, precisely so that a
-    /// cancellation landing inside it cannot slip between the two.
-    #[tokio::test]
-    async fn cancelling_the_resolver_install_leaves_the_restore_armed() {
-        // Only the write matches: the snapshot `printf`s too, but nothing
-        // redirects into the file except the install this aims at.
-        let fake = FakeRunner {
-            hang_on: Some("> /etc/resolv.conf"),
-            ..Default::default()
-        };
-        let run = |cmd: Cmd| fake.run(cmd);
-        let target = target();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        {
-            let mut installing = Box::pin(install(&run, &mut rollback, &target));
-            assert!(
-                futures_util::poll!(&mut installing).is_pending(),
-                "the injected install never completes"
-            );
-        }
-
-        let armed = rollback.armed();
-        assert_eq!(armed.len(), 1, "{armed:#?}");
-        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+        assert_eq!(ran.len(), 2, "{ran:#?}");
+        assert!(ran[1].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV);
     }
 
     /// Cancelled with the nft apply in flight: both mutations are armed, so
@@ -5007,9 +5813,10 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let target = target();
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install(&run, &mut rollback, &target));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target, &resolver));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected nft apply never completes"
@@ -5032,14 +5839,21 @@ mod tests {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        let target = Target {
-            dns_preconfigured: true,
-            ..target()
-        };
 
-        install(&run, &mut rollback, &target)
-            .await
-            .expect("install interception");
+        install_interception(
+            &run,
+            &mut rollback,
+            &target(),
+            None,
+            ListenerPorts {
+                tcp: 4001,
+                dns: 4002,
+                dns_tcp: 4003,
+            },
+            NetworkAction::Allow,
+        )
+        .await
+        .expect("install interception");
 
         let ran = fake.ran();
         assert_eq!(ran.len(), 1, "{ran:#?}");
@@ -5055,8 +5869,9 @@ mod tests {
     async fn the_table_undo_is_narrowed_to_the_handle_the_kernel_assigned() {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
 
@@ -5107,10 +5922,11 @@ mod tests {
             ..Default::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         let target = target();
         {
-            let installing = install(&run, &mut rollback, &target);
+            let installing = install(&run, &mut rollback, &target, &resolver);
             let cancelled = tokio::time::timeout(Duration::from_millis(50), installing).await;
             assert!(cancelled.is_err(), "the apply was injected to hang");
         }
@@ -5152,10 +5968,11 @@ mod tests {
                 ..Default::default()
             };
             let run = |cmd: Cmd| fake.run(cmd);
+            let resolver = FakeResolver::new();
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
 
-            let failed = install(&run, &mut rollback, &target())
+            let failed = install(&run, &mut rollback, &target(), &resolver)
                 .await
                 .expect_err("a table nothing can name exactly fails the attach");
             assert!(
@@ -5183,6 +6000,70 @@ mod tests {
                 "the table left behind has to reach the caller: {residue:#?}"
             );
         }
+    }
+
+    /// A commit that made the table and not everything the script declares is
+    /// not an interception. The attach fails, and -- unlike a table nothing
+    /// can name -- what it made is its to remove, since the handle came from
+    /// its own commit: the caller's rollback deletes it by that handle.
+    #[tokio::test]
+    async fn a_commit_that_made_less_than_the_script_declares_fails_the_attach() {
+        let declared = echoed_handles(&complete_commit_echo()).count();
+        for (shape, echo) in [
+            ("the table alone", table_only_echo()),
+            ("one rule short", commit_echo(declared - 1)),
+        ] {
+            let fake = FakeRunner {
+                echo: Some(echo),
+                ..Default::default()
+            };
+            let run = |cmd: Cmd| fake.run(cmd);
+            let resolver = FakeResolver::new();
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+
+            let failed = install(&run, &mut rollback, &target(), &resolver)
+                .await
+                .expect_err("a commit short of the script fails the attach");
+            assert!(
+                failed
+                    .to_string()
+                    .contains("objects in the redirect script"),
+                "and says what was short ({shape}): {failed}"
+            );
+
+            let residue = rollback.undo_now(&run).await;
+            assert!(residue.is_empty(), "{residue:#?}");
+            assert!(
+                fake.ran().last().is_some_and(|cmd| {
+                    cmd.contains("delete table inet handle")
+                        && cmd.contains(&FAKE_HANDLE.to_string())
+                }),
+                "the table the commit did make is removed by the handle its own \
+                 commit reported ({shape}): {:#?}",
+                fake.ran()
+            );
+        }
+    }
+
+    /// Only a shortfall is refused. The check is a count, so it holds across
+    /// an nft that echoes the same commit a little differently; a line more
+    /// than the script declares cannot mean something was left out.
+    #[tokio::test]
+    async fn a_commit_that_echoes_more_than_the_script_declares_is_kept() {
+        let mut echo = complete_commit_echo();
+        echo.extend_from_slice(b"add rule inet outrig_test egress counter # handle 99\n");
+        let fake = FakeRunner {
+            echo: Some(echo),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+
+        install(&run, &mut rollback, &target(), &resolver)
+            .await
+            .expect("install interception");
     }
 
     /// The handle is read from the echo of the transaction that created the
@@ -5213,18 +6094,34 @@ mod tests {
     #[test]
     fn a_dropped_rollback_still_issues_its_undo_commands() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let resolver = dir.path().join("resolver");
-        let table = dir.path().join("table");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
 
         {
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
-            rollback.arm(touch(&resolver));
-            rollback.arm(touch(&table));
+            rollback.arm(touch(&first));
+            rollback.arm(touch(&second));
         }
 
-        wait_for(&resolver);
-        wait_for(&table);
+        wait_for(&first);
+        wait_for(&second);
+    }
+
+    /// The resolver is the one undo a destructor cannot hand to a process, so
+    /// it puts it back itself -- and has, by the time it returns. No waiting
+    /// here: a restore that only happened later would be one the process can
+    /// exit before.
+    #[test]
+    fn a_dropped_rollback_has_put_the_resolver_back_when_it_returns() {
+        let resolver = FakeResolver::new();
+        {
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+            rollback.arm(resolver.restore());
+        }
+
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV);
     }
 
     /// Detaching a container that has already exited is a success: its
@@ -5254,16 +6151,19 @@ mod tests {
             undo: Vec::new(),
             left_behind: Vec::new(),
         };
-        rollback.arm(write_resolv_conf(
-            std::process::id(),
-            "outrig_test",
-            ORIGINAL_RESOLV.as_bytes().to_vec(),
-        ));
+        let resolver = FakeResolver::new();
+        rollback.arm(resolver.restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
         let failures = rollback.undo_now(&run).await;
 
         assert!(failures.is_empty(), "{failures:#?}");
         assert!(fake.ran().is_empty(), "{:#?}", fake.ran());
+        assert_eq!(
+            resolver.read(),
+            intercepted_resolv(&target().marker),
+            "nothing is put back into a namespace the undos were not armed against"
+        );
     }
 
     /// An answer the kernel would not give is not "the namespace is gone".
@@ -5371,10 +6271,7 @@ mod tests {
         Arc::new(compiled(NetworkPolicy::allow_all()))
     }
 
-    /// Denies everything. `SO_ORIGINAL_DST` on a connection nothing redirected
-    /// reports the accepting listener's own address, so an allowed connection
-    /// through a loop bound to that listener is bridged straight back into it
-    /// -- each one accepted, bridged, and accepted again.
+    /// Denies everything, so a connection a test carries is never dialed.
     fn deny_all_policy() -> Arc<CompiledNetworkPolicy> {
         Arc::new(compiled(
             NetworkPolicy::builder()
@@ -5383,6 +6280,13 @@ mod tests {
                 .build()
                 .expect("policy"),
         ))
+    }
+
+    /// `task` as one a [`stop_tasks`] set holds: a task with nothing to
+    /// report but that it ended.
+    async fn returning_ok(task: impl Future<Output = ()>) -> Result<()> {
+        task.await;
+        Ok(())
     }
 
     fn empty_bindings() -> Bindings {
@@ -5414,17 +6318,52 @@ mod tests {
         assert!(waited.is_ok(), "the audit log never reached {want} records");
     }
 
+    /// Waits until every connection the accept loop started has ended, counted
+    /// by the clones of its `live` sender they hold, and the loop has had its
+    /// turn since. `watch` is a weak handle on that sender; the test keeps the
+    /// one strong sender besides the connections' clones.
+    ///
+    /// A loop that ends first -- by a cancel, as the tests' do -- ends without
+    /// reaping, so what it holds then is a question of order and says nothing
+    /// about whether it takes finished connections back.
+    ///
+    /// The turn is yielded rather than waited for: the test runtime has one
+    /// thread, and the task that finished woke the loop before this is polled
+    /// again, so one yield already puts the loop ahead of this in the queue.
+    /// The rest are margin against a scheduler that orders it otherwise.
+    async fn await_connections_taken_back(watch: &mpsc::WeakSender<()>) {
+        let waited = tokio::time::timeout(Duration::from_secs(30), async {
+            while watch.strong_count() > 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{} connections never ended",
+            watch.strong_count() - 1
+        );
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// The one record `dir`'s audit log holds, read as it is the instant it is
     /// asked for -- no polling, no retry, so a record written late is a
     /// failure rather than a slow pass.
     fn only_audit_record(dir: &Path) -> serde_json::Value {
-        let text = std::fs::read_to_string(dir.join(NETWORK_LOG)).expect("read audit log");
-        let mut lines = text.lines();
-        let record = lines
-            .next()
-            .expect("an audit record for the cut connection");
-        assert_eq!(lines.next(), None, "exactly one connection was made");
-        serde_json::from_str(record).expect("audit record json")
+        let mut records = audit_records(dir);
+        assert_eq!(records.len(), 1, "exactly one connection was made");
+        records.remove(0)
+    }
+
+    /// Every record in `dir`'s audit log, in order, read the same way.
+    fn audit_records(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join(NETWORK_LOG))
+            .expect("read audit log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit record json"))
+            .collect()
     }
 
     /// One accepted connection, wired the way the accept loop wires one: the
@@ -5456,32 +6395,41 @@ mod tests {
     struct LiveConnection {
         client: TcpStream,
         upstream: TcpStream,
-        tasks: JoinSet<()>,
+        tasks: JoinSet<Result<()>>,
         cancel: CancellationToken,
     }
 
     /// Brings up one connection through `handle_tcp` and returns once bytes
     /// have demonstrably crossed it in both directions, so a test that then
-    /// cancels is cancelling something that was working.
-    async fn live_connection(dir: &Path) -> LiveConnection {
+    /// cancels is cancelling something that was working. With a
+    /// `host_alias`, the client asks for its stand-in at the upstream's port
+    /// rather than for the upstream itself.
+    async fn live_connection(dir: &Path, host_alias: Option<HostAlias>) -> LiveConnection {
         let (mut client, intercepted, orig) = accepted_connection().await;
-        let (dst, upstream) = upstream_once().await;
+        let (upstream_at, upstream) = upstream_once().await;
+        let dst = host_alias.map_or(upstream_at, |alias| {
+            SocketAddr::from((alias.stand_in, upstream_at.port()))
+        });
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(handle_tcp(
+        tasks.spawn(returning_ok(handle_tcp(
             intercepted,
             orig,
             dst,
+            host_alias,
             audit_sink(dir).await,
             empty_bindings(),
             allow_all_policy(),
             cancel.clone(),
-        ));
+        )));
 
         // Written before the upstream is accepted: this is the client's
         // opening burst, which the sniff reads and the bridge forwards.
         client.write_all(b"before\n").await.expect("write before");
-        let mut upstream = upstream.await.expect("upstream accepted");
+        let mut upstream = tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .expect("the bridge should reach the upstream")
+            .expect("upstream accepted");
         let mut sent = [0u8; 7];
         upstream
             .read_exact(&mut sent)
@@ -5517,7 +6465,7 @@ mod tests {
             mut upstream,
             mut tasks,
             cancel,
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
 
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
@@ -5543,7 +6491,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let LiveConnection {
             mut tasks, cancel, ..
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
 
         cancel.cancel();
         stop_tasks(&mut tasks).await;
@@ -5568,15 +6516,16 @@ mod tests {
         let (dst, _upstream) = upstream_once().await;
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(handle_tcp(
+        tasks.spawn(returning_ok(handle_tcp(
             intercepted,
             orig,
             dst,
+            None,
             audit_sink(dir.path()).await,
             empty_bindings(),
             allow_all_policy(),
             cancel.clone(),
-        ));
+        )));
         // The client says nothing, so the connection is parked in the sniff
         // read with no evidence yet gathered.
         tokio::task::yield_now().await;
@@ -5593,6 +6542,118 @@ mod tests {
         assert_eq!(record["conn_state"], "S0");
     }
 
+    /// #353's case end to end: under `default = "allow"`, a `ClientHello`
+    /// whose record header arrives alone is still denied by the name it
+    /// carries, and recorded with it.
+    #[tokio::test]
+    async fn a_client_hello_split_across_reads_is_denied_and_recorded_by_its_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, _upstream) = upstream_once().await;
+        let policy = Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        ));
+        let connection = tokio::spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            None,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            policy,
+            CancellationToken::new(),
+        ));
+
+        write_in_two(&mut client, &tls_client_hello("www.evil.example"), 5).await;
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("a denied connection ends")
+            .expect("connection task");
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], "deny[0]");
+        assert_eq!(record["service"], "ssl");
+        assert_eq!(record["server_name"], "www.evil.example");
+        assert_eq!(record["outrig.host"], "www.evil.example");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(record["orig_bytes"], 0);
+    }
+
+    /// Only the stand-in moves, and only to the alias's host.
+    #[test]
+    fn only_the_host_stand_in_is_dialed_elsewhere() {
+        let alias = Some(HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::new(192, 168, 1, 155),
+        });
+        let to_host = SocketAddr::from((PASTA_HOST_STAND_IN, 8080));
+        assert_eq!(
+            upstream_addr(to_host, alias),
+            SocketAddr::from(([192, 168, 1, 155], 8080))
+        );
+        // A network with no alias, and every other destination, are dialed as
+        // asked.
+        assert_eq!(upstream_addr(to_host, None), to_host);
+        let elsewhere = SocketAddr::from(([203, 0, 113, 7], 443));
+        assert_eq!(upstream_addr(elsewhere, alias), elsewhere);
+        // An IPv6 flow is never the stand-in, whatever its bits spell.
+        let mapped = SocketAddr::from((PASTA_HOST_STAND_IN.to_ipv6_mapped(), 8080));
+        assert_eq!(upstream_addr(mapped, alias), mapped);
+    }
+
+    /// A connection to the stand-in is bridged to the alias's host, on the
+    /// port it asked for, and recorded against the stand-in. Dialed literally
+    /// it would wait out `CONNECT_TIMEOUT` instead.
+    #[tokio::test]
+    async fn a_connection_to_the_host_stand_in_is_dialed_at_the_aliased_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias = HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::LOCALHOST,
+        };
+        let LiveConnection {
+            upstream,
+            mut tasks,
+            cancel,
+            ..
+        } = live_connection(dir.path(), Some(alias)).await;
+        let port = upstream.local_addr().expect("upstream addr").port();
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["id.resp_h"], "169.254.1.2");
+        assert_eq!(record["id.resp_p"], port);
+    }
+
+    /// The alias is the address the probe's connection arrives at, not the
+    /// one the listener waiting for it is bound to. Without pasta, a probe
+    /// sent to `127.0.0.2` arrives there.
+    #[tokio::test]
+    async fn the_alias_is_the_address_the_probe_arrives_at() {
+        let probe = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Inet,
+            SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("probe socket");
+        let stand_in = Ipv4Addr::new(127, 0, 0, 2);
+        assert_eq!(
+            pasta_host_alias(std::net::TcpStream::from(probe), stand_in).await,
+            Some(HostAlias {
+                stand_in,
+                host: stand_in,
+            })
+        );
+    }
+
     /// A connection parked with nothing to wake it -- neither peer speaks,
     /// neither closes -- is *terminated* by the cancel, not left running
     /// unwatched. The client's read returning EOF the moment the stop call
@@ -5606,7 +6667,7 @@ mod tests {
             upstream,
             mut tasks,
             cancel,
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
         // Held open and silent for the rest of the test: the bridge has
         // nothing to copy and no timer to expire.
         let _upstream = upstream;
@@ -5634,7 +6695,7 @@ mod tests {
         tasks.spawn(async move {
             // Only dropped when this task's frame is destroyed.
             let _held = held;
-            std::future::pending::<()>().await;
+            std::future::pending::<Result<()>>().await
         });
         tokio::task::yield_now().await;
 
@@ -5661,19 +6722,39 @@ mod tests {
     }
 
     /// A `dns_loop` on a listener bound the way attach binds one, forwarding
-    /// to `resolvers`: its IPv4 loopback address, the token that ends the
-    /// loop, and the set holding it.
+    /// to `resolvers` whatever is asked: its IPv4 loopback address, the token
+    /// that ends the loop, and the set holding it. Its records go to a log
+    /// nothing reads; [`spawned_dns_loop_under`] is the one to read them from.
     async fn spawned_dns_loop(
         resolvers: Vec<SocketAddr>,
         bindings: Bindings,
-    ) -> (SocketAddr, CancellationToken, JoinSet<()>) {
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        spawned_dns_loop_under(resolvers, bindings, allow_all_policy(), audit).await
+    }
+
+    /// [`spawned_dns_loop`] under `policy`, recording to `audit`.
+    async fn spawned_dns_loop_under(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+        policy: Arc<CompiledNetworkPolicy>,
+        audit: AuditSink,
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
         let socket = dns_listener(bind_any(SockType::Datagram, 0).expect("bind dns listener"))
             .expect("dns listener");
         let port = socket.local_addr().expect("dns addr").port();
         let listener = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(dns_loop(socket, resolvers, bindings, cancel.clone()));
+        tasks.spawn(dns_loop(
+            socket,
+            resolvers,
+            bindings,
+            policy,
+            audit,
+            cancel.clone(),
+        ));
         (listener, cancel, tasks)
     }
 
@@ -5699,6 +6780,20 @@ mod tests {
             dns_query(&buf[..n]).expect("parse the forwarded query"),
             from,
         ))
+    }
+
+    /// An address a query is refused at, and the socket holding it, which
+    /// has to outlive every use of the address. The socket is connected to
+    /// its own address, so it takes datagrams from nowhere else and the
+    /// kernel refuses what is sent there. Holding the port, rather than
+    /// binding one and letting it go, keeps any other socket from taking it
+    /// in the meantime -- the forward's own included, which would then be
+    /// sent its own query and wait out `DNS_TIMEOUT` for an answer.
+    fn refusing_resolver() -> (std::net::UdpSocket, SocketAddr) {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let addr = held.local_addr().expect("refusing addr");
+        held.connect(addr).expect("connect to itself");
+        (held, addr)
     }
 
     /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
@@ -5800,6 +6895,268 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    /// A lookup no resolver answers is answered all the same, with SERVFAIL,
+    /// so its client fails now rather than waiting out its own timeout. The
+    /// answer has to be one the client takes for the answer to its query, or
+    /// it waits all the same.
+    #[tokio::test]
+    async fn a_lookup_no_resolver_answers_gets_servfail() {
+        let (_held, refusing) = refusing_resolver();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_loop(vec![refusing], empty_bindings()).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x1234, "example.test").await;
+
+        let mut reply = [0u8; 512];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut reply))
+            .await
+            .expect("a lookup no resolver answered got no reply")
+            .expect("receive reply");
+        let reply = &reply[..n];
+        assert!(
+            asked("example.test").answered_by(listener, from, reply),
+            "the reply does not answer the query"
+        );
+        assert_eq!(dns_flags(reply), Some(0x8182), "QR, RD, RA, SERVFAIL");
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A `dns_loop` forwarding to `resolver`, which the test plays, under a
+    /// policy: with the client that asks it and the log it records to.
+    struct FilteringLoop {
+        listener: SocketAddr,
+        client: UdpSocket,
+        cancel: CancellationToken,
+        tasks: JoinSet<Result<()>>,
+        dir: tempfile::TempDir,
+        audit: AuditSink,
+    }
+
+    impl FilteringLoop {
+        async fn spawn(resolver: &UdpSocket, policy: CompiledNetworkPolicy) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let audit = audit_sink(dir.path()).await;
+            let (listener, cancel, tasks) = spawned_dns_loop_under(
+                vec![resolver.local_addr().expect("resolver addr")],
+                empty_bindings(),
+                Arc::new(policy),
+                audit.clone(),
+            )
+            .await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+            Self {
+                listener,
+                client,
+                cancel,
+                tasks,
+                dir,
+                audit,
+            }
+        }
+
+        /// The next reply the client gets, which has to come from the address
+        /// it asked.
+        async fn reply(&self) -> Vec<u8> {
+            let mut reply = [0u8; 512];
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(2), self.client.recv_from(&mut reply))
+                    .await
+                    .expect("the lookup got no reply")
+                    .expect("receive reply");
+            assert_eq!(from, self.listener, "the reply came from elsewhere");
+            reply[..n].to_vec()
+        }
+
+        async fn reply_to(&self, packet: &[u8]) -> Vec<u8> {
+            self.client
+                .send_to(packet, self.listener)
+                .await
+                .expect("send query");
+            self.reply().await
+        }
+
+        /// Ends the loop, which has to stop with nothing to report.
+        async fn stop(&mut self) {
+            self.cancel.cancel();
+            let failures = stop_tasks(&mut self.tasks).await;
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+    }
+
+    /// The point of the gate: a name no `allow` entry could cover is answered
+    /// without any resolver being asked, so nothing about it leaves.
+    #[tokio::test]
+    async fn a_lookup_the_policy_refuses_is_answered_refused_and_never_reaches_the_resolver() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "x.attacker.test", &[]);
+        let reply = dns.reply_to(&query).await;
+        assert!(
+            asked("x.attacker.test").answered_by(dns.listener, dns.listener, &reply),
+            "the reply does not answer the query"
+        );
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert!(
+            forwarded_query(&resolver, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "a refused lookup reached the resolver"
+        );
+
+        dns.stop().await;
+    }
+
+    /// Refused or not, the lookup is in the log, and in it by the time its
+    /// client has its reply: the record is written before the answer goes out.
+    #[tokio::test]
+    async fn a_refused_lookup_writes_one_deny_record_naming_the_name() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "x.attacker.test", &[]);
+        dns.reply_to(&query).await;
+
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], "x.attacker.test");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(record["proto"], "udp");
+        assert_eq!(record["service"], "dns");
+        assert_eq!(record["id.resp_p"], 53);
+        assert_eq!(record["orig_bytes"], query.len());
+
+        dns.stop().await;
+    }
+
+    /// A lookup the policy lets through is forwarded and answered as it always
+    /// was, and its record -- the rule that let it through -- is in the file
+    /// before the resolver has the query, read here with no wait.
+    #[tokio::test]
+    async fn an_allowed_lookup_has_its_record_in_the_file_before_the_resolver_sees_it() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        send_query(&dns.client, dns.listener, 0x1234, "allowed.test").await;
+        let (forwarded, from) = forwarded_query(&resolver, Duration::from_secs(2))
+            .await
+            .expect("an allowed lookup should reach the resolver");
+        assert_eq!(forwarded.question.name, "allowed.test");
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "allow[0]");
+        assert_eq!(record["outrig.host"], "allowed.test");
+
+        let answer = dns_packet(
+            forwarded.txid,
+            DNS_RESPONSE_FLAGS,
+            "allowed.test",
+            &[Rr::A("allowed.test", [198, 51, 100, 9], 60)],
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+        assert_eq!(dns.reply().await, answer);
+
+        dns.stop().await;
+    }
+
+    /// Audit mode, and a filter policy that leaves lookups open, forward every
+    /// lookup but still say what was asked.
+    #[tokio::test]
+    async fn a_lookup_under_an_allow_default_is_recorded_and_forwarded_as_before() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(&resolver, compiled(NetworkPolicy::allow_all())).await;
+
+        send_query(&dns.client, dns.listener, 0x1234, "anything.test").await;
+        forwarded_query(&resolver, Duration::from_secs(2))
+            .await
+            .expect("a lookup under an allow default should reach the resolver");
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], "anything.test");
+
+        dns.stop().await;
+    }
+
+    /// A packet whose question the interceptor cannot read is not a way round
+    /// the gate: it is refused, with the header alone to say so, and recorded
+    /// without a name.
+    #[tokio::test]
+    async fn an_unparsable_lookup_is_refused_under_a_deny_default() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let mut dns = FilteringLoop::spawn(
+            &resolver,
+            lookup_policy(NetworkAction::Deny, &["allowed.test"], &[]),
+        )
+        .await;
+
+        // Two questions, so `dns_question` refuses it.
+        let mut query = dns_packet(0x1234, DNS_QUERY_FLAGS, "allowed.test", &[]);
+        query[5] = 2;
+        let reply = dns.reply_to(&query).await;
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert!(
+            forwarded_query(&resolver, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "an unparsable lookup reached the resolver"
+        );
+
+        let record = only_audit_record(dns.dir.path());
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["outrig.rule"], UNPARSED_LOOKUP_RULE);
+        assert!(record.get("outrig.host").is_none());
+
+        dns.stop().await;
+    }
+
+    /// Every query the loop forwarded has its record, even when the detach
+    /// that cancels it comes while they are all still in flight: the records
+    /// were written first, so nothing the abort abandons is owed.
+    #[tokio::test]
+    async fn a_lookup_cut_off_by_a_cancellation_leaves_no_record_unaccounted_for() {
+        const PENDING: u16 = 4;
+        // Receives the queries and never answers them.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let mut dns = FilteringLoop::spawn(&blackhole, compiled(NetworkPolicy::allow_all())).await;
+        for txid in 0..PENDING {
+            send_query(&dns.client, dns.listener, txid, "example.test").await;
+        }
+        for _ in 0..PENDING {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query should reach the resolver");
+        }
+
+        dns.stop().await;
+        dns.audit
+            .drain()
+            .await
+            .expect("everything queued was written");
+        assert!(dns.audit.take_unwritten().is_empty());
+        assert_eq!(audit_records(dns.dir.path()).len(), usize::from(PENDING));
+    }
+
     /// The loop forwards at most `DNS_IN_FLIGHT` lookups at once. Past that it
     /// stops reading, so a burst of queries no resolver answers cannot spawn
     /// a forward apiece.
@@ -5839,9 +7196,108 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Connections that have finished do not stay in the set the accept loop
-    /// keeps them in. A set only ever spawned into holds one handle per
-    /// connection the attachment has ever served.
+    /// A connection that panicked is handed to the sink by `reap_finished`,
+    /// and one that finished cleanly is not.
+    #[tokio::test]
+    async fn a_panicked_connection_reaches_the_panic_sink() {
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async {});
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        // Bounded, so a reap that reaps nothing fails below rather than spinning.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            reap_finished(&mut conns, &panics);
+            if conns.is_empty() {
+                break;
+            }
+        }
+        assert!(conns.is_empty(), "{} connections still held", conns.len());
+        let kept = panics.lock().unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].is_panic());
+    }
+
+    /// The accept loop's `join_next` arm, which takes a connection back while
+    /// the loop is parked in `accept`, keeps a panic as well.
+    #[tokio::test]
+    async fn the_accept_loop_keeps_a_panic_it_takes_back_while_parked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = Redirected::elsewhere(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        let (live, _idle) = mpsc::channel(1);
+
+        let watched = panics.clone();
+        let token = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            let _ends_the_loop = token.drop_guard();
+            for _ in 0..1000 {
+                if !watched.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        run_accept_loop_collecting(
+            &listener,
+            &audit,
+            &cancel,
+            &conn_cancel,
+            &mut conns,
+            &live,
+            &panics,
+        )
+        .await
+        .expect("only the cancel ends the loop");
+        watcher.await.expect("watcher");
+
+        assert_eq!(panics.lock().unwrap().len(), 1);
+    }
+
+    /// Teardown turns each connection panic into a `NetworkTaskPanicked`
+    /// cause, so `detach` no longer returns `Ok(())` over a dead connection.
+    #[tokio::test]
+    async fn teardown_reports_a_panicked_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let panics = ConnPanics::default();
+        let mut conns = JoinSet::new();
+        conns.spawn(async { panic!("injected: a connection task panicked") });
+        let joined = conns.join_next().await.expect("one task");
+        note_joined(joined, &panics);
+        let (live, idle) = mpsc::channel::<()>(1);
+        drop(live);
+
+        let causes = teardown_attachment(
+            "outrig-test",
+            Attachment {
+                cancel: CancellationToken::new(),
+                tasks: JoinSet::new(),
+                idle,
+                rollback: Rollback::new(std::process::id()).expect("a namespace"),
+                transcript: None,
+                audit: audit_sink(dir.path()).await,
+                panics,
+            },
+        )
+        .await;
+
+        assert_eq!(causes.len(), 1, "{causes:#?}");
+        assert!(
+            matches!(*causes[0].source, OutrigError::NetworkTaskPanicked { .. }),
+            "{causes:#?}"
+        );
+        assert!(teardown_result(causes).is_err());
+    }
+
+    /// `reap_finished` takes every finished connection out of the set the
+    /// accept loop keeps them in, so a count of it is a count of the ones
+    /// still running.
     #[tokio::test]
     async fn finished_connections_do_not_pile_up_in_the_accept_loop_set() {
         let mut conns = JoinSet::new();
@@ -5853,7 +7309,7 @@ mod tests {
         // rather than spinning here.
         for _ in 0..64 {
             tokio::task::yield_now().await;
-            reap_finished(&mut conns);
+            reap_finished(&mut conns, &ConnPanics::default());
             if conns.is_empty() {
                 break;
             }
@@ -5866,9 +7322,10 @@ mod tests {
         );
     }
 
-    /// The same claim against the loop rather than the helper: it is the loop
-    /// that has to keep taking finished connections back out, and a test that
-    /// calls `reap_finished` itself cannot tell whether the loop still does.
+    /// What keeps that set from holding a handle per connection the attachment
+    /// has ever served is the loop taking each one back as it finishes, and a
+    /// test that calls `reap_finished` itself cannot tell whether it still
+    /// does.
     #[tokio::test]
     async fn the_accept_loop_keeps_taking_finished_connections_back() {
         const SERVED: usize = 64;
@@ -5876,11 +7333,14 @@ mod tests {
         let audit = audit_sink(dir.path()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let listener = Redirected::elsewhere(listener);
         let cancel = CancellationToken::new();
         let conn_cancel = cancel.child_token();
         // Held here rather than by the loop, which is the whole reason the
         // accepting half takes it by reference.
         let mut conns = JoinSet::new();
+        let (live, _idle) = mpsc::channel(1);
+        let watch = live.downgrade();
 
         let token = cancel.clone();
         let log = dir.path().to_path_buf();
@@ -5900,38 +7360,84 @@ mod tests {
                 // connection writes one before its task ends, and the audit
                 // writer is a queue of one on a runtime this test shares with
                 // it -- so a sleep here says nothing about how many
-                // connections are still in flight, and a machine slow enough
-                // to lag the writer would leave a whole burst of them for the
-                // assertion below to count.
+                // connections are still in flight.
                 await_audit_records(&log, served).await;
             }
+            // The last one has no further accept to be taken back at, so it
+            // is the loop parked in `accept` that has to take it.
+            await_connections_taken_back(&watch).await;
         });
 
-        let (live, _idle) = mpsc::channel(1);
-        accept_into(
-            &listener,
-            &audit,
-            &empty_bindings(),
-            &deny_all_policy(),
-            &cancel,
-            &conn_cancel,
-            &mut conns,
-            &live,
-        )
-        .await;
+        run_accept_loop_holding(&listener, &audit, &cancel, &conn_cancel, &mut conns, &live)
+            .await
+            .expect("only the cancel ends the loop");
         clients.await.expect("clients");
 
-        // Not zero: the loop reaps on its way in to an accept, so the
-        // connection it served last is still held either way, and the drain
-        // that follows `accept_into` in production is what collects it. What
-        // the gate above buys is that only the last one or two can be --
-        // every earlier connection had a whole further connection's worth of
-        // the loop to be taken back in. The claim is that the carrier does
-        // not grow with the number of connections served: without the reap
-        // all SERVED of them are still here.
         assert!(
-            conns.len() < 8,
+            conns.is_empty(),
             "{} of {SERVED} finished connections were never taken back out of the carrier",
+            conns.len()
+        );
+    }
+
+    /// A burst that finishes while the loop is parked in `accept` is taken
+    /// back whole, without another connection arriving to prompt it. The
+    /// shape of a package install or a `git clone` followed by a quiet turn.
+    #[tokio::test]
+    async fn a_burst_that_finishes_while_the_loop_is_parked_is_taken_back() {
+        const BURST: usize = 16;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = Counting {
+            inner: Redirected::elsewhere(listener),
+            accepted: accepted.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let mut conns = JoinSet::new();
+        let (live, _idle) = mpsc::channel(1);
+        let watch = live.downgrade();
+
+        let token = cancel.clone();
+        let log = dir.path().to_path_buf();
+        let clients = tokio::spawn(async move {
+            // Ends the loop however this task does; see
+            // `the_accept_loop_keeps_taking_finished_connections_back`.
+            let _ends_the_loop = token.drop_guard();
+            // Silent and open, so each connection parks in the sniff read
+            // until it is closed.
+            let mut open = Vec::new();
+            for _ in 0..BURST {
+                open.push(TcpStream::connect(addr).await.expect("connect"));
+            }
+            // Counted at the listener, which only goes up, rather than by the
+            // connections still running: a silent one gives up after
+            // `SNIFF_TIMEOUT` on its own, and a count of the running ones
+            // would then never reach BURST.
+            let all_accepted = tokio::time::timeout(Duration::from_secs(30), async {
+                while accepted.load(std::sync::atomic::Ordering::SeqCst) < BURST {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(all_accepted.is_ok(), "the loop never accepted {BURST}");
+            // Dropped in one go, while the loop has nothing left to accept.
+            drop(open);
+            await_audit_records(&log, BURST).await;
+            await_connections_taken_back(&watch).await;
+        });
+
+        run_accept_loop_holding(&listener, &audit, &cancel, &conn_cancel, &mut conns, &live)
+            .await
+            .expect("only the cancel ends the loop");
+        clients.await.expect("clients");
+
+        assert!(
+            conns.is_empty(),
+            "{} of {BURST} finished connections were still held by a loop with nothing to accept",
             conns.len()
         );
     }
@@ -5961,6 +7467,7 @@ mod tests {
                 intercepted,
                 orig,
                 dst,
+                None,
                 audit.clone(),
                 empty_bindings(),
                 allow_all_policy(),
@@ -5984,19 +7491,9 @@ mod tests {
     #[tokio::test]
     async fn the_accept_loop_waits_for_the_connections_it_started() {
         const HELD: usize = 4;
-        let dir = tempfile::tempdir().expect("tempdir");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("listener addr");
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(tcp_accept_loop(
-            listener,
-            audit_sink(dir.path()).await,
-            empty_bindings(),
-            allow_all_policy(),
-            cancel.clone(),
-            mpsc::channel(1).0,
-        ));
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected::elsewhere(listener)).await;
 
         // Silent clients, so every connection parks in the sniff read and is
         // still live -- and still unrecorded -- when the cancel lands. The
@@ -6019,6 +7516,488 @@ mod tests {
         );
     }
 
+    /// Only an errno that says the socket itself is unusable ends a listener.
+    /// Everything else -- including errors this does not recognize, and the
+    /// ones Linux `accept` passes through from the connection it was about to
+    /// return -- is tried again.
+    #[test]
+    fn only_an_unusable_socket_ends_a_listener() {
+        use ListenerFailure::{Broken, Passing, Retry};
+        for (errno, want) in [
+            (libc::ECONNABORTED, Passing),
+            (libc::EINTR, Passing),
+            (libc::EBADF, Broken),
+            (libc::EINVAL, Broken),
+            (libc::ENOTSOCK, Broken),
+            (libc::EFAULT, Broken),
+            (libc::EMFILE, Retry),
+            (libc::ENFILE, Retry),
+            (libc::ENOBUFS, Retry),
+            (libc::ENOMEM, Retry),
+            (libc::ENOSPC, Retry),
+            (libc::EPERM, Retry),
+            (libc::EPROTO, Retry),
+            (libc::EOPNOTSUPP, Retry),
+            (libc::ENETUNREACH, Retry),
+        ] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert_eq!(listener_failure(&e), want, "{e}");
+        }
+        assert_eq!(listener_failure(&io::Error::other("no errno")), Retry);
+    }
+
+    /// A listener that fails as scripted, one errno per call, and then waits
+    /// forever for a connection that never comes: the failures a real one
+    /// only produces when the whole process is out of something.
+    struct ScriptedListener {
+        script: Mutex<std::collections::VecDeque<i32>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedListener {
+        fn new(errnos: &[i32]) -> Self {
+            Self {
+                script: Mutex::new(errnos.iter().copied().collect()),
+                calls: Default::default(),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Accept for ScriptedListener {
+        fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.script.lock().expect("script").pop_front();
+            async move {
+                match next {
+                    Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    /// Somewhere a redirect could have been headed: not loopback, not the
+    /// listener, and never dialed, because every test that carries a
+    /// connection to it either denies it or cuts it in the sniff.
+    const ELSEWHERE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443);
+
+    /// A listener the redirect sends connections to: every one it takes was
+    /// headed for `dst` before the redirect displaced it. What a real listener
+    /// reports for a connection made straight to it is its own address, which
+    /// the loop refuses, so a test about what the loop does with a connection
+    /// it carries has to say where the connection was going.
+    struct Redirected {
+        listener: TcpListener,
+        dst: SocketAddr,
+    }
+
+    impl Redirected {
+        fn elsewhere(listener: TcpListener) -> Self {
+            Self {
+                listener,
+                dst: ELSEWHERE,
+            }
+        }
+    }
+
+    impl Accept for Redirected {
+        fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+            self.listener.accept()
+        }
+
+        fn original_dst(&self, _: &TcpStream, _: SocketAddr) -> io::Result<SocketAddr> {
+            Ok(self.dst)
+        }
+    }
+
+    /// A listener that counts the connections it has handed the loop, for a
+    /// test that has to know the loop has them all and cannot see the loop's
+    /// own state. Unlike the connections still running, the count never goes
+    /// down.
+    struct Counting {
+        inner: Redirected,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Accept for Counting {
+        async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            let accepted = self.inner.accept().await?;
+            self.accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(accepted)
+        }
+
+        fn original_dst(&self, stream: &TcpStream, peer: SocketAddr) -> io::Result<SocketAddr> {
+            self.inner.original_dst(stream, peer)
+        }
+    }
+
+    /// The accept loop over `listener`, carrying `conns`, until `cancel` or
+    /// the listener ends it. Under [`deny_all_policy`], so a connection it
+    /// accepts is never dialed.
+    async fn run_accept_loop(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+    ) -> io::Result<()> {
+        let (live, _idle) = mpsc::channel(1);
+        run_accept_loop_holding(listener, audit, cancel, conn_cancel, conns, &live).await
+    }
+
+    /// [`run_accept_loop`] with the carrier's `live` sender kept by the test,
+    /// so it can count the connections still running by the clones they hold.
+    async fn run_accept_loop_holding(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+        live: &mpsc::Sender<()>,
+    ) -> io::Result<()> {
+        run_accept_loop_collecting(
+            listener,
+            audit,
+            cancel,
+            conn_cancel,
+            conns,
+            live,
+            &ConnPanics::default(),
+        )
+        .await
+    }
+
+    /// [`run_accept_loop_holding`] with the sink the loop leaves connection
+    /// panics in kept by the test.
+    async fn run_accept_loop_collecting(
+        listener: &impl Accept,
+        audit: &AuditSink,
+        cancel: &CancellationToken,
+        conn_cancel: &CancellationToken,
+        conns: &mut JoinSet<()>,
+        live: &mpsc::Sender<()>,
+        panics: &ConnPanics,
+    ) -> io::Result<()> {
+        accept_into(
+            listener,
+            audit,
+            &empty_bindings(),
+            &deny_all_policy(),
+            None,
+            cancel,
+            conn_cancel,
+            conns,
+            live,
+            panics,
+        )
+        .await
+    }
+
+    /// Running out of descriptors, buffers or memory does not end the loop,
+    /// and neither does a connection that was gone before it was accepted:
+    /// each is tried again, and the connections the loop already carries are
+    /// left alone. One `EMFILE` used to end interception for the session.
+    #[tokio::test(start_paused = true)]
+    async fn transient_accept_failures_do_not_end_the_loop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+        ]);
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        let mut conns = JoinSet::new();
+        conns.spawn(std::future::pending::<()>());
+
+        let ran = tokio::time::timeout(
+            10 * LISTENER_BACKOFF,
+            run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns),
+        )
+        .await;
+
+        assert!(
+            ran.is_err(),
+            "the loop ended on a failure it retries: {ran:?}"
+        );
+        assert_eq!(
+            listener.calls(),
+            6,
+            "every failure tried again, then waiting on the next connection"
+        );
+        assert!(
+            !conn_cancel.is_cancelled(),
+            "the connections it carries were cut"
+        );
+        assert_eq!(conns.len(), 1);
+    }
+
+    /// A listener that cannot accept again ends the loop with the error that
+    /// says so, after whatever it retried on the way there.
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_listener_ends_the_loop_with_its_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[libc::EMFILE, libc::EBADF]);
+        let cancel = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+
+        let ended = run_accept_loop(
+            &listener,
+            &audit,
+            &cancel,
+            &cancel.child_token(),
+            &mut JoinSet::new(),
+        )
+        .await;
+
+        let e = ended.expect_err("a broken listener ends the loop");
+        assert_eq!(e.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(listener.calls(), 2);
+        assert!(
+            started.elapsed() >= LISTENER_BACKOFF,
+            "the EMFILE was not waited out"
+        );
+    }
+
+    /// A loop stopped while it waits out a failure stops at once, and reports
+    /// the failure: it had stopped taking connections, and the redirect sent
+    /// the container's to it all the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_stopped_while_failing_reports_the_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = ScriptedListener::new(&[libc::EMFILE]);
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LISTENER_BACKOFF / 10).await;
+            stopping.cancel();
+        });
+        let started = tokio::time::Instant::now();
+
+        let ended = run_accept_loop(
+            &listener,
+            &audit,
+            &cancel,
+            &cancel.child_token(),
+            &mut JoinSet::new(),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < LISTENER_BACKOFF,
+            "the back-off outlived the cancel"
+        );
+        let e = ended.expect_err("a listener still failing when stopped is reported");
+        assert_eq!(e.raw_os_error(), Some(libc::EMFILE));
+    }
+
+    /// A cancel and a back-off that have both landed by the time the wait is
+    /// polled again end it on the failure, as a cancel alone does. Repeated,
+    /// because without the bias `select!` picks between ready branches at
+    /// random, and the clock it would pick is the one that reports nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_that_lands_with_the_back_off_still_reports_the_failure() {
+        for _ in 0..64 {
+            let cancel = CancellationToken::new();
+            let mut waiting = std::pin::pin!(after_listener_failure(
+                "tcp",
+                io::Error::from_raw_os_error(libc::EMFILE),
+                &cancel,
+            ));
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
+            assert!(first.is_pending(), "the back-off has to be waiting");
+
+            cancel.cancel();
+            tokio::time::advance(LISTENER_BACKOFF).await;
+
+            match waiting.await {
+                ControlFlow::Break(e) => assert_eq!(e.raw_os_error(), Some(libc::EMFILE)),
+                ControlFlow::Continue(()) => panic!("a stopped loop was sent to try again"),
+            }
+        }
+    }
+
+    /// The whole path against a real socket: a listener the kernel takes out of
+    /// `LISTEN` ends its loop on its own, and stopping the attachment's tasks
+    /// reports it instead of returning clean.
+    #[tokio::test]
+    async fn a_listener_that_breaks_is_reported_when_its_tasks_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let fd = listener.as_raw_fd();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            deny_all_policy(),
+            None,
+            CancellationToken::new(),
+            mpsc::channel(1).0,
+            ConnPanics::default(),
+        ));
+        tokio::task::yield_now().await;
+
+        // Every accept on it fails with `EINVAL` from here on.
+        nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Both).expect("shutdown");
+        // Never cancelled: a loop still running when the grace runs out is
+        // aborted and reported as that instead, so this is the loop's own end.
+        let failures = stop_tasks(&mut tasks).await;
+
+        match failures.as_slice() {
+            [OutrigError::NetworkListenerFailed { listener, source }] => {
+                assert_eq!(*listener, "tcp");
+                assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
+            }
+            _ => panic!("a broken listener has to be reported: {failures:#?}"),
+        }
+    }
+
+    /// Panics, saying why, when `SO_ORIGINAL_DST` cannot be read on loopback.
+    /// Without conntrack, as inside some sandboxes, the accept loop drops
+    /// every connection it is handed, and a test waiting on its records would
+    /// only time out.
+    async fn require_original_dst() {
+        let (_client, intercepted, orig) = accepted_connection().await;
+        if let Err(e) = original_dst(&intercepted, orig) {
+            panic!("SO_ORIGINAL_DST is unavailable here ({e}); this test needs conntrack");
+        }
+    }
+
+    /// An attachment carrying as many connections as it may refuses the next
+    /// one at once and records it as refused; once those finish, it carries
+    /// connections again.
+    #[tokio::test]
+    async fn a_connection_past_the_limit_is_refused_and_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let listener = Redirected::elsewhere(listener);
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+
+        // Stand-ins for the connections it carries, held until `release`: no
+        // sockets, so a full complement costs the test no descriptors. Each
+        // holds a sender, so the receiver says when all of them are gone.
+        let release = CancellationToken::new();
+        let (held, mut gone) = mpsc::channel::<()>(1);
+        let mut conns = JoinSet::new();
+        for _ in 0..TCP_CONNECTIONS {
+            let (release, held) = (release.clone(), held.clone());
+            conns.spawn(async move {
+                release.cancelled().await;
+                drop(held);
+            });
+        }
+        drop(held);
+
+        let token = cancel.clone();
+        let log = dir.path().to_path_buf();
+        let clients = tokio::spawn(async move {
+            // However this ends, the loop ends with it; see
+            // `the_accept_loop_keeps_taking_finished_connections_back`.
+            let _ends_the_loop = token.drop_guard();
+
+            let mut refused = TcpStream::connect(addr).await.expect("connect");
+            let port = refused.local_addr().expect("client addr").port();
+            await_audit_records(&log, 1).await;
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(SNIFF_TIMEOUT, refused.read(&mut buf))
+                .await
+                .expect("a refused connection is closed at once, not left open");
+            assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+            let record = only_audit_record(&log);
+            assert_eq!(record["outrig.rule"], CONNECTION_LIMIT_RULE);
+            assert_eq!(record["outrig.action"], "deny");
+            assert_eq!(record["id.orig_p"], port);
+            assert_eq!(record["orig_bytes"], 0);
+            assert_eq!(record["resp_bytes"], 0);
+
+            release.cancel();
+            assert!(gone.recv().await.is_none());
+            // Spoken to, so the sniff decides it at once rather than after
+            // its window.
+            let mut carried = TcpStream::connect(addr).await.expect("connect");
+            carried.write_all(b"x").await.expect("write");
+            await_audit_records(&log, 2).await;
+            let record = &audit_records(&log)[1];
+            assert_ne!(
+                record["outrig.rule"], CONNECTION_LIMIT_RULE,
+                "the connections it was carrying are gone, so this one is decided by policy"
+            );
+        });
+
+        run_accept_loop(&listener, &audit, &cancel, &conn_cancel, &mut conns)
+            .await
+            .expect("only the cancel ends the loop");
+        clients.await.expect("clients");
+    }
+
+    /// How many bytes the next datagram queued on `fd` holds; zero once there
+    /// is none.
+    fn queued_datagram(fd: RawFd) -> libc::c_int {
+        let mut n: libc::c_int = 0;
+        // `FIONREAD` writes one `int` through the pointer it is handed.
+        let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+        assert_ne!(rc, -1, "FIONREAD: {}", io::Error::last_os_error());
+        n
+    }
+
+    /// A datagram the DNS listener cannot answer is skipped, not taken as the
+    /// end of the listener: it has been read already, and the next query is
+    /// still owed an answer.
+    #[tokio::test]
+    async fn an_unanswerable_datagram_does_not_end_the_dns_loop() {
+        // Bound without asking the kernel where each query was sent, so every
+        // datagram it reads is one the loop cannot answer.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind dns");
+        let listener = socket.local_addr().expect("dns addr");
+        let fd = socket.as_raw_fd();
+        let cancel = CancellationToken::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(
+            socket,
+            Vec::new(),
+            empty_bindings(),
+            allow_all_policy(),
+            audit_sink(dir.path()).await,
+            cancel.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        send_query(&client, listener, 0x4444, "example.test").await;
+        // Read once nothing is queued on the socket. The test runtime has one
+        // thread, so the loop has finished with the datagram by then too.
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            while queued_datagram(fd) > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(read.is_ok(), "the loop never read the datagram");
+
+        assert!(
+            tasks.try_join_next().is_none(),
+            "the loop ended on a datagram it could not answer"
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
     /// Repeated attach/detach cycles leave nothing behind: what a detach ends,
     /// it ends for good, so a long session does not accumulate one set of
     /// loops per attachment it ever had.
@@ -6038,10 +8017,19 @@ mod tests {
                 audit.clone(),
                 empty_bindings(),
                 allow_all_policy(),
+                None,
                 cancel.clone(),
                 mpsc::channel(1).0,
+                ConnPanics::default(),
             ));
-            tasks.spawn(dns_loop(dns, Vec::new(), empty_bindings(), cancel.clone()));
+            tasks.spawn(dns_loop(
+                dns,
+                Vec::new(),
+                empty_bindings(),
+                allow_all_policy(),
+                audit.clone(),
+                cancel.clone(),
+            ));
 
             cancel.cancel();
             let failures = stop_tasks(&mut tasks).await;
@@ -6187,21 +8175,11 @@ mod tests {
     /// peer, and is recorded by the address it actually connected from.
     #[tokio::test]
     async fn the_accept_loop_records_an_ipv4_client_by_its_ipv4_address() {
-        let dir = tempfile::tempdir().expect("tempdir");
         let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
         listener.set_nonblocking(true).expect("nonblocking");
         let listener = TcpListener::from_std(listener).expect("tokio listener");
         let port = listener.local_addr().expect("listener addr").port();
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(tcp_accept_loop(
-            listener,
-            audit_sink(dir.path()).await,
-            empty_bindings(),
-            allow_all_policy(),
-            cancel.clone(),
-            mpsc::channel(1).0,
-        ));
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected::elsewhere(listener)).await;
 
         // Silent, so it parks in the sniff read and nothing is forwarded.
         let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
@@ -6255,6 +8233,197 @@ mod tests {
         );
     }
 
+    /// The accept loop over `listener` under [`allow_all_policy`] -- audit
+    /// mode, where nothing but the loop's own refusals can stop a connection --
+    /// as a task of its own, with the directory its audit log goes to.
+    async fn spawn_allow_all_loop<L: Accept + 'static>(
+        listener: L,
+    ) -> (tempfile::TempDir, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            None,
+            cancel.clone(),
+            mpsc::channel(1).0,
+            ConnPanics::default(),
+        ));
+        (dir, cancel, tasks)
+    }
+
+    /// Connects to `target` under [`spawn_allow_all_loop`] and returns the one
+    /// record the loop wrote for it, having checked that the connection was
+    /// closed at once rather than left in the sniff.
+    ///
+    /// The loop is cancelled only after that record is in, so a connection it
+    /// had carried instead -- or dialed back into itself -- writes its own as
+    /// it is cut, and the count of one fails.
+    async fn refused_connection<L: Accept + 'static>(
+        listener: L,
+        target: SocketAddr,
+    ) -> serde_json::Value {
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(listener).await;
+
+        let mut client = TcpStream::connect(target).await.expect("connect");
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf))
+            .await
+            .expect("a refused connection is closed at once, not left open");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        await_audit_records(dir.path(), 1).await;
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+        only_audit_record(dir.path())
+    }
+
+    /// A connection made straight to the listener, the way a container
+    /// process that read its port from `/proc/net/tcp` makes one. The redirect
+    /// leaves loopback alone, so nothing displaced the destination, and what
+    /// `SO_ORIGINAL_DST` reports is the listener's own address -- which the
+    /// host would dial as whatever it has on that port.
+    ///
+    /// Against the socket the attachment really binds. The destination is the
+    /// kernel's own answer, or with `stand_in` said outright: the address the
+    /// client dials, which is what the kernel would report.
+    async fn dial_the_listener_directly(to: IpAddr, stand_in: bool) {
+        let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let target = SocketAddr::new(to, port);
+
+        let record = if stand_in {
+            let dst = target;
+            refused_connection(Redirected { listener, dst }, target).await
+        } else {
+            refused_connection(listener, target).await
+        };
+
+        assert_eq!(record["outrig.rule"], UNREDIRECTED_RULE, "{record:#}");
+        assert_eq!(record["outrig.action"], "deny");
+        assert_eq!(record["id.resp_h"], to.to_string());
+        assert_eq!(record["id.resp_p"], port);
+        assert_eq!(record["orig_bytes"], 0);
+        assert_eq!(record["resp_bytes"], 0);
+    }
+
+    /// With the kernel's own `SO_ORIGINAL_DST`, which is what makes the
+    /// destination the listener's own address in the first place.
+    #[tokio::test]
+    async fn a_direct_connection_to_the_listener_is_refused_not_dialed() {
+        require_original_dst().await;
+        dial_the_listener_directly(Ipv4Addr::LOCALHOST.into(), false).await;
+    }
+
+    /// Each family's client of the dual-stack listener, with the destination
+    /// said outright, so it holds on a host with no conntrack to give one --
+    /// the kernel tracks IPv6 flows only in a namespace something has asked it
+    /// to, and a test process's need not have. What it does not isolate is the
+    /// v4-mapped comparison, which the loopback half would settle here on its
+    /// own: that is the truth table's.
+    #[tokio::test]
+    async fn a_direct_connection_to_the_listener_is_refused_over_either_family() {
+        dial_the_listener_directly(Ipv4Addr::LOCALHOST.into(), true).await;
+        if kernel_has_ipv6() {
+            dial_the_listener_directly(Ipv6Addr::LOCALHOST.into(), true).await;
+        }
+    }
+
+    /// A destination in loopback is never one a redirect carried, whatever it
+    /// is equal to, because the redirect returns ahead of loopback. Only a
+    /// stand-in can say a connection was headed there: a real flow that was
+    /// would have reached the listener by itself, with its own address.
+    #[tokio::test]
+    async fn a_loopback_destination_is_refused_whatever_it_arrived_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let headed_for: SocketAddr = "127.0.0.1:9".parse().expect("address");
+        assert_ne!(headed_for, addr);
+
+        let record = refused_connection(
+            Redirected {
+                listener,
+                dst: headed_for,
+            },
+            addr,
+        )
+        .await;
+
+        assert_eq!(record["outrig.rule"], UNREDIRECTED_RULE, "{record:#}");
+        assert_eq!(record["id.resp_h"], "127.0.0.1");
+        assert_eq!(record["id.resp_p"], 9);
+    }
+
+    /// A connection the redirect did carry here, to another host that uses the
+    /// port the listener happens to have, is carried.
+    #[tokio::test]
+    async fn a_redirected_connection_to_another_host_on_the_listeners_port_is_carried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dst = SocketAddr::new(ELSEWHERE.ip(), addr.port());
+        let (dir, cancel, mut tasks) = spawn_allow_all_loop(Redirected { listener, dst }).await;
+
+        // Silent, so it parks in the sniff read and nothing is dialed.
+        let _client = TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(SNIFF_TIMEOUT / 5).await;
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow", "{record:#}");
+        assert_ne!(record["outrig.rule"], UNREDIRECTED_RULE);
+        assert_eq!(record["id.resp_h"], dst.ip().to_string());
+        assert_eq!(record["id.resp_p"], dst.port());
+    }
+
+    /// What `not_redirected` takes as a connection no redirect carried, and
+    /// what it leaves to policy.
+    #[test]
+    fn a_connection_is_not_redirected_when_it_is_headed_where_it_arrived_or_into_loopback() {
+        for (dst, local) in [
+            // Straight to the listener, over each family.
+            ("127.0.0.1:40000", "127.0.0.1:40000"),
+            ("[::1]:40000", "[::1]:40000"),
+            // The same, as the dual-stack listener reports an IPv4 client's
+            // end of it.
+            ("127.0.0.1:40000", "[::ffff:127.0.0.1]:40000"),
+            ("10.88.0.2:40000", "[::ffff:10.88.0.2]:40000"),
+            // The host dialing the container's address on the listener's
+            // port: the second hop of the bridge loop.
+            ("10.88.0.2:40000", "10.88.0.2:40000"),
+            ("[fd00::2]:40000", "[fd00::2]:40000"),
+            // Loopback that is not the listener's address.
+            ("127.0.0.1:9", "127.0.0.1:40000"),
+            ("127.0.0.2:40000", "127.0.0.1:40000"),
+            ("[::1]:9", "[::1]:40000"),
+            ("127.0.0.1:40000", "[::1]:40000"),
+            ("[::ffff:127.0.0.1]:9", "127.0.0.1:40000"),
+        ] {
+            assert!(not_redirected(addr(dst), addr(local)), "{dst} on {local}");
+        }
+
+        for (dst, local) in [
+            ("93.184.216.34:443", "127.0.0.1:40000"),
+            ("[2001:db8::1]:443", "[::1]:40000"),
+            ("93.184.216.34:443", "[::ffff:127.0.0.1]:40000"),
+            // The listener's port, on a host that is not the listener.
+            ("93.184.216.34:40000", "127.0.0.1:40000"),
+            ("[2001:db8::1]:40000", "[::1]:40000"),
+            // The container's own address, redirected here: it is the host's
+            // dial back that is refused, on its arrival.
+            ("10.88.0.2:40000", "127.0.0.1:40000"),
+        ] {
+            assert!(!not_redirected(addr(dst), addr(local)), "{dst} on {local}");
+        }
+    }
+
     #[test]
     fn a_helper_failure_names_its_step_and_keeps_its_errno() {
         let err = bind_failure(nsfork::Status::failed(
@@ -6266,6 +8435,266 @@ mod tests {
             err.to_string().contains("bind the DNS listener on port 53"),
             "{err}"
         );
+    }
+
+    /// A `dns_tcp_loop` on a listener bound the way attach binds one,
+    /// forwarding to `resolvers`: its address, the token that ends the loop,
+    /// and the set holding it.
+    async fn spawned_dns_tcp_loop(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+        policy: Arc<CompiledNetworkPolicy>,
+    ) -> (SocketAddr, CancellationToken, JoinSet<Result<()>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = std::net::TcpListener::from(
+            bind_any(SockType::Stream, 0).expect("bind dns tcp listener"),
+        );
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_tcp_loop(
+            TcpListener::from_std(listener).expect("listener"),
+            resolvers,
+            bindings,
+            policy,
+            audit,
+            cancel.clone(),
+        ));
+        (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), cancel, tasks)
+    }
+
+    /// A resolver that answers every framed query it is sent over TCP with
+    /// `answer(query)`, and the address it is at.
+    async fn tcp_resolver(answer: fn(&DnsQuery) -> Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(raw) = read_dns_frame(&mut stream).await {
+                        let query = dns_query(&raw).expect("parse");
+                        write_dns_frame(&mut stream, &answer(&query))
+                            .await
+                            .expect("answer");
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn ask_over_tcp(listener: SocketAddr, txid: u16, name: &str) -> Vec<u8> {
+        let mut client = TcpStream::connect(listener).await.expect("connect");
+        write_dns_frame(&mut client, &dns_packet(txid, DNS_QUERY_FLAGS, name, &[]))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(2), read_dns_frame(&mut client))
+            .await
+            .expect("the lookup was not answered")
+            .expect("read the answer")
+    }
+
+    /// A lookup made over TCP is answered and bound as one made over UDP is.
+    #[tokio::test]
+    async fn a_lookup_over_tcp_is_answered_and_binds() {
+        let resolver = tcp_resolver(|query| {
+            let name = query.question.name.as_str();
+            dns_packet(
+                query.txid,
+                DNS_RESPONSE_FLAGS,
+                name,
+                &[Rr::A(name, [198, 51, 100, 9], 60)],
+            )
+        })
+        .await;
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![resolver], bindings.clone(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x4242, "tcp.test").await;
+
+        assert_eq!(dns_txid(&reply), Some(0x4242));
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.9")),
+            resolved(&["tcp.test"])
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A truncated answer is passed through and binds nothing, over TCP as
+    /// over UDP.
+    #[tokio::test]
+    async fn a_truncated_answer_over_tcp_binds_nothing() {
+        let resolver = tcp_resolver(|query| {
+            let name = query.question.name.as_str();
+            dns_packet(
+                query.txid,
+                DNS_RESPONSE_FLAGS | 0x0200,
+                name,
+                &[Rr::A(name, [198, 51, 100, 10], 60)],
+            )
+        })
+        .await;
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![resolver], bindings.clone(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x1, "cut.test").await;
+
+        assert_eq!(dns_flags(&reply).map(|f| f & 0x0200), Some(0x0200));
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.10")),
+            ResolvedNames::default()
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A lookup the policy refuses is answered REFUSED without a resolver
+    /// being asked, and no resolver is needed to say so.
+    #[tokio::test]
+    async fn a_refused_lookup_over_tcp_is_answered_refused() {
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), deny_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x7, "nope.test").await;
+
+        assert_eq!(
+            dns_flags(&reply).map(|f| f & 0x000f),
+            Some(DNS_RCODE_REFUSED)
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// With no resolver to answer, the client is told so rather than left to
+    /// wait, and the loop carries on.
+    #[tokio::test]
+    async fn an_unanswered_lookup_over_tcp_is_answered_servfail() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead = held.local_addr().expect("addr");
+        drop(held);
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(vec![dead], empty_bindings(), allow_all_policy()).await;
+
+        let reply = ask_over_tcp(listener, 0x9, "down.test").await;
+
+        assert_eq!(dns_txid(&reply), Some(0x9));
+        assert_eq!(
+            dns_flags(&reply).map(|f| f & 0x000f),
+            Some(DNS_RCODE_SERVFAIL)
+        );
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A zone transfer answers in several messages, which the forward does
+    /// not carry; it is refused, not returned as its first message.
+    #[tokio::test]
+    async fn a_zone_transfer_over_tcp_is_refused_not_cut_short() {
+        // No resolver to ask: a forward would be answered SERVFAIL instead.
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), allow_all_policy()).await;
+        // The second is a valid zone name (RFC 2317) the policy's name parser
+        // does not take, so there is no parsed query to ask its type of.
+        for zone in ["example.test", "0/25.2.0.192.in-addr.arpa"] {
+            let mut query = dns_packet(0x5, DNS_QUERY_FLAGS, zone, &[]);
+            // The question's type, which is the last two bytes before its class.
+            let at = query.len() - 4;
+            query[at..at + 2].copy_from_slice(&252u16.to_be_bytes());
+            let mut client = TcpStream::connect(listener).await.expect("connect");
+            write_dns_frame(&mut client, &query).await.expect("send");
+
+            let reply = tokio::time::timeout(Duration::from_secs(2), read_dns_frame(&mut client))
+                .await
+                .expect("the transfer was not answered")
+                .expect("read the answer");
+
+            assert_eq!(
+                dns_flags(&reply).map(|f| f & 0x000f),
+                Some(DNS_RCODE_REFUSED),
+                "{zone}"
+            );
+        }
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A client that sends queries and never reads the answers must not hold
+    /// its connection forever: the write that cannot finish is given up on,
+    /// which is what frees the slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_reads_no_answers_does_not_keep_its_connection() {
+        let (listener, cancel, mut tasks) =
+            spawned_dns_tcp_loop(Vec::new(), empty_bindings(), deny_all_policy()).await;
+        let mut client = TcpStream::connect(listener).await.expect("connect");
+        let mut frame = Vec::new();
+        write_dns_frame(
+            &mut frame,
+            &dns_packet(0x6, DNS_QUERY_FLAGS, "flood.test", &[]),
+        )
+        .await
+        .expect("frame");
+        // Many to a write, so the buffers fill in few of them.
+        let frame = frame.repeat(512);
+        // Until the kernel will take no more in either direction, which is
+        // when the loop is parked in a write.
+        let mut full = 0;
+        while full < 2 {
+            match client.try_write(&frame) {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    full += 1;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+
+        tokio::time::sleep(DNS_TCP_IDLE * 2).await;
+
+        // Whatever the server had already queued arrives, and then it ends:
+        // closed, not parked.
+        let mut sink = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), client.read(&mut sink)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(_)) => {}
+                Err(_) => panic!("the stalled connection was not closed"),
+            }
+        }
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The port a closed attach's connections still hold in `TIME_WAIT` can
+    /// be bound again at once, which a re-attach to the same container does;
+    /// a port a listener holds still cannot be.
+    #[tokio::test]
+    async fn the_fixed_listener_port_binds_again_after_a_server_first_close() {
+        let first = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        let port = first.local_addr().expect("addr").port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (served, _) = first.accept().expect("accept");
+        // The server closes first, which is what leaves it holding the port.
+        drop(served);
+        drop(client);
+
+        assert!(
+            bind_any(SockType::Stream, port).is_err(),
+            "a live listener's port must stay refused"
+        );
+        drop(first);
+        bind_any(SockType::Stream, port).expect("bind again with the old connection lingering");
     }
 
     /// The script's shape: `create table` first, then nothing but flat
@@ -6292,7 +8721,7 @@ mod tests {
 
     #[test]
     fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
-        let rules = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        let rules = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Allow);
         assert_flat_nft_script(&rules);
         assert!(rules.contains("add rule inet outrig_test output ip daddr 127.0.0.0/8 return"));
         assert!(rules.contains("add rule inet outrig_test output ip6 daddr ::1 return"));
@@ -6300,6 +8729,13 @@ mod tests {
             rules.contains("add rule inet outrig_test output meta l4proto tcp redirect to :44123")
         );
         assert!(rules.contains("add rule inet outrig_test output udp dport 53 redirect to :44124"));
+        let dns = rules
+            .find("output tcp dport 53 redirect to :44125")
+            .expect("a TCP lookup is redirected to the DNS listener");
+        let generic = rules
+            .find("output meta l4proto tcp redirect to :44123")
+            .expect("generic TCP redirect");
+        assert!(dns < generic, "the DNS rule must come first: {rules}");
     }
 
     /// The `egress` chain's policy is the policy's `default`, and that is the
@@ -6313,8 +8749,8 @@ mod tests {
                  {{ type filter hook output priority filter; policy {verdict}; }}\n"
             )
         };
-        let allow = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
-        let deny = nft_rules("outrig_test", 44123, 44124, NetworkAction::Deny);
+        let allow = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Allow);
+        let deny = nft_rules("outrig_test", 44123, 44124, 44125, NetworkAction::Deny);
         assert_flat_nft_script(&deny);
         assert!(allow.contains(&chain("accept")), "{allow}");
         assert!(deny.contains(&chain("drop")), "{deny}");
@@ -6432,12 +8868,73 @@ options edns0
         assert_eq!(assertion.asserted_host(), Some("registry.npmjs.org"));
     }
 
+    /// A `Host:` line a read ended partway through holds part of a name, and
+    /// claiming that part would let `*.evil.example` miss `www.evil.exa`.
+    #[test]
+    fn a_host_line_cut_short_is_not_a_claim() {
+        assert_eq!(
+            sniff_client_bytes(b"GET / HTTP/1.1\r\nHost: www.evil.exa"),
+            None
+        );
+        // Ended by a bare `\n`, it is one.
+        let assertion =
+            sniff_client_bytes(b"GET / HTTP/1.1\nHost: www.evil.example\n").expect("http sniff");
+        assert_eq!(assertion.asserted_host(), Some("www.evil.example"));
+    }
+
+    /// The claim is the head's `Host:` line, wherever it sits among bytes
+    /// that are not text, and never a line of the body.
+    #[test]
+    fn only_the_request_head_is_read_for_a_host() {
+        for request in [
+            &b"POST /upload HTTP/1.1\r\nHost: www.evil.example\r\n\r\n\xff\xfe\x00\x01"[..],
+            b"GET / HTTP/1.1\r\nCookie: \xff\r\nHost: www.evil.example\r\n\r\n",
+        ] {
+            let assertion = sniff_client_bytes(request).expect("http sniff");
+            assert_eq!(assertion.http_host.as_deref(), Some("www.evil.example"));
+        }
+        assert_eq!(
+            sniff_client_bytes(
+                b"POST / HTTP/1.1\r\nContent-Length: 24\r\n\r\nHost: www.evil.example\r\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_opening_is_unfinished_until_its_record_or_head_has_arrived() {
+        for whole in [
+            tls_client_hello("registry.npmjs.org"),
+            http_request("registry.npmjs.org"),
+            b"GET / HTTP/1.1\nHost: registry.npmjs.org\n\n".to_vec(),
+        ] {
+            for end in 1..whole.len() {
+                assert!(
+                    opening_unfinished(&whole[..end]),
+                    "{:?} is not all of it",
+                    &whole[..end]
+                );
+            }
+            assert!(!opening_unfinished(&whole), "{whole:?} is all of it");
+        }
+        // Bytes that begin neither are as complete as they will get from the
+        // first one: an ssh banner, a postgres `SSLRequest`, a memcached get.
+        for other in [
+            &b"SSH-2.0-OpenSSH_9.6\r\n"[..],
+            b"\x00\x00\x00\x08\x04\xd2\x16\x2f",
+            b"get key\r\n",
+        ] {
+            assert!(!opening_unfinished(other), "{other:?}");
+        }
+    }
+
     #[test]
     fn audit_record_uses_zeek_conn_field_names() {
         let record = AuditRecord::new(
             "20260513T000000-abcd",
             "outrig-test",
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(125),
                 orig: addr("10.0.2.100:50123"),
@@ -6483,6 +8980,7 @@ options edns0
                 "sid",
                 "outrig-test",
                 AuditEvent {
+                    proto: "tcp",
                     opened: UNIX_EPOCH,
                     duration: Duration::from_millis(1),
                     orig: addr("10.0.2.100:50123"),
@@ -6514,12 +9012,91 @@ options edns0
         assert!(unknown.get("outrig.host_source").is_none());
     }
 
+    /// A lookup is recorded as the UDP exchange with the DNS listener it is,
+    /// by the name it asked for, which is a claim and says so.
+    #[test]
+    fn a_lookup_audit_record_says_udp_dns_and_an_asserted_host() {
+        let record = |assertion: ClientAssertion| {
+            let record = AuditRecord::new(
+                "20260513T000000-abcd",
+                "outrig-test",
+                AuditEvent {
+                    proto: "udp",
+                    opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    duration: Duration::ZERO,
+                    orig: addr("10.0.2.100:50123"),
+                    dst: addr("127.0.0.1:53"),
+                    resolved: ResolvedNames::default(),
+                    assertion,
+                    service: "dns",
+                    bytes_tx: 29,
+                    bytes_rx: 0,
+                    decision: PolicyDecision::new(NetworkAction::Deny, "default"),
+                },
+            );
+            serde_json::to_value(record).expect("record json")
+        };
+
+        let json = record(ClientAssertion::dns("example.test".to_string()));
+        assert_eq!(json["ts"], 1_700_000_000.0);
+        assert_eq!(json["id.orig_h"], "10.0.2.100");
+        assert_eq!(json["id.orig_p"], 50123);
+        assert_eq!(json["id.resp_h"], "127.0.0.1");
+        assert_eq!(json["id.resp_p"], 53);
+        assert_eq!(json["proto"], "udp");
+        assert_eq!(json["service"], "dns");
+        assert_eq!(json["duration"], 0.0);
+        assert_eq!(json["orig_bytes"], 29);
+        assert_eq!(json["resp_bytes"], 0);
+        assert_eq!(json["conn_state"], "S0");
+        assert_eq!(json["outrig.container"], "outrig-test");
+        assert_eq!(json["outrig.host"], "example.test");
+        assert_eq!(json["outrig.host_source"], "asserted");
+        assert_eq!(json["outrig.action"], "deny");
+        assert_eq!(json["outrig.rule"], "default");
+        assert!(json.get("server_name").is_none());
+
+        // A query with no name to record has no host either.
+        let json = record(ClientAssertion::default());
+        assert!(json.get("outrig.host").is_none());
+        assert!(json.get("outrig.host_source").is_none());
+        assert_eq!(json["service"], "dns");
+    }
+
+    /// The listener is dual-stack, so the address a query was sent to arrives
+    /// v4-mapped for an IPv4 client, and is recorded as the IPv4 address it is.
+    #[test]
+    fn the_address_a_query_was_sent_to_reads_the_same_from_either_family() {
+        let mut mapped = [0u8; 16];
+        mapped[10..12].copy_from_slice(&[0xff, 0xff]);
+        mapped[12..].copy_from_slice(&[127, 0, 0, 1]);
+        let from_v6 = Asked::V6(libc::in6_pktinfo {
+            ipi6_addr: libc::in6_addr { s6_addr: mapped },
+            ipi6_ifindex: 0,
+        });
+        let from_v4 = Asked::V4(libc::in_pktinfo {
+            ipi_ifindex: 0,
+            ipi_spec_dst: libc::in_addr { s_addr: 0 },
+            ipi_addr: libc::in_addr {
+                s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+            },
+        });
+
+        for asked in [from_v6, from_v4] {
+            assert_eq!(
+                canonical(SocketAddr::new(asked.addr(), DNS_PORT)),
+                addr("127.0.0.1:53")
+            );
+        }
+    }
+
     #[test]
     fn audit_record_writes_deny_decision_with_zero_bytes() {
         let record = AuditRecord::new(
             "20260513T000000-abcd",
             "outrig-test",
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(1),
                 orig: addr("10.0.2.100:50123"),
@@ -6562,6 +9139,46 @@ options edns0
 
         assert_eq!(decision.action, NetworkAction::Deny);
         assert_eq!(decision.rule, "deny[0]");
+    }
+
+    /// A documented limit (see `decide`): with no lookup and no claim, only an
+    /// address entry has anything to match.
+    #[test]
+    fn a_hostname_deny_does_not_see_an_address_reached_without_a_lookup() {
+        let dst = "203.0.113.66:443";
+        let by_name = lookup_policy(NetworkAction::Allow, &[], &["evil.example"]);
+        let by_address = lookup_policy(NetworkAction::Allow, &[], &["203.0.113.66"]);
+
+        let announced = by_name.decide(
+            addr(dst),
+            &ResolvedNames::default(),
+            &ClientAssertion::tls("evil.example".to_string()),
+        );
+
+        assert_eq!(decide_bare(&by_name, dst), PolicyDecision::allow_default());
+        assert_eq!(announced, refused("deny[0]"));
+        assert_eq!(decide_bare(&by_address, dst), refused("deny[0]"));
+    }
+
+    /// A documented limit (see `decide`): another name announced on an address
+    /// a resolved name earned is weighed only against `deny`.
+    #[test]
+    fn an_address_one_resolved_name_earned_admits_another_announced_name() {
+        let dst = addr("203.0.113.66:443");
+        let shared = resolved(&["allowed.example"]);
+        let other = ClientAssertion::tls("other.example".to_string());
+
+        let open = lookup_policy(NetworkAction::Deny, &["allowed.example"], &[])
+            .decide(dst, &shared, &other);
+        let denied = lookup_policy(
+            NetworkAction::Deny,
+            &["allowed.example"],
+            &["other.example"],
+        )
+        .decide(dst, &shared, &other);
+
+        assert_eq!(open, allowed("allow[0]"));
+        assert_eq!(denied, refused("deny[0]"));
     }
 
     #[test]
@@ -6868,6 +9485,279 @@ options edns0
             NetworkAction::Deny,
             "an address glob describes addresses, so a registrable name that \
              matches it must not grant"
+        );
+    }
+
+    /// A glob's last literal belongs at the end of the name, wherever else
+    /// in the name it also appears.
+    #[test]
+    fn a_suffix_glob_matches_a_name_that_repeats_its_suffix() {
+        for (pattern, value) in [
+            ("*.evil.example", "a.evil.example.evil.example"),
+            ("*.com", "a.com.b.com"),
+            ("*.npmjs.org", "registry.npmjs.org.npmjs.org"),
+            ("*.evil.example", "a.evil.example"),
+            ("10.0.*", "10.0.3.4"),
+            ("api.*.example", "api.x.example"),
+            ("*", "anything"),
+            ("a*b*c", "abc"),
+            ("example.com", "example.com"),
+        ] {
+            assert!(glob_matches(pattern, value), "{pattern} vs {value}");
+        }
+        for (pattern, value) in [
+            ("*.com", "a.com.evil.net"),
+            ("*.npmjs.org", "npmjs.org"),
+            ("a*a", "a"),
+            ("api.*.example", "api.example"),
+            ("example.com", "example.com.evil"),
+        ] {
+            assert!(!glob_matches(pattern, value), "{pattern} vs {value}");
+        }
+    }
+
+    /// A filter policy with `default`, whose `allow` and `deny` entries are
+    /// the hosts a config would write, none with a port.
+    fn lookup_policy(
+        default: NetworkAction,
+        allow: &[&str],
+        deny: &[&str],
+    ) -> CompiledNetworkPolicy {
+        let mut policy = NetworkPolicy::builder().default_action(default);
+        for host in allow {
+            policy = policy.allow_host(*host);
+        }
+        for host in deny {
+            policy = policy.deny_host(*host);
+        }
+        compiled(policy.build().expect("policy"))
+    }
+
+    /// An allow default that denies only connections to port 22, so no
+    /// lookup is refused by name.
+    fn ports_only_policy() -> CompiledNetworkPolicy {
+        compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host_port("*", 22)
+                .build()
+                .expect("policy"),
+        )
+    }
+
+    fn allowed(rule: &str) -> PolicyDecision {
+        PolicyDecision::new(NetworkAction::Allow, rule)
+    }
+
+    fn refused(rule: &str) -> PolicyDecision {
+        PolicyDecision::new(NetworkAction::Deny, rule)
+    }
+
+    #[test]
+    fn a_lookup_under_an_allow_default_is_allowed_with_the_default_rule() {
+        let open = compiled(NetworkPolicy::allow_all());
+        assert_eq!(
+            open.decide_lookup(Some("anything.example")),
+            PolicyDecision::allow_default()
+        );
+        // A deny entry for a port, or for an address, forbids no lookup.
+        assert_eq!(
+            ports_only_policy().decide_lookup(Some("anything.example")),
+            PolicyDecision::allow_default()
+        );
+    }
+
+    #[test]
+    fn a_lookup_under_a_deny_default_is_refused_when_no_allow_entry_could_cover_it() {
+        let policy = lookup_policy(NetworkAction::Deny, &["github.com", "*.npmjs.org"], &[]);
+        assert_eq!(
+            policy.decide_lookup(Some("x.attacker.example")),
+            refused("default")
+        );
+        // The names of a zone it does not name, however close.
+        assert_eq!(
+            policy.decide_lookup(Some("github.com.attacker.example")),
+            refused("default")
+        );
+    }
+
+    /// A question has no port, so an entry that names one still opens the
+    /// lookups of its host: the connection it grants is to a name that has to
+    /// be resolved first.
+    #[test]
+    fn a_hostname_allow_opens_the_lookups_it_matches_whatever_its_port() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host_port("github.com", 443)
+                .allow_host("*.npmjs.org")
+                .build()
+                .expect("policy"),
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("github.com")),
+            allowed("allow[0]")
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("registry.npmjs.org")),
+            allowed("allow[1]")
+        );
+    }
+
+    /// `*.npmjs.org` grants no connection to `npmjs.org` itself, so it opens
+    /// no lookup of it either: the apex needs an entry of its own.
+    #[test]
+    fn a_wildcard_hostname_allow_does_not_open_the_lookup_of_its_own_apex() {
+        let policy = lookup_policy(NetworkAction::Deny, &["*.npmjs.org"], &[]);
+        assert_eq!(policy.decide_lookup(Some("npmjs.org")), refused("default"));
+    }
+
+    /// Deny wins, as it does for a connection, so the log never calls a name
+    /// `allow` that a deny entry matches -- under either default.
+    #[test]
+    fn a_portless_hostname_deny_refuses_a_lookup_an_allow_would_cover() {
+        for default in [NetworkAction::Deny, NetworkAction::Allow] {
+            let policy = lookup_policy(default, &["*.example.com"], &["*.evil.example.com"]);
+            assert_eq!(
+                policy.decide_lookup(Some("x.evil.example.com")),
+                refused("deny[0]"),
+                "default {default:?}"
+            );
+            assert_ne!(
+                policy.decide_lookup(Some("x.good.example.com")).action,
+                NetworkAction::Deny,
+                "default {default:?}"
+            );
+        }
+    }
+
+    /// An entry for one port forbids connections there and no more, and an
+    /// address has no name to forbid.
+    #[test]
+    fn a_deny_entry_with_a_port_or_an_address_never_refuses_a_lookup() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host("*.example.com")
+                .deny_host_port("evil.example.com", 443)
+                .deny_host("203.0.113.0/24")
+                .deny_host("203.0.113.9")
+                .deny_host("203.0.*")
+                .build()
+                .expect("policy"),
+        );
+        assert_eq!(
+            policy.decide_lookup(Some("evil.example.com")),
+            allowed("allow[0]")
+        );
+    }
+
+    /// The entry grants connections to that address, and a name is not one:
+    /// whoever picks the name picks where it resolves, so the entry is no
+    /// evidence the name is wanted.
+    #[test]
+    fn an_allow_of_an_address_or_a_range_opens_no_lookup() {
+        let policy = lookup_policy(
+            NetworkAction::Deny,
+            &[
+                "203.0.113.7",
+                "10.0.0.0/8",
+                "2001:db8::/32",
+                "10.0.*",
+                "*.*",
+            ],
+            &[],
+        );
+        assert_eq!(policy.decide_lookup(Some("svc.corp")), refused("default"));
+    }
+
+    /// `allow = ["*"]` has always meant everything, and what it grants a
+    /// connection to is whatever a name resolves to.
+    #[test]
+    fn an_allow_covering_every_address_opens_every_lookup() {
+        for host in ["*", "**", "0.0.0.0/0", "::/0"] {
+            let policy = lookup_policy(NetworkAction::Deny, &["github.com", host], &[]);
+            assert_eq!(
+                policy.decide_lookup(Some("anything.example")),
+                allowed("allow[1]"),
+                "allow = {host:?}"
+            );
+        }
+    }
+
+    /// A query that is not a plain question has no name for the policy to
+    /// speak for. Where nothing is refused by name it is let through as it
+    /// always was; where something is, it is not a way round.
+    #[test]
+    fn an_unparsed_lookup_is_refused_only_where_a_name_could_be_refused() {
+        let unparsed = refused(UNPARSED_LOOKUP_RULE);
+
+        assert_eq!(
+            lookup_policy(NetworkAction::Deny, &["github.com"], &[]).decide_lookup(None),
+            unparsed
+        );
+        assert_eq!(
+            lookup_policy(NetworkAction::Allow, &[], &["*.evil.example"]).decide_lookup(None),
+            unparsed
+        );
+        assert_eq!(
+            compiled(NetworkPolicy::allow_all()).decide_lookup(None),
+            PolicyDecision::allow_default()
+        );
+        assert_eq!(
+            ports_only_policy().decide_lookup(None),
+            PolicyDecision::allow_default()
+        );
+    }
+
+    /// A name is decided as the lowercase one the resolver treats it as: a
+    /// stub that randomizes case, or a container that writes `GitHub.com`,
+    /// asks for the same name.
+    #[test]
+    fn a_mixed_case_question_is_decided_as_its_lowercase() {
+        let policy = lookup_policy(NetworkAction::Deny, &["github.com"], &[]);
+        let packet = dns_packet(0x1234, DNS_QUERY_FLAGS, "GitHub.COM", &[]);
+        let query = dns_query(&packet).expect("parses");
+        assert_eq!(
+            policy.decide_lookup(Some(&query.question.name)),
+            allowed("allow[0]")
+        );
+    }
+
+    /// Whoever runs a denied zone's DNS can answer for any name under it, so
+    /// a name that repeats the zone must not slip past the deny.
+    #[test]
+    fn a_deny_glob_covers_a_name_that_repeats_its_zone() {
+        let denying = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let name = "x.evil.example.evil.example";
+
+        assert_eq!(
+            denying
+                .decide(
+                    addr("203.0.113.66:443"),
+                    &resolved(&[name]),
+                    &ClientAssertion::default()
+                )
+                .action,
+            NetworkAction::Deny,
+            "resolved as {name}"
+        );
+        assert_eq!(
+            denying
+                .decide(
+                    addr("203.0.113.66:443"),
+                    &ResolvedNames::default(),
+                    &ClientAssertion::tls(name.to_string())
+                )
+                .action,
+            NetworkAction::Deny,
+            "asserted as {name}"
         );
     }
 
@@ -7205,6 +10095,100 @@ options edns0
         assert!(bindings.by_ip.len() <= MAX_BOUND_ADDRESSES);
     }
 
+    /// A wildcard zone answers every name it is asked with the one address, so
+    /// the names behind an address are as unbounded as the container's loop.
+    #[test]
+    fn names_per_address_are_capped() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        let flood = MAX_NAMES_PER_ADDRESS + 16;
+        for n in 0..flood {
+            bindings.bind(
+                shared,
+                &format!("n{n}.wild.test"),
+                Duration::from_secs(60),
+                now,
+            );
+        }
+
+        assert_eq!(bindings.by_ip[&shared].len(), MAX_NAMES_PER_ADDRESS);
+        // The name a container has just resolved is the one it is about to
+        // connect to, so it is never the one left out.
+        assert!(
+            bindings
+                .names(shared, now)
+                .iter()
+                .any(|name| name == format!("n{}.wild.test", flood - 1))
+        );
+    }
+
+    #[test]
+    fn the_name_that_expires_soonest_is_evicted() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        // Bound out of order, so the victim is chosen by expiry and not by
+        // insertion or name order.
+        for n in (0..MAX_NAMES_PER_ADDRESS).rev() {
+            bindings.bind(
+                shared,
+                &format!("n{n}.test"),
+                Duration::from_secs(60 + n as u64),
+                now,
+            );
+        }
+        bindings.bind(shared, "newest.test", Duration::from_secs(60), now);
+
+        let held = bindings.by_ip[&shared].keys().cloned().collect::<Vec<_>>();
+        assert_eq!(held.len(), MAX_NAMES_PER_ADDRESS);
+        assert!(!held.contains(&"n0.test".to_string()), "{held:?}");
+        assert!(held.contains(&"n1.test".to_string()), "{held:?}");
+        assert!(held.contains(&"newest.test".to_string()), "{held:?}");
+    }
+
+    /// The probe path is what a container re-resolving a name it holds takes;
+    /// it adds nothing, so there is nothing to make room for.
+    #[test]
+    fn re_resolving_a_name_at_the_cap_evicts_nothing() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        for n in 0..MAX_NAMES_PER_ADDRESS {
+            bindings.bind(shared, &format!("n{n}.test"), Duration::from_secs(60), now);
+        }
+        bindings.bind(shared, "n0.test", Duration::from_secs(600), now);
+
+        assert_eq!(bindings.by_ip[&shared].len(), MAX_NAMES_PER_ADDRESS);
+        assert_eq!(
+            bindings.by_ip[&shared]["n0.test"],
+            now + Duration::from_secs(600)
+        );
+    }
+
+    /// `names` already filters what has expired; this is about what is still
+    /// held, which is what the clone and the policy scan are paid on.
+    #[test]
+    fn binding_a_new_name_drops_the_addresss_expired_names() {
+        let now = Instant::now();
+        let shared = ip("203.0.113.66");
+        let mut bindings = NameBindings::default();
+        bindings.bind(shared, "old.test", Duration::from_secs(60), now);
+        bindings.bind(shared, "older.test", Duration::from_secs(60), now);
+
+        bindings.bind(
+            shared,
+            "new.test",
+            Duration::from_secs(60),
+            now + Duration::from_secs(120),
+        );
+
+        assert_eq!(
+            bindings.by_ip[&shared].keys().collect::<Vec<_>>(),
+            ["new.test"]
+        );
+    }
+
     /// The interceptor waits out its whole timeout for a datagram that
     /// actually answers the query, so an off-path host that guessed the
     /// ephemeral port cannot decide what a name resolves to.
@@ -7285,6 +10269,191 @@ options edns0
         assert_eq!(response, reply);
     }
 
+    /// A resolver that is not there is passed over at once and the next one
+    /// asked: its refusal reaches the forward, rather than leaving it to wait
+    /// out `DNS_TIMEOUT` for an answer that will never come.
+    #[tokio::test]
+    async fn forward_dns_moves_past_a_resolver_that_refuses() {
+        let (_held, refusing) = refusing_resolver();
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let resolver_addr = resolver.local_addr().expect("resolver addr");
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let answer = dns_packet(
+            0x1234,
+            DNS_RESPONSE_FLAGS,
+            "example.test",
+            &[Rr::A("example.test", [198, 51, 100, 7], 60)],
+        );
+        let sent = answer.clone();
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (_, client) = resolver.recv_from(&mut buf).await.expect("recv query");
+            let _ = resolver.send_to(&sent, client).await;
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_dns(
+                &query,
+                Some(&asked("example.test")),
+                &[refusing, resolver_addr],
+            ),
+        )
+        .await
+        .expect("a resolver that refused was waited out")
+        .expect("the next resolver answers");
+
+        assert_eq!(response, answer);
+    }
+
+    /// A query for `name_bytes` as its one question, written as given.
+    fn dns_query_with_question_bytes(name_bytes: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        packet.extend_from_slice(name_bytes);
+        // QTYPE A, QCLASS IN.
+        packet.extend_from_slice(&[0, 1, 0, 1]);
+        packet
+    }
+
+    /// No stub compresses the first name in a packet, and one that is
+    /// compressed can be read two ways. Here `bad` followed by a pointer to a
+    /// root byte -- the first byte of the question's own type -- decoded as
+    /// `bad.`, which no deny glob for `bad` matches.
+    #[test]
+    fn a_question_using_a_compression_pointer_does_not_parse() {
+        let pointer_to_root = dns_query_with_question_bytes(&[3, b'b', b'a', b'd', 0xc0, 18]);
+        assert!(dns_question(&pointer_to_root).is_none());
+        assert!(dns_query(&pointer_to_root).is_none());
+
+        let looping = dns_query_with_question_bytes(&[3, b'b', b'a', b'd', 0xc0, 16]);
+        assert!(dns_question(&looping).is_none());
+
+        let plain = dns_query_with_question_bytes(&dns_labels_bytes(&["bad"]));
+        assert_eq!(dns_question(&plain).expect("parses").name, "bad");
+    }
+
+    /// The longest name there is, 253 characters of 127 labels, parses; one
+    /// label more is not a name, and is not one a log line should carry.
+    #[test]
+    fn a_question_name_longer_than_a_name_may_be_does_not_parse() {
+        let name_of =
+            |labels: usize| dns_query_with_question_bytes(&dns_labels_bytes(&vec!["a"; labels]));
+        let longest = dns_question(&name_of(127)).expect("a name of 253 characters parses");
+        assert_eq!(longest.name.len(), MAX_DNS_NAME);
+        assert!(dns_question(&name_of(128)).is_none());
+    }
+
+    /// The EDNS record a stub appends parses as part of a plain question;
+    /// nothing else does, since a name decides only what it accounts for.
+    #[test]
+    fn a_query_is_a_plain_question_only_when_it_is_nothing_but_one() {
+        // Root owner, OPT, a 4096-byte payload size, no flags, no options.
+        const OPT: [u8; 11] = [0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        let bare = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let with = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut packet = bare.clone();
+            edit(&mut packet);
+            packet
+        };
+        // The query with `record` as its one additional record.
+        let with_additional = |record: &[u8]| {
+            with(&|p| {
+                p[11] = 1;
+                p.extend_from_slice(record);
+            })
+        };
+        let is_plain = |packet: &[u8]| {
+            dns_query(packet)
+                .expect("the question parses")
+                .is_plain_question(packet)
+        };
+
+        assert!(is_plain(&bare));
+        assert!(is_plain(&with_additional(&OPT)));
+        // The same with a cookie option, which is framed and nothing more.
+        let cookie = [&OPT[..9], &[0, 12, 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]].concat();
+        assert!(is_plain(&with_additional(&cookie)));
+
+        let mut not_opt = OPT;
+        not_opt[2] = 16;
+        let not_plain = [
+            ("QR set", with(&|p| p[2] |= 0x80)),
+            ("opcode NOTIFY", with(&|p| p[2] |= 4 << 3)),
+            ("opcode UPDATE", with(&|p| p[2] |= 5 << 3)),
+            ("an answer record", with(&|p| p[7] = 1)),
+            ("an authority record", with(&|p| p[9] = 1)),
+            ("two additional records", with(&|p| p[11] = 2)),
+            ("trailing bytes", with(&|p| p.extend_from_slice(&[1, 2, 3]))),
+            (
+                "an additional record that is not OPT",
+                with_additional(&not_opt),
+            ),
+            (
+                "an OPT whose length is not what follows",
+                with_additional(&[&OPT[..], &[0]].concat()),
+            ),
+            (
+                "an OPT whose option is cut short",
+                with_additional(&[&OPT[..9], &[0, 3, 0, 10, 0]].concat()),
+            ),
+            (
+                "an OPT whose option overruns it",
+                with_additional(&[&OPT[..9], &[0, 6, 0, 10, 0, 8, 1, 2]].concat()),
+            ),
+        ];
+        for (what, packet) in not_plain {
+            assert!(!is_plain(&packet), "{what}");
+        }
+    }
+
+    /// A refusal is an answer the client takes for the one to its query, with
+    /// the one code that says the lookup was declined.
+    #[test]
+    fn a_refusal_echoes_the_question_and_carries_rcode_5() {
+        let query = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        let parsed = dns_query(&query).expect("parses");
+        let reply = dns_error_reply(&query, Some(&parsed), DNS_RCODE_REFUSED).expect("a reply");
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8185), "QR, RD, RA, REFUSED");
+        assert_eq!(reply[12..], query[12..parsed.question.end]);
+        assert_eq!(reply[4..12], [0, 1, 0, 0, 0, 0, 0, 0], "one question only");
+        assert!(parsed.answered_by(addr("127.0.0.1:53"), addr("127.0.0.1:53"), &reply));
+
+        // The header alone for a query that did not parse, and nothing for a
+        // datagram that is itself an answer.
+        let mut two = query.clone();
+        two[5] = 2;
+        let reply = dns_error_reply(&two, None, DNS_RCODE_REFUSED).expect("a header to answer");
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_flags(&reply), Some(0x8185));
+        let answer = dns_packet(0x1234, DNS_RESPONSE_FLAGS, "example.test", &[]);
+        assert_eq!(
+            dns_error_reply(&answer, dns_query(&answer).as_ref(), DNS_RCODE_REFUSED),
+            None
+        );
+    }
+
+    /// A SERVFAIL echoes only what the interceptor knows of its query: a
+    /// question it could not parse is left out, and a datagram that is no
+    /// query gets nothing.
+    #[test]
+    fn dns_servfail_echoes_only_what_it_can() {
+        // Two questions, so `dns_question` refuses it.
+        let mut unparsable = dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]);
+        unparsable[5] = 2;
+        assert!(dns_query(&unparsable).is_none());
+        let reply = dns_servfail(&unparsable, None).expect("a header to answer");
+        assert_eq!(reply.len(), 12);
+        assert_eq!(dns_txid(&reply), Some(0x1234));
+        assert_eq!(dns_flags(&reply), Some(0x8182), "QR, RD, RA, SERVFAIL");
+        assert_eq!(reply[4..12], [0; 8], "no question echoed, no records");
+
+        let answer = dns_packet(0x1234, DNS_RESPONSE_FLAGS, "example.test", &[]);
+        assert_eq!(dns_servfail(&answer, dns_query(&answer).as_ref()), None);
+        assert_eq!(dns_servfail(&unparsable[..11], None), None);
+    }
+
     /// Lateness exists only in the timed read: a client that says nothing
     /// inside the window asserts nothing at decision time, whichever parser
     /// its bytes would have reached.
@@ -7323,6 +10492,90 @@ options edns0
         assert_eq!(sniffed.assertion.sni.as_deref(), Some("registry.npmjs.org"));
         assert!(!sniffed.initial.is_empty());
         writer.abort();
+    }
+
+    /// Writes `bytes` as two pieces split at `at`, the second 10 ms after the
+    /// first -- long enough that a read taken between them returns only the
+    /// first.
+    async fn write_in_two<W: AsyncWrite + Unpin>(client: &mut W, bytes: &[u8], at: usize) {
+        let _ = client.write_all(&bytes[..at]).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = client.write_all(&bytes[at..]).await;
+    }
+
+    /// Wherever the opening is split, the name is read from all of it, and
+    /// the read ends when the rest arrives rather than when the window does.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_split_across_reads_is_read_whole() {
+        let hello = tls_client_hello("www.evil.example");
+        let request = http_request("www.evil.example");
+        for (whole, parser) in [(&hello, "tls"), (&request, "http")] {
+            for at in 1..whole.len() {
+                let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+                let sent = whole.clone();
+                let writer = tokio::spawn(async move {
+                    write_in_two(&mut client_side, &sent, at).await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+
+                let started = tokio::time::Instant::now();
+                let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+                assert_eq!(
+                    sniffed.assertion.asserted_host(),
+                    Some("www.evil.example"),
+                    "{parser} split at {at}"
+                );
+                assert_eq!(&sniffed.initial, whole, "{parser} split at {at}");
+                assert!(started.elapsed() < SNIFF_TIMEOUT, "{parser} split at {at}");
+                writer.abort();
+            }
+        }
+    }
+
+    /// The window bounds when the opening may begin, not when it must end:
+    /// one that starts just inside it still gets the time to finish.
+    #[tokio::test(start_paused = true)]
+    async fn an_opening_begun_at_the_end_of_the_window_is_read_whole() {
+        let hello = tls_client_hello("www.evil.example");
+        let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+        let sent = hello.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(SNIFF_TIMEOUT * 9 / 10).await;
+            let _ = client_side.write_all(&sent[..5]).await;
+            tokio::time::sleep(SNIFF_TIMEOUT / 2).await;
+            let _ = client_side.write_all(&sent[5..]).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+        assert_eq!(sniffed.assertion.sni.as_deref(), Some("www.evil.example"));
+        assert_eq!(sniffed.initial, hello);
+        writer.abort();
+    }
+
+    /// A beginning nothing completes is also what a client waiting on the
+    /// server looks like, so it is not waited on past the window.
+    #[tokio::test(start_paused = true)]
+    async fn an_opening_nothing_completes_is_given_up_on_when_the_window_closes() {
+        let hello = tls_client_hello("www.evil.example");
+        for beginning in [&hello[..5], b"GET key\r\n"] {
+            let (mut interceptor_side, mut client_side) = tokio::io::duplex(64 * 1024);
+            let sent = beginning.to_vec();
+            let writer = tokio::spawn(async move {
+                let _ = client_side.write_all(&sent).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+
+            let started = tokio::time::Instant::now();
+            let sniffed = sniff_client_stream(&mut interceptor_side).await;
+
+            assert!(started.elapsed() < SNIFF_TIMEOUT * 2, "{beginning:?}");
+            assert_eq!(sniffed.initial, beginning);
+            assert_eq!(sniffed.assertion, ClientAssertion::default());
+            writer.abort();
+        }
     }
 
     /// Two loopback pairs standing in for the container side and the upstream
@@ -7472,10 +10725,118 @@ options edns0
         assert_eq!(reader.await.expect("upstream reader"), expected);
     }
 
+    /// A late opening split across reads is read whole before any of it
+    /// moves: the five bytes that arrive alone name nothing, and forwarding
+    /// them would leave the rest to be read without its record header.
+    #[tokio::test]
+    async fn a_late_client_hello_split_across_reads_still_denies() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let (mut client, mut bridged_client, mut upstream, mut upstream_server) =
+            bridged_pair().await;
+        let mut outcome = allowed_outcome();
+        let resolved = ResolvedNames::default();
+
+        let hello = tls_client_hello("www.evil.example");
+        let writer = tokio::spawn(async move {
+            write_in_two(&mut client, &hello, 5).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        // Bounded, so a recheck that misses the name fails here rather than
+        // bridging to an upstream that never closes.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge(
+                &mut bridged_client,
+                &mut upstream,
+                &[],
+                Some(LateRecheck {
+                    dst: addr("203.0.113.66:443"),
+                    resolved: &resolved,
+                    policy: &policy,
+                }),
+                &mut outcome,
+            ),
+        )
+        .await
+        .expect("a denied bridge ends");
+
+        assert_eq!(outcome.decision.action, NetworkAction::Deny);
+        assert_eq!(outcome.decision.rule, "deny[0]");
+        assert_eq!(outcome.assertion.sni.as_deref(), Some("www.evil.example"));
+        assert_eq!(outcome.bytes_tx, 0);
+
+        drop(upstream);
+        let mut seen = Vec::new();
+        upstream_server
+            .read_to_end(&mut seen)
+            .await
+            .expect("read upstream");
+        assert!(
+            seen.is_empty(),
+            "no client bytes may reach a denied upstream"
+        );
+        writer.abort();
+    }
+
+    /// Held until it is whole, a late opening still reaches upstream exactly
+    /// once and in order.
+    #[tokio::test]
+    async fn a_late_opening_split_across_reads_is_forwarded_whole() {
+        let policy = compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .deny_host("*.evil.example")
+                .build()
+                .expect("policy"),
+        );
+        let (mut client, mut bridged_client, mut upstream, mut upstream_server) =
+            bridged_pair().await;
+        let mut outcome = allowed_outcome();
+        let resolved = ResolvedNames::default();
+
+        let hello = tls_client_hello("fine.example");
+        let expected = hello.clone();
+        tokio::spawn(async move {
+            write_in_two(&mut client, &hello, 5).await;
+            let _ = client.shutdown().await;
+        });
+        let reader = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let _ = upstream_server.read_to_end(&mut seen).await;
+            seen
+        });
+
+        bridge(
+            &mut bridged_client,
+            &mut upstream,
+            &[],
+            Some(LateRecheck {
+                dst: addr("203.0.113.66:443"),
+                resolved: &resolved,
+                policy: &policy,
+            }),
+            &mut outcome,
+        )
+        .await;
+
+        assert_eq!(outcome.decision.action, NetworkAction::Allow);
+        assert_eq!(outcome.assertion.sni.as_deref(), Some("fine.example"));
+        assert_eq!(outcome.bytes_tx, expected.len() as u64);
+        assert_eq!(reader.await.expect("upstream reader"), expected);
+    }
+
     #[tokio::test]
     async fn audit_sink_stamps_container_per_handle() {
         fn event() -> AuditEvent {
             AuditEvent {
+                proto: "tcp",
                 opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 duration: Duration::from_millis(1),
                 orig: addr("10.0.2.100:50123"),
@@ -7507,5 +10868,48 @@ options edns0
             assert_eq!(record["outrig.session_id"], "sid-1");
             assert_eq!(record["outrig.container"], container);
         }
+    }
+
+    /// A container launched holding `CAP_NET_ADMIN` is refused before the
+    /// interceptor reads anything about it. The handle here names no container
+    /// that exists, so a refusal that came any later would be the engine's
+    /// error and never name the capability, and an attach that got that far
+    /// would already have changed something.
+    #[tokio::test]
+    async fn a_container_holding_net_admin_is_refused_before_anything_is_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let mut interceptor = NetworkInterceptor {
+            cancel: CancellationToken::new(),
+            policy: Arc::new(compiled(NetworkPolicy::allow_all())),
+            audit,
+            session_id: "sid-1".to_string(),
+            generation: 0,
+            attachments: BTreeMap::new(),
+        };
+        let container = Container::holding_net_admin();
+
+        let refused = interceptor
+            .attach(&container)
+            .await
+            .expect_err("a container that can delete the table is not attached");
+
+        let OutrigError::Configuration(message) = refused else {
+            panic!("expected a configuration error, got {refused:?}");
+        };
+        for expected in [
+            container.name(),
+            "CAP_NET_ADMIN",
+            "`cap-add`",
+            "mode = \"default\"",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal names {expected:?}: {message}"
+            );
+        }
+        assert!(interceptor.attachments.is_empty());
     }
 }

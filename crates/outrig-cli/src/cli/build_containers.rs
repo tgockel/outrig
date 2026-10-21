@@ -54,16 +54,64 @@ impl BuildContainer {
 /// Concurrent because the two are independent read-only listings and neither
 /// consumes the other: serializing them would pay two engine startups end to
 /// end for no ordering the join needs.
+///
+/// Each listing is taken again, on its own, if it races a removal, so a retry
+/// of one does not run the other again; see `capture_listing`.
 pub async fn list_build_containers() -> Result<Vec<BuildContainer>> {
     let (working, external) = tokio::try_join!(
-        engine::capture("buildah", &["containers", "--json"], WANTED_BY),
-        engine::capture(
-            "podman",
-            &["ps", "-a", "--external", "--format", "json"],
-            WANTED_BY
-        ),
+        capture_listing("buildah", &["containers", "--json"]),
+        capture_listing("podman", &["ps", "-a", "--external", "--format", "json"]),
     )?;
     join_build_containers(&working, &external)
+}
+
+/// What an engine prints when a container it was listing is gone by the time
+/// it asks about it: the text of `storage.ErrContainerUnknown`. buildah says
+/// `reading build containers: container not known` and podman, for
+/// `--external`, `determining buildah container for container <id>: container
+/// not known`.
+const CONTAINER_NOT_KNOWN: &str = "container not known";
+
+/// Listings taken before a [`CONTAINER_NOT_KNOWN`] is believed.
+///
+/// Neither engine lists atomically. buildah reads every container and then
+/// each one's directory, and podman's `--external` listing asks buildah's
+/// library about each container it found, so a container removed in between
+/// -- any build on the machine finishing or being cancelled -- fails the
+/// whole command. The container that vanished is not in the next listing, so
+/// each failure used up one removal, and a run of them ends when the removals
+/// do.
+///
+/// A bound, not an estimate. Measured on buildah 1.33.7 beside four loops
+/// creating and removing working containers back to back, about one listing
+/// in seven failed, and the longest run of failures in a row was three. It is
+/// finite because a listing that fails this way for a reason other than a race
+/// never stops failing, and that has to end as an error.
+const LISTING_ATTEMPTS: usize = 5;
+
+/// `program args...`, taken again when a container vanishes mid-listing.
+///
+/// Only [`CONTAINER_NOT_KNOWN`] is retried; any other failure comes back at
+/// once. The last attempt is taken outside the loop and comes back as it was,
+/// so a listing that never settles surfaces the engine's own error.
+///
+/// No pause between attempts: the container that vanished is already gone, so
+/// the next listing does not meet it, and each attempt costs an engine
+/// startup.
+async fn capture_listing(program: &'static str, args: &[&str]) -> Result<Vec<u8>> {
+    for attempt in 1..LISTING_ATTEMPTS {
+        match engine::capture(program, args, WANTED_BY).await {
+            Err(e) if e.to_string().contains(CONTAINER_NOT_KNOWN) => {
+                tracing::debug!(
+                    program,
+                    attempt,
+                    "a container vanished mid-listing; listing again"
+                );
+            }
+            result => return result,
+        }
+    }
+    engine::capture(program, args, WANTED_BY).await
 }
 
 /// Join the authoritative listing with the one that knows creation times.

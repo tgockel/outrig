@@ -58,7 +58,9 @@ asked for again.
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
-Enter at any prompt for an explanation of what's being asked plus the available options.
+Enter at any text or yes/no prompt, or at a picker on piped stdin, for an explanation of what's
+being asked plus the available options; on a terminal, pickers print their options'
+descriptions before they open and do not treat `?` as help.
 The default image-config name is `<repo-folder>-standard` (kebab-cased), so the example
 below assumes a `hello-outrig` repo. A folder name with a letter outside ASCII, which no image
 name can hold, suggests `standard` instead.
@@ -90,7 +92,7 @@ by hand, not an exhaustive Dockerfile generator.
   template adds the corresponding install steps; you can edit the file afterwards.
 
   rust    rustup + stable toolchain (cargo, rustfmt, clippy).
-  node    Node 20 LTS via NodeSource.
+  node    Node 24 LTS via NodeSource (apk on Alpine).
   python  CPython 3.12 with pip and venv.
   go      Go 1.27.
   none    Just the base image -- nothing extra installed.
@@ -107,7 +109,7 @@ The toolchain prompt offers curated options that cover the common cases:
 | Choice   | What gets installed                                               |
 |----------|-------------------------------------------------------------------|
 | `rust`   | `rustup` + the stable toolchain, `cargo`, `rustfmt`, `clippy`.    |
-| `node`   | Node 20 LTS via the base image's package manager (or NodeSource). |
+| `node`   | Node 24 LTS via NodeSource; `apk` on Alpine.                      |
 | `python` | CPython 3.12 with `pip` and `venv`.                               |
 | `go`     | Go 1.27.                                                          |
 | `none`   | Just the base image.                                              |
@@ -160,9 +162,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # node toolchain
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN node_major=24 \
+ && curl -fsSL "https://deb.nodesource.com/setup_$node_major.x" | bash - \
  && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && case "$(node --version)" in \
+      "v$node_major".*) ;; \
+      *) echo "node toolchain: expected Node $node_major, found $(node --version)" >&2; exit 1 ;; \
+    esac \
+ && npm --version
 
 # MCP servers
 RUN npm install -g @modelcontextprotocol/server-filesystem
@@ -183,6 +191,12 @@ keeps its registry cache in `CARGO_HOME`, and rustup installs any toolchain a pr
 `rust-toolchain.toml` pins into `RUSTUP_HOME`. To add to either -- `rustup component add`,
 `cargo install` -- extend that `RUN` ahead of its `chmod`; a `RUN` of its own leaves what it adds
 writable by root alone.
+
+The `node` toolchain checks its own result. NodeSource's setup script exits 0 even when one of
+its steps failed, and `apt-get install nodejs` then takes the distro's Node 18, which has no
+`npm`; the build passes and the image is cached. So the `RUN` ends by requiring `node` to report
+the major its `setup_N.x` URL names -- set once, as `node_major` -- and `npm` to run, and fails
+the build otherwise.
 
 Appended to `.agents/outrig/config.toml`:
 
@@ -293,6 +307,13 @@ without repo-local MCP config. See
 [Concepts -> Containers](../concepts/containers.md#using-a-pre-built-image) for the
 `image-name` shape.
 
+A `${VAR}` in a `[mcp]` entry's `env` is read from the machine that runs the image, not the one
+that built it, and only if that machine's global config lists the variable in
+[`[repo]` `env-allow`](../reference/config.md#repo): a session refuses an image whose label
+references an unlisted one, naming the server, the key, the variable, and the image.
+`outrig image build` does not hold the `image.toml` it is pointed at -- you chose that directory,
+and the live test runs its servers with their references resolved.
+
 ### Re-running
 
 Without `--force`, `init` refuses if any of the three files already exists, naming the
@@ -346,9 +367,17 @@ $ outrig image build rust-dev
 ```
 
 After the build, outrig reads the stamped `org.outrig.mcp` label back off the built image and
-validates it (every server name well-formed, every command non-empty). By default it then starts
+validates it (every server name well-formed, every command non-empty, every `call-timeout-secs`
+between 1 and 3600). By default it then starts
 the image, and for each declared MCP server initializes it and calls `tools/list`, reporting the
 tool count per server. The image is built locally; nothing is pushed.
+
+Ctrl-C (or SIGTERM, or SIGHUP) once the image is built stops and removes that validation
+container before outrig exits, with `130`, `143`, or `129`. A server that never answers its
+`initialize` no longer needs it: the test gives up on it after 120 seconds, and on a
+`tools/list` after another 120. During the build itself, Ctrl-C reaches buildah
+directly, which removes the working containers it created; see
+[Cancelling a build](https://tgockel.github.io/outrig/usage/build.html#cancelling-a-build).
 
 ### Failure modes
 
@@ -358,8 +387,9 @@ The command exits nonzero -- printing `error: ...` -- in these cases:
   invalid `[mcp]` table, a partial `[build]`): caught before the build runs.
 - **The stamped `org.outrig.mcp` label is missing or malformed**: read back off the built image
   and validated after the build, even with `--no-test`.
-- **A declared MCP server cannot initialize or return `tools/list`**: caught during the live
-  test. `--no-test` skips this check (the per-server stderr is captured in the error message).
+- **A declared MCP server cannot initialize or return `tools/list`**, including one that does
+  not answer either within 120 seconds: caught during the live test. `--no-test` skips this
+  check (the per-server stderr is captured in the error message).
 
 ### `--no-test`
 

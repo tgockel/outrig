@@ -70,6 +70,8 @@ use rig::http_client::{
 use rig::streaming::StreamingCompletionResponse;
 use rig::wasm_compat::WasmCompatSend;
 
+use super::is_blank;
+
 /// First backoff delay; doubles each attempt, capped at [`RetryPolicy::max_delay`].
 const BASE_DELAY: Duration = Duration::from_secs(1);
 /// Ceiling on a single *backoff* delay, before jitter is applied.
@@ -499,8 +501,9 @@ impl<M: CompletionModel> RetryingModel<M> {
 /// A response carrying no text and no tool call is a turn the user paid for and
 /// cannot see. Rig treats it as an ordinary success -- `output` is the text
 /// parts concatenated, so a reasoning-only turn is simply the empty string --
-/// and every layer above here has already lost the provider's own account of
-/// what happened. This is the last point that still holds it.
+/// and every layer above the model has already lost the provider's own account
+/// of what happened. The model layer is the last point that still holds it, so
+/// that is where this runs, in the words [`textless_line`] gives.
 ///
 /// Deliberately keyed on the *decoded* content rather than on the finish
 /// reason: that check is free on every turn, and the raw response is only
@@ -509,32 +512,39 @@ fn report_textless_completion<R: serde::Serialize>(
     response: &CompletionResponse<R>,
     max_tokens: Option<u64>,
 ) {
-    // An empty text part is not content: it is the sentinel rig normalizes an
-    // empty provider turn into, so treating it as "the model spoke" is exactly
-    // the mistake this function exists to catch.
-    let showed_something = response.choice.iter().any(|part| match part {
-        rig::message::AssistantContent::Text(text) => !text.text.trim().is_empty(),
-        rig::message::AssistantContent::ToolCall(_) => true,
-        _ => false,
-    });
-    if showed_something {
+    if showed_something(&response.choice) {
         return;
     }
 
+    let finish_reason = provider_finish_reason(&response.raw_response);
+    eprintln!("{}", textless_line(finish_reason.as_deref(), max_tokens));
+}
+
+/// Whether a completion showed the user anything: non-blank text, or a tool
+/// call. Reasoning is not shown.
+///
+/// An empty text part is not content: it is the sentinel rig normalizes an
+/// empty provider turn into, so treating it as "the model spoke" is exactly
+/// the mistake [`report_textless_completion`] exists to catch. Blankness is
+/// [`is_blank`]'s, the question `TurnEnd::is_silent` asks of the reply.
+fn showed_something(choice: &rig::OneOrMany<rig::message::AssistantContent>) -> bool {
+    choice.iter().any(|part| match part {
+        rig::message::AssistantContent::Text(text) => !is_blank(&text.text),
+        rig::message::AssistantContent::ToolCall(_) => true,
+        _ => false,
+    })
+}
+
+/// The line printed for a model call that showed the user nothing.
+fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>) -> String {
+    let reason = finish_reason
+        .map(|reason| format!(" (provider finish reason: {reason:?})"))
+        .unwrap_or_default();
     let ceiling = match max_tokens {
         Some(limit) => format!("the request carried max-tokens = {limit}"),
-        None => "the request carried no max-tokens, so the provider's own default applied"
-            .to_string(),
+        None => "the request carried no max-tokens, so the provider's own default applied".into(),
     };
-    match provider_finish_reason(&response.raw_response) {
-        Some(reason) => eprintln!(
-            "[outrig] the model produced no text and no tool call this turn \
-             (provider finish reason: {reason:?}); {ceiling}."
-        ),
-        None => eprintln!(
-            "[outrig] the model produced no text and no tool call this turn; {ceiling}."
-        ),
-    }
+    format!("[outrig] the model produced no text and no tool call this turn{reason}; {ceiling}.")
 }
 
 /// The provider's own word for why generation stopped.
@@ -620,6 +630,12 @@ where
                 }
                 (err, retry_after)
             }
+            // A request that cannot succeed as sent fails the same way however
+            // often it is sent, so it is final at once rather than spending the
+            // budget -- and with it a failover chain's -- on replays.
+            Err(error) if is_permanent(&error) => {
+                return Err(HttpError::Instance(Box::new(error)));
+            }
             // Read timeouts, connection resets, and the like -- all
             // retry-worthy, and none of them carry a `Retry-After`.
             Err(error) => {
@@ -684,8 +700,20 @@ where
 /// The retry-worthy statuses: request timeouts, "too early", rate limits, and
 /// the server-side 5xx family. Everything else -- other 4xx especially -- is
 /// terminal, because replaying it would fail the same way.
+///
+/// The 5xx family is taken whole because providers put nonstandard codes in
+/// it -- Anthropic's `529` overloaded, Cloudflare's `520`-`527` -- that an
+/// explicit list of the standard ones misses.
 fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
+}
+
+/// A transport error that no replay of the same request can clear: one reqwest
+/// could not build, or a redirect its policy refused to follow -- a loop that
+/// reached its limit, say. Every other transport error is a timeout, a dropped
+/// connection, or the like, which can.
+fn is_permanent(error: &reqwest::Error) -> bool {
+    error.is_builder() || error.is_redirect()
 }
 
 /// Pre-jitter backoff in seconds: `base_delay * 2^attempt`, capped at
@@ -754,12 +782,51 @@ fn next_delay(
 /// A short label for a failure: the status line, or the transport error. Never
 /// the provider's error body -- a rate-limited gateway's body runs to kilobytes
 /// of nested JSON.
+///
+/// A code with no standard reason phrase is shown bare: `StatusCode`'s own
+/// `Display` would print `529 <unknown status code>`, which says nothing more
+/// and pushes the retry line past a terminal's width.
 fn failure_label(err: &HttpError) -> String {
     match err {
         HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
-            format!("HTTP {code}")
+            match code.canonical_reason() {
+                Some(_) => format!("HTTP {code}"),
+                None => format!("HTTP {}", code.as_u16()),
+            }
         }
-        HttpError::Instance(inner) => format!("connection error: {inner}"),
+        HttpError::Instance(inner) => {
+            format!("connection error: {}", with_innermost_cause(inner.as_ref()))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// An error's `Display` followed by the innermost link of its `source()` chain.
+///
+/// reqwest's own text is the kind of failure and the URL; whether the connect
+/// was refused, the lookup failed, or TLS did not match is only in the chain.
+/// One link rather than all of them, since this is a status line. Left alone
+/// when there is no source or the outer text already says it.
+fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let outer = err.to_string();
+    let mut innermost = None;
+    let mut link = err.source();
+    while let Some(cause) = link {
+        innermost = Some(cause);
+        link = cause.source();
+    }
+    match innermost.map(ToString::to_string) {
+        Some(cause) if !outer.contains(&cause) => format!("{outer}: {cause}"),
+        _ => outer,
+    }
+}
+
+/// The label for a failed candidate in a failover chain's move line and
+/// `tried` rows: a transport failure reads as it does outside a chain, and
+/// anything else keeps rig's own text.
+pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
+    match err {
+        CompletionError::HttpError(http @ HttpError::Instance(_)) => failure_label(http),
         other => other.to_string(),
     }
 }
@@ -771,7 +838,9 @@ fn is_transient(err: &HttpError) -> bool {
         HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
             is_retryable_status(*code)
         }
-        HttpError::Instance(_) => true,
+        HttpError::Instance(inner) => !inner
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_permanent),
         _ => false,
     }
 }
@@ -798,13 +867,21 @@ fn is_transient(err: &HttpError) -> bool {
 /// [`chain_exhausted_label`]: super::failover::chain_exhausted_label
 /// [`HttpError`]: CompletionError::HttpError
 ///
-/// Note the deliberate reach: a wrong `base-url` fails with a connection error,
-/// which is transient by this predicate, so an unreachable endpoint ends the
-/// turn rather than the session. That is right for a REPL -- the message names
-/// the connection failure and the user can fix the config or `/quit` -- and the
-/// *wait* before it no longer follows the full budget: an endpoint that never
-/// answered is bounded by [`CONNECT_BUDGET`], so a typo costs seconds rather
-/// than minutes. The classification is the decision; the wait was the bug.
+/// Note the deliberate reach: a `base-url` naming the wrong host fails with a
+/// connection error, which is transient by this predicate, so an unreachable
+/// endpoint ends the turn rather than the session. That is right for a REPL --
+/// the message names the connection failure and the user can fix the config or
+/// `/quit` -- and the *wait* before it no longer follows the full budget: an
+/// endpoint that never answered is bounded by [`CONNECT_BUDGET`], so a typo
+/// costs seconds rather than minutes. The classification is the decision; the
+/// wait was the bug.
+///
+/// The reach stops short of a request reqwest refuses to send at all: a scheme
+/// other than `http` or `https`, a URL it cannot parse, a redirect loop that
+/// reached its limit. [`send_with_retry`] returns that at once, and it is
+/// terminal here for the reason a `401` is -- no resend can satisfy it. A
+/// config cannot carry the scheme typo that was the usual way in: a load
+/// refuses it.
 ///
 /// Returning the label rather than a `bool` keeps the classification and the
 /// thing to print together: a caller cannot decide this is recoverable without
@@ -885,9 +962,12 @@ mod tests {
         exhausted_transient_label(&PromptError::CompletionError(err))
     }
 
+    /// The only 4xx statuses that retry; the tables below split 4xx on it.
+    const RETRYABLE_4XX: [u16; 3] = [408, 425, 429];
+
     #[test]
     fn retryable_status_codes_are_transient() {
-        for code in [408, 425, 429, 500, 502, 503, 504] {
+        for code in RETRYABLE_4XX.into_iter().chain(500..=599) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(is_retryable_status(status), "{code} should retry");
             assert!(
@@ -899,7 +979,7 @@ mod tests {
 
     #[test]
     fn client_errors_are_terminal() {
-        for code in [400, 401, 403, 404, 422] {
+        for code in (400..=499).filter(|code| !RETRYABLE_4XX.contains(code)) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(!is_retryable_status(status), "{code} should not retry");
             assert!(
@@ -907,6 +987,15 @@ mod tests {
                 "{code} should stay fatal at the REPL",
             );
         }
+    }
+
+    #[test]
+    fn a_nonstandard_status_is_labeled_by_its_code() {
+        assert_eq!(label_of(http_status(529)).as_deref(), Some("HTTP 529"));
+        assert_eq!(
+            label_of(http_status(503)).as_deref(),
+            Some("HTTP 503 Service Unavailable"),
+        );
     }
 
     #[test]
@@ -1507,6 +1596,21 @@ mod tests {
         (started.elapsed(), failure_label(&err))
     }
 
+    /// The innermost `source()` text of a refused connect to [`REFUSED_PORT`],
+    /// taken from the error itself because the OS wording varies.
+    async fn refused_cause() -> String {
+        let err = test_client()
+            .get(format!("http://127.0.0.1:{REFUSED_PORT}/"))
+            .send()
+            .await
+            .expect_err("nothing listens");
+        let mut cause: &(dyn std::error::Error + 'static) = &err;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        cause.to_string()
+    }
+
     /// Confirm nothing answers on [`REFUSED_PORT`], so a test that reads a
     /// failure as "connect refused" is reading the truth.
     ///
@@ -1538,6 +1642,10 @@ mod tests {
         assert!(
             label.starts_with("connection error"),
             "the loop must have failed connecting, not on {label}",
+        );
+        assert!(
+            label.ends_with(&refused_cause().await),
+            "the label must carry the connect failure's own cause: {label}",
         );
         assert!(
             elapsed <= policy.connect_budget,
@@ -1601,6 +1709,96 @@ mod tests {
         );
     }
 
+    /// A URL reqwest refuses to send fails the same way on every replay, so the
+    /// loop returns it at once, with its budget unspent, and calls it what it
+    /// is: not something a wait or a resend could clear. The URL has a typo'd
+    /// scheme (#343). reqwest refuses it before it opens a socket, so the
+    /// paused clock counts only the waits the loop took.
+    #[tokio::test(start_paused = true)]
+    async fn a_url_reqwest_refuses_is_final_at_once() {
+        let started = tokio::time::Instant::now();
+        let err = send_with_retry::<Bytes>(
+            test_client(),
+            loop_policy(),
+            Method::POST,
+            format!("htps://127.0.0.1:{REFUSED_PORT}/v1/chat/completions")
+                .parse()
+                .expect("http parses any scheme"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .err()
+        .expect("reqwest refuses an htps:// URL");
+
+        assert_eq!(started.elapsed(), Duration::ZERO, "no wait was taken");
+        let HttpError::Instance(inner) = &err else {
+            panic!("a transport error: {err}")
+        };
+        assert!(
+            inner
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_builder),
+            "{err}"
+        );
+        let err = CompletionError::HttpError(err);
+        assert!(
+            !is_recoverable(&err),
+            "a chain must not call it recoverable"
+        );
+        assert!(
+            label_of(err).is_none(),
+            "the REPL must not call it transient"
+        );
+    }
+
+    /// A chain of `depth` links: each one's `Display` is its own name.
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn the_innermost_cause_is_appended_once() {
+        let err = Link("outer", Some(Box::new(Link("middle", Some(Box::new(Link("root", None)))))));
+        assert_eq!(with_innermost_cause(&err), "outer: root");
+    }
+
+    #[test]
+    fn a_cause_the_outer_message_already_has_is_not_repeated() {
+        let err = Link("failed: root", Some(Box::new(Link("root", None))));
+        assert_eq!(with_innermost_cause(&err), "failed: root");
+    }
+
+    #[test]
+    fn an_error_with_no_source_renders_as_it_always_did() {
+        assert_eq!(with_innermost_cause(&Link("alone", None)), "alone");
+    }
+
+    #[test]
+    fn a_candidate_transport_failure_carries_the_cause_without_rigs_prefix() {
+        let err = CompletionError::HttpError(HttpError::Instance(Box::new(Link(
+            "error sending request",
+            Some(Box::new(Link("Connection refused", None))),
+        ))));
+        assert_eq!(
+            candidate_failure_label(&err),
+            "connection error: error sending request: Connection refused"
+        );
+        let status = http_status(503);
+        assert_eq!(candidate_failure_label(&status), status.to_string());
+    }
+
     #[test]
     fn exhausted_transient_label_names_the_status_without_the_body() {
         let label = label_of(http_status(429)).expect("a 429 is recoverable");
@@ -1619,5 +1817,59 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// The words of the report a user reads for a model call that showed them
+    /// nothing, pinned because they are the user's whole account of it.
+    /// Neither half has to have an answer: a missing finish reason costs one
+    /// clause, and a missing ceiling says so in place of a number.
+    #[test]
+    fn the_textless_line_names_the_finish_reason_and_the_ceiling() {
+        assert_eq!(
+            textless_line(Some("length"), Some(2048)),
+            "[outrig] the model produced no text and no tool call this turn \
+             (provider finish reason: \"length\"); the request carried max-tokens = 2048."
+        );
+        assert_eq!(
+            textless_line(Some("stop"), None),
+            "[outrig] the model produced no text and no tool call this turn \
+             (provider finish reason: \"stop\"); the request carried no max-tokens, so the \
+             provider's own default applied."
+        );
+        assert_eq!(
+            textless_line(None, Some(512)),
+            "[outrig] the model produced no text and no tool call this turn; \
+             the request carried max-tokens = 512."
+        );
+        assert_eq!(
+            textless_line(None, None),
+            "[outrig] the model produced no text and no tool call this turn; the request \
+             carried no max-tokens, so the provider's own default applied."
+        );
+    }
+
+    /// Only non-blank text or a tool call is something shown. Reasoning is not,
+    /// and neither is the empty text part rig turns an empty provider turn into.
+    #[test]
+    fn only_non_blank_text_or_a_tool_call_is_something_shown() {
+        use rig::message::AssistantContent;
+
+        let shown = |parts: Vec<AssistantContent>| {
+            showed_something(&rig::OneOrMany::many(parts).expect("a completion has content"))
+        };
+
+        assert!(shown(vec![AssistantContent::text("done")]));
+        assert!(shown(vec![AssistantContent::tool_call(
+            "call-1",
+            "shell__exec",
+            serde_json::json!({}),
+        )]));
+        assert!(shown(vec![
+            AssistantContent::reasoning("weighing it"),
+            AssistantContent::text("done"),
+        ]));
+        assert!(!shown(vec![AssistantContent::text("")]));
+        assert!(!shown(vec![AssistantContent::text(" \n")]));
+        assert!(!shown(vec![AssistantContent::reasoning("weighing it")]));
     }
 }

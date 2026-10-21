@@ -50,9 +50,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 mod common;
-use common::stream_lines;
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+use common::{E2E_TIMEOUT, podman_names, stream_lines, wait_for_stderr_value, wait_until_gone};
 
 fn fixture_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -170,56 +168,6 @@ fn cmdlines_containing(needle: &str) -> Vec<(String, String)> {
         }
     }
     found
-}
-
-async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
-    timeout(TEST_TIMEOUT, async {
-        loop {
-            {
-                let snapshot = stderr.lock().unwrap().clone();
-                if let Some(value) = snapshot
-                    .lines()
-                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
-                {
-                    return value.to_string();
-                }
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
-}
-
-async fn podman_names(filter: &str) -> Vec<String> {
-    let out = Command::new("podman")
-        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
-        .output()
-        .await
-        .expect("podman ps");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-async fn wait_until_gone(names: &[String]) {
-    timeout(TEST_TIMEOUT, async {
-        loop {
-            let mut alive = Vec::new();
-            for name in names {
-                let found = podman_names(&format!("name={name}")).await;
-                alive.extend(found);
-            }
-            if alive.is_empty() {
-                return;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("containers {names:?} were not reaped within {TEST_TIMEOUT:?}"));
 }
 
 fn tool_names(listing: &rmcp::model::ListToolsResult) -> Vec<String> {
@@ -341,19 +289,24 @@ async fn sidecar_hosts_servers_with_labels_record_and_clean_reap() {
         let _ = service.cancel().await;
         sid
     };
-    let sid = timeout(TEST_TIMEOUT, work)
+    let sid = timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
     eprintln!("--- subprocess stderr ---\n{stderr}");
 
     assert!(status.success(), "clean EOF exit expected: {stderr}");
+    assert!(
+        stderr.contains("[outrig] ensuring sidecar image ")
+            && stderr.contains("[outrig] sidecar image ready: "),
+        "a sidecar image reports its progress pair: {stderr}"
+    );
     let leftovers = podman_names(&format!("label=org.outrig.session={sid}")).await;
     assert!(
         leftovers.is_empty(),
@@ -391,7 +344,7 @@ async fn podman_kill_of_primary_reaps_sidecars_and_exits_nonzero() {
 
     // The stdio server only reports ready once a client completes the
     // initialize handshake; keep the service alive across the kill.
-    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+    let service = timeout(E2E_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
         .await
         .expect("handshake within timeout")
         .expect("serve_client handshake");
@@ -407,9 +360,9 @@ async fn podman_kill_of_primary_reaps_sidecars_and_exits_nonzero() {
         .expect("podman kill");
     assert!(kill.success(), "podman kill failed: {kill}");
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?} after kill"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?} after kill"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -590,13 +543,13 @@ async fn warn_on_failure_serves_reduced_toolset() {
         );
         let _ = service.cancel().await;
     };
-    timeout(TEST_TIMEOUT, work)
+    timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -609,6 +562,11 @@ async fn warn_on_failure_serves_reduced_toolset() {
     assert!(
         stderr.contains("warning: sidecar broken"),
         "stderr should carry the sidecar warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("(from [sidecars.broken]) is not an [images.<name>]")
+            && !stderr.contains("--image"),
+        "the warning should name the declaring block, not a flag: {stderr}"
     );
 }
 
@@ -639,9 +597,9 @@ async fn abort_on_failure_fails_fast_without_leftovers() {
     drop(run.stdin.take());
     drop(run.stdout.take());
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -652,8 +610,15 @@ async fn abort_on_failure_fails_fast_without_leftovers() {
         "abort on-failure must fail the session: {stderr}"
     );
     assert!(
-        stderr.contains("no-such-image-outrig-e2e"),
-        "stderr should name the failing image: {stderr}"
+        stderr.contains(
+            "image \"no-such-image-outrig-e2e:1\" (from [sidecars.broken]) is not an \
+             [images.<name>]"
+        ),
+        "stderr should name the failing image and the block that declared it: {stderr}"
+    );
+    assert!(
+        stderr.contains("`podman pull no-such-image-outrig-e2e:1`") && !stderr.contains("--image"),
+        "stderr should say how to fix it, without blaming a flag nobody passed: {stderr}"
     );
 
     // The primary was started (its progress line names it) and must be gone.
@@ -684,6 +649,13 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     );
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
+    // The repo config names the token, and a repo file may reference only the
+    // variables the global config lists (#444). A global config of its own also
+    // keeps this off the developer's real one.
+    let global_dir = tempfile::tempdir().expect("tempdir global");
+    let global = global_dir.path().join("config.toml");
+    std::fs::write(&global, format!("[repo]\nenv-allow = [\"{TOKEN_VAR}\"]\n"))
+        .expect("write global config");
 
     // `-v` mirrors every podman command line to stderr and `container.log`.
     // The `--env` reference is passed as text: no shell expands it, so the
@@ -692,7 +664,13 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     let mut run = spawn_mcp(
         repo_dir.path(),
         sessions.path(),
-        &["-v", "--env", &exec_env],
+        &[
+            "--global-config",
+            global.to_str().expect("utf-8 path"),
+            "-v",
+            "--env",
+            &exec_env,
+        ],
     );
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");
@@ -784,13 +762,13 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
         let _ = service.cancel().await;
         (sid, session_dir)
     };
-    let (sid, session_dir) = timeout(TEST_TIMEOUT, work)
+    let (sid, session_dir) = timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -843,7 +821,7 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
     let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &["--network", "audit"]);
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");
-    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+    let service = timeout(E2E_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
         .await
         .expect("handshake within timeout")
         .expect("serve_client handshake");
@@ -874,9 +852,9 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
         .expect("session record");
 
     let _ = service.cancel().await;
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -885,12 +863,14 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
 
     // The entrypoint touched example.com *before* serving MCP; an audit
     // record attributed to the sidecar proves interception was live ahead of
-    // the entrypoint's first packet.
+    // the entrypoint's first packet. A connection's, not its lookup's: the
+    // lookup is recorded too, and says nothing of the proxy.
     let log = std::fs::read_to_string(session_dir.join("logs/network.jsonl"))
         .expect("network.jsonl exists");
     assert!(
-        log.lines()
-            .any(|l| l.contains(&sidecar) && l.contains("example.com")),
+        log.lines().any(|l| l.contains(&sidecar)
+            && l.contains("example.com")
+            && l.contains(r#""proto":"tcp""#)),
         "audit log should attribute the entrypoint's startup traffic to the \
          sidecar container:\n{log}"
     );
@@ -919,7 +899,7 @@ async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
     let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &[]);
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");
-    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+    let service = timeout(E2E_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
         .await
         .expect("handshake within timeout")
         .expect("serve_client handshake");
@@ -946,7 +926,7 @@ async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
         .unwrap()
         .clone();
     let dead = timeout(
-        TEST_TIMEOUT,
+        E2E_TIMEOUT,
         service.call_tool(
             CallToolRequestParams::new("fetch__list_directory".to_string())
                 .with_arguments(call_args),
@@ -978,9 +958,9 @@ async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
     );
 
     let _ = service.cancel().await;
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -1072,13 +1052,13 @@ async fn named_sidecar_entrypoint_host_serves_workspace_from_args() {
         let _ = service.cancel().await;
         sid
     };
-    let sid = timeout(TEST_TIMEOUT, work)
+    let sid = timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();
@@ -1119,7 +1099,7 @@ async fn network_audit_attaches_interceptor_to_sidecar() {
     let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &["--network", "audit"]);
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");
-    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+    let service = timeout(E2E_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
         .await
         .expect("handshake within timeout")
         .expect("serve_client handshake");
@@ -1148,9 +1128,9 @@ async fn network_audit_attaches_interceptor_to_sidecar() {
 
     // Orderly shutdown: cancel the client so the server sees EOF.
     let _ = service.cancel().await;
-    let status = timeout(TEST_TIMEOUT, run.child.wait())
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
         .await
-        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = run.stderr_task.await;
     let stderr = run.stderr_buf.lock().unwrap().clone();

@@ -364,13 +364,23 @@ fn closing_line(stopped: Option<&str>, running: Option<(&[String], usize)>) -> O
 }
 
 /// Typed lines, read on a thread of their own, ending at end of input or at
-/// the first read that fails.
+/// the first read that fails. A line that is not UTF-8 is still a line: read
+/// as bytes and decoded lossily, as `outrig run`'s prompt reads one, rather
+/// than ending input the way `BufRead::lines` would.
 fn read_lines() -> std::io::Result<mpsc::UnboundedReceiver<std::io::Result<String>>> {
     let (typed, lines) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("stdin".to_string())
         .spawn(move || {
-            for line in std::io::stdin().lock().lines() {
+            let mut stdin = std::io::stdin().lock();
+            let mut bytes = Vec::new();
+            loop {
+                bytes.clear();
+                let line = match stdin.read_until(b'\n', &mut bytes) {
+                    Ok(0) => return,
+                    Ok(_) => Ok(decode_line(&bytes)),
+                    Err(e) => Err(e),
+                };
                 let failed = line.is_err();
                 if typed.send(line).is_err() || failed {
                     return;
@@ -378,6 +388,17 @@ fn read_lines() -> std::io::Result<mpsc::UnboundedReceiver<std::io::Result<Strin
             }
         })?;
     Ok(lines)
+}
+
+/// One line as `read_until` returns it, as `BufRead::lines` would give it --
+/// without its `\n` or `\r\n` -- but with U+FFFD for each sequence that is not
+/// UTF-8.
+fn decode_line(bytes: &[u8]) -> String {
+    let line = match bytes.strip_suffix(b"\n") {
+        Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+        None => bytes,
+    };
+    String::from_utf8_lossy(line).into_owned()
 }
 
 /// What the session shows, rendered and queued on [`Output`], which writes it.
@@ -456,6 +477,16 @@ impl Terminal<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte that is not UTF-8 costs only itself: the line is kept, with
+    /// U+FFFD in its place, and line endings go as `lines` drops them.
+    #[test]
+    fn a_line_that_is_not_utf8_is_decoded_lossily() {
+        assert_eq!(decode_line(b"caf\xe9 au lait\n"), "caf\u{fffd} au lait");
+        assert_eq!(decode_line(b"crlf\r\n"), "crlf");
+        assert_eq!(decode_line(b"no newline at end"), "no newline at end");
+        assert_eq!(decode_line(b"\n"), "");
+    }
 
     #[test]
     fn a_submission_is_shown_indented_under_its_heading() {

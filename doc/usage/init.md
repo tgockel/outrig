@@ -31,8 +31,8 @@ $ outrig init
 If `~/.outrig/config.toml` doesn't exist, outrig walks you through providers and models first
 -- the same flow as `outrig config init`, inlined here so first-time users finish in one
 session. Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type
-`?` and Enter at any prompt for an explanation of what's being asked plus the available
-options.
+`?` and Enter at any text or yes/no prompt for an explanation of what's being asked; pickers
+print their options' descriptions before they open.
 
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
@@ -89,11 +89,17 @@ ASCII suggests `standard` instead. The image-config name becomes the repository 
 built from it, so a name typed here that can't be one is asked for again; see
 [`outrig image add`](image.md#outrig-image-add) for the rule.
 
+The workspace answers are held to the rules a config load applies: `host-path` must name an
+existing directory, resolved against the repo root, and `container-path` must be absolute and not
+`/`. An answer that breaks one is asked for again, after a line saying which.
+
 The model section reads your global `~/.outrig/config.toml` and lists the available models.
 Answering "yes" walks the same model-definition prompts as `outrig config init`, except the
 new `[models.<name>]` entries land in the repo config (referencing the global providers).
-You can then optionally pin one as the repo's `default-model`. "No" inherits everything
-from the global config.
+A provider name the global config lacks is asked again rather than defined: a provider
+carries an API key, and a repo config may not declare one. You can then optionally pin one
+of the new models as the repo's `default-model`. "No" inherits everything from the global
+config.
 
 If your global config has no providers, the section instead prints a hint to run
 `outrig config init` and skips the prompt -- the agent can't run without a provider.
@@ -105,8 +111,9 @@ it doesn't, picking is needed to avoid a config with no resolvable model (defaul
 `[Y/n]`).
 
 If no `default-model` is set anywhere -- globally or at the repo level -- the agent
-prompt forces an explicit `model` selection. That guarantees the resulting config
-validates and `outrig run` will work.
+prompt forces an explicit `model` selection. With no model defined anywhere there is
+nothing to pick: outrig says so and writes the agent without a `model`, and `outrig run`
+refuses the config until you add one.
 
 Finally the image-config loop:
 
@@ -137,6 +144,12 @@ container-path = "/workspace"
 # inherits default-model from the global config
 preamble = "You are a careful coding assistant."
 ```
+
+Before writing the file, outrig reads it the way the next `outrig run` will: merged over your
+global config and validated. If that would fail, nothing is written, and the error says why --
+a global `default-model` that names no model, for one. Two things count as settled: the
+image-config `image add` writes next, which `default-image` -- or an agent in your global
+config -- may name, and the agent's `model` when no model is defined anywhere, as above.
 
 The global `~/.outrig/config.toml` is written by
 [`outrig config init`](config.md#outrig-config-init); the per-image Dockerfile and

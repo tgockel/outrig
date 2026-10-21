@@ -273,8 +273,10 @@ pub(crate) enum AgentError {
     #[error(transparent)]
     Resolve(#[from] LlmResolveError),
 
+    /// Boxed, as the largest of these: the harness hands this back in every
+    /// `Err`, so its size is what each fallible call returns.
     #[error(transparent)]
-    Outrig(#[from] OutrigError),
+    Outrig(Box<OutrigError>),
 
     #[error(transparent)]
     Interpreter(#[from] InterpreterError),
@@ -323,6 +325,12 @@ pub(crate) enum AgentError {
          fails the same way; correct what it names and start a new session"
     )]
     PromptAfterWorkTerminal(String),
+}
+
+impl From<OutrigError> for AgentError {
+    fn from(e: OutrigError) -> Self {
+        AgentError::Outrig(Box::new(e))
+    }
 }
 
 /// Rendered rather than carried: a `PromptError` holds rig's types and, on some

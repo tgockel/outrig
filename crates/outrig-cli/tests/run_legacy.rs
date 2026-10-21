@@ -17,16 +17,20 @@ use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A repo config that gets `run` through model and image resolution to its
-/// first podman call. The provider is never contacted.
-const CONFIG: &str = r#"
-default-model = "fast"
-default-image = "primary"
-
+/// The global config, which alone may declare a provider. The provider is
+/// never contacted.
+const GLOBAL: &str = r#"
 [providers.openai]
 style    = "openai"
 base-url = "http://127.0.0.1:1/v1"
 api-key  = "${OUTRIG_TEST_KEY}"
+"#;
+
+/// A repo config that gets `run`, over [`GLOBAL`], through model and image
+/// resolution to its first podman call.
+const CONFIG: &str = r#"
+default-model = "fast"
+default-image = "primary"
 
 [models.fast]
 provider   = "openai"
@@ -111,10 +115,13 @@ fn arg(path: &Path) -> &str {
 /// stderr, and the one session record it left.
 async fn observed(cwd: &Path, verb: &str, flags: &[&str]) -> (Option<i32>, String, String) {
     let sessions = tempfile::tempdir().expect("tempdir sessions");
-    let absent = cwd.join("no-such-global.toml");
+    // Outside the repo, which is the workspace.
+    let global = tempfile::tempdir().expect("tempdir global");
+    let global = global.path().join("config.toml");
+    std::fs::write(&global, GLOBAL).expect("write the global config");
     let mut args = vec![
         "--global-config",
-        arg(&absent),
+        arg(&global),
         "--session-root",
         arg(sessions.path()),
         verb,
@@ -162,15 +169,16 @@ async fn observed(cwd: &Path, verb: &str, flags: &[&str]) -> (Option<i32>, Strin
 async fn run_legacy_behaves_as_run() {
     let bare = tempfile::tempdir().expect("a bare dir");
     let configured = configured_repo();
-    let missing = configured.path().join("missing");
+    let used = tempfile::tempdir().expect("a used dir");
+    std::fs::write(used.path().join("notes.md"), "mine").expect("a note");
 
     for (cwd, flags, expect) in [
         (bare.path(), &[][..], "no model selected"),
         (configured.path(), &[][..], "podman"),
         (
             configured.path(),
-            &["--max-tool-calls", "7", "--session-dir", arg(&missing)][..],
-            "is not an existing directory",
+            &["--max-tool-calls", "7", "--session-dir", arg(used.path())][..],
+            "is not empty (it holds notes.md)",
         ),
     ] {
         let run = observed(cwd, "run", flags).await;
@@ -322,6 +330,47 @@ async fn run_new_refuses_a_session_dir_another_is_starting_in() {
     assert!(!dir.path().join("session.json").exists());
     assert!(!dir.path().join("logs").exists());
     drop(held);
+}
+
+/// `run-new --session-dir` follows `run`'s rule: a directory that is not there
+/// yet is created, with its parents, and the session that fails to start is
+/// recorded in it.
+#[tokio::test]
+async fn run_new_creates_an_absent_session_dir() {
+    let repo = configured_repo();
+    let parent = tempfile::tempdir().expect("a parent");
+    let dir = parent.path().join("new/session");
+
+    let (code, stderr, record) =
+        observed(repo.path(), "run-new", &["--session-dir", arg(&dir)]).await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("[\"pull\""),
+        "the pull is what failed: {stderr}"
+    );
+    assert!(dir.join("logs").is_dir(), "{stderr}");
+    assert!(dir.join("session.json").is_file(), "{stderr}");
+    assert!(!record.is_empty(), "the root links to it: {stderr}");
+}
+
+/// A `--session-dir` that holds anything is refused, by its first entry, before
+/// any image work -- and gets nothing from the refused invocation.
+#[tokio::test]
+async fn run_new_refuses_a_session_dir_that_is_not_empty() {
+    let repo = configured_repo();
+    let dir = tempfile::tempdir().expect("a dir of notes");
+    std::fs::write(dir.path().join("notes.md"), "mine").expect("a note");
+
+    let (code, stderr, record) =
+        observed(repo.path(), "run-new", &["--session-dir", arg(dir.path())]).await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("is not empty (it holds notes.md)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("ensuring image"), "{stderr}");
+    assert!(!dir.path().join("logs").exists());
+    assert!(record.is_empty(), "{record}");
 }
 
 /// What `run` says at startup about a key only `run-new` reads.

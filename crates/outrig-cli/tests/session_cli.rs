@@ -4,7 +4,8 @@
 //! `execute_with` form of each command through `tokio::io::duplex` halves.
 //!
 //! No podman dependency: the discard tests inject their own running-check
-//! closure.
+//! closure. The `run --session-dir` tests go through the binary instead, with
+//! `podman` and `buildah` stubbed out (`common::run_outrig`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,7 +18,10 @@ use outrig_cli::session::{Session, SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 mod common;
-use common::{as_legacy_image_key, drop_image_tag, sample_session, write_raw_session};
+use common::{
+    GLOBAL_WITH_MODEL, as_legacy_image_key, drop_image_tag, run_outrig, sample_session,
+    write_other_files, write_outrig_entries, write_raw_session,
+};
 
 async fn drain<R: AsyncReadExt + Unpin>(mut r: R) -> String {
     let mut buf = Vec::new();
@@ -439,7 +443,7 @@ async fn logs_reports_unreadable_record_rather_than_not_found() {
         .expect_err("an unreadable record is not a clean miss");
     let msg = err.to_string();
     assert!(
-        msg.contains("could not be read") && msg.contains(bad.as_str()),
+        msg.contains("is unreadable") && msg.contains(bad.as_str()),
         "should name the unreadable entry; got: {msg}"
     );
     assert!(msg.contains("image_tag"), "and the reason; got: {msg}");
@@ -742,6 +746,74 @@ async fn discard_session_dir_path_works() {
     );
 }
 
+/// Everything in a session's directory is the session's, a rendered
+/// `report.html` included, so discard removes the directory whole.
+#[tokio::test]
+async fn discard_removes_the_whole_session_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let notes = tempfile::tempdir().expect("tempdir notes");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let target = store
+        .create(&sid, Some(notes.path()), &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&target);
+    write_other_files(&target);
+
+    let (mut ew, stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let rc = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(!target.exists(), "the directory goes whole");
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "and the link to it"
+    );
+    let msg = drain(stderr_r).await;
+    assert!(
+        msg.contains(&format!("[outrig] removed {}\n", target.display())),
+        "expected the directory reported: {msg}"
+    );
+    assert!(msg.contains("(symlink)"), "expected symlink notice: {msg}");
+}
+
+/// #337's reproduction: `--session-dir <root>/<sid>` names the link. The record
+/// is in the directory the link points at, and that is what has to go -- and
+/// what the report names.
+#[tokio::test]
+async fn discard_session_dir_through_the_link_removes_the_record() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T110000-dddd".into());
+    let target = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&target);
+    let link = root.path().join(sid.as_str());
+
+    let (mut ew, stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&link, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    drop(ew);
+
+    assert!(!target.exists(), "the record's directory should be removed");
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "and the link to it"
+    );
+    let msg = drain(stderr_r).await;
+    assert_eq!(msg, format!("[outrig] removed {}\n", target.display()));
+}
+
 #[tokio::test]
 async fn discard_without_yes_aborts_on_n() {
     let root = tempfile::tempdir().expect("tempdir root");
@@ -795,6 +867,7 @@ fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
         yes,
         build_containers: false,
         session: None,
+        unreadable: false,
     }
 }
 
@@ -867,6 +940,24 @@ fn clean_duration_parser_accepts_units_and_rejects_invalid() {
     assert!(clean::parse_duration("0d").is_err());
     assert!(clean::parse_duration("30x").is_err());
     assert!(clean::parse_duration("days").is_err());
+
+    // A unit that is more than one byte wide is an unknown unit, not a reason to panic.
+    assert!(clean::parse_duration("7д").is_err());
+    assert!(clean::parse_duration("7日").is_err());
+    assert!(clean::parse_duration("é").is_err());
+}
+
+#[test]
+fn clean_older_than_with_a_multibyte_unit_is_a_usage_error() {
+    let err = clean::CleanArgs::try_parse_from(["clean", "--older-than", "7д"])
+        .expect_err("`д` is not a duration unit");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string()
+            .contains("duration unit must be one of s, m, h, or d"),
+        "unexpected message: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1173,6 +1264,117 @@ async fn clean_removes_symlinked_session_target_and_link() {
     );
     let err = drain(stderr_r).await;
     assert!(err.contains("(symlink)"), "stderr:\n{err}");
+}
+
+/// `clean` removes a session's directory whole, as `discard` does.
+#[tokio::test]
+async fn clean_removes_the_whole_session_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let notes = tempfile::tempdir().expect("tempdir notes");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let target = store
+        .create(
+            &sid,
+            Some(notes.path()),
+            &mut session_with_age(&sid, now, days(40), Some(days(31))),
+        )
+        .expect("create");
+    write_outrig_entries(&target);
+    write_other_files(&target);
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(!target.exists(), "the directory goes whole");
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains(&format!("[outrig] removed {}\n", target.display())),
+        "stderr:\n{err}"
+    );
+    assert!(
+        err.contains("[outrig] cleaned 1 session\n"),
+        "stderr:\n{err}"
+    );
+}
+
+/// A record left beside a `logs` file -- a run before 0.2.2 that could not
+/// create its log directory there -- is removed like any other, and does not
+/// stop the sweep before the sessions after it.
+#[tokio::test]
+async fn clean_carries_on_past_a_logs_that_is_not_a_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let notes = tempfile::tempdir().expect("tempdir notes");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    // Newest first, so the legacy record is the first target.
+    let legacy = SessionId("20260502T090000-aaaa".into());
+    let target = store
+        .create(
+            &legacy,
+            Some(notes.path()),
+            &mut session_with_age(&legacy, now, days(40), Some(days(31))),
+        )
+        .expect("create legacy");
+    std::fs::write(target.join("logs"), b"my log\n").expect("write logs file");
+    let older = SessionId("20260501T090000-bbbb".into());
+    let older_dir = store
+        .create(
+            &older,
+            None,
+            &mut session_with_age(&older, now, days(41), Some(days(32))),
+        )
+        .expect("create older");
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(!target.exists(), "the legacy record's directory goes");
+    assert!(!older_dir.exists(), "the session after it is removed too");
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains(&format!("[outrig] removed {}\n", target.display())),
+        "stderr:\n{err}"
+    );
+    assert!(
+        err.contains("[outrig] cleaned 2 sessions\n"),
+        "stderr:\n{err}"
+    );
 }
 
 // -------- wiring sanity --------
@@ -1741,4 +1943,691 @@ async fn clean_without_the_flag_reads_exactly_as_before() {
         err.contains("no stopped sessions or stray containers older than 30d"),
         "the empty-case wording should be unchanged: {err}"
     );
+}
+
+// -------- run --session-dir --------
+
+/// A config-less project, a global config that resolves a model, and a session
+/// root, all under one tempdir. `run` against them gets as far as recording the
+/// session; the stubbed `podman` stops it at the container start.
+fn run_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).expect("mkdir proj");
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL_WITH_MODEL).expect("write global");
+    let sessions = tmp.path().join("sessions");
+    (tmp, proj, global, sessions)
+}
+
+async fn run_with_session_dir(
+    proj: &std::path::Path,
+    global: &std::path::Path,
+    sessions: &std::path::Path,
+    session_dir: &std::path::Path,
+) -> (bool, String) {
+    let utf8 = |p: &std::path::Path| p.to_str().expect("utf-8").to_string();
+    run_outrig(
+        proj,
+        &[
+            "--global-config",
+            &utf8(global),
+            "--session-root",
+            &utf8(sessions),
+            "run",
+            "--image",
+            "localhost/outrig-test-absent:latest",
+            "--session-dir",
+            &utf8(session_dir),
+        ],
+    )
+    .await
+}
+
+/// #326: `outrig run --session-dir` naming a directory that already holds
+/// something is refused before any record is written.
+#[tokio::test]
+async fn run_refuses_a_session_dir_that_is_not_empty() {
+    let (tmp, proj, global, sessions) = run_fixture();
+    let notes = tmp.path().join("notes");
+    std::fs::create_dir_all(&notes).expect("mkdir notes");
+    std::fs::write(notes.join("KEEP_ME.txt"), b"my notes\n").expect("write note");
+
+    let (ok, stderr) = run_with_session_dir(&proj, &global, &sessions, &notes).await;
+
+    assert!(!ok, "a non-empty --session-dir is refused:\n{stderr}");
+    assert!(
+        stderr.contains("is not empty (it holds KEEP_ME.txt)"),
+        "the refusal names what is there:\n{stderr}"
+    );
+    let names: Vec<_> = std::fs::read_dir(&notes)
+        .expect("read notes")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["KEEP_ME.txt"], "nothing is written beside the note");
+    let listing = SessionStore::new(sessions).list().expect("list");
+    assert!(
+        listing.sessions.is_empty(),
+        "no session is recorded:\n{stderr}"
+    );
+}
+
+/// The directory no longer has to exist first: `run` creates it.
+#[tokio::test]
+async fn run_creates_a_session_dir_that_does_not_exist() {
+    let (tmp, proj, global, sessions) = run_fixture();
+    let run_dir = tmp.path().join("runs/run-1");
+
+    let (ok, stderr) = run_with_session_dir(&proj, &global, &sessions, &run_dir).await;
+
+    assert!(
+        !ok,
+        "the stubbed podman cannot start a container:\n{stderr}"
+    );
+    let recorded = SessionStore::new(sessions).list().expect("list").sessions;
+    assert_eq!(recorded.len(), 1, "one session is recorded:\n{stderr}");
+    let canon = std::fs::canonicalize(&run_dir).expect("the directory is created");
+    assert_eq!(recorded[0].session_dir, canon);
+    assert!(canon.join("session.json").exists());
+}
+
+/// #260: a `--session-dir` session whose directory was removed by hand.
+fn dangling_session(root: &std::path::Path) -> (SessionStore, SessionId, PathBuf) {
+    let parent = root.join("scratch");
+    let dir = parent.join("run-x");
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&dir), &mut sample_session(&sid))
+        .expect("create");
+    let canon = std::fs::canonicalize(&dir).expect("canon");
+    std::fs::remove_dir_all(&canon).expect("rm session dir");
+    (store, sid, canon)
+}
+
+fn link_exists(store: &SessionStore, sid: &SessionId) -> bool {
+    std::fs::symlink_metadata(store.symlink_path(sid)).is_ok()
+}
+
+#[tokio::test]
+async fn ls_reports_a_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+
+    let (mut sw, _stdout_r) = duplex(4096);
+    let (mut ew, stderr_r) = duplex(4096);
+    ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains(&format!(
+            "skipping {sid}: session directory {} no longer exists",
+            dir.display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("no readable sessions (1 skipped)"), "{err}");
+}
+
+#[tokio::test]
+async fn discard_by_id_removes_a_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, format!("outrig-{sid}", sid = "20260501T141907-9b1c"));
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+
+    assert!(!link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_refuses_a_gone_directory_session_that_is_running() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(true) })
+        .await
+        .expect_err("running");
+    assert!(err.to_string().contains("still running"), "{err}");
+    assert!(link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_session_dir_removes_links_to_a_gone_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+
+    assert!(!link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn discard_session_dir_that_never_existed_is_an_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&tmp.path().join("typo"), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect_err("no such dir");
+    assert!(link_exists(&store, &sid));
+}
+
+#[tokio::test]
+async fn logs_names_a_gone_directory_rather_than_denying_the_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, sid.as_str()).expect_err("no record");
+    let msg = err.to_string();
+    assert!(msg.contains("no longer exists"), "{msg}");
+    assert!(msg.contains("outrig discard"), "{msg}");
+}
+
+async fn clean_dangling(
+    store: &SessionStore,
+    args: &clean::CleanArgs,
+    now: SystemTime,
+    running: BTreeSet<String>,
+) -> (i32, String) {
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        store,
+        args,
+        now,
+        running,
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    (rc, drain(stderr_r).await)
+}
+
+#[tokio::test]
+async fn clean_removes_an_old_link_whose_directory_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    // The link was just made, so it is old only against a far-future `now`.
+    let (rc, err) = clean_dangling(
+        &store,
+        &clean_args(clean::DEFAULT_OLDER_THAN, true),
+        clean_now() + days(3650),
+        BTreeSet::new(),
+    )
+    .await;
+    assert_eq!(rc, 0);
+    assert!(err.contains("(directory gone)"), "{err}");
+    assert!(!link_exists(&store, &sid), "{err}");
+}
+
+#[tokio::test]
+async fn clean_keeps_a_young_link_and_a_running_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = dangling_session(tmp.path());
+
+    let (_, err) = clean_dangling(
+        &store,
+        &clean_args(clean::DEFAULT_OLDER_THAN, true),
+        SystemTime::now(),
+        BTreeSet::new(),
+    )
+    .await;
+    assert!(link_exists(&store, &sid), "{err}");
+
+    let running = BTreeSet::from([format!("outrig-{sid}")]);
+    let (_, err) = clean_dangling(
+        &store,
+        &clean_args(days(1), true),
+        clean_now() + days(3650),
+        running,
+    )
+    .await;
+    assert!(err.contains("skipped running sessions"), "{err}");
+    assert!(link_exists(&store, &sid), "{err}");
+}
+
+#[tokio::test]
+async fn discard_session_dir_accepts_a_relative_path_to_a_gone_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = dangling_session(tmp.path());
+    let relative = pathdiff(&dir);
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&relative, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    assert!(!link_exists(&store, &sid));
+}
+
+/// `dir` spelled relative to the cwd, with `..` steps -- the form a user types.
+fn pathdiff(dir: &std::path::Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("cwd");
+    let up = cwd.components().count() - 1;
+    let mut out = PathBuf::new();
+    for _ in 0..up {
+        out.push("..");
+    }
+    out.join(dir.strip_prefix("/").expect("absolute"))
+}
+
+#[tokio::test]
+async fn discard_session_dir_through_a_symlinked_ancestor_whose_destination_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let job = tmp.path().join("scratch/job");
+    let alias = tmp.path().join("alias");
+    std::fs::create_dir_all(&job).expect("job");
+    std::os::unix::fs::symlink(&job, &alias).expect("alias");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    store
+        .create(&sid, Some(&alias.join("run")), &mut sample_session(&sid))
+        .expect("create");
+    std::fs::remove_dir_all(tmp.path().join("scratch")).expect("rm tree");
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&alias.join("run"), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("discard");
+    assert!(!link_exists(&store, &sid));
+}
+
+// -------- #261: an unreadable session record --------
+
+/// A session whose `session.json` was cut off mid-write, under an id that
+/// encodes a start time well before `clean_now()`.
+fn unreadable_session(root: &std::path::Path) -> (SessionStore, SessionId, PathBuf) {
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+    let record = dir.join("session.json");
+    let len = std::fs::metadata(&record).expect("stat").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .expect("open")
+        .set_len(len / 2)
+        .expect("truncate");
+    (store, sid, dir)
+}
+
+/// `unreadable_session`, cut just past `container_name`, with that name set
+/// to `container` -- an `outrig mcp --attach` record, which borrows one.
+fn unreadable_session_naming(
+    root: &std::path::Path,
+    container: &str,
+) -> (SessionStore, SessionId, PathBuf) {
+    let store = SessionStore::new(root.join("sessions"));
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let mut session = sample_session(&sid);
+    session.container_name = container.to_string();
+    let dir = store.create(&sid, None, &mut session).expect("create");
+    let record = dir.join("session.json");
+    let text = std::fs::read_to_string(&record).expect("read");
+    let cut = text.find("\"image_tag\"").expect("image_tag") - 1;
+    std::fs::write(&record, &text[..cut]).expect("truncate");
+    (store, sid, dir)
+}
+
+#[tokio::test]
+async fn discard_by_id_removes_an_unreadable_record_and_says_why() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(&b"y\n"[..]);
+    let args = args_for_id(sid.as_str(), false);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, "outrig-20260501T141907-9b1c");
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+    drop(ew);
+
+    assert!(!dir.exists(), "the unreadable record should be removed");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("session.json is unreadable"), "{err}");
+    assert!(!err.contains("configuration:"), "{err}");
+}
+
+#[tokio::test]
+async fn discard_by_id_refuses_an_unreadable_record_whose_container_runs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(true) })
+        .await
+        .expect_err("a running container refuses");
+    assert!(err.to_string().contains("still running"), "{err}");
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn discard_session_dir_removes_an_unreadable_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        assert_eq!(name, "outrig-20260501T141907-9b1c");
+        Ok(false)
+    })
+    .await
+    .expect("discard");
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn an_unreadable_record_is_not_blamed_on_the_configuration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = unreadable_session(tmp.path());
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, sid.as_str())
+        .expect_err("the record cannot be read");
+    let text = err.to_string();
+    assert!(text.starts_with("session record "), "{text}");
+    assert!(text.contains("is unreadable"), "{text}");
+}
+
+async fn run_clean(
+    store: &SessionStore,
+    args: &clean::CleanArgs,
+    running: BTreeSet<String>,
+    labeled: Vec<clean::LabeledContainer>,
+) -> String {
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        store,
+        args,
+        clean_now(),
+        running,
+        labeled,
+        Vec::new(),
+        no_removals,
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    drain(stderr_r).await
+}
+
+#[tokio::test]
+async fn clean_yes_alone_leaves_an_unreadable_record_and_names_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+
+    let err = run_clean(
+        &store,
+        &clean_args(days(30), true),
+        BTreeSet::new(),
+        Vec::new(),
+    )
+    .await;
+    assert!(dir.exists(), "-y must not remove what it cannot show");
+    assert!(
+        err.contains(sid.as_str()) && err.contains("--unreadable"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_unreadable_removes_the_record_past_the_cutoff() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session(tmp.path());
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let err = run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(!dir.exists(), "{err}");
+    assert!(err.contains("unreadable session record"), "{err}");
+    assert!(err.contains(sid.as_str()), "{err}");
+}
+
+#[tokio::test]
+async fn clean_unreadable_keeps_a_recent_record_and_a_running_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    // Younger than the cutoff relative to the encoded start time.
+    let young = clean::CleanArgs {
+        older_than: days(100_000),
+        ..clean_args(days(1), true)
+    };
+    let young = clean::CleanArgs {
+        unreadable: true,
+        ..young
+    };
+    run_clean(&store, &young, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists(), "a record inside the cutoff stays");
+
+    let running = BTreeSet::from(["outrig-20260501T141907-9b1c".to_string()]);
+    let err = run_clean(&store, &args, running, Vec::new()).await;
+    assert!(dir.exists(), "a running session's record stays");
+    assert!(err.contains("skipped running sessions"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_never_removes_an_unreadable_entry_that_is_not_a_session_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let dir = tmp.path().join("sessions").join("not-a-session");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("session.json"), b"{").expect("write");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn clean_does_not_sweep_the_container_of_a_record_it_kept() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, _dir) = unreadable_session(tmp.path());
+    let stopped = clean::LabeledContainer {
+        name: format!("outrig-{sid}"),
+        session_label: sid.to_string(),
+        sidecar_label: None,
+        running: false,
+        created: clean_now() - days(40),
+    };
+
+    // `no_removals` panics if the container were handed to `podman rm`.
+    run_clean(
+        &store,
+        &clean_args(days(30), true),
+        BTreeSet::new(),
+        vec![stopped],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unreadable_attach_record_is_checked_by_its_borrowed_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session_naming(tmp.path(), "borrowed-db");
+
+    // discard asks about the container the record named, not outrig-<sid>.
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |name| async move {
+        Ok(name == "borrowed-db")
+    })
+    .await
+    .expect_err("the borrowed container is running");
+    assert!(err.to_string().contains("borrowed-db"), "{err}");
+    assert!(dir.exists());
+
+    // clean sees it among the running containers, too.
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+    let running = BTreeSet::from(["borrowed-db".to_string()]);
+    let err = run_clean(&store, &args, running, Vec::new()).await;
+    assert!(dir.exists(), "{err}");
+    assert!(err.contains("skipped running sessions"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_keeps_an_unreadable_record_that_does_not_name_its_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _sid, dir) = unreadable_session(tmp.path());
+    // The issue's repro: cut before `container_name` is reached.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("session.json"))
+        .expect("open")
+        .set_len(60)
+        .expect("truncate");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let err = run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists(), "{err}");
+    assert!(err.contains("does not say which container"), "{err}");
+}
+
+#[tokio::test]
+async fn clean_does_not_take_a_short_timestamp_for_a_session_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::new(tmp.path().join("sessions"));
+    let dir = tmp.path().join("sessions").join("20260501T14190-9b1c");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("session.json"), b"{").expect("write");
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+    assert!(dir.exists());
+}
+
+#[tokio::test]
+async fn clean_unreadable_sweeps_the_removed_records_stopped_container() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, sid, dir) = unreadable_session_naming(tmp.path(), "outrig-20260501T141907-9b1c");
+    let stopped = clean::LabeledContainer {
+        name: format!("outrig-{sid}"),
+        session_label: sid.to_string(),
+        sidecar_label: None,
+        running: false,
+        created: clean_now() - days(40),
+    };
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(days(30), true)
+    };
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        clean_now(),
+        BTreeSet::new(),
+        vec![stopped],
+        Vec::new(),
+        |names| async move {
+            assert_eq!(names, vec!["outrig-20260501T141907-9b1c".to_string()]);
+            Ok(Vec::new())
+        },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    assert!(!dir.exists(), "{}", drain(stderr_r).await);
+}
+
+#[tokio::test]
+async fn discard_yes_still_warns_when_an_unreadable_record_names_no_container() {
+    for by_dir in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (store, sid, dir) = unreadable_session(tmp.path());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("session.json"))
+            .expect("open")
+            .set_len(60)
+            .expect("truncate");
+
+        let (mut ew, stderr_r) = duplex(4096);
+        let stdin = tokio::io::BufReader::new(tokio::io::empty());
+        let args = if by_dir {
+            args_for_dir(&dir, true)
+        } else {
+            args_for_id(sid.as_str(), true)
+        };
+        discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+            .await
+            .expect("discard");
+        drop(ew);
+
+        let err = drain(stderr_r).await;
+        assert!(
+            err.contains("does not name its container") && err.contains("outrig-20260501T141907"),
+            "by_dir={by_dir}: {err}"
+        );
+        assert!(!dir.exists());
+    }
 }

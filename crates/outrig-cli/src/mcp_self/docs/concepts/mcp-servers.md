@@ -43,11 +43,14 @@ Each entry is one of:
 - A **table** (full form): `{ command = [...], env = { KEY = "value", ... } }`. The `env` map is
   added to the `podman exec` invocation for this server. A `${VAR}` value is passed by name,
   off podman's command line, and outrig shows it only as the reference; see
-  [the value syntax](../reference/config.md#mcp-env-value-syntax).
+  [the value syntax](../reference/config.md#mcp-env-value-syntax). In a repo config a `${VAR}`
+  may name only a variable the global config lists in
+  [`[repo]` `env-allow`](../reference/config.md#repo).
 
 Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within an image-config.
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call
-traces, in the prefix that gets attached to every tool the server exposes.
+traces, in the prefix that gets attached to the tools the server exposes (see
+[Tool name prefixing](#tool-name-prefixing) for the length that prefix holds to).
 
 ## Sidecar placement
 
@@ -203,6 +206,53 @@ which is what a program asking about itself intends. Programs that read it are m
 than they look: rustup's `cargo` shim resolves its own toolchain that way. The trade is that
 the primary's process list is not visible through the view -- it is a filesystem view.
 
+**`/etc/ld.so.preload` is empty for the payload.** glibc's loader reads that file on every start,
+by that absolute name, and no loader option turns it off. After the join it is the *primary's*
+file, so a primary that ships one -- for an allocator, say, or a shim -- would have its library
+loaded into the sidecar's server before `main`, with the server's environment and network, and one
+built for a newer glibc than the sidecar's would stop the server from starting, with a loader
+error naming a file the sidecar never had. So when the payload's loader is not musl's, the
+launcher mounts `/dev/null` over the file in the private namespace it already holds, and the
+loader finds it empty. The primary keeps its own file. The mount is in the payload's namespace,
+though, so everything the server starts sees the file empty too, the primary's own binaries
+included: they do not preload what the primary configured. That holds only while the primary
+leaves the file alone. The mount covers the file as it is when the server starts, and the kernel
+drops a mount whose file is renamed over or deleted, so when the primary replaces the file later
+-- with `sed -i`, or by deleting it and writing another -- the server's later children read the
+replacement, and a glibc one preloads what it lists. A write in place keeps the mask. A file the
+primary creates after the server started is never masked. The server itself read the file once,
+at its start, and is not affected. A musl loader has no such file and a static payload has no
+loader, so none of this applies to either.
+
+**The engine must be local.** The launcher binds the primary's `/proc/<pid>/ns` from this
+machine, so the podman engine has to share this machine's kernel and PID namespace. A socket on
+this host works; a remote engine (another host, a VM, another container) is refused up front.
+
+**A dynamic payload cannot re-execute itself.** The kernel looks for a binary's loader
+(its `PT_INTERP`) in the process's own root, which after the join is the *primary's* rootfs --
+where the sidecar's loader is absent or is a different one. So the launcher does not exec a
+dynamically linked payload directly; it runs the sidecar's loader explicitly, as
+`/mnt/lib/ld-musl-x86_64.so.1 --library-path /mnt/lib:... /mnt/usr/local/bin/node ...`. The
+payload then gets wrong answers to the questions a self-re-exec asks: `/proc/self/exe` names the
+*loader*, so executing it runs a loader with no program, and `argv[0]` is the server's path under
+the graft -- a file that exists but that the kernel cannot run by name, because it goes looking
+for the loader in the primary. Failures are oblique. Python's
+`subprocess.run([sys.executable, ...])`, and so `multiprocessing`'s `spawn` and `forkserver`, get
+`ENOENT` for a file that is plainly there; Node's `child_process.fork()` runs `process.execPath`,
+which is the loader, and the loader tries to load the script as a program; a Go `os.Executable()`
+or Rust `current_exe()` re-exec fails the same way.
+
+A static payload has no loader and is exec'd from an open file, so executing `/proc/self/exe`
+itself -- the idiom of container runtimes -- does re-run it. What fails are the paths: none of the
+sidecar's rootfs is grafted for it, so `argv[0]` names a file the view does not have (`ENOENT`),
+and what `/proc/self/exe` reads back as -- which is what `os.Executable()` and `current_exe()`
+hand over -- is `/`, which cannot be executed.
+
+A server that does its work in one process -- the quickstart's filesystem server -- is unaffected.
+One that starts copies of itself cannot take `view = "primary"` unless it is a static binary that
+executes the literal path `/proc/self/exe`; run it as an entrypoint sidecar in its own image,
+with the project mounted through `workspace` instead.
+
 A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
 the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in
 that same pre-join instant and for the same reason: the program is one of the sidecar's own
@@ -272,6 +322,18 @@ define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
 
+A label entry may carry `call-timeout-secs`, since the image's author knows how long its tools
+run (see [What if a server hangs?](#what-if-a-server-hangs)). The placement keys and `args` are
+rejected in a label.
+
+A `${VAR}` in a label entry's `env` is read from your environment and handed to the server. The
+label is text the image's author wrote -- a Dockerfile in the repo, or an image the repo names --
+so it is held to the same [`[repo]` `env-allow`](../reference/config.md#repo) list as a repo
+config's references. A reference to a variable the list omits is refused when the session
+starts, naming the server, the key, the variable, and the image; the variable is never read. A
+server your config declares by name replaces the label's entry and is not held by this. An image
+of your own that references a variable needs it listed to start.
+
 For build-from-Dockerfile repo images, `outrig build` also stamps the cache image with the same
 merged `org.outrig.mcp` label it would use at startup. The startup overlay still runs, but is
 idempotent for those repo-local entries. This means `outrig image inspect <name>:<hash>` can show
@@ -284,8 +346,22 @@ repo that wants to delegate completely to the image can omit
 
 The `org.outrig.mcp` label is not required; this allows a shared image
 to be used with different configurations via `config.toml`. Malformed JSON,
-invalid server names, and empty command arrays are startup errors because they
-mean the image metadata is broken.
+invalid server names, and empty command arrays are errors because they
+mean the image metadata is broken: a startup error for an image outrig did not build, and a
+build error for a repo-built image, whose build reads the label it inherited before it merges
+`[images.<name>.mcp]` into it.
+
+That build error names the image-config (`image "coding" embedded config: ...`) and ends with
+the way past it. The label comes from a `LABEL` in the image's Dockerfile or from its base image,
+so replace it in the Dockerfile, after the `FROM`:
+
+```dockerfile
+FROM registry.example.com/shared/tools:3
+LABEL org.outrig.mcp='{}'
+```
+
+An empty table declares no servers, so the build keeps only what `[images.<name>.mcp]` adds.
+Set a corrected value instead to keep the servers the base image meant to declare.
 
 To inspect what will actually start, run:
 
@@ -322,9 +398,10 @@ is:
 4. **Register with Rig** -- each discovered tool becomes a `McpToolAdapter` that implements Rig's
    dynamic-tool trait. The agent now has access to it.
 
-All servers come up before the REPL accepts any input. If any server fails to initialize,
-`outrig run` reports the error on stderr and exits before the REPL starts -- you don't get partial
-sandboxes.
+All servers come up before the REPL accepts any input. If any server fails to initialize --
+including one that [stops answering](#what-if-a-server-hangs) -- `outrig run` reports the error
+on stderr, with the server's stderr so far, and exits before the REPL starts. You don't get
+partial sandboxes.
 
 When the REPL terminates (Ctrl-D, Ctrl-C, or LLM error), outrig closes each server's stdin in
 turn, waits up to 5 seconds for the process to exit, then stops the containers -- sidecars
@@ -370,7 +447,8 @@ own environment. Only the human at the REPL or the embedding program can.
 
 Two different MCP servers can have a tool with the same name (e.g. both `fs` and `archive` might
 define `read_file`). To avoid collisions and keep the LLM's tool-name space predictable, outrig
-**always** prefixes every tool with its server name:
+prefixes every tool with its server name, as far as the 64-character limit on a name allows (see
+[Long server names](#long-server-names)):
 
 ```
 fs__list_directory
@@ -422,6 +500,27 @@ You can list every tool currently registered with the agent from inside the REPL
   shell__exec          Run a shell command and return its stdout/stderr.
 >
 ```
+
+### Long server names
+
+The server-name rule bounds spelling, not length, and a rewritten name is cut at a fixed length
+without regard for where the server name ends, so the prefix survives a rewrite only while the
+server name leaves room for it. At the default six-character suffix, a rewritten name for a
+server whose name is:
+
+- **54 characters or fewer** reads `<server>__<start of the tool>_<hash>`.
+- **55 characters** keeps `<server>__` and none of the tool's name.
+- **56 characters** keeps half the separator, so it reads `<server>__<hash>`.
+- **57 characters or more** is cut inside the server name: the first 57 characters of it, `_`,
+  and the hash, with no `__`.
+
+A widened suffix leaves less room, so a widened name loses the prefix at a shorter server name.
+A name advertised as written is not affected, and begins `<server>__` in full. Routing is not
+affected either, since a name is looked up whole rather than split. What suffers is legibility:
+a person or a model reading the tool list cannot tell which server hosts such a tool, which is
+why `outrig mcp` tells its client to treat names as opaque and call each exactly as listed.
+Keeping server names to 54 characters or fewer avoids it for every name outrig does not have to
+widen.
 
 ## Protocol revisions and list caching
 
@@ -487,6 +586,28 @@ servers that are reentrant-safe: no fixed listening port, global pidfile, or exc
 lock unless the server is explicitly designed to coordinate multiple copies. If a server
 cannot run twice, the second copy should fail clearly during startup and its stderr log
 will show the underlying conflict.
+
+## What if a server hangs?
+
+Every request outrig sends a server has a deadline, so a server that stops answering costs a
+bounded wait rather than the session:
+
+- `initialize` and `tools/list` get 120 seconds each. A server that misses either fails startup
+  the way a crashed one does, with the stderr it has written so far. A `tools/list` whose pages
+  would never end -- one that hands back a `nextCursor` it already sent, or is still paging after
+  1,000 pages -- fails startup the same way, without waiting out its 120 seconds.
+- `tools/call` gets the server's own `call-timeout-secs`, else the top-level
+  `mcp-call-timeout-secs`, else 10 minutes. A call that runs past it is cancelled at the server
+  with `notifications/cancelled`, and the model gets a timeout error in place of a result. The
+  session goes on, and the server stays connected.
+
+A call outrig stops waiting for early is cancelled the same way: one in a turn interrupted with
+Ctrl-C, or one whose `outrig mcp` client sent its own cancel. Cancellation is advisory -- the MCP
+spec lets a server finish the work anyway -- so a tool with side effects may still complete them.
+
+Raise `call-timeout-secs` on a server whose tools legitimately run long, such as a build or a
+test suite, rather than the session-wide default; see
+[Reference -> Config](../reference/config.md#imagesnamemcp).
 
 ## Picking which servers to include
 

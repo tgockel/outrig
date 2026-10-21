@@ -29,14 +29,15 @@
 //!
 //! A grace is worth something only while this runtime is alive. A runtime
 //! shutting down inside one drops the reap task, `kill_on_drop` escalates
-//! immediately, and the child is back to being killed outright. Ctrl-C is not
-//! covered by this mechanism at all: the terminal delivers `SIGINT` to the
-//! whole foreground process group, so the child has a catchable signal from
-//! the kernel before outrig does anything. That is right for a child that
-//! should stop when the user does, and wrong for one that must outlive a
-//! Ctrl-C outrig handles itself -- a `podman exec` client exits on `SIGINT`,
-//! and the process it started sees its stdin close. Such a child is started
-//! with [`Cmd::in_own_process_group`].
+//! immediately, and the child is back to being killed outright. A caller about
+//! to exit keeps the grace by waiting it out: the reap is owed to whoever waits
+//! out the drop -- an [`Abandonable`](crate::Abandonable), or the engine's wait
+//! for a stopped start -- until the child is gone, and is not proven done if
+//! the grace ran out. Ctrl-C is not
+//! covered by this mechanism at all and does not need to be: the terminal
+//! delivers `SIGINT` to the whole foreground process group, so the child has
+//! a catchable signal from the kernel before outrig does anything -- unless
+//! it was spawned out of that group; see [Process groups](#process-groups).
 //!
 //! So the bound a caller who never passes a stop signal gets is **terminated
 //! synchronously, reaped as soon as the runtime is next driven** -- measured
@@ -65,6 +66,15 @@
 //! has given away. That is deliberate: `podman exec -i` callers want full
 //! bidirectional control of the handle.
 //!
+//! # Process groups
+//!
+//! A child joins outrig's process group, and that is load-bearing. `outrig
+//! build`, and the steps of a session before it listens for signals, leave
+//! `SIGINT` at its default: outrig dies where it stands, no `Drop` runs, and
+//! the only signal a running `buildah` gets is the terminal's copy. The
+//! exception is a child the session owns rather than the call that started
+//! it; see [`Cmd::in_own_process_group`].
+//!
 //! # What this module does not cover
 //!
 //! Killing a client is not cleaning up what it created. A dead `podman exec`
@@ -90,6 +100,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::error::{IoPathExt, OutrigError, Result};
+use crate::supervise::Debt;
 
 pub(crate) const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
 const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
@@ -134,13 +145,13 @@ const STREAM_READ_CHUNK: usize = 8 * 1024;
 pub(crate) struct Cmd {
     pub(crate) program: &'static str,
     pub(crate) args: Vec<OsString>,
-    /// Whether the child starts in a process group of its own; see
-    /// [`Cmd::in_own_process_group`].
-    own_process_group: bool,
     /// Display stand-ins for some of `args`, by index.
     shown: Vec<(usize, OsString)>,
     /// Added to the environment the child inherits.
     env: Vec<(OsString, OsString)>,
+    /// Whether the child leads a process group of its own rather than
+    /// joining outrig's. See [`Cmd::in_own_process_group`].
+    own_process_group: bool,
 }
 
 impl Cmd {
@@ -148,23 +159,10 @@ impl Cmd {
         Self {
             program,
             args: Vec::new(),
-            own_process_group: false,
             shown: Vec::new(),
             env: Vec::new(),
+            own_process_group: false,
         }
-    }
-
-    /// Start the child in a process group of its own, out of reach of the
-    /// `SIGINT` a terminal sends its whole foreground group on Ctrl-C.
-    ///
-    /// For a child whose caller handles Ctrl-C itself and needs the child to
-    /// outlive it. The module's usual arrangement -- the child takes the
-    /// terminal's signal alongside outrig -- is wrong there: a `podman exec`
-    /// client exits on `SIGINT`, and the process it started sees its stdin
-    /// close.
-    pub(crate) fn in_own_process_group(mut self) -> Self {
-        self.own_process_group = true;
-        self
     }
 
     pub(crate) fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
@@ -197,6 +195,28 @@ impl Cmd {
         self
     }
 
+    /// Spawn the child as the leader of a new process group, out of reach of
+    /// the terminal's Ctrl-C.
+    ///
+    /// For a child that belongs to the session rather than to the call that
+    /// started it -- an MCP transport, which has to outlive the turn a Ctrl-C
+    /// abandons, or the interpreter's `podman exec`, whose caller handles
+    /// Ctrl-C itself. The terminal sends `SIGINT` to its foreground group, and
+    /// podman's client exits on it, closing the stdin of the process it
+    /// started. A child in a group of its own hears only
+    /// what outrig sends it, so what ends it is the session's teardown:
+    /// [`crate::McpClient::shutdown`], or the drop of the [`Owned`] holding
+    /// it.
+    ///
+    /// Not for a child that inherits the terminal: a background group that
+    /// reads it is stopped with `SIGTTIN`, and one that writes to it can be
+    /// stopped with `SIGTTOU`. See [Process groups](self#process-groups) for
+    /// why this is not the default.
+    pub(crate) fn in_own_process_group(mut self) -> Self {
+        self.own_process_group = true;
+        self
+    }
+
     /// The argv as executed. For deciding what runs, never for display.
     pub(crate) fn exec_args(&self) -> &[OsString] {
         &self.args
@@ -218,12 +238,17 @@ impl Cmd {
         !self.shown.is_empty() || !self.env.is_empty()
     }
 
-    /// Build a fresh `std::process::Command` from this argv and environment.
-    /// No stdio configuration is applied.
+    /// Build a fresh `std::process::Command` from this argv, environment, and
+    /// process group. No stdio configuration is applied.
     pub(crate) fn std_command(&self) -> std::process::Command {
+        use std::os::unix::process::CommandExt as _;
+
         let mut c = std::process::Command::new(self.program);
         c.args(&self.args);
         c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        if self.own_process_group {
+            c.process_group(0);
+        }
         c
     }
 
@@ -231,11 +256,7 @@ impl Cmd {
     /// configuration is applied -- the caller layers `.stdin()` / `.stdout()`
     /// / `.stderr()` to taste before spawning.
     pub(crate) fn to_tokio_command(&self) -> Command {
-        let mut c = Command::from(self.std_command());
-        if self.own_process_group {
-            c.process_group(0);
-        }
-        c
+        Command::from(self.std_command())
     }
 
     /// Render the argv as a shell-like command line for diagnostics. This is
@@ -303,6 +324,7 @@ impl Cmd {
         Ok(Owned {
             child: Some(child),
             handle,
+            program: self.program,
             termination,
             keepalive,
         })
@@ -347,6 +369,7 @@ impl fmt::Debug for Cmd {
             .field("program", &self.program)
             .field("argv", &self.shown_args())
             .field("env", &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .field("own_process_group", &self.own_process_group)
             .finish()
     }
 }
@@ -367,17 +390,6 @@ impl StdioSpec {
             stdin: Stdio::null(),
             stdout: Stdio::piped(),
             stderr: Stdio::piped(),
-        }
-    }
-
-    /// [`Self::captured`] but with the parent's stdin. `try_capture` was built
-    /// on `Command::output()`, which (unlike `std`'s) does not redirect stdin,
-    /// so its children have always inherited it. Preserved deliberately:
-    /// `Container::exec_capture` is public and runs through this.
-    fn captured_inheriting_stdin() -> Self {
-        Self {
-            stdin: Stdio::inherit(),
-            ..Self::captured()
         }
     }
 
@@ -415,6 +427,8 @@ pub(crate) struct Owned {
     /// `Drop` has nothing to do.
     child: Option<Child>,
     handle: Handle,
+    /// The command's name, for saying which child outlived its grace.
+    program: &'static str,
     /// What the abandoning paths send. Fixed at the spawn, because the claim
     /// it encodes is about the command, not about the moment it is stopped.
     termination: Termination,
@@ -477,8 +491,8 @@ fn keep_pipes_open(child: &mut Child) -> Vec<std::os::fd::OwnedFd> {
 /// has already exited, whose zombie absorbs the signal harmlessly.
 ///
 /// The signal goes to the pid and never to a process group. outrig shares its
-/// group with everything it spawns, so `kill(-pgid, ..)` would be outrig
-/// signalling itself and every sibling command in flight.
+/// group with nearly everything it spawns, so `kill(-pgid, ..)` would be
+/// outrig signalling itself and every sibling command in flight.
 fn request_stop(child: &Child) -> bool {
     let Some(pid) = child.id() else {
         return false;
@@ -679,20 +693,28 @@ impl Drop for Owned {
         // That backstop is also the limit of a grace: it is worth something
         // only while this runtime is alive. A runtime shutting down inside
         // one drops the task, and `kill_on_drop` escalates immediately --
-        // correct, and the reason the grace is not a promise.
+        // correct, and the reason the grace is not a promise. The reap is
+        // owed to whoever is waiting out this drop, so a caller about to
+        // exit can keep the runtime alive for it.
         //
         // The keepalives ride along and are closed by this task's end, which
         // is after the reap: a child asked to stop has to be able to write
         // until it is gone.
         let keepalive = std::mem::take(&mut self.keepalive);
+        let owed = Debt::new();
+        let program = self.program;
         self.handle.spawn(async move {
             if let Some(grace) = grace
                 && tokio::time::timeout(grace, child.wait()).await.is_err()
             {
+                owed.fail(format!(
+                    "`{program}` did not stop within {grace:?} and was killed"
+                ));
                 let _ = child.start_kill();
             }
             let _ = child.wait().await;
             drop(keepalive);
+            drop(owed);
         });
     }
 }
@@ -729,19 +751,76 @@ impl Transcript {
     /// Record one already-rendered logical line with the conventional
     /// `[prefix]` marker.
     pub async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
-        let rendered = format!("[{prefix}] {line}\n");
-        self.write_all(rendered.as_bytes()).await
+        self.write_all(render_line(prefix, line).as_bytes()).await
     }
 
     async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         if self.stderr {
-            let mut stderr = tokio::io::stderr();
-            stderr.write_all(bytes).await?;
-            stderr.flush().await?;
+            write_to_stderr(bytes).await?;
         }
         let mut file = self.file.lock().await;
         file.write_all(bytes).await?;
         file.flush().await
+    }
+}
+
+/// The one rendering of a command's line, so a line shown as it arrives and
+/// the same line recorded under `-v` read alike.
+fn render_line(prefix: &str, line: &str) -> String {
+    format!("[{prefix}] {line}\n")
+}
+
+/// Write to this process's stderr and wait for the bytes to land. tokio's
+/// stderr hands each write to a blocking thread and only `flush` waits for
+/// it, so a caller that orders a later `eprintln!` after this needs both.
+async fn write_to_stderr(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stderr = tokio::io::stderr();
+    stderr.write_all(bytes).await?;
+    stderr.flush().await
+}
+
+/// Where a captured command's lines go besides the caller's buffer.
+///
+/// A transcript records every line it is given and, under `-v`, mirrors it
+/// to stderr; the live sink writes to stderr and nowhere else. The two meet
+/// in one rule, applied at construction: a line reaches stderr once, however
+/// many sinks are on.
+#[derive(Clone, Debug)]
+pub(crate) struct Tee {
+    /// Also the only sink for what is recorded but never shown as it
+    /// happens: the `$ <cmd>` echo.
+    transcript: Option<Transcript>,
+    /// Write each line to this process's stderr as it arrives. Cleared when
+    /// `transcript` already mirrors there.
+    live_stderr: bool,
+}
+
+impl Tee {
+    pub(crate) fn new(transcript: Option<Transcript>, live_stderr: bool) -> Self {
+        let mirrored = transcript.as_ref().is_some_and(|t| t.stderr);
+        Self {
+            transcript,
+            live_stderr: live_stderr && !mirrored,
+        }
+    }
+
+    /// `[prefix] line` to every sink that is on.
+    ///
+    /// A transcript failure is returned: the caller asked for a record and
+    /// did not get one. A live failure is dropped: the view is best-effort,
+    /// and neither the drain nor the command stops over it.
+    async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
+        if self.transcript.is_none() && !self.live_stderr {
+            return Ok(());
+        }
+        let rendered = render_line(prefix, line);
+        if self.live_stderr {
+            let _ = write_to_stderr(rendered.as_bytes()).await;
+        }
+        match &self.transcript {
+            Some(t) => t.write_all(rendered.as_bytes()).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -751,8 +830,13 @@ impl Transcript {
 /// caller (e.g. `git rev-parse --git-dir` for "is this a git repo?",
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
+///
+/// The child's stdin is `/dev/null`. This is what `Container::exec_capture`
+/// runs through, and its `podman exec -i` client forwards whatever it reads: a
+/// stdin inherited from the caller would be consumed out from under an
+/// embedder that reads its own.
 pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
-    let mut child = cmd.spawn_owned(StdioSpec::captured_inheriting_stdin(), Termination::Kill)?;
+    let mut child = cmd.spawn_owned(StdioSpec::captured(), Termination::Kill)?;
     let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
     let stderr_task = Drain::spawn(capture_all(child.take_stderr()));
 
@@ -816,8 +900,27 @@ pub(crate) async fn try_capture_logged_until(
     termination: Termination,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
-    let transcript = transcript.cloned();
-    if let Some(t) = &transcript {
+    let tee = Tee::new(transcript.cloned(), false);
+    try_capture_tee_until(cmd, prefix, tee, termination, true, stop).await
+}
+
+/// [`try_capture_logged_until`] over any [`Tee`]: the body every logged
+/// capture shares, so the recorded and the shown variants differ only in
+/// where their lines go.
+///
+/// Stderr keeps its last `STDERR_TAIL_LIMIT + 1` bytes, the same bound
+/// [`run_capture`] applies, so a chatty command cannot grow the process
+/// without limit. Stdout is kept whole when `keep_stdout` and dropped (after
+/// reaching the tee) otherwise, for the commands whose stdout nobody reads.
+async fn try_capture_tee_until(
+    cmd: Cmd,
+    prefix: &'static str,
+    tee: Tee,
+    termination: Termination,
+    keep_stdout: bool,
+    stop: impl Future<Output = ()>,
+) -> Result<Output> {
+    if let Some(t) = &tee.transcript {
         t.line(prefix, &format!("$ {}", cmd.render())).await?;
     }
 
@@ -830,9 +933,17 @@ pub(crate) async fn try_capture_logged_until(
     let stdout_task = Drain::spawn(capture_stream(
         child.take_stdout(),
         prefix,
-        transcript.clone(),
+        tee.clone(),
+        keep_stdout.then_some(usize::MAX),
     ));
-    let stderr_task = Drain::spawn(capture_stream(child.take_stderr(), prefix, transcript));
+    let stderr_task = Drain::spawn(capture_stream(
+        child.take_stderr(),
+        prefix,
+        tee,
+        // One byte past the limit, so `tail_string` can still see a clip and
+        // mark it.
+        Some(STDERR_TAIL_LIMIT + 1),
+    ));
 
     // Pinned so the same signal can be awaited twice: once against the child,
     // and again against the drain that outlives it.
@@ -912,7 +1023,7 @@ pub(crate) async fn run_capture_logged(
     prefix: &'static str,
     transcript: Option<&Transcript>,
 ) -> Result<Output> {
-    run_capture_logged_terminating(cmd, prefix, transcript, Termination::Kill).await
+    run_capture_logged_terminating(cmd, prefix, transcript, Termination::Kill, true).await
 }
 
 /// [`run_capture_logged`] for a caller that owns the termination claim.
@@ -920,18 +1031,25 @@ pub(crate) async fn run_capture_logged(
 /// Separate rather than a fourth parameter on the common helper: `Kill` is
 /// right for every one of its callers but the build, and a parameter on all
 /// of them would bury the single exception in a column of identical
-/// arguments instead of naming it.
+/// arguments instead of naming it. [`run_capture_shown`] is the same shape
+/// for the other exception a session's build makes.
+///
+/// `keep_stdout` is false for the build and the pull, whose stdout is not read
+/// and can run to the length of a build log.
 pub(crate) async fn run_capture_logged_terminating(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
     termination: Termination,
+    keep_stdout: bool,
 ) -> Result<Output> {
-    let output = try_capture_logged_until(
+    let tee = Tee::new(transcript.cloned(), false);
+    let output = try_capture_tee_until(
         cmd.clone(),
         prefix,
-        transcript,
+        tee,
         termination,
+        keep_stdout,
         std::future::pending(),
     )
     .await?;
@@ -942,6 +1060,43 @@ pub(crate) async fn run_capture_logged_terminating(
             output.status.code(),
             tail_string(&output.stderr, STDERR_TAIL_LIMIT),
         ))
+    }
+}
+
+/// [`run_capture_logged_terminating`] for the one command whose output is
+/// the point: a cache-miss `buildah build` or `podman pull` during session
+/// startup. Each line goes to this process's stderr as it arrives -- once,
+/// since a transcript that already mirrors there is left to do it -- so a
+/// build that takes minutes is seen to be running rather than hung.
+///
+/// No stderr tail on failure. The lines are already above the error, and
+/// repeating up to a mebibyte of them would bury it: the same reasoning as
+/// [`run_streamed_checked`].
+///
+/// Every line is on stderr before this returns. [`write_to_stderr`] waits for
+/// each write to land, and the drains are joined before the `Output` exists,
+/// so a caller's own `eprintln!` after the await lands after the last shown
+/// line.
+pub(crate) async fn run_capture_shown(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    termination: Termination,
+) -> Result<Output> {
+    let tee = Tee::new(transcript.cloned(), true);
+    let output = try_capture_tee_until(
+        cmd.clone(),
+        prefix,
+        tee,
+        termination,
+        false,
+        std::future::pending(),
+    )
+    .await?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(cmd.process_error(output.status.code(), String::new()))
     }
 }
 
@@ -1114,10 +1269,14 @@ impl BoundedStderrTail {
     }
 }
 
+/// Drain `stream` through `tee`, retaining the last `retain` bytes: `None`
+/// keeps nothing, `Some(usize::MAX)` everything. A bounded buffer is trimmed
+/// back to the limit at twice its size, so the copying stays amortized.
 async fn capture_stream<R>(
     stream: R,
     prefix: &'static str,
-    transcript: Option<Transcript>,
+    tee: Tee,
+    retain: Option<usize>,
 ) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -1129,25 +1288,31 @@ where
     // transcript on a full disk used to end this loop with the child still
     // writing, which for a child whose read end this module holds open is a
     // stall rather than an error -- see the drain in [`run_streamed`].
-    let mut transcript_failed = None;
+    let mut tee_failed = None;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
         if n == 0 {
             break;
         }
-        captured.extend_from_slice(&line);
-        if let Some(t) = &transcript
-            && transcript_failed.is_none()
-        {
+        if let Some(limit) = retain {
+            captured.extend_from_slice(&line);
+            if captured.len() / 2 > limit {
+                captured.drain(..captured.len() - limit);
+            }
+        }
+        if tee_failed.is_none() {
             let rendered = String::from_utf8_lossy(&line);
             let rendered = rendered.trim_end_matches(['\r', '\n']);
-            if let Err(e) = t.line(prefix, rendered).await {
-                transcript_failed = Some(e);
+            if let Err(e) = tee.line(prefix, rendered).await {
+                tee_failed = Some(e);
             }
         }
     }
-    match transcript_failed {
+    if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
+        captured.drain(..captured.len() - limit);
+    }
+    match tee_failed {
         Some(e) => Err(e),
         None => Ok(captured),
     }

@@ -50,13 +50,21 @@ outrig build [--image <name>]
      A literal build-arg is passed as `KEY=value`. A `${VAR}` one is passed as a bare `KEY`,
      with the value in buildah's environment rather than on its command line, and outrig's
      errors and logs show it as `KEY=${VAR}` -- see
-     [the value syntax](../reference/config.md#mcp-env-value-syntax).
+     [the value syntax](../reference/config.md#mcp-env-value-syntax). In a repo config a
+     `${VAR}` build-arg may name only a variable the global config lists in
+     [`[repo]` `env-allow`](../reference/config.md#repo); any other is refused when the config
+     loads, before buildah runs.
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.
+     A label it cannot decode fails the build here, before anything is committed, with an error
+     naming the image-config; see
+     [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
      The temporary tag is then removed, whether or not the build succeeded. If buildah refuses
      the removal, outrig warns and reissues it in the background rather than leaving the tag
-     behind; the build's own result stands either way.
+     behind; the build's own result stands either way. When the label-stamping working container
+     could not be removed either, the tag is removed after it, since buildah refuses to remove an
+     image a container was made from.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 
@@ -70,7 +78,7 @@ $ outrig build
 [outrig] dockerfile:       .agents/outrig/images/coding/Dockerfile
 [outrig] context:          .agents/outrig/images/coding
 [outrig] image tag:        coding:8c2a4f7e91d6b5a3
-[buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
+[buildah] STEP 1/6: FROM docker.io/library/node:24-bookworm-slim
 ...
 [outrig] image ready: coding:8c2a4f7e91d6b5a3
 ```
@@ -113,7 +121,9 @@ stop rather than killing it outright, and waits a bounded grace before escalatin
 buildah that unwinds removes the per-stage *working containers* it created and a killed one
 does not. Those are the one engine resource outrig cannot name for itself: buildah derives
 their names from the base image and offers no way to label them, so the only process that can
-prove which belong to this build is buildah.
+prove which belong to this build is buildah. When a signal ends `outrig run` or `outrig mcp`
+during its image build, outrig waits for that unwind before it exits; a second SIGINT or SIGTERM
+cuts the wait short.
 
 What a cancelled build leaves:
 

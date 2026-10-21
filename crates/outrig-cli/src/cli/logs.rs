@@ -49,17 +49,9 @@ pub struct LogsArgs {
 pub async fn execute(
     args: &LogsArgs,
     session_root_flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
-    global_cfg_path: &Path,
-    cwd: &Path,
+    global_override: Option<&Path>,
 ) -> Result<i32> {
-    let logs_dir = resolve_logs_dir(
-        args,
-        session_root_flag,
-        repo_cfg_override,
-        global_cfg_path,
-        cwd,
-    )?;
+    let logs_dir = resolve_logs_dir(args, session_root_flag, global_override)?;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     execute_with(
@@ -102,12 +94,10 @@ where
 fn resolve_logs_dir(
     args: &LogsArgs,
     session_root_flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
-    global_cfg_path: &Path,
-    cwd: &Path,
+    global_override: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(dir) = args.session_dir.as_deref() {
-        return Ok(dir.join("logs"));
+        return Ok(dir.join(session::LOGS_DIR));
     }
     let Some(query) = args.session.as_deref() else {
         return Err(OutrigError::Configuration(
@@ -115,15 +105,10 @@ fn resolve_logs_dir(
         )
         .into());
     };
-    let root = session::resolve_session_root_for_cli(
-        session_root_flag,
-        repo_cfg_override,
-        global_cfg_path,
-        cwd,
-    )?;
+    let root = session::resolve_session_root_for_cli(session_root_flag, global_override)?;
     let store = SessionStore::new(root);
     let (dir, _) = super::resolve_session_arg(&store, query)?;
-    Ok(dir.join("logs"))
+    Ok(dir.join(session::LOGS_DIR))
 }
 
 async fn list_logs<W, E>(stdout: &mut W, stderr: &mut E, logs_dir: &Path) -> Result<()>

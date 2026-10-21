@@ -14,16 +14,16 @@
 //! recursion is that the launch tools are withheld at the maximum depth,
 //! leaving that subagent with nothing to launch with.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rig::tool::{ToolCallExtensions, ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::llm::TurnUndo;
+use crate::llm::{ANTHROPIC_FALLBACK_MAX_TOKENS, EffectiveCeiling, TurnUndo};
 use crate::rig_tool::truncate_for_llm;
-use crate::subagent::state::{Outcome, SubagentShared, TRUNCATED_REPORT};
+use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
 use crate::subagent::{Read, SubagentRegistry};
 
 /// Wraps a failure as the model-visible tool error.
@@ -283,8 +283,10 @@ impl ToolDyn for WaitResultsTool {
          collect, then return which ones. Returns names only, not their \
          findings -- call outrig__get_result per subagent to read those, so one \
          call cannot flood your context. Use min_count to react to whichever \
-         finishes first. Drop names you have already collected, or this returns \
-         them again immediately."
+         finishes first. A ready subagent stays ready until you collect it, so \
+         this returns it again at once. One whose result you collected counts \
+         again only when it reports again; if it is idle, it is not waited on, \
+         and a call naming only such subagents fails."
             .to_string()
     }
 
@@ -301,7 +303,8 @@ impl ToolDyn for WaitResultsTool {
                     "type": "integer",
                     "minimum": 1,
                     "description": "How many must be ready before returning. \
-                                    Defaults to all of them."
+                                    Defaults to all of them; idle ones \
+                                    with nothing new do not count."
                 }
             },
             "required": ["names"],
@@ -543,7 +546,18 @@ const SHORTEN_THE_REPORT: &str = "\
     quoting at length. If it genuinely cannot be shortened, say so via \
     `status: \"error\"` with a short `body`.";
 
-/// What every truncated call gets once the round has given up.
+/// [`SHORTEN_THE_REPORT`], for a round whose report already stands (#521).
+/// Offering `status: "error"` here would invite a model to publish a short
+/// error over the report, which the inbox keeps only the latest of.
+const SHORTEN_A_REVISION: &str = "\
+    nothing was recorded by this call: `status` arrived but `body` did not. \
+    That usually means the reply hit the output token limit part-way through. \
+    The report you recorded earlier stands, and the agent that launched you \
+    will read it. If the revision matters, call again with a shorter `body`; \
+    otherwise stop calling outrig__set_result.";
+
+/// What every truncated call gets once the round has given up and told the
+/// parent so.
 ///
 /// Deliberately a *failure* rather than a success. Returning `Ok` here read as
 /// "call handled" to the repeat breaker in [`crate::llm::RepeatTracker`], which
@@ -555,6 +569,21 @@ const ALREADY_REPORTED: &str = "\
     told that your reply is being cut off at its output-token limit, so this \
     report cannot be delivered. Stop calling outrig__set_result.";
 
+/// [`ALREADY_REPORTED`], for a round that gave up after it had reported: that
+/// report stands, and the agent that launched it was told nothing (#350).
+const REPORT_STANDS: &str = "\
+    nothing further was recorded. This report is being cut off at your \
+    output-token limit, so it cannot be delivered; the agent that launched you \
+    keeps the report you recorded earlier. Stop calling outrig__set_result.";
+
+/// What a truncated call gets once the round has given up, by how it did.
+fn refusal(how: GaveUp) -> &'static str {
+    match how {
+        GaveUp::Told => ALREADY_REPORTED,
+        GaveUp::KeptReport => REPORT_STANDS,
+    }
+}
+
 /// The last ask. Retrying the report is off the table by now, so this asks for
 /// the one thing that still fits: a short error the parent can act on.
 const SEND_A_SHORT_ERROR: &str = "\
@@ -563,6 +592,14 @@ const SEND_A_SHORT_ERROR: &str = "\
     -- it will be cut off in the same place. Call once more with `status: \
     \"error\"` and a one-sentence `body` naming what you found and that the \
     report did not fit.";
+
+/// [`SEND_A_SHORT_ERROR`], for a round whose report already stands (#521).
+const LEAVE_THE_REPORT: &str = "\
+    still nothing recorded: `body` was missing again, so the revision is being \
+    cut off before it is written. The report you recorded earlier stands, and \
+    the agent that launched you will read it. Do not attempt the longer \
+    revision again -- it will be cut off in the same place. Stop calling \
+    outrig__set_result.";
 
 /// `outrig__set_result`: the subagent-side tool. Publishes into the inbox the
 /// parent reads, and does **not** end the round -- the subagent may keep
@@ -573,13 +610,99 @@ pub struct SetResultTool {
     /// This subagent's handle, for the trace prefix, matching the shape the
     /// agent loop's own traces use.
     label: Arc<str>,
-    /// The agent whose turns hit the ceiling, and the ceiling in effect for
-    /// it -- which may have come from the agent or from its model. Carried
-    /// only to name the fix in the one operator-facing warning below.
-    /// `None` for an agentless session, which has no `[agents.<name>]` table
-    /// to point the operator at.
+    /// The agent whose turns hit the ceiling. Carried only to name the fix
+    /// in the one operator-facing warning below. `None` for an agentless
+    /// session, which has no `[agents.<name>]` table to point the operator at.
     agent_name: Option<Arc<str>>,
-    max_tokens: Option<u32>,
+    /// The ceilings this subagent's candidates send, which may differ from
+    /// the configured ones. Filled once `build_agent` has computed them; this
+    /// tool is one of its inputs, so it cannot be handed them directly.
+    ceilings: Arc<OnceLock<Vec<EffectiveCeiling>>>,
+}
+
+/// What to tell the operator about a cut-off report, from the ceilings the
+/// subagent's candidates actually send (#258). Empty means the cell was never
+/// filled, which is told as an unset value.
+fn ceiling_remedy(scope: &str, agent_name: Option<&str>, ceilings: &[EffectiveCeiling]) -> String {
+    let ceilings = match ceilings {
+        [] => return single_ceiling_remedy(scope, agent_name, &EffectiveCeiling::default()),
+        [only] => return single_ceiling_remedy(scope, agent_name, only),
+        many => many,
+    };
+    // Which candidate wrote the cut-off report is not knowable from here, so
+    // name every candidate's number rather than the first one's.
+    let sent = ceilings
+        .iter()
+        .map(|c| match c.sent {
+            Some(n) => format!("{} {n}", c.model_name),
+            None => format!("{} (none sent)", c.model_name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // An agent's `max-tokens` overrides every candidate's model row, so where
+    // there is an agent it is the knob that always takes effect; editing a
+    // `[models.<name>]` row would do nothing when the agent sets one.
+    let knob = match agent_name {
+        Some(agent) => format!(
+            "set [agents.{agent}].max-tokens, which overrides each candidate's \
+             [models.<name>].max-tokens"
+        ),
+        None => "raise the answering candidate's [models.<name>].max-tokens".to_string(),
+    };
+    format!(
+        "this alias's candidates send max-tokens {sent}; whichever answered hit its own \
+         -- {knob}, or ask for a shorter or split report"
+    )
+}
+
+fn single_ceiling_remedy(
+    scope: &str,
+    agent_name: Option<&str>,
+    ceiling: &EffectiveCeiling,
+) -> String {
+    match (ceiling.configured, ceiling.sent) {
+        // Lowered to what the identifier serves: raising the setting cannot
+        // help, so do not say to.
+        (Some(configured), Some(sent)) if configured > sent => format!(
+            "max-tokens for {scope} is {configured}, but this model serves at most {sent}, so \
+             {sent} was sent -- raising it cannot help; ask for a shorter or split report"
+        ),
+        (Some(limit), _) => {
+            format!("the max-tokens in effect for {scope} is {limit} -- raise it")
+        }
+        // Nothing set it, but outrig or rig chose a number: name it.
+        (None, Some(sent)) if u64::from(sent) == ANTHROPIC_FALLBACK_MAX_TOKENS => {
+            format!(
+                "max-tokens is unset, so outrig's fallback of {sent} was sent -- set \
+                 max-tokens explicitly{}",
+                where_to_set(agent_name)
+            )
+        }
+        (None, Some(sent)) => format!(
+            "max-tokens is unset, so the model's published maximum of {sent} was sent -- \
+             raising it cannot help; ask for a shorter or split report"
+        ),
+        // Nothing set it anywhere, so there is no ambiguity about which
+        // table to name -- except that an agentless session has no
+        // `[agents.<name>]` table, and its only knob is the model's.
+        (None, None) => match agent_name {
+            Some(agent) => format!(
+                "[agents.{agent}].max-tokens is unset, so the provider's default \
+                 applies -- set it explicitly"
+            ),
+            None => "max-tokens is unset, so the provider's default applies -- set \
+                     [models.<name>].max-tokens explicitly"
+                .to_string(),
+        },
+    }
+}
+
+/// ` in [agents.<name>]` or the model table, for the end of a sentence.
+fn where_to_set(agent_name: Option<&str>) -> String {
+    match agent_name {
+        Some(agent) => format!(" in [agents.{agent}]"),
+        None => " in [models.<name>]".to_string(),
+    }
 }
 
 impl SetResultTool {
@@ -587,13 +710,13 @@ impl SetResultTool {
         shared: Arc<SubagentShared>,
         label: &str,
         agent_name: Option<&str>,
-        max_tokens: Option<u32>,
+        ceilings: Arc<OnceLock<Vec<EffectiveCeiling>>>,
     ) -> Self {
         Self {
             shared,
             label: Arc::from(label),
             agent_name: agent_name.map(Arc::from),
-            max_tokens,
+            ceilings,
         }
     }
 
@@ -610,23 +733,11 @@ impl SetResultTool {
             Some(agent) => format!("agent {agent}"),
             None => "this session".to_string(),
         };
-        let remedy = match self.max_tokens {
-            Some(limit) => {
-                format!("the max-tokens in effect for {scope} is {limit} -- raise it")
-            }
-            // Nothing set it anywhere, so there is no ambiguity about which
-            // table to name -- except that an agentless session has no
-            // `[agents.<name>]` table, and its only knob is the model's.
-            None => match &self.agent_name {
-                Some(agent) => format!(
-                    "[agents.{agent}].max-tokens is unset, so the provider's default \
-                     applies -- set it explicitly"
-                ),
-                None => "max-tokens is unset, so the provider's default applies -- set \
-                         [models.<name>].max-tokens explicitly"
-                    .to_string(),
-            },
-        };
+        let remedy = ceiling_remedy(
+            &scope,
+            self.agent_name.as_deref(),
+            self.ceilings.get().map_or(&[], Vec::as_slice),
+        );
         eprintln!(
             "[outrig]   [{}] set_result was cut off before `body`: the model's \
              output-token ceiling is too low for this report. {remedy}.",
@@ -683,27 +794,30 @@ impl ToolDyn for SetResultTool {
                 // Checked before the attempt count, and latched rather than
                 // derived from it, so that everything below happens exactly
                 // once per round however many truncated calls keep arriving.
-                if self.shared.has_given_up() {
-                    return fail(ALREADY_REPORTED);
+                if let Some(how) = self.shared.gave_up() {
+                    return fail(refusal(how));
                 }
                 return match attempt {
                     1 => {
                         self.warn_about_the_ceiling();
-                        fail(SHORTEN_THE_REPORT)
+                        fail(if self.shared.report_stands() {
+                            SHORTEN_A_REVISION
+                        } else {
+                            SHORTEN_THE_REPORT
+                        })
                     }
-                    n if n <= TRUNCATION_RETRY_BUDGET => fail(SEND_A_SHORT_ERROR),
+                    n if n <= TRUNCATION_RETRY_BUDGET => fail(if self.shared.report_stands() {
+                        LEAVE_THE_REPORT
+                    } else {
+                        SEND_A_SHORT_ERROR
+                    }),
                     // Out of retries. Publishing on the subagent's behalf is
                     // what makes this converge: `end_round` sees a round that
                     // published, and a parent blocked in `get_result` wakes now
                     // with the cause instead of once the tool-call budget has
-                    // drained into the same failing call.
-                    _ => {
-                        if self.shared.give_up() {
-                            self.shared
-                                .publish(Outcome::Error(TRUNCATED_REPORT.to_string()));
-                        }
-                        fail(ALREADY_REPORTED)
-                    }
+                    // drained into the same failing call. A round that reported
+                    // already keeps its report instead (#350).
+                    _ => fail(refusal(self.shared.give_up())),
                 };
             }
             let args: SetResultArgs = parse_args(&args)?;
@@ -752,6 +866,7 @@ pub fn parent_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagent::state::TRUNCATED_REPORT;
 
     /// The built-ins must look exactly like MCP tools to the model, which
     /// means going through the same `<server>__<tool>` sanitizer.
@@ -935,9 +1050,106 @@ mod tests {
         let shared = Arc::new(SubagentShared::new());
         shared.begin_round();
         (
-            SetResultTool::new(shared.clone(), "audit", Some("primary"), None),
+            SetResultTool::new(shared.clone(), "audit", Some("primary"), Arc::default()),
             shared,
         )
+    }
+
+    fn sent(model: &str, configured: Option<u32>, sent: Option<u32>) -> EffectiveCeiling {
+        EffectiveCeiling {
+            model_name: model.to_string(),
+            configured,
+            sent,
+        }
+    }
+
+    /// A configured value above what the model serves is lowered, so the
+    /// remedy names what was sent and does not tell the operator to raise it
+    /// (#258).
+    #[test]
+    fn a_capped_ceiling_names_what_was_sent_and_does_not_say_raise_it() {
+        let remedy = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("sonnet", Some(128_000), Some(64_000))],
+        );
+        assert!(
+            remedy.contains("128000") && remedy.contains("64000"),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("raise it "), "{remedy}");
+        assert!(remedy.contains("cannot help"), "{remedy}");
+    }
+
+    /// An unset value that outrig or rig filled in is named, not hidden
+    /// behind "the provider's default".
+    #[test]
+    fn an_unset_ceiling_names_the_number_that_was_chosen() {
+        let published = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("sonnet", None, Some(64_000))],
+        );
+        assert!(published.contains("64000"), "{published}");
+        assert!(!published.contains("provider's default"), "{published}");
+        assert!(published.contains("cannot help"), "{published}");
+
+        let fallback = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[sent("odd", None, Some(32_768))],
+        );
+        assert!(fallback.contains("32768"), "{fallback}");
+        assert!(!fallback.contains("provider's default"), "{fallback}");
+        assert!(fallback.contains("[agents.primary]"), "{fallback}");
+    }
+
+    /// Nothing is sent on the OpenAI arm when nothing is configured, and a
+    /// configured value is sent as is: both keep their wording.
+    #[test]
+    fn an_openai_style_ceiling_keeps_its_wording() {
+        assert_eq!(
+            ceiling_remedy("agent a", Some("a"), &[sent("m", Some(4096), Some(4096))]),
+            "the max-tokens in effect for agent a is 4096 -- raise it",
+        );
+        assert_eq!(
+            ceiling_remedy("agent a", Some("a"), &[sent("m", None, None)]),
+            "[agents.a].max-tokens is unset, so the provider's default applies -- set it \
+             explicitly",
+        );
+        assert_eq!(
+            ceiling_remedy("this session", None, &[sent("m", None, None)]),
+            "max-tokens is unset, so the provider's default applies -- set \
+             [models.<name>].max-tokens explicitly",
+        );
+    }
+
+    /// A chain names every candidate's number: which one wrote the report
+    /// is not known here.
+    #[test]
+    fn a_chain_names_each_candidates_ceiling() {
+        let remedy = ceiling_remedy(
+            "agent primary",
+            Some("primary"),
+            &[
+                sent("head-model", Some(4096), Some(4096)),
+                sent("next-model", Some(16_384), Some(16_384)),
+            ],
+        );
+        assert!(remedy.contains("head-model 4096"), "{remedy}");
+        assert!(remedy.contains("next-model 16384"), "{remedy}");
+        assert!(remedy.contains("[agents.primary].max-tokens"), "{remedy}");
+
+        let agentless = ceiling_remedy(
+            "this session",
+            None,
+            &[sent("a", Some(1), Some(1)), sent("b", Some(2), Some(2))],
+        );
+        assert!(
+            agentless.contains("[models.<name>].max-tokens"),
+            "{agentless}"
+        );
+        assert!(!agentless.contains("[agents."), "{agentless}");
     }
 
     /// The truncated shape, as it arrives from the provider: `status` present
@@ -1137,6 +1349,108 @@ mod tests {
             shared.snapshot().outcome,
             Some(Outcome::Result("the short version".to_string())),
             "the report that fit must survive the later truncation"
+        );
+    }
+
+    /// #350: the restored budget runs out too. Giving up then published the
+    /// cut-off over the report that fit, so the parent was told nothing was
+    /// recorded when something was. The report stands, and the subagent is
+    /// told so rather than that its parent was told of the cut-off.
+    #[tokio::test]
+    async fn giving_up_on_a_revision_keeps_the_report_that_fit() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the short version"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        truncated_call(&tool).await.expect_err("first attempt");
+        truncated_call(&tool).await.expect_err("second attempt");
+        for call in 3..=4 {
+            let err = truncated_call(&tool)
+                .await
+                .expect_err("past the budget, every call is refused");
+            assert!(
+                err.to_string()
+                    .contains("keeps the report you recorded earlier"),
+                "call {call}: {err}"
+            );
+        }
+
+        let snapshot = shared.snapshot();
+        assert_eq!(
+            snapshot.outcome,
+            Some(Outcome::Result("the short version".to_string()))
+        );
+        assert_eq!(snapshot.version, 1, "nothing is published over it");
+    }
+
+    /// #521: the earlier rungs of the ladder offered `status: "error"` too, so
+    /// a compliant model replaced the report that fit with it. While the
+    /// report stands, no ask mentions an error.
+    #[tokio::test]
+    async fn a_revision_cut_off_after_a_report_is_not_asked_for_an_error() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        for call in 1..=2 {
+            let err = truncated_call(&tool).await.expect_err("cut off");
+            let text = err.to_string();
+            assert!(
+                text.contains("recorded earlier stands"),
+                "call {call}: {text}"
+            );
+            assert!(!text.contains("\"error\""), "call {call}: {text}");
+        }
+
+        let snapshot = shared.snapshot();
+        assert_eq!(
+            snapshot.outcome,
+            Some(Outcome::Result("the findings".to_string()))
+        );
+        assert_eq!(snapshot.version, 1);
+    }
+
+    /// A report the parent has steered past answers nothing, so the short
+    /// error is still the right ask.
+    #[tokio::test]
+    async fn a_revision_cut_off_after_a_steer_is_still_asked_for_a_short_error() {
+        let (tool, shared) = set_result_tool();
+
+        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        shared.accept("and what about the tests?".into());
+        let first = truncated_call(&tool).await.expect_err("first attempt");
+        assert!(first.to_string().contains("`status: \"error\"`"), "{first}");
+        let second = truncated_call(&tool).await.expect_err("second attempt");
+        assert!(
+            second.to_string().contains("Call once more with"),
+            "{second}"
+        );
+    }
+
+    /// A steer that lands while the model request is in flight is accepted
+    /// before the report that request publishes, but that report was written
+    /// without it. Until a report follows the steer's delivery, the short
+    /// error stays the ask.
+    #[tokio::test]
+    async fn a_report_written_without_a_steer_does_not_stand_against_it() {
+        let (tool, shared) = set_result_tool();
+
+        shared.accept("and what about the tests?".into());
+        tool.call(r#"{"status":"result","body":"composed before the steer"}"#.to_string())
+            .await
+            .expect("a body that fits");
+        let (steers, _) = shared.deliver_injections();
+        assert_eq!(steers.len(), 1);
+        let first = truncated_call(&tool).await.expect_err("first attempt");
+        assert!(first.to_string().contains("`status: \"error\"`"), "{first}");
+        let second = truncated_call(&tool).await.expect_err("second attempt");
+        assert!(
+            second.to_string().contains("Call once more with"),
+            "{second}"
         );
     }
 

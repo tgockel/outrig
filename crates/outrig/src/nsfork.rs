@@ -12,9 +12,18 @@
 //! lock. The helpers here allocate nothing and return
 //! [`io::Error::from_raw_os_error`] (which doesn't allocate either) rather than
 //! [`io::Error::other`] on the paths a child can reach.
+//!
+//! A child that acts on a container's files enters it with [`UserMountNs`]: the
+//! container's user namespace first -- `setns(CLONE_NEWUSER)` grants a full
+//! capability set in the namespace it joins, so the child can then `setuid(0)`
+//! and become the container's root -- and only then its mount namespace.
+//! Joining the mount namespace straight from the host is `EPERM`. What runs
+//! there is this process's own code: nothing is `exec`ed, so nothing the
+//! container's image holds is ever run.
 
+use std::fs::File;
 use std::io;
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 use nix::libc;
 
@@ -51,7 +60,7 @@ impl Status {
 }
 
 /// Most descriptors a child may hand back in one message.
-pub(crate) const MAX_FDS: usize = 2;
+pub(crate) const MAX_FDS: usize = 4;
 
 const CTRL_LEN: usize = cmsg_space(size_of::<[RawFd; MAX_FDS]>());
 
@@ -60,22 +69,53 @@ const CTRL_LEN: usize = cmsg_space(size_of::<[RawFd; MAX_FDS]>());
 #[repr(C, align(8))]
 struct CmsgBuf([u8; CTRL_LEN]);
 
+/// Why [`fork_collect`] has no [`Status`] to hand back.
+#[derive(Debug)]
+pub(crate) enum CollectError {
+    /// The socketpair or the fork failed: no child ever ran.
+    Spawn(io::Error),
+    /// The child ran, but its reply could not be received, was malformed, or
+    /// never came -- it died first.
+    Reply(io::Error),
+}
+
+impl From<CollectError> for io::Error {
+    fn from(err: CollectError) -> Self {
+        match err {
+            CollectError::Spawn(e) | CollectError::Reply(e) => e,
+        }
+    }
+}
+
+/// The exit status of a child whose closure panicked -- the one Rust gives a
+/// process whose `main` panics -- so [`silent_child`] can tell it from one that
+/// simply returned.
+const PANIC_EXIT: libc::c_int = 101;
+
 /// Run `child` in a forked child process and collect the message it sends back
 /// over the socketpair, plus any descriptors attached to it. `child` receives
 /// its end of the socket, must send exactly one message (see [`send_status`]),
-/// and must stay async-signal-safe. Its exit code carries nothing: the parent
+/// and must stay async-signal-safe. Its exit code carries no result: the parent
 /// reads the [`Status`], or an error if the child died without one.
+///
+/// A panic in `child` ends the child on the spot, exiting with [`PANIC_EXIT`].
+/// Unwinding on would drop the caller's values in this copy of the parent -- a
+/// `Container` among them -- and carry the copy on wherever the unwind lands,
+/// with the socket still open and the parent waiting on it. (A build with
+/// `panic = "abort"` has nothing to catch: the child is aborted, and the
+/// parent's error names the signal.)
 ///
 /// Errors only when the fork machinery itself failed or the child never
 /// replied -- a child that reports a failure through its [`Status`] still
-/// returns `Ok`.
-pub(crate) fn fork_collect<F>(child: F) -> io::Result<(Status, Vec<OwnedFd>)>
+/// returns `Ok`. A child killed before replying is named by its signal, and one
+/// that panicked by the panic.
+pub(crate) fn fork_collect<F>(child: F) -> Result<(Status, Vec<OwnedFd>), CollectError>
 where
     F: FnOnce(RawFd),
 {
     let mut sv = [0 as RawFd; 2];
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sv.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
+        return Err(CollectError::Spawn(io::Error::last_os_error()));
     }
 
     let pid = unsafe { libc::fork() };
@@ -83,14 +123,15 @@ where
         let err = io::Error::last_os_error();
         close_fd(sv[0]);
         close_fd(sv[1]);
-        return Err(err);
+        return Err(CollectError::Spawn(err));
     }
 
     if pid == 0 {
         close_fd(sv[0]);
-        child(sv[1]);
-        // `_exit` diverges, so nothing in this frame is ever dropped.
-        unsafe { libc::_exit(0) };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| child(sv[1])));
+        // `_exit` diverges, so nothing in this frame is ever dropped -- not even
+        // the payload of a panic.
+        unsafe { libc::_exit(if outcome.is_ok() { 0 } else { PANIC_EXIT }) };
     }
 
     close_fd(sv[1]);
@@ -99,10 +140,37 @@ where
 
     // Reaping our own child doesn't race tokio's process driver: it only
     // waits on pids it spawned itself.
+    // A failed wait leaves the status at 0, which reads as a plain exit.
     let mut wait_status = 0;
     let _ = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
 
     received
+        .and_then(|reply| reply.ok_or_else(|| silent_child(wait_status)))
+        .map_err(CollectError::Reply)
+}
+
+/// The error for a child that closed its socket without replying, naming the
+/// signal that killed it, or the panic that ended it, when its `wait_status`
+/// says so.
+fn silent_child(wait_status: libc::c_int) -> io::Error {
+    let message = if libc::WIFSIGNALED(wait_status) {
+        let sig = libc::WTERMSIG(wait_status);
+        let name = nix::sys::signal::Signal::try_from(sig)
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|_| format!("signal {sig}"));
+        format!("namespace helper was killed by {name} before reporting a status")
+    } else if libc::WIFEXITED(wait_status) && libc::WEXITSTATUS(wait_status) == PANIC_EXIT {
+        "namespace helper panicked before reporting a status".to_string()
+    } else {
+        "namespace helper exited without reporting a status".to_string()
+    };
+    io::Error::new(io::ErrorKind::UnexpectedEof, message)
+}
+
+/// Report that the child stopped at `step`, with `errno`, passing nothing
+/// back. Safe to call from a forked child.
+pub(crate) fn send_failure(sock: RawFd, step: u32, errno: i32) {
+    let _ = send_status(sock, Status::failed(step, errno), &[]);
 }
 
 /// Send one status message, optionally passing `fds` to the peer. Safe to call
@@ -152,9 +220,10 @@ pub(crate) fn send_status(sock: RawFd, payload: Status, fds: &[RawFd]) -> io::Re
     Ok(())
 }
 
-/// Receive one status message and the descriptors that came with it. The
-/// descriptors arrive owned, so a caller that drops them closes them.
-fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
+/// Receive one status message and the descriptors that came with it, or
+/// `None` if the peer closed its end without sending one. The descriptors
+/// arrive owned, so a caller that drops them closes them.
+fn recv_status(sock: RawFd) -> io::Result<Option<(Status, Vec<OwnedFd>)>> {
     let mut payload = [0u8; 8];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
@@ -172,10 +241,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
         return Err(io::Error::last_os_error());
     }
     if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "namespace helper exited without reporting a status",
-        ));
+        return Ok(None);
     }
 
     let status = Status::from_bytes(payload);
@@ -183,7 +249,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Ok((status, out));
+            return Ok(Some((status, out)));
         }
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
             return Err(io::Error::new(
@@ -200,7 +266,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
             out.push(OwnedFd::from_raw_fd(*data.add(i)));
         }
     }
-    Ok((status, out))
+    Ok(Some((status, out)))
 }
 
 /// `setns(2)` as an [`io::Result`]. Safe to call from a forked child.
@@ -219,6 +285,66 @@ pub(crate) fn close_fd(fd: RawFd) {
     }
 }
 
+/// The errno of the syscall that just failed. Safe to call from a forked
+/// child.
+pub(crate) fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Which of a container's namespace files [`UserMountNs::open`] could not
+/// open, in the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NsFile {
+    User,
+    Mount,
+}
+
+/// Where [`UserMountNs::enter`] stopped, in the child. Each caller maps these
+/// onto wire codes of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnterStep {
+    SetnsUser,
+    SetIds,
+    SetnsMount,
+}
+
+/// A container's user and mount namespace files, opened in the parent so
+/// that a failure to open them never involves a child at all.
+pub(crate) struct UserMountNs {
+    user: File,
+    mount: File,
+}
+
+impl UserMountNs {
+    pub(crate) fn open(pid: u32) -> Result<Self, (NsFile, io::Error)> {
+        let user = File::open(format!("/proc/{pid}/ns/user")).map_err(|e| (NsFile::User, e))?;
+        let mount = File::open(format!("/proc/{pid}/ns/mnt")).map_err(|e| (NsFile::Mount, e))?;
+        Ok(Self { user, mount })
+    }
+
+    /// Join the container's namespaces as its root. Runs in the forked child:
+    /// syscalls only. A failure carries the errno of the call that failed,
+    /// read before anything else can overwrite it.
+    pub(crate) fn enter(&self) -> Result<(), (EnterStep, i32)> {
+        // EINVAL means the container has no user namespace of its own --
+        // rootful podman -- so we are already where we need to be and are
+        // already root.
+        match setns_raw(self.user.as_raw_fd(), libc::CLONE_NEWUSER) {
+            Ok(()) => {
+                // Joining granted a full capability set in that namespace;
+                // spend it on becoming the container's root, which owns /etc.
+                if unsafe { libc::setgid(0) } == -1 || unsafe { libc::setuid(0) } == -1 {
+                    return Err((EnterStep::SetIds, errno()));
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(e) => return Err((EnterStep::SetnsUser, e.raw_os_error().unwrap_or(0))),
+        }
+        setns_raw(self.mount.as_raw_fd(), libc::CLONE_NEWNS)
+            .map_err(|e| (EnterStep::SetnsMount, e.raw_os_error().unwrap_or(0)))
+    }
+}
+
 const fn cmsg_align(len: usize) -> usize {
     let align = size_of::<usize>();
     (len + align - 1) & !(align - 1)
@@ -234,6 +360,8 @@ const fn cmsg_len(data_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+
     use super::*;
 
     #[test]
@@ -274,6 +402,75 @@ mod tests {
     #[test]
     fn fork_collect_errors_when_the_child_never_replies() {
         let err = fork_collect(|_sock| {}).expect_err("silent child");
+        let CollectError::Reply(err) = err else {
+            panic!("a silent child is a reply failure: {err:?}");
+        };
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("exited without"), "{err}");
+    }
+
+    #[test]
+    fn fork_collect_names_the_signal_that_killed_a_silent_child() {
+        let err = fork_collect(|_sock| unsafe {
+            libc::raise(libc::SIGKILL);
+        })
+        .expect_err("killed child");
+        let CollectError::Reply(err) = err else {
+            panic!("a killed child is a reply failure: {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("killed by SIGKILL"), "{err}");
+    }
+
+    /// Writes a byte to its pipe when dropped in any process but the one that
+    /// made it: a stand-in for a destructor of the frames that forked, such as
+    /// `Drop for Container`.
+    struct DropsInTheChild {
+        owner: u32,
+        pipe: io::PipeWriter,
+    }
+
+    impl Drop for DropsInTheChild {
+        fn drop(&mut self) {
+            if std::process::id() != self.owner {
+                let _ = self.pipe.write_all(b"x");
+            }
+        }
+    }
+
+    /// #272. A panic in the child used to unwind out of `fork_collect` there,
+    /// running the caller's destructors in a copy of the process and, where a
+    /// runtime caught it, leaving the copy running with the parent waiting on
+    /// it.
+    ///
+    /// The unwind is raised with `resume_unwind`, which does not run the panic
+    /// hook: a forked child of this multi-threaded binary can wait forever on a
+    /// lock (stderr, the backtrace printer) that another test's thread held at
+    /// the fork.
+    #[test]
+    fn fork_collect_ends_a_child_that_panics_and_names_the_panic() {
+        let (mut escaped, pipe) = io::pipe().expect("pipe");
+        let caller = DropsInTheChild {
+            owner: std::process::id(),
+            pipe,
+        };
+
+        let err = fork_collect(|_sock| std::panic::resume_unwind(Box::new("injected")))
+            .expect_err("a child that panicked sent no reply");
+        let CollectError::Reply(err) = err else {
+            panic!("a panicked child is a reply failure: {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("panicked"), "{err}");
+
+        // The child is reaped, so dropping this process's end leaves nothing
+        // that can still write, and the read ends at whatever the child did.
+        drop(caller);
+        let mut written = Vec::new();
+        escaped.read_to_end(&mut written).expect("read");
+        assert!(
+            written.is_empty(),
+            "the child unwound into the frames of its caller"
+        );
     }
 }

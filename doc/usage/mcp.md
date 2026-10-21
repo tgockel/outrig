@@ -42,12 +42,15 @@ outrig mcp self
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
-- `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path, which must
+  be empty or not exist yet.
 - `--config <path>` (default: walks up from cwd; if not found, run config-less): read the repo
   config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
   which repo the session runs against.
-- `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
-- `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
+- `--global-config <path>` (default: `~/.outrig/config.toml`, skipped if missing): read the global
+  config from this file, which has to exist.
+- `--session-root <path>` (default: global config, then XDG data directory): root for all
+  sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Read-only unless `:rw` is given; the host
   directory must exist. Rejected with `--attach`.
@@ -95,8 +98,9 @@ config. With no agent it resolves no model and no provider either, so a working 
 it needs -- the built-in default supplies the image and two MCP servers. Pass
 `--image <local-ref>` to proxy a different image instead; its proxied MCP servers come from
 that image's `org.outrig.mcp` labels. As with `outrig run`, the current directory can't be your
-home directory or one above it unless a config declares `[workspace] host-path` -- so an MCP
-client that starts outrig in `/` or `~` needs `--config` naming a repo.
+home directory, one above it, or one that contains the global config, unless the global config
+declares `[workspace] host-path` -- so an MCP client that starts outrig in `/` or `~` needs
+`--config` naming a repo.
 
 With `--attach`, image-config selection is different:
 
@@ -140,7 +144,9 @@ container Dockerfile just as you would for `outrig run`. In the example above,
 
 An image can also carry the same `[mcp]` table in its `org.outrig.mcp` OCI label.
 Use that when a shared image owns the default tool set, then keep only repo-specific
-overrides in `.agents/outrig/config.toml`. See
+overrides in `.agents/outrig/config.toml`. A `${VAR}` in a label entry's `env` is held to the
+global config's [`[repo]` `env-allow`](../reference/config.md#repo) list, as a repo config's
+references are, and a session whose label names an unlisted variable is refused. See
 [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
 
 To inspect the effective table without serving MCP:
@@ -152,7 +158,8 @@ outrig mcp show-merged --image coding
 In fresh mode this starts the selected container, reads the `org.outrig.mcp` label off the
 primary image and every named sidecar image, applies `config.toml` overrides, prints the merged
 `[mcp]` table to stdout, then stops the container. Sidecar containers are not launched for the
-read. Each server carries a comment naming its placement and provenance:
+read. A label that names an unlisted host variable is refused here too, as at a session start.
+Each server carries a comment naming its placement and provenance:
 
 ```toml
 [mcp]
@@ -288,7 +295,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 1. **Locate config.** Walks up from the current directory until
    `.agents/outrig/config.toml` is found, else runs config-less there. The MCP host's
    `cwd` therefore needs to be the repo, or pass `--config <repo>/.agents/outrig/config.toml`
-   explicitly.
+   explicitly. A config found that another user owns is refused, not read (see
+   [Reference -> CLI](../reference/cli.md#global-flags)). Startup names the config file it read
+   and the workspace it will mount on stderr before anything is built or started.
 2. **Resolve image.** Uses explicit `--image` first. Config entries win; an
    unknown explicit value is treated as a local Podman image ref. Without
    explicit `--image`, top-level `default-image` still names a config block.
@@ -300,7 +309,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
    label if present, then overlay `[images.<name>.mcp]` from config by server name. Each
    declared sidecar's image is resolved, its label merged (scoped to that sidecar), and
-   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. An entrypoint-stdio
+   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. A label whose `env`
+   references a host variable the global config's `[repo]` `env-allow` does not list is a
+   startup error, before any sidecar starts. An entrypoint-stdio
    sidecar (inline `image`, no `command`) is instead created and initialized with its
    ENTRYPOINT held un-executed, env baked in via `podman create --env` (a `${VAR}` value by
    name, from podman's own environment). Sidecar failures follow the block's `on-failure`
@@ -315,13 +326,18 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command in the container its placement names -- or, for entrypoint-stdio servers,
    `podman start --attach --interactive` the held container, whose lifetime now equals
-   the server's -- and run the MCP `initialize` handshake.
+   the server's -- and run the MCP `initialize` handshake. A server that has not answered
+   within 120 seconds fails startup, with its stderr in the error.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
-   each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
+   each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below. Each
+   backing server's `tools/list` gets 120 seconds too.
 8. **Serve MCP.** Without `--listen`, rmcp's stdio transport reads JSON-RPC frames
    from the process stdin and writes responses to stdout. With `--listen`, rmcp's
    Streamable HTTP service accepts POST/SSE traffic at `/mcp`. The proxy dispatches
-   `tools/call` to the right backing server in both modes.
+   `tools/call` to the right backing server in both modes, under that server's
+   [`call-timeout-secs`](../reference/config.md#imagesnamemcp) (10 minutes unless configured).
+   A client's `notifications/cancelled` for a call is forwarded to the backing server, and so
+   is outrig's own when a call runs past its deadline; the client gets a timeout error.
 
 If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.
@@ -363,6 +379,7 @@ By default, `outrig mcp` serves MCP over stdio. Its stdout is reserved for JSON-
 messages to the client; all other process output goes somewhere else:
 
 - startup banner: stderr
+- a cache-miss image build or pull, as `[buildah]` / `[podman]` lines: stderr
 - outrig tracing controlled by `OUTRIG_LOG`, or `RUST_LOG` when unset: stderr
 - top-level startup errors: stderr
 - backing server stderr: `<session_dir>/logs/<server>.stderr`
@@ -393,7 +410,10 @@ a character outside that set, one too long to fit, or one on a server whose own 
 in `_` or contains `__` -- is advertised with a short hash suffix instead, as
 `fs__read_file_5d2270`. The suffix depends only on the server and tool names, so a client
 reconnecting to the same servers sees the names it saw before, whatever order those servers
-list their tools in.
+list their tools in. That hash-suffixed name keeps the `<server>__` prefix only while the
+server's name is 54 characters or fewer; past that the cut can fall inside the server name,
+which is why the proxy's `instructions` tell a client to treat names as opaque and call each
+exactly as listed.
 
 Sixty-four characters cannot encode every possible pair, so two tools can still want one
 name. outrig widens one side's suffix rather than dropping either, and picks which side
@@ -450,16 +470,27 @@ rendering, because that is the shape its tool channel has.
 
 ## Lifecycle
 
-`outrig mcp` has three graceful shutdown triggers:
+`outrig mcp` has four graceful shutdown triggers:
 
 - stdio stdin EOF, which usually means the external MCP client disconnected
 - SIGINT, such as Ctrl-C in the terminal that launched the process
 - SIGTERM, such as a supervisor asking the process to stop
+- SIGHUP, such as the terminal that launched the process closing
 
 All paths cancel the rmcp service, wait for the dispatcher to settle, shut down each
 backing MCP server, and finalize the session record. Fresh-container mode then stops the
 containers -- sidecars first, primary last. Attach mode leaves the borrowed container
-running.
+running. A signal is how a server is stopped, so once startup has finished it exits `0`.
+
+Under `--listen`, a signal gives requests still in flight five seconds to finish. Anything
+unfinished after that -- a request whose body has stalled, say -- is abandoned so teardown can
+proceed, and a second signal ends the wait early.
+
+A signal during startup -- while the image builds, the container starts, a backing server
+initializes, or a stdio client has yet to send `initialize` -- stops whatever had started and
+finalizes the record too, and exits with 128 plus the signal number: `130`, `143`, `129`. A
+SIGINT or SIGTERM while the containers are being stopped stops the waiting: outrig finalizes
+the record, exits, and leaves the remaining containers to a forced removal in the background.
 
 Sessions with sidecars also watch the primary container: if it dies out from under outrig
 (a manual `podman kill`, the OOM killer), the sidecars are reaped and the process exits
@@ -467,8 +498,8 @@ non-zero. A sidecar dying mid-session only degrades the tool set -- its tools re
 errors and the session continues.
 
 HTTP/SSE mode is daemon-shaped: client disconnects close only that MCP session. The
-`outrig mcp --listen` process stays alive until SIGINT, SIGTERM, or attached-container
-shutdown.
+`outrig mcp --listen` process stays alive until SIGINT, SIGTERM, SIGHUP, or
+attached-container shutdown.
 
 If an attached host session stops the container while `outrig mcp --attach` is live, the
 attacher cancels its proxy, shuts down its MCP children, finalizes its session with a

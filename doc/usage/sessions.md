@@ -11,7 +11,7 @@ workspace changes (outrig writes to your repo directly; see [Workspace](../conce
 Sessions live under a **session root** directory. Resolution order:
 
 1. `--session-root <path>` flag (any session-touching subcommand).
-2. `session-root` key in repo or global config.
+2. `session-root` key in the global config.
 3. `<XDG_DATA_HOME>/outrig/sessions/` (default; typically
    `~/.local/share/outrig/sessions/`).
 
@@ -22,6 +22,12 @@ Set `session-root` once in `~/.outrig/config.toml` to keep sessions somewhere pe
 session-root = "/var/lib/outrig/sessions"
 ```
 
+A relative value resolves against the global config's directory, and a leading `~` is your home
+directory, so `session-root = "~/outrig-sessions"` works too. The key is global-only: one machine
+keeps one root, so `outrig ls` finds the same sessions from any directory, and a repo config that
+sets `session-root` is rejected at load. See
+[Reference -> Config](../reference/config.md#top-level).
+
 ## Layout under the root
 
 Each session is a subdirectory of the root, named by session id (a UTC timestamp plus four
@@ -31,6 +37,7 @@ random hex digits -- sortable, unambiguous across concurrent runs):
 ~/.local/share/outrig/sessions/
 └── 20260501T134412-3f2a/
     ├── session.json              # id, timestamps, containers, image, exit status
+    ├── outrig-enter              # launcher for view = "primary" sidecars, if any start
     ├── report.html               # the event log as a page, once you have rendered it
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
@@ -75,6 +82,13 @@ $ cat /tmp/my-debug-run/session.json
 $ tail -f /tmp/my-debug-run/logs/shell.stderr
 ```
 
+`<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A
+directory that already holds anything -- even a `.gitkeep` -- is refused, because from then on
+the directory is the session's. Running again with the same path is refused for the same
+reason, since the first run's `session.json` is still there: discard that session first, or
+give each run its own path.
+`outrig run-new --session-dir` takes the same path on the same terms.
+
 ## `outrig ls`
 
 List sessions newest-first:
@@ -89,8 +103,10 @@ ID                     STARTED              DURATION  IMAGE      EXIT
 
 `EXIT` is the outrig process exit code, not the agent's "did it succeed" signal -- there's no
 formal way for the agent to declare success or failure. A non-zero exit usually means an LLM API
-error, a container failure, or a SIGINT after the user gave up. The `-> /path` suffix marks
-sessions whose root entry is a symlink (created via `outrig run --session-dir`).
+error or a container failure. `130`, `143`, and `129` mean a SIGINT, SIGTERM, or SIGHUP ended the
+session -- Ctrl-C during startup, a `kill`, a closed terminal -- and it was torn down like any
+other. The `-> /path` suffix marks sessions whose root entry is a symlink (created via
+`outrig run --session-dir`).
 
 `outrig mcp` sessions have no agent. Their in-memory session row has `agent_name = None`; new
 on-disk `session.json` files omit `agent_name`, and older records with `"agent_name": null`
@@ -110,7 +126,8 @@ exit status is 0 -- skipping applies to reading and parsing a `session.json`, wh
 reported rather than failed on. A fault reaching the entry at all (an unreadable session
 root, or a directory entry outrig can't stat) is still an error. `outrig clean` treats an
 unreadable record as still owning its container, so the container is not swept up as a
-stray.
+stray. `outrig discard <sid>` removes such a record after the usual confirmation, which says why
+it is unreadable, and `outrig clean --unreadable` removes the ones past the cutoff.
 
 Override the root for a single invocation with `--session-root`:
 
@@ -166,8 +183,9 @@ warning: unused import: `std::collections::HashMap`
 returns when EOF is reached and no further writes are expected.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
-`conn.log`-style JSON object per outbound TCP connection. It is not selected with the server-name
-argument because it is not an MCP stderr log; read it directly from the session directory:
+`conn.log`-style JSON object per outbound TCP connection and one per name lookup. It is not
+selected with the server-name argument because it is not an MCP stderr log; read it directly from
+the session directory:
 
 ```sh
 $ jq . /tmp/my-debug-run/logs/network.jsonl
@@ -181,7 +199,30 @@ the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, a
 metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`,
 `outrig.host`, and `outrig.host_source`. The last of those is `resolved` when the name in
 `outrig.host` is one the interceptor validated for that address and `asserted` when the
-container merely claimed it -- only a resolved name can have granted a hostname allow rule.
+container merely claimed it -- only a resolved name can have granted a hostname allow rule. A
+connection that a hostname `allow` entry granted may therefore show an `asserted` host: the name
+that earned the grant is a resolved one, which can be the name shown or another the container
+resolved to that address. `outrig.rule` says which entry decided, so read it against the policy;
+see [Reference -> Config](../reference/config.md#what-a-hostname-rule-matches). A
+connection refused because its container already had 256 open through the interceptor is recorded
+with `outrig.action` `deny` and `outrig.rule` `connection-limit`. One that reached the
+interceptor's own listener without being redirected there -- a process in the container
+connecting straight to the listener's port, which the redirect leaves alone because it is on
+loopback -- is closed on arrival and recorded with `outrig.action` `deny` and `outrig.rule`
+`not-redirected`. Its only destination is the listener itself, which the interceptor would
+otherwise dial from the host's network namespace.
+
+A name lookup is recorded as the UDP exchange with the interceptor's DNS listener that it is:
+`proto` is `udp`, `service` is `dns`, `id.resp_p` is 53, and `outrig.host` is the name the
+container asked for, with `outrig.host_source` `asserted`. `id.resp_h` is the address the query
+reached the listener at, which is loopback whichever resolver the tool aimed at, since the
+redirect has rewritten it by then. `orig_bytes` is the query's size. The record is written when
+the lookup is decided, before any resolver is asked, so `duration` and `resp_bytes` are zero and
+`conn_state` is `S0` however the lookup came out; `outrig.action` and `outrig.rule` say whether
+it was answered or refused, and why. A query that is not a plain
+question for one name is refused under `outrig.rule` `dns-unparsed` where any lookup could be,
+and has no `outrig.host` when even its question could not be read. See
+[Reference -> Config](../reference/config.md#name-lookups) for what decides a lookup.
 
 Interception ends with the session, and ending it is the exact inverse of starting it. Every
 connection still open through the interceptor is cut, and each one is recorded before teardown
@@ -202,11 +243,12 @@ table something replaced under that name is left alone and so is a namespace thi
 reaches by a pid that has since been reused.
 
 If any part of that fails -- the resolver cannot be written back, the rules cannot be removed,
-a task does not end -- the remaining parts still run, and the failure is *returned* rather than
-logged and swallowed. Returned to the caller of the interceptor, that is: a library embedding
-outrig gets it and decides. `outrig` the command is one such caller, and what it decides is to
-log it and carry on stopping containers, because stopping them is the more urgent half, so from
-the command line these failures appear in `container.log` rather than in the exit status.
+a task does not end, a listener had stopped taking the container's traffic before teardown began
+-- the remaining parts still run, and the failure is *returned* rather than logged and swallowed.
+Returned to the caller of the interceptor, that is: a library embedding outrig gets it and
+decides. `outrig` the command is one such caller, and what it decides is to log it and carry on
+stopping containers, because stopping them is the more urgent half, so from the command line these
+failures appear in `container.log` rather than in the exit status.
 
 Attaching has the same property from the other side: a failed or interrupted attach leaves the
 container exactly as it found it, so a container never ends up resolving to a listener that is
@@ -278,7 +320,8 @@ event log can change between versions, and each copy reads its own version's.
 
 ## `outrig discard`
 
-Delete a session's entire on-disk record (including logs):
+Delete a session's directory -- `session.json`, `logs/`, `outrig-enter`, a rendered
+`report.html`, and anything else in it:
 
 ```sh
 $ outrig discard 20260430T091203-44d2 --yes
@@ -294,16 +337,20 @@ $ outrig discard 20260501T141907-9b1c --yes
 [outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c (symlink)
 ```
 
-You can also point at a session directory directly:
+You can also point at a session directory directly, or at its symlink under the root, which
+discards the directory the symlink names:
 
 ```sh
 $ outrig discard --session-dir /tmp/my-debug-run --yes
 ```
 
-`--yes` skips the interactive confirmation. This is destructive (it `rm -rf`'s the session
-directory) but only of the session record itself -- your repository is untouched. A session
-that's still running can't be discarded; outrig refuses with an error pointing at the running
-container.
+`--yes` skips the interactive confirmation. Discard removes the directory whole: a session's
+directory starts new or empty, so everything in it is the session's. A symlink inside it is
+unlinked, never followed. Versions before 0.2.2 let a session start in a directory that already
+held other files, and discarding one of those sessions removes them too.
+
+A session that's still running can't be discarded; outrig refuses with an error pointing at the
+running container.
 
 ## `outrig clean`
 
@@ -334,8 +381,15 @@ $ outrig clean --older-than 30d --yes
 
 `outrig clean` uses the same deletion semantics as `outrig discard`: auto-allocated sessions
 remove the session directory, while sessions created with `--session-dir` remove both the
-symlink target and the symlink under the session root. Running sessions are skipped so cleanup
-doesn't race a live `outrig run` or `outrig mcp` writer.
+symlink target and the symlink under the session root, each directory whole. Running sessions
+are skipped so cleanup doesn't race a live `outrig run`, `outrig run-new`, or `outrig mcp`
+writer.
+
+A record outrig cannot read is not shown to you, so `--yes` does not remove it: `clean` names
+it and leaves it. Add `--unreadable` to have it previewed and removed with the rest, aged by the
+start time in its directory name; an entry whose name is not a session id is never removed, and
+neither is a record too damaged to say which container it owns -- `outrig discard <sid>` removes
+that one.
 
 Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
 carrying the `org.outrig.session` label whose session record no longer exists (a lost record,

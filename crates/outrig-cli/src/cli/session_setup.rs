@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,12 +34,14 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::run_new_only_keys;
+use crate::cli::signals::{self, Signals};
 use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
-    RepoConfig, default_session_root, refuse_home_workspace, repo_config_path,
+    RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
+    refuse_workspace_covering_global_config, repo_config_path,
 };
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
@@ -51,7 +54,7 @@ use outrig::container::{
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
 use outrig::error::IoPathExt;
-use outrig::image::{self, ImageTag};
+use outrig::image::{self, BuildOutput, ImageBuildOutcome, ImageTag};
 use outrig::network::NetworkInterceptor;
 use outrig::{McpClient, Transcript};
 
@@ -64,19 +67,28 @@ pub(crate) struct ProgressSpan {
 impl ProgressSpan {
     pub(crate) fn start(label: impl Into<String>) -> Self {
         let label = label.into();
-        eprintln!("[outrig] {label}");
+        progress_line(format_args!("[outrig] {label}"));
         Self {
             started: Instant::now(),
         }
     }
 
     pub(crate) fn done(self, message: impl AsRef<str>) {
-        eprintln!(
+        progress_line(format_args!(
             "[outrig] {} ({})",
             message.as_ref(),
             format_elapsed(self.started.elapsed())
-        );
+        ));
     }
+}
+
+/// One progress line on stderr, dropped if stderr cannot take it. `eprintln!`
+/// panics on a failed write, and a reader that closes its end of the pipe
+/// mid-startup would then end the command partway -- before a `show-merged`
+/// table is printed or the session is finalized -- over lines it chose not to
+/// read.
+fn progress_line(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 pub(crate) fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -95,11 +107,24 @@ fn format_elapsed(duration: Duration) -> String {
     format!("{}m{:02}s", secs / 60, secs % 60)
 }
 
+/// The parenthetical an `image ready` line carries: how the image came to
+/// exist. One function so the primary's and a sidecar's lines cannot drift.
+fn cache_status(raw_local_image: bool, outcome: &ImageBuildOutcome) -> &'static str {
+    if raw_local_image {
+        "local image"
+    } else if outcome.cache_hit {
+        "cache hit"
+    } else {
+        "built"
+    }
+}
+
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
 /// is the caller's stack frame.
 pub struct SessionSetupArgs<'a> {
     pub repo: &'a RepoConfig,
-    pub global_cfg_path: &'a Path,
+    /// The global config, `None` when there is no default location for one.
+    pub global_cfg_path: Option<&'a Path>,
     pub session_root_flag: Option<&'a Path>,
     pub image_flag: Option<&'a str>,
     /// Existing session id or podman container name to attach to instead of
@@ -275,6 +300,10 @@ pub struct SessionSetup {
     /// Present only when sidecars started; orderly teardown disarms it
     /// before stopping containers.
     pub watcher: Option<SessionWatcher>,
+    /// Installed before the record was written, so no signal since has been
+    /// at its default disposition. The command races its own slow steps
+    /// against these, as setup did.
+    pub signals: Signals,
 }
 
 #[derive(Debug)]
@@ -294,14 +323,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else {
         args.repo.load(args.global_cfg_path)?
     };
-    span.done("config loaded");
-    // No config of its own at the root means the root is the working
-    // directory by default, whether or not `--config` supplied the settings.
-    if !repo_config_path(&repo_root).exists() {
-        eprintln!(
-            "[outrig] no repo config found; using current directory as workspace ({})",
-            repo_root.display()
-        );
+    // Named before anything runs, so a config picked up from somewhere
+    // unexpected is on screen before it mounts or starts anything. A
+    // `--config` file was checked to exist when it was resolved.
+    let own_config = repo_config_path(&repo_root).is_file();
+    if own_config || args.repo.file.is_some() {
+        span.done(format!("config loaded: {}", args.repo.config_path().display()));
+    } else {
+        span.done("config loaded");
     }
 
     let session_root =
@@ -318,9 +347,32 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None => None,
     };
     // A workspace no config declared is outrig's pick, and outrig never picks
-    // the home directory or one above it. An attached session mounts nothing.
-    if attach.is_none() && cfg.workspace.declared_host_path().is_none() {
-        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
+    // the home directory or one above it, nor one that contains the global
+    // config. An attached session mounts nothing.
+    if attach.is_none() {
+        // Spelled without the default `.` it joins to the root.
+        let workspace: PathBuf = cfg
+            .workspace
+            .resolved_host_path(&repo_root)
+            .components()
+            .collect();
+        let declared = cfg.workspace.declared_host_path().is_some();
+        if !declared {
+            refuse_home_workspace(&workspace, &repo_root)?;
+            refuse_workspace_covering_global_config(&workspace, &repo_root, args.global_cfg_path)?;
+        }
+        refuse_repo_declared_mounts(&cfg, &repo_root, args.global_cfg_path)?;
+        // No config of its own at the root, and no declared host path, means
+        // the working directory by default, whether or not `--config`
+        // supplied the settings.
+        if declared || own_config {
+            eprintln!("[outrig] workspace: {}", workspace.display());
+        } else {
+            eprintln!(
+                "[outrig] no repo config found; using current directory as workspace ({})",
+                workspace.display()
+            );
+        }
     }
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
     if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {
@@ -513,16 +565,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     launch.unmask = security.unmask.clone();
     launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
-    if let Some(p) = args.explicit_session_dir
-        && !p.is_dir()
-    {
-        return Err(OutrigError::Configuration(format!(
-            "--session-dir {} is not an existing directory (create it first or omit the flag)",
-            p.display()
-        ))
-        .into());
-    }
-
     let container_name = attach
         .as_ref()
         .map(|attach| attach.container_name.clone())
@@ -541,30 +583,38 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         exit_code: None,
         link_target: None,
     };
+    // The record is the first thing a signal could orphan. From here on, none
+    // ends the process without the session torn down: each slow step below
+    // is raced against these, and a signal takes that step's bail-out.
+    let mut signals = Signals::install()?;
     let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
-    let log_dir = session_dir.join("logs");
-    if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
-        let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e)
-            .path_ctx("create directory", &log_dir)
-            .map_err(Into::into);
-    }
+    // Every bail-out before there are containers to stop: end the record with
+    // the exit code `e` carries, and pass `e` on.
+    let fail = |e: CliError| {
+        let _ = store.finalize(&sid, SystemTime::now(), e.exit_code());
+        e
+    };
+    let log_dir = session_dir.join(session::LOGS_DIR);
+    tokio::fs::create_dir_all(&log_dir)
+        .await
+        .path_ctx("create directory", &log_dir)
+        .map_err(|e| fail(e.into()))?;
 
     let transcript = if args.verbose > 0 {
-        match Transcript::create(&log_dir.join("container.log"), true).await {
-            Ok(t) => Some(t),
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
-        }
+        let transcript = Transcript::create(&log_dir.join("container.log"), true).await;
+        Some(transcript.map_err(|e| fail(e.into()))?)
     } else {
         None
     };
 
-    let mut container = if let Some(attach) = &attach {
+    let container = if let Some(attach) = &attach {
         let span = ProgressSpan::start(format!("attaching to container {}", attach.container_name));
-        match Container::is_running(&attach.container_name).await {
+        // Raced like every step after the record: a stalled podman must not
+        // leave a signal with nothing to answer it.
+        match signals
+            .race(Container::is_running(&attach.container_name))
+            .await
+        {
             Ok(true) => {
                 span.done(format!("attached to container: {}", attach.container_name));
                 Container::attach(
@@ -575,72 +625,56 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                 )
             }
             Ok(false) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(OutrigError::Configuration(format!(
-                    "attached container {:?} is not running",
-                    attach.container_name
-                ))
-                .into());
+                return Err(fail(
+                    OutrigError::Configuration(format!(
+                        "attached container {:?} is not running",
+                        attach.container_name
+                    ))
+                    .into(),
+                ));
             }
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
+            Err(e) => return Err(fail(e)),
         }
     } else {
         let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
-        let ensure = if raw_local_image {
-            image::ensure_local_image(&image_tag, transcript.as_ref()).await
-        } else {
-            image::ensure_tagged_image_for(
-                &image_cfg_name,
-                &image_cfg,
-                &repo_root,
-                &image_tag,
-                false,
-                transcript.as_ref(),
-            )
-            .await
-        };
-        let image_outcome = match ensure {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
+        // A cache miss shows its build as it runs: `ensuring image` followed by
+        // minutes of nothing reads as a hang, and the Ctrl-C that answers one
+        // throws the partial build away. The `-v` transcript, when there is
+        // one, already mirrors to stderr and is left to do it.
+        //
+        // Settled rather than raced, like the sidecar phase, which builds
+        // sidecar images: a signal must not end the process under a build
+        // that is still removing its working containers.
+        let ensure = async {
+            if raw_local_image {
+                image::ensure_local_image_requested_by("--image", &image_tag, transcript.as_ref())
+                    .await
+            } else {
+                image::ensure_tagged_image_for_with_output(
+                    &image_cfg_name,
+                    &image_cfg,
+                    &repo_root,
+                    &image_tag,
+                    false,
+                    transcript.as_ref(),
+                    BuildOutput::Stderr,
+                )
+                .await
             }
         };
-        let cache_status = if raw_local_image {
-            "local image"
-        } else if image_outcome.cache_hit {
-            "cache hit"
-        } else {
-            "built"
-        };
+        let image_outcome = signals.race_settled(ensure).await.map_err(fail)?;
         span.done(format!(
-            "image ready: {} ({cache_status})",
-            image_outcome.tag
+            "image ready: {} ({})",
+            image_outcome.tag,
+            cache_status(raw_local_image, &image_outcome)
         ));
 
         let span = ProgressSpan::start(format!("starting container {container_name}"));
-        match Container::start_named(&image_tag, launch, container_name, transcript.clone()).await {
-            Ok(container) => {
-                span.done(format!("container ready: {}", container.name()));
-                container
-            }
-            Err(e) => {
-                let _ = store.finalize(&sid, SystemTime::now(), 1);
-                return Err(e.into());
-            }
-        }
+        let start = Container::start_named(&image_tag, launch, container_name, transcript.clone());
+        let container = signals.race(start).await.map_err(fail)?;
+        span.done(format!("container ready: {}", container.name()));
+        container
     };
-
-    let span = ProgressSpan::start("bootstrapping container user");
-    if let Err(e) = container.bootstrap_user().await {
-        let _ = container.stop(STOP_GRACE).await;
-        let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e.into());
-    }
-    span.done("container user ready");
 
     // In a local as well as in `containers`, because the sidecar phase takes
     // the container set by `&mut` and cannot also hold a borrow into it.
@@ -651,6 +685,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         instance_salt: instance_salt.clone(),
         primary: container,
     };
+
+    let span = ProgressSpan::start("bootstrapping container user");
+    if let Err(e) = signals.race(containers.primary.bootstrap_user()).await {
+        return Err(abort_containers(containers, &store, &sid, e).await);
+    }
+    span.done("container user ready");
 
     // Placement plan, sidecar starts, and network interception. Any error
     // propagated out of the phase aborts the whole container set.
@@ -671,19 +711,16 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         cli_env: args.cli_env,
         transcript: transcript.as_ref(),
     };
-    let (mcp_plan, network) = match setup_sidecars_and_network(phase, &mut containers).await {
+    let sidecars_and_network = setup_sidecars_and_network(phase, &mut containers);
+    let (mcp_plan, network) = match signals.race_settled(sidecars_and_network).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            abort_containers(containers, &store, &sid).await;
-            return Err(e);
-        }
+        Err(e) => return Err(abort_containers(containers, &store, &sid, e).await),
     };
 
     if !containers.sidecars.is_empty() {
         let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
-            abort_containers(containers, &store, &sid).await;
-            return Err(e.into());
+            return Err(abort_containers(containers, &store, &sid, e).await);
         }
         session.sidecar_container_names = names;
     }
@@ -719,6 +756,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         network,
         mcp_plan,
         watcher,
+        signals,
     })
 }
 
@@ -793,7 +831,14 @@ pub(crate) async fn launch_declared_sidecar(
     sc: &SidecarPlan,
     abandoned: &mut Vec<Container>,
 ) -> Result<Container> {
-    let tag = ensure_sidecar_image(ctx.cfg, ctx.repo_root, &sc.image, ctx.transcript).await?;
+    let tag = ensure_sidecar_image(
+        ctx.cfg,
+        ctx.repo_root,
+        &sc.image,
+        &sc.image_declared_by(),
+        ctx.transcript,
+    )
+    .await?;
     start_one_sidecar(
         ctx,
         &tag,
@@ -808,23 +853,29 @@ pub(crate) async fn launch_declared_sidecar(
 /// check `--env SERVER:` names against it, start `start = "auto"` sidecars,
 /// and attach the network interceptor to every running container.
 ///
+/// Building the plan is a step of its own on stderr, so a failure in it prints
+/// under that step's line rather than under `container user ready`.
+///
 /// Failure routing: image-ensure / start / bootstrap / interceptor-attach
 /// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
-/// sidecar, and continues; `abort` propagates). Label-merge collisions and
-/// malformed labels are startup errors regardless of `on-failure`, as are
-/// all primary-container failures.
+/// sidecar, and continues; `abort` propagates). Label-merge collisions,
+/// malformed labels, and a label entry whose `env` references a host variable
+/// `[repo] env-allow` does not list are startup errors regardless of
+/// `on-failure`, as are all primary-container failures.
 async fn setup_sidecars_and_network(
     args: SidecarPhaseArgs<'_>,
     containers: &mut SessionContainers,
 ) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
+    let span = ProgressSpan::start("reading and merging MCP configuration");
     let mut plan = sidecar::plan_from_config(args.cfg, args.image_cfg);
     let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
     // Phase A -- ensure each distinct sidecar image (and read its labels when a
-    // label-honoring sidecar needs them) concurrently. Sidecars are independent,
-    // so their podman-heavy ensure/inspect work overlaps; the results are
-    // consumed below in deterministic name order.
+    // label-honoring sidecar needs them). Sidecars are independent, so their
+    // podman-heavy label inspects overlap; the ensures run one at a time so a
+    // cache miss's shown build is not interleaved with another's. The results
+    // are consumed below in deterministic name order.
     let resolutions =
         resolve_sidecar_images(&plan, args.cfg, args.repo_root, args.transcript).await;
 
@@ -869,9 +920,17 @@ async fn setup_sidecars_and_network(
     }
 
     // Every label has merged, so the plan is complete. Checked here rather
-    // than after `setup` returns so an undeclared name takes `setup`'s abort
-    // path, which stops the containers and finalizes the session record.
+    // than after `setup` returns so a refusal -- an undeclared name, a label
+    // reference no list allows -- takes `setup`'s abort path, which stops the
+    // containers and finalizes the session record, and before Phase C starts a
+    // sidecar on the strength of a label that is about to be refused.
     check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
+    check_label_env_refs(&plan, args.image_cfg_name, args.cfg.repo.env_allow())?;
+    let server_count = plan.servers.len();
+    let server_word = plural(server_count, "server", "servers");
+    span.done(format!(
+        "MCP configuration ready: {server_count} {server_word}"
+    ));
 
     // Phase C -- start the auto sidecars concurrently, inserting in name order.
     start_auto_sidecars(&plan, &args, to_start, containers).await?;
@@ -909,11 +968,18 @@ struct ImageResolution {
     labels: Option<std::result::Result<BTreeMap<String, McpServerSpec>, String>>,
 }
 
-/// Ensure every distinct sidecar image (and read its labels when needed)
-/// concurrently, deduped by image ref so two sidecars sharing an image run the
-/// tag-compute + ensure + label-inspect once. `join_all` runs the futures on
-/// the current task, so the borrowed inputs need no `'static` and nothing is
+/// Ensure every distinct sidecar image (and read its labels when needed),
+/// deduped by image ref so two sidecars sharing an image run the tag compute,
+/// the ensure, and the label inspect once. `join_all` runs the futures on the
+/// current task, so the borrowed inputs need no `'static` and nothing is
 /// cloned beyond the image key.
+///
+/// The ensures take turns; the label reads overlap. An ensure that misses the
+/// cache shows its `buildah build` as it runs, and two of those at once would
+/// interleave their `[buildah]` lines and split each one's progress pair --
+/// the reason `outrig build --all` builds serially too. The turn also covers
+/// the tag hash and the cache probe, which is what a warm start pays for it:
+/// one probe after another instead of all at once, tens of milliseconds each.
 async fn resolve_sidecar_images(
     plan: &SessionMcpPlan,
     cfg: &Config,
@@ -922,14 +988,25 @@ async fn resolve_sidecar_images(
 ) -> HashMap<String, ImageResolution> {
     // Distinct images, each flagged for a label read iff some sidecar using
     // it honors labels (an image only anonymous or entrypoint hosts use is
-    // never inspected).
-    let mut images: BTreeMap<&str, bool> = BTreeMap::new();
+    // never inspected), and carrying where every sidecar using it wrote it:
+    // one ensure serves them all, so a miss names them all.
+    let mut images: BTreeMap<&str, (bool, Vec<String>)> = BTreeMap::new();
     for sc in plan.sidecars.values() {
-        *images.entry(sc.image.as_str()).or_default() |= plan.sidecar_honors_labels(sc);
+        let (read_labels, declared_by) = images.entry(sc.image.as_str()).or_default();
+        *read_labels |= plan.sidecar_honors_labels(sc);
+        declared_by.push(sc.image_declared_by());
     }
 
-    futures_util::future::join_all(images.into_iter().map(|(image, read_labels)| async move {
-        let resolution = match ensure_sidecar_image(cfg, repo_root, image, transcript).await {
+    let one_ensure_at_a_time = tokio::sync::Mutex::new(());
+    let one_ensure_at_a_time = &one_ensure_at_a_time;
+    futures_util::future::join_all(images.into_iter().map(|(image, wanted)| async move {
+        let (read_labels, declared_by) = wanted;
+        let ensured = {
+            let _turn = one_ensure_at_a_time.lock().await;
+            ensure_sidecar_image(cfg, repo_root, image, &declared_by.join(" and "), transcript)
+                .await
+        };
+        let resolution = match ensured {
             Ok(tag) => {
                 let labels = if read_labels {
                     Some(
@@ -976,6 +1053,30 @@ fn check_env_servers(
     Ok(())
 }
 
+/// Hold every server an image's label declared to `env_allow`, the global
+/// config's `[repo] env-allow` (#624): a `${VAR}` in its `env` that the list
+/// omits is refused, naming the image the label came from -- the primary's as
+/// the operator wrote it, a sidecar's as `[sidecars.<sc>]` did. A server the
+/// config declared by name replaced the label's at the merge, so it is no
+/// longer label-sourced and is not held here; that is what lets a repo-built
+/// image through, whose label carries a stamped copy of every config entry.
+fn check_label_env_refs(
+    plan: &SessionMcpPlan,
+    image_cfg_name: &str,
+    env_allow: &[String],
+) -> Result<()> {
+    for (name, placed) in &plan.servers {
+        if placed.source == embedded::McpDeclarationSource::ImageLabel {
+            let image = match placed.placement.sidecar_name() {
+                Some(sidecar) => plan.sidecars[sidecar].image.as_str(),
+                None => image_cfg_name,
+            };
+            embedded::check_label_server_env(image, name, &placed.spec, env_allow)?;
+        }
+    }
+    Ok(())
+}
+
 /// Start the `start = "auto"` sidecars concurrently, then insert them into
 /// `containers` in name order. The container starts (and any bootstrap) are
 /// independent; only the ordered insert and `warn`/`abort` routing run after
@@ -1008,7 +1109,7 @@ async fn start_auto_sidecars(
         })?;
         (
             Some(PrimaryView::new(
-                containers.primary.name(),
+                containers.primary.selector(),
                 containers.primary.pid().await?,
                 helper_host,
                 payload_home,
@@ -1158,23 +1259,44 @@ fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliErr
 /// Resolve and ensure a sidecar's image with `--image`-identical semantics:
 /// an `[images.<name>]` config name builds through the content-hash cache; an
 /// unmatched name is a raw podman ref that must be present locally.
+///
+/// Reports a progress pair like the primary's, and shows a cache miss's build
+/// as it runs for the same reason: without them a sidecar that needs building
+/// is a long pause that names nothing.
+/// `declared_by` is where the sidecars using `image_name` wrote it
+/// ([`SidecarPlan::image_declared_by`]), which a raw ref that is not local
+/// names in its error.
 async fn ensure_sidecar_image(
     cfg: &Config,
     repo_root: &Path,
     image_name: &str,
+    declared_by: &str,
     transcript: Option<&Transcript>,
 ) -> Result<ImageTag> {
+    let span = ProgressSpan::start(format!("ensuring sidecar image {image_name}"));
     let (image_cfg, raw_local) = resolve_image_config(cfg, image_name, true)?;
-    if raw_local {
-        let tag = ImageTag::new(image_name);
-        image::ensure_local_image(&tag, transcript).await?;
-        Ok(tag)
+    let outcome = if raw_local {
+        image::ensure_local_image_requested_by(declared_by, &ImageTag::new(image_name), transcript)
+            .await?
     } else {
         let tag = image::compute_tag_for(image_name, &image_cfg, repo_root).await?;
-        image::ensure_tagged_image_for(image_name, &image_cfg, repo_root, &tag, false, transcript)
-            .await?;
-        Ok(tag)
-    }
+        image::ensure_tagged_image_for_with_output(
+            image_name,
+            &image_cfg,
+            repo_root,
+            &tag,
+            false,
+            transcript,
+            BuildOutput::Stderr,
+        )
+        .await?
+    };
+    span.done(format!(
+        "sidecar image ready: {} ({})",
+        outcome.tag,
+        cache_status(raw_local, &outcome)
+    ));
+    Ok(outcome.tag)
 }
 
 /// The launch inputs every sidecar container shares, whichever path starts
@@ -1370,23 +1492,36 @@ async fn create_one_entrypoint_sidecar(
     Ok(container)
 }
 
-/// Stop every session container (sidecars before the primary) and finalize
-/// the session row with a failure exit. Setup's bail-out path.
-async fn abort_containers(containers: SessionContainers, store: &SessionStore, sid: &SessionId) {
-    let SessionContainers {
-        abandoned,
-        sidecars,
-        instance_salt: _,
-        primary,
-    } = containers;
-    for container in abandoned {
-        let _ = container.stop(STOP_GRACE).await;
-    }
-    for (_, container) in sidecars {
-        let _ = container.stop(STOP_GRACE).await;
-    }
-    let _ = primary.stop(STOP_GRACE).await;
-    let _ = store.finalize(sid, SystemTime::now(), 1);
+/// Stop every session container (sidecars before the primary), finalize the
+/// session row with the exit code `cause` carries, and hand `cause` back.
+/// Setup's bail-out once there are containers.
+///
+/// A signal during the stops ends the wait, not the cleanup -- see
+/// [`signals::unless_signaled`] -- and the record is finalized either way.
+async fn abort_containers(
+    containers: SessionContainers,
+    store: &SessionStore,
+    sid: &SessionId,
+    cause: CliError,
+) -> CliError {
+    signals::unless_signaled(async move {
+        let SessionContainers {
+            abandoned,
+            sidecars,
+            instance_salt: _,
+            primary,
+        } = containers;
+        for container in abandoned {
+            let _ = container.stop(STOP_GRACE).await;
+        }
+        for (_, container) in sidecars {
+            let _ = container.stop(STOP_GRACE).await;
+        }
+        let _ = primary.stop(STOP_GRACE).await;
+    })
+    .await;
+    let _ = store.finalize(sid, SystemTime::now(), cause.exit_code());
+    cause
 }
 
 /// Resolve an image-config name to its [`ImageConfig`] and whether it is a
@@ -1507,6 +1642,7 @@ pub async fn connect_mcp_clients(
         match result {
             Ok(client) => {
                 span.done(format!("MCP {mcp_name}: initialized"));
+                let client = client.with_call_timeout(mcp_plan.call_timeout(placed));
                 connected.push((sidecar_name, Arc::new(client)));
             }
             Err(e) => {
@@ -1560,8 +1696,13 @@ pub async fn connect_mcp_clients(
 /// mistaken for external death) -> MCP shutdowns (so their `podman exec`
 /// pipes drain before the containers go away) -> network interceptor
 /// shutdown (detaches every container) -> sidecar stops -> primary stop ->
-/// session finalize. Each step's failure is logged but never propagated;
-/// the caller's outcome owns the process exit code.
+/// session finalize, with the exit code `outcome` carries. Each step's
+/// failure is logged but never propagated; the caller's outcome owns the
+/// process exit code.
+///
+/// A SIGINT or SIGTERM during the stops ends the wait, not the cleanup --
+/// see [`signals::unless_signaled`]. The record is finalized either way,
+/// which is why it is not part of the sequence that signal can cut short.
 ///
 /// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
@@ -1570,8 +1711,22 @@ pub async fn teardown(
     runtime: SessionRuntime,
     store: &SessionStore,
     sid: &SessionId,
-    final_exit: i32,
+    outcome: &Result<i32>,
 ) {
+    signals::unless_signaled(stop_session(runtime)).await;
+    let exit_code = outcome
+        .as_ref()
+        .map_or_else(CliError::exit_code, |code| *code);
+    if let Err(e) = store.finalize(sid, SystemTime::now(), exit_code) {
+        tracing::warn!(
+            target: "outrig::cli::session_setup",
+            "session finalize failed: {e}"
+        );
+    }
+}
+
+/// Everything [`teardown`] does before it finalizes the record.
+async fn stop_session(runtime: SessionRuntime) {
     let SessionRuntime {
         watcher,
         mcp_arcs,
@@ -1634,12 +1789,6 @@ pub async fn teardown(
         tracing::warn!(
             target: "outrig::cli::session_setup",
             "container stop failed: {e}"
-        );
-    }
-    if let Err(e) = store.finalize(sid, SystemTime::now(), final_exit) {
-        tracing::warn!(
-            target: "outrig::cli::session_setup",
-            "session finalize failed: {e}"
         );
     }
 }
@@ -1782,5 +1931,141 @@ lint = { command = ["mcp-lint"], sidecar = "lint" }
         check_env(&["fs:A=1", "lint:B=2"]).expect("a manual sidecar's server is declared");
         check_env(&["GLOBAL=1"]).expect("a global entry names no server");
         check_env(&[]).expect("an empty overlay names no server");
+    }
+
+    /// A plan of `[images.x]` over `config`, as `setup_sidecars_and_network`
+    /// starts one before the labels merge in.
+    fn label_plan(config: &str) -> SessionMcpPlan {
+        let cfg: Config = toml::from_str(&format!(
+            "[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n{config}"
+        ))
+        .expect("config parses");
+        sidecar::plan_from_config(&cfg, &cfg.images["x"])
+    }
+
+    /// An exec server with one `env` entry, written as a config file writes
+    /// it: exactly `${VAR}` is a reference, anything else a literal.
+    fn with_env(key: &str, raw: &str) -> McpServerSpec {
+        McpServerSpec::exec(["srv"]).with_env(BTreeMap::from([(
+            key.to_string(),
+            outrig::config::EnvValue::from_raw(raw.to_string()),
+        )]))
+    }
+
+    fn secret_label(server: &str) -> BTreeMap<String, McpServerSpec> {
+        BTreeMap::from([(server.to_string(), with_env("TOKEN", "${SECRET}"))])
+    }
+
+    fn allow(vars: &[&str]) -> Vec<String> {
+        vars.iter().map(|var| var.to_string()).collect()
+    }
+
+    /// The refusal the issue asked for: the label named a variable the
+    /// operator did not list, so it says where, and what to list.
+    #[test]
+    fn a_primary_label_reference_the_list_omits_is_refused() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([("probe".to_string(), with_env("STOLEN", "${SECRET}"))]),
+        );
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "mcp server \"probe\" from the org.outrig.mcp label of image \"x\" may not \
+             reference ${SECRET} in env key \"STOLEN\": list \"SECRET\" in [repo] env-allow in \
+             global config to allow it"
+        );
+    }
+
+    #[test]
+    fn a_listed_reference_a_literal_and_no_env_pass_the_label_check() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([
+                ("listed".to_string(), with_env("TOKEN", "${SECRET}")),
+                ("literal".to_string(), with_env("HOME", "/workspace")),
+                ("plain".to_string(), McpServerSpec::exec(["srv"])),
+            ]),
+        );
+
+        check_label_env_refs(&plan, "x", &allow(&["OTHER", "SECRET"]))
+            .expect("a listed reference is the supported shape");
+
+        plan.servers.remove("listed");
+        check_label_env_refs(&plan, "x", &[])
+            .expect("a literal and a server with no env read nothing from the host");
+    }
+
+    /// A named sidecar's label is held the same way, and the refusal names the
+    /// sidecar's image as `[sidecars.tools]` wrote it, not the primary's.
+    #[test]
+    fn a_sidecar_label_reference_is_refused_naming_the_sidecars_image() {
+        let mut plan = label_plan(
+            "\n[sidecars.tools]\nimage = \"mcp-tools\"\n\n[images.x.mcp]\n\
+             anchor = { command = [\"anchor\"], sidecar = \"tools\" }\n",
+        );
+        sidecar::merge_sidecar_labels(&mut plan, "tools", secret_label("fs"))
+            .expect("merge succeeds");
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert!(
+            err.to_string().starts_with(
+                "mcp server \"fs\" from the org.outrig.mcp label of image \"mcp-tools\""
+            ),
+            "{err}"
+        );
+        check_label_env_refs(&plan, "x", &allow(&["SECRET"]))
+            .expect("listing the variable allows it in a sidecar's label too");
+    }
+
+    /// Only the label is held here. A config entry is #444's when a repo file
+    /// declared it, and the operator's own when the global config did.
+    #[test]
+    fn a_config_entry_is_not_held_as_a_label() {
+        let mut plan = label_plan(
+            "\n[images.x.mcp]\nfs = { command = [\"srv\"], env = { TOKEN = \"${SECRET}\" } }\n",
+        );
+        sidecar::merge_primary_labels(&mut plan, BTreeMap::new());
+
+        check_label_env_refs(&plan, "x", &[])
+            .expect("a config-declared reference is not a label's");
+    }
+
+    /// `outrig build` stamps the config's own entries into the label, so a
+    /// repo-built image carries a copy of each, references included. The config
+    /// entry replaced the label's of that name at the merge, so the copy is
+    /// never read and is not refused.
+    #[test]
+    fn a_label_entry_the_config_replaced_is_not_refused() {
+        let mut plan = label_plan(
+            "\n[images.x.mcp]\nfs = { command = [\"srv\"], env = { TOKEN = \"${SECRET}\" } }\n",
+        );
+        sidecar::merge_primary_labels(&mut plan, secret_label("fs"));
+
+        check_label_env_refs(&plan, "x", &[])
+            .expect("the config's entry is what runs, and the label's copy never does");
+    }
+
+    /// Entries are walked in name order, so what an operator is told to list
+    /// first does not depend on how the label was written.
+    #[test]
+    fn the_first_unlisted_reference_in_name_order_is_the_one_reported() {
+        let mut plan = label_plan("");
+        sidecar::merge_primary_labels(
+            &mut plan,
+            BTreeMap::from([
+                ("zeta".to_string(), with_env("K", "${Z_VAR}")),
+                ("alpha".to_string(), with_env("K", "${A_VAR}")),
+            ]),
+        );
+
+        let err = check_label_env_refs(&plan, "x", &[]).unwrap_err();
+
+        assert!(err.to_string().starts_with("mcp server \"alpha\""), "{err}");
     }
 }

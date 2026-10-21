@@ -25,6 +25,17 @@ These are accepted by every subcommand.
 without an `outrig/config.toml` inside does not terminate the walk -- outrig keeps looking in
 parents.
 
+The walk takes only a config of your own. The file, the `.agents/` and `outrig/` directories
+above it, and the directory they sit in must all belong to the user running outrig; a symlink
+counts as itself, not as what it points to. Anyone who owns one of them could have written the
+config, and the config decides what is mounted, which commands run, and where API keys go. So a
+config found anywhere else -- `/tmp/.agents/outrig/config.toml`, say, planted by another user of
+a shared host -- stops the command with an error naming it, as git does for a repository another
+user owns. It is not read, and not skipped in favor of a config-less run. The walk finds the
+nearest config first, so `outrig init` in your own directory puts one between you and it. To
+read a config you do not own on purpose, such as a checkout shared with your team, name it with
+`--config`, which is never refused for its owner.
+
 The flag names a file, and that file has to exist: a path that is not one is an error, not a
 config-less run. Which repo the command then runs against depends on where the file is:
 
@@ -37,17 +48,34 @@ config-less run. Which repo the command then runs against depends on where the f
   file sits never decides which directory is mounted as the workspace.
 
 `--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
-when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --
-note this is `~/.outrig/`, not `~/.config/outrig/`).
+when `XDG_CONFIG_HOME` is set to an absolute path, then `~/.outrig/config.toml` (the
+outrig-specific fallback -- note this is `~/.outrig/`, not `~/.config/outrig/`). As the XDG Base
+Directory Specification says, an empty `XDG_CONFIG_HOME` counts as unset and a relative one is
+ignored, so the global config is never looked for under the current directory. A home directory
+that is not absolute is ignored the same way. With no absolute `XDG_CONFIG_HOME` and no absolute
+home directory there is no default location: a command that reads the global config runs without
+one, and `outrig init` and `outrig config init`, which would have nowhere to write it, stop and
+ask for `--global-config`.
 
-`--session-root` resolves in this order: this flag, then `session-root` in the repo or global
-config, then `<XDG_DATA_HOME>/outrig/sessions/`.
+Only the default may be missing: a machine with no global config runs on the repo config alone. A
+path the flag names has to exist wherever outrig reads the global config, and one that does not
+is an error naming it, not an empty global config. To run without a global config whatever the
+default holds, pass `--global-config /dev/null`. `outrig init` and `outrig config init` write the
+file the flag names, so for them it need not exist yet.
+
+`--session-root` resolves in this order: this flag, then `session-root` in the global config, then
+`<XDG_DATA_HOME>/outrig/sessions/`. The config key is global-only, so `ls`, `logs`, `discard`, and
+`clean` read no repo config at all and ignore `--config`: they find the same root from any
+directory. Given `--session-root`, or `--session-dir` for `logs`, they read no
+global config either, so a `--global-config` path is not checked.
 
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
 enable trace-level logs from outrig's own modules for that invocation. It does not change
 container, MCP, or agent behavior. Normal startup progress is printed to stderr without
-`--verbose`.
+`--verbose`, and so is a cache-miss `buildah build` or `podman pull` during startup, as
+`[buildah]` / `[podman]` lines while it runs; `--verbose` adds the command lines and the output
+of every other command, and writes it all to `container.log`.
 
 `--verbose` controls command *output*; the tracing filter controls command *lines*. At
 `debug`, every buildah/podman invocation is logged before it is spawned and again on exit with
@@ -217,8 +245,10 @@ outrig run [--agent <name>]
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for MCP servers. `KEY=VALUE`
   applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
   the `${VAR}` host-env-reference syntax described in
-  [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
-  on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
+  [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax); you typed them, so they are
+  not held to the global config's [`[repo]` `env-allow`](config.md#repo) list, which governs
+  the references in a repo config and in an image's label. Within a scope, last wins on
+  duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): per-turn tool-call
   max.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
@@ -229,19 +259,26 @@ outrig run [--agent <name>]
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
-- `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run;
+  must be empty or not exist yet.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
-When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
-under `<path>`, and additionally creates a symlink `<session-root>/<sid> -> <path>` so
-`outrig ls`/`logs`/`discard`/`clean` still find it. When omitted, outrig auto-generates a
-session id and writes to `<session-root>/<sid>/` directly.
+When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and
+`outrig-enter` (only for a `view = "primary"` sidecar) directly under `<path>`, and
+additionally creates a symlink `<session-root>/<sid> -> <path>` so
+`outrig ls`/`logs`/`discard`/`clean` still find it. A `<path>` that does not exist is created,
+with any missing parents; one that already holds anything is refused, as is the second of two
+launches started at once with one `<path>`. When omitted, outrig
+auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
-when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C.
+when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C. A Ctrl-C before
+the first prompt, or a SIGTERM or SIGHUP at any point, ends the session the same way -- its
+containers stopped, its record finalized -- and exits `130`, `143`, or `129`. An interactive run
+gets a line editor with in-session history; a piped or redirected one reads plain lines.
 
 With no repo config found and no `--config`, `run` and `mcp` use the current directory as the
 workspace root and take all config from the global file. `run` then needs exactly one thing
@@ -252,8 +289,9 @@ a repo config and does not fall through; pass `--image outrig-default` to pre-wa
 built-in.
 
 Whichever way the repo root is found, a workspace no config declares is never your home
-directory or a directory above it: `run` and `mcp` refuse to start, naming the directory and
-what chose it. Declare `[workspace] host-path` to mount it on purpose; see
+directory or a directory above it, nor one that contains the global config: `run` and `mcp`
+refuse to start, naming the directory and what chose it. Declare `[workspace] host-path` in the
+global config to mount it on purpose; see
 [Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
@@ -586,7 +624,7 @@ outrig mcp self
 | `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
 | `--network <default|audit|filter>`| config, else `default` | Network monitoring mode.       |
-| `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
+| `--session-dir <path>` | `<session-root>/<sid>` (auto)| New or empty dir for this server.     |
 | `--volume <spec>`      | --                           | Extra bind mount; not with --attach.  |
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
@@ -639,12 +677,13 @@ repo-local overrides, not for serving MCP JSON-RPC.
 container or require a repo config. Use it from an external MCP-capable AI tool when the built-in
 image templates do not fit.
 
-| Trigger or failure                               | Exit |
-|--------------------------------------------------|------|
-| Stdio client closes stdin after successful startup | `0` |
-| SIGINT or SIGTERM after successful startup       | `0`  |
-| Config, image, container, or MCP startup failure | `1`  |
-| Bad flags or missing required args               | `2`  |
+| Trigger or failure                                  | Exit                  |
+|-----------------------------------------------------|-----------------------|
+| Stdio client closes stdin after successful startup  | `0`                   |
+| SIGINT, SIGTERM, or SIGHUP after successful startup | `0`                   |
+| SIGINT, SIGTERM, or SIGHUP during startup           | `130`, `143`, `129`   |
+| Config, image, container, or MCP startup failure    | `1`                   |
+| Bad flags or missing required args                  | `2`                   |
 
 Environment variables used by `outrig mcp`:
 
@@ -652,8 +691,8 @@ Environment variables used by `outrig mcp`:
 |-------------------|-----------------------------------------------------------------|
 | `OUTRIG_LOG`      | Preferred `tracing-subscriber` filter.                          |
 | `RUST_LOG`        | Fallback tracing filter when `OUTRIG_LOG` is unset.             |
-| `XDG_DATA_HOME`   | Default base for `session-root` if not set in config.           |
-| `XDG_CONFIG_HOME` | Global config is checked before `~/.outrig/config.toml`.        |
+| `XDG_DATA_HOME`   | Default base for `session-root` if not set in global config.    |
+| `XDG_CONFIG_HOME` | Absolute only: global config is checked before `~/.outrig/`.    |
 
 See [Usage -> outrig mcp](../usage/mcp.md) for client configuration and stdio details.
 
@@ -686,7 +725,8 @@ outrig ls [--session-root <path>]
 ```
 
 Output columns: `ID`, `STARTED`, `DURATION`, `CONTAINER`, `EXIT`. Symlinked sessions (created
-via `outrig run --session-dir`) display the symlink target as a hint.
+via `outrig run --session-dir`) display the symlink target as a hint. A symlink whose directory
+is gone has no record to list: `ls` reports it on stderr, and `discard` or `clean` removes it.
 
 See [Usage -> Sessions](../usage/sessions.md).
 
@@ -713,7 +753,7 @@ on `<session>` is allowed if unambiguous.
 
 ### `outrig discard`
 
-Delete a session's on-disk record (logs and metadata).
+Delete a session's on-disk record (`session.json`, `logs/`, `outrig-enter`) and its directory.
 
 ```
 outrig discard [<session>] [--yes]
@@ -729,8 +769,15 @@ outrig discard [<session>] [--yes]
 
 `<session>` and `--session-dir` are mutually exclusive. If the session was created via
 `outrig run --session-dir <path>` (i.e. lives at a user-chosen path with a symlink in the root),
-discard removes the real directory **and** the symlink. Refuses if the session's container is
-still running. Discards the session directory only -- your repository is untouched.
+discard removes the real directory **and** the symlink; `--session-dir` given that symlink
+discards the directory it names. A symlink whose directory is gone is removed by
+`discard <sid>`, or by `--session-dir` given the path the directory had. Discard removes the
+session's directory whole, a rendered `report.html` and anything else in it included; a symlink
+inside it is unlinked, not followed. A session whose `session.json` cannot be read is discarded
+the same way after the confirmation, which names why it is unreadable; with no record to name
+the container, the check for a running one uses `outrig-<sid>`, and `discard` warns on stderr,
+`--yes` or not, when the record did not name its container. Refuses if the session's container
+is still running.
 
 ### `outrig clean`
 
@@ -740,6 +787,7 @@ Delete old stopped session records in bulk.
 outrig clean [--older-than <duration>]
              [--yes]
              [--build-containers]
+             [--unreadable]
              [--session <id>]
              [--session-root <path>]
 ```
@@ -749,12 +797,21 @@ outrig clean [--older-than <duration>]
 | `--older-than <duration>` | `30d`   | Remove sessions older than cutoff.      |
 | `--yes`, `-y`             | off     | Skip the interactive confirmation.      |
 | `--build-containers`      | off     | Also remove buildah working containers. |
+| `--unreadable`            | off     | Also remove unreadable session records. |
 | `--session <id>`          | all     | Restrict both sweeps to one session id. |
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
-Running sessions are skipped. Sessions created with `--session-dir` remove both the symlink
-target and the symlink under the session root. Alongside the record walk, `clean` sweeps
+Running sessions are skipped. Symlinks whose directory is gone, older than the cutoff by the
+link's own modification time, are removed too. Sessions created with `--session-dir` remove both
+the symlink target and the symlink under the session root, each directory whole, as `discard`
+does. A record that cannot be read is aged by the start time in
+its directory name and is removed only with `--unreadable`: without it, even `--yes` leaves the
+record and names it, since what is in it cannot be shown. An entry whose name is not a session
+id is never removed, and an unreadable record keeps its container from being swept as a stray
+until the record itself is gone. A record cut off before it names its container is kept too,
+since an `outrig mcp --attach` session borrows a container that is not `outrig-<sid>`; `discard`
+removes it. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
 Stopped strays older than the cutoff are removed; running ones are only reported.
 
@@ -782,7 +839,15 @@ only thing keeping it away from a build in flight.
 | `0`   | Success.                                                               |
 | `1`   | Generic failure (config, image build, LLM API error, etc.).            |
 | `2`   | Misuse (bad flags, missing required args). clap prints the usage line. |
-| `130` | Interrupted by SIGINT before subcommand-specific handling.             |
+| `129` | Ended by SIGHUP.                                                       |
+| `130` | Ended by SIGINT.                                                       |
+| `143` | Ended by SIGTERM.                                                      |
+
+Once `outrig run` or `outrig mcp` has written its session record, it catches all three signals:
+it stops the session's containers and finalizes the record, which keeps the same code, before it
+exits. `outrig mcp` exits `0` on a signal once its startup has finished; see
+[`outrig mcp`](#outrig-mcp). `outrig image build` catches them once it starts its validation
+container, and stops that container before it exits.
 
 `outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
 there; the run is reported in full, and the container is named on stderr.
@@ -798,8 +863,13 @@ number of the signal that ended the program.
 - `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.
-- `XDG_DATA_HOME`: default base for `session-root` if not set in config.
-- `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
+- `XDG_DATA_HOME`: default base for `session-root` if not set in the global config.
+- `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`, when it is
+  an absolute path. An empty or relative value is ignored.
+
+These are read on the host. None of them, nor any other host variable such as `HTTPS_PROXY`,
+reaches a container unless an MCP server's `env` or `--env` names it; see
+[Containers -> The container's environment](../concepts/containers.md#the-containers-environment).
 
 ## See also
 

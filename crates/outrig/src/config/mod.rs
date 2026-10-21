@@ -4,66 +4,37 @@ mod api_key;
 mod binding;
 mod env_ref;
 mod env_value;
+mod lenient;
 mod merge;
 mod validate;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef, EnvSecrets, Secrets};
 pub use binding::{Binding, FactoryValue};
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
+pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
 pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
 };
 pub(crate) use validate::{
-    check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
-    is_valid_mcp_server_name, mcp_command_is_empty, validate_binding, validate_session_paths,
+    check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image, check_sidecar_name,
+    check_view_exclusions, is_valid_mcp_server_name, mcp_call_timeout_secs_in_range,
+    mcp_command_is_empty, validate_binding, validate_session_paths,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};
-
-/// True when the parse error is an "unknown field" complaint and its span
-/// lands on a `[<dotted.path>]` header whose path has an unquoted `.`. That's
-/// the shape that makes TOML treat a name like `opus-4.7` as nested keys
-/// (`opus-4` table with field `7`) and is the cue to suggest quoting.
-/// Restricting to unknown-field errors avoids hinting on legitimate dotted
-/// headers like `[providers.openai]` whose values fail validation.
-fn error_lands_on_unquoted_dotted_header(err: &toml::de::Error, input: &str) -> bool {
-    if !err.message().contains("unknown field") {
-        return false;
-    }
-    let Some(span) = err.span() else {
-        return false;
-    };
-    let line_start = input[..span.start].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = input[span.start..]
-        .find('\n')
-        .map_or(input.len(), |i| span.start + i);
-    let line = input[line_start..line_end].trim();
-    let Some(rest) = line.strip_prefix('[') else {
-        return false;
-    };
-    let Some(end) = rest.find(']') else {
-        return false;
-    };
-    let mut in_quote = false;
-    for c in rest[..end].chars() {
-        match c {
-            '"' => in_quote = !in_quote,
-            '.' if !in_quote => return true,
-            _ => {}
-        }
-    }
-    false
-}
 
 pub const DEFAULT_TOOL_CALL_MAX: u32 = 50;
 pub const TOOL_CALL_MAX_LIMIT: u32 = 2000;
@@ -159,6 +130,39 @@ pub const DEFAULT_HOST_GRACE_SECS: u64 = 5;
 /// [`RETRY_BUDGET_SECS_CEILING`], so a mistyped value cannot leave a program that ignores signals
 /// running for days.
 pub const HOST_GRACE_SECS_CEILING: u64 = 3600;
+
+/// How long one MCP `tools/call` may run before outrig gives up on it, sends
+/// the server `notifications/cancelled`, and hands the model a timeout in
+/// place of a result. Ten minutes, like [`DEFAULT_RETRY_BUDGET_SECS`]: long
+/// enough for a build or a test run, short enough that a server which will
+/// never answer gives the turn back inside the session. A server's own
+/// `call-timeout-secs` and the top-level `mcp-call-timeout-secs` override it,
+/// in that order.
+///
+/// `initialize` and `tools/list` are not covered: they are bounded by a fixed
+/// startup deadline, because nothing a server does at startup should take as
+/// long as a tool may.
+pub const DEFAULT_MCP_CALL_TIMEOUT_SECS: u64 = 600;
+/// Upper bound accepted for `call-timeout-secs` and `mcp-call-timeout-secs`.
+/// The same hour, floor, and reasoning as [`REQUEST_TIMEOUT_SECS_CEILING`]: a
+/// `0` is an immediate timeout rather than none, so it is rejected.
+pub const MCP_CALL_TIMEOUT_SECS_CEILING: u64 = 3600;
+
+/// The `tools/call` deadline for one server: its own `call-timeout-secs`, else
+/// the session's `mcp-call-timeout-secs`, else
+/// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`]. Most specific wins, and the values are
+/// read after every merge, so a label entry a config entry replaced brings
+/// nothing with it.
+pub(crate) fn effective_mcp_call_timeout(
+    per_server: Option<u64>,
+    session_default: Option<u64>,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        per_server
+            .or(session_default)
+            .unwrap_or(DEFAULT_MCP_CALL_TIMEOUT_SECS),
+    )
+}
 
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
@@ -327,6 +331,11 @@ pub struct Config {
     pub default_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Global-only: a repo config that sets it fails
+    /// [`validate_as_repo`](Self::validate_as_repo), and [`merge`] never reads
+    /// it from the repo side. A config read from a file holds it resolved
+    /// against that file's directory, so after any [`load`](Self::load) it is
+    /// absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,6 +354,11 @@ pub struct Config {
     /// [`DEFAULT_RETRY_BUDGET_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_budget_secs: Option<u64>,
+    /// Default `tools/call` deadline for every MCP server, in seconds. A
+    /// server's own `call-timeout-secs` overrides this. See
+    /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_call_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
     #[serde(default, skip_serializing_if = "EventsConfig::is_default")]
@@ -352,6 +366,12 @@ pub struct Config {
     /// How a program `outrig run <script.py>` runs on the host is treated. See [`HostConfig`].
     #[serde(default, skip_serializing_if = "HostConfig::is_default")]
     pub host: HostConfig,
+    /// Global-only, like [`session_root`](Self::session_root): which host
+    /// variables a repo config file may reference. A repo config that declares
+    /// `[repo].env-allow` fails [`validate_as_repo`](Self::validate_as_repo),
+    /// and [`merge`] never reads it from the repo side.
+    #[serde(default, skip_serializing_if = "RepoPolicy::is_default")]
+    pub repo: RepoPolicy,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -372,17 +392,28 @@ pub struct Config {
     /// [`Binding`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, Binding>,
+
+    /// What the load set aside instead of failing on. See
+    /// [`warnings`](Self::warnings).
+    #[serde(skip)]
+    warnings: Vec<ConfigWarning>,
 }
 
 impl Config {
+    /// Parse `s` as a config file. A key no table has is dropped and recorded
+    /// in [`warnings`](Self::warnings); any other problem fails the parse.
+    /// `toml::from_str::<Config>` stays strict and fails on the key as well.
     pub fn load_from_str(s: &str) -> Result<Self> {
-        match toml::from_str(s) {
-            Ok(cfg) => Ok(cfg),
-            Err(e) if error_lands_on_unquoted_dotted_header(&e, s) => {
-                Err(OutrigError::ConfigDottedKey { source: e })
-            }
-            Err(e) => Err(e.into()),
-        }
+        lenient::parse(s, None, false)
+    }
+
+    /// What the load that produced this config set aside instead of failing
+    /// on, in file order: each key no table has, and, from the global config
+    /// alone, each value that did not deserialize. `[network]` and the
+    /// `security` tables set nothing aside. [`merge`] keeps both sides',
+    /// global first. Empty for a config built in code.
+    pub fn warnings(&self) -> &[ConfigWarning] {
+        &self.warnings
     }
 
     /// Read repo + (optional) global config files, merge with repo precedence,
@@ -390,7 +421,7 @@ impl Config {
     /// file is read from `<repo_root>/.agents/outrig/config.toml`; a missing
     /// one loads as empty.
     pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate(Some(repo_root))?;
         Ok(merged)
     }
@@ -403,7 +434,7 @@ impl Config {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
         Ok(merged)
     }
@@ -412,7 +443,7 @@ impl Config {
     /// sections, so this preserves image and general validation while skipping
     /// agent/model/provider cross-reference checks.
     pub fn load_for_build(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
         merged.validate_for_build(Some(repo_root))?;
         Ok(merged)
     }
@@ -433,7 +464,7 @@ impl Config {
         repo_root: &Path,
         global_path: Option<&Path>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate(Some(repo_root))?;
         Ok(merged)
     }
@@ -447,7 +478,7 @@ impl Config {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
         Ok(merged)
     }
@@ -459,7 +490,7 @@ impl Config {
         repo_root: &Path,
         global_path: Option<&Path>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        let merged = Self::load_file_unvalidated(repo_cfg, global_path)?;
         merged.validate_for_build(Some(repo_root))?;
         Ok(merged)
     }
@@ -468,7 +499,7 @@ impl Config {
     /// `outrig run`/`outrig mcp` may run in a directory with no
     /// `.agents/outrig/config.toml`, falling back to the global config (and
     /// built-in defaults). Mirrors the global-file handling in
-    /// [`load_unvalidated`](Self::load_unvalidated).
+    /// [`load_global`](Self::load_global).
     fn read_repo(repo_root: &Path) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
         let repo_text = match fs::read_to_string(&repo_path) {
@@ -497,23 +528,74 @@ impl Config {
         Ok(repo_cfg)
     }
 
+    /// Parse the file `src` names, setting aside what [`load_from_str`]
+    /// does -- and, for the global config, a value that does not deserialize
+    /// -- with each warning naming the file, then stamp it.
+    ///
+    /// [`load_from_str`]: Self::load_from_str
     fn parse_stamped(text: &str, src: &ConfigSource) -> Result<Self> {
-        let mut cfg = Self::load_from_str(text)?;
+        let global = matches!(src, ConfigSource::Global { .. });
+        let mut cfg = lenient::parse(text, Some(&src.config_path()), global)?;
         cfg.stamp_source(src);
         Ok(cfg)
     }
 
-    /// Merge `repo_cfg` over the global config at `global_path`, unvalidated.
-    fn load_unvalidated(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
-        let global_cfg = match global_path {
-            Some(g) => {
-                let (g, text) = read_resolved(g)?;
-                match text {
-                    Ok(text) => Self::parse_stamped(&text, &ConfigSource::Global { path: g })?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-                    Err(e) => return Err(e).path_ctx("read", &g),
-                }
+    /// The global config at `path` alone: parsed, with `session-root` resolved
+    /// against its directory, and every path entry stamped with its origin, but
+    /// neither merged nor validated. A missing
+    /// file loads as empty, as it does for [`load`](Self::load).
+    ///
+    /// Unvalidated because a global file is half of a config, not a whole one:
+    /// its `default-model` may name a model the repo declares. This is the read
+    /// for a caller that wants a machine-level key and has no repo -- `outrig
+    /// ls` finding the session root from any directory.
+    ///
+    /// Read leniently, because every outrig on the machine reads this one
+    /// file: a key no table has, and a value that does not deserialize, are
+    /// dropped and recorded in [`warnings`](Self::warnings) rather than
+    /// failing the load -- except in `[network]` and the `security` tables,
+    /// where leaving a key out would give a container more than the file
+    /// allows. A TOML syntax error still fails it.
+    pub fn load_global(path: &Path) -> Result<Self> {
+        let (path, text) = read_resolved(path)?;
+        match text {
+            Ok(text) => {
+                let src = ConfigSource::Global { path };
+                let mut cfg = Self::parse_stamped(&text, &src)?;
+                cfg.resolve_global_roots(src.base_dir());
+                Ok(cfg)
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).path_ctx("read", &path),
+        }
+    }
+
+    /// [`load`](Self::load) up to the validation: both files read, each held
+    /// to its own rules, and merged, but the merged config not validated.
+    ///
+    /// For a caller that reports [`warnings`](Self::warnings) before
+    /// validating. A key set aside can be why a rule then fails -- a misspelled
+    /// `provider` leaves its model with none -- and the warning naming it is
+    /// what makes that error make sense. Follow it with
+    /// [`validate`](Self::validate), [`validate_for_run`](Self::validate_for_run),
+    /// or [`validate_for_build`](Self::validate_for_build), as the matching
+    /// `load` would.
+    pub fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        Self::merge_over_global(Self::read_repo(repo_root)?, global_path)
+    }
+
+    /// [`load_unvalidated`](Self::load_unvalidated), with the repo config read
+    /// from `repo_cfg` as [`load_file`](Self::load_file) reads it. No repo
+    /// root: nothing is resolved against one until the validation that
+    /// follows.
+    pub fn load_file_unvalidated(repo_cfg: &Path, global_path: Option<&Path>) -> Result<Self> {
+        Self::merge_over_global(Self::read_repo_file(repo_cfg)?, global_path)
+    }
+
+    /// Merge `repo_cfg` over the global config at `global_path`, unvalidated.
+    fn merge_over_global(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
+        let global_cfg = match global_path {
+            Some(g) => Self::load_global(g)?,
             None => Self::default(),
         };
 
@@ -575,10 +657,32 @@ impl Config {
         keys.chain(refs).collect()
     }
 
+    /// Resolve `session-root` against `base`, the global file's directory, now
+    /// rather than stamping it like the paths above. It is global-only, so that
+    /// is the one base it can have, and no provenance is left to record.
+    /// Resolving keeps the promise a loaded config has always made about this
+    /// pub field -- that it is absolute -- which a value carried as written
+    /// beside a private source would quietly break for every caller reading the
+    /// field directly. So it is the exception to "stored as written". A repo
+    /// side needs no such step: [`validate_as_repo`](Self::validate_as_repo)
+    /// refuses it.
+    fn resolve_global_roots(&mut self, base: &Path) {
+        if let Some(path) = &mut self.session_root {
+            *path = resolve_against(base, path);
+        }
+    }
+
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
     /// `repo_root: Some(_)` enables the on-disk existence checks for
     /// config-declared paths; `None` keeps the check pure-structural for unit
     /// tests.
+    ///
+    /// One rule needs both files, so it is checked here, on the merged value: a
+    /// `${VAR}` in the `build-args` or MCP `env` of an image a repo config file
+    /// declared must name a variable the global config's
+    /// [`[repo].env-allow`](RepoPolicy::env_allow) lists. Images the global
+    /// config declared, and images no file declared -- hand-built, or read by
+    /// [`load_from_str`](Self::load_from_str) -- are not held to it.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
         Ok(())
@@ -588,15 +692,29 @@ impl Config {
     /// the unmerged value.
     ///
     /// [`validate`](Self::validate) runs on the merged config, which by
-    /// construction has already taken its `[network]` policy from the global
-    /// side and so cannot say which file declared what. These rules therefore
-    /// run per-file, before [`merge`](fn@merge). Today there is one: a repo
-    /// config may choose `[network].mode`, but `default`, `allow`, and `deny`
-    /// describe the machine's egress and stay with the operator.
+    /// construction has already taken its global-only keys from the global
+    /// side and replaced any global provider a repo entry shadowed, and so
+    /// cannot say which file declared what. These rules therefore run
+    /// per-file, before [`merge`](fn@merge). Today there are four. A repo
+    /// config may not set `session-root`, which chooses where this machine
+    /// writes. It may choose `[network].mode`, but
+    /// `default`, `allow`, and `deny` describe the machine's egress and stay
+    /// with the operator. It may not declare `[repo].env-allow`, even empty: it
+    /// says what a repo config may reference from the host environment, which a
+    /// repo file must not answer for itself. And it may declare no provider:
+    /// every style carries an `api-key`, a key names a host environment
+    /// variable, and a repo that could pair one with its own `base-url` would
+    /// decide where the operator's secret is sent.
     ///
     /// `Config::load` applies this to the repo file it reads. An embedder
     /// assembling a repo-side `Config` by hand should call it too -- `merge`
-    /// is infallible and simply drops a repo policy rather than reporting it.
+    /// is infallible: it drops a repo policy or root rather than reporting it,
+    /// and it takes a repo provider as written.
+    ///
+    /// What a repo file may *reference* is not checked here: that needs the
+    /// global config's `[repo]` list too, so [`validate`](Self::validate) checks
+    /// it on the merged value. A repo-side `Config` assembled by hand carries no
+    /// record of the file that declared its images, and is not held to the list.
     pub fn validate_as_repo(&self) -> Result<()> {
         validate::validate_as_repo(self)?;
         Ok(())
@@ -807,9 +925,10 @@ impl Config {
         Ok(())
     }
 
-    /// `--model` stands in for the model of the agent the run selects, and
-    /// only that one.
-    fn validate_for_run(
+    /// [`validate`](Self::validate) as [`load_for_run`](Self::load_for_run)
+    /// applies it: `--model` stands in for the model of the agent the run
+    /// selects, and only that one.
+    pub fn validate_for_run(
         &self,
         repo_root: Option<&Path>,
         agent_flag: Option<&str>,
@@ -827,7 +946,10 @@ impl Config {
         Ok(())
     }
 
-    fn validate_for_build(&self, repo_root: Option<&Path>) -> Result<()> {
+    /// [`validate`](Self::validate) as [`load_for_build`](Self::load_for_build)
+    /// applies it: the image and general rules, without the
+    /// agent/model/provider cross-references a build does not use.
+    pub fn validate_for_build(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate_with_options(
             self,
             repo_root,
@@ -1306,8 +1428,9 @@ impl Workspace {
         self.source = None;
     }
 
-    /// Declare `container-path`. Carries no provenance -- a container path is
-    /// absolute and resolves against nothing.
+    /// Declare `container-path`. Carries no provenance -- a container path
+    /// resolves against nothing. [`Config::validate`] requires it absolute and
+    /// not `/`.
     pub fn set_container_path(&mut self, container_path: impl Into<PathBuf>) {
         self.container_path = Some(container_path.into());
     }
@@ -1356,6 +1479,13 @@ impl Workspace {
     /// resolved, where [`known_path`] can say.
     pub(crate) fn known_host_path(&self, repo_root: Option<&Path>) -> Option<PathBuf> {
         known_path(self.source.as_ref(), self.host_path(), repo_root)
+    }
+
+    /// The config file that declared `host-path`, or `None` when none did: the
+    /// built-in `.`, or a value from [`Workspace::new`] or
+    /// [`set_host_path`](Self::set_host_path).
+    pub fn config_source(&self) -> Option<&ConfigSource> {
+        self.source.as_ref()
     }
 
     /// The file to name in a diagnostic about `host-path`, or `None` when no
@@ -2028,6 +2158,20 @@ pub(crate) enum NetworkHostPattern {
     AddressGlob(String),
 }
 
+impl NetworkHostPattern {
+    /// Whether this pattern matches every address of the family it describes:
+    /// a `*` glob, or a CIDR with no prefix. The one kind of address entry that
+    /// could grant a connection to any name, since any name can resolve to an
+    /// address of that family.
+    pub(crate) fn covers_every_address(&self) -> bool {
+        match self {
+            Self::Cidr { prefix, .. } => *prefix == 0,
+            Self::AddressGlob(pattern) => pattern.chars().all(|c| c == '*'),
+            Self::Ip(_) | Self::HostGlob(_) => false,
+        }
+    }
+}
+
 pub(crate) fn parse_network_host_pattern(
     host: &str,
 ) -> std::result::Result<NetworkHostPattern, String> {
@@ -2081,6 +2225,65 @@ pub(crate) fn parse_network_host_pattern(
         Ok(NetworkHostPattern::HostGlob(glob))
     } else {
         Ok(NetworkHostPattern::AddressGlob(glob))
+    }
+}
+
+/// The `[repo]` block, in the global config only: what a repo config file may
+/// take from this machine. The one key today is `env-allow`, the host variables
+/// a `${VAR}` reference in a repo config's `build-args` or MCP `env` may name;
+/// none by default. A variable on the list is the repo's to route: the repo
+/// picks which build-arg or server environment receives the value.
+///
+/// Only the operator's file may declare it. A repo file that declares
+/// `env-allow`, even empty, fails [`Config::validate_as_repo`], and
+/// [`merge`](fn@merge) reads it from the global side alone;
+/// [`Config::validate`] holds every image a repo file declares to it. The field
+/// is private, like [`NetworkConfig`]'s, so `None` is "not declared" rather than
+/// an empty list: read what is in effect with [`env_allow`](Self::env_allow).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct RepoPolicy {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_env_allow"
+    )]
+    env_allow: Option<Vec<String>>,
+}
+
+impl RepoPolicy {
+    /// The variables a repo config may reference: what was declared, and
+    /// nothing when the config declared none, which allows no reference.
+    pub fn env_allow(&self) -> &[String] {
+        self.env_allow.as_deref().unwrap_or_default()
+    }
+
+    /// Declare the variables a repo config may reference. An entry that is not
+    /// a variable name (`^[A-Z_][A-Z0-9_]*$`) allows nothing, since no reference
+    /// can match it.
+    pub fn set_env_allow(&mut self, vars: impl IntoIterator<Item = impl Into<String>>) {
+        self.env_allow = Some(vars.into_iter().map(Into::into).collect());
+    }
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Read `env-allow`, holding each entry to the grammar of a `${VAR}` reference.
+/// An entry no reference could match -- lower case, wrapped in `${...}`, a glob
+/// -- would otherwise allow nothing without saying so. The global config reads
+/// leniently, so there the error sets the whole key aside with a warning, which
+/// leaves the list empty: every reference is refused, never one more allowed.
+fn deserialize_env_allow<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error> {
+    let names = Vec::<String>::deserialize(deserializer)?;
+    match names.iter().find(|name| !env_ref::is_env_var_name(name)) {
+        Some(name) => Err(serde::de::Error::custom(format!(
+            "env-allow entry {name:?} is not a variable name (must match ^[A-Z_][A-Z0-9_]*$)"
+        ))),
+        None => Ok(Some(names)),
     }
 }
 
@@ -2144,9 +2347,12 @@ pub(crate) fn capability_name_without_prefix(name: &str) -> &str {
     name.strip_prefix("CAP_").unwrap_or(name)
 }
 
+/// The name `name` stands for, or `None` if it is not one. A second `CAP_` is
+/// not a name: podman rejects `CAP_CAP_X`, but once one prefix is stripped on
+/// the way to it the rest reads as `CAP_X`, which it takes for `X`.
 pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
     let name = capability_name_without_prefix(name);
-    if name.is_empty() {
+    if name.is_empty() || name.starts_with("CAP_") {
         return None;
     }
     if name
@@ -2189,6 +2395,17 @@ pub struct ImageConfig {
     #[serde(skip)]
     #[schemars(skip)]
     source: Option<ConfigSource>,
+    /// Whether a repo config file declared this entry; `false` for the global
+    /// config's, and for one no file declared. Set at load time beside
+    /// [`source`](Self::config_source) and never deserialized, but kept apart
+    /// from it: [`set_build_paths`](Self::set_build_paths) and
+    /// [`set_image_name`](Self::set_image_name) clear `source`, which only
+    /// resolves relative paths, and say nothing about who wrote the `${VAR}`
+    /// references in `build-args` and `mcp` that [`Config::validate`] holds to
+    /// `[repo] env-allow`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    repo_declared: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     mcp: BTreeMap<String, McpServerSpec>,
 }
@@ -2373,6 +2590,7 @@ impl ImageConfig {
             build_args: BTreeMap::new(),
             security: ContainerSecurity::default(),
             source: None,
+            repo_declared: false,
             mcp: BTreeMap::new(),
         }
     }
@@ -2396,15 +2614,16 @@ impl ImageConfig {
         self.context.as_deref()
     }
 
-    /// Make this a build-source config: declare both build paths, and drop the
-    /// `image_name` and any recorded [`ConfigSource`]. The new values did not
-    /// come from a config file, so they resolve against the `repo_root` passed
-    /// to [`resolved_build_paths`](Self::resolved_build_paths). `build_args`
-    /// are kept.
+    /// Make this a build-source config: declare both build paths, clear
+    /// `image_name`, and drop any recorded [`ConfigSource`]. The new values did
+    /// not come from a config file, so they resolve against the `repo_root`
+    /// passed to [`resolved_build_paths`](Self::resolved_build_paths).
     ///
-    /// The pair is written together because one source backs both: a setter
-    /// for one path alone would clear the source its untouched sibling still
-    /// depends on.
+    /// The source shape is replaced whole, so a pull-source config comes out as
+    /// a build source rather than as both. The pair is written together because
+    /// one source backs both: a setter for one path alone would clear the
+    /// source its untouched sibling still depends on. `build_args` is left as
+    /// it was, and so is whether a repo config file declared the entry.
     pub fn set_build_paths(&mut self, dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) {
         self.image_name = None;
         self.dockerfile = Some(dockerfile.into());
@@ -2412,13 +2631,16 @@ impl ImageConfig {
         self.source = None;
     }
 
-    /// Make this a pull-source config naming `image_name`: drop both build
-    /// paths and the [`ConfigSource`] that backed them, the mirror of
-    /// [`set_build_paths`](Self::set_build_paths).
+    /// Make this a pull-source config: name the image, clear both build paths,
+    /// and drop any recorded [`ConfigSource`], which existed only to resolve
+    /// those paths. The counterpart of [`set_build_paths`](Self::set_build_paths)
+    /// and the in-place form of [`from_image_name`](Self::from_image_name).
     ///
-    /// `build_args` are kept, as there; a pull source with any left is
-    /// reported by [`Config::validate`] as `ImageNameWithBuildArgs`, not
-    /// silently emptied.
+    /// `build_args` is left as it was, so a build-source config that declared
+    /// any still fails validation with
+    /// [`ConfigValidationError::ImageNameWithBuildArgs`] until they are
+    /// cleared. Whether a repo config file declared the entry is left as it was
+    /// too.
     pub fn set_image_name(&mut self, image_name: impl Into<String>) {
         self.image_name = Some(image_name.into());
         self.dockerfile = None;
@@ -2467,7 +2689,10 @@ impl ImageConfig {
         self.source.as_ref()
     }
 
+    /// Record the file this entry was read from. Anything but the global config
+    /// is a repo config.
     pub(crate) fn set_config_source(&mut self, source: ConfigSource) {
+        self.repo_declared = !matches!(source, ConfigSource::Global { .. });
         self.source = Some(source);
     }
 
@@ -2522,8 +2747,10 @@ impl ImageConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
+/// `Deserialize` is written by hand below; these serde attributes drive
+/// `Serialize` and the JSON schema.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
 #[non_exhaustive]
 pub enum McpServerSpec {
     Short(Vec<String>),
@@ -2534,8 +2761,9 @@ pub enum McpServerSpec {
         /// path sees a non-empty command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<Vec<String>>,
-        /// Always serialized (no skip) so a `Full` entry can't collapse into
-        /// the `Short` shape on a round-trip.
+        /// Always serialized, even empty. It always has been, and the
+        /// `org.outrig.mcp` label it lands in is part of an image's cache
+        /// key, so eliding it now would rebuild every image stamped since.
         #[serde(default)]
         env: BTreeMap<String, EnvValue>,
         /// The sidecar declared under `[sidecars.<sc>]` that hosts this
@@ -2563,7 +2791,79 @@ pub enum McpServerSpec {
         /// it serializes exactly as before.
         #[serde(default, skip_serializing_if = "SidecarView::is_none")]
         view: SidecarView,
+        /// This server's `tools/call` deadline in seconds, overriding the
+        /// top-level `mcp-call-timeout-secs`. Last and elided when unset, so
+        /// an entry without it serializes -- into a label too -- exactly as
+        /// before. See [`DEFAULT_MCP_CALL_TIMEOUT_SECS`].
+        #[serde(
+            default,
+            rename = "call-timeout-secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        call_timeout_secs: Option<u64>,
     },
+}
+
+/// Dispatches on the value's own type -- an array is `Short`, a table `Full`
+/// -- rather than through `#[serde(untagged)]`. Untagged tries each variant
+/// and, when none fits, reports only that none did; a table read directly
+/// names the key it rejects, ``unknown field `comand` ``, as every other
+/// table in the config does.
+impl<'de> Deserialize<'de> for McpServerSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+        struct Table {
+            command: Option<Vec<String>>,
+            #[serde(default)]
+            env: BTreeMap<String, EnvValue>,
+            sidecar: Option<String>,
+            image: Option<String>,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default)]
+            view: SidecarView,
+            call_timeout_secs: Option<u64>,
+        }
+
+        struct SpecVisitor;
+
+        impl<'de> Visitor<'de> for SpecVisitor {
+            type Value = McpServerSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an argv array or an MCP server table")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(McpServerSpec::Short)
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let t = Table::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(McpServerSpec::Full {
+                    command: t.command,
+                    env: t.env,
+                    sidecar: t.sidecar,
+                    image: t.image,
+                    args: t.args,
+                    view: t.view,
+                    call_timeout_secs: t.call_timeout_secs,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
+    }
 }
 
 impl McpServerSpec {
@@ -2636,6 +2936,20 @@ impl McpServerSpec {
         })
     }
 
+    /// This server's own `tools/call` deadline in seconds, replacing whatever
+    /// the session default would have given it.
+    pub fn with_call_timeout_secs(self, secs: u64) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full {
+                call_timeout_secs: slot,
+                ..
+            } = spec
+            {
+                *slot = Some(secs);
+            }
+        })
+    }
+
     /// The one `Full` literal in this impl: the two constructors and the
     /// `Short` promotion below all route through it, so a field added to the
     /// variant is filled in exactly one place.
@@ -2647,6 +2961,7 @@ impl McpServerSpec {
             image,
             args: Vec::new(),
             view: SidecarView::None,
+            call_timeout_secs: None,
         }
     }
 
@@ -2726,6 +3041,17 @@ impl McpServerSpec {
         match self {
             Self::Short(_) => SidecarView::None,
             Self::Full { view, .. } => *view,
+        }
+    }
+
+    /// This server's own `tools/call` deadline in seconds, if it declares
+    /// one. Always `None` for `Short`; the session default then applies.
+    pub fn call_timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full {
+                call_timeout_secs, ..
+            } => *call_timeout_secs,
         }
     }
 
@@ -2824,5 +3150,24 @@ mod tests {
                 "{home:?}",
             );
         }
+    }
+
+    /// `McpServerSpec` serializes through its derive and deserializes through
+    /// a hand-written table struct, so every key has two spellings to agree.
+    /// No field here is at its default, so none is elided on the way out.
+    #[test]
+    fn every_mcp_table_key_round_trips() {
+        let spec = McpServerSpec::Full {
+            command: Some(vec!["mcp-fs".to_string()]),
+            env: BTreeMap::from([("TOKEN".to_string(), EnvValue::EnvRef("T".to_string()))]),
+            sidecar: Some("tools".to_string()),
+            image: Some("ghcr.io/example/fs:1".to_string()),
+            args: vec!["/workspace".to_string()],
+            view: SidecarView::Primary,
+            call_timeout_secs: Some(30),
+        };
+
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<McpServerSpec>(&json).unwrap(), spec);
     }
 }

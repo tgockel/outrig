@@ -16,7 +16,9 @@ crates publish from this repository.
 - [podman](https://podman.io) **4.3 or newer**, installed and working in rootless mode.
   Verify with `podman info` -- it should print without errors. The floor is 4.3 because
   outrig's cancellation cleanup removes containers with `podman rm --filter`, which older
-  podman does not accept.
+  podman does not accept. The engine must share this machine's kernel and PID namespace: a
+  socket on this host is fine, but a remote engine (another host, a VM, another container) is not
+  supported, and outrig refuses it.
 - [buildah](https://buildah.io) installed alongside podman. They share image storage by default.
 - An API key for an OpenAI-compatible chat endpoint, exported as `OPENAI_API_KEY`.
 
@@ -36,7 +38,7 @@ Install the CLI package to get the `outrig` command:
 ```sh
 $ cargo install outrig-cli
 $ outrig --version
-outrig 0.2.1
+outrig 0.2.2
 ```
 
 ## Try it before configuring anything
@@ -74,8 +76,8 @@ $ outrig init
 `init` walks you through the global config first (providers and models -- skipped if it
 already exists), then the repo config (workspace, default agent), then offers to call
 `image add` for the first image-config. Every prompt shows its default in
-`[default: ...]`; press Enter to accept. Type `?` and Enter at any prompt for an explanation
-and the available options.
+`[default: ...]`; press Enter to accept. Type `?` and Enter at any text or yes/no prompt for an
+explanation; pickers print their options' descriptions before they open.
 
 If the built-in image prompts do not cover the environment you need, still start with
 `outrig init` for the provider, workspace, and agent scaffolding. Then use
@@ -246,6 +248,7 @@ Diagnostics arrive on stderr:
 
 ```
 [outrig] agent:             coder (model: fast / provider: openai / gpt-4o-mini)
+[outrig] base-url:          https://api.openai.com/v1
 [outrig] tool-call max:     50
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  hello-outrig-standard
@@ -301,6 +304,9 @@ and committed the change. The file now reads:
     from the agent
 > 
 ```
+
+`Up` and `Down` recall the prompts you typed earlier in the session, and the prompt edits like any
+readline prompt; see [Line editing and history](usage/run.md#line-editing-and-history).
 
 Press `Ctrl-D` to end the session. outrig stops the container, finalizes the session record,
 and exits.

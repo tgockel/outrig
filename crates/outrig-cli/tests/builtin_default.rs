@@ -15,22 +15,22 @@
 
 mod common;
 
-use std::path::Path;
+use common::{GLOBAL_WITH_MODEL, RepoDir, run_outrig, run_outrig_with_env};
 
-use common::{GLOBAL_WITH_MODEL, run_outrig};
-
-/// Write a repo config and a global config into a fresh tempdir repo.
-fn repo_with(config_toml: &str) -> tempfile::TempDir {
-    let repo = tempfile::tempdir().expect("tempdir repo");
+/// Write a repo config into a fresh tempdir repo, and a global config beside
+/// it: the repo is the default workspace, and one that holds the global config
+/// is refused (#609).
+fn repo_with(config_toml: &str) -> RepoDir {
+    let repo = RepoDir::new();
     let cfg_dir = repo.path().join(".agents/outrig");
     std::fs::create_dir_all(&cfg_dir).expect("create config dir");
     std::fs::write(cfg_dir.join("config.toml"), config_toml).expect("write repo config");
-    std::fs::write(repo.path().join("global.toml"), GLOBAL_WITH_MODEL).expect("write global");
+    std::fs::write(repo.beside("global.toml"), GLOBAL_WITH_MODEL).expect("write global");
     repo
 }
 
-fn global_arg(repo: &Path) -> String {
-    repo.join("global.toml")
+fn global_arg(repo: &RepoDir) -> String {
+    repo.beside("global.toml")
         .to_str()
         .expect("utf-8")
         .to_string()
@@ -43,17 +43,17 @@ fn global_arg(repo: &Path) -> String {
 async fn a_bare_directory_now_fails_only_on_the_model() {
     let repo = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
-    let absent = repo.path().join("no-such-global.toml");
+    // No `--global-config`, and nothing where the default would be.
+    let config_home = tempfile::tempdir().expect("tempdir config home");
 
-    let (ok, stderr) = run_outrig(
+    let (ok, stderr) = run_outrig_with_env(
         repo.path(),
         &[
-            "--global-config",
-            absent.to_str().expect("utf-8"),
             "--session-root",
             sessions.path().to_str().expect("utf-8"),
             "run",
         ],
+        &[("XDG_CONFIG_HOME", config_home.path())],
     )
     .await;
 
@@ -79,12 +79,7 @@ async fn build_all_never_targets_the_built_in() {
 
     let (_, stderr) = run_outrig(
         repo.path(),
-        &[
-            "--global-config",
-            &global_arg(repo.path()),
-            "build",
-            "--all",
-        ],
+        &["--global-config", &global_arg(&repo), "build", "--all"],
     )
     .await;
 
@@ -106,7 +101,7 @@ async fn the_built_in_is_reachable_by_name_from_build() {
         repo.path(),
         &[
             "--global-config",
-            &global_arg(repo.path()),
+            &global_arg(&repo),
             "build",
             "--image",
             "outrig-default",
@@ -133,7 +128,7 @@ async fn the_built_in_is_reachable_by_name_from_run() {
         repo.path(),
         &[
             "--global-config",
-            &global_arg(repo.path()),
+            &global_arg(&repo),
             "--session-root",
             sessions.path().to_str().expect("utf-8"),
             "run",
@@ -144,7 +139,7 @@ async fn the_built_in_is_reachable_by_name_from_run() {
     .await;
 
     assert!(
-        !stderr.contains("did not match any [images.<name>]"),
+        !stderr.contains("is not an [images.<name>]"),
         "`outrig run --image outrig-default` must resolve the built-in, not fall \
          through to the raw-local-ref rule: {stderr}"
     );
@@ -163,7 +158,7 @@ async fn a_user_declared_reserved_name_wins_and_is_reported() {
         repo.path(),
         &[
             "--global-config",
-            &global_arg(repo.path()),
+            &global_arg(&repo),
             "--session-root",
             sessions.path().to_str().expect("utf-8"),
             "run",
@@ -206,7 +201,7 @@ async fn a_veto_without_a_default_image_names_the_vetoing_block() {
                 repo.path(),
                 &[
                     "--global-config",
-                    &global_arg(repo.path()),
+                    &global_arg(&repo),
                     "--session-root",
                     sessions.path().to_str().expect("utf-8"),
                     "mcp",

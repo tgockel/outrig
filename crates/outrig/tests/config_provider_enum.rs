@@ -1,13 +1,13 @@
 //! Schema tests for the `LlmProvider` tagged-enum (task 0001-13). Exercises
 //! parse + validate paths the existing `config_schema` and `config_merge`
 //! tests don't cover -- the per-style field rules, the typo error message,
-//! and the parse errors the removed in-process surface now produces.
+//! and what a load makes of the removed in-process surface.
 
 use std::path::Path;
 
 use outrig::config::{
-    AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, LlmProvider, OpenAiOptions,
-    RoleAlternation,
+    AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, ConfigWarningKind, LlmProvider,
+    OpenAiOptions, RoleAlternation,
 };
 use outrig::error::OutrigError;
 
@@ -77,8 +77,9 @@ context-window = 200000
 }
 
 /// `request-timeout-secs` and `retry-budget-secs` are the optional connection
-/// fields, and unknown keys are rejected by the tagged enum rather than
-/// silently ignored.
+/// fields, and an unknown key is refused by the tagged enum rather than
+/// silently ignored -- which a config file's load turns into a warning naming
+/// it.
 #[test]
 fn anthropic_provider_field_rules() {
     let cfg = parse(
@@ -125,20 +126,25 @@ base-url = "https://api.anthropic.com"
         );
     }
 
-    let err = Config::load_from_str(
-        r#"
+    let with_max_tokens = r#"
 [providers.claude]
 style      = "anthropic"
 base-url   = "https://api.anthropic.com"
 api-key    = "${ANTHROPIC_API_KEY}"
 max-tokens = 4096
-"#,
-    )
-    .expect_err("unknown provider field should fail");
+"#;
+    let err = toml::from_str::<Config>(with_max_tokens).expect_err("unknown provider field");
     assert!(
         err.to_string().contains("max-tokens"),
         "error should name the unknown field, got: {err}"
     );
+    let cfg = parse(with_max_tokens);
+    let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+    assert_eq!(keys, ["providers.claude.max-tokens"]);
+    assert!(matches!(
+        cfg.providers["claude"],
+        LlmProvider::Anthropic { .. }
+    ));
 }
 
 #[test]
@@ -242,9 +248,11 @@ fn the_removed_mistralrs_style_is_a_parse_error() {
 }
 
 /// The six weight keys and the top-level `model-cache-root` went with the
-/// style. Each refuses to parse rather than loading with the key dropped.
+/// style. A config written for 0.2 still loads, each one set aside with a
+/// warning naming it, as any key this build does not know is -- and a strict
+/// parse still refuses it.
 #[test]
-fn removed_local_llm_keys_are_parse_errors() {
+fn removed_local_llm_keys_are_set_aside_with_a_warning() {
     for line in [
         r#"model-id = "Qwen/Qwen2.5-7B-Instruct-GGUF""#,
         r#"model-path = "/var/cache/outrig/models/model.gguf""#,
@@ -267,27 +275,47 @@ identifier = "claude-sonnet-4-6"
 {line}
 "#
         );
-        let err = Config::load_from_str(&toml).unwrap_err();
-        assert!(
-            matches!(err, OutrigError::Config(_)),
-            "{key}: a parse error, not a validation error: {err:?}",
+        let cfg = Config::load_from_str(&toml).expect("a 0.2 config loads");
+        let warnings: Vec<_> = cfg.warnings().iter().map(|w| (w.key(), w.kind())).collect();
+        let expected = format!("models.sonnet.{key}");
+        assert_eq!(
+            warnings,
+            [(expected.as_str(), &ConfigWarningKind::UnknownKey)],
+            "{key}"
         );
-        assert!(
-            err.to_string().contains(key),
-            "{key}: error should name the key, got: {err}",
-        );
+        let err = toml::from_str::<Config>(&toml).expect_err("a strict parse refuses it");
+        assert!(err.to_string().contains(key), "{key}: {err}");
     }
 
-    let err =
-        Config::load_from_str("model-cache-root = \"/var/cache/outrig/models\"\n").unwrap_err();
-    assert!(
-        matches!(err, OutrigError::Config(_)),
-        "a parse error, not a validation error: {err:?}",
+    let cfg = Config::load_from_str("model-cache-root = \"/var/cache/outrig/models\"\n")
+        .expect("a 0.2 config loads");
+    let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+    assert_eq!(keys, ["model-cache-root"]);
+}
+
+/// `style = "mistralrs"` names a style this build does not have. The global
+/// config sets such a provider aside with a warning, as it does any value it
+/// cannot use, so a machine's config shared with 0.2 keeps loading; a model
+/// naming the provider then has none. Any other file fails to load.
+#[test]
+fn a_mistralrs_provider_is_set_aside_only_from_the_global_config() {
+    let text = "[providers.local]\nstyle = \"mistralrs\"\n";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let global = dir.path().join("config.toml");
+    std::fs::write(&global, text).expect("write global config");
+
+    let cfg = Config::load_global(&global).expect("the global config loads");
+    assert!(cfg.providers.is_empty(), "{:?}", cfg.providers);
+    assert_eq!(
+        cfg.warnings().first().map(|w| w.key()),
+        Some("providers.local"),
+        "{:?}",
+        cfg.warnings()
     );
-    assert!(
-        err.to_string().contains("model-cache-root"),
-        "error should name the key, got: {err}",
-    );
+
+    let err = Config::load_from_str(text).expect_err("a repo file's provider fails");
+    assert!(matches!(err, OutrigError::Config(_)), "{err:?}");
+    assert!(err.to_string().contains("mistralrs"), "{err}");
 }
 
 /// The constructor options carry both remote-only settings in one place, each

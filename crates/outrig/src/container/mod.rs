@@ -11,20 +11,24 @@
 //! 3. [`Drop`] -- best-effort detached `podman rm -f` if a `Container`
 //!    falls out of scope without `stop` being called (e.g. a future was
 //!    cancelled, an `?` propagated past the handle).
-//! 4. [`install_panic_hook`] -- last-resort replay of every outstanding
-//!    attempt's removal when the process is unwinding from a panic and `Drop`
-//!    cannot run.
+//! 4. The panic sweep -- last-resort replay of every outstanding attempt's
+//!    removal when a panic is ending the process: [`with_panic_sweep`] once
+//!    the panic has unwound out of `main`'s body, or [`install_panic_hook`] at
+//!    the panic site in a `panic = "abort"` build, where `Drop` never runs.
 //!
 //! All four select the container by the per-attempt `org.outrig.attempt` label
 //! rather than by the name that was asked for. A name is a request and podman
 //! can grant it again; only the label is one attempt's alone. `NameGuard`
 //! carries the argument in full.
 
+pub(crate) mod ctr_log;
 pub mod embedded;
 pub mod enter;
 mod namespace;
 pub mod sidecar;
 mod userdb;
+
+pub(crate) use ctr_log::CtrLog;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,9 +43,7 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::{
-    CapabilityProfile, MountAccess, ResolvedEnvValue, capability_name_without_prefix,
-};
+use crate::config::{CapabilityProfile, MountAccess, ResolvedEnvValue, normalize_capability_name};
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
@@ -116,6 +118,12 @@ pub struct Container {
     ///
     /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
     dns_preconfigured: bool,
+    /// Launched holding `CAP_NET_ADMIN` ([`ContainerCapabilities::grants_net_admin`]),
+    /// which [`NetworkInterceptor::attach`] refuses. `false` for a container
+    /// outrig only borrowed.
+    ///
+    /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
+    net_admin: bool,
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
@@ -129,6 +137,11 @@ pub struct Container {
     /// point of [`stop_or_keep`](Self::stop_or_keep) -- cannot act on whatever
     /// holds the name by the time that retry runs.
     id: Option<ContainerId>,
+    /// Where an entrypoint-stdio container's output is also written, for a
+    /// failed start whose stderr the attach stream did not carry. Set by
+    /// [`Container::create_initialized`]; `None` for every other container,
+    /// and for one that was created where no log could be made.
+    ctr_log: Option<CtrLog>,
     /// Stands in for the engine call whose rendering contains the fragment,
     /// first match winning, so a test can wedge the stop or the removal in
     /// particular and hold the other one still. Every bounded-call path here
@@ -555,6 +568,32 @@ impl ContainerCapabilities {
             ..Self::default()
         }
     }
+
+    /// Whether these flags leave the container holding `CAP_NET_ADMIN`, which
+    /// in its own network namespace is control of the nftables table the
+    /// network interceptor installs there.
+    ///
+    /// `cap-add` of `NET_ADMIN` does, and so does `ALL` unless `NET_ADMIN` is
+    /// also dropped: podman takes the drops off the `ALL` base, and an
+    /// explicit add alongside `ALL` is discarded rather than restored. No
+    /// profile adds it, and `SYS_ADMIN` does not stand in for it -- netlink
+    /// checks `CAP_NET_ADMIN` in the namespace's owning user namespace.
+    /// Names compare upper-cased, as podman reads them, because a hand-built
+    /// spec skips config validation's normalizer. An entry that is not one
+    /// name never gets this far: [`reject_malformed_capabilities`] refuses
+    /// it at launch, so this does not have to parse podman's flag syntax.
+    /// The spellings are measured in the unit test.
+    pub(crate) fn grants_net_admin(&self) -> bool {
+        fn lists(list: &[String], wanted: &str) -> bool {
+            list.iter()
+                .any(|entry| canonical_capability_name(entry).as_deref() == Some(wanted))
+        }
+        if lists(&self.cap_add, "ALL") {
+            !lists(&self.cap_drop, "NET_ADMIN")
+        } else {
+            lists(&self.cap_add, "NET_ADMIN")
+        }
+    }
 }
 
 impl Container {
@@ -582,6 +621,7 @@ impl Container {
         // attempt made and discharges its obligation -- neither of which `Drop
         // for Container` can do, because no `Container` exists yet.
         reject_reserved_labels(&launch.labels)?;
+        reject_malformed_capabilities(&launch.capabilities)?;
         let reserved = NameGuard::reserve(&name);
 
         let cmd = build_podman_run_cmd(
@@ -608,7 +648,10 @@ impl Container {
             image.clone(),
             workspace,
             transcript,
-            false,
+            LaunchFacts {
+                net_admin: launch.capabilities.grants_net_admin(),
+                ..LaunchFacts::default()
+            },
         ))
     }
 
@@ -622,6 +665,14 @@ impl Container {
     /// A `podman init` that fails to materialize a PID surfaces later through
     /// the interceptor's pid probe. See [`ContainerCreateOptions`] for what
     /// each input does.
+    ///
+    /// The container logs to a file of outrig's own, which
+    /// [`McpClient::connect_via_podman_start`](crate::McpClient::connect_via_podman_start)
+    /// reads if the attach stream that should carry a failed start's stderr
+    /// comes back empty. That replaces the host's default log driver for this
+    /// container; `podman logs` still works while it runs. Where SELinux is
+    /// enforcing there is no such log, and the container logs as the host
+    /// says.
     pub async fn create_initialized(options: ContainerCreateOptions) -> Result<Self> {
         // As in start_named. The guard matters more here: an `init` that
         // fails, or a future dropped between `create` and `init`, leaves the
@@ -629,12 +680,19 @@ impl Container {
         // `create` that failed on a name collision records no id, so the same
         // guard removes nothing.
         reject_reserved_labels(&options.launch.labels)?;
+        reject_malformed_capabilities(&options.launch.capabilities)?;
         let reserved = NameGuard::reserve(&options.name);
 
+        let selinux = selinux_enforcing().await;
+        // Not on an SELinux host: conmon writing to a path outrig picked is
+        // unchecked there, and a log it could not open fails the `podman init`
+        // -- a worse outcome than a start that reports what it always did.
+        let ctr_log = if selinux { None } else { CtrLog::create() };
         let create = build_podman_create_cmd(
             &options,
-            selinux_enforcing().await,
+            selinux,
             &reserved.attempt_label(),
+            ctr_log.as_ref().map(CtrLog::path),
         );
         // The create's own output carries the engine's id for what it made,
         // which is the only name for this container that cannot later mean
@@ -645,7 +703,7 @@ impl Container {
         // is released: a container this cannot name is not one to go on with.
         let id = engine_id(&created.stdout)
             .ok_or_else(|| unidentified_container(&options.name, &created.stdout))?;
-        let init = Cmd::new("podman").arg("init").arg(&options.name);
+        let init = Cmd::new("podman").arg("init").arg(id.as_str());
         process::run_capture_logged(init, "podman", options.transcript.as_ref()).await?;
 
         let workspace = match &options.launch.workspace {
@@ -653,7 +711,7 @@ impl Container {
             None => (PathBuf::new(), PathBuf::new()),
         };
         let attempt = reserved.release();
-        Ok(Self::handle(
+        let mut container = Self::handle(
             EngineIdentity::Owned {
                 name: options.name,
                 attempt,
@@ -662,8 +720,20 @@ impl Container {
             options.image,
             workspace,
             options.transcript,
-            options.intercept_dns,
-        ))
+            LaunchFacts {
+                dns_preconfigured: options.intercept_dns,
+                net_admin: options.launch.capabilities.grants_net_admin(),
+            },
+        );
+        container.ctr_log = ctr_log;
+        Ok(container)
+    }
+
+    /// The file [`Container::create_initialized`] had this container's log
+    /// written to, if it made one: where its stderr can still be read when the
+    /// attach stream did not carry it.
+    pub(crate) fn ctr_log_path(&self) -> Option<&Path> {
+        self.ctr_log.as_ref().map(CtrLog::path)
     }
 
     /// Build a handle for an already-running container that outrig does not
@@ -684,7 +754,7 @@ impl Container {
             image_tag,
             workspace,
             transcript,
-            false,
+            LaunchFacts::default(),
         )
     }
 
@@ -695,7 +765,10 @@ impl Container {
         image_tag: ImageTag,
         (host_workspace, container_workspace): (PathBuf, PathBuf),
         transcript: Option<Transcript>,
-        dns_preconfigured: bool,
+        LaunchFacts {
+            dns_preconfigured,
+            net_admin,
+        }: LaunchFacts,
     ) -> Self {
         let (name, attempt, id, ownership) = match engine {
             EngineIdentity::Owned { name, attempt, id } => {
@@ -715,8 +788,10 @@ impl Container {
             transcript,
             ownership,
             dns_preconfigured,
+            net_admin,
             pid: OnceCell::new(),
             id,
+            ctr_log: None,
             #[cfg(test)]
             engine_override: Vec::new(),
             #[cfg(test)]
@@ -753,7 +828,7 @@ impl Container {
             ImageTag::new("outrig-test-unstoppable"),
             (PathBuf::new(), PathBuf::new()),
             None,
-            false,
+            LaunchFacts::default(),
         );
         container.engine_override = vec![("stop", Cmd::new("/bin/false"))];
         container
@@ -771,8 +846,18 @@ impl Container {
             ImageTag::new("outrig-test-borrowed"),
             (PathBuf::new(), PathBuf::new()),
             None,
-            false,
+            LaunchFacts::default(),
         )
+    }
+
+    /// A handle that says it was launched holding `CAP_NET_ADMIN`, for tests
+    /// of what the network interceptor does with one. Nothing is run against
+    /// it: the refusal comes before the interceptor reads the container.
+    #[cfg(test)]
+    pub(crate) fn holding_net_admin() -> Self {
+        let mut container = Self::stops_cleanly();
+        container.net_admin = true;
+        container
     }
 
     /// Inspect an existing podman container by name. This is intentionally
@@ -808,6 +893,27 @@ impl Container {
         &self.name
     }
 
+    /// What to hand podman to address this container: the engine's id for one
+    /// outrig created, which is never granted to another container, else the
+    /// name. Fits anywhere podman takes a container, such as
+    /// `--userns=container:<selector>`. Prefer it to [`name`](Self::name) for
+    /// anything that acts on the container, since a name can be granted again
+    /// once the container is gone.
+    ///
+    /// Podman looks a selector up as a name too, so this is not proof of
+    /// identity: another container *named* with this id would answer to it.
+    /// Reads that need that proof, such as the PID, check the id podman
+    /// reports back.
+    pub fn selector(&self) -> &str {
+        self.id.as_ref().map_or(&*self.name, ContainerId::as_str)
+    }
+
+    fn inspect_cmd(&self, format: &str) -> Cmd {
+        Cmd::new("podman")
+            .args(["inspect", "--format", format])
+            .arg(self.selector())
+    }
+
     /// The container's init PID via `podman inspect --format {{.State.Pid}}`.
     /// Errors when the container is not running (`State.Pid == 0`): a created
     /// but unstarted container has no namespaces to join or intercept. Shared
@@ -824,21 +930,21 @@ impl Container {
     }
 
     async fn inspect_pid(&self) -> Result<u32> {
-        let output = process::run_capture_logged(
-            Cmd::new("podman")
-                .args(["inspect", "--format", "{{.State.Pid}}"])
-                .arg(&self.name),
-            "podman",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let pid = text.trim().parse::<u32>().map_err(|e| {
+        let text = self
+            .inspect_format("{{.State.Pid}} {{.State.ConmonPid}}")
+            .await?;
+        let invalid = |what: &str, e: std::num::ParseIntError| {
             OutrigError::Configuration(format!(
-                "podman inspect {} returned invalid pid: {e}",
+                "podman inspect {} returned invalid {what}: {e}",
                 self.name
             ))
-        })?;
+        };
+        let mut fields = text.split_whitespace();
+        let pid = fields
+            .next()
+            .unwrap_or("")
+            .parse::<u32>()
+            .map_err(|e| invalid("pid", e))?;
         if pid == 0 {
             return Err(OutrigError::Configuration(format!(
                 "container {:?} has no running namespaces (not running, and not \
@@ -846,13 +952,73 @@ impl Container {
                 self.name
             )));
         }
+        let conmon = fields
+            .next()
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|e| invalid("conmon pid", e))?;
+        // The PID is in the engine's namespace; everything downstream reads it
+        // through this machine's `/proc`. Only a container's init is a child of
+        // its conmon, so that parentage -- not `ServiceIsRemote`, which is true
+        // of a working same-host socket too -- says the number means the same
+        // process on both sides.
+        let parent = std::fs::read(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parent_pid_from_stat(&stat));
+        if conmon == 0 || parent != Some(conmon) {
+            return Err(OutrigError::ContainerPidNotLocal {
+                container: self.name.clone(),
+                pid,
+            });
+        }
         Ok(pid)
+    }
+
+    /// Whether podman networks the container with pasta, rootless podman 5's
+    /// default (4's is `slirp4netns`; rootful is `bridge`). Read from podman's
+    /// own state, so nothing inside the container can change the answer, and it
+    /// reads the same before `podman start` as after.
+    pub(crate) async fn uses_pasta(&self) -> Result<bool> {
+        Ok(self.inspect_format("{{.HostConfig.NetworkMode}}").await? == "pasta")
+    }
+
+    /// `podman inspect --format <format>` of this container, trimmed.
+    ///
+    /// Podman resolves a selector as a name as well as an id, so an owned
+    /// handle also reads back the id of what answered and refuses a different
+    /// one: a container named with this one's full id is not this container.
+    async fn inspect_format(&self, format: &str) -> Result<String> {
+        let output = process::run_capture_logged(
+            self.inspect_cmd(&format!("{{{{.Id}}}} {format}")),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (answered, rest) = text.trim().split_once(' ').unwrap_or((text.trim(), ""));
+        if let Some(id) = &self.id
+            && answered != id.as_str()
+        {
+            return Err(OutrigError::Configuration(format!(
+                "podman inspect {} answered for container {answered}, not the {} this handle \
+                 created",
+                self.name,
+                id.as_str()
+            )));
+        }
+        Ok(rest.trim().to_string())
     }
 
     /// Whether the interceptor's resolver was baked in at create time; see
     /// the field doc.
     pub(crate) fn dns_preconfigured(&self) -> bool {
         self.dns_preconfigured
+    }
+
+    /// Whether the container was launched holding `CAP_NET_ADMIN`; see the
+    /// field doc.
+    pub(crate) fn holds_net_admin(&self) -> bool {
+        self.net_admin
     }
 
     pub fn image_tag(&self) -> &ImageTag {
@@ -928,7 +1094,7 @@ impl Container {
 
         let pid = self.pid().await?;
         let db = namespace::open_user_db(pid)
-            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
+            .map_err(|e| self.bootstrap_failed(e.step.label_for(pid), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
@@ -949,8 +1115,9 @@ impl Container {
             ));
         }
         let home = userdb::home_dir(&user_name);
-        namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.io()))?;
+        namespace::create_home(pid, Path::new(&home), self.uid, self.gid).map_err(|e| {
+            self.bootstrap_failed(format!("{} ({home})", e.step.label_for(pid)), e.source)
+        })?;
         self.reconcile_home(&db, &home).await?;
 
         self.log_bootstrap(&format!(
@@ -1088,7 +1255,7 @@ impl Container {
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
         }
-        c = c.arg(&self.name);
+        c = c.arg(self.selector());
         for arg in cmd {
             c = c.arg(arg);
         }
@@ -1129,6 +1296,10 @@ impl Container {
     /// process it started: that runs in the container under conmon and
     /// survives its client. Stopping the workload means stopping the
     /// container.
+    ///
+    /// The client joins the caller's process group, so a terminal's Ctrl-C
+    /// reaches it as well as the caller, and podman's client exits on it.
+    /// Only [`crate::McpClient`]'s transports are spawned out of it.
     pub async fn exec_stdio(&self, cmd: &[String], options: &ExecOptions) -> Result<Child> {
         process::spawn_stdio(self.build_exec_argv(cmd, options)).await
     }
@@ -1154,10 +1325,19 @@ impl Container {
     /// ran, and what it made of its arguments is the caller's to judge. A
     /// working directory the container does not have lands here too: podman
     /// exits non-zero and names the path on stderr.
+    ///
+    /// Its stdin is empty -- it reads end-of-file at once -- so a command that
+    /// needs input goes through [`Self::exec_stdio`].
     pub async fn exec_capture(&self, cmd: &[String], options: &ExecOptions) -> Result<Output> {
         process::try_capture(self.build_exec_argv(cmd, options)).await
     }
 
+    /// Stops the container, waiting up to `grace` for its PID 1 to exit on
+    /// SIGTERM before podman kills it.
+    ///
+    /// A container from [`Self::start`] runs `sleep infinity` as PID 1 and
+    /// is created with `--stop-signal=SIGKILL`, so it is killed at once and
+    /// `grace` is never spent on it.
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
         self.stop_inner(grace).await
     }
@@ -1178,7 +1358,7 @@ impl Container {
         Cmd::new("podman")
             .args(["stop", "--ignore", "-t"])
             .arg(secs)
-            .arg(self.id.as_ref().map_or(&*self.name, ContainerId::as_str))
+            .arg(self.selector())
     }
 
     /// The command to actually run for `real`. Itself outside tests.
@@ -1352,7 +1532,7 @@ impl Drop for Container {
 /// between the name being chosen and a [`Container`] existing to own it.
 ///
 /// [`Drop`] for `Container` cannot cover that window -- there is no
-/// `Container` yet -- and the panic hook only fires on a panic, so a cancelled
+/// `Container` yet -- and the panic sweep only runs on a panic, so a cancelled
 /// or failed create used to leave the name in `TRACKED` forever and, if podman
 /// had already made the container, the container running with nothing that
 /// would remove it.
@@ -1402,7 +1582,7 @@ struct NameGuard {
 
 impl NameGuard {
     /// Reserve `name`, registering the obligation this attempt now owes so the
-    /// panic hook can discharge it too.
+    /// panic sweep can discharge it too.
     ///
     /// The guard keeps no copy of `name`. It is recorded against the token for
     /// [`is_tracked`] and diagnostics, and the guard cannot reach it -- so
@@ -1444,7 +1624,7 @@ impl Drop for NameGuard {
         }
         // Detached first, discharged second, never the reverse: a panic landing
         // between the two has to find the obligation still registered, so the
-        // hook re-issues a removal rather than finding nothing owed.
+        // sweep re-issues a removal rather than finding nothing owed.
         removal_by_attempt(&self.attempt).detach();
         discharge(&self.attempt);
     }
@@ -1528,6 +1708,17 @@ fn classify_engine_call(cmd: &Cmd, outcome: Result<Output>) -> EngineOutcome {
         // container is gone.
         Err(e) => EngineOutcome::Failed(e),
     }
+}
+
+/// What the launch that made a [`Container`] established about it, for the
+/// facts a handle cannot learn later. A borrowed handle has none, which is
+/// why the default is every flag `false`.
+#[derive(Clone, Copy, Default)]
+struct LaunchFacts {
+    /// The interceptor's resolver was baked in at `podman create`.
+    dns_preconfigured: bool,
+    /// The launch flags leave the container holding `CAP_NET_ADMIN`.
+    net_admin: bool,
 }
 
 /// Everything podman knows one container by, in the two shapes there are.
@@ -1630,6 +1821,45 @@ fn reject_reserved_labels(labels: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
+/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
+/// single name.
+///
+/// Flag lowering and [`ContainerCapabilities::grants_net_admin`] both go
+/// through this, so podman is handed the name the classifier compares and the
+/// two cannot read one entry differently.
+fn canonical_capability_name(entry: &str) -> Option<String> {
+    normalize_capability_name(&entry.to_ascii_uppercase())
+}
+
+/// Reject a `cap-add` or `cap-drop` entry that is not one capability name.
+///
+/// podman reads each `--cap-add`/`--cap-drop` value as a CSV list: it would
+/// take `SYS_ADMIN,NET_ADMIN` as two capabilities and `"NET_ADMIN"` as one
+/// with its quotes removed. Config validation already allows only a name, and
+/// a hand-built spec is held to the same, so that
+/// [`ContainerCapabilities::grants_net_admin`] reads what podman is given
+/// instead of re-implementing its parser -- a spelling it misread would leave
+/// a container holding `CAP_NET_ADMIN` under network interception. Case and a
+/// `CAP_` prefix stay allowed, since podman accepts both.
+fn reject_malformed_capabilities(capabilities: &ContainerCapabilities) -> Result<()> {
+    let lists = [
+        ("cap-drop", &capabilities.cap_drop),
+        ("cap-add", &capabilities.cap_add),
+    ];
+    for (field, entries) in lists {
+        for entry in entries {
+            if canonical_capability_name(entry).is_none() {
+                return Err(OutrigError::Configuration(format!(
+                    "`{field}` entry {entry:?} is not a capability name: write one name per \
+                     entry, such as \"NET_RAW\" or \"CAP_NET_RAW\""
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A value no other container on the machine carries, so a removal scoped to
 /// it cannot reach anything this process did not ask for.
 fn attempt_token() -> String {
@@ -1668,14 +1898,6 @@ pub fn force_remove_detached(name: &str) {
     );
 }
 
-/// How long podman lets `sleep infinity` -- PID 1 of every container started
-/// with `podman run` here -- ignore `SIGTERM` before `SIGKILL`, when a stop
-/// names no grace of its own: a cleanup guard's `podman rm -f`, or the panic
-/// sweep. `sleep` as PID 1 ignores `SIGTERM`, so podman's default of ten
-/// seconds is always waited out in full; this is the two seconds the orderly
-/// stop passes explicitly.
-const STOP_TIMEOUT_SECS: &str = "2";
-
 fn build_podman_run_cmd(
     image: &ImageTag,
     name: &str,
@@ -1684,9 +1906,14 @@ fn build_podman_run_cmd(
     attempt_label: &str,
 ) -> Cmd {
     let cmd = Cmd::new("podman")
-        .args(["run", "-d", "--rm", "--name"])
-        .arg(name)
-        .args(["--stop-timeout", STOP_TIMEOUT_SECS]);
+        .args(["run", "-d", "--rm"])
+        // PID 1 is `sleep infinity`, which installs no SIGTERM handler, so the
+        // kernel discards the default stop signal and every stop would wait
+        // out its whole grace (and `rm -f` podman's 10 s) before the SIGKILL
+        // that ends it regardless.
+        .arg("--stop-signal=SIGKILL")
+        .args(["--name"])
+        .arg(name);
     // After the caller's labels, so podman's last-wins parsing cannot let one
     // of theirs displace the value cleanup removes by.
     append_launch_flags(cmd, launch, selinux)
@@ -1707,10 +1934,17 @@ fn build_podman_run_cmd(
 /// exec-form ENTRYPOINT and *replaces* CMD, so it is for images whose server
 /// is an ENTRYPOINT. Empty `args` emits nothing, leaving the argument vector
 /// byte-identical to the pre-`args` one.
+///
+/// `ctr_log` is the file conmon writes the container's output to: the driver
+/// is pinned to a file log, because the host's default is often `journald`,
+/// which outrig cannot read back, and the file is named, because podman's own
+/// is out of reach. See [`CtrLog`]. Without one the container logs as the host
+/// says, and the argument vector is the one it was before.
 fn build_podman_create_cmd(
     options: &ContainerCreateOptions,
     selinux: bool,
     attempt_label: &str,
+    ctr_log: Option<&Path>,
 ) -> Cmd {
     let mut cmd = Cmd::new("podman")
         .args(["create", "--name"])
@@ -1733,16 +1967,35 @@ fn build_podman_create_cmd(
     cmd = engine_env::push_resolved(cmd, "--env", &options.env);
 
     // After the caller's labels; see `build_podman_run_cmd`.
-    cmd.arg("--label")
+    cmd = cmd
+        .arg("--label")
         .arg(attempt_label)
-        .args(["--interactive", "--rm"])
-        .arg(options.image.as_str())
-        .args(&options.args)
+        .args(["--interactive", "--rm"]);
+    if let Some(path) = ctr_log {
+        // The host's `log_tag` must stay off this container: conmon exits on a
+        // tag with a file log, so a host that sets one would fail every `podman
+        // init`, and podman 6 refuses the create (a tag is for `journald`
+        // alone). Neither of the first two flags is enough on every podman, so
+        // both are given. `json-file`, podman's documented alias for `k8s-file`
+        // (conmon is handed `k8s-file:<path>` either way), is spared the host's
+        // tag through podman 5.8, which `k8s-file` is not, but podman 6 spares
+        // no driver. An empty `tag` counts as one already given from podman
+        // 5.5.1, but before that the host's tag replaces it. The cap bounds a
+        // chatty server's stdout, which the log holds too, and is far above
+        // what a startup writes.
+        cmd = cmd
+            .arg("--log-driver=json-file")
+            .arg("--log-opt=tag=")
+            .arg("--log-opt=max-size=1mb")
+            .arg(format!("--log-opt=path={}", path.display()));
+    }
+    cmd.arg(options.image.as_str()).args(&options.args)
 }
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
 /// extra bind mounts, keep-id, workspace workdir, capability policy, device
-/// passthrough, the hardening tail, and `--image-volume=ignore`.
+/// passthrough, the hardening tail, `--http-proxy=false`, and
+/// `--image-volume=ignore`.
 /// `--security-opt=no-new-privileges` is part of that tail only when the
 /// launch spec keeps it, and each `unmask` entry follows it as a second
 /// `--security-opt`.
@@ -1812,6 +2065,12 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     if launch.primary_view.is_some() {
         cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
     }
+    // podman copies the client's `http_proxy`, `https_proxy`, `ftp_proxy`,
+    // `no_proxy` and their uppercase forms into the container unless told not
+    // to, and the client inherits outrig's environment -- so a proxy URL's
+    // `user:password@` was readable by everything the agent ran (#455). A
+    // container gets a proxy only from an `env` entry that names it.
+    cmd = cmd.arg("--http-proxy=false");
     // No volume for the image's `VOLUME`s: the path keeps what the image's
     // layers put there, and a write to it lands in the container's own layer,
     // which `--rm` removes with it. An anonymous volume is not removed with
@@ -1835,17 +2094,15 @@ fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -
         }
     }
 
+    // The same name `grants_net_admin` compares. A launch refuses an entry
+    // that has none ([`reject_malformed_capabilities`]), so the raw entry is
+    // only what a caller bypassing that check would have sent anyway.
+    let flag_value = |entry: &String| canonical_capability_name(entry).unwrap_or(entry.clone());
     for capability in &capabilities.cap_drop {
-        cmd = cmd.arg(format!(
-            "--cap-drop={}",
-            capability_name_without_prefix(capability)
-        ));
+        cmd = cmd.arg(format!("--cap-drop={}", flag_value(capability)));
     }
     for capability in &capabilities.cap_add {
-        cmd = cmd.arg(format!(
-            "--cap-add={}",
-            capability_name_without_prefix(capability)
-        ));
+        cmd = cmd.arg(format!("--cap-add={}", flag_value(capability)));
     }
 
     cmd
@@ -1874,21 +2131,20 @@ fn append_bind_mount(
 /// Every removal the panic sweep would issue right now, one per outstanding
 /// obligation and each scoped to the attempt that owes it.
 ///
-/// Separate from the hook for two reasons, the second of which is the one that
-/// was a defect. It lets the sweep be asserted on without a process panic. And
-/// it builds the commands under the lock and spawns them outside it: the hook
-/// used to `Command::spawn` -- and, through [`crate::supervise`], possibly start
-/// a thread -- while still holding the registry, from a panicking thread.
+/// Separate from the sweep for two reasons, the second of which is the one
+/// that was a defect. It lets the sweep be asserted on without a process
+/// panic. And it builds the commands under the lock and spawns them outside
+/// it: the hook used to `Command::spawn` -- and, through [`crate::supervise`],
+/// possibly start a thread -- while still holding the registry, from a
+/// panicking thread.
 ///
-/// `try_lock` rather than `lock`, because a hook runs at the panic site before
-/// unwinding: a thread that panics while holding the registry would re-lock a
-/// non-reentrant mutex on itself and hang there, and a forked child
-/// ([`crate::nsfork`]) inherits a lock held by a thread it does not have. A
-/// sweep that gives up is a leak; one that deadlocks is a process that never
-/// reports the panic at all.
+/// `try_lock` rather than `lock`. The hook runs at the panic site before
+/// unwinding, so a thread that panics while holding the registry would re-lock
+/// a non-reentrant mutex on itself and hang there. A sweep that gives up is a
+/// leak; one that deadlocks is a process that never finishes dying.
 ///
 /// A registry that will not come free is left alone. Giving up costs a sweep;
-/// waiting would cost the panic report itself.
+/// waiting would cost the panic report, or the exit, itself.
 fn pending_removals() -> Vec<Removal> {
     match TRACKED.try_lock() {
         Ok(guard) => removals_for(&guard),
@@ -1899,7 +2155,7 @@ fn pending_removals() -> Vec<Removal> {
 
 /// The removals `tracked` owes. Pure, and separate from acquiring the lock, so
 /// a caller that can afford to wait for the registry does not have to inherit
-/// the hook's refusal to.
+/// the sweep's refusal to.
 fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
     tracked
         .keys()
@@ -1907,21 +2163,140 @@ fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
         .collect()
 }
 
-/// Install a process-wide panic hook that replays every outstanding attempt's
-/// label-scoped removal before delegating to the previous hook. Idempotent --
-/// safe to call from multiple `main`s or test setups.
+/// The panic sweep: detach every removal still owed. What both of its
+/// triggers run.
+fn sweep() {
+    for removal in pending_removals() {
+        removal.detach();
+    }
+}
+
+/// `sweep`, armed for the calling process and no other (#272). A forked child
+/// ([`crate::nsfork`]) inherits the registry and every trigger armed before its
+/// fork, but the containers are its parent's: a sweep from the child would
+/// remove them all out from under the parent. The pid is taken here, when the
+/// trigger is armed, and compared when it fires; `getpid` is async-signal-safe,
+/// so that is as safe to ask in a child that has just panicked as anywhere.
+///
+/// `sweep` is supplied, as it is to [`on_unwind`], so a test can watch for it
+/// without spawning `podman`.
+fn arm(sweep: impl Fn()) -> impl Fn() {
+    let owner = std::process::id();
+    move || {
+        if std::process::id() == owner {
+            sweep();
+        }
+    }
+}
+
+/// Run `f`, and if a panic unwinds out of it, replay every outstanding
+/// attempt's label-scoped removal before letting the panic carry on.
+///
+/// This is the panic sweep for an ordinary, unwinding build, and it belongs
+/// around `main`'s body. It sweeps for a panic that is ending the process and
+/// for no other, which only a frame this far out can tell.
+///
+/// The panic site cannot. The sweep used to run from a panic hook, which runs
+/// where the panic is raised, before anything has had the chance to catch it
+/// -- so a panic tokio's task harness would contain, in a subagent round, an
+/// MCP service, or a watcher, removed every container of a session that then
+/// carried on without them (#349). No test made at the panic site fixes that.
+/// A `current_thread` runtime polls its tasks on the thread that drives it, so
+/// "the main thread" includes them; and "outside any task" misses a task's
+/// panic that its caller re-raises with [`std::panic::resume_unwind`], which
+/// ends the process without calling a hook at all.
+///
+/// A panic that has left `f` is one nothing inside `f` caught, and by the time
+/// it arrives the unwind has dropped everything `f` owned: every [`Container`]
+/// on the way out and, if `f` held the runtime, every task's future with it.
+/// Each of those has already detached its own removal and discharged its
+/// obligation. What the sweep finds is what `Drop` could not reach -- a handle
+/// another thread owns, or one that was leaked.
+///
+/// The panic is resumed rather than raised again, so the hook does not run a
+/// second time and the report and exit status are the ones the panic already
+/// had. The sweep runs after the catch, not from a guard's `Drop` during the
+/// unwind, so a fault inside it is an ordinary panic rather than an abort.
+///
+/// It sweeps only in the process that called it. A forked child inherits this
+/// frame and the registry, but the containers are its parent's, so a panic that
+/// reaches the sweep there removes nothing.
+///
+/// # Where to put it
+///
+/// Around the outermost frame that can panic: `main`'s body, after
+/// [`install_panic_hook`]. Anything further out that catches a panic makes the
+/// sweep wrong, because it would remove the containers of a process that goes
+/// on.
+///
+/// # What it does not cover
+///
+/// A panic that does not unwind -- every panic in a `panic = "abort"` build,
+/// which [`install_panic_hook`] covers instead, and a panic in a destructor
+/// while another is unwinding, which nothing can.
+///
+/// # Example
+///
+/// ```no_run
+/// fn main() -> std::process::ExitCode {
+///     outrig::container::install_panic_hook();
+///     outrig::container::with_panic_sweep(|| {
+///         // Start containers and run the session.
+///         std::process::ExitCode::SUCCESS
+///     })
+/// }
+/// ```
+pub fn with_panic_sweep<T>(f: impl FnOnce() -> T) -> T {
+    on_unwind(f, arm(sweep))
+}
+
+/// [`with_panic_sweep`] with the sweep supplied, so a test can watch for it
+/// without spawning `podman`.
+fn on_unwind<T>(f: impl FnOnce() -> T, sweep: impl FnOnce()) -> T {
+    // Unwind safety is about state a panic left half-updated being observed
+    // afterwards, and nothing observes it: the payload goes straight back to
+    // unwinding.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            sweep();
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+/// In a `panic = "abort"` build, install a process-wide panic hook that
+/// replays every outstanding attempt's label-scoped removal before delegating
+/// to the previous hook. In an unwinding build, install nothing:
+/// [`with_panic_sweep`] is the sweep there. Idempotent -- safe to call from
+/// multiple `main`s.
+///
+/// The build decides because it is the one thing that settles, at the panic
+/// site, whether a panic ends the process. Under `abort` every panic does and
+/// no destructor runs after it, so a hook is the only layer left that can act,
+/// and it is never wrong to. Under `unwind` a hook cannot know, and acting
+/// anyway is what removed the containers of a session that survived a task's
+/// panic (#349).
+///
+/// The hook sweeps only in the process that installed it, as
+/// [`with_panic_sweep`] does. A forked child inherits the hook, but the
+/// containers are its parent's.
 ///
 /// Not to be installed from a test. It is process-wide and `OnceLock`-guarded,
-/// so one test installing it makes every *other* failing test in that binary
-/// sweep obligations it does not own.
+/// so in an abort build one test installing it makes every *other* failing
+/// test in that binary sweep obligations it does not own.
 pub fn install_panic_hook() {
+    // `cfg!` rather than `#[cfg]`, so the hook is still compiled and linted in
+    // the unwinding builds that never install it.
+    if !cfg!(panic = "abort") {
+        return;
+    }
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
+        let armed = arm(sweep);
         std::panic::set_hook(Box::new(move |info| {
-            for removal in pending_removals() {
-                removal.detach();
-            }
+            armed();
             prev(info);
         }));
     });
@@ -2036,10 +2411,46 @@ async fn selinux_enforcing() -> bool {
     }
 }
 
+/// The parent PID in the bytes of a `/proc/<pid>/stat`. `comm`, the second
+/// field, is the kernel's raw task name -- free bytes that may hold spaces,
+/// `)`, or a multibyte character cut mid-sequence by the 15-byte limit -- so
+/// the fields after it are found from the last `)` without decoding it.
+fn parent_pid_from_stat(stat: &[u8]) -> Option<u32> {
+    let after_comm = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
+    std::str::from_utf8(after_comm)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::EnvValue;
+
+    #[test]
+    fn parent_pid_is_read_past_a_comm_with_parens_and_spaces() {
+        assert_eq!(
+            parent_pid_from_stat(b"1775180 (sleep) S 1775165 1 1 0"),
+            Some(1775165)
+        );
+        assert_eq!(parent_pid_from_stat(b"42 (a b) c) S 7 1 1 0"), Some(7));
+        assert_eq!(parent_pid_from_stat(b"42 (x) S"), None);
+        assert_eq!(parent_pid_from_stat(b"no parens"), None);
+    }
+
+    #[test]
+    fn parent_pid_is_read_past_a_comm_that_is_not_utf8() {
+        // A multibyte name truncated to the kernel's 15 bytes ends mid-character.
+        let mut stat = b"42 (".to_vec();
+        stat.extend_from_slice(&[b'a'; 13]);
+        stat.extend_from_slice(&"é".as_bytes()[..1]);
+        stat.extend_from_slice(b") S 7 1 1 0");
+        assert!(std::str::from_utf8(&stat).is_err());
+        assert_eq!(parent_pid_from_stat(&stat), Some(7));
+    }
 
     /// The stop names the container the engine made, not the name it was
     /// asked for. A handle kept for a retry -- which is what a failed stop
@@ -2069,6 +2480,41 @@ mod tests {
         // stop either, since stopping one is a no-op it returns early from.
         let borrowed = Container::stops_cleanly();
         assert_eq!(borrowed.id, None);
+    }
+
+    /// Every verb that acts on the container names the id, for the reason the
+    /// stop does: a handle that outlives its container must reach nothing
+    /// rather than whatever is granted the name next.
+    #[test]
+    fn exec_and_inspect_name_the_id_for_an_owned_handle_and_the_name_for_a_borrowed_one() {
+        let id = "2f8b1c0d".repeat(8);
+        let mut owned = Container::unstoppable();
+        owned.name = "outrig-a-name-that-can-come-round-again".to_string();
+        owned.id = engine_id(id.as_bytes());
+        owned.user_name = Some("tester".to_string());
+
+        assert_eq!(owned.selector(), id);
+        for argv in [
+            owned.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
+            owned.inspect_cmd("{{.State.Pid}}"),
+        ] {
+            let asked = argv.render();
+            assert!(asked.contains(&id), "must name the engine's id: {asked}");
+            assert!(
+                !asked.contains("come-round-again"),
+                "and not a name that can come round again: {asked}"
+            );
+        }
+
+        let mut borrowed = Container::stops_cleanly();
+        borrowed.user_name = Some("tester".to_string());
+        assert_eq!(borrowed.selector(), "outrig-test-borrowed");
+        for argv in [
+            borrowed.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
+            borrowed.inspect_cmd("{{.State.Pid}}"),
+        ] {
+            assert!(argv.render().contains("outrig-test-borrowed"));
+        }
     }
 
     /// An id is what podman prints for a `create`, and nothing else counts as
@@ -2324,12 +2770,12 @@ mod tests {
     /// Every removal the panic sweep would issue right now, as
     /// `(argv, reissue)`.
     fn swept() -> Vec<(Vec<String>, Reissue)> {
-        // Through the blocking lock, not the hook's `try_lock`. A test that
+        // Through the blocking lock, not the sweep's `try_lock`. A test that
         // used `pending_removals` would read "another test is holding the
         // registry" as "nothing is owed" and fail at random in a parallel
-        // binary; the hook declines to wait because a panic hook must not, and
-        // a test has no such constraint. What is under test is the mapping,
-        // and `removals_for` is exactly that half.
+        // binary; the sweep declines to wait because a dying process must not,
+        // and a test has no such constraint. What is under test is the
+        // mapping, and `removals_for` is exactly that half.
         removals_for(&tracked())
             .into_iter()
             .map(|removal| (argv(removal.cmd), removal.reissue))
@@ -2518,6 +2964,128 @@ mod tests {
         }
     }
 
+    /// Run `f` under the panic sweep's trigger, with a sweep that only records
+    /// that it ran: whether it did, and what `f` returned or unwound with.
+    fn under_the_sweep<T>(f: impl FnOnce() -> T) -> (bool, std::thread::Result<T>) {
+        let fired = std::cell::Cell::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_unwind(f, || fired.set(true))
+        }));
+        (fired.get(), outcome)
+    }
+
+    /// The runtime shape of the CLI's: tasks are polled on the thread that
+    /// drives the session.
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime builds")
+    }
+
+    /// A task that panics, as a subagent round, an MCP service, or a model
+    /// load can. Spawned onto the runtime the caller is inside.
+    fn panicking_task(message: &'static str) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { panic!("{message}") })
+    }
+
+    /// A panic nothing inside the closure caught is ending the process, so it
+    /// is swept -- and still reaches whatever is further out, intact.
+    #[test]
+    fn a_panic_that_leaves_the_closure_sweeps_and_keeps_unwinding() {
+        let (fired, outcome) = under_the_sweep::<()>(|| panic!("the session is over"));
+
+        assert!(
+            fired,
+            "a panic out of `main`'s body is the one to sweep for"
+        );
+        let payload = outcome.expect_err("the panic must carry on past the sweep");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the session is over"),
+            "the panic must arrive as it was raised"
+        );
+    }
+
+    /// #349. A panic tokio's task harness contains is one the session goes on
+    /// from, so it must not take the session's containers with it -- even on a
+    /// `current_thread` runtime, where it is raised on the very thread that
+    /// drives the session. The hook this replaced swept here.
+    #[test]
+    fn a_panic_a_task_catches_sweeps_nothing() {
+        let (fired, outcome) = under_the_sweep(|| {
+            current_thread_runtime()
+                .block_on(async { panicking_task("a subagent round failed").await })
+        });
+
+        assert!(!fired, "a task's panic is not the process's");
+        let joined = outcome.expect("the closure returned");
+        assert!(joined.expect_err("the task panicked").is_panic());
+    }
+
+    /// A task's panic its caller hands on with `resume_unwind`, as the CLI's
+    /// model registry does, ends the process without calling a panic hook a
+    /// second time. That is why the sweep is not decided at the panic site: a
+    /// hook that let the task's panic go -- rightly -- would never have seen
+    /// this one.
+    #[test]
+    fn a_task_panic_its_caller_re_raises_sweeps() {
+        let (fired, outcome) = under_the_sweep(|| {
+            current_thread_runtime().block_on(async {
+                if let Err(e) = panicking_task("a model load failed").await {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+            })
+        });
+
+        assert!(fired, "a re-raised panic that leaves the closure is fatal");
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn a_panic_caught_inside_the_closure_sweeps_nothing() {
+        let (fired, outcome) = under_the_sweep(|| {
+            std::panic::catch_unwind::<_, ()>(|| panic!("recovered from")).is_err()
+        });
+
+        assert!(!fired, "a panic the closure recovered from is not fatal");
+        assert_eq!(outcome.ok(), Some(true));
+    }
+
+    #[test]
+    fn a_closure_that_returns_sweeps_nothing_and_hands_back_its_value() {
+        let (fired, outcome) = under_the_sweep(|| 42);
+
+        assert!(!fired);
+        assert_eq!(outcome.ok(), Some(42));
+    }
+
+    /// #272. A forked child inherits the registry and every trigger armed
+    /// before its fork, so a sweep it ran would remove the containers of the
+    /// parent that is waiting on it. The child reports whether the armed sweep
+    /// fired in it.
+    #[test]
+    fn a_forked_child_never_sweeps() {
+        use crate::nsfork::{Status, fork_collect, send_failure};
+
+        let fired = std::cell::Cell::new(false);
+        let armed = arm(|| fired.set(true));
+
+        armed();
+        assert!(fired.get(), "the process that armed the sweep runs it");
+
+        fired.set(false);
+        let (reply, _) = fork_collect(|sock| {
+            armed();
+            send_failure(sock, u32::from(fired.get()), 0);
+        })
+        .expect("fork_collect");
+        assert_eq!(
+            reply,
+            Status::OK,
+            "a forked child swept its parent's obligations"
+        );
+    }
+
     #[test]
     fn podman_run_args_include_workspace_then_extra_mounts() {
         let launch = ContainerLaunchSpec {
@@ -2560,10 +3128,9 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "-v",
                 "/host/repo:/workspace:rw",
                 "-v",
@@ -2574,6 +3141,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2620,10 +3188,9 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-20260711T000000-abcd-tools",
-                "--stop-timeout",
-                "2",
                 "--label",
                 "org.outrig.session=20260711T000000-abcd",
                 "--label",
@@ -2634,6 +3201,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2675,14 +3243,14 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "-v",
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2773,6 +3341,7 @@ mod tests {
             .with_intercept_dns(true),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -2789,6 +3358,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--dns",
@@ -2818,6 +3388,7 @@ mod tests {
             ),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -2829,6 +3400,7 @@ mod tests {
                 "outrig-test-fetch",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -2837,6 +3409,80 @@ mod tests {
                 "--rm",
                 "local:test",
             ]
+        );
+    }
+
+    /// Both launch paths turn off podman's proxy forwarding; see
+    /// `append_launch_flags` (#455).
+    #[test]
+    fn no_container_takes_the_host_proxy() {
+        let image = ImageTag::new("local:test");
+        let run = argv(build_podman_run_cmd(
+            &image,
+            "outrig-test",
+            &ContainerLaunchSpec::default(),
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
+        let create = argv(build_podman_create_cmd(
+            &ContainerCreateOptions::new(image, ContainerLaunchSpec::default(), "outrig-test"),
+            false,
+            "org.outrig.attempt=testtoken",
+            None,
+        ));
+        for (path, args) in [("run", run), ("create", create)] {
+            assert!(
+                args.iter().any(|a| a == "--http-proxy=false"),
+                "`podman {path}` would copy the host's proxy into the container: {args:?}"
+            );
+        }
+    }
+
+    /// The container log is named on the command line, and every piece of it
+    /// goes before the image ref, where podman reads flags. The driver is
+    /// pinned and the size capped, because the host's default driver is not
+    /// one outrig can read back. A host `log_tag`, which conmon refuses with a
+    /// file log, is kept off by two flags: the `json-file` driver, which older
+    /// podmans spare it, and an empty `tag`, which podman 6 needs. Without a
+    /// log the argv is the one it was before there was one (#422).
+    #[test]
+    fn a_container_log_is_pinned_to_a_capped_file_before_the_image() {
+        let options = ContainerCreateOptions::new(
+            ImageTag::new("docker.io/mcp/filesystem:latest"),
+            ContainerLaunchSpec::default(),
+            "outrig-test-fs",
+        )
+        .with_args(vec!["/workspace".to_string()]);
+
+        let logged = argv(build_podman_create_cmd(
+            &options,
+            false,
+            "org.outrig.attempt=testtoken",
+            Some(Path::new("/run/user/1000/outrig-ctr-log-a1b2/ctr.log")),
+        ));
+        let rm = logged.iter().position(|arg| arg == "--rm").expect("--rm");
+        assert_eq!(
+            logged[rm + 1..rm + 6],
+            [
+                "--log-driver=json-file",
+                "--log-opt=tag=",
+                "--log-opt=max-size=1mb",
+                "--log-opt=path=/run/user/1000/outrig-ctr-log-a1b2/ctr.log",
+                "docker.io/mcp/filesystem:latest",
+            ],
+            "{logged:?}"
+        );
+        assert_eq!(logged.last().map(String::as_str), Some("/workspace"));
+
+        let unlogged = argv(build_podman_create_cmd(
+            &options,
+            false,
+            "org.outrig.attempt=testtoken",
+            None,
+        ));
+        assert!(
+            unlogged.iter().all(|arg| !arg.starts_with("--log-")),
+            "{unlogged:?}"
         );
     }
 
@@ -2854,6 +3500,7 @@ mod tests {
             .with_args(vec!["/workspace".to_string(), "--read-only".to_string()]),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -2865,6 +3512,7 @@ mod tests {
                 "outrig-test-fs",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--env",
@@ -2922,6 +3570,7 @@ mod tests {
             .with_args(launcher_argv),
             true,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -2941,6 +3590,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--entrypoint",
                 "/outrig-enter",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--env",
@@ -2976,6 +3626,7 @@ mod tests {
             ),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
         assert_eq!(
             args,
@@ -2986,6 +3637,7 @@ mod tests {
                 "outrig-test-noview",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3026,13 +3678,13 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3042,6 +3694,205 @@ mod tests {
                 "infinity",
             ]
         );
+    }
+
+    /// What podman gives a container is what decides, so each row is a
+    /// `--cap-add`/`--cap-drop` spelling measured against podman 5.7 with
+    /// `ip link add` in the container: `NET_ADMIN`, `ALL`, and either one in
+    /// any case or with `CAP_` configure a link; `ALL` less `NET_ADMIN` (even
+    /// beside an explicit `NET_ADMIN` add) and `SYS_ADMIN` do not.
+    #[test]
+    fn grants_net_admin_follows_what_podman_would_hand_the_container() {
+        let caps = |profile, drop: &[&str], add: &[&str]| ContainerCapabilities {
+            profile,
+            cap_drop: drop.iter().map(|c| c.to_string()).collect(),
+            cap_add: add.iter().map(|c| c.to_string()).collect(),
+        };
+        let default = CapabilityProfile::Default;
+
+        for add in [
+            "NET_ADMIN",
+            "CAP_NET_ADMIN",
+            "net_admin",
+            "cap_net_admin",
+            "Cap_Net_Admin",
+            "ALL",
+            "all",
+            // Rendered as `--cap-add=ALL`: the prefix is stripped before
+            // podman sees it, and config validation lets it through.
+            "CAP_ALL",
+        ] {
+            assert!(
+                caps(default, &[], &[add]).grants_net_admin(),
+                "cap-add {add:?} grants it"
+            );
+        }
+        // A profile only drops, and an explicit add is rendered after it.
+        assert!(caps(CapabilityProfile::DropAll, &[], &["NET_ADMIN"]).grants_net_admin());
+        assert!(caps(CapabilityProfile::NoNetRaw, &[], &["ALL"]).grants_net_admin());
+        assert!(caps(default, &["NET_RAW"], &["ALL"]).grants_net_admin());
+
+        // `ALL` is the base the drops come off.
+        assert!(!caps(default, &["NET_ADMIN"], &["ALL"]).grants_net_admin());
+        assert!(!caps(default, &["CAP_NET_ADMIN"], &["all"]).grants_net_admin());
+        // An explicit add beside `ALL` is discarded, not restored over the drop.
+        assert!(!caps(default, &["NET_ADMIN"], &["ALL", "NET_ADMIN"]).grants_net_admin());
+        assert!(!caps(default, &["NET_ADMIN"], &["NET_ADMIN", "ALL"]).grants_net_admin());
+
+        assert!(!ContainerCapabilities::default().grants_net_admin());
+        assert!(!ContainerCapabilities::new(CapabilityProfile::DropAll).grants_net_admin());
+        for add in ["SYS_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "NET_BROADCAST"] {
+            assert!(
+                !caps(default, &[], &[add]).grants_net_admin(),
+                "cap-add {add:?} does not"
+            );
+        }
+        assert!(!caps(default, &["NET_ADMIN"], &[]).grants_net_admin());
+    }
+
+    /// Podman reads a capability flag value as CSV -- measured against 5.7,
+    /// `--cap-add=SYS_ADMIN,NET_ADMIN` grants `NET_ADMIN`, as does a quoted
+    /// `--cap-add='"NET_ADMIN"'`, and a quoted drop takes it off `ALL` -- so
+    /// an entry that is not one name is refused rather than read.
+    #[test]
+    fn a_capability_entry_that_is_not_one_name_is_refused() {
+        let spec = |drop: &[&str], add: &[&str]| ContainerCapabilities {
+            profile: CapabilityProfile::Default,
+            cap_drop: drop.iter().map(|c| c.to_string()).collect(),
+            cap_add: add.iter().map(|c| c.to_string()).collect(),
+        };
+
+        for entry in [
+            "SYS_ADMIN,NET_ADMIN",
+            "NET_RAW,",
+            "\"NET_ADMIN\"",
+            "\"SYS_ADMIN,NET_ADMIN\"",
+            // podman rejects `CAP_CAP_NET_ADMIN` itself; stripping one prefix
+            // on the way out would hand it `CAP_NET_ADMIN`, which it grants.
+            "CAP_CAP_NET_ADMIN",
+            "cap_cap_net_admin",
+            "CAP_CAP_",
+            " NET_ADMIN",
+            "NET_ADMIN ",
+            "NET_ADMIN\n",
+            "NET ADMIN",
+            "NET-ADMIN",
+            "CAP_",
+            "",
+        ] {
+            for (field, capabilities) in [
+                ("cap-add", spec(&[], &[entry])),
+                ("cap-drop", spec(&[entry], &["ALL"])),
+            ] {
+                let error = reject_malformed_capabilities(&capabilities)
+                    .expect_err(&format!("{field} entry {entry:?} is refused"));
+                let OutrigError::Configuration(message) = error else {
+                    panic!("{field} entry {entry:?}: expected Configuration, got {error:?}");
+                };
+                assert!(
+                    message.contains(field) && message.contains(&format!("{entry:?}")),
+                    "names the field and the entry: {message}"
+                );
+            }
+        }
+
+        for entry in [
+            "NET_ADMIN",
+            "CAP_NET_ADMIN",
+            "net_admin",
+            "cap_net_admin",
+            "ALL",
+            "all",
+            "SYS_ADMIN",
+        ] {
+            reject_malformed_capabilities(&spec(&[entry], &[entry]))
+                .unwrap_or_else(|e| panic!("{entry:?} is one name: {e}"));
+        }
+        reject_malformed_capabilities(&ContainerCapabilities::default()).unwrap();
+    }
+
+    /// The classifier and the flags are two readings of the same entry, so
+    /// they must not drift: whatever spelling is accepted, podman is handed
+    /// the one name the classifier compares. `podman_reads` is how podman
+    /// takes a flag value, measured against 5.7: upper-cased, `CAP_` added
+    /// when it is missing, and no `CAP_` stripped or doubled.
+    #[test]
+    fn every_accepted_capability_spelling_reaches_podman_as_the_name_compared() {
+        let podman_reads = |value: &str| {
+            let value = value.to_ascii_uppercase();
+            if value.starts_with("CAP_") {
+                value
+            } else {
+                format!("CAP_{value}")
+            }
+        };
+        for (entry, name) in [
+            ("NET_ADMIN", "NET_ADMIN"),
+            ("CAP_NET_ADMIN", "NET_ADMIN"),
+            ("net_admin", "NET_ADMIN"),
+            ("cap_net_admin", "NET_ADMIN"),
+            ("Cap_Net_Admin", "NET_ADMIN"),
+            ("CAP_Net_Admin", "NET_ADMIN"),
+            ("ALL", "ALL"),
+            ("CAP_ALL", "ALL"),
+            ("all", "ALL"),
+        ] {
+            for (flag, capabilities) in [
+                (
+                    "--cap-add=",
+                    ContainerCapabilities {
+                        cap_add: vec![entry.to_string()],
+                        ..ContainerCapabilities::default()
+                    },
+                ),
+                (
+                    "--cap-drop=",
+                    ContainerCapabilities {
+                        cap_drop: vec![entry.to_string()],
+                        ..ContainerCapabilities::default()
+                    },
+                ),
+            ] {
+                reject_malformed_capabilities(&capabilities)
+                    .unwrap_or_else(|e| panic!("{entry:?} is accepted: {e}"));
+                let args = argv(append_capability_flags(Cmd::new("podman"), &capabilities));
+                let [_, emitted] = args.as_slice() else {
+                    panic!("one flag for {entry:?}: {args:?}");
+                };
+                let value = emitted.strip_prefix(flag).expect("the flag asked for");
+                assert_eq!(
+                    podman_reads(value),
+                    format!("CAP_{name}"),
+                    "{flag}{entry} reaches podman as {name}"
+                );
+            }
+        }
+    }
+
+    /// Neither launch path may reach podman with one: the refusal comes before
+    /// anything is spawned, so this needs no engine.
+    #[tokio::test]
+    async fn both_launch_paths_refuse_a_capability_entry_that_is_not_one_name() {
+        let launch = || ContainerLaunchSpec {
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::Default,
+                cap_drop: Vec::new(),
+                cap_add: vec!["SYS_ADMIN,NET_ADMIN".to_string()],
+            },
+            ..ContainerLaunchSpec::default()
+        };
+        let image = ImageTag::new("outrig-test-never-run");
+
+        let error = Container::start_named(&image, launch(), "outrig-test-never".into(), None)
+            .await
+            .expect_err("start_named refuses it");
+        assert!(matches!(error, OutrigError::Configuration(_)), "{error:?}");
+
+        let options = ContainerCreateOptions::new(image, launch(), "outrig-test-never");
+        let error = Container::create_initialized(options)
+            .await
+            .expect_err("create_initialized refuses it");
+        assert!(matches!(error, OutrigError::Configuration(_)), "{error:?}");
     }
 
     #[test]
@@ -3073,15 +3924,15 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--cap-drop=ALL",
                 "--cap-drop=MKNOD",
                 "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3115,14 +3966,14 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--device=/dev/kvm",
                 "--security-opt=no-new-privileges",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3158,14 +4009,14 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
                 "--security-opt=unmask=ALL",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3209,16 +4060,16 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
                 "--device=/dev/net/tun",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3255,11 +4106,11 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3299,14 +4150,14 @@ mod tests {
                 "run",
                 "-d",
                 "--rm",
+                "--stop-signal=SIGKILL",
                 "--name",
                 "outrig-test",
-                "--stop-timeout",
-                "2",
                 "--userns=keep-id",
                 "--cap-drop=ALL",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3335,6 +4186,7 @@ mod tests {
             &ContainerCreateOptions::new(ImageTag::new("local:test"), launch, "outrig-test-fetch"),
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert_eq!(
@@ -3347,6 +4199,7 @@ mod tests {
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--security-opt=unmask=/proc/*",
+                "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
                 "--label",
@@ -3380,6 +4233,7 @@ mod tests {
             &options,
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
 
         assert!(args.contains(&"outrig-test-fs".to_string()), "{args:?}");
@@ -3556,7 +4410,7 @@ mod tests {
             "env holds the values"
         );
 
-        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken");
+        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken", None);
 
         assert_token_passed_by_name(&cmd);
         let args = argv(cmd);
@@ -3579,6 +4433,7 @@ mod tests {
             &create,
             false,
             "org.outrig.attempt=testtoken",
+            None,
         ));
         assert_token_passed_by_name(
             &bootstrapped_container().build_exec_argv(&["pwd".to_string()], &exec_again),
@@ -3598,7 +4453,7 @@ mod tests {
 
         let cmds = [
             bootstrapped_container().build_exec_argv(&["pwd".to_string()], &exec),
-            build_podman_create_cmd(&create, false, "org.outrig.attempt=testtoken"),
+            build_podman_create_cmd(&create, false, "org.outrig.attempt=testtoken", None),
         ];
         for cmd in cmds {
             let args = argv(cmd.clone());

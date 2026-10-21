@@ -23,6 +23,7 @@ use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 
 use crate::cli::session_setup::plural;
+use crate::cli::signals::Signals;
 use crate::error::{OutrigError, Result};
 use outrig::error::IoPathExt;
 
@@ -68,16 +69,32 @@ pub async fn run(
     std::fs::create_dir_all(&host_ws).path_ctx("create directory", &host_ws)?;
     let log_dir = scratch.path().join("logs");
 
-    let mut container = Container::start(
-        &tag,
-        ContainerLaunchSpec::workspace(&host_ws, Path::new("/workspace")),
-    )
-    .await?;
+    // The container is the first thing a signal could orphan: at its default
+    // disposition a Ctrl-C kills the process before any `Drop` runs (#475).
+    // Raced from here, a signal drops the start or the probe instead -- the
+    // start guard and each `McpClient` clean up after themselves -- and the
+    // stop below still runs. The build above is left alone: buildah gets the
+    // terminal's SIGINT and removes its own working containers.
+    let mut signals = Signals::install()?;
+    let mut container = signals
+        .race_ending(
+            "the validation",
+            Container::start(
+                &tag,
+                ContainerLaunchSpec::workspace(&host_ws, Path::new("/workspace")),
+            ),
+        )
+        .await?;
 
     // Validate (and optionally test) against the container, then tear down on
     // both paths -- the validation error wins over a stop error. `Drop` is the
     // backstop for the window between `start` and `stop`.
-    let outcome = validate_and_test(&mut container, &log_dir, no_test).await;
+    let outcome = signals
+        .race_ending(
+            "the validation",
+            validate_and_test(&mut container, &log_dir, no_test),
+        )
+        .await;
     let stop = container.stop(STOP_GRACE).await;
     outcome?;
     stop?;

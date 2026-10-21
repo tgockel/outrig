@@ -17,15 +17,16 @@ use serde::Serialize;
 use crate::error::{OutrigError, Result};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::paths::{global_config_path, write_atomic};
-use outrig::config::{AnthropicOptions, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
+use outrig::config::{AnthropicOptions, ApiKeyRef, Config, LlmProvider, Model, OpenAiOptions};
 
 /// Public entry: resolve the path, pick a `PromptSource` via
 /// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
 /// delegate to `run_with`. `global_override` plumbs the top-level
 /// `--global-config` flag into the same resolver [`global_config_path`]
-/// uses elsewhere.
+/// uses elsewhere; with no flag and no home to put the file in, that is an
+/// error.
 pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
-    let path = global_config_path(global_override);
+    let path = global_config_path(global_override)?;
     eprintln!("[outrig] writing global config to {}", path.display());
     let mut prompt = prompt::auto();
     run_with(force, &path, &mut prompt).await?;
@@ -50,6 +51,11 @@ pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) 
     let default_model = prompt_default_model(prompt, &models).await?;
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
+    // With no repo root: a global config serves every repo, so no one root is
+    // the one to check its paths against. Nothing the prompts above accept
+    // fails this -- each answer a load would refuse is asked for again where it
+    // was given -- so it keeps the module doc true rather than catching a typo.
+    Config::load_from_str(&toml_text)?.validate(None)?;
     write_atomic(path, &toml_text)?;
     Ok(())
 }
@@ -98,7 +104,8 @@ const ANTHROPIC_BASE_URL_FIELD: Field = Field {
 
 const API_KEY_ENV_FIELD: Field = Field {
     name: "API key environment variable",
-    description: "Name of the env var that holds the API key. Stored as ${VAR}.",
+    description: "Name of the env var that holds the API key, such as OPENAI_API_KEY -- \
+                  not the key itself. Stored as ${VAR}; typing it as ${VAR} works too.",
     options: &[],
     doc_link: "doc/reference/config.md",
 };
@@ -147,9 +154,10 @@ const MODEL_PROVIDER_FIELD: Field = Field {
     description: "An LLM provider is a backend that hosts the model -- e.g. \
                   OpenAI, OpenRouter, or a local Ollama or vLLM server. \
                   Each carries its own connection details (URL, API key, \
-                  etc.). This can be the name of an existing \
-                  [providers.<name>] entry or you can give a new name to \
-                  create a new provider.",
+                  etc.). Name an existing [providers.<name>] entry. When \
+                  writing the global config, a new name offers to define \
+                  one; a repo config only references global providers, \
+                  since providers carry API keys.",
     options: &[],
     doc_link: "doc/concepts/llm-providers.md",
 };
@@ -209,8 +217,8 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
     loop {
         let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
         let style = STYLES[style_idx].0;
-        let name = prompt.ask_string(&PROVIDER_NAME_FIELD, style).await?;
-        let provider = prompt_provider_body(prompt, style).await?;
+        let name = ask_unused_name(prompt, &PROVIDER_NAME_FIELD, style, &out, "provider").await?;
+        let provider = prompt_provider_body(prompt, &name, style).await?;
         out.insert(name, provider);
 
         if !prompt.ask_bool(&ADD_PROVIDER_FIELD, false).await? {
@@ -227,30 +235,28 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
 /// ask the style + connection details.
 pub(crate) async fn prompt_new_provider_for_name(
     prompt: &mut impl PromptSource,
+    name: &str,
 ) -> Result<LlmProvider> {
     let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
     let style = STYLES[style_idx].0;
-    prompt_provider_body(prompt, style).await
+    prompt_provider_body(prompt, name, style).await
 }
 
-async fn prompt_provider_body(prompt: &mut impl PromptSource, style: &str) -> Result<LlmProvider> {
+async fn prompt_provider_body(
+    prompt: &mut impl PromptSource,
+    name: &str,
+    style: &str,
+) -> Result<LlmProvider> {
     match style {
-        "openai" => prompt_openai_provider(prompt).await,
-        "anthropic" => prompt_anthropic_provider(prompt).await,
+        "openai" => prompt_openai_provider(prompt, name).await,
+        "anthropic" => prompt_anthropic_provider(prompt, name).await,
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
 }
 
-async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
-    let base_url = prompt
-        .ask_string(&BASE_URL_FIELD, "https://api.openai.com/v1")
-        .await?;
-    // We capture the env-var name and render it as `${VAR}` -- `ApiKeyRef` only
-    // accepts that form, so feeding a bare name would be rejected at parse time.
-    let env_name = prompt
-        .ask_string(&API_KEY_ENV_FIELD, "OPENAI_API_KEY")
-        .await?;
-    let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
+async fn prompt_openai_provider(prompt: &mut impl PromptSource, name: &str) -> Result<LlmProvider> {
+    let base_url = ask_base_url(prompt, &BASE_URL_FIELD, "https://api.openai.com/v1", name).await?;
+    let api_key = ask_api_key_env(prompt, "OPENAI_API_KEY").await?;
     Ok(LlmProvider::openai(
         base_url,
         api_key,
@@ -258,21 +264,70 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
     ))
 }
 
-async fn prompt_anthropic_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
+async fn prompt_anthropic_provider(
+    prompt: &mut impl PromptSource,
+    name: &str,
+) -> Result<LlmProvider> {
     // The bare official endpoint: rig appends `/v1/messages` itself, and
     // normalizes a `/v1` suffix away if one is typed anyway.
-    let base_url = prompt
-        .ask_string(&ANTHROPIC_BASE_URL_FIELD, "https://api.anthropic.com")
-        .await?;
-    let env_name = prompt
-        .ask_string(&API_KEY_ENV_FIELD, "ANTHROPIC_API_KEY")
-        .await?;
-    let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
+    let base_url = ask_base_url(
+        prompt,
+        &ANTHROPIC_BASE_URL_FIELD,
+        "https://api.anthropic.com",
+        name,
+    )
+    .await?;
+    let api_key = ask_api_key_env(prompt, "ANTHROPIC_API_KEY").await?;
     Ok(LlmProvider::anthropic(
         base_url,
         api_key,
         AnthropicOptions::new(),
     ))
+}
+
+/// Asks `field` for provider `name`'s `base-url` until the rule a load holds it
+/// to accepts the answer, printing the validator's message before each repeat;
+/// that message names the key and never quotes the value, which can carry
+/// credentials. The probe holds an openai provider whatever the style: the rule
+/// is one arm for both remote styles, and the api-key the probe carries, which
+/// the next prompt asks for, is not looked at.
+async fn ask_base_url(
+    prompt: &mut impl PromptSource,
+    field: &Field,
+    default: &str,
+    name: &str,
+) -> Result<String> {
+    let mut probe = Config::default();
+    let api_key = ApiKeyRef::parse("${OPENAI_API_KEY}")?;
+    loop {
+        let answer = prompt.ask_string(field, default).await?;
+        let provider = LlmProvider::openai(answer.clone(), api_key.clone(), OpenAiOptions::new());
+        probe.providers.insert(name.to_string(), provider);
+        match probe.validate(None) {
+            Ok(()) => return Ok(answer),
+            Err(e) => eprintln!("[outrig] {e}"),
+        }
+    }
+}
+
+/// Asks for the name of the env var that holds an API key until the answer is
+/// one, given bare or as the `${VAR}` it is stored as. The refusal never
+/// repeats the answer: the likeliest wrong one is the key itself, pasted in.
+async fn ask_api_key_env(prompt: &mut impl PromptSource, default: &str) -> Result<ApiKeyRef> {
+    loop {
+        let answer = prompt.ask_string(&API_KEY_ENV_FIELD, default).await?;
+        let api_key = ApiKeyRef::parse(&answer)
+            .or_else(|_| ApiKeyRef::parse(&format!("${{{answer}}}")))
+            .ok();
+        if let Some(api_key) = api_key {
+            return Ok(api_key);
+        }
+        eprintln!(
+            "[outrig] that is not an env var name: upper-case letters, digits, and `_`, not \
+             starting with a digit, such as OPENAI_API_KEY. Give the name of the variable that \
+             holds the key, not the key itself."
+        );
+    }
 }
 
 async fn prompt_models(
@@ -282,25 +337,27 @@ async fn prompt_models(
     if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
         return Ok(BTreeMap::new());
     }
-    let (models, new_providers) = prompt_models_loop(prompt, providers).await?;
+    let (models, new_providers) = prompt_models_loop(prompt, providers, true).await?;
     providers.extend(new_providers);
     Ok(models)
 }
 
 /// The model-add loop without the outer `Define a model now?` gate.
-/// Returns `(models, new_providers)` -- providers added inline (when the
-/// user references one that doesn't exist yet) come back to the caller so
-/// init::repo can write them to the repo config without mutating the
-/// global providers it was passed.
+/// Returns `(models, new_providers)` -- providers added inline when the user
+/// names one that doesn't exist yet. Only the global flow passes
+/// `allow_new_providers`: a provider carries an API key, which a repo config
+/// may not declare (`Config::validate_as_repo`), so the repo flow re-asks
+/// until an existing name is given and its map comes back empty.
 pub(crate) async fn prompt_models_loop(
     prompt: &mut impl PromptSource,
     existing_providers: &BTreeMap<String, LlmProvider>,
+    allow_new_providers: bool,
 ) -> Result<(BTreeMap<String, Model>, BTreeMap<String, LlmProvider>)> {
     let mut out = BTreeMap::new();
     let mut new_providers: BTreeMap<String, LlmProvider> = BTreeMap::new();
 
     loop {
-        let name = prompt.ask_string(&MODEL_NAME_FIELD, "fast").await?;
+        let name = ask_unused_name(prompt, &MODEL_NAME_FIELD, "fast", &out, "model").await?;
 
         // Print providers defined so far (existing + any added inline) so
         // the user has the list at hand for the next prompt.
@@ -325,9 +382,18 @@ pub(crate) async fn prompt_models_loop(
             if existing_providers.contains_key(&answer) || new_providers.contains_key(&answer) {
                 break answer;
             }
+            if !allow_new_providers {
+                eprintln!(
+                    "[outrig] no provider named `{answer}`. Providers carry API keys and \
+                     belong in your global config; add `{answer}` there first, or pick one \
+                     of: {}",
+                    provider_names.join(", ")
+                );
+                continue;
+            }
             eprintln!("[outrig] no provider named `{answer}` yet.");
             if prompt.ask_bool(&ADD_NEW_PROVIDER_FIELD, true).await? {
-                let provider = prompt_new_provider_for_name(prompt).await?;
+                let provider = prompt_new_provider_for_name(prompt, &answer).await?;
                 new_providers.insert(answer.clone(), provider);
                 break answer;
             }
@@ -373,7 +439,8 @@ async fn prompt_anthropic_model(
     let identifier = prompt
         .ask_string(&MODEL_IDENTIFIER_FIELD, "claude-sonnet-4-6")
         .await?;
-    let max_tokens = ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens").await?;
+    let max_tokens =
+        ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens", 1).await?;
     let mut model = Model::new(provider_name);
     model.identifier = Some(identifier);
     model.max_tokens = max_tokens;
@@ -381,23 +448,26 @@ async fn prompt_anthropic_model(
 }
 
 /// Ask for an optional non-negative integer: blank leaves the key unset, and
-/// anything unparseable names `knob` in the error rather than the raw type.
+/// anything unparseable is asked for again after a line naming `knob`.
 async fn ask_optional_u32(
     prompt: &mut impl PromptSource,
     field: &Field,
     default: &str,
     knob: &str,
+    min: u32,
 ) -> Result<Option<u32>> {
-    blank_to_none(prompt.ask_string(field, default).await?)
-        .map(|s| {
-            s.parse::<u32>().map_err(|_| {
-                OutrigError::Configuration(format!(
-                    "{knob} must be a non-negative integer; got `{s}`"
-                ))
-                .into()
-            })
-        })
-        .transpose()
+    loop {
+        let Some(answer) = blank_to_none(prompt.ask_string(field, default).await?) else {
+            return Ok(None);
+        };
+        match answer.parse::<u32>() {
+            Ok(n) if n >= min => return Ok(Some(n)),
+            _ if min > 0 => {
+                eprintln!("[outrig] {knob} must be an integer of at least {min}; got `{answer}`")
+            }
+            _ => eprintln!("[outrig] {knob} must be a non-negative integer; got `{answer}`"),
+        }
+    }
 }
 
 pub(crate) async fn prompt_default_model(
@@ -464,4 +534,46 @@ fn render(
 
 fn blank_to_none(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Asks `field` for a name `taken` holds no entry under, asking again after a
+/// line naming the clash: the caller inserts the answer, and a taken name
+/// would replace the earlier entry's answers without a word. The suggestion
+/// is `base`, or the first of `base-2`, `base-3`, ... still free, so Enter
+/// always gives a name of its own.
+async fn ask_unused_name<V>(
+    prompt: &mut impl PromptSource,
+    field: &Field,
+    base: &str,
+    taken: &BTreeMap<String, V>,
+    kind: &str,
+) -> Result<String> {
+    let suggestion = std::iter::once(base.to_string())
+        .chain((2..).map(|n| format!("{base}-{n}")))
+        .find(|name| !taken.contains_key(name))
+        .expect("an unbounded sequence of names holds a free one");
+    loop {
+        let answer = prompt.ask_string(field, &suggestion).await?;
+        if !taken.contains_key(&answer) {
+            return Ok(answer);
+        }
+        eprintln!(
+            "[outrig] a {kind} named `{answer}` is already defined; defined: {}",
+            taken.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod picker_help_tests {
+    use super::*;
+    use crate::init::prompt::format_field_help;
+
+    #[test]
+    fn style_help_carries_every_blurb() {
+        let help = format_field_help(&STYLE_FIELD);
+        for (_, blurb) in STYLES {
+            assert!(help.contains(blurb), "missing {blurb:?}");
+        }
+    }
 }

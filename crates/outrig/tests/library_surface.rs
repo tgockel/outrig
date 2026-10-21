@@ -11,15 +11,16 @@
 
 #![cfg(feature = "e2e")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
-    MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
-    SidecarWorkspaceAccess,
+    MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SecuritySpec, SidecarSpec,
+    SidecarView, SidecarWorkspaceAccess,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -116,6 +117,22 @@ fn build_shell_less_image(tag: &str) {
         "FROM docker.io/library/alpine:latest\n\
          RUN [\"/bin/busybox\", \"rm\", \"-f\", \
          \"/bin/sh\", \"/bin/ash\", \"/bin/bash\", \"/usr/bin/sh\", \"/usr/bin/ash\"]\n",
+    );
+}
+
+/// The filesystem server on a glibc base (`node:22-slim`): a `view = "primary"`
+/// payload whose loader the launcher has to run by name.
+///
+/// The `ENTRYPOINT` names `node` absolutely and the server by its real path
+/// rather than the `mcp-server-filesystem` shim, which is a shebang script and
+/// so refused before any of this is reached.
+fn build_glibc_fs_sidecar_image(tag: &str) {
+    build_image_from_dockerfile(
+        tag,
+        "FROM docker.io/library/node:22-slim\n\
+         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
+         ENTRYPOINT [\"/usr/local/bin/node\", \
+         \"/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js\"]\n",
     );
 }
 
@@ -714,16 +731,7 @@ async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
         std::process::id(),
     );
     // The absolute `/lib64` interpreter symlink comes free with the base image.
-    // The `ENTRYPOINT` names `node` absolutely and the server by its real path
-    // rather than the `mcp-server-filesystem` shim, which is a shebang script
-    // and so refused before any of this is reached.
-    build_image_from_dockerfile(
-        &sidecar_tag,
-        "FROM docker.io/library/node:22-slim\n\
-         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
-         ENTRYPOINT [\"/usr/local/bin/node\", \
-         \"/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js\"]\n",
-    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
     // Stock and unmodified: the primary contributes only its glibc version, so
     // a derived image would be a build that adds no layer.
     ensure_image(UBUNTU_IMAGE);
@@ -792,6 +800,306 @@ async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
     );
 }
 
+/// What glibc's loader prints, on stderr and before `main`, for each entry of
+/// `/etc/ld.so.preload` it cannot load. The `from` and the path pin it to that
+/// file; an `LD_PRELOAD` entry says `from LD_PRELOAD`.
+const PRELOAD_FILE_ERROR: &str = "from /etc/ld.so.preload";
+
+/// What the filesystem server has written to `path` once it has announced
+/// itself, which it does only after its transport is connected. The dynamic
+/// loader's own reports come before `main`, so by then they are in the file if
+/// they are coming at all -- which is what lets the caller assert one is
+/// absent. Polled: the file is filled by a separate `podman start --attach`.
+async fn stderr_once_running(path: &Path) -> String {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && text.contains("running on stdio")
+        {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{} never showed the server's startup line: {:?}",
+        path.display(),
+        std::fs::read_to_string(path),
+    );
+}
+
+/// `view = "primary"` with a **glibc** sidecar over a primary that ships
+/// `/etc/ld.so.preload` (#268).
+///
+/// glibc's loader opens that file on every start, by that absolute name, and no
+/// loader option turns that off. `outrig-enter` runs the payload through the
+/// sidecar's own loader *inside* the primary's mount namespace, so the name is
+/// the primary's file: every object it lists was loaded into the sidecar's
+/// server before `main`, with the server's environment and network, and one
+/// built for a newer glibc than the sidecar's stopped the server from starting
+/// at all.
+///
+/// The primary here lists an object that does not exist. The loader reports
+/// that on stderr and carries on, so it is the same read, visible without
+/// compiling a library. That makes the primary's own processes the control --
+/// they must print it, or the fixture proves nothing -- and the server's stderr
+/// the thing under test.
+///
+/// The pairing is the neighbor test's, `ubuntu:24.04` against `node:22-slim`: a
+/// glibc that differs from the sidecar's is the realistic shape of the failure.
+#[tokio::test]
+async fn primary_view_glibc_sidecar_does_not_load_the_primarys_ld_so_preload() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-preload-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-preload-primary-{}:latest",
+        std::process::id(),
+    );
+    ensure_image(UBUNTU_IMAGE);
+    build_image_from_dockerfile(
+        &primary_tag,
+        &format!(
+            "FROM {UBUNTU_IMAGE}\n\
+             RUN echo /opt/from-the-primary/missing.so > /etc/ld.so.preload\n"
+        ),
+    );
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The control. Without it a pass could mean the fixture never took effect,
+    // or that the loader words its report differently from what the assertions
+    // below look for.
+    let control = outrig
+        .exec_capture(&["true".into()], &ExecOptions::new())
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains(PRELOAD_FILE_ERROR),
+        "the primary's own loader should report its preload file, got: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("preloadfs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("preloadfs", ["/"]),
+        )
+        .await
+        .expect("a glibc sidecar must start over a primary that ships /etc/ld.so.preload");
+
+    // What the server's loader said about it.
+    let stderr = stderr_once_running(&session_dir.path().join("logs/preloadfs.stderr")).await;
+    assert!(
+        !stderr.contains(PRELOAD_FILE_ERROR),
+        "the server's loader should not have read the primary's preload file, got: {stderr}",
+    );
+
+    // And what the server itself finds at that path.
+    let seen = outrig
+        .call_tool(
+            "preloadfs",
+            "read_file",
+            serde_json::json!({ "path": "/etc/ld.so.preload" }),
+        )
+        .await
+        .expect("read the preload file through the view");
+    assert!(
+        !seen.is_error && seen.render_text().trim().is_empty(),
+        "the server should read the primary's preload file as empty, got: {}",
+        seen.render_text(),
+    );
+
+    // The mask is the launcher's own, in its own mount namespace: the primary
+    // keeps its file.
+    let kept = outrig
+        .exec_capture(
+            &["cat".into(), "/etc/ld.so.preload".into()],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&kept.stdout).contains("/opt/from-the-primary/missing.so"),
+        "the primary should still have its own preload file, got: {}",
+        String::from_utf8_lossy(&kept.stdout),
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("preloadfs"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// The mask over `/etc/ld.so.preload` does not depend on the launcher being
+/// able to read the file (#600).
+///
+/// The launcher is the sidecar image's user, here root, holding only the
+/// capabilities the sidecar was given. With `DAC_OVERRIDE` dropped it cannot
+/// open a file owned by the session user with mode `0600`, while the payload,
+/// which runs as that user, can -- so a probe that read "cannot open" as "not
+/// there" skipped the mask and the server preloaded the primary's file.
+#[tokio::test]
+async fn primary_view_sidecar_without_dac_override_masks_an_unreadable_ld_so_preload() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-preload-eacces-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_glibc_fs_sidecar_image(&sidecar_tag);
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-preload-eacces-primary-{}:latest",
+        std::process::id(),
+    );
+    ensure_image(UBUNTU_IMAGE);
+
+    // The session user is the invoking host user, so the file is theirs by id.
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let meta = std::fs::metadata(session_dir.path()).expect("stat session dir");
+    build_image_from_dockerfile(
+        &primary_tag,
+        &format!(
+            "FROM {UBUNTU_IMAGE}\n\
+             RUN echo /opt/from-the-primary/missing.so > /etc/ld.so.preload \
+             && chown {}:{} /etc/ld.so.preload && chmod 0600 /etc/ld.so.preload\n",
+            meta.uid(),
+            meta.gid(),
+        ),
+    );
+
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The control: the session user's own loader reads the file.
+    let control = outrig
+        .exec_capture(&["true".into()], &ExecOptions::new())
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains(PRELOAD_FILE_ERROR),
+        "the primary's own loader should report its preload file, got: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    let mut security = SecuritySpec::default();
+    security.capabilities.cap_drop = vec!["DAC_OVERRIDE".to_string()];
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("preloadfs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_security(security)
+                .with_entrypoint_server("preloadfs", ["/"]),
+        )
+        .await
+        .expect("a sidecar without DAC_OVERRIDE must start over the primary");
+
+    let stderr = stderr_once_running(&session_dir.path().join("logs/preloadfs.stderr")).await;
+    assert!(
+        !stderr.contains(PRELOAD_FILE_ERROR),
+        "the server's loader should not have read the primary's preload file, got: {stderr}",
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// The musl counterpart of the test above, pinning what musl's loader does with
+/// the primary's files: nothing, for the one that matters.
+///
+/// musl has no `/etc/ld.so.preload`. Its one startup file is
+/// `/etc/ld-musl-<arch>.path`, found relative to the *loader's own path* --
+/// `/mnt/lib/ld-musl-<arch>.so.1` here, so `/mnt/etc/ld-musl-<arch>.path`, the
+/// sidecar's -- and not the primary's.
+///
+/// The payload is `xz`, which needs `liblzma.so.5`. The sidecar moves that
+/// library out of every directory its loader searches, so on its own `xz` dies
+/// with `Error loading shared library liblzma.so.5`. The primary has the
+/// library only in `/opt/pmark`, which its path file names, and nowhere the
+/// loader's built-in directories reach. Were the primary's path file read, the
+/// loader would find the library there and `xz` would start instead.
+#[tokio::test]
+async fn primary_view_musl_sidecar_does_not_read_the_primarys_library_path_file() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-pathfile-primary-{}:latest",
+        std::process::id(),
+    );
+    // The arch in the file's name is musl's own spelling, which `uname -m`
+    // matches on both x86-64 and aarch64.
+    build_image_from_dockerfile(
+        &primary_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz-libs \
+         && mkdir -p /opt/pmark \
+         && mv /usr/lib/liblzma.so.5* /opt/pmark/ \
+         && echo /opt/pmark:/lib:/usr/local/lib:/usr/lib > /etc/ld-musl-$(uname -m).path\n",
+    );
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-pathfile-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(
+        &sidecar_tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache xz \
+         && mkdir /opt/hidden \
+         && mv /usr/lib/liblzma.so.5* /opt/hidden/\n\
+         ENTRYPOINT [\"/usr/bin/xz\"]\n",
+    );
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // `xz` is not an MCP server, so the add fails either way; what the
+    // container wrote says why. The loader's error is the pass, `xz` having
+    // started is the fail.
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("pathfile", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("pathfile", ["/"]),
+        )
+        .await
+        .expect_err("a library only the primary's path file names must not be found");
+    let stderr = std::fs::read_to_string(session_dir.path().join("logs/pathfile.stderr"))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("Error loading shared library liblzma.so.5"),
+        "the payload should fail to find liblzma.so.5, got: {stderr:?}",
+    );
+
+    assert_eq!(
+        sidecar_containers_labeled("pathfile"),
+        Vec::<String>::new(),
+        "a failed add should leave no container"
+    );
+    outrig.shutdown().await.expect("shutdown");
+}
+
 /// A `view = "primary"` sidecar whose `ENTRYPOINT` names a program no `PATH`
 /// entry provides fails saying exactly that. The bare `open` errno this used to
 /// be ("open frobnicate: No such file or directory") reads like a missing file
@@ -837,6 +1145,15 @@ async fn primary_view_sidecar_with_an_unresolvable_entrypoint_names_the_path() {
     assert!(
         message.contains("outrig-no-such-program") && message.contains("PATH=/"),
         "the failure should name the program and the PATH searched, got: {message}",
+    );
+    // The launcher exits within milliseconds, which is when `podman start --attach` can drop
+    // what the container wrote (#422), so this is what the container's own log is there for.
+    // The file the error cites, and `outrig logs` reads, holds the same text.
+    let stderr = std::fs::read_to_string(session_dir.path().join("logs/badentry.stderr"))
+        .expect("the server's stderr file");
+    assert!(
+        stderr.contains("outrig-no-such-program") && stderr.contains("PATH=/"),
+        "badentry.stderr should hold the launcher's line, got: {stderr:?}",
     );
 
     assert_eq!(
@@ -967,6 +1284,14 @@ async fn exec_capture_runs_a_command_in_the_primary() {
         .await
         .expect("a failing command still ran");
     assert_eq!(failed.status.code(), Some(3));
+
+    // The command's stdin is empty: one that reads it gets end-of-file.
+    let read_stdin = outrig
+        .exec_capture(&["cat".into()], &ExecOptions::new())
+        .await
+        .expect("a command reading stdin still ran");
+    assert!(read_stdin.status.success(), "exit: {:?}", read_stdin.status);
+    assert_eq!(String::from_utf8_lossy(&read_stdin.stdout), "");
 
     // The streaming form hands back the child with all three pipes open.
     let mut child = outrig
@@ -1178,6 +1503,217 @@ workspace = "ro"
     assert!(
         result.render_text().contains("MARKER.txt"),
         "sidecar list_directory should see the workspace, got: {}",
+        result.render_text(),
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// A primary image whose `org.outrig.mcp` label declares `fs` -- the server the
+/// config below moves into a sidecar -- and `docs`, which it leaves alone. The
+/// label's `fs` serves `/tmp` and the sidecar's serves `/workspace`, so which of
+/// the two answered a call shows in what it can list.
+fn build_primary_image_embedding_fs_and_docs(tag: &str) {
+    let embedded_mcp = BTreeMap::from([
+        ("fs".to_string(), fs_spec("/tmp")),
+        ("docs".to_string(), fs_spec("/workspace")),
+    ]);
+    build_fixture_image_with_mcp_label(tag, &embedded_mcp);
+}
+
+/// The config both placement tests lower: the primary's `fs` is placed in
+/// `[sidecars.tools]`, whose `start` is the one thing they differ in.
+fn placed_fs_config(host_ws: &Path, primary_tag: &str, tools_tag: &str, start: &str) -> Config {
+    let config_toml = format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.primary]
+image-name = "{primary_tag}"
+
+[images.toolsimg]
+image-name = "{tools_tag}"
+
+[images.primary.mcp]
+fs = {{ command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }}
+
+[sidecars.tools]
+image = "toolsimg"
+workspace = "ro"
+start = "{start}"
+"#,
+        host_ws = host_ws.display(),
+    );
+    let config: Config = toml::from_str(&config_toml).expect("parse config");
+    config
+        .validate(None)
+        .expect("the placement config is valid");
+    config
+}
+
+/// A server the config places in a sidecar is served from that sidecar alone:
+/// the primary image's own `org.outrig.mcp` entry of the same name is not
+/// imported beside it, which used to abort the launch at `add_sidecar` with
+/// "already connected". The image's unrelated entries still merge.
+#[tokio::test]
+async fn from_config_placement_wins_over_the_primary_images_embedded_server() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let pid = std::process::id();
+    let primary_tag = format!("localhost/outrig-library-surface-placed-primary-{pid}:latest");
+    let tools_tag = format!("localhost/outrig-library-surface-placed-tools-{pid}:latest");
+    build_primary_image_embedding_fs_and_docs(&primary_tag);
+    build_fixture_image(&tools_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+    let config = placed_fs_config(host_ws.path(), &primary_tag, &tools_tag, "auto");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config");
+    // The premise: the config moved `fs` out of the primary, into a sidecar the
+    // spec carries.
+    assert!(
+        !spec.mcp.contains_key("fs"),
+        "`fs` is sidecar-placed, so not in the primary map: {:?}",
+        spec.mcp.keys().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        spec.sidecars
+            .iter()
+            .filter(|sidecar| sidecar.servers.contains_key("fs"))
+            .count(),
+        1,
+        "exactly one sidecar hosts `fs`",
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect(
+        "launch must not import the image's own `fs` when the config placed `fs` in a sidecar",
+    );
+    let servers: BTreeSet<&str> = outrig
+        .tools()
+        .iter()
+        .map(|tool| tool.server.as_str())
+        .collect();
+    assert_eq!(
+        servers,
+        BTreeSet::from(["docs", "fs"]),
+        "the sidecar's `fs` and the image's unrelated `docs`",
+    );
+
+    // `fs` can list `/workspace` only if the one connected is the sidecar's: the
+    // image's own entry serves `/tmp`. `docs` is the primary's and serves it too.
+    for server in ["fs", "docs"] {
+        let result = outrig
+            .call_tool(
+                server,
+                "list_directory",
+                serde_json::json!({ "path": "/workspace" }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("call_tool {server}: {e}"));
+        assert!(
+            result.render_text().contains("MARKER.txt"),
+            "{server} list_directory should see the workspace, got: {}",
+            result.render_text(),
+        );
+    }
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// A `start = "manual"` placement is not imported into the primary either.
+/// `from_config` neither starts nor carries that sidecar, but its server still
+/// belongs to it: the primary image's entry of the same name stays out, and the
+/// name is free when `add_sidecar` starts the sidecar later.
+#[tokio::test]
+async fn from_config_manual_placement_is_not_imported_into_the_primary() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let pid = std::process::id();
+    let primary_tag = format!("localhost/outrig-library-surface-manual-primary-{pid}:latest");
+    let tools_tag = format!("localhost/outrig-library-surface-manual-tools-{pid}:latest");
+    build_primary_image_embedding_fs_and_docs(&primary_tag);
+    build_fixture_image(&tools_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+    let config = placed_fs_config(host_ws.path(), &primary_tag, &tools_tag, "manual");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config");
+    assert!(spec.sidecars.is_empty(), "a manual sidecar is not carried");
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let servers: BTreeSet<&str> = outrig
+        .tools()
+        .iter()
+        .map(|tool| tool.server.as_str())
+        .collect();
+    assert_eq!(
+        servers,
+        BTreeSet::from(["docs"]),
+        "the image's `fs` belongs to the manual sidecar, so only `docs` is in the primary",
+    );
+    outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("nothing serves `fs` until the manual sidecar is added");
+
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("tools", tools_tag.as_str())
+                .with_workspace_access(SidecarWorkspaceAccess::Ro)
+                .with_server("fs", fs_command("/workspace")),
+        )
+        .await
+        .expect("add_sidecar: the name `fs` is still free");
+    let result = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via the added sidecar");
+    assert!(
+        result.render_text().contains("MARKER.txt"),
+        "the added sidecar's `fs` should see the workspace, got: {}",
         result.render_text(),
     );
 
@@ -1549,6 +2085,113 @@ async fn from_image_can_ignore_embedded_mcp_label() {
         "list_directory output should mention MARKER.txt, got: {}",
         result.render_text(),
     );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// `from_config` pulls an `image-name` the host does not have, as `outrig
+/// run` would, instead of leaving `launch` to fail with `image not known`.
+#[tokio::test]
+async fn from_config_pulls_an_absent_image_name_primary() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let image = "docker.io/library/alpine:3.20";
+    // Absent is the precondition. No `--force`: that would also remove any
+    // container using the image, and this is the contributor's own store. A
+    // plain `rmi` refuses when one does, and the test then has nothing to say.
+    let _ = std::process::Command::new("podman")
+        .args(["rmi", image])
+        .output();
+    let present = std::process::Command::new("podman")
+        .args(["image", "exists", image])
+        .status()
+        .expect("spawn podman image exists")
+        .success();
+    if present {
+        eprintln!("skipping: {image} is in use and cannot be removed without --force");
+        return;
+    }
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    let config: Config = toml::from_str(&format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.probe]
+image-name = "{image}"
+"#,
+        host_ws = host_ws.path().display(),
+    ))
+    .expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "probe",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config pulls the image");
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// A Dockerfile image-config is built under its own name -- the tag `outrig
+/// run` and `build` use -- not under `outrig-cache`.
+#[tokio::test]
+async fn from_config_builds_a_dockerfile_primary_under_its_config_name() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(
+        repo_root.path().join("Dockerfile"),
+        format!(
+            "FROM docker.io/library/alpine:latest\n# marker: {}\n",
+            std::process::id()
+        ),
+    )
+    .expect("write Dockerfile");
+    let config: Config = toml::from_str(&format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.shared]
+dockerfile = "Dockerfile"
+context = "."
+"#,
+        host_ws = host_ws.path().display(),
+    ))
+    .expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "shared",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config builds the image");
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let cfg = config.images.get("shared").expect("shared image-config");
+    let tag = outrig::image::compute_tag_for("shared", cfg, repo_root.path())
+        .await
+        .expect("compute_tag_for");
+    let status = std::process::Command::new("podman")
+        .args(["image", "exists", tag.as_str()])
+        .status()
+        .expect("spawn podman image exists");
+    assert!(status.success(), "{tag} should exist after from_config");
 
     outrig.shutdown().await.expect("shutdown");
 }

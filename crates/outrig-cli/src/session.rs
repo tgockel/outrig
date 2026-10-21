@@ -6,7 +6,12 @@
 //!   `<root>/<sid>/logs/`.
 //! - **Explicit** (`create(.., Some(dir), ..)`): writes to `<dir>/session.json`
 //!   directly and creates `<root>/<sid>` as a symlink to `<dir>` so
-//!   `outrig ls` finds it uniformly.
+//!   `outrig ls` finds it uniformly. `<dir>` has to be empty or absent: from
+//!   then on it is the session's.
+//!
+//! Either way the record is `session.json`, `logs/`, and -- for a session with
+//! a `view = "primary"` sidecar -- `outrig-enter`. Removal deletes the whole
+//! directory, which holds nothing that is not the session's.
 
 use std::fs;
 use std::io::Write as _;
@@ -15,11 +20,17 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{default_session_root, resolve_repo_config};
+use crate::paths::{
+    default_session_root, load_global_or_empty, report_config_warnings, resolve_global_config,
+};
 use outrig::config::Config;
-use outrig::error::{IoPathExt, OutrigError, Result};
+use crate::error::{CliError, Result};
+use outrig::error::{IoPathExt, OutrigError};
 
 const SESSION_JSON: &str = "session.json";
+/// The session's log directory. Everything outrig logs for a session -- MCP
+/// stderr, `network.jsonl`, transcripts -- goes under it.
+pub(crate) const LOGS_DIR: &str = "logs";
 
 /// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrr` (UTC, four
 /// hex digits of randomness). Lexicographic order matches chronological
@@ -42,6 +53,24 @@ impl SessionId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The start time `name` encodes, when it has the shape [`SessionId::new`]
+    /// gives: `None` for anything else, which is how a directory that is not
+    /// a session's is told from one whose record is lost.
+    pub fn started_at(name: &str) -> Option<SystemTime> {
+        let (ts, rand) = name.split_once('-')?;
+        if rand.len() != 4 || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", ts).ok()?;
+        // `strptime` accepts short fields (`14190` for a second), so only the
+        // exact text `new` writes counts as a session id.
+        if civil.strftime("%Y%m%dT%H%M%S").to_string() != ts {
+            return None;
+        }
+        let zoned = civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+        Some(SystemTime::from(zoned.timestamp()))
     }
 }
 
@@ -120,7 +149,76 @@ pub struct Session {
 pub struct SkippedSession {
     /// The `<sid>` directory name under the session root.
     pub entry: String,
-    pub reason: String,
+    /// The directory holding the record -- the link's target for a link.
+    pub dir: PathBuf,
+    /// Whether `<root>/<entry>` is a symlink to `dir`.
+    pub linked: bool,
+    /// The `container_name` text found in the damaged record, when it got that
+    /// far. An `outrig mcp --attach` session records the borrowed container's
+    /// name, not `outrig-<sid>`, so only this says what to check for running.
+    pub recorded_container: Option<String>,
+    /// Why the record could not be read: a [`CliError::SessionRecord`] for a
+    /// record that does not parse, an I/O error for one that could not be read.
+    pub error: CliError,
+}
+
+impl SkippedSession {
+    pub fn id(&self) -> SessionId {
+        SessionId(self.entry.clone())
+    }
+
+    /// The container the session would have run in. The record that would name
+    /// it is unreadable, so this is the name `outrig run` gives every session
+    /// it creates.
+    pub fn container_name(&self) -> String {
+        self.recorded_container
+            .clone()
+            .unwrap_or_else(|| format!("outrig-{}", self.entry))
+    }
+
+    /// Whether [`SkippedSession::container_name`] is what the record said,
+    /// rather than the name `outrig run` would have given. When it is not, an
+    /// attach session's borrowed container cannot be ruled out.
+    pub fn container_known(&self) -> bool {
+        self.recorded_container.is_some()
+    }
+
+    /// Why the record is unreadable, without the `session record <path> is
+    /// unreadable:` framing that the path-naming errors carry.
+    pub fn reason(&self) -> String {
+        match &self.error {
+            CliError::SessionRecord { source, .. } => source.to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// A `<root>/<sid>` symlink, left by `--session-dir`, whose target directory
+/// is gone. The link is all that remains of the session: there is no record
+/// to read, so it is kept out of [`SessionListing::sessions`] and
+/// [`SessionListing::skipped`] alike.
+#[derive(Debug, Clone)]
+pub struct DanglingLink {
+    /// The `<sid>` name under the session root.
+    pub entry: String,
+    /// The directory the link names, which no longer exists.
+    pub target: PathBuf,
+    /// When the link was last modified -- written once, at session start, so
+    /// it stands in for the start time the missing record would have given.
+    pub modified: SystemTime,
+}
+
+impl DanglingLink {
+    pub fn id(&self) -> SessionId {
+        SessionId(self.entry.clone())
+    }
+
+    /// The container the session would have run in. A dangling link has no
+    /// record to name it, so this is the name `outrig run` gives every
+    /// session it creates.
+    pub fn container_name(&self) -> String {
+        format!("outrig-{}", self.entry)
+    }
 }
 
 /// The result of [`SessionStore::list`]: the records that parsed, plus the
@@ -129,6 +227,7 @@ pub struct SkippedSession {
 pub struct SessionListing {
     pub sessions: Vec<Session>,
     pub skipped: Vec<SkippedSession>,
+    pub dangling: Vec<DanglingLink>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +252,30 @@ impl SessionStore {
     /// with the resolved path so the caller doesn't need to compute it twice
     /// and the in-memory `Session` matches what got persisted. Returns the
     /// same path for convenience.
+    ///
+    /// An explicit directory is created if absent and refused unless empty, so
+    /// that nothing in it predates the session (see [`prepare_explicit_dir`]).
+    /// Writing the record claims the directory: of two launches given one at
+    /// once, the second to write is refused.
     pub fn create(
+        &self,
+        sid: &SessionId,
+        explicit_dir: Option<&Path>,
+        session: &mut Session,
+    ) -> Result<PathBuf> {
+        // Before the root is created, so a root nested inside the explicit
+        // directory is not taken for something already there.
+        if let Some(dir) = explicit_dir {
+            prepare_explicit_dir(dir)?;
+        }
+        self.create_prepared(sid, explicit_dir, session)
+    }
+
+    /// [`create`](Self::create) for an explicit directory the caller already
+    /// held to [`prepare_explicit_dir`], and has written in since: `run-new`
+    /// creates `logs/` there, under a lock of its own, before the session has
+    /// a record to write.
+    pub fn create_prepared(
         &self,
         sid: &SessionId,
         explicit_dir: Option<&Path>,
@@ -164,20 +286,15 @@ impl SessionStore {
         let actual_dir = match explicit_dir {
             Some(dir) => {
                 let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
-                let target_json = canon.join(SESSION_JSON);
-                if target_json.exists() {
-                    return Err(OutrigError::Configuration(format!(
-                        "--session-dir {} already contains session.json",
-                        canon.display()
-                    )));
-                }
                 session.session_dir = canon.clone();
-                write_session_json_atomic(&canon, session)?;
+                claim_session_json(&canon, session)?;
                 let link = self.root.join(&sid.0);
                 std::os::unix::fs::symlink(&canon, &link).path_ctx("symlink", &link)?;
                 canon
             }
             None => {
+                // Replacing, not claiming, until #382 makes the `create_dir`
+                // of a fresh id the claim.
                 let dir = self.root.join(&sid.0);
                 session.session_dir = dir.clone();
                 fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
@@ -212,7 +329,8 @@ impl SessionStore {
 
     /// Newest-first. Symlinked entries get `link_target = Some(read_link_result)`.
     /// Entries without a `session.json` are skipped silently (foreign content under
-    /// the root shouldn't crash listings). Entries that have one but can't be parsed
+    /// the root shouldn't crash listings), except a symlink whose target directory
+    /// is gone, which is reported via [`SessionListing::dangling`]. Entries that have one but can't be parsed
     /// are skipped too, but reported via [`SessionListing::skipped`] -- a single
     /// corrupt or schema-drifted record shouldn't cost the user every other session.
     /// Faults reading the root itself are still hard errors.
@@ -221,7 +339,7 @@ impl SessionStore {
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e).path_ctx("read directory", &self.root),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
         for entry in entries {
             let entry = entry?;
@@ -233,24 +351,35 @@ impl SessionStore {
                     session.link_target = link_target;
                     out.sessions.push(session);
                 }
-                Err(OutrigError::Path { source, .. })
+                Err(CliError::Outrig(OutrigError::Path { source, .. }))
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
+                    if link_target.is_some() && !resolved.exists() {
+                        let modified = fs::symlink_metadata(entry.path())
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH);
+                        out.dangling.push(DanglingLink {
+                            entry: entry.file_name().to_string_lossy().into_owned(),
+                            target: resolved,
+                            modified,
+                        });
+                    }
                     continue;
                 }
-                Err(e) => out.skipped.push(SkippedSession {
+                Err(error) => out.skipped.push(SkippedSession {
                     entry: entry.file_name().to_string_lossy().into_owned(),
-                    // Unwrap the `configuration:` framing: this is a stale
-                    // record, not something the user misconfigured.
-                    reason: match e {
-                        OutrigError::Configuration(msg) => msg,
-                        other => other.to_string(),
-                    },
+                    linked: link_target.is_some(),
+                    recorded_container: fs::read(resolved.join(SESSION_JSON))
+                        .ok()
+                        .and_then(|bytes| salvage_container_name(&bytes)),
+                    dir: resolved,
+                    error,
                 }),
             }
         }
         out.sessions.sort_by(|a, b| b.id.0.cmp(&a.id.0));
         out.skipped.sort_by(|a, b| b.entry.cmp(&a.entry));
+        out.dangling.sort_by(|a, b| b.entry.cmp(&a.entry));
         Ok(out)
     }
 
@@ -271,36 +400,63 @@ impl SessionStore {
         read_session_json(&dir.join(SESSION_JSON))
     }
 
-    /// Auto session: remove the dir.
-    /// Symlinked: remove the link target's contents *and* the symlink.
+    /// Remove a session's directory -- the link target for a symlinked
+    /// session -- with everything in it, and the symlink too.
     pub fn remove_by_id(&self, id: &SessionId) -> Result<()> {
         let entry = self.root.join(&id.0);
         let meta = fs::symlink_metadata(&entry).path_ctx("stat", &entry)?;
         if meta.file_type().is_symlink() {
-            let target = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
+            // Relative to the link's directory, as `resolve_entry` reads it.
+            let target = self
+                .root
+                .join(fs::read_link(&entry).path_ctx("read symlink", &entry)?);
             if target.exists() {
-                fs::remove_dir_all(&target).path_ctx("remove", &target)?;
+                remove_record(&target)?;
             }
             fs::remove_file(&entry).path_ctx("remove", &entry)?;
+            Ok(())
         } else {
-            fs::remove_dir_all(&entry).path_ctx("remove", &entry)?;
+            remove_record(&entry)
         }
-        Ok(())
     }
 
-    /// `rm -rf <dir>`, then sweep `<root>` for any symlink whose target was
-    /// `<dir>` and remove it too. O(n) over root entries; fine for v0.
+    /// Unlink a dangling `<root>/<entry>` and nothing else. The removal for a
+    /// link that was dangling when it was selected: it never follows the
+    /// link, so a session that recreated the directory since is untouched.
+    /// Returns `false`, leaving the entry, when it is no longer a symlink to
+    /// `target` or `target` exists again.
+    pub fn unlink_dangling(&self, link: &DanglingLink) -> Result<bool> {
+        let entry = self.root.join(&link.entry);
+        let Ok(meta) = fs::symlink_metadata(&entry) else {
+            return Ok(false);
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let current = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
+        if self.root.join(current) != link.target || link.target.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&entry).path_ctx("remove", &entry)?;
+        Ok(true)
+    }
+
+    /// [`SessionStore::remove_by_id`] for a directory named outright, then
+    /// sweep `<root>` for any symlink whose target was `<dir>` and remove it
+    /// too. O(n) over root entries; fine for v0.
     pub fn remove_by_path(&self, dir: &Path) -> Result<()> {
         // Resolve once *before* removing so we can match dangling symlinks
-        // even after the target is gone.
+        // even after the target is gone. The removal works on this path too:
+        // given a symlink, it is the directory the link names that holds the
+        // record.
         let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if dir.exists() {
-            fs::remove_dir_all(dir).path_ctx("remove", dir)?;
+        if canon_dir.exists() {
+            remove_record(&canon_dir)?;
         }
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).path_ctx("read directory", &self.root),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root).map_err(CliError::from),
         };
         for entry in entries {
             let entry = entry?;
@@ -314,12 +470,94 @@ impl SessionStore {
             let Ok(target) = fs::read_link(&path) else {
                 continue;
             };
-            if target == canon_dir {
+            if self.root.join(target) == canon_dir {
                 fs::remove_file(&path).path_ctx("remove", &path)?;
             }
         }
         Ok(())
     }
+}
+
+/// Hold `dir`, a `--session-dir`, to the rule a session's explicit directory
+/// follows: created if absent, with any missing parents, and refused unless
+/// empty, naming an earlier session's record or the first entry it finds.
+/// These checks are the policy and the messages for a directory that is
+/// plainly taken; writing the record is the claim that holds when two
+/// launches pass them together.
+pub fn prepare_explicit_dir(dir: &Path) -> Result<()> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(OutrigError::Configuration(format!(
+            "--session-dir {} exists and is not a directory",
+            dir.display()
+        ))
+        .into());
+    }
+    fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+    if dir.join(SESSION_JSON).exists() {
+        return Err(OutrigError::Configuration(format!(
+            "--session-dir {} holds an earlier session's record; discard that \
+             session first, or name a new or empty directory",
+            dir.display()
+        ))
+        .into());
+    }
+    if let Some(first) = dir_names(dir)?.first() {
+        return Err(OutrigError::Configuration(format!(
+            "--session-dir {} is not empty (it holds {first}); name a new or \
+             empty directory",
+            dir.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Remove the session directory `dir` and everything in it. All of it is the
+/// session's: a `--session-dir` must name a new or empty directory, and what
+/// lands there after -- `outrig-enter`, `logs/`, `session.json`, the
+/// `report.html` `scripts/render-session.py` writes -- is as ephemeral as the
+/// session. `session.json` goes last, so a removal that fails partway leaves a
+/// record that can still be found and removed again. A symlink inside is
+/// unlinked, never followed.
+fn remove_record(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir).path_ctx("read directory", dir)? {
+        let entry = entry.path_ctx("read directory", dir)?;
+        if entry.file_name() == SESSION_JSON {
+            continue;
+        }
+        let path = entry.path();
+        // `DirEntry::file_type` does not follow a symlink, so one is removed
+        // as a file whatever it names.
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+        tolerate_gone(removed).path_ctx("remove", &path)?;
+    }
+    let record = dir.join(SESSION_JSON);
+    tolerate_gone(fs::remove_file(&record)).path_ctx("remove", &record)?;
+    tolerate_gone(fs::remove_dir(dir)).path_ctx("remove", dir)?;
+    Ok(())
+}
+
+/// `result`, with a target that was already gone counted as removed.
+fn tolerate_gone(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The names in `dir`, sorted, so what a message names does not depend on
+/// directory order.
+fn dir_names(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).path_ctx("read directory", dir)? {
+        let entry = entry.path_ctx("read directory", dir)?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// Resolve a path under the session root. `Ok(None)` when the entry is
@@ -330,11 +568,14 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).path_ctx("stat", path),
+        Err(e) => return Err(e).path_ctx("stat", path).map_err(CliError::from),
     };
     if meta.file_type().is_symlink() {
         let tgt = fs::read_link(path).path_ctx("read symlink", path)?;
-        Ok(Some((tgt.clone(), Some(tgt))))
+        // A relative target is relative to the link's directory, not to the
+        // cwd; `link_target` keeps the text as written.
+        let resolved = path.parent().map_or_else(|| tgt.clone(), |p| p.join(&tgt));
+        Ok(Some((resolved, Some(tgt))))
     } else if meta.is_dir() {
         Ok(Some((path.to_path_buf(), None)))
     } else {
@@ -356,45 +597,25 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
     default.to_path_buf()
 }
 
-/// Same cascade as [`resolve_session_root`], but suitable for read-only session
-/// commands (`ls`, `logs`, `discard`) that may run outside any repo. Skips the
-/// validation+merge that [`Config::load`] performs (we only need the
-/// `session-root` key) and degrades silently when the repo or global config
-/// file is missing -- the user might have neither and just want the XDG
-/// default.
+/// Same cascade as [`resolve_session_root`], for the session commands (`ls`,
+/// `logs`, `discard`, `clean`), which may run outside any repo. `session-root`
+/// is global-only, so the global config is the only file consulted, and the
+/// answer is the same from every directory. Read with
+/// [`Config::load_global`], which resolves the key beside the file and skips
+/// validation (only this key matters here); a missing default file, or no
+/// default location to look in, falls through to the XDG default.
+/// `global_override` is `--global-config` as given, resolved only without
+/// `flag`: given the flag, the global config is neither read nor checked.
 pub fn resolve_session_root_for_cli(
     flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
-    global_cfg_path: &Path,
-    cwd: &Path,
+    global_override: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let repo_cfg_path = match resolve_repo_config(repo_cfg_override, cwd) {
-        Ok(repo) => Some(repo.config_path()),
-        Err(OutrigError::NoRepoConfig) => None,
-        Err(e) => return Err(e),
-    };
-    if let Some(p) = repo_cfg_path
-        && let Some(root) = read_session_root(&p)?
-    {
-        return Ok(root);
-    }
-    if let Some(root) = read_session_root(global_cfg_path)? {
-        return Ok(root);
-    }
-    Ok(default_session_root())
-}
-
-fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {
-    let text = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).path_ctx("read", path),
-    };
-    let cfg = Config::load_from_str(&text)?;
-    Ok(cfg.session_root)
+    let global = load_global_or_empty(resolve_global_config(global_override)?.as_deref())?;
+    report_config_warnings(&global);
+    Ok(global.session_root.unwrap_or_else(default_session_root))
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is
@@ -424,24 +645,72 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// The string value of `"container_name"` in a record that no longer parses --
+/// truncated after it, or broken somewhere else -- or `None` when the text
+/// never gets that far or the value is not closed.
+fn salvage_container_name(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let rest = text.split_once("\"container_name\"")?.1;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let body = rest.strip_prefix('"')?;
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return serde_json::from_str(&rest[..at + 2]).ok(),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn read_session_json(path: &Path) -> Result<Session> {
     let bytes = fs::read(path).path_ctx("read", path)?;
-    serde_json::from_slice::<Session>(&bytes).map_err(|e| {
-        OutrigError::Configuration(format!("session.json at {}: {}", path.display(), e))
+    serde_json::from_slice::<Session>(&bytes).map_err(|source| CliError::SessionRecord {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
-/// Atomic write: temp file in the same dir, fsync, rename. Skipping the
-/// parent-dir fsync is a deliberate v0 punt; outrig is a developer tool, not
-/// a database.
-fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
+/// The record written and fsynced to a temp file in `dir`, ready to be
+/// renamed into place. Skipping the parent-dir fsync is a deliberate v0 punt;
+/// outrig is a developer tool, not a database.
+fn stage_session_json(dir: &Path, session: &Session) -> Result<tempfile::NamedTempFile> {
     let payload = serde_json::to_vec_pretty(session)
         .map_err(|e| OutrigError::Configuration(format!("encoding session.json: {e}")))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.as_file_mut().write_all(&payload)?;
     tmp.as_file_mut().sync_all()?;
-    tmp.persist(dir.join(SESSION_JSON))?;
+    Ok(tmp)
+}
+
+/// Atomic write: [`stage_session_json`], then rename over whatever
+/// `session.json` is there.
+fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
+    stage_session_json(dir, session)?
+        .persist(dir.join(SESSION_JSON))
+        .map_err(OutrigError::from)?;
     Ok(())
+}
+
+/// The first write of a record into an explicit directory, which is also the
+/// claim on it: the rename fails rather than replace a `session.json` another
+/// launch wrote first (#430). `create`'s checks have already turned away a
+/// directory that is plainly taken, so a refusal here is two launches racing.
+fn claim_session_json(dir: &Path, session: &Session) -> Result<()> {
+    match stage_session_json(dir, session)?.persist_noclobber(dir.join(SESSION_JSON)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(OutrigError::Configuration(format!(
+                "--session-dir {} was claimed by another session that started at the \
+                 same moment; name a different directory",
+                dir.display()
+            ))
+            .into())
+        }
+        Err(e) => Err(OutrigError::from(e).into()),
+    }
 }
 
 pub(crate) mod iso_systime {

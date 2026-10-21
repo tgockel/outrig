@@ -4,26 +4,30 @@
 //! Two entry points, because two kinds of rule live here. [`validate`] runs on
 //! the *merged* config and checks that it hangs together. [`validate_as_repo`]
 //! runs on a single *unmerged* repo file and checks what that file was allowed
-//! to say -- a question the merged value cannot answer, since the merge has by
-//! then taken each global-only key from the global side.
+//! to say on its own -- a question the merged value mostly cannot answer, since
+//! the merge has by then taken each global-only key from the global side and
+//! replaced any global provider a repo entry shadowed, with no record of which
+//! file won. An image-config is the exception: it records whether a repo file
+//! declared it, which is what lets [`validate`] hold that file's `${VAR}`
+//! references to the global config's `[repo] env-allow`.
 //!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
 //! config-declared paths.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Binding, Config, HOST_GRACE_SECS_CEILING, ImageConfig, ImageSourceRef, LlmProvider,
-    McpServerSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
-    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
-    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, lexical,
-    normalize_capability_name,
+    Binding, Config, EnvValue, HOST_GRACE_SECS_CEILING, ImageConfig, ImageSourceRef, LlmProvider,
+    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, Model, ModelSourceRef, NetworkMode,
+    REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
+    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
+    TOOL_RESULT_MAX_FLOOR_BYTES, lexical, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -203,6 +207,17 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    // No `declared_in` on these two: only `host-path` records the file it came
+    // from, and `container-path` is inherited from the global config apart
+    // from it.
+    #[error("workspace container-path {path:?} must be absolute")]
+    #[non_exhaustive]
+    WorkspaceContainerNotAbsolute { path: PathBuf },
+
+    #[error("workspace container-path must not be /")]
+    #[non_exhaustive]
+    WorkspaceContainerRoot {},
+
     // The five below restate `MountRuleViolation` in workspace terms, so their
     // `declared_in` means exactly what the variant it is mapped from means.
     #[error(
@@ -297,6 +312,16 @@ pub enum ConfigValidationError {
     #[error("image {image:?}: `devices` entry {device:?} must be an absolute path")]
     DevicePathRelative { image: String, device: String },
 
+    #[error(
+        "image {image:?}: `devices` entry {device:?} is malformed: {detail}; expected \
+         `<host-path>[:<container-path>][:<permissions>]`"
+    )]
+    DevicePathMalformed {
+        image: String,
+        device: String,
+        detail: String,
+    },
+
     #[error("image {image:?}: `devices` entry {device:?} is declared more than once")]
     DevicePathDuplicate { image: String, device: String },
 
@@ -370,6 +395,28 @@ pub enum ConfigValidationError {
     )]
     RequestTimeoutSecsZero { path: String, max: u64 },
 
+    #[error(
+        "{path} must be at least 1; got 0, which leaves the model no room to \
+         answer -- leave the key unset for the default"
+    )]
+    MaxTokensZero { path: String },
+
+    // `detail` says what is wrong without quoting the value, which can carry
+    // credentials in its userinfo.
+    #[error("{path} must be an http:// or https:// URL; {detail}")]
+    #[non_exhaustive]
+    BaseUrlInvalid { path: String, detail: String },
+
+    #[error("{path} must be between 1 and {max} seconds; got {value}")]
+    McpCallTimeoutSecsTooLarge { path: String, value: u64, max: u64 },
+
+    #[error(
+        "{path} must be between 1 and {max} seconds; got 0, which is an immediate \
+         timeout rather than a disabled one -- every tools/call would fail before \
+         it could be answered"
+    )]
+    McpCallTimeoutSecsZero { path: String, max: u64 },
+
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
 
@@ -378,6 +425,54 @@ pub enum ConfigValidationError {
          global config"
     )]
     RepoNetworkPolicy { key: &'static str },
+
+    #[error("repo config may not set {key}; it belongs in global config")]
+    RepoGlobalOnlyKey { key: &'static str },
+
+    #[error(
+        "repo config may not declare [providers.{provider}]: a style={style} \
+         provider carries api-key ${{{var}}}, which belongs in global config"
+    )]
+    #[non_exhaustive]
+    RepoProviderApiKey {
+        provider: String,
+        style: &'static str,
+        var: String,
+    },
+
+    // The names in the next two come from a repo file, so they print with
+    // `{:?}`: a control character in one would otherwise reach the operator's
+    // terminal. `var` cannot hold one -- it matched the reference grammar.
+    #[error(
+        "repo config may not reference ${{{var}}} in image {image:?} build-arg {key:?}{}: \
+         list {var:?} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    RepoBuildArgRef {
+        image: String,
+        key: String,
+        var: String,
+        /// The repo config file that declared the image, or `None` when
+        /// unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "repo config may not reference ${{{var}}} in image {image:?} mcp server {server:?} \
+         env key {key:?}{}: list {var:?} in [repo] env-allow in global config to allow it",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    RepoMcpEnvRef {
+        image: String,
+        server: String,
+        key: String,
+        var: String,
+        /// The repo config file that declared the image, or `None` when
+        /// unrecorded.
+        declared_in: Option<PathBuf>,
+    },
 
     #[error(
         "model {model:?} (provider style={style}) must set 'identifier' (the \
@@ -636,6 +731,7 @@ pub(super) fn validate_with_options(
     options: ValidationOptions<'_>,
 ) -> Result<(), ConfigValidationError> {
     validate_workspace_host_path(cfg, repo_root)?;
+    validate_workspace_container_path(cfg)?;
     validate_workspace_mounts(cfg, repo_root)?;
     validate_bindings(cfg, repo_root)?;
 
@@ -710,6 +806,7 @@ pub(super) fn validate_with_options(
             })?;
         }
         validate_image_security(image_name, image)?;
+        validate_repo_env_refs(cfg, image_name, image)?;
 
         for (server_name, spec) in image.mcp() {
             if !is_valid_mcp_server_name(server_name) {
@@ -731,6 +828,12 @@ pub(super) fn validate_with_options(
                     server: server_name.clone(),
                 });
             }
+            if let Some(value) = spec.call_timeout_secs() {
+                check_mcp_call_timeout_secs(
+                    &format!("images.{image_name}.mcp.{server_name}.call-timeout-secs"),
+                    value,
+                )?;
+            }
         }
 
         // Only the sidecars this image-config actually names: a declared block
@@ -746,6 +849,10 @@ pub(super) fn validate_with_options(
         }
     }
 
+    // A loaded config cannot fail these two: both keys are resolved against
+    // the global file's directory as it is read. What reaches here relative is
+    // a value no file declared -- hand-built, or from `load_from_str` -- which
+    // has no directory to resolve against.
     if let Some(path) = &cfg.session_root
         && !path.is_absolute()
     {
@@ -774,6 +881,9 @@ pub(super) fn validate_with_options(
     }
     if let Some(value) = cfg.retry_budget_secs {
         validate_retry_budget_secs("top-level retry-budget-secs", value)?;
+    }
+    if let Some(value) = cfg.mcp_call_timeout_secs {
+        check_mcp_call_timeout_secs("top-level mcp-call-timeout-secs", value)?;
     }
     validate_network_policy(cfg)?;
 
@@ -807,18 +917,21 @@ pub(super) fn validate_with_options(
             // Deliberately without a `_` arm, matching the model loop below: a
             // new provider style has to stop here and say whether it retries
             // and whether it speaks HTTP at all.
-            let (retry_budget_secs, request_timeout_secs) = match provider {
+            let (base_url, retry_budget_secs, request_timeout_secs) = match provider {
                 LlmProvider::OpenAi {
+                    base_url,
                     retry_budget_secs,
                     request_timeout_secs,
                     ..
                 }
                 | LlmProvider::Anthropic {
+                    base_url,
                     retry_budget_secs,
                     request_timeout_secs,
                     ..
-                } => (*retry_budget_secs, *request_timeout_secs),
+                } => (base_url, *retry_budget_secs, *request_timeout_secs),
             };
+            validate_base_url(&format!("providers.{provider_name}.base-url"), base_url)?;
             if let Some(value) = retry_budget_secs {
                 validate_retry_budget_secs(
                     &format!("providers.{provider_name}.retry-budget-secs"),
@@ -834,6 +947,9 @@ pub(super) fn validate_with_options(
         }
 
         for (agent_name, agent) in &cfg.agents {
+            if let Some(value) = agent.max_tokens {
+                validate_max_tokens(&format!("agents.{agent_name}.max-tokens"), value)?;
+            }
             if let Some(value) = agent.tool_call_max {
                 validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
             }
@@ -864,6 +980,9 @@ pub(super) fn validate_with_options(
             else {
                 continue;
             };
+            if let Some(value) = model.max_tokens {
+                validate_max_tokens(&format!("models.{model_name}.max-tokens"), value)?;
+            }
             let provider = cfg.providers.get(provider_name).ok_or_else(|| {
                 ConfigValidationError::UnknownModelProvider {
                     model: model_name.clone(),
@@ -887,14 +1006,102 @@ pub(super) fn validate_with_options(
 
 /// The rules that apply to a repo config file, checked on the unmerged value.
 ///
-/// Today there is one: `[network]`'s policy keys describe the machine's egress
-/// and belong to the operator, so a repo config may declare `mode` and nothing
-/// else. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
+/// Four today, drawing one line: what the operator's machine does stays with
+/// the operator. `session-root` picks where this machine writes -- for
+/// sessions also where `clean` and `discard` delete and what `clean` reads as a
+/// stray container -- so one machine has one.
+/// `[network]`'s policy keys describe the machine's egress, so a repo config
+/// may declare `mode` and nothing else. `[repo].env-allow` says which host
+/// variables a repo config may reference, a question a repo file must not
+/// answer for itself. A provider's `api-key` names a host environment variable
+/// and its `base-url` says where the host process sends it, and every style
+/// carries a key, so a repo config may declare no provider; a repo model may
+/// still name a global provider. Checked in schema order. See
+/// [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
-    match cfg.network.declared_policy_key() {
-        Some(key) => Err(ConfigValidationError::RepoNetworkPolicy { key }),
-        None => Ok(()),
+    if cfg.session_root.is_some() {
+        return Err(ConfigValidationError::RepoGlobalOnlyKey {
+            key: "session-root",
+        });
     }
+    if let Some(key) = cfg.network.declared_policy_key() {
+        return Err(ConfigValidationError::RepoNetworkPolicy { key });
+    }
+    if !cfg.repo.is_default() {
+        return Err(ConfigValidationError::RepoGlobalOnlyKey {
+            key: "[repo].env-allow",
+        });
+    }
+    if let Some((name, provider)) = cfg.providers.iter().next() {
+        // Deliberately without a `_` arm, as in `validate`: a new provider
+        // style has to say here whether a repo file may declare it.
+        let (LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. }) =
+            provider;
+        return Err(ConfigValidationError::RepoProviderApiKey {
+            provider: name.clone(),
+            style: provider.style(),
+            var: api_key.var_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Hold the `${VAR}` references of an image a repo config file declared to the
+/// global config's `[repo] env-allow`.
+///
+/// A reference in `build-args` or in an MCP server's `env` is read from the
+/// host environment and handed to code the repo controls -- a build of its own
+/// Dockerfile, a server command it chose -- so a repo file may name only the
+/// variables the operator listed. The two places are the only ones the schema
+/// holds an [`EnvValue`] in. An image's own `org.outrig.mcp` label can carry
+/// such references too, but it is not a config file and this does not see it:
+/// a session holds a label's references to the same list once the label has
+/// merged in, through `embedded::check_label_server_env` -- from the CLI's
+/// session setup, and from `Outrig::launch` for the library.
+///
+/// This is a rule of the merged value, not of [`validate_as_repo`], because it
+/// needs the global config's list as well as the repo file. The CLI also
+/// reports what the load set aside between the two steps, and a global
+/// `env-allow` that was set aside is the reason a reference is then refused,
+/// so the warning has to come first.
+///
+/// An image no file declared -- hand-built, or read by `Config::load_from_str`
+/// -- and one the global config declared are the caller's own, and are not held
+/// to the list. Every image a repo file declares is checked, used or not:
+/// validation does not know which one a session will select.
+fn validate_repo_env_refs(
+    cfg: &Config,
+    image_name: &str,
+    image: &ImageConfig,
+) -> Result<(), ConfigValidationError> {
+    if !image.repo_declared {
+        return Ok(());
+    }
+    let unlisted = |value: &EnvValue| value.unlisted_ref(cfg.repo.env_allow()).map(str::to_string);
+    for (key, value) in &image.build_args {
+        if let Some(var) = unlisted(value) {
+            return Err(ConfigValidationError::RepoBuildArgRef {
+                image: image_name.to_string(),
+                key: key.clone(),
+                var,
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    for (server, spec) in &image.mcp {
+        for (key, value) in spec.env() {
+            if let Some(var) = unlisted(value) {
+                return Err(ConfigValidationError::RepoMcpEnvRef {
+                    image: image_name.to_string(),
+                    server: server.clone(),
+                    key: key.clone(),
+                    var,
+                    declared_in: image.declared_in(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
@@ -934,6 +1141,12 @@ fn validate_security(
 /// Shape-check the `devices` list. Whether the node exists is deliberately not
 /// checked: validation runs on machines that are not the launch host, and
 /// podman's own error covers a missing node clearly enough.
+///
+/// An entry is podman's `--device` value, `<host>[:<container>][:<perms>]`,
+/// and the shape check refuses only what podman refuses at launch. This is
+/// the opposite of `validate_unmask_list`'s treatment of `:` on purpose:
+/// podman splits an `unmask` value into several paths, but the colons of a
+/// `--device` value separate the parts of one device.
 fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigValidationError> {
     let mut seen = BTreeSet::new();
 
@@ -943,10 +1156,18 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
                 image: scope.to_string(),
             });
         }
-        if !Path::new(device).is_absolute() {
+        let fields: Vec<&str> = device.split(':').collect();
+        if !Path::new(fields[0]).is_absolute() {
             return Err(ConfigValidationError::DevicePathRelative {
                 image: scope.to_string(),
                 device: device.clone(),
+            });
+        }
+        if let Err(detail) = check_device_suffix(&fields[1..]) {
+            return Err(ConfigValidationError::DevicePathMalformed {
+                image: scope.to_string(),
+                device: device.clone(),
+                detail: detail.to_string(),
             });
         }
         if !seen.insert(device.clone()) {
@@ -958,6 +1179,39 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
     }
 
     Ok(())
+}
+
+/// Check the fields after the host path the way podman parses them: one
+/// field is a container path or a permission string, two are a container
+/// path then permissions, and more is refused. An empty container path
+/// defaults to the host path, so `/dev/null:` and `/dev/null::rw` are fine.
+/// Empty permissions after a container path are fine too: for a device
+/// directory such as `/dev/dri` podman expands the children with default
+/// `rwm`, and only refuses them for a single node. Which one the source is
+/// depends on the launch host, so that call is left to podman.
+fn check_device_suffix(rest: &[&str]) -> Result<(), &'static str> {
+    // Each of `r`, `w`, `m` at most once: podman refuses `rrw` at launch.
+    let is_perms = |f: &str| {
+        !f.is_empty()
+            && f.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
+            && f.chars().enumerate().all(|(i, c)| !f[..i].contains(c))
+    };
+    let is_dst = |f: &str| f.is_empty() || Path::new(f).is_absolute();
+    match rest {
+        [] => Ok(()),
+        [one] if is_dst(one) || is_perms(one) => Ok(()),
+        [_] => Err("the second field must be an absolute path or permissions (`r`, `w`, `m`)"),
+        [dst, perms] => {
+            if !is_dst(dst) {
+                Err("the container path must be absolute")
+            } else if !perms.is_empty() && !is_perms(perms) {
+                Err("permissions must be some of `r`, `w`, `m`, each at most once")
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("at most three `:`-separated fields are allowed"),
+    }
 }
 
 /// Shape-check the `unmask` list. Entries reach podman verbatim, which is what
@@ -984,7 +1238,9 @@ fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigVali
                 image: scope.to_string(),
             });
         }
-        // Checked before the absolute-path rule: a colon-joined list is made of
+        // Unlike `devices`, where `:` joins the parts of one device, podman
+        // splits an unmask value on it. Checked before the absolute-path rule:
+        // a colon-joined list is made of
         // absolute paths, so the rule below would wave it through into an
         // argument podman then splits back into several.
         if path.contains(':') {
@@ -1360,7 +1616,7 @@ fn validate_sidecar(
     // so extra mounts must not collide with it.
     let mut reserved = BTreeSet::new();
     if sidecar.workspace != super::SidecarWorkspaceAccess::None {
-        reserved.insert(cfg.workspace.container_path().to_path_buf());
+        reserved.insert(fold_container_path(cfg.workspace.container_path()));
     }
     check_mount_list(&sidecar.mounts, reserved, repo_root).map_err(|violation| {
         ConfigValidationError::SidecarMount {
@@ -1427,6 +1683,24 @@ fn validate_workspace_host_path(
     Ok(())
 }
 
+/// Hold the primary `container-path` to the shape [`check_mount_list`] asks of
+/// every extra mount: absolute, and not `/`. Podman refuses a relative one only
+/// once it creates the container, after the image is built; it takes `/`, and
+/// the workspace then covers the image's whole root filesystem. Structural, so
+/// it runs with or without a repo root.
+fn validate_workspace_container_path(cfg: &Config) -> Result<(), ConfigValidationError> {
+    let path = cfg.workspace.container_path();
+    if !path.is_absolute() {
+        return Err(ConfigValidationError::WorkspaceContainerNotAbsolute {
+            path: path.to_path_buf(),
+        });
+    }
+    if fold_container_path(path) == Path::new("/") {
+        return Err(ConfigValidationError::WorkspaceContainerRoot {});
+    }
+    Ok(())
+}
+
 pub(super) fn validate_workspace_mounts(
     cfg: &Config,
     repo_root: Option<&Path>,
@@ -1484,7 +1758,10 @@ fn check_workspace_mounts(
     repo_root: Option<&Path>,
     workspace: Option<PathBuf>,
 ) -> Result<(), ConfigValidationError> {
-    let reserved = workspace.into_iter().collect();
+    let reserved = workspace
+        .map(|path| fold_container_path(&path))
+        .into_iter()
+        .collect();
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {
             MountRuleViolation::ContainerNotAbsolute { path, declared_in } => {
@@ -1574,6 +1851,24 @@ pub enum MountRuleViolation {
     },
 }
 
+/// An absolute in-container path with `.` and `..` folded by component, the way
+/// podman cleans a destination before it compares them. `..` at the root stays
+/// at the root. Lexical: there is no filesystem to resolve against, and
+/// `Path` equality alone never folds `..`.
+fn fold_container_path(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::Normal(part) => folded.push(part),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    folded
+}
+
 /// Shared rules for any bind-mount list: absolute container paths, never `/`,
 /// no duplicates (including against `reserved` paths already claimed by the
 /// owning block), and -- when a repo root is known -- host paths that exist
@@ -1596,10 +1891,11 @@ fn check_mount_list(
                     declared_in,
                 });
             }
-            if container == Path::new("/") {
+            let folded = fold_container_path(&container);
+            if folded == Path::new("/") {
                 return Err(MountRuleViolation::ContainerRoot { declared_in });
             }
-            if !reserved.insert(container.clone()) {
+            if !reserved.insert(folded) {
                 return Err(MountRuleViolation::ContainerDuplicate {
                     path: container,
                     declared_in,
@@ -1771,7 +2067,8 @@ pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
 /// The name becomes the repository of the image's tag (`<name>:<hash>`), so it
 /// is held to the path-component grammar of podman's image references:
 /// lowercase letters and digits, separated by one `.`, one or two `_`, or a
-/// run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`).
+/// run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), and to at most 237
+/// characters.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum BuildImageNameError {
@@ -1801,7 +2098,21 @@ pub enum BuildImageNameError {
          with {separator:?}: only one `.`, one or two `_`, or a run of `-`"
     )]
     InvalidSeparator { separator: String },
+
+    /// The name is `len` characters, over the `max` its tag's repository can
+    /// be. Buildah normalizes a short name to `docker.io/library/<name>` and
+    /// refuses a repository over 255 characters.
+    #[error(
+        "a build image's name becomes its repository, which can't be longer than {max} \
+         characters, and this one is {len}"
+    )]
+    TooLong { len: usize, max: usize },
 }
+
+/// The longest a build image's name can be: the 255 characters buildah allows
+/// a repository, less the 18 of the `docker.io/library/` it prepends to a
+/// short name.
+const BUILD_IMAGE_NAME_MAX_LEN: usize = 255 - "docker.io/library/".len();
 
 /// Checks that `name` can key a build image's `[images.<name>]` block, the one
 /// that sets `dockerfile` and `context`, and says what's wrong when it can't.
@@ -1819,6 +2130,13 @@ pub fn check_build_image_name(name: &str) -> Result<(), BuildImageNameError> {
         .find(|&c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || is_separator(c)))
     {
         return Err(BuildImageNameError::InvalidCharacter { character });
+    }
+    // Only ASCII is left, so bytes are characters.
+    if name.len() > BUILD_IMAGE_NAME_MAX_LEN {
+        return Err(BuildImageNameError::TooLong {
+            len: name.len(),
+            max: BUILD_IMAGE_NAME_MAX_LEN,
+        });
     }
     if let Some(separator) = [name.chars().next(), name.chars().next_back()]
         .into_iter()
@@ -1921,6 +2239,75 @@ fn validate_request_timeout_secs(path: &str, value: u64) -> Result<(), ConfigVal
         });
     }
     Ok(())
+}
+
+/// A zero output ceiling leaves the model no room to answer, and the Anthropic
+/// arm's cap against the published ceiling only lowers a value, so a `0` would
+/// reach the wire as written. There is no upper bound here: the ceiling a model
+/// allows is the provider's to state.
+fn validate_max_tokens(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if value == 0 {
+        return Err(ConfigValidationError::MaxTokensZero {
+            path: path.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Hold a remote provider's `base-url` to what a request can be sent to: it
+/// must parse as the `http::Uri` rig builds each request from, and name `http`
+/// or `https`, the only schemes reqwest sends to. Anything else loads as a
+/// string and then fails every request -- in rig's request builder if it does
+/// not parse, with reqwest's `builder error` if its scheme is another -- and
+/// neither error names the key.
+///
+/// `http::Uri` rather than the `url` crate reqwest parses with: the first is
+/// already in this crate's tree, and the second would bring IDNA tables into
+/// it. What only `url` refuses -- a port past 65535, say -- is left to the
+/// first request, which the CLI's retry loop fails at once rather than
+/// retrying.
+///
+/// The detail never quotes the value, which can carry credentials in its
+/// userinfo. Naming the scheme is safe: `http::Uri` reads one only where `://`
+/// follows it, so it ends before any userinfo begins.
+fn validate_base_url(path: &str, value: &str) -> Result<(), ConfigValidationError> {
+    let detail = match value.parse::<http::Uri>() {
+        Err(e) => format!("it does not parse ({e})"),
+        Ok(uri) => match uri.scheme_str() {
+            Some("http" | "https") => return Ok(()),
+            Some(scheme) => format!("its scheme is {scheme:?}"),
+            None => "it has no scheme".to_string(),
+        },
+    };
+    Err(ConfigValidationError::BaseUrlInvalid {
+        path: path.to_string(),
+        detail,
+    })
+}
+
+/// The `call-timeout-secs` / `mcp-call-timeout-secs` range rule, shared with
+/// the label and `image.toml` reads and the library's hand-built specs, so
+/// every route a deadline can arrive by refuses the same values.
+pub(crate) fn check_mcp_call_timeout_secs(
+    path: &str,
+    value: u64,
+) -> Result<(), ConfigValidationError> {
+    if mcp_call_timeout_secs_in_range(value) {
+        return Ok(());
+    }
+    let (path, max) = (path.to_string(), MCP_CALL_TIMEOUT_SECS_CEILING);
+    Err(if value == 0 {
+        ConfigValidationError::McpCallTimeoutSecsZero { path, max }
+    } else {
+        ConfigValidationError::McpCallTimeoutSecsTooLarge { path, value, max }
+    })
+}
+
+/// The one statement of the range [`check_mcp_call_timeout_secs`] enforces,
+/// for the label and `image.toml` reads, which report it in their own error
+/// types.
+pub(crate) fn mcp_call_timeout_secs_in_range(value: u64) -> bool {
+    (1..=MCP_CALL_TIMEOUT_SECS_CEILING).contains(&value)
 }
 
 fn validate_tool_result_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {

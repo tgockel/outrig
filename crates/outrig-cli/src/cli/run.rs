@@ -26,6 +26,7 @@ use crate::cli::session_setup::{
     self, ProgressSpan, STOP_GRACE, SessionRuntime, SessionSetup, SessionSetupArgs,
     SidecarStartCtx, plural,
 };
+use crate::cli::signals::{self, Signals};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
@@ -34,7 +35,7 @@ use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
 use crate::self_tool;
-use crate::session_tool::{self, SessionTool};
+use crate::session_tool::{self, SessionTool, SharedTools};
 use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
 use outrig::config::{
@@ -44,6 +45,7 @@ use outrig::config::{
 use outrig::container::Container;
 use outrig::container::sidecar::{SessionMcpPlan, SidecarPlan};
 use outrig::image::ImageTag;
+use outrig::network::NetworkInterceptor;
 use rig::tool::ToolDyn;
 use tokio_util::sync::CancellationToken;
 
@@ -66,8 +68,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME-OR-LOCAL-REF")]
     pub image: Option<String>,
 
-    /// Write the session into an explicit, already-existing directory. The
-    /// session root gets a symlink at `<root>/<sid>` pointing at this path.
+    /// Write the session into this directory, which must be empty or not exist
+    /// yet (it is created, with any missing parents). The session root gets a
+    /// symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
 
@@ -97,7 +100,7 @@ pub struct RunArgs {
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
     repo: &RepoConfig,
-    global_cfg_path: &Path,
+    global_cfg_path: Option<&Path>,
     session_root_flag: Option<&Path>,
     args: &RunArgs,
     verbose: u8,
@@ -139,6 +142,7 @@ pub async fn execute(
         mcp_plan,
         watcher,
         used_builtin_default,
+        mut signals,
         attached: _,
         session: _,
     } = setup;
@@ -166,12 +170,11 @@ pub async fn execute(
         cli_env: &cli_env,
         runtime: &mut runtime,
         store: &store,
+        signals: &mut signals,
     })
     .await;
 
-    let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(runtime, &store, &sid, final_exit).await;
-    crate::cli::watcher::exit_if_monitor_stopped(&outcome, final_exit);
+    session_setup::teardown(runtime, &store, &sid, &outcome).await;
     outcome
 }
 
@@ -203,6 +206,9 @@ struct RunInnerArgs<'a> {
     cli_env: &'a CliEnvEntries,
     runtime: &'a mut SessionRuntime,
     store: &'a SessionStore,
+    /// Raced against each slow startup step, then against the REPL for
+    /// SIGTERM and SIGHUP.
+    signals: &'a mut Signals,
 }
 
 async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
@@ -222,6 +228,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cli_env,
         runtime,
         store,
+        signals,
     } = args;
 
     // Grab the death token before the watcher disappears into the REPL's
@@ -239,17 +246,26 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
-    let connected =
-        session_setup::connect_mcp_clients(&mut runtime.containers, mcp_plan, log_dir, cli_env)
-            .await?;
+    let connected = signals
+        .race(session_setup::connect_mcp_clients(
+            &mut runtime.containers,
+            mcp_plan,
+            log_dir,
+            cli_env,
+        ))
+        .await?;
     runtime.mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<SessionTool> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
     for arc in runtime.mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
-        let adapters =
-            McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_max_bytes).await?;
+        let adapters = signals
+            .race(McpToolAdapter::from_client_tools(
+                arc.clone(),
+                resolved.tool_result_max_bytes,
+            ))
+            .await?;
         let tool_count = adapters.len();
         let tool_word = plural(tool_count, "tool", "tools");
         span.done(format!(
@@ -260,14 +276,13 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         all_tools.extend(session_tool::erase(adapters));
     }
 
-    // Subagents borrow the session's MCP tools as they stand now. A sidecar
-    // added later grows the *primary* agent's tool list via `extend_tools`,
-    // but not this snapshot, so subagents launched afterwards still see the
-    // startup set.
+    // Shared by the primary and every subagent registry, so a sidecar added
+    // later reaches the launches after it; see `SharedTools`.
+    let mcp_tools = SharedTools::new(all_tools.clone());
     let subagents = Arc::new(SubagentRegistry::new(SubagentContext {
         resolved: resolved.clone(),
         cfg: cfg.clone(),
-        mcp_tools: all_tools.clone(),
+        mcp_tools: mcp_tools.clone(),
         log_dir: log_dir.to_path_buf(),
         ancestry: Vec::new(),
         // The primary is the root at depth 1, so its subagents live at depth 2.
@@ -294,7 +309,9 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     }
 
     let span = ProgressSpan::start("building agent");
-    let agent = llm::build_agent(&resolved, agent_tools.clone()).await?;
+    let agent = signals
+        .race(llm::build_agent(&resolved, agent_tools.clone()))
+        .await?;
     span.done("agent ready");
 
     print_banner(StartupBanner {
@@ -309,7 +326,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     });
 
     let primary_name = runtime.containers.primary.name().to_string();
-    let agent = llm::RebuildingAgent::new(agent, agent_tools, resolved);
+    let agent = llm::RebuildingAgent::new(agent, agent_tools, mcp_tools, resolved);
 
     let session = ReplSession {
         runtime: RefCell::new(runtime),
@@ -326,16 +343,21 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     eprintln!("[outrig] entering REPL");
     // When a watcher is armed, external death of the primary ends the REPL
     // with an error instead of leaving the agent talking to dead tools.
-    let result = match primary_died {
-        Some(died) => {
-            tokio::select! {
-                result = run_repl(session) => result,
-                _ = died.cancelled() => {
-                    Err(crate::cli::watcher::primary_death_error(&primary_name))
-                }
-            }
+    let primary_died = async {
+        match primary_died {
+            Some(died) => died.cancelled().await,
+            None => std::future::pending().await,
         }
-        None => run_repl(session).await,
+    };
+    // SIGINT is the REPL's own: it cancels a turn, and only a second one ends
+    // the session. SIGTERM and SIGHUP end it from anywhere, mid-turn included.
+    // The signal wins a tie: a closed terminal delivers SIGHUP and ends stdin
+    // at once, and the record should say which of the two ended the session.
+    let result = tokio::select! {
+        biased;
+        sig = signals.termination() => Err(signals::interrupted_mid_line(sig)),
+        () = primary_died => Err(crate::cli::watcher::primary_death_error(&primary_name)),
+        result = run_repl(session) => result,
     };
 
     // Stop every subagent *and wait for the tasks to end* before teardown.
@@ -515,6 +537,88 @@ impl Drop for TakenHistory<'_> {
     }
 }
 
+/// The session's network interceptor, moved out of the shared runtime around
+/// one await so no `RefCell` borrow is held across it, and moved back when this
+/// drops -- for [`TakenHistory`]'s reason: Ctrl-C drops an in-flight slash
+/// command mid-await too (#345), and a write-back after the await never runs.
+///
+/// Lost, it would not just be missing. Dropping an interceptor undoes every
+/// attachment it holds, the primary's included, so the session would go on
+/// with nothing intercepted, the next `/sidecar add` would attach nothing, and
+/// teardown would find no interceptor to shut down.
+struct TakenInterceptor<'r, 'a> {
+    runtime: &'r RefCell<&'a mut SessionRuntime>,
+    interceptor: Option<NetworkInterceptor>,
+}
+
+impl<'r, 'a> TakenInterceptor<'r, 'a> {
+    /// `None` for a session running without interception.
+    fn take(runtime: &'r RefCell<&'a mut SessionRuntime>) -> Option<Self> {
+        let interceptor = runtime.borrow_mut().network.take()?;
+        Some(Self {
+            runtime,
+            interceptor: Some(interceptor),
+        })
+    }
+}
+
+impl Deref for TakenInterceptor<'_, '_> {
+    type Target = NetworkInterceptor;
+
+    fn deref(&self) -> &NetworkInterceptor {
+        self.interceptor.as_ref().expect("held until dropped")
+    }
+}
+
+impl DerefMut for TakenInterceptor<'_, '_> {
+    fn deref_mut(&mut self) -> &mut NetworkInterceptor {
+        self.interceptor.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for TakenInterceptor<'_, '_> {
+    fn drop(&mut self) {
+        self.runtime.borrow_mut().network = self.interceptor.take();
+    }
+}
+
+/// A sidecar's interceptor attachment between a successful `attach` and the
+/// point where the add either commits it or detaches it in order.
+///
+/// Dropped while still armed -- an add Ctrl-C interrupted in between (#345) --
+/// it drops the attachment, as the sidecar's own `Drop` removes the container.
+/// Without it the interceptor keeps an entry for a container that is gone, and
+/// a retried add of the same sidecar, which gets the same container name, is
+/// refused as already attached for the rest of the session.
+struct UncommittedAttachment<'r, 'a> {
+    runtime: &'r RefCell<&'a mut SessionRuntime>,
+    container: Option<String>,
+}
+
+impl<'r, 'a> UncommittedAttachment<'r, 'a> {
+    fn arm(runtime: &'r RefCell<&'a mut SessionRuntime>, container: &str) -> Self {
+        Self {
+            runtime,
+            container: Some(container.to_string()),
+        }
+    }
+
+    /// The add reached a path that sees to the attachment itself.
+    fn disarm(mut self) {
+        self.container = None;
+    }
+}
+
+impl Drop for UncommittedAttachment<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take()
+            && let Some(network) = self.runtime.borrow_mut().network.as_mut()
+        {
+            network.drop_attachment(&container);
+        }
+    }
+}
+
 /// Dispatch for the `/sidecar` slash command. Always returns stderr text --
 /// errors are reported to the user and never escape to the REPL loop, so a
 /// failed add cannot end the session.
@@ -674,83 +778,83 @@ async fn try_sidecar_add(
         .append(&mut abandoned);
     let container = launched?;
 
-    // Take the interceptor out of the shared slot around the await so no
-    // RefCell borrow is held across it; slash callbacks run sequentially,
-    // so nothing observes the empty slot.
-    let taken = state.runtime.borrow_mut().network.take();
-    if let Some(mut interceptor) = taken {
-        let attached = interceptor.attach(&container).await;
-        state.runtime.borrow_mut().network = Some(interceptor);
-        if let Err(e) = attached {
-            // The same rule as the post-connect path below: stopping is a
-            // compensation and its failure is not a detail. A sidecar that was
-            // created, possibly half-attached, and then could not be stopped
-            // has no later owner, and `attach` itself reports through
-            // `NetworkAttachNotUndone` whether it left anything behind. The
-            // handle moves to the session's cleanup-only list so teardown
-            // gets one more orderly try at it.
-            if let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await {
-                state.runtime.borrow_mut().containers.abandoned.push(kept);
-                return Err(SidecarAddError::Residue {
-                    source: e.into(),
-                    residue: vec![stopped],
-                });
-            }
-            // Stopping it worked, so the container `attach` was worried about
-            // is gone and so is anything it left on it. What the caller is
-            // told is what stopped the attach, not obligations against
-            // something that no longer exists -- this pairs with "session
-            // unaffected", and the two must not contradict each other.
-            return Err(SidecarAddError::Unwound(
-                outrig::error::superseded_by_a_confirmed_stop(e, name).into(),
-            ));
+    // Slash callbacks run sequentially, so nothing observes the slot the guard
+    // empties; what matters is that it is refilled on every way out, a Ctrl-C
+    // included.
+    let attached = match TakenInterceptor::take(&state.runtime) {
+        Some(mut interceptor) => interceptor.attach(&container).await,
+        None => Ok(()),
+    };
+    if let Err(e) = attached {
+        // The same rule as the post-connect path below: stopping is a
+        // compensation and its failure is not a detail. A sidecar that was
+        // created, possibly half-attached, and then could not be stopped
+        // has no later owner, and `attach` itself reports through
+        // `NetworkAttachNotUndone` whether it left anything behind. The
+        // handle moves to the session's cleanup-only list so teardown
+        // gets one more orderly try at it.
+        if let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await {
+            state.runtime.borrow_mut().containers.abandoned.push(kept);
+            return Err(SidecarAddError::Residue {
+                source: e.into(),
+                residue: vec![stopped],
+            });
         }
+        // Stopping it worked, so the container `attach` was worried about
+        // is gone and so is anything it left on it. What the caller is
+        // told is what stopped the attach, not obligations against
+        // something that no longer exists -- this pairs with "session
+        // unaffected", and the two must not contradict each other.
+        return Err(SidecarAddError::Unwound(
+            outrig::error::superseded_by_a_confirmed_stop(e, name).into(),
+        ));
     }
 
-    let (new_arcs, new_adapters) =
-        match connect_added_sidecar_servers(state, name, &container).await {
-            Ok(connected) => connected,
-            Err(e) => {
-                // Both compensations are attempted and neither failure is
-                // discarded: a detach that failed leaves a live sidecar still
-                // carrying interception that no attachment owns, there is no
-                // retained handle to try again through, and this is the last
-                // place anything is going to notice.
-                let mut detach_failed = None;
-                let taken = state.runtime.borrow_mut().network.take();
-                if let Some(mut interceptor) = taken {
-                    if let Err(detached) = interceptor.detach(container.name()).await {
-                        detach_failed = Some(detached);
-                    }
-                    state.runtime.borrow_mut().network = Some(interceptor);
+    // A no-op on drop when nothing was attached.
+    let attachment = UncommittedAttachment::arm(&state.runtime, container.name());
+    let connected = connect_added_sidecar_servers(state, name, &container).await;
+    // Both ways on from here see to the attachment themselves: the failure
+    // path detaches it in order, and the commit hands it to the session.
+    attachment.disarm();
+    let (new_arcs, new_adapters) = match connected {
+        Ok(connected) => connected,
+        Err(e) => {
+            // Both compensations are attempted and neither failure is
+            // discarded: a detach that failed leaves a live sidecar still
+            // carrying interception that no attachment owns, there is no
+            // retained handle to try again through, and this is the last
+            // place anything is going to notice.
+            let detach_failed = match TakenInterceptor::take(&state.runtime) {
+                Some(mut interceptor) => interceptor.detach(container.name()).await.err(),
+                None => None,
+            };
+            let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await else {
+                // The container is gone, and its namespaces with it -- so
+                // is the interception a failed detach could not undo, and
+                // the rules and resolver it would have undone. Residue is
+                // a claim about what is still running, and there is
+                // nothing: saying otherwise sends someone looking for a
+                // container that no longer exists. Kept as a log line,
+                // because a detach that failed is still worth knowing
+                // about, but it is not what the caller is told.
+                if let Some(detached) = detach_failed {
+                    tracing::warn!(
+                        target: "outrig::cli::run",
+                        sidecar = %name,
+                        "detaching {name:?} failed ({detached}); stopping it \
+                         afterwards worked, so nothing is left behind"
+                    );
                 }
-                let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await else {
-                    // The container is gone, and its namespaces with it -- so
-                    // is the interception a failed detach could not undo, and
-                    // the rules and resolver it would have undone. Residue is
-                    // a claim about what is still running, and there is
-                    // nothing: saying otherwise sends someone looking for a
-                    // container that no longer exists. Kept as a log line,
-                    // because a detach that failed is still worth knowing
-                    // about, but it is not what the caller is told.
-                    if let Some(detached) = detach_failed {
-                        tracing::warn!(
-                            target: "outrig::cli::run",
-                            sidecar = %name,
-                            "detaching {name:?} failed ({detached}); stopping it \
-                             afterwards worked, so nothing is left behind"
-                        );
-                    }
-                    return Err(SidecarAddError::Unwound(e.into()));
-                };
-                // It is still running, so whatever detach could not undo is
-                // still on it.
-                let mut residue: Vec<_> = detach_failed.into_iter().collect();
-                residue.push(stopped);
-                state.runtime.borrow_mut().containers.abandoned.push(kept);
-                return Err(SidecarAddError::Residue { source: e.into(), residue });
-            }
-        };
+                return Err(SidecarAddError::Unwound(e.into()));
+            };
+            // It is still running, so whatever detach could not undo is
+            // still on it.
+            let mut residue: Vec<_> = detach_failed.into_iter().collect();
+            residue.push(stopped);
+            state.runtime.borrow_mut().containers.abandoned.push(kept);
+            return Err(SidecarAddError::Residue { source: e.into(), residue });
+        }
+    };
 
     let container_name = container.name().to_string();
     let server_names: Vec<String> = new_arcs.iter().map(|arc| arc.name().to_string()).collect();
@@ -771,7 +875,7 @@ async fn try_sidecar_add(
             watcher.register_sidecar(sidecar);
         }
     }
-    state.agent.extend_tools(new_adapters);
+    state.agent.extend_mcp_tools(new_adapters);
 
     let mut text = format!(
         "[outrig] sidecar {name} started: {container_name}\n\
@@ -815,7 +919,7 @@ async fn connect_added_sidecar_servers(
         )
         .await
         {
-            Ok(client) => Arc::new(client),
+            Ok(client) => Arc::new(client.with_call_timeout(state.mcp_plan.call_timeout(placed))),
             Err(e) => {
                 failure = Some(e.into());
                 break;
@@ -963,6 +1067,17 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     if !fallbacks.is_empty() {
         let _ = writeln!(buf, "[outrig] model failover:    {}", fallbacks.join(", "));
     }
+    // Where the key goes. The provider *style* above reads the same for any
+    // two endpoints speaking one wire format, so the endpoint itself is the
+    // row that tells them apart. A repo config cannot declare a provider, so
+    // this is always a `base-url` the operator's own file set.
+    let (llm::ResolvedProvider::OpenAi { base_url, .. }
+    | llm::ResolvedProvider::Anthropic { base_url, .. }) = resolved.provider();
+    let _ = writeln!(
+        buf,
+        "[outrig] base-url:          {}",
+        redact_url_userinfo(base_url)
+    );
     let _ = writeln!(
         buf,
         "[outrig] tool-call max:     {}",
@@ -991,6 +1106,29 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
         "[outrig] session id: {session_id}   (Ctrl-D to exit, /help for slash commands)"
     );
     buf
+}
+
+/// `url` with any userinfo replaced by `***`: a gateway configured as
+/// `https://user:secret@proxy.example/v1` sends those credentials with every
+/// request, and the banner names its host and nothing else. Textual rather
+/// than a URL parse, so the operator's own spelling is what prints and a URL
+/// a parser would refuse is left alone.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+    match url[authority_start..authority_end].rfind('@') {
+        Some(at) => format!(
+            "{}***{}",
+            &url[..authority_start],
+            &url[authority_start + at..]
+        ),
+        None => url.to_string(),
+    }
 }
 
 fn build_tools_summary(tools: &[SessionTool]) -> String {
@@ -1198,6 +1336,77 @@ mod tests {
         );
     }
 
+    /// The endpoint is the one fact the provider *style* does not carry, and
+    /// the one a key is posted to, so the banner names it up front. The
+    /// resolved key itself is never part of the banner.
+    #[test]
+    fn the_banner_names_the_base_url() {
+        let mut remote = test_resolved_agent();
+        remote.candidates[0].provider = llm::ResolvedProvider::OpenAi {
+            base_url: "http://127.0.0.1:18081/v1".to_string(),
+            api_key: "sk-PROBE-KEY-123".to_string(),
+            request_timeout_secs: None,
+            retry_budget_secs: None,
+        };
+        let banner = render_test_banner(&remote, "rust-dev", false);
+        assert!(
+            banner.contains("[outrig] base-url:          http://127.0.0.1:18081/v1\n"),
+            "a remote provider names its endpoint: {banner}"
+        );
+        assert!(
+            !banner.contains("sk-PROBE-KEY-123"),
+            "the resolved key never reaches the banner: {banner}"
+        );
+    }
+
+    /// A gateway may carry Basic-auth credentials in its URL, and the client
+    /// sends them with every request; the banner must not repeat them. The
+    /// host and path remain, with a marker where the credentials were.
+    #[test]
+    fn the_banner_masks_credentials_embedded_in_the_base_url() {
+        let mut remote = test_resolved_agent();
+        remote.candidates[0].provider = llm::ResolvedProvider::Anthropic {
+            base_url: "https://gateway-user:SECRET-PASS@proxy.corp.example/anthropic".to_string(),
+            api_key: "sk-PROBE-KEY-123".to_string(),
+            request_timeout_secs: None,
+            retry_budget_secs: None,
+        };
+        let banner = render_test_banner(&remote, "rust-dev", false);
+        assert!(
+            banner.contains(
+                "[outrig] base-url:          https://***@proxy.corp.example/anthropic\n"
+            ),
+            "the host and path remain: {banner}"
+        );
+        assert!(
+            !banner.contains("SECRET-PASS") && !banner.contains("gateway-user"),
+            "neither half of the credential reaches the banner: {banner}"
+        );
+    }
+
+    /// The redaction is textual and touches only the authority: an `@` in a
+    /// path or query is not a credential, a URL without userinfo prints as
+    /// written, and one without a scheme is left alone.
+    #[test]
+    fn url_userinfo_redaction_touches_only_the_authority() {
+        for (url, shown) in [
+            ("https://api.openai.com/v1", "https://api.openai.com/v1"),
+            ("https://token@host.example", "https://***@host.example"),
+            (
+                "https://u:p@host.example:8443/v1?x=a@b#f",
+                "https://***@host.example:8443/v1?x=a@b#f",
+            ),
+            (
+                "https://host.example/path@with@ats",
+                "https://host.example/path@with@ats",
+            ),
+            ("https://host.example/?q=user@x", "https://host.example/?q=user@x"),
+            ("localhost:11434/v1", "localhost:11434/v1"),
+        ] {
+            assert_eq!(redact_url_userinfo(url), shown, "{url}");
+        }
+    }
+
     /// Locks `/help` to the exact text the REPL printed when it owned the
     /// command list (pre-dispatcher `HELP_TEXT`).
     #[test]
@@ -1312,7 +1521,12 @@ mod tests {
                             primary,
                         },
                     ),
-                    agent: llm::RebuildingAgent::new(rig_agent, Vec::new(), resolved),
+                    agent: llm::RebuildingAgent::new(
+                        rig_agent,
+                        Vec::new(),
+                        SharedTools::default(),
+                        resolved,
+                    ),
                     store: SessionStore::new(std::env::temp_dir()),
                     sid: SessionId::from("test".to_string()),
                     cfg: cfg.clone(),
@@ -1412,6 +1626,39 @@ auto = { command = ["mcp-auto"], sidecar = "autos" }
             assert!(text.contains("autos"), "{text}");
             assert!(text.contains("not started"), "{text}");
             assert!(text.contains("servers: fs"), "{text}");
+        }
+
+        /// Ctrl-C drops `/sidecar add` wherever it is waiting, its attach
+        /// included, and the interceptor the add took out of the session has
+        /// to be back anyway (#345). Dropped with the add instead, it would
+        /// undo the primary's interception while the session went on.
+        ///
+        /// Behind `e2e` only because an interceptor needs `nft` and `nsenter`
+        /// on PATH; nothing here starts a container.
+        #[cfg(feature = "e2e")]
+        #[tokio::test]
+        async fn an_interrupted_attach_puts_the_interceptor_back() {
+            let mut fixture = Fixture::new(DECLARED).await;
+            let logs = tempfile::tempdir().expect("tempdir");
+            fixture.runtime.network = Some(
+                NetworkInterceptor::new(logs.path(), "test", fixture.cfg.network.policy())
+                    .await
+                    .expect("an interceptor with nothing attached"),
+            );
+            let state = fixture.state();
+
+            // Dropped where an attach was waiting, the way Ctrl-C drops it.
+            let taken = TakenInterceptor::take(&state.runtime);
+            assert!(taken.is_some());
+            assert!(
+                state.runtime.borrow().network.is_none(),
+                "the add holds the interceptor while it waits"
+            );
+            drop(taken);
+            assert!(
+                state.runtime.borrow().network.is_some(),
+                "the interrupted add lost the session's interceptor"
+            );
         }
 
         #[tokio::test]

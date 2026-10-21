@@ -76,7 +76,7 @@ pub struct RunCommandArgs {
 /// it, or 3 when a session it left open is not proven stopped.
 pub async fn execute(
     repo: &RepoConfig,
-    global_cfg_path: &Path,
+    global_cfg_path: Option<&Path>,
     session_root: Option<&Path>,
     grace: Option<u64>,
     program: &[OsString],

@@ -20,8 +20,9 @@
 //!   `completion_model` (what `build_agent` uses) and
 //!   `CompletionModel::with_model` (which would silently cap replies at 2048);
 //! * the shared retry client covers this provider too -- including that a
-//!   `Retry-After` sets the wait, and that a spent budget ends the turn
-//!   without taking the session with it;
+//!   `Retry-After` sets the wait, that a spent budget ends the turn without
+//!   taking the session with it, and that a redirect loop, which no wait can
+//!   clear, is final at once;
 //! * a `200` carrying no usable content is retried above the HTTP client,
 //!   which is the only place it is visible at all, and ends the turn rather
 //!   than the session when it persists;
@@ -515,9 +516,23 @@ async fn tool_call_cap_applies_to_the_anthropic_path() {
 /// lands. The real wait here is one jittered base delay, at most a second.
 #[tokio::test]
 async fn transient_status_is_retried_at_the_http_layer() {
+    assert_retried_at_the_http_layer("OUTRIG_TEST_ANTHROPIC_RETRY", 503).await;
+}
+
+/// `529` is Anthropic's documented "overloaded" status and sits outside the
+/// standard `5xx` codes, so an explicit list of those once let it end the
+/// session on the first occurrence (#332). Not `start_paused`, as above.
+#[tokio::test]
+async fn overloaded_529_is_retried_at_the_http_layer() {
+    assert_retried_at_the_http_layer("OUTRIG_TEST_ANTHROPIC_RETRY_529", 529).await;
+}
+
+/// One model call answered `status` and then a reply: the turn completes, and
+/// the retry sent the same request again rather than rebuilding the turn.
+async fn assert_retried_at_the_http_layer(var: &str, status: u16) {
     let (addr, mut requests) = start_mock_http(vec![
         CannedResponse::status(
-            503,
+            status,
             json!({
                 "type": "error",
                 "error": { "type": "overloaded_error", "message": "overloaded" },
@@ -527,15 +542,9 @@ async fn transient_status_is_retried_at_the_http_layer() {
     ])
     .await;
 
-    let reply = run_one_turn(
-        addr,
-        "OUTRIG_TEST_ANTHROPIC_RETRY",
-        MODEL,
-        Some(1024),
-        vec![],
-    )
-    .await
-    .expect("the retry should carry the turn through the 503");
+    let reply = run_one_turn(addr, var, MODEL, Some(1024), vec![])
+        .await
+        .expect("the retry should carry the turn through the failed call");
 
     assert_eq!(reply, "Recovered.");
 
@@ -914,6 +923,43 @@ async fn a_rejected_api_key_stays_fatal() {
         drain_recorded(&mut requests).len(),
         1,
         "a 401 is terminal at both retry layers",
+    );
+}
+
+/// A redirect loop is terminal at the transport: reqwest follows it to its
+/// limit and gives up, and a replay would do the same. So it is sent once --
+/// one request and the redirects reqwest follows -- and stays fatal, as a
+/// `401` does, rather than ending only the turn. The budget is the shipped
+/// default, so a loop that is retried runs into the timeout.
+#[tokio::test]
+async fn a_redirect_loop_is_fatal_at_once() {
+    let (addr, mut requests) = start_mock_http(vec![
+        CannedResponse::status(307, json!({})).with_header("Location", "/v1/messages"),
+    ])
+    .await;
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_one_turn(
+            addr,
+            "OUTRIG_TEST_ANTHROPIC_REDIRECT_LOOP",
+            MODEL,
+            Some(1024),
+            vec![],
+        ),
+    )
+    .await
+    .expect("a redirect loop must not be retried for the whole budget")
+    .expect_err("no resend can satisfy a redirect loop, so it must not end up an Ok turn");
+
+    assert!(
+        err.to_string().contains("redirect"),
+        "the error should say a redirect failed: {err}",
+    );
+    let sent = drain_recorded(&mut requests).len();
+    assert!(
+        (2..=11).contains(&sent),
+        "one request and the redirects reqwest follows, once: {sent}",
     );
 }
 

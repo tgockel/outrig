@@ -78,6 +78,97 @@ pub fn sample_session(id: &SessionId) -> Session {
     }
 }
 
+/// What a session writes into its directory beside `session.json`: a log
+/// under `logs/`, and the `outrig-enter` launcher a `view = "primary"` sidecar
+/// runs.
+#[allow(dead_code)]
+pub fn write_outrig_entries(dir: &Path) {
+    std::fs::create_dir_all(dir.join("logs")).expect("mkdir logs");
+    std::fs::write(dir.join("logs/fs.stderr"), b"server stderr\n").expect("write log");
+    std::fs::write(dir.join("outrig-enter"), b"\x7fELF").expect("write launcher");
+}
+
+/// Files a session directory holds beside what outrig itself writes there:
+/// the page `scripts/render-session.py` renders, and a directory of anything
+/// else put there after the session started.
+#[allow(dead_code)]
+pub fn write_other_files(dir: &Path) {
+    std::fs::write(dir.join("report.html"), b"<!doctype html>\n").expect("write report");
+    std::fs::create_dir_all(dir.join("notes")).expect("mkdir notes");
+    std::fs::write(dir.join("notes/todo.md"), b"- look at this\n").expect("write note");
+}
+
+/// The mcp-fs fixture: a `Dockerfile` whose image carries
+/// `mcp-server-filesystem`, the server the e2e tests drive.
+#[allow(dead_code)]
+pub fn fixture_mcp_fs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("outrig-cli is under crates/")
+        .join("outrig/tests/fixtures/mcp-fs")
+}
+
+/// Ceiling for an e2e wait on a live `outrig` process or on podman.
+#[allow(dead_code)]
+pub const E2E_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wait for a stderr line starting with `prefix`, and return the rest of it,
+/// trimmed.
+#[allow(dead_code)]
+pub async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            {
+                let snapshot = stderr.lock().unwrap().clone();
+                if let Some(value) = snapshot
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+                {
+                    return value.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
+}
+
+/// The names of every container, running or not, that `filter` selects.
+#[allow(dead_code)]
+pub async fn podman_names(filter: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("podman")
+        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Wait until no container by any of `names` exists.
+#[allow(dead_code)]
+pub async fn wait_until_gone(names: &[String]) {
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            let mut alive = Vec::new();
+            for name in names {
+                let found = podman_names(&format!("name={name}")).await;
+                alive.extend(found);
+            }
+            if alive.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("containers {names:?} were not reaped within {E2E_TIMEOUT:?}"));
+}
+
 /// Drain `reader` line-by-line, mirroring each line to the test runner's
 /// stderr (so a hang dumps everything-so-far) and into the shared `sink`
 /// buffer for later assertions. `label` distinguishes which stream a line
@@ -351,6 +442,19 @@ pub fn drain_recorded(
     out
 }
 
+/// The next request the mock records, waited for: [`drain_recorded`] for a
+/// test that has to know a request arrived before it acts -- a held model
+/// call it is about to interrupt, most usefully.
+#[allow(dead_code)]
+pub async fn next_recorded(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) -> RecordedRequest {
+    tokio::time::timeout(E2E_TIMEOUT, rx.recv())
+        .await
+        .expect("the mock received a request in time")
+        .expect("the mock is serving")
+}
+
 /// Set an environment variable for a test.
 ///
 /// SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
@@ -504,6 +608,47 @@ provider   = "openai"
 identifier = "test-model"
 "#;
 
+/// An image no registry holds, so the stubbed podman fails on it at once.
+#[allow(dead_code)]
+pub const ABSENT_IMAGE: &str = "localhost/outrig-test-absent:latest";
+
+/// A fixture repo at `<tmp>/repo`, with the rest of `<tmp>` for what a session
+/// must not be able to rewrite. The repo is the workspace outrig mounts
+/// read-write by default, so a global config inside it would let the agent
+/// rewrite what the next session loads, and `run` and `mcp` refuse that layout
+/// (#609). Keep the global config beside the repo, as an operator's is.
+#[allow(dead_code)]
+pub struct RepoDir {
+    tmp: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+#[allow(dead_code)]
+impl RepoDir {
+    pub fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir repo");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        Self { tmp, repo }
+    }
+
+    /// The repo: the session's working directory and workspace.
+    pub fn path(&self) -> &Path {
+        &self.repo
+    }
+
+    /// `name` in the directory holding the repo, outside the workspace.
+    pub fn beside(&self, name: &str) -> PathBuf {
+        self.tmp.path().join(name)
+    }
+}
+
+/// `path` as the `&str` an argument list wants.
+#[allow(dead_code)]
+pub fn utf8(path: &Path) -> &str {
+    path.to_str().expect("utf-8")
+}
+
 /// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
 /// probes and pulls fail instantly instead of hitting the network. Each call
 /// is appended to `<dir>/runtime.log`, so a test can say none was made.
@@ -542,10 +687,25 @@ pub async fn run_outrig_with_env(
     args: &[&str],
     env: &[(&str, &Path)],
 ) -> (bool, String) {
+    let output = run_outrig_output(cwd, args, env).await;
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// [`run_outrig_with_env`], returning the whole `Output` for a test that reads
+/// stdout as well.
+#[allow(dead_code)]
+pub async fn run_outrig_output(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> std::process::Output {
     let stubs = tempfile::tempdir().expect("tempdir stubs");
     let cache = tempfile::tempdir().expect("tempdir cache");
 
-    let output = tokio::time::timeout(
+    tokio::time::timeout(
         RUN_OUTRIG_TIMEOUT,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_outrig"))
             .args(args)
@@ -559,10 +719,51 @@ pub async fn run_outrig_with_env(
     )
     .await
     .expect("outrig timed out")
-    .expect("spawn outrig");
+    .expect("spawn outrig")
+}
 
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+/// The startup progress lines `outrig run` prints on stderr, in order, from
+/// the first one to the one that opens the REPL, each as far as it is the same
+/// from one run to the next. `run_smoke` holds the binary to it and
+/// `doc_contracts` holds the transcript on `doc/usage/run.md` to it, so
+/// neither can lose a step the other still shows.
+#[allow(dead_code)]
+pub const STARTUP_PHASES: &[&str] = &[
+    "[outrig] loading config",
+    "[outrig] config loaded",
+    "[outrig] workspace:",
+    "[outrig] resolving agent and container",
+    "[outrig] agent/container resolved",
+    "[outrig] computing image tag",
+    "[outrig] image tag computed",
+    "[outrig] ensuring image",
+    "[outrig] image ready:",
+    "[outrig] starting container",
+    "[outrig] container ready:",
+    "[outrig] bootstrapping container user",
+    "[outrig] container user ready",
+    "[outrig] reading and merging MCP configuration",
+    "[outrig] MCP configuration ready:",
+    "[outrig] MCP fs: initializing",
+    "[outrig] MCP fs: initialized",
+    "[outrig] MCP fs: listing tools",
+    "[outrig] MCP fs: tools ready",
+    "[outrig] building agent",
+    "[outrig] agent ready",
+    "[outrig] agent:",
+    "[outrig] base-url:",
+    "[outrig] entering REPL",
+];
+
+/// Panics unless every needle occurs in `text`, each after the one before it.
+#[allow(dead_code)]
+pub fn assert_lines_in_order(text: &str, needles: &[&str]) {
+    let mut offset = 0;
+    for needle in needles {
+        let haystack = &text[offset..];
+        let Some(pos) = haystack.find(needle) else {
+            panic!("text lacked ordered startup line {needle:?}: {text}");
+        };
+        offset += pos + needle.len();
+    }
 }

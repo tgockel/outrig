@@ -32,6 +32,10 @@ Because it borrows the parent's MCP connections, launching one starts no contain
 server. That keeps the [MCP trust model](mcp-trust-model.md) invariant intact: a subagent can only
 reach tools the operator already granted the session.
 
+The tools are the session's as they stand at launch. A sidecar started with `/sidecar add` joins
+them for every subagent launched after it, at any depth. A subagent already running keeps the
+tools it was launched with; release it and launch it again to give it the new ones.
+
 ## The tools
 
 ```
@@ -72,7 +76,11 @@ alias is offered when **at least one** of its candidates is reachable in this bu
 lets `alias = ["opus-bedrock", "opus-anthropic"]` stay launchable on a machine with only
 `ANTHROPIC_API_KEY` set, where naming `opus-bedrock` directly would not be. A launch under an
 alias reports the hop it took -- `(model: cheap -> fast)` -- in the launch trace, the tool result,
-and the transcript header, so the answer to "which model actually ran" is never inferred.
+and the transcript header, which name the candidate the subagent *starts* on. An alias that lists
+more than one can move mid-round, so the transcript also records each round a later candidate
+answered: an `--- answered by ---` block naming every model that answered a call that round, in
+the order the alias lists them. A round the first candidate answered throughout adds nothing.
+Together they mean the answer to "which model actually ran" is never inferred.
 
 This is for delegating mechanical work. Grepping a tree, summarizing logs, or checking whether a
 symbol is still used does not need the parent's expensive reasoning model, and moving it to a cheap
@@ -144,15 +152,27 @@ body and fails the same way, so retrying only spends model calls:
 | 3rd     | The failure has been reported upward already -- stop calling.               |
 | 4th on  | The same refusal, unchanged.                                                |
 
+When the round has already reported and the parent sent nothing after that report, the earlier
+report stands and the 1st and 2nd asks say so instead: shorten the revision if it matters, or
+stop calling. They never ask for `status: "error"`, because a short error that fits would replace
+the report in the inbox. If the parent did send something after the report, the report is no
+answer to it, and the table above applies as written.
+
 The third attempt is what makes this end. OutRig publishes the truncation as that round's outcome
 on the subagent's behalf, so a parent blocked in `outrig__get_result` wakes with the cause
 immediately instead of once the subagent's whole tool-call budget has drained into one call that
 could not succeed.
 
-Having given up, the round stays given up: it publishes and warns once, and every later truncated
-call gets the same refusal. That refusal is a tool *failure*, not a success, so identical repeats
-keep accumulating against the breaker below -- which is what ends the round if the subagent will
-not take the hint.
+Unless the round has reported already: a report that fit stands, and a later one that will not
+fit does not replace it. The subagent is told its earlier report stands instead, and the give-up
+is noted on stderr and in the subagent's transcript. If the parent sent a message after the
+report, the report is no answer to it, so the parent reads the report if it had not, then, once
+the round ends, that the subagent's report did not fit.
+
+Having given up, the round stays given up: it publishes, or keeps the report, and warns once, and
+every later truncated call gets the same refusal. That refusal is a tool *failure*, not a success,
+so identical repeats keep accumulating against the breaker below -- which is what ends the round if
+the subagent will not take the hint.
 
 The durable fix is a bigger ceiling. `max-tokens` is unset by default, which leaves the limit to
 the provider, and that default can be much lower than expected behind a gateway. The first
@@ -209,8 +229,12 @@ outrig__get_result({"name": "audit-mcp"})
 ```
 
 > A subagent that is ready and left uncollected stays ready. Keep passing its name to
-> `outrig__wait_results` and every call returns it immediately and never blocks for the others --
-> drop names once they have been collected.
+> `outrig__wait_results` and every call returns it immediately and never blocks for the others.
+>
+> Once collected, a name counts again only when that subagent reports again. One still working is
+> waited on. One that is idle is not: only `outrig__subagent_send` gives it something new to
+> report, and the parent cannot send while it waits, so it neither counts toward `min_count` nor
+> appears in the answer. A call naming only such subagents fails rather than block.
 
 ### Subagents stay addressable
 

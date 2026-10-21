@@ -26,7 +26,7 @@ use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_t
 use crate::engine_env;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
-use crate::supervise::{CleanupGuard, Reissue};
+use crate::supervise::{CLEANUP_RETRIES, CleanupGuard, RETRY_BACKOFF, Reissue};
 
 /// Repository used for build-type images that have no image-config name (the
 /// nameless library path: [`crate::Outrig::launch`] with a raw build spec).
@@ -58,7 +58,7 @@ const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
 /// -- so erring long costs a process that lingers, and erring short costs the
 /// leak this exists to prevent. Measured on buildah 1.33.7, the whole unwind
 /// takes about 200 ms.
-const BUILD_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const BUILD_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(any(test, feature = "e2e"))]
 tokio::task_local! {
@@ -83,8 +83,10 @@ tokio::task_local! {
 /// Not a guarantee, and deliberately not described as one. Outside a `RUN`
 /// -- during a pull, a `COPY`, the final commit, or the seam between two
 /// `RUN`s -- buildah has no handler registered and dies where it stands, and
-/// so does it if outrig's runtime goes away inside the grace. What is left
-/// over is what `outrig clean --build-containers` exists to collect.
+/// so does it if outrig's runtime goes away inside the grace, which a caller
+/// that [abandons](crate::Abandonable) the build rather than dropping it waits
+/// out. What is left over is what `outrig clean --build-containers` exists to
+/// collect.
 fn build_termination() -> process::Termination {
     #[cfg(any(test, feature = "e2e"))]
     if FORCE_UNGRACEFUL_BUILD.try_with(|()| ()).is_ok() {
@@ -165,6 +167,21 @@ pub struct ImageBuildOutcome {
     pub cache_hit: bool,
 }
 
+/// Where a cache-miss `buildah build` or `podman pull` writes its output
+/// while it runs. See [`ensure_tagged_image_for_with_output`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildOutput {
+    /// Held in memory. A failure carries the last 1 MiB of stderr.
+    Captured,
+    /// Each line to this process's stderr as `[buildah] <line>` (or
+    /// `[podman] <line>` for a pull) as it arrives, so a build that takes
+    /// minutes is seen to be running. Once: a [`Transcript`] that already
+    /// mirrors to stderr suppresses the live copy. A failure carries no
+    /// stderr tail, because the lines are already above it.
+    Stderr,
+}
+
 pub(crate) struct CacheKey;
 
 impl CacheKey {
@@ -185,11 +202,7 @@ impl CacheKey {
             .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
-        let mut block = String::new();
-        for (k, v) in build_args {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
+        hash_pairs(build_args, &mut hasher);
 
         hash_context(context, &mut hasher).await?;
 
@@ -217,24 +230,47 @@ impl CacheKey {
             .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
-        let mut block = String::new();
-        for (k, v) in build_args {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
-
-        let mut block = String::new();
-        block.push_str("\n[outrig-labels]\n");
-        for (k, v) in labels {
-            let _ = writeln!(block, "{k}={v}");
-        }
-        hasher.update(block.as_bytes());
+        hash_pairs(build_args, &mut hasher);
+        hasher.update(b"\n[outrig-labels]\n");
+        hash_pairs(labels, &mut hasher);
 
         hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
     }
+}
+
+/// `pairs` as the lines a cache key hashes: `key=value` and a newline each, in key order.
+///
+/// A backslash or newline in a key or value is written `\\` or `\n`, so a line holds one pair
+/// and a value cannot spell the next. A pair with neither is written as it always was. A key
+/// holding `=` needs no escape: buildah splits `--build-arg` at the first one, so `A=1`/`x` and
+/// `A`/`1=x` reach it as the same argument.
+fn pairs_block(pairs: &BTreeMap<String, String>) -> String {
+    let escape = |s: &str| s.replace('\\', r"\\").replace('\n', r"\n");
+    let mut block = String::new();
+    for (k, v) in pairs {
+        let _ = writeln!(block, "{}={}", escape(k), escape(v));
+    }
+    block
+}
+
+/// Hash `pairs` as [`pairs_block`] writes them, after a `0xFF` byte if it escaped anything.
+///
+/// Escaping writes a newline as a backslash and an `n`, and a backslash as two. Those are the
+/// bytes a release before the escaping hashed for a backslash and an `n`, and for two backslashes.
+/// The image store outlives an upgrade and a cache probe asks only whether a tag exists, so a key
+/// computed from them would reuse the image built for the other value. That release hashed only
+/// UTF-8 text here, which never holds `0xFF`, so the byte keeps an escaped block from matching
+/// anything it hashed. A backslash gets into the block only as an escape, so a block without one
+/// is hashed as it always was, and an image whose pairs hold neither character keeps its tag.
+fn hash_pairs(pairs: &BTreeMap<String, String>, hasher: &mut blake3::Hasher) {
+    let block = pairs_block(pairs);
+    if block.contains('\\') {
+        hasher.update(b"\xff");
+    }
+    hasher.update(block.as_bytes());
 }
 
 /// Resolve `build-args` for an image-config. Literal values pass through;
@@ -363,10 +399,30 @@ async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) ->
 
 /// Ensure `tag` exists in Podman's local image store without pulling it.
 ///
-/// This is used for raw CLI image references: once a value failed to match an
+/// This is used for raw image references: once a value failed to match an
 /// `[images.<name>]` config block, OutRig should behave like `podman run` with
-/// `--pull=never` and accept only already-local images.
+/// `--pull=never` and accept only already-local images. A miss does not say
+/// who asked for the ref; [`ensure_local_image_requested_by`] does.
 pub async fn ensure_local_image(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_local_image_with_requester(None, tag, transcript).await
+}
+
+/// [`ensure_local_image`] whose miss names `requester` -- where the ref was
+/// written, such as `--image` or `[sidecars.tools]` -- so the error points at
+/// the setting to look at rather than at one the user may never have used.
+pub async fn ensure_local_image_requested_by(
+    requester: &str,
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_local_image_with_requester(Some(requester), tag, transcript).await
+}
+
+async fn ensure_local_image_with_requester(
+    requester: Option<&str>,
     tag: &ImageTag,
     transcript: Option<&Transcript>,
 ) -> Result<ImageBuildOutcome> {
@@ -377,11 +433,27 @@ pub async fn ensure_local_image(
             cache_hit: true,
         });
     }
-    Err(OutrigError::Configuration(format!(
-        "--image {:?} did not match any [images.<name>] and local podman image {:?} was not found",
-        tag.as_str(),
-        tag.as_str()
+    Err(OutrigError::Configuration(local_image_missing(
+        requester, tag,
     )))
+}
+
+/// The miss message: what was asked for and by whom, why it was refused, and
+/// the command that fixes it. A raw ref is never pulled (see
+/// [`ensure_local_image`]), so the fix is the user's to run -- and is meant to
+/// be pasted, so the ref is rendered as the one literal argument it is rather
+/// than interpolated: a config accepts any nonblank ref, `$(...)` included.
+fn local_image_missing(requester: Option<&str>, tag: &ImageTag) -> String {
+    let image = tag.as_str();
+    let from = requester
+        .map(|requester| format!(" (from {requester})"))
+        .unwrap_or_default();
+    let pull = Cmd::new("podman").arg("pull").arg(image).render();
+    format!(
+        "image {image:?}{from} is not an [images.<name>] and is not in podman's local image \
+         store; outrig does not pull a raw image ref, so run `{pull}` (or build and tag it) \
+         first"
+    )
 }
 
 /// Pull an image by ref via `podman pull`. Stderr is streamed to
@@ -396,13 +468,39 @@ pub async fn pull_image(tag: &ImageTag) -> Result<()> {
 }
 
 /// Logged sibling of [`pull_image`] for session startup.
-async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
-    process::run_capture_logged(
+async fn pull_image_logged(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+    output: BuildOutput,
+) -> Result<()> {
+    run_shown_or_captured(
         Cmd::new("podman").arg("pull").arg(tag.as_str()),
         "podman",
         transcript,
+        process::Termination::Kill,
+        output,
     )
-    .await?;
+    .await
+}
+
+/// The one dispatch on [`BuildOutput`], so the two commands it governs
+/// cannot disagree about what each variant means.
+async fn run_shown_or_captured(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    termination: process::Termination,
+    output: BuildOutput,
+) -> Result<()> {
+    match output {
+        BuildOutput::Captured => {
+            process::run_capture_logged_terminating(cmd, prefix, transcript, termination, false)
+                .await?;
+        }
+        BuildOutput::Stderr => {
+            process::run_capture_shown(cmd, prefix, transcript, termination).await?;
+        }
+    }
     Ok(())
 }
 
@@ -416,7 +514,7 @@ pub async fn build_image_for(
     no_cache: bool,
 ) -> Result<()> {
     let build_args = resolve_build_args(image, cfg)?;
-    build_image_with_build_args(cfg, repo_root, tag, no_cache, &build_args).await
+    build_image_with_build_args(image, cfg, repo_root, tag, no_cache, &build_args).await
 }
 
 /// Run `build` against a temporary tag, and own that tag whatever happens to
@@ -429,53 +527,75 @@ pub async fn build_image_for(
 /// because a cancellation landing inside that cleanup is the case the guard is
 /// for. Three call sites got that right independently; one is easier to keep
 /// right.
+///
+/// `build` is handed a list for removals it could not finish and that the
+/// tag's removal has to wait for: buildah will not remove an image a working
+/// container was made from. Those are retried here, awaited and in order, ahead
+/// of the tag's own, so they finish before this returns -- a CLI that exits on
+/// the build's error would take a background reaper, and the `rmi` queued
+/// behind the `rm`, with it. Only what the retries cannot clear is detached.
 async fn into_temp_tag<F>(tag: &ImageTag, transcript: Option<&Transcript>, build: F) -> Result<()>
 where
-    F: AsyncFnOnce(&ImageTag) -> Result<()>,
+    F: AsyncFnOnce(&ImageTag, &mut Vec<Owed>) -> Result<()>,
 {
     let temp_tag = temporary_build_tag(tag);
     let temp_owned = temp_tag_guard(&temp_tag);
-    let result = build(&temp_tag).await;
-    discharge(temp_owned, "image not known", transcript).await;
+    let mut first = Vec::new();
+    let result = build(&temp_tag, &mut first).await;
+    if first.is_empty() {
+        discharge(temp_owned, "image not known", transcript).await;
+    } else {
+        // No lone `rmi` first: it would be refused as in use.
+        first.push(Owed {
+            guard: temp_owned,
+            absent: "image not known",
+        });
+        discharge_in_order(first, transcript).await;
+    }
     result
 }
 
 async fn build_image_with_build_args(
+    image: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
-    into_temp_tag(tag, None, async |temp_tag| {
+    into_temp_tag(tag, None, async |temp_tag, owed_first| {
         process::run_streamed_checked(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
             build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, cfg.mcp(), None).await
+        stamp_repo_image_labels(image, temp_tag, tag, cfg.mcp(), None, owed_first).await
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_image_logged_with_build_args(
+    image: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
     build_args: &BTreeMap<String, ResolvedEnvValue>,
+    output: BuildOutput,
 ) -> Result<()> {
-    into_temp_tag(tag, transcript, async |temp_tag| {
-        process::run_capture_logged_terminating(
+    into_temp_tag(tag, transcript, async |temp_tag, owed_first| {
+        run_shown_or_captured(
             build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
             transcript,
             build_termination(),
+            output,
         )
         .await?;
-        stamp_repo_image_labels(temp_tag, tag, cfg.mcp(), transcript).await
+        stamp_repo_image_labels(image, temp_tag, tag, cfg.mcp(), transcript, owed_first).await
     })
     .await
 }
@@ -527,7 +647,7 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            build_image_with_build_args(cfg, repo_root, &tag, no_cache, &build_args).await?;
+            build_image_with_build_args(image, cfg, repo_root, &tag, no_cache, &build_args).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,
@@ -541,6 +661,9 @@ async fn ensure_image_for(
 /// framed against the selected image-config. This lets session startup
 /// write a complete `session.json` and open `logs/container.log` before the
 /// buildah probe/build begins, without hashing the Dockerfile/context twice.
+///
+/// A cache miss's build or pull is captured; see
+/// [`ensure_tagged_image_for_with_output`] to show it as it runs.
 pub async fn ensure_tagged_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -548,6 +671,35 @@ pub async fn ensure_tagged_image_for(
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    ensure_tagged_image_for_with_output(
+        image,
+        cfg,
+        repo_root,
+        tag,
+        no_cache,
+        transcript,
+        BuildOutput::Captured,
+    )
+    .await
+}
+
+/// [`ensure_tagged_image_for`] with a say in where a cache miss's `buildah
+/// build` or `podman pull` writes its output while it runs.
+///
+/// Only that one command honors `output`. The cache probe, the label commit
+/// that follows a build, and the `$ <cmd>` echo of each command are recorded
+/// by `transcript` alone, so what [`BuildOutput::Stderr`] adds to a plain
+/// session is the build itself and nothing a `--verbose` transcript would
+/// not also carry.
+pub async fn ensure_tagged_image_for_with_output(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+    transcript: Option<&Transcript>,
+    output: BuildOutput,
 ) -> Result<ImageBuildOutcome> {
     match cfg.source() {
         ImageSourceRef::Image { .. } => {
@@ -558,7 +710,7 @@ pub async fn ensure_tagged_image_for(
                     cache_hit: true,
                 });
             }
-            pull_image_logged(tag, transcript).await?;
+            pull_image_logged(tag, transcript, output).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag: tag.clone(),
@@ -575,12 +727,14 @@ pub async fn ensure_tagged_image_for(
                 });
             }
             build_image_logged_with_build_args(
+                image,
                 cfg,
                 repo_root,
                 tag,
                 no_cache,
                 transcript,
                 &build_args,
+                output,
             )
             .await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
@@ -624,7 +778,7 @@ pub async fn build_standalone(
     // removing the temporary one leaves the image under the caller's. On the
     // path where the build never reached the tag, it is a real delete --
     // which is what the guard is for.
-    into_temp_tag(tag, None, async |temp_tag| {
+    into_temp_tag(tag, None, async |temp_tag, _owed_first| {
         // `--label` stays on the build. The cached path commits its labels
         // afterwards because it has to merge the Dockerfile's own against the
         // config's; a standalone project has its whole label set up front.
@@ -939,15 +1093,24 @@ fn temp_nonce() -> u128 {
     u128::from_be_bytes(buf)
 }
 
+/// Merge `source_tag`'s own `org.outrig.mcp` label with `config_mcp` and commit
+/// the result as `final_tag`.
+///
+/// `image` is the image-config's name, and it -- not `source_tag` -- is what a
+/// label that will not decode is reported against. `source_tag` is this
+/// build's temporary tag, which [`into_temp_tag`] removes before the caller
+/// sees the error.
 async fn stamp_repo_image_labels(
+    image: &str,
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     config_mcp: &BTreeMap<String, McpServerSpec>,
     transcript: Option<&Transcript>,
+    owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
-    let labels = merged_mcp_config_to_labels(source_tag.as_str(), &inherited, config_mcp)?;
-    commit_image_with_labels(source_tag, final_tag, &labels, transcript).await
+    let labels = merged_mcp_config_to_labels(image, &inherited, config_mcp)?;
+    commit_image_with_labels(source_tag, final_tag, &labels, transcript, owed_first).await
 }
 
 async fn commit_image_with_labels(
@@ -955,6 +1118,7 @@ async fn commit_image_with_labels(
     final_tag: &ImageTag,
     labels: &BTreeMap<String, String>,
     transcript: Option<&Transcript>,
+    owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let builder = temporary_builder_name();
     // `outrig-label-<pid>-<nonce>`, so likewise this build's alone.
@@ -993,14 +1157,22 @@ async fn commit_image_with_labels(
     }
     .await;
 
-    // `commit --rm` takes the working container on the success path, and
-    // `discharge` on the failure path. A reissue that leaves races the
-    // caller's `rmi` of the image this container was made from, which buildah
-    // refuses as in use if it loses -- so that guard stays armed too, and its
-    // backed-off retries land once the container is gone.
+    // `commit --rm` takes the working container on the success path, and the
+    // awaited removal on the failure path. One buildah refuses is handed to
+    // the caller still armed rather than reissued here: the caller's `rmi` of
+    // the image this container was made from is refused as in use until the
+    // container is gone, so the two are detached as one chain, `rm` first,
+    // and the `rmi` gets its whole retry budget after the `rm` is done.
     match result {
         Ok(()) => builder_owned.release(),
-        Err(_) => discharge(builder_owned, "container not known", transcript).await,
+        Err(_) => owed_first.extend(
+            try_remove(builder_owned, "container not known", transcript)
+                .await
+                .map(|(guard, _)| Owed {
+                    guard,
+                    absent: "container not known",
+                }),
+        ),
     }
     result
 }
@@ -1022,11 +1194,75 @@ async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Resul
 /// failure is warned about rather than returned: the caller is holding the
 /// build's own result, which a cleanup failure must not replace.
 async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transcript>) {
+    if let Some((guard, failure)) = try_remove(guard, absent, transcript).await {
+        warn_left_behind(&failure);
+        drop(guard);
+    }
+}
+
+/// A removal that is owed, and the stderr [`left_nothing`] reads as its target
+/// already being gone.
+///
+/// A struct, not a `(CleanupGuard, &'static str)` tuple: [`into_temp_tag`]'s
+/// async closure takes a `&mut Vec<Owed>`, and a lifetime in that argument
+/// type -- even `'static` -- fails the `Send` a spawned session start asks of
+/// every build future, which the compiler checks for any lifetime in its
+/// place. A named type carries none.
+struct Owed {
+    guard: CleanupGuard,
+    absent: &'static str,
+}
+
+/// Run each removal in `owed` awaited, in order, retrying a refused one on the
+/// schedule [`supervise`](crate::supervise) gives a detached cleanup, and only
+/// then move on to the next.
+///
+/// What still will not go after its retries is detached, still in order, so a
+/// later one is not raced against an earlier one that is still owed.
+async fn discharge_in_order(owed: Vec<Owed>, transcript: Option<&Transcript>) {
+    let mut left = Vec::new();
+    for Owed { guard, absent } in owed {
+        let mut guard = Some(guard);
+        let mut backoff = RETRY_BACKOFF;
+        for attempt in 0..=CLEANUP_RETRIES {
+            let Some(owed) = guard.take() else { break };
+            match try_remove(owed, absent, transcript).await {
+                None => {}
+                Some((still_owed, failure)) => {
+                    if attempt == CLEANUP_RETRIES {
+                        warn_left_behind(&failure);
+                    } else {
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                    guard = Some(still_owed);
+                }
+            }
+        }
+        left.extend(guard);
+    }
+    CleanupGuard::detach_chain(left);
+}
+
+fn warn_left_behind(failure: &OutrigError) {
+    tracing::warn!(
+        target: "outrig::image",
+        "a build cleanup left its target behind; reissuing it in the background: {failure}"
+    );
+}
+
+/// One awaited attempt at `guard`'s removal: `None` once it left nothing
+/// behind, otherwise the guard still armed, with why it did.
+async fn try_remove(
+    guard: CleanupGuard,
+    absent: &str,
+    transcript: Option<&Transcript>,
+) -> Option<(CleanupGuard, OutrigError)> {
     let cmd = guard.removal().clone();
     let failure = match process::try_capture_logged(cmd.clone(), "buildah", transcript).await {
         Ok(output) if left_nothing(&output, absent) => {
             guard.release();
-            return;
+            return None;
         }
         Ok(output) => cmd.process_error(
             output.status.code(),
@@ -1034,10 +1270,7 @@ async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transc
         ),
         Err(e) => e,
     };
-    tracing::warn!(
-        target: "outrig::image",
-        "a build cleanup left its target behind; reissuing it in the background: {failure}"
-    );
+    Some((guard, failure))
 }
 
 /// Whether a removal's output shows its target gone: removed now, or never
@@ -1147,12 +1380,14 @@ async fn is_worktree_root(dir: &Path) -> Result<bool> {
 }
 
 /// Hash every file in a git-hosted `ctx` that no ignore rule excludes, tracked
-/// or not, each by its context-relative path, `st_mode`, and content.
+/// or not, each by its context-relative path, `st_mode`, and content, and every
+/// directory no rule excludes, empty ones included, by path and `st_mode`.
 ///
 /// buildah is handed the whole directory, so that is the set a `COPY` can
 /// reach, less what `.gitignore` excludes: build output (`target/`,
 /// `node_modules/`) stays out so it cannot bust the cache. The mode carries
-/// both the file type and the permission bits `COPY` preserves.
+/// both the file type and the permission bits `COPY` preserves. Directories
+/// come from [`context_dirs`], not git's listing.
 ///
 /// Where the rules exclude every file -- the context sits under an ignored
 /// directory, as `.agents/` kept out of version control would, or every file
@@ -1192,14 +1427,41 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
     .await
     .expect("context hashing task panicked")?;
 
-    // Nothing left, or only what a rule excludes: the whole tree counts.
+    // Nothing left, or only what a rule excludes: the whole tree counts, and
+    // so does its own mode, which `TreeHasher::dir` leaves to a parent.
     if entries
         .iter()
         .all(|(rel, ..)| excluded.binary_search(rel).is_ok())
     {
-        hasher.update(hash_whole_tree(ctx, dir).await?.as_bytes());
+        let root = tokio::fs::symlink_metadata(&tree)
+            .await
+            .path_ctx("stat", &tree)?;
+        update_record(hasher, b"", root.mode(), &hash_whole_tree(ctx, dir).await?);
         return Ok(());
     }
+
+    // Asked only here: from a directory below an ignored one, which the
+    // whole-tree case above covers, git exits 128.
+    let ignored = ls_files(
+        &tree,
+        &["--others", "--ignored", "--exclude-standard", "--directory"],
+    )
+    .await?;
+    // A nested repository is walked by its own call, under its own rules.
+    let skip: HashSet<Vec<u8>> = ignored
+        .iter()
+        .filter_map(|rel| rel.strip_suffix(b"/"))
+        .chain(
+            entries
+                .iter()
+                .filter(|(.., entry)| matches!(entry, ContextEntry::Dir))
+                .map(|(rel, ..)| rel.strip_suffix(b"/").unwrap_or(rel)),
+        )
+        .map(<[u8]>::to_vec)
+        .collect();
+    let dirs = tokio::task::spawn_blocking(move || context_dirs(&tree, &skip))
+        .await
+        .expect("context hashing task panicked")?;
 
     for (rel, mode, entry) in entries {
         let digest = match entry {
@@ -1221,14 +1483,93 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
                 }
             }
         };
-        // Everything after the NUL-terminated path is fixed-width, so two
-        // different listings cannot feed the same stream.
-        hasher.update(&rel);
-        hasher.update(b"\0");
-        hasher.update(&mode.to_le_bytes());
-        hasher.update(digest.as_bytes());
+        update_record(hasher, &rel, mode, &digest);
+    }
+    for (rel, mode) in dirs {
+        update_record(hasher, &rel, mode, &NO_CONTENT);
     }
     Ok(())
+}
+
+/// One entry of the context stream. Everything after the NUL-terminated path is
+/// fixed-width, so two different listings cannot feed the same stream.
+fn update_record(hasher: &mut blake3::Hasher, rel: &[u8], mode: u32, digest: &blake3::Hash) {
+    hasher.update(rel);
+    hasher.update(b"\0");
+    hasher.update(&mode.to_le_bytes());
+    hasher.update(digest.as_bytes());
+}
+
+/// The digest of an entry with no content to read: a directory, FIFO, socket,
+/// or device.
+const NO_CONTENT: blake3::Hash = blake3::Hash::from_bytes([0; 32]);
+
+/// Every directory under `tree`, itself included, that no ignore rule
+/// excludes, as its path relative to `tree` (empty for `tree`) and its
+/// `st_mode`. Empty ones count: buildah copies them, and git, which tracks
+/// files, lists neither them nor any directory's mode.
+///
+/// `skip` holds the paths, relative to `tree`, that are not walked: directories
+/// the rules exclude, and those a nested repository or submodule owns. `.git`
+/// and symlinks are not walked either.
+fn context_dirs(tree: &Path, skip: &HashSet<Vec<u8>>) -> Result<Vec<(Vec<u8>, u32)>> {
+    let mut dirs = Vec::new();
+    // Next to visit last, so names come out sorted.
+    let mut pending = vec![Vec::new()];
+    while let Some(rel) = pending.pop() {
+        let path = tree.join(OsStr::from_bytes(&rel));
+        // A directory under one the build user cannot search has no mode to
+        // read; its parent's record is all of it that shows.
+        let Some(meta) = unless_denied(std::fs::symlink_metadata(&path), "stat", &path)? else {
+            continue;
+        };
+        dirs.push((rel.clone(), meta.mode()));
+
+        // Keyed but not opened, as `git ls-files` does.
+        let Some(entries) = unless_denied(std::fs::read_dir(&path), "read", &path)? else {
+            continue;
+        };
+        let mut children = Vec::new();
+        for entry in entries {
+            let entry = entry.path_ctx("read", &path)?;
+            let Some(file_type) = unless_denied(entry.file_type(), "stat", &path)? else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let mut child = rel.clone();
+            if !child.is_empty() {
+                child.push(b'/');
+            }
+            child.extend_from_slice(name.as_bytes());
+            if !skip.contains(&child) {
+                children.push(child);
+            }
+        }
+        children.sort_unstable();
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(dirs)
+}
+
+/// `None` for what the build user may not look at. git warns and carries on
+/// there, and a root-owned volume in a context must not fail a build that
+/// worked.
+fn unless_denied<T>(
+    result: std::io::Result<T>,
+    op: &'static str,
+    path: &Path,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => Ok(None),
+        Err(err) => Err(err).path_ctx(op, path),
+    }
 }
 
 /// What `git ls-files -z <flags> .` lists in `tree`, sorted and deduplicated.
@@ -1332,7 +1673,7 @@ impl<'a> TreeHasher<'a> {
         } else if file_type.is_dir() {
             self.dir(rel)
         } else {
-            Ok(blake3::Hash::from_bytes([0; 32]))
+            Ok(NO_CONTENT)
         }
     }
 
@@ -1353,10 +1694,8 @@ impl<'a> TreeHasher<'a> {
             let rel = rel.join(&name);
             let path = self.ctx.join(&rel);
             let meta = std::fs::symlink_metadata(&path).path_ctx("stat", &path)?;
-            hasher.update(name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(&meta.mode().to_le_bytes());
-            hasher.update(self.entry(&rel, &meta)?.as_bytes());
+            let digest = self.entry(&rel, &meta)?;
+            update_record(&mut hasher, name.as_bytes(), meta.mode(), &digest);
         }
         Ok(hasher.finalize())
     }
@@ -1523,6 +1862,56 @@ mod tests {
 
     use super::*;
     use crate::config::EnvValue;
+
+    /// The issue #355 shape: a sidecar's raw ref that is not local was blamed
+    /// on `--image`, and the error never named the command that fixes it.
+    #[test]
+    fn a_missing_local_image_names_its_requester_and_the_pull() {
+        let tag = ImageTag::new("ghcr.io/example/mcp-tools:1");
+
+        let message = local_image_missing(Some("[sidecars.tools]"), &tag);
+        assert!(
+            message.starts_with(
+                "image \"ghcr.io/example/mcp-tools:1\" (from [sidecars.tools]) is not an \
+                 [images.<name>]"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("`podman pull ghcr.io/example/mcp-tools:1`"),
+            "{message}"
+        );
+        assert!(!message.contains("--image"), "{message}");
+
+        let anonymous = local_image_missing(None, &tag);
+        assert!(!anonymous.contains("(from"), "{anonymous}");
+        assert!(anonymous.contains("`podman pull "), "{anonymous}");
+    }
+
+    /// The pull advice is copied into a shell, and a ref is any nonblank
+    /// string: one with a command substitution or an apostrophe must stay a
+    /// single quoted argument, not code.
+    #[test]
+    fn the_pull_advice_keeps_a_hostile_ref_one_literal_argument() {
+        let substitution =
+            local_image_missing(None, &ImageTag::new("missing$(printf marker >&2):1"));
+        assert!(
+            substitution.contains("`podman pull 'missing$(printf marker >&2):1'`"),
+            "{substitution}"
+        );
+
+        let apostrophe = local_image_missing(None, &ImageTag::new("it's:1"));
+        assert!(
+            apostrophe.contains("`podman pull 'it'\\''s:1'`"),
+            "{apostrophe}"
+        );
+
+        let plain = local_image_missing(None, &ImageTag::new("ghcr.io/example/mcp-tools:1"));
+        assert!(
+            plain.contains("`podman pull ghcr.io/example/mcp-tools:1`"),
+            "a ref of safe bytes stays bare: {plain}"
+        );
+    }
 
     /// The issue #324 shape: a token in a build-arg must not be on buildah's
     /// command line, where `ps` reads it, nor in anything a failure prints.

@@ -34,20 +34,15 @@ use outrig_cli::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 mod common;
-use common::stream_lines;
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-fn fixture_mcp_fs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("outrig-cli is under crates/")
-        .join("outrig/tests/fixtures/mcp-fs")
-}
+use common::{
+    E2E_TIMEOUT, assert_lines_in_order, fixture_mcp_fs_dir, podman_names, stream_lines,
+    wait_for_stderr_value,
+};
 
 fn fs_spec() -> McpServerSpec {
     McpServerSpec::Short(vec![
@@ -184,9 +179,9 @@ async fn run_mcp_client(args: &[String], repo: &Path) -> McpRun {
 
     let _ = service.cancel().await;
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = stderr_task.await;
     let stderr = stderr_buf.lock().unwrap().clone();
@@ -199,25 +194,6 @@ fn stderr_value<'a>(stderr: &'a str, prefix: &str) -> &'a str {
         .lines()
         .find_map(|line| line.strip_prefix(prefix).map(str::trim))
         .unwrap_or_else(|| panic!("stderr lacked {prefix:?}: {stderr}"))
-}
-
-async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
-    timeout(TEST_TIMEOUT, async {
-        loop {
-            {
-                let snapshot = stderr.lock().unwrap().clone();
-                if let Some(value) = snapshot
-                    .lines()
-                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
-                {
-                    return value.to_string();
-                }
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
 }
 
 /// An MCP session opened over `--listen`: the id the server issued, and the
@@ -462,11 +438,11 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
     };
 
     // 4. Wait for everything with a wall-clock bound.
-    timeout(TEST_TIMEOUT, work)
+    timeout(E2E_TIMEOUT, work)
         .await
-        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {E2E_TIMEOUT:?}"));
 
-    let wait_result = timeout(TEST_TIMEOUT, child.wait()).await;
+    let wait_result = timeout(E2E_TIMEOUT, child.wait()).await;
     let status = match wait_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => panic!("child.wait() failed: {e}"),
@@ -476,7 +452,7 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
                 stderr_buf.lock().unwrap()
             );
             let _ = child.kill().await;
-            panic!("subprocess did not exit within {TEST_TIMEOUT:?}");
+            panic!("subprocess did not exit within {E2E_TIMEOUT:?}");
         }
     };
     let _ = stderr_task.await;
@@ -628,9 +604,9 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
         .expect("send SIGTERM");
     assert!(term.success(), "kill -TERM failed with {term}");
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     let _ = stderr_task.await;
     let stderr_str = stderr_buf.lock().unwrap().clone();
@@ -870,9 +846,9 @@ async fn mcp_attach_exits_when_host_stops_container() {
         .await
         .expect("host stop");
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
+    let status = timeout(E2E_TIMEOUT, child.wait())
         .await
-        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
         .expect("child.wait");
     drop(service);
     let _ = stderr_task.await;
@@ -889,6 +865,104 @@ async fn mcp_attach_exits_when_host_stops_container() {
     );
 }
 
+/// Run `outrig mcp <args>` with stdin closed and assert it fails. Returns its
+/// stderr and the session records left under `session_root`.
+async fn run_mcp_expecting_failure(
+    session_root: &Path,
+    repo: &Path,
+    args: &[&str],
+) -> (String, Vec<Session>) {
+    let output = timeout(
+        E2E_TIMEOUT,
+        Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--session-root")
+            .arg(session_root)
+            .arg("mcp")
+            .args(args)
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("subprocess did not exit within {E2E_TIMEOUT:?}"))
+    .expect("run outrig mcp");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "outrig mcp should fail; stderr was: {stderr}"
+    );
+    let sessions = SessionStore::new(session_root.to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions;
+    (stderr, sessions)
+}
+
+/// A stderr reader that goes away mid-startup costs the command its progress
+/// lines and nothing else: `show-merged` still prints the merged table and
+/// finishes the session. The reader leaves as soon as the MCP configuration
+/// step opens, so the line that closes it is the first write to a closed pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_show_merged_survives_stderr_closing_mid_startup() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--session-root")
+        .arg(sessions.path())
+        .args(["mcp", "show-merged"])
+        .current_dir(repo_dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp show-merged");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped"));
+    let reach_step = async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = stderr.read_line(&mut line).await.expect("read stderr");
+            assert_ne!(read, 0, "stderr ended before the MCP configuration step");
+            if line.contains("[outrig] reading and merging MCP configuration") {
+                break;
+            }
+        }
+    };
+    timeout(E2E_TIMEOUT, reach_step)
+        .await
+        .unwrap_or_else(|_| panic!("no MCP configuration step within {E2E_TIMEOUT:?}"));
+    drop(stderr);
+
+    let output = timeout(E2E_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("show-merged did not exit within {E2E_TIMEOUT:?}"))
+        .expect("wait for outrig");
+    assert!(
+        output.status.success(),
+        "show-merged exited {:?} after its stderr closed; stdout: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("fs"),
+        "show-merged printed no table: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let listed = SessionStore::new(sessions.path().to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions;
+    assert!(
+        listed.iter().all(|session| session.ended_at.is_some()),
+        "the session was left unfinalized: {listed:?}"
+    );
+}
+
 /// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
 /// assert it fails with the undeclared-server error. Returns the session
 /// records left under `session_root`.
@@ -897,36 +971,30 @@ async fn run_mcp_with_undeclared_env_server(
     repo: &Path,
     args: &[&str],
 ) -> Vec<Session> {
-    let output = timeout(
-        TEST_TIMEOUT,
-        Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .arg("--session-root")
-            .arg(session_root)
-            .arg("mcp")
-            .args(args)
-            .args(["--env", "no_such_server:DEBUG=1"])
-            .current_dir(repo)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
-    .expect("run outrig mcp");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("--- subprocess stderr ---\n{stderr}");
-    assert!(
-        !output.status.success(),
-        "outrig mcp should fail; stderr was: {stderr}"
-    );
+    let args: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(["--env", "no_such_server:DEBUG=1"])
+        .collect();
+    let (stderr, sessions) = run_mcp_expecting_failure(session_root, repo, &args).await;
     assert!(
         stderr.contains("image 'smoke' has no MCP server 'no_such_server'"),
         "stderr should name the undeclared server: {stderr}"
     );
-    SessionStore::new(session_root.to_path_buf())
-        .list()
-        .expect("list sessions")
-        .sessions
+    // The refusal belongs to the MCP configuration step, not to whatever
+    // printed last before it (#269).
+    assert_lines_in_order(
+        &stderr,
+        &[
+            "[outrig] reading and merging MCP configuration",
+            "has no MCP server 'no_such_server'",
+        ],
+    );
+    assert!(
+        !stderr.contains("[outrig] MCP configuration ready"),
+        "a refused plan is not ready: {stderr}"
+    );
+    sessions
 }
 
 /// An undeclared `--env SERVER:` name is refused after the session record
@@ -957,6 +1025,54 @@ async fn mcp_env_for_undeclared_server_finalizes_session_and_stops_container() {
         "container `{}` is still alive: {leftovers}",
         session.container_name
     );
+}
+
+/// Run `outrig mcp <args>` over [`write_mcp_config`]'s repo with `cap-add =
+/// ["NET_ADMIN"]` on its image and `extra` appended, and assert the session is
+/// refused interception (#363): the error names the capability and the key,
+/// the session record is finalized, and the container is stopped before any
+/// MCP server ran.
+async fn assert_net_admin_refused_under_interception(args: &[&str], extra: &str) {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let config = repo_dir.path().join(".agents/outrig/config.toml");
+    let mut toml = std::fs::read_to_string(&config).expect("read config");
+    toml.push_str("\n  [images.smoke.security]\n  cap-add = [\"NET_ADMIN\"]\n");
+    toml.push_str(extra);
+    std::fs::write(&config, toml).expect("write config");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let (stderr, listed) = run_mcp_expecting_failure(sessions.path(), repo_dir.path(), args).await;
+    assert!(
+        stderr.contains("CAP_NET_ADMIN") && stderr.contains("`cap-add`"),
+        "stderr should name the capability and the key: {stderr}"
+    );
+    assert_eq!(listed.len(), 1, "expected one session record: {listed:?}");
+    let session = &listed[0];
+    assert!(
+        session.exit_code.is_some_and(|code| code != 0),
+        "{session:?}"
+    );
+    assert!(session.ended_at.is_some(), "{session:?}");
+    let leftovers = podman_names(&format!("name={}", session.container_name)).await;
+    assert!(
+        leftovers.is_empty(),
+        "container `{}` is still alive: {leftovers:?}",
+        session.container_name
+    );
+}
+
+/// `--network audit` over a config that never mentions the mode: nothing in
+/// config validation can see it, which is why the refusal is the interceptor's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_network_flag_refuses_a_container_holding_net_admin() {
+    assert_net_admin_refused_under_interception(&["--network", "audit"], "").await;
+}
+
+/// The same refusal when the repo config declares the mode itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_network_config_mode_refuses_a_container_holding_net_admin() {
+    assert_net_admin_refused_under_interception(&[], "\n[network]\nmode = \"audit\"\n").await;
 }
 
 /// The same refusal under `--attach` finalizes only the attacher's own record

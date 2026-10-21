@@ -75,7 +75,12 @@ const SETTLE: Duration = Duration::from_millis(500);
 /// fail with nothing done, *n* being the count the marker holds, and an
 /// `absent.rmi.<token>` marker makes an `rmi` answer as buildah does for a tag
 /// that does not exist. A working container's name carries no token, so for
-/// these a `buildah rm` also matches against the `from` that made it.
+/// these a `buildah rm` also matches against the `from` that made it. A
+/// `slow.<verb>.<token>` marker holds the seconds that verb sleeps before it
+/// answers, refusal or not.
+///
+/// As buildah does, an `rmi` of an image is refused as in use while a `from`
+/// made from it has not been removed -- by `rm`, or by a `commit` that took it.
 const FAKE: &str = r#"#!/bin/sh
 journal="$OUTRIG_FAKE_JOURNAL"
 pending=$(mktemp "$journal/pending.XXXXXX")
@@ -131,6 +136,15 @@ if [ "$1" = rm ] && [ -f "$journal/origin.$target" ]; then
 fi
 seen=" $* $origin "
 
+# A `slow.<verb>.<token>` marker holds the seconds this verb takes to answer.
+for marker in "$journal"/slow."$1".*; do
+  [ -e "$marker" ] || continue
+  token=${marker##*/slow.$1.}
+  case "$seen" in
+    *"$token"*) sleep "$(cat "$marker")" ;;
+  esac
+done
+
 # A `refuse.<verb>.<token>` marker holds a count, and that many invocations
 # fail the way a busy engine fails one: exit 125, with nothing created and
 # nothing removed. Once the count is spent the verb carries on as usual, which
@@ -170,6 +184,22 @@ case "$1" in
           ;;
       esac
     done
+    # An image a working container was made from cannot lose its last name.
+    if [ "$1" = rmi ]; then
+      for made_by in "$journal"/origin.*; do
+        [ -e "$made_by" ] || continue
+        holder=${made_by##*/origin.}
+        read -r made < "$made_by"
+        case " $made " in
+          *" $target "*)
+            [ -e "$journal/removed.$(flat "$holder")" ] && continue
+            printf 'Error: 1 error occurred:\n\t* image used by %s: image is in use by a container\n' "$holder" 1>&2
+            publish
+            exit 125
+            ;;
+        esac
+      done
+    fi
     if [ -n "$filter" ]; then
       lbl=${filter#label=}
       if [ -f "$journal/labeled.$lbl" ]; then
@@ -183,6 +213,13 @@ case "$1" in
     exit 0
     ;;
 esac
+
+# `commit --rm` takes the working container it commits.
+if [ "$1" = commit ]; then
+  case " $* " in
+    *" --rm "*) : > "$journal/removed.$(flat "$(printf '%s\n' "$@" | grep '^outrig-label-')")" ;;
+  esac
+fi
 
 case "$1" in
   run|create|init|start|build|from)
@@ -413,6 +450,13 @@ fn refuse_for(journal: &Path, verb: &str, token: &str, times: u32) {
         format!("{times}\n"),
     )
     .expect("write refuse marker");
+}
+
+/// Make the fake's `verb` take `seconds` to answer whenever `token` is in its
+/// argv, so a test can make a removal outlast the retries of another.
+fn slow_for(journal: &Path, verb: &str, token: &str, seconds: &str) {
+    std::fs::write(journal.join(format!("slow.{verb}.{token}")), seconds)
+        .expect("write slow marker");
 }
 
 /// Assert the refusals [`refuse_for`] armed have all been spent.
@@ -804,11 +848,15 @@ async fn a_cancel_between_create_and_init_removes_the_container() {
     // outrig-cancel-init-...` contains the word too, and a fragment match
     // would park this test in `create` and quietly retire the boundary it
     // exists for. The name keeps the collision rather than dodging it, so the
-    // matcher stays honest.
-    let initializing = [name.as_str()];
+    // matcher stays honest. The `init` names the id the fake `create` printed,
+    // which is its pid in hex, since a name is not what it is given.
     let client = tokio::select! {
         _ = &mut create => panic!("the fake `podman init` should not have returned"),
-        pid = invocation_pid(journal, "init", &initializing) => pid,
+        pid = async {
+            let created = invocation_pid(journal, "create", &[name.as_str()]).await;
+            let id = format!("{created:064x}");
+            invocation_pid(journal, "init", &[id.as_str()]).await
+        } => pid,
     };
     drop(create);
 
@@ -1391,6 +1439,47 @@ async fn a_refused_working_container_removal_is_reissued() {
     let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
     let builder = flag_value(&from, "--name");
     expect_removed(journal, &builder).await;
+}
+
+/// Issue #275: the temporary tag cannot go while the working container made
+/// from it exists, so its removal waits for the container's however long that
+/// takes, instead of spending its own retries first.
+///
+/// The `rm` is refused twice and takes 300 ms an attempt, which outlasts the
+/// ~0.9 s a lone `rmi` reissue is given.
+#[tokio::test]
+async fn a_temp_tag_removal_waits_for_the_working_container_removal() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("tag-after-builder");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    refuse_for(journal, "commit", &token, 1);
+    refuse_for(journal, "rm", &token, 2);
+    slow_for(journal, "rm", &token, "0.3");
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let err = outrig::image::build_image_for("chained", &cfg, context.path(), &final_tag, false)
+        .await
+        .expect_err("the fake refuses the commit");
+    assert!(
+        failed_at(&err, "commit"),
+        "the build should report the commit's failure, got {err}"
+    );
+
+    let (_, argv) = invocation(journal, "build", &[token.as_str()]).await;
+    let temp_tag = flag_value(&argv, "--tag");
+    // Already gone when the call returns: a CLI exits on the error, and a
+    // background reaper would go with it.
+    assert!(
+        was_removed(journal, &temp_tag),
+        "the temp tag outlived the build call; removals seen: {:?}",
+        removals(journal)
+    );
+    expect_refusals_spent(journal, "rm", &token);
 }
 
 /// A tag the build never created is not removed again.

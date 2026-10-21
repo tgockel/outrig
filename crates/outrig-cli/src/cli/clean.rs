@@ -30,7 +30,7 @@ use crate::cli::build_containers::{
 };
 use crate::cli::engine;
 use crate::error::{OutrigError, Result};
-use crate::session::{self, Session, SessionStore};
+use crate::session::{self, DanglingLink, Session, SessionId, SessionStore, SkippedSession};
 use outrig::container::{LABEL_SESSION, LABEL_SIDECAR};
 
 const DAY: u64 = 24 * 60 * 60;
@@ -67,6 +67,15 @@ pub struct CleanArgs {
     /// container older than the cutoff, including any you made yourself.
     #[arg(long = "build-containers")]
     pub build_containers: bool,
+    /// Also remove session records outrig cannot read.
+    ///
+    /// A record that does not parse -- hand-edited, truncated, or written by
+    /// an outrig whose schema differs -- has no end time to age, so it is
+    /// aged by the start time in its directory name; a directory whose name is
+    /// not a session id is never removed. `--yes` alone leaves these in place
+    /// and says so, since what is in them cannot be shown.
+    #[arg(long = "unreadable")]
+    pub unreadable: bool,
 }
 
 /// One `org.outrig.session`-labeled podman container, as reported by
@@ -83,16 +92,9 @@ pub struct LabeledContainer {
 pub async fn execute(
     args: &CleanArgs,
     session_root_flag: Option<&Path>,
-    repo_cfg_override: Option<&Path>,
-    global_cfg_path: &Path,
-    cwd: &Path,
+    global_override: Option<&Path>,
 ) -> Result<i32> {
-    let root = session::resolve_session_root_for_cli(
-        session_root_flag,
-        repo_cfg_override,
-        global_cfg_path,
-        cwd,
-    )?;
+    let root = session::resolve_session_root_for_cli(session_root_flag, global_override)?;
     let store = SessionStore::new(root);
     // Only when asked: with the flag off, `clean` still needs nothing but
     // podman, and buildah is never invoked. When it is asked, the listings
@@ -189,11 +191,70 @@ where
         });
     }
 
-    let target_ids: BTreeSet<&str> = targets.iter().map(|t| t.session.id.as_str()).collect();
+    // A link whose directory is gone has no record to age, so its own mtime --
+    // set when the session started -- stands in for the start time.
+    let mut dangling_targets = Vec::new();
+    let mut dangling_running = Vec::new();
+    for link in &listing.dangling {
+        if args.session.as_deref().is_some_and(|id| id != link.entry) {
+            continue;
+        }
+        let aged = now
+            .duration_since(link.modified)
+            .map(|age| age >= args.older_than)
+            .unwrap_or(false);
+        if !aged {
+            continue;
+        }
+        if running.contains(&link.container_name()) {
+            dangling_running.push(link);
+        } else {
+            dangling_targets.push(link);
+        }
+    }
+
+    // A record we couldn't parse is aged by the start time in its name. Removal
+    // is the `--unreadable` opt-in, so without it these are only reported; and
+    // `--session`, which does not narrow `listing.skipped` above, narrows what
+    // may be removed, so a scoped run removes nothing it was not pointed at.
+    let retention = format_retention(args.older_than);
+    let mut unreadable_targets = Vec::new();
+    let mut unreadable_left = Vec::new();
+    let mut unreadable_unsure = Vec::new();
+    let mut unreadable_running = Vec::new();
+    for skipped in &listing.skipped {
+        let aged = SessionId::started_at(&skipped.entry).is_some_and(|started| {
+            now.duration_since(started)
+                .is_ok_and(|age| age >= args.older_than)
+        });
+        if !aged || args.session.as_deref().is_some_and(|id| id != skipped.entry) {
+            continue;
+        }
+        if running.contains(&skipped.container_name()) {
+            unreadable_running.push(skipped);
+        } else if args.unreadable && !skipped.container_known() {
+            // The record never got as far as naming its container, and an
+            // attach session's is not `outrig-<sid>`: nothing here shows it
+            // is not running, so it stays for `outrig discard` to ask about.
+            unreadable_unsure.push(skipped);
+        } else if args.unreadable {
+            unreadable_targets.push(skipped);
+        } else {
+            unreadable_left.push(skipped);
+        }
+    }
+
+    let mut target_ids: BTreeSet<&str> = targets.iter().map(|t| t.session.id.as_str()).collect();
+    target_ids.extend(unreadable_targets.iter().map(|s| s.entry.as_str()));
     // A record we couldn't parse is still a record: its directory survives this
-    // run, so its container is not a stray and must not be force-removed out
-    // from under it.
-    let unreadable: Vec<&str> = listing.skipped.iter().map(|s| s.entry.as_str()).collect();
+    // run unless removed above, so its container is not a stray and must not be
+    // force-removed out from under it.
+    let unreadable: Vec<&str> = listing
+        .skipped
+        .iter()
+        .map(|s| s.entry.as_str())
+        .filter(|entry| !target_ids.contains(entry))
+        .collect();
     let (stray_targets, stray_running) = classify_strays(
         &sessions,
         &target_ids,
@@ -206,12 +267,24 @@ where
     let (build_targets, build_undatable) =
         classify_build_containers(build, args.older_than, now);
 
-    write_skipped_running(stderr, &skipped_running).await?;
+    write_skipped_running(
+        stderr,
+        &skipped_running,
+        &dangling_running,
+        &unreadable_running,
+    )
+    .await?;
+    write_unreadable_left(stderr, &unreadable_left, &retention).await?;
+    write_unreadable_unsure(stderr, &unreadable_unsure, &retention).await?;
     write_stray_running(stderr, &stray_running).await?;
     write_build_undatable(stderr, &build_undatable).await?;
 
-    let retention = format_retention(args.older_than);
-    if targets.is_empty() && stray_targets.is_empty() && build_targets.is_empty() {
+    if targets.is_empty()
+        && dangling_targets.is_empty()
+        && unreadable_targets.is_empty()
+        && stray_targets.is_empty()
+        && build_targets.is_empty()
+    {
         // The wording only grows when the sweep was asked for, so a run
         // without the flag reads exactly as it always has.
         let msg = if args.build_containers {
@@ -227,6 +300,8 @@ where
     }
 
     write_preview(stderr, &targets, &retention).await?;
+    write_dangling_preview(stderr, &dangling_targets, &retention).await?;
+    write_unreadable_preview(stderr, &unreadable_targets, &retention).await?;
     write_stray_preview(stderr, &stray_targets, &retention).await?;
     write_build_preview(stderr, &build_targets, &retention).await?;
 
@@ -234,7 +309,7 @@ where
         && !confirm(
             stderr,
             stdin,
-            targets.len(),
+            targets.len() + dangling_targets.len() + unreadable_targets.len(),
             stray_targets.len(),
             build_targets.len(),
         )
@@ -253,6 +328,24 @@ where
         stderr.write_all(dir_msg.as_bytes()).await?;
         if target.session.link_target.is_some() {
             let link_path = store.symlink_path(&target.session.id);
+            let link_msg = format!("[outrig] removed {} (symlink)\n", link_path.display());
+            stderr.write_all(link_msg.as_bytes()).await?;
+        }
+    }
+
+    for link in &dangling_targets {
+        let (gone, msg) = super::unlink_dangling_report(store, link)?;
+        removed += usize::from(gone);
+        stderr.write_all(msg.as_bytes()).await?;
+    }
+
+    for skipped in &unreadable_targets {
+        store.remove_by_id(&skipped.id())?;
+        removed += 1;
+        let dir_msg = format!("[outrig] removed {}\n", skipped.dir.display());
+        stderr.write_all(dir_msg.as_bytes()).await?;
+        if skipped.linked {
+            let link_path = store.symlink_path(&skipped.id());
             let link_msg = format!("[outrig] removed {} (symlink)\n", link_path.display());
             stderr.write_all(link_msg.as_bytes()).await?;
         }
@@ -314,13 +407,14 @@ where
 }
 
 pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
-    let raw = value.trim();
-    if raw.len() < 2 {
+    let mut chars = value.trim().chars();
+    let unit = chars.next_back();
+    let amount = chars.as_str();
+    if amount.is_empty() {
         return Err("expected a duration like 30d, 12h, 45m, or 10s".to_string());
     }
 
-    let (amount, unit) = raw.split_at(raw.len() - 1);
-    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+    if !amount.bytes().all(|b| b.is_ascii_digit()) {
         return Err("duration amount must be a positive integer".to_string());
     }
 
@@ -332,10 +426,10 @@ pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     }
 
     let unit_secs = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => DAY,
+        Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 60 * 60,
+        Some('d') => DAY,
         _ => return Err("duration unit must be one of s, m, h, or d".to_string()),
     };
 
@@ -397,11 +491,16 @@ fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
-async fn write_skipped_running<E>(stderr: &mut E, skipped: &[Session]) -> Result<()>
+async fn write_skipped_running<E>(
+    stderr: &mut E,
+    skipped: &[Session],
+    dangling: &[&DanglingLink],
+    unreadable: &[&SkippedSession],
+) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {
-    if skipped.is_empty() {
+    if skipped.is_empty() && dangling.is_empty() && unreadable.is_empty() {
         return Ok(());
     }
 
@@ -412,7 +511,131 @@ where
         let line = format!("  {}  {}\n", session.id, session.container_name);
         stderr.write_all(line.as_bytes()).await?;
     }
+    for link in dangling {
+        let line = format!("  {}  {}\n", link.entry, link.container_name());
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    for record in unreadable {
+        let line = format!("  {}  {}\n", record.entry, record.container_name());
+        stderr.write_all(line.as_bytes()).await?;
+    }
     Ok(())
+}
+
+async fn write_unreadable_preview<E>(
+    stderr: &mut E,
+    records: &[&SkippedSession],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if records.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] will remove {} older than {retention} (record unreadable):\n",
+        unreadable_count(records.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for record in records {
+        let line = format!(
+            "  {}  {}  {}\n",
+            record.entry,
+            record.dir.display(),
+            record.reason()
+        );
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// The records `--unreadable` would remove, named rather than silently kept:
+/// `--yes` does not answer for what cannot be shown.
+async fn write_unreadable_left<E>(
+    stderr: &mut E,
+    records: &[&SkippedSession],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if records.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] kept {} older than {retention}; --unreadable removes them:\n",
+        unreadable_count(records.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for record in records {
+        let line = format!("  {}  {}\n", record.entry, record.reason());
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Records `--unreadable` would remove but for not knowing their container.
+async fn write_unreadable_unsure<E>(
+    stderr: &mut E,
+    records: &[&SkippedSession],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if records.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] kept {} older than {retention}: the damaged record does not say which \
+         container it owns, so a running attach session cannot be ruled out; \
+         `outrig discard <sid>` removes one:\n",
+        unreadable_count(records.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for record in records {
+        let line = format!("  {}  {}\n", record.entry, record.reason());
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+fn unreadable_count(count: usize) -> String {
+    format!(
+        "{count} unreadable session {}",
+        crate::cli::session_setup::plural(count, "record", "records")
+    )
+}
+
+async fn write_dangling_preview<E>(
+    stderr: &mut E,
+    links: &[&DanglingLink],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if links.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] will remove {} older than {retention} (directory gone):\n",
+        session_link_count(links.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for link in links {
+        let line = format!("  {}  -> {}\n", link.entry, link.target.display());
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+fn session_link_count(count: usize) -> String {
+    format!(
+        "{count} session {}",
+        crate::cli::session_setup::plural(count, "link", "links")
+    )
 }
 
 async fn write_preview<E>(stderr: &mut E, targets: &[CleanTarget], retention: &str) -> Result<()>

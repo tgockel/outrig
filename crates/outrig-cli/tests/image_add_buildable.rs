@@ -182,3 +182,76 @@ async fn generated_go_toolchain_runs_on_the_host_architecture() {
     let platform = format!("linux/{goarch}");
     assert_toolchain_probe(Toolchain::Go, GO_PROBE, &[&platform, "Hello, world!"]).await;
 }
+
+/// Print what the toolchain installed, as the session user.
+const NODE_PROBE: &str = r#"set -eux
+id
+node --version
+npm --version
+"#;
+
+/// The `node` toolchain is NodeSource's Node, with the `npm` its package
+/// ships, for the session user. `v24.` moves with `node_major` in
+/// `templates/node.debian.dockerfile`.
+#[tokio::test]
+async fn generated_node_toolchain_is_nodesources_node() {
+    common::init_tracing();
+    assert_toolchain_probe(Toolchain::Node, NODE_PROBE, &["v24."]).await;
+}
+
+/// A `curl` ahead of the real one on `PATH` that cannot fetch NodeSource's
+/// signing key, the way a transient network failure would leave it. The setup
+/// script's own `apt update` has run by then.
+const KEY_FETCH_FAILS: &str = r#"RUN printf '#!/bin/sh\ncase "$*" in *gpgkey*) exit 22 ;; esac\nexec /usr/bin/curl "$@"\n' \
+      > /usr/local/bin/curl \
+ && chmod +x /usr/local/bin/curl
+"#;
+
+/// NodeSource's setup script exits 0 whatever goes wrong in it, so a `node`
+/// toolchain whose setup failed used to build anyway: `apt-get install nodejs`
+/// took Debian's Node 18, which has no `npm`, and the image was cached under
+/// its normal tag (#565). The build must fail, saying which Node it found.
+#[tokio::test]
+async fn a_node_toolchain_whose_nodesource_setup_failed_does_not_build() {
+    common::init_tracing();
+    let dockerfile = render::render(BaseImage::DebianBookwormSlim, &[Toolchain::Node], &[]);
+    let (header, node) = dockerfile
+        .split_once("\n# node toolchain\n")
+        .expect("a node toolchain section");
+    let dockerfile = format!("{header}\n{KEY_FETCH_FAILS}\n# node toolchain\n{node}");
+
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::write(project.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    // Outside the build context, which the image's tag is a hash of.
+    let logs = tempfile::tempdir().expect("tempdir");
+    let log = logs.path().join("build.log");
+    let transcript = outrig::Transcript::create(&log, false)
+        .await
+        .expect("create transcript");
+
+    let image = "outrig-e2e-node-setup";
+    let cfg = common::fixture_build_config();
+    let tag = image::compute_tag_for(image, &cfg, project.path())
+        .await
+        .expect("compute tag");
+    let built = timeout(
+        TOOLCHAIN_BUILD_TIMEOUT,
+        image::ensure_tagged_image_for(image, &cfg, project.path(), &tag, false, Some(&transcript)),
+    )
+    .await
+    .expect("the toolchain image build must not hang");
+
+    let log = std::fs::read_to_string(&log).expect("read the build log");
+    let err = built.expect_err(&format!(
+        "a node toolchain whose NodeSource setup failed built an image\n--- build log ---\n{log}"
+    ));
+    // Buildah echoes each `RUN` before it runs it, so the log holds the check's
+    // `echo` as written -- `$node_major` and all -- even when the build failed
+    // before the check ran. Only the expanded message came from the check.
+    // `v18.` is the `nodejs` in Debian's own archive; `24` moves with
+    // `node_major`, like the probe's `v24.`.
+    assert!(
+        log.contains("node toolchain: expected Node 24, found v18."),
+        "the build failed, but not at the node toolchain's check: {err}\n--- build log ---\n{log}",
+    );
+}

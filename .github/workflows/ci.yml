@@ -212,7 +212,13 @@ jobs:
       # "we ran the e2e suite" means one thing on both machines. Both crates
       # declare `e2e`; qualifying it per package is what keeps either suite
       # from silently staying out.
-      - run: cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e
+      #
+      # `--no-fail-fast` for the same reason: cargo otherwise ends the run at
+      # the first test binary that fails, and every binary sorted after it
+      # stays out. A failure in `image_build` kept six e2e binaries from
+      # running at all from `1dad8af` on (#637), and a run that is red for one
+      # reason cannot say whether it is red for another.
+      - run: cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e --no-fail-fast
 
   public-api:
     name: public-api

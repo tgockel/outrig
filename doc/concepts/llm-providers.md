@@ -56,9 +56,11 @@ endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at r
 never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
 
-You can declare as many providers as you want -- one per account, one per local Ollama install,
-one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`, `local-ollama`,
-`work-account`) become labels you reference from models.
+You can declare as many providers as you want in your global config -- one per account, one
+per local Ollama install, one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`,
+`local-ollama`, `work-account`) become labels you reference from models, in either file. A
+repo config may not declare a provider, since every provider carries an `api-key`; see
+[Where things live](#where-things-live-global-vs-repo) below.
 
 ## `[models.<name>]`
 
@@ -174,8 +176,10 @@ A move happens *between* model calls, never around a whole turn, so tool calls t
 ran are not re-executed -- a turn that fails on its fifth model call has already run the tool calls
 from the first four, and those stay done.
 
-The cost is that one reply can be half one model's work. That is why a move prints, and why the
-banner lists the fallbacks a session may reach before it starts.
+The cost is that one reply can be half one model's work. That is why a move prints, why the banner
+lists the fallbacks a session may reach before it starts, and why a
+[subagent's transcript](subagents.md) records which models answered a round that left the first
+candidate.
 
 The history travels with the chain, with one exception: an Anthropic candidate is sent only the
 reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, or an OpenAI-style
@@ -299,8 +303,9 @@ round opens. Promote whole rounds on such a provider. See
 
 A model running on your own machine is reached the same way: serve it with a local server that
 speaks the OpenAI wire format, and point a `style = "openai"` provider at its `localhost`
-`base-url`. Start the model however that tool wants -- note the tool-calling flags, which
-outrig's agent loop needs and none of these servers turn on by default:
+`base-url`, in your global config like any other provider. Start the model however that tool
+wants -- note the tool-calling flags, which outrig's agent loop needs and none of these servers
+turn on by default:
 
 ```sh
 ollama serve                 # then: ollama pull qwen3:4b
@@ -345,10 +350,13 @@ you is isolation from the rest of the machine: each request is serialized and cr
 however briefly. outrig makes no claim that a question stays inside its own process.
 
 **Coming from `style = "mistralrs"`.** outrig 0.2 could also run a model in its own process,
-behind the `local-llm` build feature. That backend was removed in 0.3: a config that still names
-`style = "mistralrs"`, sets any of the six weight keys (`model-id`, `model-path`, `model-file`,
-`revision`, `context-length`, `device`), or sets the top-level `model-cache-root` fails to parse.
-Replace the bare provider and its weight-bearing rows with the pair above. The six keys have no
+behind the `local-llm` build feature. That backend was removed in 0.3. A config that still sets
+any of the six weight keys (`model-id`, `model-path`, `model-file`, `revision`, `context-length`,
+`device`) or the top-level `model-cache-root` loads, with a warning for each, and a
+`style = "mistralrs"` provider is set aside with a warning in the global config -- leaving its
+models without one -- and refused anywhere else. Replace the bare provider and its weight-bearing
+rows with the pair above, the provider in your global config even if the old one sat in a repo
+config. The six keys have no
 counterpart on purpose -- the server owns all of them, which is the point of the move.
 `context-window` is not `context-length` renamed: it configures nothing on the server, and only
 tells `outrig run-new` the limit the server already has. The
@@ -410,7 +418,8 @@ stops, timing out or losing its connection mid-request -- is retried until it su
 the retry budget runs out. The budget is `retry-budget-secs` on the provider, falling back
 to the top-level value and then to ten minutes. Everything else, including the rest of the
 `4xx` family, is final on the first try: a `401` will not become a `200` on the second
-attempt.
+attempt. So is a call the HTTP client refuses to make -- a redirect loop that reaches its
+limit of ten hops, or a URL it cannot send to -- because each replay is refused the same way.
 
 A call that never reaches the endpoint at all is retried on a much shorter leash. A refused
 connection, an unresolvable host, or a TLS mismatch usually means the address is wrong
@@ -440,8 +449,9 @@ The distinction is per request, not per turn, and it latches: once a call has pr
 response, the full budget applies for the rest of that request. A call that connects, gets
 a `503`, and then cannot reconnect for its retry is a provider having a bad minute -- not an
 address that was never right -- and it keeps the full budget. The practical effect of the
-split is that a typo in `base-url` ends the turn in seconds, naming the connection failure,
-rather than after ten minutes of retry lines.
+split is that a typo in `base-url`'s host ends the turn in seconds, naming the connection
+failure, rather than after ten minutes of retry lines. A `base-url` that is not an `http://`
+or `https://` URL does not get that far: the config is refused when it loads, naming the key.
 
 When the server says how long to wait, outrig waits that long. This is the reason the retry
 lives in outrig's own HTTP client rather than around the model call: a `Retry-After` header
@@ -488,13 +498,21 @@ on stderr. No tool-call line means no tool calling.
 
 ## API keys are env-var-only
 
-`api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses to load any
-other value -- a literal key, a missing `${...}` wrapper, anything. This guarantees:
+`api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses any other
+value -- a literal key, a missing `${...}` wrapper, anything. A repo config holding one fails to
+load; in the global config the provider holding one is left out, with a warning that names the
+provider but not the value. Either way the value is never sent. This guarantees:
 
-- Configs are safe to commit to source control.
+- No config file holds key material, so none of them can leak it.
 - Keys never end up in `outrig logs` output, in tracing diagnostics, or in session metadata on
   disk.
 - Rotating a key is a shell change, not a file edit.
+
+The reference is resolved on the machine running outrig, and the provider's `base-url` says
+where the result is sent. That pairing is the operator's to make, so a provider that carries an
+`api-key` may be declared only in the global config: a committed `.agents/outrig/config.toml`
+cannot name your key, and so cannot redirect it. (The repo file sits inside the read-write
+workspace, where the agent could edit it for the next session.)
 
 Different shells (different accounts, different rate limits) just point `api-key` at different
 env-var names:
@@ -515,7 +533,7 @@ api-key  = "${OPENAI_API_KEY}"
 
 | Layer                 | Global (`~/.outrig/config.toml`) | Repo (`.agents/outrig/config.toml`) |
 |-----------------------|----------------------------------|-------------------------------------|
-| `[providers.<name>]`  | typical home                     | allowed for repo-only providers     |
+| `[providers.<name>]`  | home for every provider          | not allowed                         |
 | `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
 | `[agents.<name>]`     | rare                             | typical home                        |
 | `[workspace]`         | rare (machine-wide paths)        | typical home                        |
@@ -524,7 +542,10 @@ api-key  = "${OPENAI_API_KEY}"
 | `default-agent`       | rare                             | optional                            |
 | `default-image`       | rare                             | required for `outrig run`           |
 
-If a name is defined in both, the repo wins -- override by redefining.
+If a name is defined in both, the repo wins -- override by redefining. Providers are the one
+map with a repo-side restriction: every provider carries an `api-key`, so a provider is always
+the global file's, `base-url` included, and a repo `[models.<name>]` names it. A repo config
+that declares a provider is rejected at load.
 
 `[workspace]` is the one block that does not merge by name. Its `host-path` and `container-path`
 merge per key, so a global `container-path` stays in effect until a repo declares its own, and

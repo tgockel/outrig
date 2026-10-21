@@ -184,6 +184,10 @@ cap-add = ["NET_BIND_SERVICE"]
 Explicit `cap-add` values are rendered last, so a container can start from `drop-all` and add
 back one narrow capability. Capability names may include or omit the `CAP_` prefix.
 
+`NET_ADMIN` (or `ALL`) in `cap-add` does not combine with network interception: under
+`mode = "audit"` or `"filter"` the container is refused, since it could delete the table that
+intercepts it. See [`[network]`](../reference/config.md#network).
+
 ### Devices and privilege escalation
 
 Three further keys in the same block cover what capabilities cannot express. A device node is
@@ -207,10 +211,11 @@ config that never mentions it keeps today's protection. And the container is sti
 unprivileged rootless podman container in a user namespace -- clearing the flag grants the
 container's own namespace-local root, not root on the host.
 
-`devices` passes host device nodes through, one `--device=<path>` per entry, in declaration
-order. This is the sharpest of the three in the general case: `/dev/kvm` or a raw block device
-hands out real hardware access. It is explicit per path and per image-config, and outrig does
-not police which paths you may ask for.
+`devices` passes host device nodes through, one `--device=<entry>` per entry, in declaration
+order. An entry is `<host-path>[:<container-path>][:<permissions>]`; the permissions (`r`, `w`,
+`m`) are not enforced by rootless podman. This is the sharpest of the three in the general
+case: `/dev/kvm` or a raw block device hands out real hardware access. It is explicit per path
+and per image-config, and outrig does not police which paths you may ask for.
 
 `unmask` excludes paths from podman's default masking, one `--security-opt=unmask=<path>` per
 entry. Entries are absolute paths, globs allowed, or the literal `ALL` -- and they reach podman
@@ -364,10 +369,11 @@ outrig tags built images as `<image-config-name>:<hash>`, where the name is the 
 block key and the hash is a content-addressed cache key combining the contents of the
 `Dockerfile`, the `build-args`, the OutRig labels derived from `[images.<name>.mcp]`, and the
 build context. When the context is in a git repo, that means every file in it that `.gitignore`
-does not exclude, committed or not, by path, permission bits, and content. If `.gitignore`
-matches the context directory, or every file in it, committed or not, then every file counts: the
-rules say nothing about which of them the build uses. Outside a git repo, it is a tarball hash of
-the whole directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
+does not exclude, committed or not, by path, permission bits, and content, and every directory it
+does not exclude, empty ones included, by path and permission bits. If `.gitignore` matches the
+context directory, or every file in it, committed or not, then every file counts: the rules say
+nothing about which of them the build uses. Outside a git repo, it is a tarball hash of the whole
+directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
 podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
@@ -382,10 +388,12 @@ alphanumeric separated by `.`, `_`, or `-` -- and `outrig` rejects invalid names
 
 A change to the `Dockerfile`, any file in the context, build args, or `[images.<name>.mcp]`
 causes a rebuild on the next `outrig run` or `outrig build`. Otherwise the cache hit is
-immediate. To force a rebuild without changing files, run `outrig build --no-cache`. In a git
-repo, unless `.gitignore` excludes the context whole, a file it excludes does not count when the
-`Dockerfile` copies it by its own path, so run `outrig build --no-cache` after changing one. A
-symlink counts by what it points at, ignored or not, since copying the link copies that.
+immediate. Either command shows the build as it runs, as `[buildah]` lines on stderr (`[podman]`
+lines for a pull), so a rebuild is visible rather than a pause before `image ready`. To force a
+rebuild without changing files, run `outrig build --no-cache`. In a git repo, unless
+`.gitignore` excludes the context whole, a file it excludes does not count when the `Dockerfile`
+copies it by its own path, so run `outrig build --no-cache` after changing one. A symlink counts
+by what it points at, ignored or not, since copying the link copies that.
 
 Image-name configs use podman's local image store directly; there is no `<name>:<hash>`
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the
@@ -417,7 +425,10 @@ access         = "read-write"        # "read-only" (default) | "read-write"
 
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
 (Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
-must be present locally. An optional `[sidecars.<sc>.security]` block reuses the
+must be present locally -- outrig never pulls one. A ref that is not local is refused with
+`image "<ref>" (from [sidecars.<sc>]) is not an [images.<name>] ...` and the `podman pull <ref>`
+to run first; an inline `image` on an MCP entry reads `(from the inline image of MCP server
+"<name>")`. An optional `[sidecars.<sc>.security]` block reuses the
 whole security surface of the primary -- capability keys, `no-new-privileges`, `devices`, and
 `unmask` alike -- and each sidecar's block stands on its own, so opting one out of
 `no-new-privileges` leaves the others hardened. `start = "manual"` declares a sidecar that does
@@ -438,13 +449,15 @@ so `outrig clean` sweeps a library session's strays the same way. The session id
 
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
 after the primary and stop before it, and the same four cleanup layers -- explicit stop, the
-name guard, Drop, and the panic-hook sweep -- cover every container. In addition, sessions with
-sidecars run a `podman events` watcher on the primary: if the primary dies out from under
-outrig (manual `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an
-error. It reaps by `org.outrig.instance`, a per-container label whose value is unique to the
-session, rather than by container name -- a sidecar dies at the same moment the primary does
-and `--rm` frees its name on the spot, so a removal that resolved a name a moment later could
-reach whatever had taken it.
+name guard, Drop, and the panic sweep -- cover every container. The panic sweep acts only on a
+panic that ends outrig, never on one the session carries on from, such as a subagent round or an
+MCP connection whose task panicked. In addition, sessions with sidecars run a `podman events`
+watcher on the primary: if the primary dies out from under outrig (manual `podman kill`, OOM),
+the watcher reaps all sidecars and ends the session with an error. It reaps by
+`org.outrig.instance`, a per-container label whose value is unique to the session, rather than
+by container name -- a sidecar dies at the same moment the primary does and `--rm` frees its
+name on the spot, so a removal that resolved a name a moment later could reach whatever had
+taken it.
 A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
 sweeps stopped, record-less containers carrying `org.outrig.session`; see
 [Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
@@ -467,7 +480,7 @@ create that collided made nothing carrying it, and a cleanup still in flight can
 container you have since started under the same name. Labels are part of the creation request,
 so there is no instant in which the container exists without the mark that identifies it.
 
-**Every layer uses that selector**, not just the start guard. The panic-hook sweep used to hold
+**Every layer uses that selector**, not just the start guard. The panic sweep used to hold
 container *names* and remove by them, so a panic arriving while a start had collided would
 delete the container that already held the name -- one outrig never created. It now replays
 each outstanding attempt's label-scoped removal instead, and it tracks those attempts
@@ -532,12 +545,14 @@ in place, then becomes that user for the exec, so the *server* runs unprivileged
 container was created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
-into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<path>` flags
+into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<entry>` flags
 only when it declares `devices`, and `--security-opt=unmask=<path>` flags only when it declares
 `unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
 `org.outrig.sidecar`). Every container gets `--image-volume=ignore`, so its image's `VOLUME`s
 create no volumes; see
-[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names).
+[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names). Every container
+also gets `--http-proxy=false`, so podman copies none of the host's proxy variables into it; see
+[The container's environment](#the-containers-environment).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode
@@ -562,6 +577,21 @@ mount, or a co-hosted exec server). Do not assume the mapped ids for one. The si
 to the exception is a `view = "primary"` sidecar, whose launcher is handed the session's ids
 explicitly and drops to them before the payload runs.
 
+Its stderr normally reaches `<session_dir>/logs/<server>.stderr` through `podman start --attach`,
+which can drop all of it for a server that exits within milliseconds of starting. So that a server
+that fails at once still says why, outrig creates such a container with `--log-driver=json-file`,
+an empty `--log-opt=tag=`, a `--log-opt=path=` naming a private file of its own (under
+`$XDG_RUNTIME_DIR`, else the temporary directory), and `--log-opt=max-size=1mb`. When a start fails
+and the stderr file is empty, outrig copies the container's stderr from that file into it. The log
+replaces the host's default driver for this container -- `journald` on most systemd hosts --
+though `podman logs` still works while it runs, and it goes away with the session. The driver and
+the empty tag keep the host's `log_tag` from `containers.conf` off the container, since conmon
+refuses a tag with a file log. `json-file` is podman's alias of `k8s-file`, and podman before 6
+gives the host's tag to every driver but that one. The empty tag counts as one already given on
+podman 5.5.1 and later, which matters on podman 6, where `json-file` gets the host's tag too and a
+tag on any driver but `journald` is an error. Where SELinux is enforcing, or the log's path holds
+a `,`, `"` or `:`, outrig makes no log and the container logs as the host says.
+
 The working directory is the one exec flag that is conditional. Supply one and outrig emits
 `--workdir <path>`; leave it unset and no flag is emitted at all, so the exec lands wherever the
 container already is. That is the image's `WORKDIR` only when nothing overrode it -- a
@@ -579,6 +609,47 @@ correct quoting from the caller; setting `PWD` instead changes the variable with
 process, so anything calling `getcwd` never notices. A library caller sets it with
 `ExecOptions::with_workdir`; see the crate docs for `Outrig::exec_stdio` and
 `Outrig::exec_capture`.
+
+## The container's environment
+
+A container's environment is its image's `ENV`, the `container` and `HOSTNAME` podman sets in
+any container, the `HOME` outrig sets, and the `env` entries the config and `outrig run --env`
+give its MCP servers. Nothing is copied from the host's own environment unless your
+`containers.conf` sets `env_host` and asks podman to copy all of it. That includes the
+proxy variables podman otherwise copies from the environment it runs in -- `http_proxy`,
+`https_proxy`, `ftp_proxy`, `no_proxy`, and their uppercase forms -- because a proxy URL can
+carry a `user:password@` that everything the agent runs could then read. outrig passes
+`--http-proxy=false` to every container it starts.
+
+Behind a proxy, name it on the servers that need it. A `${VAR}` reference takes the value from
+your environment when the server starts:
+
+```toml
+[images.coding.mcp.shell]
+command = ["bash", "-lc", "exec shell-mcp-command"]
+env     = { HTTPS_PROXY = "${HTTPS_PROXY}", NO_PROXY = "${NO_PROXY}" }
+```
+
+A repo config may reference a host variable only if the global config lists it, so for the
+config above `~/.outrig/config.toml` needs the two names under
+[`[repo]`](../reference/config.md#repo):
+
+```toml
+[repo]
+env-allow = ["HTTPS_PROXY", "NO_PROXY"]
+```
+
+`outrig run --env 'HTTPS_PROXY=${HTTPS_PROXY}'` does the same for every server in one session,
+single-quoted so your shell leaves the reference for outrig, and needs no entry: you typed it.
+See [the value syntax](../reference/config.md#mcp-env-value-syntax) for how each form reaches
+podman.
+
+A proxy named this way is the agent's to read, credentials included: every process the server
+starts inherits it. Under a `filter` [network policy](../reference/config.md#network), traffic
+sent through the proxy reaches the interceptor as a connection to the proxy, so the policy rules
+on the proxy's host and port rather than on what lies behind it -- allowing the proxy allows
+whatever it will reach. A Dockerfile `ENV` works for a proxy that needs no password, but it is
+baked into the image, so keep credentials out of it.
 
 ## See also
 

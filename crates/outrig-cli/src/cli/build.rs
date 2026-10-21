@@ -37,7 +37,11 @@ pub struct BuildArgs {
 }
 
 /// Run one `outrig build` invocation end-to-end. Returns the process exit code.
-pub async fn execute(repo: &RepoConfig, global_cfg_path: &Path, args: &BuildArgs) -> Result<i32> {
+pub async fn execute(
+    repo: &RepoConfig,
+    global_cfg_path: Option<&Path>,
+    args: &BuildArgs,
+) -> Result<i32> {
     let repo_root = &repo.root;
     let mut cfg = repo.load_for_build(global_cfg_path)?;
 

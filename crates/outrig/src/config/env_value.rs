@@ -50,6 +50,20 @@ impl EnvValue {
         }
     }
 
+    /// The host variable this value references when `allow` does not list it,
+    /// which is what `[repo] env-allow` refuses. A literal references nothing.
+    ///
+    /// The one definition of that refusal, for a reference in a repo config
+    /// file and in a server an image's `org.outrig.mcp` label declares alike.
+    /// Matched without a `_` arm: a new way to name a host variable has to say
+    /// here whether it needs listing.
+    pub(crate) fn unlisted_ref(&self, allow: &[String]) -> Option<&str> {
+        match self {
+            Self::EnvRef(var) if !allow.contains(var) => Some(var),
+            Self::EnvRef(_) | Self::Literal(_) => None,
+        }
+    }
+
     /// The config-file spelling this value round-trips through: the literal
     /// text, or `${VAR}` for a reference. Inverse of [`EnvValue::from_raw`].
     pub fn to_raw(&self) -> String {
@@ -158,5 +172,34 @@ impl JsonSchema for EnvValue {
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         json_schema!({ "type": "string" })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_reference_is_refused_unless_the_list_names_it() {
+        let value = EnvValue::from_raw("${TOKEN}".to_string());
+
+        assert_eq!(value.unlisted_ref(&[]), Some("TOKEN"));
+        assert_eq!(value.unlisted_ref(&names(&["OTHER"])), Some("TOKEN"));
+        assert_eq!(value.unlisted_ref(&names(&["OTHER", "TOKEN"])), None);
+    }
+
+    /// A value that is not exactly `${VAR}` is a literal, passed verbatim, so
+    /// it reads nothing from the host and has nothing to list.
+    #[test]
+    fn a_literal_names_no_variable() {
+        for raw in ["/workspace/.cargo", "prefix-${TOKEN}-suffix", "${lower}"] {
+            let value = EnvValue::from_raw(raw.to_string());
+
+            assert_eq!(value.unlisted_ref(&[]), None, "{raw:?}");
+        }
     }
 }

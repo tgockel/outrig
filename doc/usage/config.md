@@ -7,8 +7,8 @@
 ## `outrig config init`
 
 `outrig config init` walks you through the global config at `~/.outrig/config.toml` (or
-`<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set) -- the user/machine-level
-providers and models that any outrig repo can reuse.
+`<XDG_CONFIG_HOME>/outrig/config.toml` if `XDG_CONFIG_HOME` is set to an absolute path) -- the
+user/machine-level providers and models that any outrig repo can reuse.
 
 It's the first phase of [`outrig init`](init.md), which runs `config init` automatically when
 no global config is present.
@@ -26,7 +26,8 @@ outrig config init [--force]
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
-Enter at any prompt for an explanation of what's being asked plus the available options.
+Enter at any text or yes/no prompt for an explanation of what's being asked; pickers print
+their options' descriptions before they open, and `?` there is a search character.
 
 ```sh
 $ outrig config init
@@ -50,6 +51,16 @@ $ outrig config init
 [outrig] wrote ~/.outrig/config.toml
 ```
 
+Each provider and each model needs a name of its own. A name already given in this run is asked
+for again, after a line saying so, and the suggested name moves on: a second `openai` provider is
+offered `openai-2`, and a second model `fast-2`.
+
+An answer the written config would refuse is asked for again the same way, after a line saying
+why: a `Base URL` that is not an `http://` or `https://` URL, an API key variable that is not a
+variable name, or a `max-tokens` that is not a whole number of at least 1. The API key prompt
+takes the name of the variable that holds the key -- `OPENAI_API_KEY`, or `${OPENAI_API_KEY}` as
+it is stored -- never the key itself, and its refusal does not repeat what was typed.
+
 The prompts that follow depend on the style you pick.
 
 `anthropic` asks the same connection questions with its own defaults
@@ -67,8 +78,10 @@ recognize to run on the conservative fallback outrig would otherwise apply. See
 
 ### Help at any prompt
 
-Type `?` and Enter at any prompt to get a short explanation of the field and its options. The
-prompt is then re-displayed so you can answer:
+Type `?` and Enter at any text or yes/no prompt to get a short explanation of the field and its
+options. On a terminal, pickers print the same block before they open and do not treat `?` as
+help; on piped stdin, `?` works at pickers too, as here. The prompt is then re-displayed so you
+can answer:
 
 ```
 ? Pick a provider style [default: openai]: ?

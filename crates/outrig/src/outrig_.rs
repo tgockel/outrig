@@ -3,7 +3,7 @@
 //! `launch -> tools/call_tool -> shutdown` flow that doesn't expose
 //! internals like rig, the REPL, or session storage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
@@ -13,10 +13,11 @@ use serde_json::{Map, Value};
 use tokio::process::Child;
 
 use crate::config::{
-    CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
-    McpServerSpec, MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart,
-    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_sidecar_image,
-    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
+    CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, McpServerSpec,
+    MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, check_entrypoint_hosting, check_mcp_call_timeout_secs,
+    check_sidecar_image, check_sidecar_name, check_view_exclusions, effective_mcp_call_timeout,
+    is_valid_mcp_server_name,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
@@ -174,6 +175,9 @@ pub enum SidecarServerSpec {
     ExecStdio {
         command: Vec<String>,
         env: BTreeMap<String, EnvValue>,
+        /// This server's `tools/call` deadline in seconds; see
+        /// [`SidecarServerSpec::with_call_timeout_secs`].
+        call_timeout_secs: Option<u64>,
     },
     /// The container's own `ENTRYPOINT`, spoken to over `podman start
     /// --attach --interactive`. `args` are its positional arguments, which is
@@ -184,6 +188,9 @@ pub enum SidecarServerSpec {
     Entrypoint {
         args: Vec<String>,
         env: BTreeMap<String, EnvValue>,
+        /// This server's `tools/call` deadline in seconds; see
+        /// [`SidecarServerSpec::with_call_timeout_secs`].
+        call_timeout_secs: Option<u64>,
     },
 }
 
@@ -194,6 +201,7 @@ impl SidecarServerSpec {
         Self::ExecStdio {
             command: command.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         }
     }
 
@@ -204,6 +212,7 @@ impl SidecarServerSpec {
         Self::Entrypoint {
             args: args.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         }
     }
 
@@ -215,6 +224,35 @@ impl SidecarServerSpec {
             Self::ExecStdio { env: slot, .. } | Self::Entrypoint { env: slot, .. } => *slot = env,
         }
         self
+    }
+
+    /// This server's own `tools/call` deadline in seconds, in place of the
+    /// session's. Mirrors [`McpServerSpec::with_call_timeout_secs`], and is
+    /// range-checked the same way when the sidecar starts.
+    pub fn with_call_timeout_secs(mut self, secs: u64) -> Self {
+        match &mut self {
+            Self::ExecStdio {
+                call_timeout_secs: slot,
+                ..
+            }
+            | Self::Entrypoint {
+                call_timeout_secs: slot,
+                ..
+            } => *slot = Some(secs),
+        }
+        self
+    }
+
+    /// This server's own `tools/call` deadline in seconds, if it declares one.
+    pub fn call_timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::ExecStdio {
+                call_timeout_secs, ..
+            }
+            | Self::Entrypoint {
+                call_timeout_secs, ..
+            } => *call_timeout_secs,
+        }
     }
 
     /// The argv to exec, or `None` for the entrypoint form.
@@ -362,7 +400,10 @@ impl SidecarSpec {
 #[non_exhaustive]
 pub enum EmbeddedMcpPolicy {
     /// Merge image-embedded declarations with the launch spec's MCP map.
-    /// Launch-spec entries replace image entries with the same server name.
+    /// Launch-spec entries replace image entries with the same server name,
+    /// and a spec built by [`LaunchSpec::from_config`] also keeps an image
+    /// entry out of the primary when the config placed a server of that name
+    /// in a sidecar.
     #[default]
     Merge,
     /// Ignore image-embedded declarations and use only the launch spec's MCP map.
@@ -444,7 +485,32 @@ pub struct LaunchSpec {
     pub security: SecuritySpec,
     pub network: NetworkSpec,
     pub embedded_mcp_policy: EmbeddedMcpPolicy,
+    /// The host variables a server the primary image's `org.outrig.mcp` label
+    /// declares may reference in its `env` as `${VAR}`, under
+    /// [`EmbeddedMcpPolicy::Merge`].
+    ///
+    /// A label is text the image's author wrote, and a reference in it is read
+    /// from this process's environment and handed to the server, so
+    /// [`Outrig::launch`] refuses a label entry that names a variable not
+    /// listed here ([`OutrigError::EmbeddedMcpEnvRef`]). Empty by default,
+    /// which allows no reference, as the global config's `[repo] env-allow`
+    /// does; [`LaunchSpec::from_config`] fills it from that list. An entry that
+    /// is not a variable name (`^[A-Z_][A-Z0-9_]*$`) allows nothing, since no
+    /// reference can match it. Entries in [`mcp`](Self::mcp) are the caller's
+    /// own and are not held to it, and neither is a label entry `mcp` replaces
+    /// by name. Set it with
+    /// [`with_embedded_mcp_env_allow`](Self::with_embedded_mcp_env_allow).
+    pub embedded_mcp_env_allow: Vec<String>,
     pub mcp: BTreeMap<String, McpServerSpec>,
+    /// Names of the servers the config placed outside the primary: in a
+    /// sidecar, including a `start = "manual"` one that `from_config` does not
+    /// carry. They are absent from `mcp` either way, so without this a name the
+    /// config moved looks like one it never mentioned, and `launch` would
+    /// import the primary image's label entry of that name. Set by
+    /// `from_config` and empty otherwise. It is derived once: a caller who later
+    /// removes the sidecar from `sidecars` loses the server rather than
+    /// falling back to the label's.
+    placed_elsewhere: BTreeSet<String>,
     pub sidecars: Vec<SidecarSpec>,
     /// The id the session's containers carry. The primary is named
     /// `outrig-<id>` and labeled `org.outrig.session=<id>`; a sidecar is
@@ -462,6 +528,11 @@ pub struct LaunchSpec {
     /// under OutRig's own root, where no caller's mount may go. A session's
     /// builder fills it.
     pub(crate) packages: Vec<ContainerMount>,
+    /// The `tools/call` deadline in seconds for every server, primary or
+    /// sidecar, that does not declare its own -- the config's top-level
+    /// `mcp-call-timeout-secs`. `None` is
+    /// [`DEFAULT_MCP_CALL_TIMEOUT_SECS`](crate::config::DEFAULT_MCP_CALL_TIMEOUT_SECS).
+    pub mcp_call_timeout_secs: Option<u64>,
 }
 
 impl LaunchSpec {
@@ -493,11 +564,14 @@ impl LaunchSpec {
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: Vec::new(),
             mcp,
+            placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
             packages: Vec::new(),
+            mcp_call_timeout_secs: None,
         }
     }
 
@@ -515,11 +589,14 @@ impl LaunchSpec {
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: Vec::new(),
             mcp,
+            placed_elsewhere: BTreeSet::new(),
             sidecars: Vec::new(),
             session_id: None,
             log_dir,
             packages: Vec::new(),
+            mcp_call_timeout_secs: None,
         }
     }
 
@@ -550,10 +627,23 @@ impl LaunchSpec {
     /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
     ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
     ///   mid-session.
+    /// - A server the config places in a sidecar, a `start = "manual"` one
+    ///   included, is not also imported from the primary image's
+    ///   `org.outrig.mcp` label. Under [`EmbeddedMcpPolicy::Merge`],
+    ///   [`Outrig::launch`] skips a label entry of that name, as `outrig run`
+    ///   does, and merges the label's other entries as usual.
     /// - `on-failure = "warn"` is not honored: launch-time sidecars are
     ///   abort-only here, per [`LaunchSpec::with_sidecar`].
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
     ///   servers come only from the repo config's placement entries.
+    /// - The config's `[repo].env-allow` is carried into
+    ///   [`LaunchSpec::embedded_mcp_env_allow`], which holds the primary
+    ///   image's label entries to it, as `outrig run` does.
+    ///
+    /// Like `outrig run`, this acquires the primary image before it returns:
+    /// an `image-name` is pulled when absent, and a Dockerfile image-config is
+    /// built (or found in the cache) under `image_name`, the tag `run` and
+    /// `build` share.
     ///
     /// Assumes `config` has passed validation (see [`Config`]); an unvalidated
     /// config can silently drop a server that names a missing sidecar block.
@@ -585,24 +675,20 @@ impl LaunchSpec {
                 )
             })
             .collect();
-        let source = match cfg.source() {
-            ImageSourceRef::Build { build_args, .. } => {
-                let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
-                LaunchSource::Build {
-                    dockerfile,
-                    context,
-                    build_args: build_args.clone(),
-                }
-            }
-            ImageSourceRef::Image { image_name } => LaunchSource::Image {
-                tag: image_name.to_string(),
-            },
+        // Ensured under the image-config's name, as `outrig run` does: the
+        // pull or build happens here, and `launch` is handed the local tag.
+        let tag = image::compute_tag_for(image_name, cfg, repo_root).await?;
+        image::ensure_tagged_image_for(image_name, cfg, repo_root, &tag, false, None).await?;
+        let source = LaunchSource::Image {
+            tag: tag.into_string(),
         };
 
         let plan = sidecar::plan_from_config(config, cfg);
         let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root);
         for sidecar in &mut sidecars {
-            sidecar.image = resolve_sidecar_image_tag(config, repo_root, &sidecar.image).await?;
+            let declared_by = plan.sidecars[&sidecar.name].image_declared_by();
+            sidecar.image =
+                resolve_sidecar_image_tag(config, repo_root, &sidecar.image, &declared_by).await?;
         }
 
         Ok(Self {
@@ -612,11 +698,21 @@ impl LaunchSpec {
             security: SecuritySpec::from(cfg.security()),
             network: NetworkSpec::from(&config.network),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            embedded_mcp_env_allow: config.repo.env_allow().to_vec(),
             mcp,
+            // Every sidecar-placed name, a manual sidecar's included: the
+            // primary map and `sidecars` above leave all of them out.
+            placed_elsewhere: plan
+                .servers
+                .iter()
+                .filter(|(_, placed)| placed.placement != Placement::Primary)
+                .map(|(name, _)| name.clone())
+                .collect(),
             sidecars,
             session_id: None,
             log_dir,
             packages: Vec::new(),
+            mcp_call_timeout_secs: config.mcp_call_timeout_secs,
         })
     }
 
@@ -672,6 +768,19 @@ impl LaunchSpec {
         self
     }
 
+    /// Set the host variables a server the primary image's label declares may
+    /// reference; see [`embedded_mcp_env_allow`](Self::embedded_mcp_env_allow).
+    /// Replaces what the spec held, as
+    /// [`RepoPolicy::set_env_allow`](crate::config::RepoPolicy::set_env_allow)
+    /// does.
+    pub fn with_embedded_mcp_env_allow(
+        mut self,
+        vars: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.embedded_mcp_env_allow = vars.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Declare a sidecar to start with the session. Launch-time sidecars are
     /// abort-only: any sidecar failure fails the launch and tears down
     /// everything already started (a library caller holds the `Result` and
@@ -679,6 +788,14 @@ impl LaunchSpec {
     /// "warn"` convenience is a CLI concern).
     pub fn with_sidecar(mut self, sidecar: SidecarSpec) -> Self {
         self.sidecars.push(sidecar);
+        self
+    }
+
+    /// The `tools/call` deadline in seconds for every server that does not
+    /// declare its own: the library's `mcp-call-timeout-secs`. Range-checked
+    /// by [`Outrig::launch`].
+    pub fn with_mcp_call_timeout_secs(mut self, secs: u64) -> Self {
+        self.mcp_call_timeout_secs = Some(secs);
         self
     }
 }
@@ -751,7 +868,8 @@ fn primary_launch(
 /// sidecars. Pure -- no image resolution, so each `SidecarSpec.image` still
 /// holds the unresolved config ref for [`LaunchSpec::from_config`] to rewrite.
 /// `start = "manual"` sidecars are dropped (their servers, being sidecar-placed,
-/// are already absent from the primary map); every other placement lowers,
+/// are already absent from the primary map, and nothing here carries them on --
+/// `from_config` records their names separately); every other placement lowers,
 /// entrypoint-stdio included.
 fn plan_to_launch_parts(
     plan: &SessionMcpPlan,
@@ -775,14 +893,20 @@ fn plan_to_launch_parts(
         let servers = match plan.entrypoint_server_in(sc) {
             Some((name, placed)) => BTreeMap::from([(
                 name.clone(),
-                SidecarServerSpec::entrypoint(sidecar::entrypoint_args(&placed.spec, sc).to_vec())
+                carry_call_timeout(
+                    SidecarServerSpec::entrypoint(
+                        sidecar::entrypoint_args(&placed.spec, sc).to_vec(),
+                    )
                     .with_env(placed.spec.env().clone()),
+                    &placed.spec,
+                ),
             )]),
             None => plan
                 .servers_in(&sc.name)
                 .map(|(name, placed)| {
                     let (command, env) = placed.spec.normalize();
-                    (name.clone(), SidecarServerSpec::exec(command).with_env(env))
+                    let server = SidecarServerSpec::exec(command).with_env(env);
+                    (name.clone(), carry_call_timeout(server, &placed.spec))
                 })
                 .collect(),
         };
@@ -810,15 +934,26 @@ fn plan_to_launch_parts(
     (mcp, sidecars)
 }
 
+/// `server` with `declared`'s own `call-timeout-secs`, if it has one. The
+/// session default is not copied in: it travels on [`LaunchSpec`] and is
+/// resolved per server at connect time.
+fn carry_call_timeout(server: SidecarServerSpec, declared: &McpServerSpec) -> SidecarServerSpec {
+    match declared.call_timeout_secs() {
+        Some(secs) => server.with_call_timeout_secs(secs),
+        None => server,
+    }
+}
+
 /// Resolve a sidecar image ref like `--image`: a sibling `[images.<name>]`
 /// config builds/pulls through the content-hash cache; an unmatched name is a
 /// raw podman ref that must already be present locally (no pull). Returns the
-/// resolved tag used verbatim as [`SidecarSpec::image`]. Mirrors the CLI's
-/// `ensure_sidecar_image`.
+/// resolved tag used verbatim as [`SidecarSpec::image`]; `declared_by` is what
+/// a missing raw ref's error points at. Mirrors the CLI's `ensure_sidecar_image`.
 async fn resolve_sidecar_image_tag(
     config: &Config,
     repo_root: &Path,
     image_ref: &str,
+    declared_by: &str,
 ) -> Result<String> {
     match config.images.get(image_ref) {
         Some(image_cfg) => {
@@ -829,7 +964,7 @@ async fn resolve_sidecar_image_tag(
         }
         None => {
             let tag = ImageTag::new(image_ref);
-            image::ensure_local_image(&tag, None).await?;
+            image::ensure_local_image_requested_by(declared_by, &tag, None).await?;
             Ok(tag.into_string())
         }
     }
@@ -858,7 +993,8 @@ pub struct ToolHandle {
 /// attached. Construct via [`Outrig::launch`]; grow via
 /// [`Outrig::add_sidecar`]; clean up via [`Outrig::shutdown`]. Dropping
 /// without `shutdown` still removes every container via a detached
-/// `podman rm -f` (plus the panic-hook sweeper if the host installed it).
+/// `podman rm -f` (plus the panic sweep, if the host runs under
+/// [`crate::container::with_panic_sweep`]).
 pub struct Outrig {
     /// Containers this session still owns for cleanup only.
     ///
@@ -876,6 +1012,9 @@ pub struct Outrig {
     tools: Vec<ToolHandle>,
     network: Option<NetworkInterceptor>,
     log_dir: PathBuf,
+    /// [`LaunchSpec::mcp_call_timeout_secs`], kept for the servers
+    /// [`Outrig::add_sidecar`] connects after launch.
+    mcp_call_timeout_secs: Option<u64>,
 }
 
 impl Outrig {
@@ -891,10 +1030,18 @@ impl Outrig {
     /// The container gets OutRig's static CPython read-only at
     /// `/outrig/python`, whatever the image holds, and OutRig's own Python
     /// package at `/outrig/lib`. Both are embedded in this build; the first
-    /// launch on a machine writes them under the user's cache directory. Before any image build, this fails if the workspace or
-    /// a mount is placed at or under `/outrig`, which OutRig reserves, if the
-    /// session id cannot name a container, or if the build could not embed
-    /// the payload.
+    /// launch on a machine writes them under the user's cache directory.
+    /// Before any image build, this fails if the workspace or a mount is placed
+    /// at or under `/outrig`, which OutRig reserves, if the session id cannot
+    /// name a container, if an MCP `tools/call` deadline is out of range, or if
+    /// the build could not embed the payload.
+    ///
+    /// Under [`EmbeddedMcpPolicy::Merge`], a server the image's
+    /// `org.outrig.mcp` label declares is held to
+    /// [`spec.embedded_mcp_env_allow`](LaunchSpec::embedded_mcp_env_allow)
+    /// before any server connects: a `${VAR}` in its `env` that the list omits
+    /// fails the launch with [`OutrigError::EmbeddedMcpEnvRef`], and nothing is
+    /// read from this process's environment on its account.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
         let workspace = spec.workspace.iter().map(|workspace| &workspace.container);
         let mounts = spec.mounts.iter().map(|mount| &mount.container);
@@ -905,6 +1052,19 @@ impl Outrig {
         // reason `reject_reserved` is: an id podman cannot name costs nothing
         // to refuse here and a build to refuse at `podman run`.
         let session_id = resolve_session_id(spec)?;
+        // Likewise: a deadline out of range is a spec error, not a server that
+        // fails every call once the session is up.
+        if let Some(value) = spec.mcp_call_timeout_secs {
+            check_mcp_call_timeout_secs("LaunchSpec mcp-call-timeout-secs", value)?;
+        }
+        for (name, server) in &spec.mcp {
+            if let Some(value) = server.call_timeout_secs() {
+                check_mcp_call_timeout_secs(
+                    &format!("mcp server {name:?} call-timeout-secs"),
+                    value,
+                )?;
+            }
+        }
         let python = payload::mounts().await?;
 
         let image_tag = match &spec.source {
@@ -959,17 +1119,43 @@ impl Outrig {
 
         let mcp = match spec.embedded_mcp_policy {
             EmbeddedMcpPolicy::Merge => {
-                embedded::merged_mcp_with_source(
+                let mut merged = embedded::merged_mcp_with_source(
                     &container,
                     &spec.mcp,
                     McpDeclarationSource::LaunchSpec,
                 )
-                .await?
+                .await?;
+                // The config's placement replaces the image's entry of the
+                // same name, so an entry the config put in a sidecar is not
+                // the primary's. Only the image's entries go: one in
+                // `spec.mcp` is the caller's own.
+                merged.retain(|name, server| {
+                    server.source != McpDeclarationSource::ImageLabel
+                        || !spec.placed_elsewhere.contains(name)
+                });
+                merged
             }
             EmbeddedMcpPolicy::Ignore => {
                 embedded::mcp_with_source(&spec.mcp, McpDeclarationSource::LaunchSpec)
             }
         };
+
+        // The label is its author's text, and a reference in it is resolved
+        // from this process's environment when the server connects, so what
+        // the image declared is held to the list first. `spec.mcp` is the
+        // caller's own. Past the policy match, so an entry the config placed
+        // in a sidecar is already gone, and whatever puts a label entry in the
+        // map is held.
+        for (name, server) in &mcp {
+            if server.source == McpDeclarationSource::ImageLabel {
+                embedded::check_label_server_env(
+                    image_tag.as_str(),
+                    name,
+                    &server.spec,
+                    &spec.embedded_mcp_env_allow,
+                )?;
+            }
+        }
 
         // The effective MCP map runs in the primary; a placement-bearing
         // entry would silently run there otherwise. `LaunchSpec::from_config`
@@ -997,7 +1183,11 @@ impl Outrig {
                 &spec.log_dir,
                 &BTreeMap::new(),
             )
-            .await?;
+            .await?
+            .with_call_timeout(effective_mcp_call_timeout(
+                server.spec.call_timeout_secs(),
+                spec.mcp_call_timeout_secs,
+            ));
             tools.extend(tool_handles(name, client.list_tools().await?));
             clients.insert(name.clone(), Arc::new(client));
         }
@@ -1010,6 +1200,7 @@ impl Outrig {
             tools,
             network,
             log_dir: spec.log_dir.clone(),
+            mcp_call_timeout_secs: spec.mcp_call_timeout_secs,
         };
         for sidecar in &spec.sidecars {
             if let Err(e) = outrig.add_sidecar(sidecar.clone()).await {
@@ -1139,7 +1330,9 @@ impl Outrig {
             .await);
         }
 
-        match connect_sidecar_servers(&container, &spec, &self.log_dir).await {
+        match connect_sidecar_servers(&container, &spec, &self.log_dir, self.mcp_call_timeout_secs)
+            .await
+        {
             Ok((clients, tools)) => {
                 self.sidecars.insert(spec.name.clone(), container);
                 self.clients
@@ -1216,7 +1409,7 @@ impl Outrig {
                 )
             })?;
             launch.primary_view = Some(PrimaryView::new(
-                self.container.name(),
+                self.container.selector(),
                 pid,
                 enter::materialize(&self.log_dir)?,
                 payload_home,
@@ -1277,7 +1470,9 @@ impl Outrig {
 
     /// [`Outrig::exec_stdio`], driven to completion: stdout and stderr are
     /// drained concurrently and returned with the exit status. A non-zero
-    /// exit is data on the returned [`Output`], not an error.
+    /// exit is data on the returned [`Output`], not an error. Its stdin is
+    /// empty -- it reads end-of-file at once -- so a command that needs input
+    /// goes through [`Outrig::exec_stdio`].
     pub async fn exec_capture(&self, argv: &[String], options: &ExecOptions) -> Result<Output> {
         self.container.exec_capture(argv, options).await
     }
@@ -1428,6 +1623,15 @@ fn validate_sidecar_spec<C, S>(
                 spec.name
             )));
         }
+        if let Some(value) = server.call_timeout_secs() {
+            check_mcp_call_timeout_secs(
+                &format!(
+                    "sidecar {:?} mcp server {name:?} call-timeout-secs",
+                    spec.name
+                ),
+                value,
+            )?;
+        }
         if existing_clients.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "sidecar {:?}: mcp server name {name:?} is already connected in this \
@@ -1522,10 +1726,13 @@ async fn unwound(
 /// Connect every server in `spec` against the started sidecar and index its
 /// tools. On failure every client connected so far (including the failing
 /// one, when it got that far) is shut down before the error propagates.
+/// `session_call_timeout_secs` is the session's `tools/call` deadline for a
+/// server that declares none of its own.
 async fn connect_sidecar_servers(
     container: &Container,
     spec: &SidecarSpec,
     log_dir: &Path,
+    session_call_timeout_secs: Option<u64>,
 ) -> Result<(BTreeMap<String, McpClient>, Vec<ToolHandle>)> {
     let mut clients: BTreeMap<String, McpClient> = BTreeMap::new();
     let mut tools: Vec<ToolHandle> = Vec::new();
@@ -1560,7 +1767,10 @@ async fn connect_sidecar_servers(
             }
         };
         let client = match connected {
-            Ok(client) => client,
+            Ok(client) => client.with_call_timeout(effective_mcp_call_timeout(
+                server.call_timeout_secs(),
+                session_call_timeout_secs,
+            )),
             Err(e) => {
                 shutdown_partial_clients(clients).await;
                 return Err(e);
@@ -1845,6 +2055,37 @@ mod tests {
         assert!(matches!(err, OutrigError::Configuration(_)), "{err}");
     }
 
+    /// A spec nobody listed anything on allows a label no reference, as the
+    /// global config's `[repo] env-allow` does by default.
+    #[test]
+    fn a_hand_built_spec_lists_no_variable_a_label_may_reference() {
+        let from_image = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir());
+        let built = LaunchSpec::build(
+            PathBuf::from("Dockerfile"),
+            PathBuf::from("."),
+            BTreeMap::new(),
+            WorkspaceSpec::new("/host", "/workspace"),
+            BTreeMap::new(),
+            log_dir(),
+        );
+
+        assert!(from_image.embedded_mcp_env_allow.is_empty());
+        assert!(built.embedded_mcp_env_allow.is_empty());
+    }
+
+    #[test]
+    fn builder_sets_the_variables_a_label_may_reference() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir())
+            .with_embedded_mcp_env_allow(["GITHUB_TOKEN", "HTTPS_PROXY"])
+            .with_embedded_mcp_env_allow(["GITHUB_TOKEN"]);
+
+        assert_eq!(
+            spec.embedded_mcp_env_allow,
+            vec!["GITHUB_TOKEN".to_string()],
+            "the second call replaces the first"
+        );
+    }
+
     fn tools_sidecar() -> SidecarSpec {
         SidecarSpec::from_image("tools", "ghcr.io/example/mcp-tools:1")
             .with_server("fs", vec!["mcp-fs".to_string(), "/workspace".to_string()])
@@ -2057,6 +2298,28 @@ view = "primary"
         );
     }
 
+    /// A hand-built sidecar server gets the range a config entry does: a `0`
+    /// would fail every call the moment the sidecar was up.
+    #[test]
+    fn validate_rejects_an_out_of_range_call_timeout() {
+        for secs in [0, 3601] {
+            let spec = SidecarSpec::from_image("tools", "img:1").with_server_spec(
+                "lint",
+                SidecarServerSpec::exec(["mcp-lint"]).with_call_timeout_secs(secs),
+            );
+            let err = validate_alone(&spec).expect_err("out of range");
+            assert!(
+                err.to_string().contains("call-timeout-secs"),
+                "{secs}: {err}"
+            );
+        }
+        let spec = SidecarSpec::from_image("tools", "img:1").with_server_spec(
+            "lint",
+            SidecarServerSpec::exec(["mcp-lint"]).with_call_timeout_secs(3600),
+        );
+        validate_alone(&spec).expect("the ceiling itself is in range");
+    }
+
     /// A build without the musl target embeds no launcher, so a
     /// `view = "primary"` spec has to fail before any container exists --
     /// naming the artifact rather than surfacing an opaque podman error.
@@ -2105,6 +2368,41 @@ shell = ["bash", "-lc", "sh"]
         let names: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
         assert_eq!(names, ["fs", "shell"]);
         assert!(sidecars.is_empty(), "no placement -> no sidecars");
+    }
+
+    /// Each server's own `call-timeout-secs` survives the lowering into
+    /// whichever spec carries it -- the primary map, a named sidecar's exec
+    /// server, an anonymous exec sidecar, an entrypoint host. The rebuilt
+    /// `SidecarServerSpec`s are the place it could silently drop.
+    #[test]
+    fn from_config_carries_each_servers_call_timeout() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs    = { command = ["mcp-fs"], call-timeout-secs = 30 }
+lint  = { command = ["mcp-lint"], sidecar = "tools", call-timeout-secs = 60 }
+plain = { command = ["mcp-plain"], sidecar = "tools" }
+anon  = { command = ["mcp-anon"], image = "anon-img", call-timeout-secs = 90 }
+gh    = { image = "gh-mcp", call-timeout-secs = 120 }
+[sidecars.tools]
+image = "mcp-tools"
+"#,
+        );
+
+        assert_eq!(mcp["fs"].call_timeout_secs(), Some(30));
+        let server = |name: &str| {
+            sidecars
+                .iter()
+                .find_map(|sc| sc.servers.get(name))
+                .unwrap_or_else(|| panic!("{name} lowers into some sidecar: {sidecars:?}"))
+        };
+        assert_eq!(server("lint").call_timeout_secs(), Some(60));
+        assert_eq!(server("plain").call_timeout_secs(), None);
+        assert_eq!(server("anon").call_timeout_secs(), Some(90));
+        assert!(server("gh").is_entrypoint());
+        assert_eq!(server("gh").call_timeout_secs(), Some(120));
     }
 
     #[test]

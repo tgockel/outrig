@@ -31,9 +31,9 @@ authority, and every call to it runs and is published.
 Until then, OutRig starts nothing that holds a credential from its config where the agent can
 reach it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
 resolved secrets beside the interpreter, as the same user, and MCP servers presented as Python
-objects are not in this phase (`mcp-wrappers.md`). What the container runtime passes in on its own
-is not covered: podman forwards the host's proxy variables by default, and a proxy URL can carry a
-password (#455).
+objects are not in this phase (`mcp-wrappers.md`). What the container runtime passed in on its own
+is closed too: podman forwarded the host's proxy variables by default, and a proxy URL can carry a
+password, until 0.2.2 turned that off for every container OutRig starts (#455).
 
 ## OutRig's existing property, unchanged
 

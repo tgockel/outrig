@@ -1,9 +1,10 @@
 //! Unit tests for `process`: covers all four call patterns (`run_capture`,
 //! `try_capture_logged`, `run_streamed`, `spawn_stdio`), the structured
 //! `Process` error variant, the spawn/exit tracing every podman invocation
-//! relies on, the honest stderr-tail truncation behavior, and both halves of
-//! the ownership guarantee -- the bound a dropped future gets and the
-//! confirmed reap a stop signal gets.
+//! relies on, the honest stderr-tail truncation behavior, the once-only rule
+//! of the `Tee` behind `run_capture_shown`, and both halves of the ownership
+//! guarantee -- the bound a dropped future gets and the confirmed reap a stop
+//! signal gets.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -18,7 +19,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::error::OutrigError;
 
-use super::{Cmd, Termination, Transcript};
+use super::{Cmd, Tee, Termination, Transcript};
 
 /// Ceiling for the drop path. Termination is synchronous and the reap is one
 /// task hop, so the real figure is microseconds; this is margin for a loaded
@@ -86,6 +87,40 @@ async fn try_capture_returns_output_on_nonzero_exit() {
         .expect("try_capture must not error on non-zero exit");
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// A child of `try_capture` must not read the caller's stdin (#359).
+///
+/// The property is about this process's fd 0, which every other test shares,
+/// so the body runs again as a child whose stdin is a pipe it controls.
+#[tokio::test(flavor = "current_thread")]
+async fn try_capture_leaves_the_callers_stdin_alone() {
+    const CHILD: &str = "OUTRIG_TEST_TRY_CAPTURE_STDIN";
+
+    if std::env::var_os(CHILD).is_some() {
+        let out = super::try_capture(Cmd::new("/bin/cat"))
+            .await
+            .expect("cat runs");
+        assert_eq!(out.stdout, b"", "cat read what this process still owed");
+        return;
+    }
+
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    std::io::Write::write_all(&mut writer, b"owed\n").expect("fill the pipe");
+    drop(writer);
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .arg("try_capture_leaves_the_callers_stdin_alone")
+        .env(CHILD, "1")
+        .stdin(reader)
+        .output()
+        .expect("run the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the child holding the pipe failed ({:?}): {stdout}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1036,6 +1071,68 @@ async fn a_graceful_child_that_ignores_the_stop_is_killed_at_the_grace() {
     println!("graceful escalation: pid {pid} gone in {took:?} (grace {grace:?})");
 }
 
+/// A dropped child is owed to whoever waits out the drop until it is reaped,
+/// so a caller about to exit keeps the grace the child was given: the wait
+/// ends with the child gone, having stopped itself.
+#[tokio::test(flavor = "current_thread")]
+async fn an_abandoned_graceful_child_is_waited_out_until_it_is_reaped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+    let marker = dir.path().join("caught");
+
+    let child = stop_catching_sleeper(&path, &marker)
+        .spawn_owned(
+            super::StdioSpec::captured(),
+            Termination::TermThenKill(Duration::from_secs(2)),
+        )
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    let held = crate::Abandonable::new(async move {
+        let _child = child;
+        std::future::pending::<()>().await
+    });
+    held.abandon().await;
+
+    assert!(
+        !occupies_a_process_slot(pid),
+        "abandon returned with pid {pid} still in the process table"
+    );
+    assert!(marker.exists(), "the child should have stopped itself");
+}
+
+/// A child killed when its grace runs out is reaped, and its stop is not
+/// proven: whatever it was asked to clean up may still be there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_child_killed_at_its_grace_is_not_proven_stopped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+
+    let child = stop_ignoring_sleeper(&path)
+        .spawn_owned(
+            super::StdioSpec::captured(),
+            Termination::TermThenKill(Duration::from_millis(150)),
+        )
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    let owed = crate::supervise::Tracked::new(async move {
+        let _child = child;
+        std::future::pending::<()>().await
+    })
+    .owed();
+
+    let why = owed.settled(REAP_CEILING).await;
+    assert_eq!(
+        why,
+        Err(vec![
+            "`/bin/sh` did not stop within 150ms and was killed".to_string()
+        ])
+    );
+    assert!(
+        !occupies_a_process_slot(pid),
+        "the wait ended with pid {pid} still in the process table"
+    );
+}
+
 /// The awaited path runs the same sequence and returns only once the child is
 /// terminated *and* reaped, matching
 /// [`a_stopped_capture_returns_after_a_confirmed_reap`].
@@ -1206,7 +1303,12 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
 
     let drained = tokio::time::timeout(
         Duration::from_secs(20),
-        super::capture_stream(reader, "test", Some(transcript)),
+        super::capture_stream(
+            reader,
+            "test",
+            Tee::new(Some(transcript), false),
+            Some(usize::MAX),
+        ),
     )
     .await
     .expect("the drain stopped reading and never returned");
@@ -1220,6 +1322,173 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         .expect("the writer was left blocked on a stream nobody was draining")
         .expect("the pump task panicked")
         .expect("the writer must have been able to finish");
+}
+
+// ---------------------------------------------------------------------------
+// The shown capture: a line reaches stderr once, and a failure has no tail
+// ---------------------------------------------------------------------------
+
+/// The rule lives in the constructor, so it is the constructor under test:
+/// the live sink is on only when nothing else already writes to stderr.
+///
+/// Constructing a mirroring transcript writes nothing until a line is given,
+/// so the test binary's own fd 2 is never touched. The write itself cannot be
+/// observed in-process -- tokio's stderr bypasses libtest's capture -- and is
+/// pinned end to end by `run_smoke`'s cache-miss cases instead.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tee_writes_live_only_when_the_transcript_does_not_already() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mirroring = Transcript::create(&dir.path().join("mirroring.log"), true)
+        .await
+        .expect("create transcript");
+    let recording = Transcript::create(&dir.path().join("recording.log"), false)
+        .await
+        .expect("create transcript");
+
+    assert!(Tee::new(None, true).live_stderr);
+    assert!(Tee::new(Some(recording), true).live_stderr);
+    assert!(
+        !Tee::new(Some(mirroring.clone()), true).live_stderr,
+        "a transcript already mirroring to stderr leaves the line to it"
+    );
+    assert!(!Tee::new(None, false).live_stderr);
+    assert!(!Tee::new(Some(mirroring), false).live_stderr);
+}
+
+/// A shown command's lines were on stderr as they arrived, so its failure
+/// carries nothing to repeat them with -- the `Process` error has the exit
+/// code and an empty tail, as a streamed failure does.
+///
+/// The child writes a line to stderr before it fails, so a tail that kept
+/// the child's stderr would carry that line and fail the assertion. Being
+/// shown, the line also reaches this test binary's own fd 2: one `[test]`
+/// line in the test output is this test working.
+#[tokio::test(flavor = "current_thread")]
+async fn a_shown_failure_carries_no_tail() {
+    // Reaches the spawn/exit callsites with no subscriber installed. See
+    // `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
+    // The shell assembles the marker, so it is in the child's stderr but not
+    // in the argv the error prints.
+    let marker = "a shown line the error must not repeat";
+    let script = "m=repeat; echo \"a shown line the error must not $m\" >&2; exit 3";
+    let err = super::run_capture_shown(
+        Cmd::new("/bin/sh").args(["-c", script]),
+        "test",
+        None,
+        Termination::Kill,
+    )
+    .await
+    .expect_err("exit 3 must fail");
+    let OutrigError::Process {
+        exit_code,
+        stderr_tail,
+        ..
+    } = &err
+    else {
+        panic!("expected a Process error, got {err:?}");
+    };
+    assert_eq!(*exit_code, Some(3));
+    assert_eq!(stderr_tail, "", "a shown failure repeats nothing");
+    assert!(
+        !err.to_string().contains(marker),
+        "the rendered error must not repeat a shown line: {err}"
+    );
+}
+
+/// A build-sized log must not accumulate in memory: stderr keeps its last
+/// `STDERR_TAIL_LIMIT` bytes and a discarded stdout keeps none.
+#[tokio::test]
+async fn a_captured_run_retains_a_bounded_tail() {
+    let _emitting = emitting().await;
+    let limit = super::STDERR_TAIL_LIMIT;
+    let script = format!(
+        "yes out | head -c {n}; yes err | head -c {n} >&2; echo last >&2",
+        n = 3 * limit
+    );
+    let output = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect("exit 0");
+    assert!(output.stdout.is_empty(), "stdout was not asked for");
+    assert!(
+        output.stderr.len() <= limit + 1,
+        "{} bytes kept",
+        output.stderr.len()
+    );
+    assert!(output.stderr.ends_with(b"last\n"), "the tail is the end");
+}
+
+/// A failure whose stderr was clipped still says so in the error.
+#[tokio::test]
+async fn a_clipped_failure_tail_keeps_its_truncation_marker() {
+    let _emitting = emitting().await;
+    let script = format!(
+        "yes err | head -c {n} >&2; exit 3",
+        n = 3 * super::STDERR_TAIL_LIMIT
+    );
+    let err = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect_err("exit 3");
+    let OutrigError::Process { stderr_tail, .. } = &err else {
+        panic!("expected a Process error, got {err:?}");
+    };
+    assert!(stderr_tail.starts_with("... (truncated) ..."), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Process groups: who the terminal's Ctrl-C reaches
+// ---------------------------------------------------------------------------
+
+/// A plain child joins outrig's process group, so the terminal's `SIGINT`
+/// reaches it; one spawned `in_own_process_group` leads a group of its own,
+/// so it does not. Either way the drop still ends it: `Owned` signals the
+/// pid, never a group.
+///
+/// The membership is the whole of what this can pin without a terminal. A
+/// `SIGINT` to the test binary's own group would land on the test runner;
+/// `run_smoke`'s e2e case sends the real one to an `outrig run` (#335).
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_child_in_its_own_group_is_out_of_the_terminals_reach() {
+    use nix::unistd::{Pid, getpgid, getpgrp};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let joined_path = dir.path().join("joined.pid");
+    let own_path = dir.path().join("own.pid");
+
+    let joined = pid_publishing_sleeper(&joined_path)
+        .spawn_owned(super::StdioSpec::captured(), Termination::Kill)
+        .expect("spawn must succeed");
+    let own = pid_publishing_sleeper(&own_path)
+        .in_own_process_group()
+        .spawn_owned(super::StdioSpec::captured(), Termination::Kill)
+        .expect("spawn must succeed");
+    let joined_pid = published_pid(&joined_path).await;
+    let own_pid = published_pid(&own_path).await;
+
+    let group_of = |pid: u32| getpgid(Some(Pid::from_raw(pid as i32))).expect("getpgid");
+    assert_eq!(group_of(joined_pid), getpgrp(), "a plain child joins ours");
+    assert_eq!(
+        group_of(own_pid),
+        Pid::from_raw(own_pid as i32),
+        "the child leads its own group"
+    );
+
+    drop(joined);
+    drop(own);
+    elapsed_until_gone(joined_pid).await;
+    elapsed_until_gone(own_pid).await;
 }
 
 /// The value every test below hides, and what each shows in its place.

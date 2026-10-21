@@ -24,6 +24,12 @@ work is every duration key at once:
 - `OpenAiOptions` / `AnthropicOptions` -- both fields and both `with_*` setters
 - `DEFAULT_RETRY_BUDGET_SECS`, `RETRY_BUDGET_SECS_CEILING`,
   `REQUEST_TIMEOUT_SECS_CEILING`, `DEFAULT_REQUEST_TIMEOUT_SECS`
+- the MCP `tools/call` deadline (#338): `Config::mcp_call_timeout_secs`,
+  `McpServerSpec::Full::call_timeout_secs` (`call-timeout-secs`, also accepted in
+  `org.outrig.mcp` labels and `image.toml`), `SidecarServerSpec`'s and `LaunchSpec`'s
+  fields and setters, `SessionMcpPlan::mcp_call_timeout_secs`,
+  `DEFAULT_MCP_CALL_TIMEOUT_SECS`, `MCP_CALL_TIMEOUT_SECS_CEILING`. A label key
+  changes shape across versions, so this one needs a read-both window.
 - both provider tables and the validation rules in `doc/reference/config.md`
 - `crates/outrig/public-api.txt`
 

@@ -1,5 +1,7 @@
-# Mirror of doc/reference/config.md "Full examples", flattened into one file
-# so the schema fixture exercises every legal section in a single round-trip.
+# Mirror of doc/reference/config.md "Full examples" -- both files flattened
+# into one so the schema fixture exercises every legal section in a single
+# round-trip. Loads as a *global* config; as a repo config it is refused,
+# because only the operator's file may declare the keyed providers below.
 
 default-image      = "coding"
 default-agent      = "coding"
@@ -10,6 +12,7 @@ tool-result-max    = 524288
 subagent-depth-max = 4
 subagent-width-max = 6
 retry-budget-secs  = 300
+mcp-call-timeout-secs = 900
 
 [network]
 mode = "audit"
@@ -19,6 +22,9 @@ mode = "record"
 
 [host]
 grace-secs = 10
+
+[repo]
+env-allow = ["GITHUB_TOKEN", "HTTPS_PROXY", "NO_PROXY"]
 
 [providers.openai]
 style                = "openai"
@@ -111,6 +117,7 @@ build-args = { NODE_VERSION = "20" }
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
   grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
   lint  = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
+  tests = { command = ["test-mcp"], call-timeout-secs = 1800 }
 
 # Sidecars are top level: declared once, referenced by name from any
 # image-config, and started only for the ones whose `[mcp]` entries name them.

@@ -11,7 +11,7 @@ use rig::tool::ToolCallExtensions;
 use thiserror::Error;
 
 use crate::error::{CliError, Result};
-use crate::session_tool::{self, SessionTool};
+use crate::session_tool::{self, SessionTool, SharedTools};
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider};
 
 /// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
@@ -684,6 +684,34 @@ fn resolve_candidate(
     })
 }
 
+/// The output-token ceiling one candidate sends, next to the one configured.
+///
+/// Carried out of [`build_agent_with_ceilings`] because the two differ on the
+/// Anthropic arm -- a configured value above the identifier's published
+/// ceiling is lowered, and an unset one becomes rig's ceiling or outrig's
+/// fallback -- and the operator-facing warning for a cut-off report has to
+/// name the number that reached the wire (#258). Elsewhere `sent` is the
+/// configured value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EffectiveCeiling {
+    /// The `[models.<name>]` row, never the alias's name.
+    pub(crate) model_name: String,
+    /// What the agent's or model's `max-tokens` said.
+    pub(crate) configured: Option<u32>,
+    /// What the candidate's requests carry; `None` when no ceiling is sent.
+    pub(crate) sent: Option<u32>,
+}
+
+impl EffectiveCeiling {
+    fn new(candidate: &ResolvedCandidate, sent: Option<u32>) -> Self {
+        Self {
+            model_name: candidate.model_name.clone(),
+            configured: candidate.max_tokens,
+            sent,
+        }
+    }
+}
+
 /// Runtime-dispatched Rig agent. The OpenAi-backed and Anthropic-backed
 /// `CompletionModel` impls produce concretely different `Agent<M>` types
 /// (Rig's trait carries associated response and client types, so a single
@@ -777,13 +805,25 @@ fn remote_http_client(
 ///
 /// Building does no I/O: each candidate gets an HTTP client, handed to Rig.
 pub async fn build_agent(resolved: &ResolvedAgent, tools: Vec<SessionTool>) -> Result<RigAgent> {
+    build_agent_with_ceilings(resolved, tools)
+        .await
+        .map(|(agent, _)| agent)
+}
+
+/// [`build_agent`], also returning each candidate's [`EffectiveCeiling`] in
+/// chain order, for a caller that has to describe the ceiling in effect.
+pub(crate) async fn build_agent_with_ceilings(
+    resolved: &ResolvedAgent,
+    tools: Vec<SessionTool>,
+) -> Result<(RigAgent, Vec<EffectiveCeiling>)> {
     // A chain of one is not a special case: it takes the single-candidate path
     // below and produces exactly the `RigAgent` it always did, wrapper and all.
     // That is what keeps every no-alias session byte-for-byte what it was --
     // the same variant, the same retry stack, the same error text -- rather
     // than merely equivalent to it.
     if resolved.candidates.len() == 1 {
-        return build_single(resolved, resolved.primary(), tools).await;
+        let (agent, ceiling) = build_single(resolved, resolved.primary(), tools).await?;
+        return Ok((agent, vec![ceiling]));
     }
 
     // One policy for the whole chain, so its `chain_deadline` is the same
@@ -801,11 +841,14 @@ pub async fn build_agent(resolved: &ResolvedAgent, tools: Vec<SessionTool>) -> R
 
     let mut candidates: Vec<Box<dyn failover::Candidate>> =
         Vec::with_capacity(resolved.candidates.len());
+    let mut ceilings = Vec::with_capacity(resolved.candidates.len());
     for candidate in &resolved.candidates {
-        candidates.push(build_candidate(candidate, &policy).await?);
+        let (built, ceiling) = build_candidate(candidate, &policy).await?;
+        candidates.push(built);
+        ceilings.push(ceiling);
     }
 
-    Ok(RigAgent::Failover {
+    let agent = RigAgent::Failover {
         agent: finish_agent(
             failover::FailoverModel::new(candidates, policy),
             resolved,
@@ -815,7 +858,8 @@ pub async fn build_agent(resolved: &ResolvedAgent, tools: Vec<SessionTool>) -> R
             tools,
         ),
         tool_call_max: resolved.tool_call_max,
-    })
+    };
+    Ok((agent, ceilings))
 }
 
 /// Build the one-candidate agent: the pre-failover path, unchanged.
@@ -823,7 +867,8 @@ async fn build_single(
     resolved: &ResolvedAgent,
     candidate: &ResolvedCandidate,
     tools: Vec<SessionTool>,
-) -> Result<RigAgent> {
+) -> Result<(RigAgent, EffectiveCeiling)> {
+    let ceiling = EffectiveCeiling::new(candidate, candidate.max_tokens);
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -835,7 +880,7 @@ async fn build_single(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
-            Ok(RigAgent::OpenAi {
+            let agent = RigAgent::OpenAi {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
                     resolved,
@@ -843,7 +888,8 @@ async fn build_single(
                     tools,
                 ),
                 tool_call_max: resolved.tool_call_max,
-            })
+            };
+            Ok((agent, ceiling))
         }
         ResolvedProvider::Anthropic {
             base_url,
@@ -855,7 +901,7 @@ async fn build_single(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
-            Ok(RigAgent::Anthropic {
+            let agent = RigAgent::Anthropic {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
                     resolved,
@@ -863,7 +909,8 @@ async fn build_single(
                     tools,
                 ),
                 tool_call_max: resolved.tool_call_max,
-            })
+            };
+            Ok((agent, EffectiveCeiling::new(candidate, max_tokens)))
         }
     }
 }
@@ -879,7 +926,8 @@ async fn build_single(
 async fn build_candidate(
     candidate: &ResolvedCandidate,
     policy: &retry::RetryPolicy,
-) -> Result<Box<dyn failover::Candidate>> {
+) -> Result<(Box<dyn failover::Candidate>, EffectiveCeiling)> {
+    let ceiling = EffectiveCeiling::new(candidate, candidate.max_tokens);
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -890,12 +938,15 @@ async fn build_candidate(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
             let model = openai_model(&client, candidate);
-            Ok(Box::new(failover::ModelCandidate::new(
-                retry::RetryingModel::new(model, policy.clone()),
-                &candidate.model_name,
-                &candidate.model_identifier,
-                candidate.max_tokens,
-            )))
+            Ok((
+                Box::new(failover::ModelCandidate::new(
+                    retry::RetryingModel::new(model, policy.clone()),
+                    &candidate.model_name,
+                    &candidate.model_identifier,
+                    candidate.max_tokens,
+                )),
+                ceiling,
+            ))
         }
         ResolvedProvider::Anthropic {
             base_url,
@@ -906,12 +957,15 @@ async fn build_candidate(
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = anthropic_client(base_url, api_key, http)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
-            Ok(Box::new(failover::ModelCandidate::new(
-                retry::RetryingModel::new(model, policy.clone()),
-                &candidate.model_name,
-                &candidate.model_identifier,
-                max_tokens,
-            )))
+            Ok((
+                Box::new(failover::ModelCandidate::new(
+                    retry::RetryingModel::new(model, policy.clone()),
+                    &candidate.model_name,
+                    &candidate.model_identifier,
+                    max_tokens,
+                )),
+                EffectiveCeiling::new(candidate, max_tokens),
+            ))
         }
     }
 }
@@ -1303,14 +1357,34 @@ impl RigAgent {
             RigAgent::Failover { agent, .. } => run_turn_inner(agent, prompt, history, hook).await,
         }
     }
+
+    /// The candidates of a chain that answered a model call since this was last
+    /// asked, as indices into [`ResolvedAgent::candidates`] -- the chain is
+    /// built from that list in order -- ascending (#265).
+    ///
+    /// Empty for a single-candidate agent, whose one candidate is index 0 and
+    /// the model it was launched on. For a chain it is what a transcript needs
+    /// to attribute a round honestly: a launch label names the head, but a call
+    /// that failed over was answered by a later candidate.
+    pub(crate) fn take_answered(&self) -> Vec<usize> {
+        match self {
+            RigAgent::Failover { agent, .. } => agent.model.take_answered(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A [`RigAgent`] plus the recipe to rebuild it when `/sidecar add` grows
 /// the tool list mid-session. The rig agent's toolset is frozen at build
-/// time, so [`RebuildingAgent::extend_tools`] only marks the agent stale;
+/// time, so [`RebuildingAgent::extend_mcp_tools`] only marks the agent stale;
 /// the next [`RebuildingAgent::run_turn`] rebuilds over the full list
 /// (a fresh HTTP client, so the first turn after a rebuild re-handshakes rather
 /// than reusing the pooled connection).
+///
+/// What it adds also joins the session's [`SharedTools`], which subagents
+/// launch from: growing the primary is the only way the session gains a tool,
+/// so no later launch misses one. Only MCP tools go that way -- the `outrig__`
+/// launch tools hold a subagent registry, which holds that list.
 ///
 /// Interior mutability (`RefCell`/`Cell`) because the wrapper is shared by
 /// `&` between the REPL's prompt path and its `/sidecar` command; the
@@ -1319,6 +1393,8 @@ impl RigAgent {
 pub struct RebuildingAgent {
     resolved: ResolvedAgent,
     tools: RefCell<Vec<SessionTool>>,
+    /// The session's MCP tools, without the built-ins `tools` also holds.
+    mcp_tools: SharedTools,
     dirty: Cell<bool>,
     // The agent rides in an inner `Rc` so a turn clones it out and never
     // holds the `RefCell` borrow across the run_turn await (a rebuild in a
@@ -1329,18 +1405,26 @@ pub struct RebuildingAgent {
 impl RebuildingAgent {
     /// Wrap an already-built agent. The first build stays with the caller
     /// so any error it raises surfaces there.
-    pub fn new(agent: RigAgent, tools: Vec<SessionTool>, resolved: ResolvedAgent) -> Self {
+    pub fn new(
+        agent: RigAgent,
+        tools: Vec<SessionTool>,
+        mcp_tools: SharedTools,
+        resolved: ResolvedAgent,
+    ) -> Self {
         Self {
             resolved,
             tools: RefCell::new(tools),
+            mcp_tools,
             dirty: Cell::new(false),
             agent: RefCell::new(Rc::new(agent)),
         }
     }
 
-    /// Append tool adapters and mark the agent stale; the next
-    /// [`RebuildingAgent::run_turn`] rebuilds over the extended list.
-    pub fn extend_tools(&self, new: Vec<SessionTool>) {
+    /// Append MCP tool adapters, here and to the shared list, and mark the
+    /// agent stale; the next [`RebuildingAgent::run_turn`] rebuilds over the
+    /// extended list.
+    pub fn extend_mcp_tools(&self, new: Vec<SessionTool>) {
+        self.mcp_tools.extend(new.iter().cloned());
         self.tools.borrow_mut().extend(new);
         self.dirty.set(true);
     }
@@ -2861,6 +2945,29 @@ mod tests {
     #[test]
     fn model_display_is_the_bare_name_for_a_direct_model() {
         assert_eq!(test_resolved_for_display().model_display(), "opus-5");
+    }
+
+    /// Tools `/sidecar add` gives the primary join the shared MCP list too,
+    /// which is what a subagent launched afterwards is built from (#351).
+    #[tokio::test]
+    async fn extended_tools_join_the_shared_mcp_list() {
+        let resolved = crate::subagent::fixtures::test_resolved(1);
+        let built = build_agent(&resolved, Vec::new())
+            .await
+            .expect("openai agent builds without I/O");
+        let mcp_tools = SharedTools::default();
+        let agent = RebuildingAgent::new(built, Vec::new(), mcp_tools.clone(), resolved);
+
+        // Stand-ins for a sidecar's MCP adapters, which need a live client.
+        let added = crate::self_tool::self_tools();
+        let names = |tools: &[SessionTool]| -> Vec<String> {
+            tools.iter().map(rig::tool::ToolDyn::name).collect()
+        };
+        let expected = names(&added);
+        agent.extend_mcp_tools(added);
+
+        assert_eq!(names(&mcp_tools.snapshot()), expected);
+        assert_eq!(names(&agent.tools()), expected);
     }
 
     /// The display helper only reads the first candidate's name and

@@ -1,7 +1,9 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Directive;
 
 use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
@@ -14,9 +16,9 @@ use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::program::{self, RunCommandArgs};
 use crate::cli::run::{self, RunArgs};
 use crate::cli::run_new::{self, RunNewArgs};
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::paths::{
-    RepoConfig, global_config_path, resolve_repo_config, resolve_repo_config_optional,
+    RepoConfig, resolve_global_config, resolve_repo_config, resolve_repo_config_optional,
 };
 use crate::{config_init, image_setup, init};
 
@@ -36,7 +38,7 @@ struct Cli {
     global_config: Option<PathBuf>,
 
     /// Override the session root for this invocation. Default cascade:
-    /// flag > config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
+    /// flag > global config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
     #[arg(long = "session-root", global = true, value_name = "PATH")]
     session_root: Option<PathBuf>,
 
@@ -173,18 +175,42 @@ enum ImageCmd {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    raise_descriptor_limit();
 
+    // The hook is the panic sweep only in an abort build; in this one, the
+    // sweep is a panic leaving everything below.
     outrig::container::install_panic_hook();
+    outrig::container::with_panic_sweep(|| {
+        tracing::debug!("outrig starting");
+        let code = match dispatch(&cli) {
+            Ok(code) => code,
+            Err(e) => {
+                // A signal announced itself as it landed, and the terminal it
+                // would be reported to may be gone.
+                if !matches!(e, CliError::Interrupted(_)) {
+                    super::eprint_best_effort(&format!("error: {e}\n"));
+                }
+                e.exit_code()
+            }
+        };
+        ExitCode::from(code.clamp(0, 255) as u8)
+    })
+}
 
-    tracing::debug!("outrig starting");
-    let code = match dispatch(&cli) {
-        Ok(code) => code,
-        Err(e) => {
-            super::eprint_best_effort(&format!("error: {e}\n"));
-            e.exit_status()
-        }
-    };
-    ExitCode::from(code.clamp(0, 255) as u8)
+/// Drive a session command, then shut its runtime down without waiting on
+/// blocking work. A REPL or a stdio MCP transport can leave a blocking stdin
+/// read in flight that returns only when the other end writes or closes the
+/// pipe, and dropping the runtime normally waits for it -- after a signal, a
+/// stopped container, or a second Ctrl-C, the session was torn down and the
+/// process sat there until someone pressed Enter. Every session has finished
+/// its own teardown by the time `fut` resolves.
+fn block_on_session(
+    runtime: tokio::runtime::Runtime,
+    fut: impl Future<Output = Result<i32>>,
+) -> Result<i32> {
+    let result = runtime.block_on(fut);
+    runtime.shutdown_background();
+    result
 }
 
 fn dispatch(cli: &Cli) -> Result<i32> {
@@ -193,7 +219,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
             runtime.block_on(program::execute(
                 &repo_config,
-                &global_config,
+                global_config.as_deref(),
                 cli.session_root.as_deref(),
                 args.grace,
                 &args.program,
@@ -201,19 +227,22 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::Run(RunCommandArgs { session: args, .. }) | Cmd::RunLegacy(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(run::execute(
-                &repo_config,
-                &global_config,
-                cli.session_root.as_deref(),
-                args,
-                cli.verbose,
-            ))
+            block_on_session(
+                runtime,
+                run::execute(
+                    &repo_config,
+                    global_config.as_deref(),
+                    cli.session_root.as_deref(),
+                    args,
+                    cli.verbose,
+                ),
+            )
         }
         Cmd::RunNew(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
             runtime.block_on(run_new::execute(
                 &repo_config,
-                &global_config,
+                global_config.as_deref(),
                 cli.session_root.as_deref(),
                 args,
             ))
@@ -226,18 +255,21 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 return runtime.block_on(mcp_self_cli::execute(args));
             }
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(mcp::execute(
-                &repo_config,
-                &global_config,
-                cli.session_root.as_deref(),
-                args,
-                cli.verbose,
-            ))
+            block_on_session(
+                runtime,
+                mcp::execute(
+                    &repo_config,
+                    global_config.as_deref(),
+                    cli.session_root.as_deref(),
+                    args,
+                    cli.verbose,
+                ),
+            )
         }
         Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, true)?;
-            runtime.block_on(build::execute(&repo_config, &global_config, args))
+            runtime.block_on(build::execute(&repo_config, global_config.as_deref(), args))
         }
         Cmd::Config(args) => match &args.cmd {
             ConfigCmd::Init { force } => {
@@ -302,44 +334,57 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             }
         },
         Cmd::Ls(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(ls::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(ls::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Logs(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(logs::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(logs::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Discard(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(discard::execute(
-                args,
-                session_root,
-                repo_cfg,
-                &global,
-                &cwd,
-            ))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(discard::execute(args, cli.session_root.as_deref(), global))
         }
         Cmd::Clean(args) => {
-            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
-            let session_root = cli.session_root.as_deref();
-            let repo_cfg = cli.config.as_deref();
-            runtime.block_on(clean::execute(args, session_root, repo_cfg, &global, &cwd))
+            let (global, runtime) = session_cmd_ctx(cli)?;
+            runtime.block_on(clean::execute(args, cli.session_root.as_deref(), global))
         }
+    }
+}
+
+/// Raises this process's soft limit on open descriptors to its hard limit.
+///
+/// The soft limit is commonly 1024, kept low for programs that still use
+/// `select`, which outrig does not. Under network audit or filter each
+/// connection a container makes holds two of outrig's descriptors, on top of
+/// the MCP pipes, logs and LLM sockets it already has, so a few busy
+/// containers could take all 1024 between them -- after which an LLM call
+/// fails as surely as the container's next connection. The hard limit is the
+/// ceiling the host set, so going up to it asks for nothing more. Processes
+/// outrig starts inherit it; podman, the main one, raises its own to the same
+/// ceiling regardless.
+fn raise_descriptor_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let raised = getrlimit(Resource::RLIMIT_NOFILE).and_then(|(soft, hard)| {
+        if soft < hard {
+            setrlimit(Resource::RLIMIT_NOFILE, hard, hard)?;
+            tracing::debug!("raised the open-file limit from {soft} to {hard}");
+        }
+        Ok(())
+    });
+    if let Err(e) = raised {
+        tracing::debug!("left the open-file limit as it was: {e}");
     }
 }
 
 fn init_tracing(verbose: u8) {
     let outrig_log = std::env::var("OUTRIG_LOG").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
-    let mut filter =
-        EnvFilter::try_new(log_filter_spec(outrig_log.as_deref(), rust_log.as_deref()))
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+    let spec = log_filter_spec(outrig_log.as_deref(), rust_log.as_deref());
+    let mut filter = EnvFilter::try_new(spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(directive) = quiet_rustyline(spec) {
+        filter = filter.add_directive(directive);
+    }
     if verbose >= 2 {
         filter = filter.add_directive(
             "outrig=trace"
@@ -364,36 +409,51 @@ fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -
     outrig_log.or(rust_log).unwrap_or("info")
 }
 
-/// Shared preamble for `ls`/`logs`/`discard`: cwd, the resolved global
-/// config path, and a current-thread tokio runtime ready to drive the
-/// async `execute` form of each subcommand. The repo config is resolved
-/// inside each handler because session lookups can substring-match across
-/// repos and shouldn't fail on a missing repo config.
-fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
-    let cwd = crate::paths::current_dir()?;
-    let global = global_config_path(cli.global_config.as_deref());
+/// Hold rustyline's own records at `warn` unless the filter names it.
+///
+/// rustyline logs every key it decodes and every buffer it reads at `debug`
+/// -- the text typed at the REPL prompt, including what a Ctrl-C discards --
+/// and the `log` bridge this subscriber installs would carry all of it to
+/// stderr under the documented `RUST_LOG=debug`, where a redirected
+/// diagnostic log is the last place a pasted key belongs. A spec that
+/// mentions `rustyline` is the opt-in and is left alone.
+fn quiet_rustyline(spec: &str) -> Option<Directive> {
+    (!spec.contains("rustyline")).then(|| {
+        "rustyline=warn"
+            .parse()
+            .expect("hard-coded rustyline directive must parse")
+    })
+}
+
+/// Shared preamble for `ls`/`logs`/`discard`/`clean`: `--global-config` as
+/// given and a current-thread tokio runtime ready to drive the async
+/// `execute` form of each subcommand. No repo config and no cwd: the session
+/// root is global-only, so these commands answer the same from any directory.
+/// The global config is resolved only where a command reads it.
+fn session_cmd_ctx(cli: &Cli) -> Result<(Option<&Path>, tokio::runtime::Runtime)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    Ok((cwd, global, runtime))
+    Ok((cli.global_config.as_deref(), runtime))
 }
 
-/// Shared preamble for `run`/`run-new`/`mcp`/`build`: the resolved repo config, the
-/// resolved global config, and a current-thread tokio runtime. With
-/// `require_config` (build), errors if no repo config can be located;
-/// otherwise (run/mcp) a missing config falls back to the current directory
-/// as repo root, merged over the global config.
+/// Shared preamble for `run`/`run-new`/`mcp`/`build`: the resolved repo config,
+/// the resolved global config (`None` with nowhere to look for one), and a
+/// current-thread tokio runtime. With `require_config` (build), errors if no
+/// repo config can be located; otherwise (run/mcp) a missing config falls back
+/// to the current directory as repo root, merged over the global config.
 fn repo_cmd_ctx(
     cli: &Cli,
     require_config: bool,
-) -> Result<(RepoConfig, PathBuf, tokio::runtime::Runtime)> {
+) -> Result<(RepoConfig, Option<PathBuf>, tokio::runtime::Runtime)> {
     let cwd = crate::paths::current_dir()?;
     let repo_config = if require_config {
         resolve_repo_config(cli.config.as_deref(), &cwd)?
     } else {
         resolve_repo_config_optional(cli.config.as_deref(), &cwd)?
     };
-    let global_config = global_config_path(cli.global_config.as_deref());
+    // After the repo config, so a bad `--config` is the error reported.
+    let global_config = resolve_global_config(cli.global_config.as_deref())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -404,7 +464,7 @@ fn repo_cmd_ctx(
 mod tests {
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Cmd, ImageCmd, log_filter_spec};
+    use super::{Cli, Cmd, EnvFilter, ImageCmd, log_filter_spec, quiet_rustyline};
 
     /// The `outrig ...` lines of the README's `## Commands` fence, with
     /// trailing comments dropped and an `a|b` alternation in the final word
@@ -533,6 +593,21 @@ mod tests {
             panic!("not `run-legacy`");
         };
         assert_eq!(args.agent.as_deref(), Some("x"));
+    }
+
+    /// `RUST_LOG=debug` is documented for podman transcripts; it must not also
+    /// print what the user types at the line editor.
+    #[test]
+    fn a_global_filter_holds_rustyline_at_warn() {
+        let directive = quiet_rustyline("debug").expect("a global spec gets the directive");
+        let filter = EnvFilter::new("debug").add_directive(directive);
+        assert!(filter.to_string().contains("rustyline=warn"), "{filter}");
+    }
+
+    #[test]
+    fn naming_rustyline_in_the_filter_is_the_opt_in() {
+        assert!(quiet_rustyline("rustyline=debug").is_none());
+        assert!(quiet_rustyline("outrig=trace,rustyline=trace").is_none());
     }
 
     #[test]

@@ -620,7 +620,7 @@ pub(super) async fn stop(container: Option<Outrig>, bindings: &mut Bindings) {
 
 /// A start failure from OutRig's own error.
 fn start_error(e: OutrigError) -> SessionError {
-    SessionError::Start(Failure(AgentError::Outrig(e)))
+    SessionError::Start(Failure(AgentError::from(e)))
 }
 
 /// `spec`, rewritten for a session with bindings: every directory it mounts
@@ -708,8 +708,9 @@ pub(crate) fn chosen_repo_root(root: Option<&Path>) -> Result<PathBuf, OutrigErr
 /// `config`: its workspace, mounts, security and network as `config` declares
 /// them, with repository-relative paths against `repo_root` and its logs in
 /// `log_dir`. With `pinned`, the image is that already-ensured tag, keeping the
-/// block's security; otherwise it is whatever the block names, which
-/// [`Outrig::launch`] builds or runs.
+/// block's security, which [`LaunchSpec::from_config`] finds local; otherwise
+/// it is whatever the block names, which `from_config` pulls or builds under
+/// the block's name.
 ///
 /// **No MCP server and no sidecar starts**, including servers an image
 /// declares in its own `org.outrig.mcp` label. The model's one tool submits

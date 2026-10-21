@@ -36,7 +36,7 @@ use nix::fcntl::{Flock, FlockArg};
 use outrig::config::{Config, EnvSecrets, EventsMode, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::harness::{self, DEFAULT_DRAIN, Progress, SessionBuilder, Step, Verdict};
-use outrig::image::{self, ImageTag};
+use outrig::image::{self, BuildOutput, ImageTag};
 use outrig::LaunchSpec;
 
 use crate::builtin_image;
@@ -44,8 +44,11 @@ use crate::cli::eprint_best_effort;
 use crate::cli::report::{Summary, render_report, summarize};
 use crate::cli::session_setup::ProgressSpan;
 use crate::error::{CliError, OutrigError, Result};
-use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
-use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
+use crate::paths::{
+    RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
+    refuse_workspace_covering_global_config,
+};
+use crate::session::{self, Session, SessionId, SessionStore, resolve_session_root};
 
 mod approve;
 mod converse;
@@ -75,8 +78,9 @@ pub struct RunNewArgs {
     #[arg(long, value_name = "NAME")]
     pub image: Option<String>,
 
-    /// Write the session into an explicit, already-existing directory. The
-    /// session root gets a symlink at `<root>/<sid>` pointing at this path.
+    /// Write the session into this directory, which must be empty or not exist
+    /// yet (it is created, with any missing parents). The session root gets a
+    /// symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
 }
@@ -85,7 +89,7 @@ pub struct RunNewArgs {
 /// code.
 pub async fn execute(
     repo: &RepoConfig,
-    global_cfg_path: &Path,
+    global_cfg_path: Option<&Path>,
     session_root_flag: Option<&Path>,
     args: &RunNewArgs,
 ) -> Result<i32> {
@@ -100,10 +104,19 @@ pub async fn execute(
         );
     }
     // A workspace no config declared is outrig's pick, and outrig never picks
-    // the home directory or one above it -- the rule `run` applies.
+    // the home directory or one above it, nor one that contains the global
+    // config; and a repo config may not mount either -- the rules `run`
+    // applies.
+    let workspace: PathBuf = cfg
+        .workspace
+        .resolved_host_path(&repo_root)
+        .components()
+        .collect();
     if cfg.workspace.declared_host_path().is_none() {
-        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
+        refuse_home_workspace(&workspace, &repo_root)?;
+        refuse_workspace_covering_global_config(&workspace, &repo_root, global_cfg_path)?;
     }
+    refuse_repo_declared_mounts(&cfg, &repo_root, global_cfg_path)?;
 
     // What the session needs from outside, given before it starts: the
     // terminal sees each submission through a subscription of its own, and
@@ -175,15 +188,15 @@ pub async fn execute(
     // Written only now, once the container runs under the name recorded. A
     // session that failed to start is recorded too, and at once finalized, so
     // it is never a live record without a container.
-    if let Err(e) = store.create(&sid, args.session_dir.as_deref(), &mut session) {
+    if let Err(e) = store.create_prepared(&sid, args.session_dir.as_deref(), &mut session) {
         let Ok(running) = started else {
-            return Err(e.into());
+            return Err(e);
         };
         let summary = summarize(&running.shutdown(DEFAULT_DRAIN).await);
         if summary.verdict != Verdict::Clean {
             eprint_best_effort(&render_report(&summary));
         }
-        return outcome_of(Err(e.into()), &summary);
+        return outcome_of(Err(e), &summary);
     }
     let mut running = match started {
         Ok(running) => running,
@@ -219,7 +232,10 @@ pub async fn execute(
     let conversed = converse::reconcile(conversed, &mut failures);
     let outcome = outcome_of(conversed, &summary);
     // The status the process exits with, so the record never says otherwise.
-    let exit = outcome.as_ref().copied().unwrap_or_else(CliError::exit_status);
+    let exit = outcome
+        .as_ref()
+        .copied()
+        .unwrap_or_else(CliError::exit_code);
     if let Err(e) = store.finalize(&sid, SystemTime::now(), exit) {
         tracing::warn!(target: "outrig::cli::run_new", "finalizing session {sid}: {e}");
     }
@@ -338,22 +354,23 @@ fn image_config_name(
 /// a second invocation fails at once, having written nothing. The kernel
 /// drops it with the process, so a killed invocation leaves nothing stale.
 ///
-/// `explicit` is checked here rather than when the record is written, so a
-/// bad `--session-dir` fails before anything starts.
+/// `explicit` is held to the rule `run`'s follows -- created if absent, refused
+/// unless empty -- here rather than when the record is written, so a bad
+/// `--session-dir` fails before anything starts.
 fn reserve_session_dir(
     store: &SessionStore,
     sid: &SessionId,
     explicit: Option<&Path>,
 ) -> Result<(Flock<File>, PathBuf)> {
     let dir = match explicit {
-        Some(dir) if !dir.is_dir() => {
-            return Err(OutrigError::Configuration(format!(
-                "--session-dir {} is not an existing directory (create it first or omit the flag)",
-                dir.display()
-            ))
-            .into());
+        // Created now if absent, so there is a directory to lock; whether it
+        // may be used is decided under the lock.
+        Some(dir) => {
+            if !dir.exists() {
+                std::fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+            }
+            dir.to_path_buf()
         }
-        Some(dir) => dir.to_path_buf(),
         None => {
             let dir = store.symlink_path(sid);
             std::fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
@@ -368,12 +385,8 @@ fn reserve_session_dir(
         ))
     })?;
     // Checked under the lock, so two invocations cannot both find it free.
-    if dir.join("session.json").exists() {
-        return Err(OutrigError::Configuration(format!(
-            "--session-dir {} already contains session.json",
-            dir.display()
-        ))
-        .into());
+    if let Some(explicit) = explicit {
+        session::prepare_explicit_dir(explicit)?;
     }
     let log_dir = dir.join("logs");
     std::fs::create_dir_all(&log_dir).path_ctx("create directory", &log_dir)?;
@@ -406,12 +419,21 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
 
     // Ensured here, under the image-config's name as `run` and `build` do,
     // rather than left to `launch`: it never pulls an `image-name`, and it
-    // would build a Dockerfile under a nameless tag of its own.
+    // would build a Dockerfile under a nameless tag of its own. A cache miss
+    // shows its build as it runs, as `run`'s does, so minutes of building do
+    // not read as a hang.
     let span = ProgressSpan::start(format!("ensuring image for {image_cfg_name}"));
     let tag = image::compute_tag_for(image_cfg_name, image_cfg, repo_root).await?;
-    let image =
-        image::ensure_tagged_image_for(image_cfg_name, image_cfg, repo_root, &tag, false, None)
-            .await?;
+    let image = image::ensure_tagged_image_for_with_output(
+        image_cfg_name,
+        image_cfg,
+        repo_root,
+        &tag,
+        false,
+        None,
+        BuildOutput::Stderr,
+    )
+    .await?;
     span.done(format!(
         "image ready: {} ({})",
         image.tag,
@@ -602,7 +624,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
 
         let stuck = outcome_of(failed(), &summary(Verdict::NotProvenStopped))
             .expect_err("the conversation's error is returned");
-        assert_eq!(stuck.exit_status(), 3);
+        assert_eq!(stuck.exit_code(), 3);
         assert_eq!(stuck.to_string(), text, "the error is printed as it was");
 
         for other in [
@@ -611,7 +633,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             died(Verdict::Clean),
         ] {
             let err = outcome_of(failed(), &other).expect_err("the error is returned");
-            assert_eq!(err.exit_status(), 1, "{other:?}");
+            assert_eq!(err.exit_code(), 1, "{other:?}");
             assert_eq!(err.to_string(), text);
         }
     }
@@ -638,23 +660,37 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
         );
     }
 
+    /// The rule `run`'s `--session-dir` follows: a directory that is not there
+    /// yet is created, with its parents, and one that holds anything is
+    /// refused -- a record by what it is, anything else by name.
     #[test]
-    fn a_session_dir_must_exist_and_hold_no_record() {
+    fn a_session_dir_is_created_if_absent_and_must_be_empty() {
         let root = tempfile::tempdir().expect("a root");
         let store = SessionStore::new(root.path().to_path_buf());
         let sid = SessionId::from("sid".to_string());
-        let missing = root.path().join("missing");
-        let err = reserve_session_dir(&store, &sid, Some(&missing))
-            .expect_err("a missing dir is refused")
-            .to_string();
-        assert!(err.contains("is not an existing directory"), "{err}");
+        let missing = root.path().join("missing/nested");
+        let (_reserved, log_dir) =
+            reserve_session_dir(&store, &sid, Some(&missing)).expect("an absent dir is created");
+        assert_eq!(log_dir, missing.join("logs"));
+        assert!(log_dir.is_dir());
 
         let used = tempfile::tempdir().expect("a used dir");
         std::fs::write(used.path().join("session.json"), "{}").expect("a record");
         let err = reserve_session_dir(&store, &sid, Some(used.path()))
             .expect_err("a dir with a record is refused")
             .to_string();
-        assert!(err.contains("already contains session.json"), "{err}");
+        assert!(err.contains("holds an earlier session's record"), "{err}");
+
+        let notes = tempfile::tempdir().expect("a dir of notes");
+        std::fs::write(notes.path().join("notes.md"), "mine").expect("a note");
+        let err = reserve_session_dir(&store, &sid, Some(notes.path()))
+            .expect_err("a dir with anything in it is refused")
+            .to_string();
+        assert!(err.contains("is not empty (it holds notes.md)"), "{err}");
+        assert!(
+            !notes.path().join("logs").exists(),
+            "a refused dir gets nothing"
+        );
 
         let (_reserved, log_dir) =
             reserve_session_dir(&store, &sid, None).expect("the default layout");

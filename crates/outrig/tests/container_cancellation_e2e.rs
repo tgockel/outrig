@@ -101,7 +101,7 @@ fn unique_name(what: &str) -> String {
 
 /// A `podman` that is the real one, except where a marker says to park.
 ///
-/// `create_initialized` runs `podman create` and then `podman init <name>`, so
+/// `create_initialized` runs `podman create` and then `podman init <id>`, so
 /// by the time `init` is spawned the engine is already holding the container.
 /// This wrapper parks exactly there -- after a real create, before a real init
 /// -- and publishes `holding.<name>`, which a test waits on with a stat rather
@@ -112,11 +112,18 @@ fn unique_name(what: &str) -> String {
 const WRAPPER: &str = r#"#!/bin/sh
 journal="$OUTRIG_E2E_JOURNAL"
 
-# `podman init <name>`, and only for a name a test asked to hold. Publishing
-# before parking is what lets the wait be a stat: the marker appearing means
-# the real create has already returned and the engine holds the container.
-if [ "$1" = "init" ] && [ -n "$2" ] && [ -f "$journal/hold.init.$2" ]; then
-  : > "$journal/holding.$2"
+# `podman init <id>`, and only for a container a test asked to hold by name:
+# the id is resolved to its name by the real engine, which already holds the
+# container. Publishing before parking is what lets the wait be a stat: the
+# marker appearing means the real create has already returned and the engine
+# holds the container.
+held=
+if [ "$1" = "init" ] && [ -n "$2" ]; then
+  held=$(PATH="$OUTRIG_REAL_PATH" podman inspect --format '{{.Name}}' "$2" 2>/dev/null)
+  [ -n "$held" ] || held=$2
+fi
+if [ -n "$held" ] && [ -f "$journal/hold.init.$held" ]; then
+  : > "$journal/holding.$held"
   # `exec` so the cancellation's kill reaches the sleeper itself rather than a
   # shell that would have to forward it.
   exec sleep 300

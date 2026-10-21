@@ -55,8 +55,9 @@ impl Case {
     /// own, its stdout and stderr piped.
     fn spawn(&self, args: &[&str]) -> Child {
         Command::new(env!("CARGO_BIN_EXE_outrig"))
+            // An empty global config, which exists, as `--global-config` must.
             .arg("--global-config")
-            .arg(self.dir.path().join("no-global.toml"))
+            .arg("/dev/null")
             .arg("--session-root")
             .arg(self.sessions())
             .arg("run")

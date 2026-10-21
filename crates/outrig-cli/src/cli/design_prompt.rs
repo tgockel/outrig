@@ -243,10 +243,10 @@ context = ".agents/outrig/images/rust-dev"
 const NODE_EXAMPLE: &str = r#"
 ### Worked example: Node container
 
-User request: Node 20 container with repo filesystem access.
+User request: Node 24 container with repo filesystem access.
 
 ```Dockerfile
-FROM docker.io/library/node:20-bookworm-slim
+FROM docker.io/library/node:24-bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*

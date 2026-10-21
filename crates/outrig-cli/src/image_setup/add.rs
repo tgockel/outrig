@@ -20,9 +20,7 @@ use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use crate::paths::{
-    global_config_path, image_dir, image_dir_rel, repo_config_path, write_atomic_all,
-};
+use crate::paths::{image_dir, image_dir_rel, repo_config_path, write_atomic_all};
 use outrig::config::{ConfigValidationError, check_build_image_name};
 use outrig::error::IoPathExt;
 
@@ -40,10 +38,9 @@ pub async fn run(
     name: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
     let (repo_root, name) =
-        init_repo::resolve_or_bootstrap(cwd, &global_path, name, &mut prompt).await?;
+        init_repo::resolve_or_bootstrap(cwd, global_override, name, &mut prompt).await?;
     run_with(&repo_root, name, force, &mut prompt).await
 }
 
@@ -165,8 +162,8 @@ const BASES: &[(&str, &str)] = &[
         BaseImage::AlpineLatest.description(),
     ),
     (
-        BaseImage::Node20BookwormSlim.as_str(),
-        BaseImage::Node20BookwormSlim.description(),
+        BaseImage::Node24BookwormSlim.as_str(),
+        BaseImage::Node24BookwormSlim.description(),
     ),
     (
         BaseImage::Python3_12Slim.as_str(),
@@ -186,7 +183,7 @@ const TOOLCHAINS: &[(&str, &str)] = &[
         "rust",
         "rustup + stable toolchain (cargo, rustfmt, clippy).",
     ),
-    ("node", "Node 20 LTS via the base image's package manager."),
+    ("node", "Node 24 LTS via NodeSource (apk on Alpine)."),
     ("python", "CPython 3 with pip and venv."),
     ("go", "Go 1.27."),
     ("none", "Just the base image -- nothing extra installed."),
@@ -355,7 +352,19 @@ fn mcp_value(server: McpServer) -> Item {
 mod tests {
     use outrig::config::{BuildImageNameError, Config};
 
+    use crate::init::prompt::format_field_help;
+
     use super::*;
+
+    #[test]
+    fn picker_help_carries_every_blurb() {
+        for field in [&BASE_FIELD, &TOOLCHAIN_FIELD, &MCP_FIELD] {
+            let help = format_field_help(field);
+            for (_, blurb) in field.options {
+                assert!(help.contains(blurb), "missing {blurb:?}");
+            }
+        }
+    }
 
     /// What `run_with` appends for `coding` with the default `fs` server.
     const CODING: &str = "\n[images.coding]\n\
@@ -499,5 +508,21 @@ mod tests {
         ] {
             assert_eq!(default_image_name(Path::new(folder)), want, "{folder:?}");
         }
+    }
+
+    /// `-standard` is 9 characters, so a folder of 228 is the longest that
+    /// keeps its name, and one of 229 falls back.
+    #[test]
+    fn the_default_image_name_stays_within_the_length_limit() {
+        let keeps = format!("/src/{}", "a".repeat(228));
+        assert_eq!(default_image_name(Path::new(&keeps)).len(), 237);
+        let falls_back = format!("/src/{}", "a".repeat(229));
+        assert_eq!(default_image_name(Path::new(&falls_back)), "standard");
+    }
+
+    #[test]
+    fn check_name_refuses_a_name_over_the_length_limit() {
+        assert!(check_name(&"a".repeat(237)).is_ok());
+        assert!(check_name(&"a".repeat(238)).is_err());
     }
 }

@@ -237,7 +237,7 @@ async fn add_from(
     let (mut prompt, _stderr) = scripted_prompt(script).await;
     let name = name.map(str::to_string);
     timeout(TEST_TIMEOUT, async {
-        let (repo_root, name) = resolve_or_bootstrap(cwd, global, name, &mut prompt).await?;
+        let (repo_root, name) = resolve_or_bootstrap(cwd, Some(global), name, &mut prompt).await?;
         run_with(&repo_root, name, false, &mut prompt).await
     })
     .await
@@ -253,15 +253,15 @@ async fn fallback_yes_bootstraps_repo_config() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
     std::fs::create_dir_all(&cwd).unwrap();
-    let global = tmp.path().join("global.toml");
+    let global = Path::new("/dev/null");
 
     // Script: configure-now (Y) + 5 repo-config defaults (container name,
     // workspace x2, agent name, preamble; the model section is
-    // informational only when the global config is missing) + 3
+    // informational only when the global config is empty) + 3
     // container-add defaults (base, toolchains, mcp -- name was already
     // asked during bootstrap) = 9 prompts.
     let script = b"\n\n\n\n\n\n\n\n\n";
-    add_from(&cwd, &global, None, script)
+    add_from(&cwd, global, None, script)
         .await
         .expect("fallback flow must succeed");
 
@@ -318,6 +318,8 @@ async fn a_configured_repo_keeps_its_default_image() {
     );
     let cwd = tmp.path().join("src");
     std::fs::create_dir_all(&cwd).unwrap();
+    // Never written: a repo that has a config doesn't read the global one,
+    // so it doesn't check `--global-config` either (#342).
     let global = tmp.path().join("global.toml");
 
     // Only the image-add prompts: base, toolchains, mcp.
@@ -334,7 +336,7 @@ async fn a_configured_repo_keeps_its_default_image() {
 #[tokio::test]
 async fn fallback_no_returns_no_repo_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let global = tmp.path().join("global.toml");
+    let global = Path::new("/dev/null");
 
     // Script: configure now? -> n. No further prompts should be consumed.
     let script = b"n\n";
@@ -342,7 +344,7 @@ async fn fallback_no_returns_no_repo_config() {
 
     let err = timeout(
         TEST_TIMEOUT,
-        resolve_or_bootstrap(tmp.path(), &global, None, &mut prompt),
+        resolve_or_bootstrap(tmp.path(), Some(global), None, &mut prompt),
     )
     .await
     .expect("fallback must not hang")
@@ -355,6 +357,35 @@ async fn fallback_no_returns_no_repo_config() {
 
     // Nothing was written.
     assert!(!tmp.path().join(".agents").exists());
+}
+
+/// #342: the bootstrap is where `image add` reads the global config, so a
+/// `--global-config` that does not exist is refused there -- before the
+/// first prompt, and before anything is written.
+#[tokio::test]
+async fn the_bootstrap_refuses_a_missing_global_config_before_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("confg.toml");
+
+    // No script: a prompt would fail on EOF instead.
+    let (mut prompt, _stderr) = scripted_prompt(b"").await;
+
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), Some(&missing), None, &mut prompt),
+    )
+    .await
+    .expect("the bootstrap must not hang")
+    .expect_err("a missing --global-config must be refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "configuration: --global-config {} does not exist",
+            missing.display()
+        ),
+    );
+    assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
 }
 
 #[tokio::test]
@@ -673,12 +704,12 @@ async fn the_bootstraps_name_prompt_asks_again() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
     std::fs::create_dir_all(&cwd).unwrap();
-    let global = tmp.path().join("global.toml");
+    let global = Path::new("/dev/null");
 
     // Configure-now, agent name, preamble, image name (refused), image
     // name, workspace x2, then the image-add defaults: base, toolchains, mcp.
     let script = b"\n\n\nRustDev\nrust-dev\n\n\n\n\n\n";
-    add_from(&cwd, &global, None, script)
+    add_from(&cwd, global, None, script)
         .await
         .expect("fallback flow must succeed");
 

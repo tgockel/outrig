@@ -42,10 +42,12 @@ outrig run [--agent <name>]
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for the MCP servers this session
   starts. `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one server by name.
   Values take the same `${VAR}` host-env-reference syntax config files use, described in
-  [Reference -> Config](../reference/config.md#mcp-env-value-syntax). Within a scope the last
-  value given for a key wins; across scopes the per-key precedence is config-file env < global
-  `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not declare
-  is an error.
+  [Reference -> Config](../reference/config.md#mcp-env-value-syntax). You typed them, so
+  they are not held to the global config's [`[repo]` `env-allow`](../reference/config.md#repo)
+  list, which governs the references in a repo config and in an image's label. Within a scope
+  the last value given for a key wins; across scopes the per-key precedence is config-file env <
+  global `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not
+  declare is an error.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
   per-turn tool-call max for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
@@ -56,8 +58,8 @@ outrig run [--agent <name>]
   choose Podman's default networking, network audit logging, or global network filtering for
   this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
-  directory; symlinked from the root.
-- `--session-root <path>` (default: `session-root` config, else XDG): root directory
+  directory, which must be empty or not exist yet; symlinked from the root.
+- `--session-root <path>` (default: global config's `session-root`, else XDG): root directory
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Access defaults to read-only; append `:rw`
@@ -74,14 +76,20 @@ Normal startup progress is always printed to stderr so slow container or MCP sta
 progress lines. Tracing filters come from `OUTRIG_LOG` first, then `RUST_LOG` if `OUTRIG_LOG`
 is unset -- a set `OUTRIG_LOG` shadows `RUST_LOG` entirely.
 
+When the image is not cached, the `buildah build` (or the `podman pull` for an `image-name`
+config) that produces it is shown as it runs, as `[buildah]` / `[podman]` lines between
+`ensuring image` and `image ready`, so a first run does not look hung. `--verbose` is not
+required for that either; it adds the command line itself and writes everything to
+`container.log`. Sidecar images report the same way, one at a time.
+
 Three levels of detail, in increasing order:
 
-| Setting               | What it adds                                                     |
-|-----------------------|------------------------------------------------------------------|
-| (none)                | Progress lines only: one per startup phase, with elapsed time.   |
-| `RUST_LOG=debug`      | Every buildah/podman command line, plus its exit code and timing. |
+| Setting               | What it adds                                                           |
+|-----------------------|------------------------------------------------------------------------|
+| (none)                | Progress lines, plus the output of a build or pull on a cache miss.    |
+| `RUST_LOG=debug`      | Every buildah/podman command line, plus its exit code and timing.      |
 | `--verbose` (`-v`)    | The full command *output* transcript, also written to `container.log`. |
-| `-vv`                 | Trace-level logs from outrig's own modules.                      |
+| `-vv`                 | Trace-level logs from outrig's own modules.                            |
 
 A phase that stalls between progress lines is a stalled child process. `RUST_LOG=debug` names
 the exact command it is waiting on, which is the fastest way to reproduce the stall by hand:
@@ -96,17 +104,21 @@ An env value that came from a `${VAR}` reference appears in that line as `'KEY=$
 as its value. Pasted as shown, the single quotes would hand podman that literal text; to rerun
 the command by hand, write it as `"KEY=${VAR}"` so your shell fills the value in.
 
-When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
-`<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
-keep working. This lets you launch with a known path and read `session.json` immediately without
-looking up an auto-generated id:
+When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and (for a
+`view = "primary"` sidecar) `outrig-enter` directly into `<path>` and creates a symlink at
+`<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard` keep working. This lets you
+launch with a known path and read `session.json` immediately without looking up an
+auto-generated id:
 
 ```sh
 $ outrig run --session-dir /tmp/my-debug-run < prompts.txt
 $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 ```
 
-`--session-dir` refuses if the path already contains a `session.json`.
+`<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A path
+that already holds anything -- even a `.gitkeep`, or an earlier run's `session.json` -- is
+refused, because `outrig discard` removes the directory along with the session. See
+[Sessions](sessions.md#outrig-discard).
 
 ## Config-less runs
 
@@ -119,11 +131,12 @@ $ outrig run --image my-tool:latest --volume "$PWD/data:/data:rw"
 
 With no repo config found and no `--config`, outrig uses the current directory as the workspace
 root (mounted at `/workspace`) and reads the agent, model, and provider from the global config
-(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). You need not pass
-`--image`: with nothing else naming one, the session falls through to
+(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml` when that is an absolute
+path). You need not pass `--image`: with nothing else naming one, the session falls through to
 [the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
 unknown ref is used as a local Podman image and is never pulled. The current directory can't be
-your home directory or one above it, unless a config declares `[workspace] host-path`; see
+your home directory, one above it, or one that contains the global config, unless the *global*
+config declares `[workspace] host-path`; see
 [Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 What the global config must still supply is a **model**. The session does not need an agent --
@@ -173,7 +186,12 @@ tools) and `shell` is unavailable. Full details in
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
    found. If none is found and no `--config` is given, run config-less: the current directory
    becomes the workspace root and config comes from the global file only (see
-   [Config-less runs](#config-less-runs)).
+   [Config-less runs](#config-less-runs)). A config found that another user owns is refused, not
+   read (see [Reference -> CLI](../reference/cli.md#global-flags)). Startup names the config
+   file it read and the workspace it will mount before anything is built or started. A key this
+   outrig does not know -- a typo, or one a newer outrig reads from the same global config -- is
+   ignored with a `[outrig] warning:` line naming the file and line (see
+   [Reference -> Config](../reference/config.md#what-a-load-sets-aside)).
 2. **Resolve image.** Uses explicit `--image` first. If that value matches
    `[images.<name>]`, OutRig uses the config block; otherwise it must already
    exist in local Podman images. Without explicit `--image`, agent `image` and
@@ -182,7 +200,8 @@ tools) and `shell` is unavailable. Full details in
    [the built-in default](#the-built-in-default-image).
 3. **Build/cache/probe the image.** Config build images run `buildah build` or
    cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
-   local-only and are checked with `podman image exists`.
+   local-only and are checked with `podman image exists`. A build or pull streams
+   its output to stderr while it runs.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
    become additional `-v` binds. The trailing `sleep infinity` is the container's command and
@@ -195,27 +214,35 @@ tools) and `shell` is unavailable. Full details in
    their `/etc/passwd` entry names. The image needs no `useradd`/`groupadd` for this. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
-6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
+6. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp` label,
+   then overlay `[images.<name>.mcp]` from config by server name. Each declared sidecar's image is
+   ensured and its label merged, and the `start = "auto"` sidecars are started. A sidecar failure
+   follows the block's `on-failure` key; a malformed label, two labels claiming one server
+   name, or a label whose `env` references a host variable the global config's
+   [`[repo]` `env-allow`](../reference/config.md#repo) does not list, is a startup error. See
+   [Config -> sidecars](../reference/config.md#sidecarssc).
+7. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
    The default mode skips this step entirely.
-7. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
+8. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
-   handshake, and discover tools via `tools/list`.
-8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
+   handshake, and discover tools via `tools/list`. Each of those two gets 120 seconds; a server
+   that misses either fails startup, with its stderr in the error.
+9. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
    an agentless session resolves as though the agent had no keys set), pick the
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
    must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call max from
    `tool-call-max` and the per-result byte max from `tool-result-max`. Then read the API key
    from the env var named in the provider's `api-key`. Build the Rig provider client.
-9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
-   `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
-   `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
-   system prompt at all.
-10. **Open the REPL.** Banner on stderr, `> ` prompt, ready for input.
+10. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
+    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
+    `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
+    system prompt at all.
+11. **Open the REPL.** Banner on stderr, `> ` prompt on the terminal, ready for input.
 
-If anything before step 10 fails, `outrig run` reports the error on stderr and exits non-zero
+If anything before step 11 fails, `outrig run` reports the error on stderr and exits non-zero
 without starting the REPL.
 
 ## REPL banner
@@ -224,9 +251,10 @@ A typical startup looks like:
 
 ```
 [outrig] loading config
-[outrig] config loaded (1ms)
-[outrig] resolving agent and image-config
-[outrig] agent/image-config resolved: agent coding, image-config coding (0ms)
+[outrig] config loaded: /home/you/coding/.agents/outrig/config.toml (1ms)
+[outrig] workspace: /home/you/coding
+[outrig] resolving agent and container
+[outrig] agent/container resolved: agent coding, container coding (0ms)
 [outrig] computing image tag
 [outrig] image tag computed: coding:8c2a4f7e91d6b5a3 (32ms)
 [outrig] ensuring image coding:8c2a4f7e91d6b5a3
@@ -244,6 +272,7 @@ A typical startup looks like:
 [outrig] building agent
 [outrig] agent ready (0ms)
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
+[outrig] base-url:          https://api.openai.com/v1
 [outrig] tool-call max:     50
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding
@@ -256,6 +285,22 @@ A typical startup looks like:
 [outrig] entering REPL
 >
 ```
+
+When the image is not cached, the build runs between `ensuring image` and `image ready`, and its
+output is shown as it happens:
+
+```
+[outrig] ensuring image coding:8c2a4f7e91d6b5a3
+[buildah] STEP 1/6: FROM docker.io/library/node:24-bookworm-slim
+[buildah] STEP 2/6: RUN apt-get update && apt-get install -y git
+...
+[outrig] image ready: coding:8c2a4f7e91d6b5a3 (built) (4m12s)
+```
+
+The lines are buildah's own (`podman pull`'s, as `[podman]`, for an `image-name` config). Without
+`--verbose` the command line itself is not shown and nothing is written to `container.log`; with
+it, each line still appears once. A sidecar image that needs building shows the same, under its
+own `ensuring sidecar image <name>` / `sidecar image ready` pair.
 
 Two config keys are read only by `outrig run-new`: `context-window` on a `[models.<name>]` row,
 and `[events] mode = "record"`. `outrig run` parses them and does nothing with them, so when a
@@ -272,8 +317,10 @@ that sets one. Without either key, startup is as above. See
 [Config](../reference/config.md#events) for the event log.
 
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
-the assistant's natural-language reply, printed when the turn finishes. The stream separation
-makes it easy to capture just the model output:
+the assistant's natural-language reply, printed when the turn finishes. On an interactive terminal
+the `> ` prompt and the echo of what you type go to the terminal itself rather than to either
+stream, so neither `outrig run > out.txt` nor `outrig run 2> err.txt` captures them, and the
+prompt stays visible in both. The stream separationmakes it easy to capture just the model output:
 
 ```sh
 $ echo "summarise this repo" | outrig run > summary.txt
@@ -372,9 +419,37 @@ conversation keeps. The call is retried twice before outrig gives up:
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
-The REPL is line-buffered. Multi-line input is not supported in v0.
+## Line editing and history
 
-> **TODO: Incomplete** -- multi-line / paste-mode input is deferred.
+On an interactive terminal the `>` prompt is a full line editor. Arrow keys and the usual
+readline bindings move and edit within the line -- `Ctrl-A`/`Ctrl-E` for the ends, `Ctrl-W` and
+`Ctrl-K` to cut a word or the tail, `Alt-B`/`Alt-F` to move by word. `Up` and `Down` recall the
+prompts you typed earlier in this session, and `Ctrl-R` searches them.
+
+That history lives in memory for the length of the session. **outrig writes no history file**:
+nothing you type at the prompt is persisted anywhere, and a new `outrig run` starts with an empty
+recall list. `/reset` clears the *conversation* history the model sees; it does not touch the
+prompts the editor recalls.
+
+Pasting several lines at once sends them as a single prompt, with the line breaks intact, rather
+than as one turn per line. Typing multi-line input is still not supported -- `Enter` always ends
+the prompt.
+
+The editor needs a terminal it can drive. When stdin is a pipe or a file, or a terminal other
+than the one you are typing at (`outrig run < /dev/pts/7`), or `TERM` is `dumb`, `cons25`, or
+`emacs`, the prompt falls back to reading one line at a time with no editing and no recall, which
+is what keeps scripted use (`echo "..." | outrig run`) working unchanged.
+
+Input is read as UTF-8. A line from a pipe or a file with bytes that are not UTF-8 -- a Latin-1
+`é` in a prompts file -- is still sent, with U+FFFD (`�`) in place of each bad sequence. The line
+editor does not do this yet: at the first such byte, from an `Alt` key that sets the eighth bit or
+a paste out of a Latin-1 source, its read fails and the session ends with an error. Redirect stdin
+to send such text (#516).
+
+`RUST_LOG=debug` and `OUTRIG_LOG=debug` do not record what you type. The editor's own debug
+output names every keystroke, so it stays at `warn` unless the filter mentions `rustyline`.
+
+> **TODO: Incomplete** -- typed multi-line input is deferred.
 
 ## Slash commands
 
@@ -408,8 +483,10 @@ A sidecar declared with `start = "manual"` (see
 -- its image label is merged and its servers are reserved names -- but its container does not
 start and its tools are absent. `/sidecar add <name>` starts it mid-session: the container
 comes up with session labels, network policy attaches (in audit and filter modes), its MCP
-servers connect, and the new tools become available to the agent **on the next turn**. Unknown
-names and already-running sidecars are errors, and there is no `/sidecar stop` in v0.
+servers connect, and the new tools become available to the agent **on the next turn**. Subagents
+launched from then on get them too; one already running keeps the tools it was launched with
+(see [Concepts -> Subagents](../concepts/subagents.md)). Unknown names and already-running
+sidecars are errors, and there is no `/sidecar stop` in v0.
 
 ```
 > /sidecar list
@@ -423,7 +500,8 @@ names and already-running sidecars are errors, and there is no `/sidecar stop` i
 ```
 
 A failed add -- image missing, server crashing on connect -- is reported on stderr and changes
-nothing: the container set, tool list, and conversation stay as they were.
+nothing: the container set, tool list, and conversation stay as they were. An add interrupted
+with Ctrl-C changes nothing either, and either one can simply be run again.
 
 ## Subagents
 
@@ -466,21 +544,38 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   them, so the next turn knows those calls ran. The rest of the turn is not kept: a tool call
   still running when Ctrl-C lands, any the model asked for alongside it, and the whole of a turn
   interrupted before its first results went back, which leaves the conversation as it stood
-  before that prompt. Say what you still need rather than referring back to them. A local model's
-  reply that had already streamed in full is kept, even if Ctrl-C lands while its output is still
-  being written. It stops the agent *waiting*, not work already handed to the container: a
-  `shell__exec` that started a build runs to completion, and any
+  before that prompt. Say what you still need rather than referring back to them. It stops the
+  agent *waiting*, not work already handed to the container: a
+  `shell__exec` that started a build may run to completion, and any
   [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn, as
   does a result the turn read from one of them but did not keep.
 
   Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
   over, belong to the session and not to the turn, so they stay up for the next prompt; what
-  Ctrl-C abandons is the request in flight over one of them. A server that is midway through
-  the work runs it to completion and simply has no one to answer. Ending the session, with
-  Ctrl-D, is what stops those.
+  Ctrl-C abandons is the request in flight over one of them. outrig sends that server
+  `notifications/cancelled` for it, but cancellation is advisory: a server that ignores it runs
+  the work to completion and simply has no one to answer. Ending the session, with Ctrl-D, is
+  what stops those. A tool call that nobody interrupts is bounded too: past its
+  [`call-timeout-secs`](../reference/config.md#imagesnamemcp) (10 minutes unless configured), it
+  is cancelled the same way and the model is told it timed out.
+- **Ctrl-C** during a slash command cancels it the same way, with the same `[outrig] interrupted`.
+  A `/sidecar add` waiting on an image or on a server that never answers `initialize` stops
+  there, and whatever it had started goes: the sidecar container is removed in the background
+  and its tools never appear. The session is left as a failed add leaves it.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
-- A second Ctrl-C without an intervening prompt also exits.
+- **Ctrl-C** at the prompt discards whatever is typed on that line and draws a fresh `> `. A
+  second Ctrl-C, with nothing entered in between, exits.
+- **Ctrl-C before the first prompt** -- while the image builds, the container starts, or an MCP
+  server initializes -- ends the session the way Ctrl-D does: whatever had started is stopped,
+  and the session record is finalized. So does **SIGTERM** or **SIGHUP** at any point, prompt
+  and turn included: `kill <pid>`, a closed terminal, a service manager stopping the process, a
+  CI job timing out. outrig prints `[outrig] SIGTERM received; ending the session` (or the
+  signal's own name) and exits with 128 plus the signal number -- `130` for SIGINT, `143` for
+  SIGTERM, `129` for SIGHUP -- which is also the exit code the session record keeps.
+- A SIGINT or SIGTERM while that shutdown is still stopping containers stops the waiting:
+  outrig finalizes the record and exits, and the remaining containers are force-removed in the
+  background. A SIGHUP does not hurry it, since a closed terminal can deliver one twice.
 
 ```
 > please refactor everything   ^C
@@ -500,6 +595,19 @@ help: run `outrig init` to initialize
 ```
 
 You're not inside an outrig-configured repo. Either `cd` into one or pass `--config <path>`.
+
+```
+$ outrig run
+error: configuration: refusing /tmp/.agents/outrig/config.toml: it is owned by uid 1001,
+       not by you (uid 1000), so another user could have written it
+help: run `outrig init` where you are to start a config of your own; outrig reads a
+      config you do not own only when --config names it
+```
+
+The nearest config above the current directory belongs to someone else, so outrig will not run
+on it. If it should not be there, `outrig init` gives the current directory a config of its
+own, which the walk finds first. If you trust it -- a checkout shared with your team -- pass it
+with `--config`.
 
 ```
 $ outrig run
@@ -523,12 +631,16 @@ The MCP server binary isn't in the image. Install it in the Dockerfile.
 
 ```
 $ outrig run --image outrig-standard:53e082e721df8ecc
-error: --image "outrig-standard:53e082e721df8ecc" did not match any [images.<name>]
-       and local podman image "outrig-standard:53e082e721df8ecc" was not found
+error: configuration: image "outrig-standard:53e082e721df8ecc" (from --image) is not an
+       [images.<name>] and is not in podman's local image store; outrig does not pull a raw
+       image ref, so run `podman pull outrig-standard:53e082e721df8ecc` (or build and tag it)
+       first
 ```
 
 An explicit `--image` ref that is not an image-config is local-only. Build, tag,
-or pull it with Podman first, then rerun the command.
+or pull it with Podman first, then rerun the command. A sidecar's `image` that is
+not an image-config is refused the same way, with `(from [sidecars.<name>])` in
+place of `(from --image)`.
 
 ```
 $ outrig run

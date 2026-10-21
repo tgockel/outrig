@@ -349,10 +349,10 @@ thread that reads the environment, and every process started meanwhile inherits 
 - ~~The module's public name and its type names.~~ Settled by `0003-19`: `outrig::harness`, a
   `SessionBuilder` that starts a `Session`, and the events in `outrig::harness::event`.
 - Whether starting a session ensures its image. `run-new` does that itself today, before
-  `Outrig::launch`, because `launch` neither pulls nor builds under the image-config's name
-  (#456). If this API is all `run-new` uses, either the session takes that step or the API
-  offers it. For a host program's session the engine ensures the image (`0003-29`); whether the
-  Rust builder gains the same step stays open.
+  `Outrig::launch`, so the step shows on its own. Since 0.2.2 `LaunchSpec::from_config` pulls or
+  builds the primary under the image-config's name (#456), so a builder given no tag gets the
+  same image, ensured inside its start. For a host program's session the engine ensures the image
+  (`0003-29`); whether the Rust builder reports the step as its own stays open.
 - Which of `run`'s flags `run-new` gains (`plan/next/run-new-flag-parity.md`) becomes a question
   about the builder: a flag with no builder input has no way in.
 - Whether a subscriber can join a session that has already started, and what it is told about the

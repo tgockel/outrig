@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{
-    CacheKey, ImageConfig, ImageTag, McpServerSpec, UNNAMED_IMAGE, compute_tag, compute_tag_for,
+    CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, UNNAMED_IMAGE, compute_tag,
+    compute_tag_for, hash_context, pairs_block,
 };
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -76,6 +77,48 @@ async fn key(dockerfile: &Path, args: &BTreeMap<String, String>, ctx: &Path) -> 
         .expect("CacheKey::compute")
 }
 
+async fn labeled_key(
+    dockerfile: &Path,
+    args: &BTreeMap<String, String>,
+    ctx: &Path,
+    labels: &BTreeMap<String, String>,
+) -> String {
+    CacheKey::compute_with_labels(dockerfile, args, ctx, labels)
+        .await
+        .expect("CacheKey::compute_with_labels")
+}
+
+/// The key a release before [`pairs_block`] computed: each pair a raw `key=value` line.
+async fn unescaped_key(
+    dockerfile: &Path,
+    args: &BTreeMap<String, String>,
+    ctx: &Path,
+    labels: &BTreeMap<String, String>,
+) -> String {
+    let raw = |pairs: &BTreeMap<String, String>| {
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect::<String>()
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&std::fs::read(dockerfile).expect("read Dockerfile"));
+    hasher.update(raw(args).as_bytes());
+    if !labels.is_empty() {
+        hasher.update(b"\n[outrig-labels]\n");
+        hasher.update(raw(labels).as_bytes());
+    }
+    hash_context(ctx, &mut hasher).await.expect("hash_context");
+    hasher.finalize().to_hex().as_str()[..KEY_HEX_LEN].to_string()
+}
+
+fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 #[tokio::test]
 async fn same_inputs_same_key() {
     let a = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("hello.txt", "hi\n")]);
@@ -139,6 +182,162 @@ async fn label_change_changes_key() {
         .expect("CacheKey::compute_with_labels");
 
     assert_ne!(ka, kb);
+}
+
+/// buildah is handed `--build-arg A=1\nB=2` for one set and `--build-arg A=1 --build-arg B=2` for
+/// the other, so the two must not share a tag. In the second case both sets hold a backslash, so
+/// both are escaped and only the escaping keeps them apart.
+#[tokio::test]
+async fn a_newline_in_a_build_arg_value_is_not_a_second_build_arg() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let labels = map(&[("org.outrig.mcp", "{}")]);
+
+    for (joined, b) in [("1\nB=2", "2"), ("1\nB=2\\", "2\\")] {
+        let joined = map(&[("A", joined)]);
+        let split = map(&[("A", "1"), ("B", b)]);
+
+        assert_ne!(
+            key(&dockerfile, &joined, ctx.path()).await,
+            key(&dockerfile, &split, ctx.path()).await
+        );
+        assert_ne!(
+            labeled_key(&dockerfile, &joined, ctx.path(), &labels).await,
+            labeled_key(&dockerfile, &split, ctx.path(), &labels).await
+        );
+    }
+}
+
+/// The `[outrig-labels]` block is framed as the build args are.
+#[tokio::test]
+async fn a_newline_in_a_label_value_is_not_a_second_label() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+
+    for (joined, b) in [("1\nb=2", "2"), ("1\nb=2\\", "2\\")] {
+        assert_ne!(
+            labeled_key(&dockerfile, &args, ctx.path(), &map(&[("a", joined)])).await,
+            labeled_key(
+                &dockerfile,
+                &args,
+                ctx.path(),
+                &map(&[("a", "1"), ("b", b)])
+            )
+            .await
+        );
+    }
+}
+
+/// An escape spelled out in a value is a different value from the character it stands for, so a
+/// fix that escaped the newline and left the backslash would hash two builds alike.
+#[tokio::test]
+async fn an_escape_spelled_out_is_not_the_character() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+
+    let mut keys = Vec::new();
+    for value in ["1\nB=2", r"1\nB=2", r"1\\nB=2"] {
+        keys.push(key(&dockerfile, &map(&[("A", value)]), ctx.path()).await);
+    }
+    keys.sort();
+    keys.dedup();
+
+    assert_eq!(keys.len(), 3, "a newline, `\\n`, and `\\\\n` key apart");
+}
+
+/// A build arg that spells the labels header must not read as the labels it stands in for. As
+/// above, the second case holds a backslash on both sides.
+#[tokio::test]
+async fn a_build_arg_cannot_spell_the_labels_header() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+
+    for (spelled, b) in [
+        ("1\n\n[outrig-labels]\nB=2", "2"),
+        ("1\n\n[outrig-labels]\nB=2\\", "2\\"),
+    ] {
+        assert_ne!(
+            key(&dockerfile, &map(&[("A", spelled)]), ctx.path()).await,
+            labeled_key(
+                &dockerfile,
+                &map(&[("A", "1")]),
+                ctx.path(),
+                &map(&[("B", b)])
+            )
+            .await
+        );
+    }
+}
+
+/// What the key hashes, byte for byte: a tag built from plain pairs is the one it was before
+/// escaping, so only a pair holding a backslash or a newline moves.
+#[test]
+fn pairs_block_keeps_plain_pairs_and_escapes_the_rest() {
+    assert_eq!(pairs_block(&BTreeMap::new()), "");
+    assert_eq!(
+        pairs_block(&map(&[("A", "1"), ("B", "two words")])),
+        "A=1\nB=two words\n"
+    );
+    assert_eq!(
+        pairs_block(&map(&[("A\nB", "x\\y\nz")])),
+        "A\\nB=x\\\\y\\nz\n"
+    );
+}
+
+/// A pair with neither a backslash nor a newline keeps the key it had before escaping, so the
+/// images built under it are still found.
+#[tokio::test]
+async fn plain_pairs_keep_the_key_they_had() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = map(&[("A", "1"), ("B", "two words")]);
+    let labels = map(&[("org.outrig.mcp", "{}")]);
+
+    assert_eq!(
+        key(&dockerfile, &args, ctx.path()).await,
+        unescaped_key(&dockerfile, &args, ctx.path(), &BTreeMap::new()).await
+    );
+    assert_eq!(
+        labeled_key(&dockerfile, &args, ctx.path(), &labels).await,
+        unescaped_key(&dockerfile, &args, ctx.path(), &labels).await
+    );
+}
+
+/// The image store outlives an upgrade, and a cache probe asks only whether a tag exists. An
+/// escaped newline is a backslash and an `n`, and an escaped backslash is two, which is what an
+/// older release hashed for those characters. A pair that holds one must not take a key an older
+/// release wrote, or a `${VAR}` that gains a newline reuses the image built for a literal `\n`.
+#[tokio::test]
+async fn an_escaped_pair_does_not_take_a_key_an_older_release_wrote() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+
+    // The build args and labels a value goes in: a build arg alone, a label alone, and a build arg
+    // beside a label, which is how a repo-local build calls it.
+    let placed = |value: &str| {
+        [
+            (map(&[("A", value)]), BTreeMap::new()),
+            (BTreeMap::new(), map(&[("l", value)])),
+            (map(&[("A", value)]), map(&[("org.outrig.mcp", "{}")])),
+        ]
+    };
+    // Each escaped value spells one of the older values.
+    let escaped = [r"x\y", "1\n2", r"1\n2"];
+    let older = [r"x\y", r"x\\y", "1\n2", r"1\n2", r"1\\n2"];
+
+    let mut older_keys = Vec::new();
+    for value in older {
+        for (args, labels) in placed(value) {
+            older_keys.push(unescaped_key(&dockerfile, &args, ctx.path(), &labels).await);
+        }
+    }
+    for value in escaped {
+        for (args, labels) in placed(value) {
+            let new = labeled_key(&dockerfile, &args, ctx.path(), &labels).await;
+            assert!(!older_keys.contains(&new), "{value:?} took the key {new}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -359,6 +558,173 @@ async fn path_and_mode_are_part_of_the_key() {
     std::fs::rename(ctx.path().join("entry.sh"), ctx.path().join("start.sh")).unwrap();
     let renamed = key(&dockerfile, &args, ctx.path()).await;
     assert_ne!(executable, renamed, "a rename must change the key");
+}
+
+/// A committed context for `COPY . /app`, with a tracked directory `conf` and
+/// whatever else `files` adds.
+fn copy_all_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let mut all = vec![
+        ("Dockerfile", "FROM scratch\nCOPY . /app\n"),
+        ("conf/app.conf", "x\n"),
+    ];
+    all.extend_from_slice(files);
+    let ctx = make_ctx(&all);
+    git_init(ctx.path());
+    ctx
+}
+
+/// Flip the group-execute bit of `dir`, leaving its owner's access alone.
+fn chmod_directory(dir: &Path) {
+    let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode ^ 0o010)).unwrap();
+}
+
+/// git tracks files, so it lists no empty directory, yet `COPY .` copies one.
+#[tokio::test]
+async fn an_empty_directory_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::create_dir(ctx.path().join("cache")).unwrap();
+    assert_not_ignored(ctx.path(), "cache");
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory must change the key"
+    );
+
+    // `untracked/` is one entry to `ls-files --directory`, which says nothing
+    // of what is inside.
+    let untracked = ctx.path().join("untracked");
+    std::fs::create_dir(&untracked).unwrap();
+    std::fs::write(untracked.join("a.txt"), "a\n").unwrap();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::create_dir(untracked.join("empty")).unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory inside an untracked directory must change the key"
+    );
+}
+
+/// `COPY` keeps a directory's permission bits, which no git listing carries.
+#[tokio::test]
+async fn chmod_on_a_directory_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    std::fs::create_dir(ctx.path().join("empty")).unwrap();
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+
+    // A directory of tracked files, an empty one, and the context itself.
+    for rel in ["conf", "empty", ""] {
+        let dir = ctx.path().join(rel);
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        chmod_directory(&dir);
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "chmod on {rel:?} must change the key"
+        );
+    }
+}
+
+/// Where the rules exclude every file, the whole tree counts, and `COPY .`
+/// still keeps the context directory's own mode.
+#[tokio::test]
+async fn chmod_on_an_ignored_context_changes_the_key() {
+    let repo = make_ctx(&[
+        (".gitignore", "private/\n"),
+        ("private/ctx/Dockerfile", "FROM scratch\nCOPY . /app\n"),
+    ]);
+    git_init(repo.path());
+    assert_ignored(repo.path(), "private/ctx/Dockerfile");
+    let ctx = repo.path().join("private/ctx");
+    let dockerfile = ctx.join("Dockerfile");
+    let args = BTreeMap::new();
+
+    let before = key(&dockerfile, &args, &ctx).await;
+    chmod_directory(&ctx);
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, &ctx).await,
+        "chmod on an ignored context directory must change the key"
+    );
+}
+
+/// Ignore rules keep build output out of the key, directories included.
+#[tokio::test]
+async fn an_ignored_directory_does_not_count() {
+    let ctx = copy_all_ctx(&[(".gitignore", "build/\ncache/\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::create_dir(ctx.path().join("cache")).unwrap();
+    std::fs::create_dir_all(ctx.path().join("build/sub")).unwrap();
+    std::fs::write(ctx.path().join("build/sub/out.o"), "artifact").unwrap();
+    assert_ignored(ctx.path(), "cache");
+    assert_ignored(ctx.path(), "build/sub");
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an ignored directory, empty or not, must not change the key"
+    );
+
+    chmod_directory(&ctx.path().join("cache"));
+    chmod_directory(&ctx.path().join("build/sub"));
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "chmod on an ignored directory must not change the key"
+    );
+}
+
+/// A nested repository is walked by its own pass, under its own rules; the
+/// outer one leaves it alone.
+#[tokio::test]
+async fn an_empty_directory_in_a_nested_repository_changes_the_key() {
+    let ctx = copy_all_ctx(&[]);
+    let lib = ctx.path().join("vendor/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("lib.txt"), "v1").unwrap();
+    git_init(&lib);
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::create_dir(lib.join("cache")).unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an empty directory inside a nested repository must change the key"
+    );
+}
+
+/// git warns about a directory it cannot look into and carries on, and so must
+/// the key: a root-owned volume in a context does not stop a build that worked.
+/// Mode 0o000 cannot be opened; 0o644 can be listed, but nothing in it can be
+/// reached, a subdirectory included.
+#[tokio::test]
+async fn an_inaccessible_directory_does_not_fail_the_key() {
+    for mode in [0o000, 0o644] {
+        let ctx = copy_all_ctx(&[]);
+        let locked = ctx.path().join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap();
+        if std::fs::symlink_metadata(locked.join("sub")).is_ok() {
+            eprintln!("skipping: permissions are not enforced for this user");
+            return;
+        }
+
+        let dockerfile = ctx.path().join("Dockerfile");
+        let result = CacheKey::compute(&dockerfile, &BTreeMap::new(), ctx.path()).await;
+
+        // So the tempdir can clean up, whatever the result.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap_or_else(|err| panic!("mode {mode:o} must not fail the key: {err}"));
+    }
 }
 
 #[tokio::test]

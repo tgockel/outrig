@@ -130,6 +130,21 @@ pub enum OutrigError {
         source: std::io::Error,
     },
 
+    /// The PID the engine reports for a container is not that container's
+    /// init on this machine, so every `/proc/<pid>` read would land on some
+    /// other process. The engine is outside this machine's PID namespace --
+    /// a remote `CONTAINER_HOST` or `podman system connection`, a VM, or
+    /// another container. A same-host socket is fine.
+    #[error(
+        "container {container}: the engine reports pid {pid}, which is not that container's \
+         process on this machine\n\
+         help: outrig needs a podman engine that shares this machine's kernel and PID \
+         namespace; a remote engine (`CONTAINER_HOST`, `podman system connection`, a VM, or \
+         another container) is not supported, though a socket on this host is fine"
+    )]
+    #[non_exhaustive]
+    ContainerPidNotLocal { container: String, pid: u32 },
+
     #[error("mcp server {name:?} env key {key:?}: {source}")]
     #[non_exhaustive]
     McpEnvResolveFailed {
@@ -148,12 +163,49 @@ pub enum OutrigError {
         source: EnvValueError,
     },
 
-    #[error("image {image:?} embedded config: {source}")]
+    // Raised by the build merge, a runtime read of a raw or sidecar image, and
+    // `image inspect`, so the `help:` cannot assume the reader owns the
+    // image's Dockerfile.
+    #[error(
+        "image {image:?} embedded config: {source}\n\
+         help: the label is part of the image, set by a `LABEL` in its Dockerfile or inherited \
+         from its base image; replace it with `LABEL org.outrig.mcp='{{}}'` (an empty table \
+         declares no servers) in the Dockerfile that builds the image, or in one built `FROM` \
+         it, or correct its value"
+    )]
     #[non_exhaustive]
     EmbeddedImageConfigParse {
         image: String,
         #[source]
         source: Box<EmbeddedImageConfigError>,
+    },
+
+    /// A server an image's `org.outrig.mcp` label declares has an `env` value
+    /// that references a host variable the operator did not list in `[repo]
+    /// env-allow`, so it was refused rather than resolved. A label is text its
+    /// image's author wrote, and a reference in it is read from the operator's
+    /// environment and handed to the server, so it is held to the list as one
+    /// in a repo config file is ([`ConfigValidationError::RepoMcpEnvRef`]).
+    ///
+    /// For a library caller the list is
+    /// [`LaunchSpec::embedded_mcp_env_allow`](crate::LaunchSpec::embedded_mcp_env_allow);
+    /// `image` is then the image tag, and for the CLI the name the operator
+    /// wrote.
+    // The first three come from outside -- an image's label, a config file --
+    // so they print with `{:?}`: a control character in one would otherwise
+    // reach the operator's terminal. `var` matched the reference grammar and
+    // cannot hold one.
+    #[error(
+        "mcp server {server:?} from the org.outrig.mcp label of image {image:?} may not \
+         reference ${{{var}}} in env key {key:?}: list {var:?} in [repo] env-allow in global \
+         config to allow it"
+    )]
+    #[non_exhaustive]
+    EmbeddedMcpEnvRef {
+        image: String,
+        server: String,
+        key: String,
+        var: String,
     },
 
     // Transparent for the same reason as the network pair below: its payload
@@ -163,12 +215,22 @@ pub enum OutrigError {
     #[error(transparent)]
     McpStartupFailed(Box<McpStartupFailure>),
 
-    #[error("mcp server {name:?} tools/list failed: {source}")]
+    /// The server came up but its `tools/list` failed -- the session broke,
+    /// the server answered with an error, or the listing outlived its
+    /// deadline. Carries the server's stderr tail, as
+    /// [`McpStartupFailure`] does, since a listing is still startup.
+    #[error(
+        "mcp server {name:?} tools/list failed: {source}\n  \
+         stderr ({stderr_path}):\n{stderr_tail}",
+        stderr_path = stderr_path.display(),
+    )]
     #[non_exhaustive]
     McpToolsListFailed {
         name: String,
         #[source]
         source: McpSessionError,
+        stderr_path: PathBuf,
+        stderr_tail: String,
     },
 
     /// A `tools/call` on a live MCP session failed. `name` is the server's
@@ -264,6 +326,22 @@ pub enum OutrigError {
     NetworkTaskPanicked {
         #[source]
         source: tokio::task::JoinError,
+    },
+
+    /// One of an attachment's listeners stopped taking the container's
+    /// traffic before teardown asked it to: its socket failed in a way it
+    /// cannot recover from, or it was still failing when it was stopped.
+    ///
+    /// The redirect stays installed until detach, so from then on that traffic
+    /// was refused rather than let through -- the container lost it, and this
+    /// is what says so.
+    #[error("the interceptor's {listener} listener stopped taking traffic: {source}")]
+    #[non_exhaustive]
+    NetworkListenerFailed {
+        /// `"tcp"` or `"dns"`.
+        listener: &'static str,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -669,10 +747,16 @@ mod tests {
         let listed = OutrigError::McpToolsListFailed {
             name: "fs".to_string(),
             source: McpSessionError::new(McpFailureKind::Timeout, "request timeout after 5s"),
+            stderr_path: PathBuf::from("/logs/fs.stderr"),
+            stderr_tail: "still indexing".to_string(),
         };
         let rendered = listed.to_string();
         assert!(rendered.contains(r#""fs""#), "{rendered}");
         assert!(rendered.contains("request timeout after 5s"), "{rendered}");
+        assert!(
+            rendered.contains("/logs/fs.stderr") && rendered.contains("still indexing"),
+            "a listing is still startup, so it shows what the server said: {rendered}"
+        );
 
         let source = listed
             .source()

@@ -29,7 +29,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use common::{CannedResponse, RecordedRequest, drain_recorded, start_mock_http, stream_lines};
+use common::{
+    CannedResponse, RecordedRequest, RepoDir, drain_recorded, start_mock_http, stream_lines,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a step has once the session is up. Short, so a line that never
@@ -89,14 +91,47 @@ fn tool_result(request: &RecordedRequest, id: &str) -> String {
 }
 
 /// A repo whose image has no Python and whose config declares a primary MCP
-/// server carrying a secret.
-fn repo(addr: std::net::SocketAddr) -> tempfile::TempDir {
+/// server carrying a secret, beside a global config -- see [`global_config`]
+/// -- holding the provider at `addr`.
+fn repo(addr: std::net::SocketAddr) -> RepoDir {
     repo_with(addr, "")
 }
 
+/// The global config [`repo_with`] writes beside the repo `repo`, outside the
+/// workspace: the provider, which only it may declare, and the `env-allow`
+/// that lets the repo's image name the secret.
+fn global_config(repo: &Path) -> std::path::PathBuf {
+    repo.parent()
+        .expect("a fixture repo is in a directory of its own")
+        .join("global.toml")
+}
+
+/// Add `text` to the end of the config file at `path`.
+fn append(path: &Path, text: &str) {
+    let mut config = std::fs::read_to_string(path).expect("read the config");
+    config.push_str(text);
+    std::fs::write(path, config).expect("write the config");
+}
+
 /// [`repo`], its config ending with `extra`.
-fn repo_with(addr: std::net::SocketAddr, extra: &str) -> tempfile::TempDir {
-    let repo = tempfile::tempdir().expect("a repo");
+fn repo_with(addr: std::net::SocketAddr, extra: &str) -> RepoDir {
+    let repo = RepoDir::new();
+    std::fs::write(
+        global_config(repo.path()),
+        format!(
+            r#"
+[providers.claude]
+style                = "anthropic"
+base-url             = "http://{addr}"
+api-key              = "${{{KEY_VAR}}}"
+request-timeout-secs = 30
+
+[repo]
+env-allow = ["{SECRET_VAR}"]
+"#
+        ),
+    )
+    .expect("write the global config");
     let cfg_dir = repo.path().join(".agents/outrig");
     std::fs::create_dir_all(&cfg_dir).expect("create config dir");
     std::fs::write(
@@ -105,12 +140,6 @@ fn repo_with(addr: std::net::SocketAddr, extra: &str) -> tempfile::TempDir {
             r#"
 default-model = "sonnet"
 default-image = "primary"
-
-[providers.claude]
-style                = "anthropic"
-base-url             = "http://{addr}"
-api-key              = "${{{KEY_VAR}}}"
-request-timeout-secs = 30
 
 [models.sonnet]
 provider   = "claude"
@@ -194,13 +223,7 @@ impl Session {
     }
 
     fn spawn(repo: &Path, sessions: &Path, reader: Reader) -> Self {
-        Self::launch(
-            repo,
-            sessions,
-            &repo.join("no-such-global.toml"),
-            &[],
-            reader,
-        )
+        Self::launch(repo, sessions, &global_config(repo), &[], reader)
     }
 
     /// [`Session::start`], with `global` as the global config and `env` added
@@ -939,7 +962,7 @@ struct Merged {
 impl Merged {
     fn start(repo: &Path, sessions: &Path) -> Self {
         let (mut pipe, writer) = std::io::pipe().expect("a pipe");
-        let mut child = run_new_command(repo, sessions, &repo.join("no-such-global.toml"), &[])
+        let mut child = run_new_command(repo, sessions, &global_config(repo), &[])
             .stdout(writer.try_clone().expect("a second write end"))
             .stderr(writer)
             .spawn()
@@ -1254,7 +1277,7 @@ async fn a_killed_session_leaves_a_labeled_stray_clean_can_find() {
     std::fs::remove_dir_all(&session_dir).expect("remove the record");
     let out = Command::new(env!("CARGO_BIN_EXE_outrig"))
         .arg("--global-config")
-        .arg(repo.path().join("no-such-global.toml"))
+        .arg(global_config(repo.path()))
         .arg("--session-root")
         .arg(sessions.path())
         .args(["clean", "-y", "--older-than", "2s", "--session", &sid])
@@ -1690,16 +1713,14 @@ async fn every_hosted_request_is_recorded_through_run_new() {
     ])
     .await;
     let repo = repo_with(addr, "[events]\nmode = \"record\"");
-    let home = tempfile::tempdir().expect("a home for the global config");
-    let global = home.path().join("config.toml");
-    std::fs::write(
+    let global = global_config(repo.path());
+    append(
         &global,
-        format!(
+        &format!(
             "[bindings.fx]\ndescription = \"The fixture.\"\nrequires = [{requirement:?}]\n\
              factory = \"outrig_fixture:make\"\n"
         ),
-    )
-    .expect("write the global config");
+    );
     let sessions = tempfile::tempdir().expect("a session root");
     let mut session = Session::with_global(
         repo.path(),
@@ -1857,14 +1878,12 @@ async fn a_gitpython_binding_is_used_as_plain_code() {
     git(work.path(), &["commit", "-m", "the start"]);
     let url = format!("file://{}", bare.path().display());
     git(work.path(), &["remote", "add", "origin", &url]);
-    let home = tempfile::tempdir().expect("a home for the global config");
-    let global = home.path().join("config.toml");
-    std::fs::write(
+    let global = global_config(work.path());
+    append(
         &global,
         "[bindings.repo]\ndescription = \"The repository, through GitPython.\"\n\
          requires = [\"GitPython==3.2.0\"]\nfactory = \"git:Repo\"\nargs = [{ path = \".\" }]\n",
-    )
-    .expect("write the global config");
+    );
     let sessions = tempfile::tempdir().expect("a session root");
     let mut session = Session::with_global(work.path(), sessions.path(), &global, &[]);
     session.type_line("commit and push").await;

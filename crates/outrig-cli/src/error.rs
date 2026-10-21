@@ -5,6 +5,7 @@ use thiserror::Error;
 
 pub use outrig::error::OutrigError;
 
+use crate::cli::signals::EndSignal;
 use crate::llm::LlmResolveError;
 
 #[derive(Debug, Error)]
@@ -14,12 +15,15 @@ pub enum CliError {
 
     /// A monitored session container went away: the borrowed container in
     /// attach mode stopped, or the watcher saw the primary die externally.
-    /// The type doubles as a control signal -- after teardown the process
-    /// must `std::process::exit` instead of returning, because the blocking
-    /// stdin read (MCP stdio transport, REPL) never completes while the peer
-    /// holds the pipe open. See `cli::watcher::exit_if_monitor_stopped`.
     #[error("{0}")]
     SessionMonitorStopped(String),
+
+    /// A signal ended the session before it finished on its own. Not a
+    /// failure to report: the signal was announced as it landed, and the
+    /// session is torn down with its record keeping [`EndSignal::exit_code`],
+    /// which is also what the process exits with.
+    #[error("interrupted by {0}")]
+    Interrupted(EndSignal),
 
     #[error("{0}")]
     LlmResolve(#[from] LlmResolveError),
@@ -38,19 +42,32 @@ pub enum CliError {
     #[error("mcp server initialize: {0}")]
     McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
 
+    /// A session's `session.json` exists but does not parse -- a hand edit, a
+    /// corrupted file, or a record from an outrig whose schema renamed a
+    /// required field. Not a configuration fault, so it is not an
+    /// [`OutrigError::Configuration`]: nothing the user configured is wrong.
+    #[error("session record {} is unreadable: {source}", path.display())]
+    SessionRecord {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("agent prompt failed: {0}")]
     Prompt(rig::completion::PromptError),
 
     /// A failure from an `outrig` harness session, which renders its own
-    /// errors.
+    /// errors. Boxed, as `McpServerInitialize` is: inline, it is as large as
+    /// [`OutrigError`], and the two together would grow every `CliError`.
     #[error(transparent)]
-    Session(#[from] outrig::harness::SessionError),
+    Session(Box<outrig::harness::SessionError>),
 
     /// Rig refused to build the request because no output-token ceiling was
     /// set. Its own wording names `max_tokens`, which is the field on the wire
     /// and not a key any outrig config can carry -- the model and agent tables
-    /// are `rename_all = "kebab-case"`, so `max_tokens` would be rejected as an
-    /// unknown field. Say `max-tokens` instead, and say where it goes.
+    /// are `rename_all = "kebab-case"`, so `max_tokens` would be an unknown
+    /// key, ignored with a warning. Say `max-tokens` instead, and say where it
+    /// goes.
     ///
     /// `build_agent` supplies a fallback ceiling on the native Anthropic path,
     /// so this should not be reachable there. It stays for the paths that have
@@ -82,10 +99,12 @@ impl CliError {
     }
 
     /// The status the process exits with after printing this error, and the
-    /// one a command records for the session: 1, unless
-    /// [`CliError::with_status`] said otherwise.
-    pub fn exit_status(&self) -> i32 {
+    /// one a command records for the session: the signal's for
+    /// [`CliError::Interrupted`], the one [`CliError::with_status`] set, and 1
+    /// for everything else.
+    pub fn exit_code(&self) -> i32 {
         match self {
+            CliError::Interrupted(sig) => sig.exit_code(),
             CliError::WithStatus { status, .. } => *status,
             _ => 1,
         }
@@ -109,6 +128,12 @@ impl From<rig::completion::PromptError> for CliError {
             }
             _ => CliError::Prompt(e),
         }
+    }
+}
+
+impl From<outrig::harness::SessionError> for CliError {
+    fn from(e: outrig::harness::SessionError) -> Self {
+        CliError::Session(Box::new(e))
     }
 }
 
@@ -170,11 +195,11 @@ mod tests {
     #[test]
     fn a_status_changes_the_exit_and_not_the_text() {
         let plain = CliError::from(std::io::Error::other("stdout went away"));
-        assert_eq!(plain.exit_status(), 1, "an error without a status exits 1");
+        assert_eq!(plain.exit_code(), 1, "an error without a status exits 1");
         let text = plain.to_string();
 
         let carried = plain.with_status(3);
-        assert_eq!(carried.exit_status(), 3);
+        assert_eq!(carried.exit_code(), 3);
         assert_eq!(carried.to_string(), text);
     }
 }

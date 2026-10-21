@@ -44,6 +44,18 @@ RUN apk add --no-cache ca-certificates curl shadow
     .expect("write Dockerfile");
 }
 
+/// [`write_curl_image_context`] with `dig`, which can ask over TCP.
+fn write_dig_image_context(dir: &Path) {
+    std::fs::write(
+        dir.join("Dockerfile"),
+        r#"
+FROM docker.io/library/alpine:latest
+RUN apk add --no-cache ca-certificates curl shadow bind-tools
+"#,
+    )
+    .expect("write Dockerfile");
+}
+
 async fn ensure_curl_image(context: &Path) -> ImageTag {
     let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, context, false)
@@ -148,6 +160,10 @@ fn outrig_table_name(pid: u32) -> Option<String> {
         .filter(|name| name.starts_with("outrig_"))
 }
 
+/// Whether the namespace holds a redirect table of any contents. Right for
+/// asking whether one is *gone*: a table left half-made still counts as
+/// there. For whether interception is *installed*, see
+/// [`netns_has_complete_redirect`].
 fn netns_has_outrig_table(pid: u32) -> bool {
     let output = run_capture(Command::new("nsenter").args([
         "-t",
@@ -159,6 +175,45 @@ fn netns_has_outrig_table(pid: u32) -> bool {
         "tables",
     ]));
     String::from_utf8_lossy(&output.stdout).contains("outrig_")
+}
+
+/// Whether the namespace holds the whole redirect table interception
+/// installs, and not only a table by its name: both chains, with every rule
+/// the script gives them. An empty table passes the name alone while
+/// redirecting nothing.
+///
+/// The counts are those of `nft_rules`, which this crate cannot call: `output`
+/// carries the five redirect rules and `egress` the three that keep the
+/// namespace's own traffic. A rule added to the script fails this loudly.
+fn netns_has_complete_redirect(pid: u32) -> bool {
+    let Some(table) = outrig_table_name(pid) else {
+        return false;
+    };
+    let listed = nft_in_netns(pid, &["list", "table", "inet", &table]);
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    chain_rules(&listing, "output") == Some(5) && chain_rules(&listing, "egress") == Some(3)
+}
+
+/// How many rules `chain` holds in an `nft list table` listing, or `None`
+/// when the listing has no such chain.
+fn chain_rules(listing: &str, chain: &str) -> Option<usize> {
+    let opening = format!("chain {chain} {{");
+    let mut lines = listing.lines().map(str::trim);
+    lines.find(|line| *line == opening)?;
+    // The line after the opening is the chain's `type ... hook ...` header.
+    Some(lines.skip(1).take_while(|line| *line != "}").count())
+}
+
+/// Wait for the reaper to delete a dropped attachment's redirect table.
+async fn wait_for_table_reaped(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while netns_has_outrig_table(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the redirect table should be deleted by the reaper"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn record_host(record: &Value) -> Option<&str> {
@@ -493,6 +548,105 @@ async fn curl_http_host_writes_allow_audit_record() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
+/// Every IPv4 address the host has, loopback included.
+fn host_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()
+        .expect("list the host's addresses")
+        .filter_map(|ifaddr| Some(ifaddr.address?.as_sockaddr_in()?.ip()))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Under interception `host.containers.internal` reaches the very host
+/// address it reaches without. A listener on each of the host's IPv4
+/// addresses shares one port, and only the one the alias lands on with
+/// interception off may hear from it. Under pasta that is an address of
+/// pasta's own choosing, which on a host with several need not be the one the
+/// container connects from; the host's loopback is never it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_alias_reaches_the_address_it_reaches_without_interception() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    let host_ip = container_host_ipv4(&container);
+
+    // Never accepted from until curl is done, so a connection that reached a
+    // listener waits in its backlog for `accept` to find, and nothing answers.
+    let landing =
+        std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind landing listener");
+    landing
+        .set_nonblocking(true)
+        .expect("landing listener nonblocking");
+    let landing_port = landing.local_addr().expect("landing addr").port();
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--max-time", "2"],
+        &format!("http://{host_ip}:{landing_port}/"),
+    ));
+    let (arrived, _) = landing
+        .accept()
+        .expect("the alias should reach the host without interception");
+    let expected = arrived.local_addr().expect("arrival addr").ip();
+    let addresses = host_ipv4_addresses();
+    assert!(
+        addresses.iter().any(|addr| IpAddr::V4(*addr) == expected),
+        "the alias landed at {expected}, which is none of the host's addresses: {addresses:?}"
+    );
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    let mut port = 0;
+    let listeners: Vec<_> = addresses
+        .iter()
+        .map(|addr| {
+            let listener = std::net::TcpListener::bind((*addr, port))
+                .unwrap_or_else(|e| panic!("bind {addr}:{port}: {e}"));
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking");
+            port = listener.local_addr().expect("listener addr").port();
+            (*addr, listener)
+        })
+        .collect();
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--max-time", "2"],
+        &format!("http://{host_ip}:{port}/"),
+    ));
+    for (addr, listener) in &listeners {
+        let heard = listener.accept().is_ok();
+        let should = IpAddr::V4(*addr) == expected;
+        assert_eq!(
+            heard,
+            should,
+            "under interception the alias should reach {expected} and nothing else, but \
+             {addr}:{port} {} from it",
+            if heard { "heard" } else { "did not hear" }
+        );
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     let _guard = E2E_LOCK.lock().await;
@@ -584,6 +738,196 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
         .shutdown()
         .await
         .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// Starts a container whose `/bin/sh` records when the host ran it.
+///
+/// The shell writes `/tmp/sh-ran` whenever it runs outside the container's pid
+/// namespace, where `/proc/self` names nothing. That is a shell the host
+/// started in the container's mount namespace alone, as interception's
+/// resolver edits once did. A shell started inside the container records
+/// nothing.
+///
+/// The file holds the names of the environment the shell was handed, never
+/// the values. A failure prints it, and the values would be the secrets of
+/// whoever ran the test.
+async fn start_recording_shell_container(dir: &Path) -> Container {
+    let context = dir.join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    std::fs::write(
+        context.join("Dockerfile"),
+        r#"
+FROM docker.io/library/alpine:latest
+RUN /bin/busybox rm /bin/sh \
+ && printf '%s\n' '#!/bin/busybox sh' \
+      '[ -e /proc/self ] || env | /bin/busybox cut -d= -f1 > /tmp/sh-ran' \
+      'exec /bin/busybox sh "$@"' > /bin/sh \
+ && /bin/busybox chmod 755 /bin/sh
+"#,
+    )
+    .expect("write Dockerfile");
+    let image = image::ensure_image(&common::fixture_build_config(), &context, false)
+        .await
+        .expect("ensure recording-shell image")
+        .tag;
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    start_bootstrapped_container(&image, &workspace).await
+}
+
+/// Fails with what the image's shell recorded, if it ran from the host.
+fn assert_no_host_shell_ran(container: &Container) {
+    let ran = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["cat", "/tmp/sh-ran"]),
+    );
+    assert!(
+        !ran.status.success(),
+        "the image's /bin/sh ran outside the container's namespaces, handed: {}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+}
+
+/// Installing and removing interception runs nothing from the container's
+/// image. Its resolver is read, rewritten and put back by outrig itself, so a
+/// hostile image's `sh` never gets outrig's environment or the host's network
+/// namespace -- the trust boundary audit and filter mode exist to hold (#328).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_and_detach_run_nothing_from_the_image() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    let during = read_resolv_conf(&container);
+    assert!(
+        String::from_utf8_lossy(&during).contains("nameserver 127.0.0.1"),
+        "resolver under interception: {}",
+        String::from_utf8_lossy(&during)
+    );
+    assert_no_host_shell_ran(&container);
+
+    interceptor
+        .detach(container.name())
+        .await
+        .expect("detach the container");
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "detach should restore the resolver byte for byte"
+    );
+    assert_no_host_shell_ran(&container);
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// An interceptor dropped rather than shut down has put the resolver back by
+/// the time the drop returns -- read here with no waiting -- and its redirect
+/// table goes shortly after, through the reaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_interceptor_has_put_the_resolver_back() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    assert_ne!(read_resolv_conf(&container), before);
+    drop(interceptor);
+
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "the resolver is back before the drop returns"
+    );
+    wait_for_table_reaped(pid).await;
+    assert_no_host_shell_ran(&container);
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// `drop_attachment` is that drop for one container: the resolver is back
+/// when it returns, the table goes through the reaper, and the name is free --
+/// an attach of the same container afterwards is not refused as already
+/// attached, which is what an interrupted `/sidecar add` relies on to be
+/// retried (#345).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_attachment_frees_its_name_and_puts_the_resolver_back() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    assert_ne!(read_resolv_conf(&container), before);
+
+    assert!(interceptor.drop_attachment(container.name()));
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "the resolver is back before drop_attachment returns"
+    );
+    assert!(
+        !interceptor.drop_attachment(container.name()),
+        "nothing is left attached to drop"
+    );
+    wait_for_table_reaped(pid).await;
+
+    interceptor
+        .attach(&container)
+        .await
+        .expect("the dropped attachment's name is free to attach again");
+    assert_ne!(read_resolv_conf(&container), before);
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    assert_eq!(read_resolv_conf(&container), before);
+    assert_no_host_shell_ran(&container);
+
     container
         .stop(Duration::from_secs(2))
         .await
@@ -720,8 +1064,14 @@ async fn two_containers_attribute_audit_records_and_detach_cleanly() {
 
     let pid_a = container_root_pid(&container_a);
     let pid_b = container_root_pid(&container_b);
-    assert!(netns_has_outrig_table(pid_a));
-    assert!(netns_has_outrig_table(pid_b));
+    assert!(
+        netns_has_complete_redirect(pid_a),
+        "container a's redirect table should be whole"
+    );
+    assert!(
+        netns_has_complete_redirect(pid_b),
+        "container b's redirect table should be whole"
+    );
 
     interceptor
         .detach(container_b.name())
@@ -732,7 +1082,7 @@ async fn two_containers_attribute_audit_records_and_detach_cleanly() {
         "detach should delete container b's nft table"
     );
     assert!(
-        netns_has_outrig_table(pid_a),
+        netns_has_complete_redirect(pid_a),
         "detach of b must not disturb container a's nft table"
     );
 
@@ -1116,6 +1466,240 @@ async fn a_lookup_sent_to_another_resolver_is_answered() {
         .expect("stop container");
 }
 
+/// A lookup made over TCP is answered, whether the container's own resolver
+/// is asked -- where a stub's retry after a truncated answer goes -- or
+/// another one, which the redirect brings to the listener. Nothing but the
+/// listener could answer the second: the address is from a documentation
+/// range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_over_tcp_is_answered() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_dig_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    for args in [
+        &["+tcp", "+tries=1", "example.com"][..],
+        &["+tcp", "+tries=1", "@192.0.2.53", "example.com"][..],
+    ] {
+        let output = try_capture(
+            Command::new("podman")
+                .arg("exec")
+                .arg(container.name())
+                .arg("dig")
+                .args(args),
+        );
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("status: NOERROR"),
+            "dig {args:?} should be answered: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// A name resolved over TCP grants its hostname `allow` as one resolved over
+/// UDP does: the connection to the address `dig +tcp` returned is decided by
+/// `allow[0]`, with nothing but the lookup to have named it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_resolved_over_tcp_grants_a_hostname_allow() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_dig_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let looked_up = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["dig", "+tcp", "+short", "+tries=1", "example.com", "A"]),
+    );
+    let stdout = String::from_utf8_lossy(&looked_up.stdout);
+    let address = stdout
+        .lines()
+        .find(|line| line.parse::<std::net::Ipv4Addr>().is_ok())
+        .unwrap_or_else(|| panic!("dig +tcp returned no address: {stdout}"))
+        .to_string();
+
+    // `--resolve` makes the client dial the address itself, so the lookup is
+    // the only thing that can have bound it to the name.
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--resolve", &format!("example.com:443:{address}")],
+        "https://example.com/",
+    ));
+
+    let records = read_audit_records_until(&log_dir, |records| {
+        records
+            .iter()
+            .any(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+    })
+    .await;
+    let record = records
+        .iter()
+        .find(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+        .unwrap_or_else(|| panic!("no example.com:443 audit record in {records:#?}"));
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("allow"),
+        "a name resolved over TCP should grant its hostname rule: {record:#?}"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// The lookup records `records` holds for `name`: what the DNS listener wrote
+/// when a container asked it, as opposed to the connections that followed.
+fn lookup_records<'a>(records: &'a [Value], name: &str) -> Vec<&'a Value> {
+    records
+        .iter()
+        .filter(|record| {
+            record.get("service").and_then(Value::as_str) == Some("dns")
+                && record_host(record) == Some(name)
+        })
+        .collect()
+}
+
+/// Under a deny default a name resolves only if some hostname `allow` could
+/// cover it, and every lookup is recorded either way. The refused name never
+/// reaches a resolver -- the listener answers REFUSED itself -- so nothing of
+/// it leaves the container's namespace but the record. Needs working outbound
+/// DNS for the name that is allowed.
+///
+/// Asked with `nslookup`, not `curl`: musl's resolver does not take REFUSED
+/// as an answer and waits out its timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_under_a_deny_default_is_refused_unless_a_hostname_allow_covers_it() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let nslookup = |name: &str| {
+        try_capture(
+            Command::new("podman")
+                .arg("exec")
+                .arg(container.name())
+                .args(["nslookup", name]),
+        )
+    };
+    let allowed = nslookup("example.com");
+    assert!(
+        allowed.status.success(),
+        "a name an allow entry covers should resolve: {:?}\nstdout: {}\nstderr: {}",
+        allowed.status,
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let refused = nslookup("data.attacker.example.net");
+    assert!(
+        !refused.status.success(),
+        "a name no allow entry covers should be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    let records = read_audit_records_until(&log_dir, |records| {
+        !lookup_records(records, "example.com").is_empty()
+            && !lookup_records(records, "data.attacker.example.net").is_empty()
+    })
+    .await;
+    for (name, action, rule) in [
+        ("example.com", "allow", "allow[0]"),
+        ("data.attacker.example.net", "deny", "default"),
+    ] {
+        for record in lookup_records(&records, name) {
+            assert_eq!(record["proto"], "udp", "{record:#?}");
+            assert_eq!(record["id.resp_p"], 53, "{record:#?}");
+            assert_eq!(record["outrig.host_source"], "asserted", "{record:#?}");
+            assert_eq!(record["outrig.action"], action, "{record:#?}");
+            assert_eq!(record["outrig.rule"], rule, "{record:#?}");
+        }
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 /// systemd-resolved's stub listener address.
 const RESOLVED_STUB: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 53);
 
@@ -1293,6 +1877,212 @@ async fn a_datagram_the_redirects_do_not_carry_is_dropped_under_a_deny_default()
     });
     assert_eq!(String::from_utf8_lossy(&buf[..len]).trim(), "probe");
 
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// The port the interceptor's TCP listener has, read from the redirect it
+/// installed in the container's namespace.
+fn listener_port(pid: u32) -> u16 {
+    let table = outrig_table_name(pid).expect("the redirect table");
+    let rules = nft_in_netns(pid, &["list", "table", "inet", &table]);
+    String::from_utf8_lossy(&rules.stdout)
+        .lines()
+        .find_map(|line| {
+            let (_, port) = line.split_once("meta l4proto tcp redirect to :")?;
+            port.trim().parse().ok()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no TCP redirect in {table}: {}",
+                String::from_utf8_lossy(&rules.stdout)
+            )
+        })
+}
+
+/// The redirect leaves loopback alone, so a process in the container that
+/// connects to the listener itself -- its port is in `/proc/net/tcp`, and in
+/// the redirect -- is not redirected, and the destination the interceptor
+/// reads for it is the listener's own address. Dialed from the host's
+/// namespace, that is whatever the host has on the same port. It must be
+/// refused and recorded instead, in audit mode, where policy would allow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_made_straight_to_the_listener_is_refused_not_dialed_by_the_host() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+    let port = listener_port(container_root_pid(&container));
+
+    // The host's own service on that port, in the host's namespace. The port
+    // was chosen by the kernel in the container's, so nothing made it free
+    // here; a host that happens to use it cannot run this.
+    let host_service = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .unwrap_or_else(|e| panic!("the host already has something on 127.0.0.1:{port}: {e}"));
+    host_service
+        .set_nonblocking(true)
+        .expect("nonblocking host service");
+
+    // Its outcome is the interceptor's to settle: the connection is closed,
+    // and curl says so.
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &[],
+        &format!("http://127.0.0.1:{port}/"),
+    ));
+
+    // Before the records: a connection that was carried instead is held open
+    // by the service that never answers it, so no record of it is written
+    // until teardown, and waiting for one would hide this.
+    match host_service.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the host was made to dial its own 127.0.0.1:{port}: {other:?}"),
+    }
+
+    let to_port =
+        |record: &&Value| record.get("id.resp_p").and_then(Value::as_u64) == Some(port as u64);
+    let records = read_audit_records_until(&log_dir, |records| {
+        records.iter().filter(to_port).count() > 0
+    })
+    .await;
+    let to_listener: Vec<&Value> = records.iter().filter(to_port).collect();
+    assert_eq!(to_listener.len(), 1, "{records:#?}");
+    let record = to_listener[0];
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("deny"),
+        "{record:#?}"
+    );
+    assert_eq!(
+        record.get("outrig.rule").and_then(Value::as_str),
+        Some("not-redirected"),
+        "{record:#?}"
+    );
+    assert_eq!(
+        record.get("id.resp_h").and_then(Value::as_str),
+        Some("127.0.0.1")
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// A container started with `cap-add = ["NET_ADMIN"]` is refused by `attach`
+/// before it is touched (#363). `NET_ADMIN` in its network namespace is
+/// control of the nftables table the interception is, so a root process in it
+/// could delete the redirect and leave no record; the refusal leaves no table
+/// and the resolver as it was. Every other spelling that grants it is in
+/// `grants_net_admin`'s unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_holding_net_admin_is_refused_and_left_untouched() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let mut launch = ContainerLaunchSpec::workspace(&workspace, PathBuf::from("/workspace"));
+    launch.capabilities.cap_add = vec!["NET_ADMIN".to_string()];
+    let container = Container::start(&image, launch)
+        .await
+        .expect("start container");
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let refused = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect_err("a container holding NET_ADMIN is not attached");
+    let message = refused.to_string();
+    assert!(
+        message.contains("CAP_NET_ADMIN") && message.contains("`cap-add`"),
+        "the refusal names the capability and the key: {message}"
+    );
+    assert!(
+        !netns_has_outrig_table(pid),
+        "a refused attach installs no table"
+    );
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "a refused attach leaves the resolver alone"
+    );
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// `SYS_ADMIN` is not `NET_ADMIN`: netlink checks `CAP_NET_ADMIN` in the
+/// namespace's owning user namespace and nothing else, so a nested container
+/// runtime's `cap-add = ["SYS_ADMIN"]` still runs under interception (#363).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_holding_sys_admin_is_still_attached() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let mut launch = ContainerLaunchSpec::workspace(&workspace, PathBuf::from("/workspace"));
+    launch.capabilities.cap_add = vec!["SYS_ADMIN".to_string()];
+    let container = Container::start(&image, launch)
+        .await
+        .expect("start container");
+    let pid = container_root_pid(&container);
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("a container holding SYS_ADMIN attaches");
+
+    // The point of refusing NET_ADMIN, from the other side: root with
+    // SYS_ADMIN cannot configure the namespace's netfilter.
+    let tried = try_capture(
+        common::root_cmd(container.name()).args(["ip", "link", "add", "outrig0", "type", "dummy"]),
+    );
+    let stderr = String::from_utf8_lossy(&tried.stderr);
+    assert!(
+        !tried.status.success() && stderr.contains("Operation not permitted"),
+        "SYS_ADMIN alone must not configure the network namespace: {stderr}"
+    );
+    assert!(
+        netns_has_complete_redirect(pid),
+        "a container holding SYS_ADMIN should still get a whole redirect table"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     container
         .stop(Duration::from_secs(2))
         .await

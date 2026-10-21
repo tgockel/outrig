@@ -30,9 +30,11 @@ use common::{CannedResponse, drain_recorded, start_mock_http, stub_runtime_path}
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A working directory, and a `PATH` whose `podman` and `buildah` log their calls and fail.
+/// A working directory, a global config outside it, and a `PATH` whose `podman` and `buildah`
+/// log their calls and fail.
 struct Case {
     dir: tempfile::TempDir,
+    global: tempfile::TempDir,
     path: std::ffi::OsString,
 }
 
@@ -42,11 +44,24 @@ impl Case {
         let stubs = dir.path().join("stubs");
         std::fs::create_dir(&stubs).expect("mkdir stubs");
         let path = stub_runtime_path(&stubs);
-        Self { dir, path }
+        let global = tempfile::tempdir().expect("tempdir global");
+        let case = Self { dir, global, path };
+        case.write_global("");
+        case
     }
 
     fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    fn global_config(&self) -> PathBuf {
+        self.global.path().join("config.toml")
+    }
+
+    /// The global config, which a `--global-config` must name and only it may declare a provider
+    /// in.
+    fn write_global(&self, contents: &str) {
+        std::fs::write(self.global_config(), contents).expect("write the global config");
     }
 
     fn write(&self, name: &str, contents: &str) -> PathBuf {
@@ -61,7 +76,7 @@ impl Case {
         std::fs::read_to_string(self.path().join("stubs/runtime.log")).unwrap_or_default()
     }
 
-    /// `outrig --global-config <absent> <args>`, working in the case's directory, in a process
+    /// `outrig --global-config <the case's> <args>`, working in the case's directory, in a process
     /// group of its own.
     fn outrig(&self, args: &[&str]) -> Command {
         let mut command = self.outrig_in_this_group(args);
@@ -74,7 +89,7 @@ impl Case {
         let mut command = Command::new(env!("CARGO_BIN_EXE_outrig"));
         command
             .arg("--global-config")
-            .arg(self.path().join("no-global.toml"))
+            .arg(self.global_config())
             .args(args)
             .current_dir(self.path())
             .env("PATH", &self.path)
@@ -99,16 +114,23 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// A repo config whose provider is the mock at `addr`, so a model call would be recorded.
-fn repo_config(addr: std::net::SocketAddr, default_model: &str) -> String {
+/// A global config whose provider is the mock at `addr`, so a model call would be recorded.
+fn global_config(addr: std::net::SocketAddr) -> String {
     format!(
         r#"
-default-model = "{default_model}"
-
 [providers.mock]
 style    = "anthropic"
 base-url = "http://{addr}"
 api-key  = "${{OUTRIG_TEST_PROGRAM_KEY}}"
+"#
+    )
+}
+
+/// A repo config whose model is on [`global_config`]'s provider.
+fn repo_config(default_model: &str) -> String {
+    format!(
+        r#"
+default-model = "{default_model}"
 
 [models.{default_model}]
 provider   = "mock"
@@ -127,7 +149,8 @@ async fn the_requirements_example_runs_on_the_host_alone() {
     let case = Case::new();
     let (addr, mut requests) =
         start_mock_http(vec![CannedResponse::ok(serde_json::json!({}))]).await;
-    case.write(".agents/outrig/config.toml", &repo_config(addr, "fast"));
+    case.write_global(&global_config(addr));
+    case.write(".agents/outrig/config.toml", &repo_config("fast"));
     std::fs::create_dir(case.path().join("workspace")).unwrap();
     case.write(
         "worker.py",
@@ -211,13 +234,13 @@ async fn a_session_flag_before_the_script_is_refused_and_after_it_is_the_program
 #[tokio::test]
 async fn the_configuration_comes_from_the_invocation() {
     let case = Case::new();
-    let addr = "127.0.0.1:1".parse().unwrap();
-    case.write(".agents/outrig/config.toml", &repo_config(addr, "from-cwd"));
+    case.write_global(&global_config("127.0.0.1:1".parse().unwrap()));
+    case.write(".agents/outrig/config.toml", &repo_config("from-cwd"));
     case.write(
         "elsewhere/.agents/outrig/config.toml",
-        &repo_config(addr, "from-script"),
+        &repo_config("from-script"),
     );
-    case.write("chosen.toml", &repo_config(addr, "from-flag"));
+    case.write("chosen.toml", &repo_config("from-flag"));
     case.write(
         "elsewhere/which.py",
         "import outrig\nview = outrig.config()\nprint(view.default_model, sorted(view.models))\n",

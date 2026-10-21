@@ -8,8 +8,8 @@
 //!
 //! Two properties come from being an ordinary OS process rather than a task:
 //!
-//! - It needs no tokio runtime, so it is callable from `Drop` and from a
-//!   panic hook -- the two places that have no runtime to lean on.
+//! - It needs no tokio runtime, so it is callable from `Drop` and from the
+//!   panic sweep -- the two places that have no runtime to lean on.
 //! - It runs to completion even if outrig's runtime is torn down, or outrig
 //!   itself exits, immediately afterwards. A spawned task would be cancelled
 //!   by either.
@@ -36,9 +36,11 @@
 //! cleanup this thread starts while it polls or drops the future, and each
 //! piece started then counts against it: a detached command until the reaper
 //! is done with it, a killed process group ([`owe`]) until it is proven
-//! empty, and blocking work that outlived its future ([`blocking`]) until it
-//! returns. Cleanup started on other threads, or on this one outside those
-//! polls, belongs to whoever started it.
+//! empty, blocking work that outlived its future ([`blocking`]) until it
+//! returns, and a child process the future dropped until it is reaped.
+//! Cleanup started on other threads, or on this one outside those polls,
+//! belongs to whoever started it. [`Abandonable`] is the public face of this,
+//! for a caller that cancels and then exits.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -148,14 +150,14 @@ fn ended_by_our_kill(kill: Kill, status: &std::process::ExitStatus) -> bool {
 /// that reports it as an error -- and retrying that forever would spend
 /// processes on it forever. Two retries covers a transient lock; a third
 /// attempt failing says the answer is not going to change.
-const CLEANUP_RETRIES: u8 = 2;
+pub(crate) const CLEANUP_RETRIES: u8 = 2;
 
 /// Delay before the first retry; doubled for each one after it.
 ///
 /// Long enough that a retry is not simply the same contended instant again,
 /// short enough that the whole sequence is over well inside a session
 /// teardown.
-const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Most *arrivals* the reaper accepts in one pass before it scans.
 ///
@@ -173,7 +175,7 @@ const REAP_BATCH: usize = 64;
 /// Run `cmd` as a detached cleanup process and take responsibility for
 /// reaping it.
 ///
-/// Synchronous and runtime-free: safe from `Drop` and from a panic hook. The
+/// Synchronous and runtime-free: safe from `Drop` and from the panic sweep. The
 /// exit status is unavailable by construction -- nobody is left to receive it
 /// -- so this is for obligations whose failure has nowhere to go. A caller
 /// that can await and wants the status should run the command through
@@ -186,10 +188,8 @@ pub(crate) fn detach_cleanup(cmd: Cmd, reissue: Reissue) {
 ///
 /// Handing the reaper one command at a time hands it no ordering: each call
 /// spawns its own child and returns, so two cleanups race. Where the second
-/// depends on the first having finished -- removing a redirect before
-/// restoring the resolver that pointed at it, so the container is never left
-/// resolving through a rule aimed at a listener that is gone -- they have to
-/// arrive as one obligation, which is what this is.
+/// depends on the first having finished, they have to arrive as one
+/// obligation, which is what this is.
 ///
 /// Every command runs, in the order given. They are sequenced, not
 /// conditional: the later ones are owed whatever became of the earlier, and
@@ -323,8 +323,8 @@ fn hand_back(unqueued: Wait, program: &'static str) {
     // Reached only when the reaper thread has died *and* no thread can be made,
     // at which point a short block is the least bad of three bad options: the
     // tail started beside a head still running is the ordering failure the
-    // chain exists to prevent, and dropping it loses the resolver undo for
-    // good, after the listeners it points at have stopped.
+    // chain exists to prevent, and dropping it loses the tail's obligations
+    // for good.
     tracing::debug!(
         target: "outrig::supervise",
         "the rest of a cleanup chain has no thread to sequence it; \
@@ -397,9 +397,8 @@ fn proved_gone(head: &mut Child, patience: Duration) -> bool {
 /// Reached only when the reaper is unavailable or gone, which is also the only
 /// path on which ordering cannot be kept: there is nothing left to notice one
 /// command ending and start the next. Launching them anyway is the lesser
-/// loss -- the alternative is dropping them, which for the delete-then-restore
-/// chain means a live container left pointing at a DNS listener that has
-/// stopped, with nothing coming to put it back.
+/// loss -- the alternative is dropping them, with nothing coming to discharge
+/// what they owed.
 fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
     if then.is_empty() {
         return;
@@ -424,14 +423,12 @@ fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
 /// The commands as a single `sh` that runs them in order.
 ///
 /// A sequencer that needs no runtime and no reaper, for the path where
-/// neither is available. Ordering still has to hold there: the resolver must
-/// not go back while the redirect aimed at it is still in place, and launching
-/// the commands side by side is exactly that failure.
+/// neither is available. Ordering still has to hold there, and launching the
+/// commands side by side is exactly that failure.
 ///
 /// Every argv element is passed as a positional parameter and referenced by
-/// index, so nothing is interpolated into the script -- which matters because
-/// one of those elements is a container's resolver, arbitrary bytes that no
-/// quoting rule gets to see.
+/// index, so nothing is interpolated into the script: an argument is bytes
+/// that no quoting rule gets to see.
 fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
     let mut script = String::new();
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
@@ -880,6 +877,29 @@ impl CleanupGuard {
     pub(crate) fn release(mut self) {
         self.0 = None;
     }
+
+    /// Hand the removals `guards` owe to the reaper as one ordered obligation.
+    ///
+    /// For removals where a later one cannot succeed until an earlier one has:
+    /// dropped separately they run side by side, and the later one can spend
+    /// its whole retry budget while the earlier is still being refused. The
+    /// chain starts each after the last has finished, with a budget of its own.
+    ///
+    /// The chain is reissued only if every removal in it may be.
+    pub(crate) fn detach_chain(guards: Vec<CleanupGuard>) {
+        let mut reissue = Reissue::Safe;
+        let cmds = guards
+            .into_iter()
+            .filter_map(|mut guard| guard.0.take())
+            .map(|(cmd, each)| {
+                if each == Reissue::Once {
+                    reissue = Reissue::Once;
+                }
+                cmd
+            })
+            .collect();
+        detach_cleanup_chain(cmds, reissue);
+    }
 }
 
 impl Drop for CleanupGuard {
@@ -1056,6 +1076,56 @@ impl<F> Drop for Tracked<F> {
     fn drop(&mut self) {
         let _owner = self.owed.enter();
         self.future = None;
+    }
+}
+
+/// How long [`Abandonable::abandon`] waits: the longest grace anything outrig
+/// stops is given -- a `buildah build`'s -- with time over for the kill that
+/// ends it and the removals queued behind it.
+const ABANDON_WAIT: Duration =
+    crate::image::BUILD_TERM_GRACE.saturating_add(Duration::from_secs(5));
+
+/// A future whose cancellation can be waited out.
+///
+/// outrig is cancelled by dropping its futures, and what a drop sets going
+/// runs on after it. Most of that is an ordinary process -- a container's
+/// removal -- that outlives this one. A stopped `buildah build` does not: it
+/// is given a grace to remove its working containers, the grace is kept by a
+/// task on the runtime that spawned it, and a process that exits, or a
+/// runtime that shuts down, inside the grace kills buildah part way and
+/// leaves them behind.
+///
+/// Poll this in place of the future -- through `&mut` it can be raced and
+/// kept -- and to cancel it, [`abandon`](Self::abandon) it rather than
+/// dropping it.
+pub struct Abandonable<F>(Tracked<F>);
+
+impl<F> Abandonable<F> {
+    pub fn new(future: F) -> Self {
+        Self(Tracked::new(future))
+    }
+
+    /// Drop the future, and wait for what that sets going -- and for the
+    /// cleanup the future set going as it ran -- to finish: a stopped build
+    /// until buildah has exited, a removal until it has run. Bounded by a
+    /// little more than a stopped build's grace, so a wedged removal is left
+    /// to run on its own rather than waited for.
+    pub async fn abandon(self) {
+        if let Err(why) = self.0.owed().settled(ABANDON_WAIT).await {
+            tracing::debug!(
+                target: "outrig::supervise",
+                why = why.join("; "),
+                "abandoned work did not prove it finished"
+            );
+        }
+    }
+}
+
+impl<F: Future> Future for Abandonable<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        Pin::new(&mut self.0).poll(cx)
     }
 }
 
@@ -1404,7 +1474,7 @@ mod tests {
     }
 
     /// Argv travels as positional parameters, so a command carrying arbitrary
-    /// bytes -- a container's resolver -- is never interpolated into a script.
+    /// bytes is never interpolated into a script.
     #[test]
     fn an_ordered_shell_passes_argv_rather_than_quoting_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1720,6 +1790,35 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!marker.exists(), "a released guard still ran its cleanup");
+    }
+
+    /// Guards detached together run in the order given, and none of them
+    /// discharges on its own afterward.
+    #[test]
+    fn detached_guards_run_as_one_ordered_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+
+        CleanupGuard::detach_chain(vec![
+            CleanupGuard::arm(
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("sleep 0.4; : > {}", first.display())),
+                Reissue::Safe,
+            ),
+            CleanupGuard::arm(
+                Cmd::new("/bin/sh").arg("-c").arg(format!(
+                    "test -e {} && : > {}",
+                    first.display(),
+                    second.display()
+                )),
+                Reissue::Safe,
+            ),
+        ]);
+
+        wait_for(&second, Duration::from_secs(10), "the chain to finish");
+        assert!(first.exists(), "the first removal must have run");
     }
 
     /// Kills the blocked cleanups however the test ends, so a failed assertion

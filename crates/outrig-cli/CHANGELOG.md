@@ -36,7 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded like `run`'s, in a container named
   `outrig-<sid>` and labeled `org.outrig.session=<sid>`, so `outrig clean` finds one an abrupt
   exit left behind. It takes `--agent`, `--model`, `--image` (a configured image-config only),
-  and `--session-dir`. Ctrl-C while its
+  and `--session-dir`, which as for `run` names an empty directory or one it creates. It refuses
+  what `run` refuses: a workspace no config declared that is the home directory, one above it, or
+  one holding the global config, and a repo config's mount of either. An image build on a cache
+  miss shows as it runs, and a typed line that is not UTF-8 is read with U+FFFD in place of each
+  bad sequence rather than ending input. Ctrl-C while its
   Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
   model reads how it ended; a second Ctrl-C stops waiting for it, and a Ctrl-C at the prompt then
   stops the Python it left running, counting as the first of the two that exit. With no Python
@@ -123,6 +127,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming it, and exits once each has stopped: with the program's status, or 3 when one is not
   proven stopped.
 
+### Changed
+
+- **`outrig discard` and `outrig clean` remove a session's whole directory.** 0.2.2 removed only
+  `session.json`, `logs/` and `outrig-enter`, and kept a directory holding anything else, because
+  a `--session-dir` once took any existing directory. It takes only a new or empty one now, so
+  what else is there is the session's too -- the `report.html` `scripts/render-session.py` writes
+  beside the record, which 0.2.2 kept. A session started before 0.2.2 in a directory that already
+  held other files loses them with it.
+
 ### Removed
 
 - **The in-process LLM backend: the `local-llm` Cargo feature and `style = "mistralrs"`**,
@@ -132,11 +145,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outrig init`'s weight-source prompts and HuggingFace file picker. All of it was deprecated in
   0.2.0, the release that carried the warning.
 
-  A config that still names the style or sets any of those keys now fails to load: a parse
-  error naming the offending value, on every command, `outrig build` included. A build without
-  the feature used to parse such a config and fail only when a model was used. `--device` is an
-  unknown argument, and `--features local-llm` is a Cargo error. With the only streaming
-  backend gone, every reply prints when its turn finishes.
+  A config that still sets any of those keys loads, each one named in a warning and set aside, as
+  0.2.2 sets aside any key it does not know. A `style = "mistralrs"` provider is set aside with a
+  warning from the global config, leaving a model that names it without a provider, and refused
+  in any other file. Since every remaining style carries an `api-key`, which 0.2.2 keeps to the
+  global config, a repo config can declare no provider at all. `--device` is an unknown
+  argument, and `--features local-llm` is a Cargo error. With the only streaming backend gone,
+  every reply prints when its turn finishes.
 
   Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
   `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
@@ -148,6 +163,672 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deprecation retracted the argument that this mattered; the removal takes away the last thing
   that provided it. The default build is unchanged, since the backend was never in it; the
   lockfile loses the several hundred crates that only `--features local-llm` pulled in.
+
+### Fixed
+
+- **A signal during a cold image build no longer leaves buildah's working containers behind.**
+  0.2.2's signal teardown for `outrig run` and `outrig mcp` dropped a build in progress, which asks
+  buildah to stop and gives it ten seconds to remove the working containers its `RUN` stages made;
+  outrig then exited inside that grace, killing buildah part way and leaving them for
+  `outrig clean --build-containers`. A signal during the primary or a sidecar image's build now
+  waits for buildah's own cleanup before teardown goes on, and a second SIGINT or SIGTERM still cuts
+  it short.
+- **Restoring the terminal no longer waits on one that has stopped reading.** A session ended at the
+  line editor's prompt -- by SIGTERM, SIGHUP, or its container dying -- restores the terminal with a
+  blocking write to it. With output paused by `Ctrl-S`, and stdout and stderr sent elsewhere, that
+  write held SIGINT's handler and the session's teardown until the terminal read again. The write is
+  now non-blocking, best effort, and comes after the handler is back.
+
+## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
+
+The second patch release since 0.2.0. Most of it is fixes, and the `outrig run` prompt becomes a
+line editor on a terminal (see **Added**). Several fixes refuse a config that used to load,
+because it could give an agent your credentials or write access to the global config. A repo
+config, or an image's `org.outrig.mcp` label, may reference only the host variables the global
+config's `[repo] env-allow` lists, and that list is empty by default. A repo config may not
+declare a provider that carries an `api-key`. A workspace outrig picks may not contain the global
+config, and the walk up from the current directory takes only a config you own. A container no
+longer inherits the host's proxy variables, and a `--global-config` path that does not exist is
+an error. One known issue: at the line editor, a byte that is not UTF-8 ends the session (#516).
+Piped and redirected input is unaffected.
+
+### Added
+
+- **`outrig clean --unreadable` removes session records outrig cannot read.** Without it, `clean`
+  (even with `--yes`) leaves such a record and names it. Aged by the start time in the directory
+  name; an entry whose name is not a session id is never removed, nor is a record cut off before
+  it names its container (an attach session borrows one), which `discard` removes.
+- **The `outrig run` banner names the endpoint.** A `[outrig] base-url:` row follows the
+  `agent:`/`model:` line for an `openai` or `anthropic` provider, so where the session's key goes
+  is on screen before the first turn; the provider *style* on the line above reads the same for
+  any two endpoints speaking one wire format. Credentials embedded in the URL
+  (`https://user:secret@proxy.example`) print as `***@`. An in-process `mistralrs` model prints
+  no such row.
+- **The `outrig run` prompt is a line editor.** On an interactive terminal it has readline-style
+  editing -- `Ctrl-A`/`Ctrl-E`, `Ctrl-W`, `Ctrl-K`, word motion -- and `Up`/`Down` recall of the
+  prompts typed earlier in the session, with `Ctrl-R` to search them. Recall is in memory for the
+  length of the session: **outrig writes no history file**, so nothing typed at the prompt is
+  persisted. `/reset` still clears conversation history and does not touch prompt recall.
+
+  The prompt and the echo of what is typed now go to the controlling terminal rather than to
+  stderr. That is what keeps `outrig run > out.txt` capturing only the model's replies, and it
+  additionally means `outrig run 2> err.txt` no longer swallows the prompt.
+
+  Two behavior changes to know about. A multi-line paste now arrives as **one** prompt with the
+  line breaks intact, where it previously became one turn per line. And `Ctrl-C` at the prompt
+  discards the typed line rather than raising a signal; a second `Ctrl-C` with nothing entered in
+  between still exits, and `Ctrl-C` during a turn is unchanged.
+
+  Scripted use is unchanged: piped stdin, a redirected file, a terminal on stdin other than the
+  one you are typing at, and `TERM` set to `dumb`, `cons25`, or `emacs` all keep the previous
+  line-at-a-time reader. `RUST_LOG=debug` does not record what you type: the editor's own debug
+  output stays at `warn` unless the filter names `rustyline`. See
+  [Line editing and history](../../doc/usage/run.md#line-editing-and-history).
+- **`call-timeout-secs` and `mcp-call-timeout-secs` set how long a tool call may run.** A
+  `tools/call` that outlives its deadline is cancelled at the server and comes back to the model
+  as a timeout error; the session goes on. The deadline is the server's own `call-timeout-secs`
+  (on the table form of an `[images.<name>.mcp]` entry, or in an image's `org.outrig.mcp`
+  label), else the top-level `mcp-call-timeout-secs` (either config file; repo wins), else 600
+  seconds. Both accept 1 to 3600. Raise it on a server whose tools run builds or test suites. A
+  primary-hosted entry's key is part of the image's stamped label, so changing it rebuilds a
+  repo-built image, as changing its `env` does. See
+  [What if a server hangs?](../../doc/concepts/mcp-servers.md#what-if-a-server-hangs) (#338).
+
+### Changed
+
+- **The network docs state two limits of a hostname rule.** A hostname `deny` does not stop a
+  container that reaches an address by literal IP and announces no name, and a hostname `allow`
+  grants the address its name resolved to, so any other site served from it. Both were always
+  so; nothing in the policy changed. See
+  [What a hostname rule matches](../../doc/reference/config.md#what-a-hostname-rule-matches).
+  (#362)
+
+- **A config key outrig does not know is a warning, not an error.** A global config shared with
+  a newer outrig -- the 0.3 line's `[events]`, a model's `context-window`, a provider's
+  `role-alternation` -- stopped every command that reads config, `run`, `mcp`, `build`, `ls`,
+  `logs`, `discard`, `clean`, and `init` among them, at ``unknown field `events` ``. Each now
+  prints ``[outrig] warning: <file>:<line>: unknown key `events`, ignored`` on stderr and goes
+  on, whichever config file the key is in. In the global config a value outrig cannot read -- a
+  wrong type, an unknown `style`, a missing required key -- is skipped the same way, with the
+  smallest entry holding it (one mount of a mount list, but never one element of an argv); in a
+  repo or `--config` file it is still an error, which names a misspelled required key. A warning
+  comes before any validation error it explains: a misspelled `provider` is warned about, then
+  its model is refused for having none. Still errors: anything in `[network]` or a `security`
+  table, a TOML syntax error, and an unquoted dotted name such as `[models.opus-4.7]`. `outrig
+  mcp self`'s `validate_config` returns the warnings in a new `warnings` array. (#507)
+
+- **A cache miss during `outrig run` and `outrig mcp` startup shows the build as it happens.**
+  `[outrig] ensuring image <tag>` used to be followed by silence for as long as `buildah build`
+  took, which on a first run looked like a hang. The build's output (or the `podman pull` for an
+  `image-name` config) now streams to stderr as `[buildah]` / `[podman]` lines between
+  `ensuring image` and `image ready`, without `--verbose`; `-v` still adds the command lines and
+  `container.log`, and each line appears once. Sidecar images report `ensuring sidecar image
+  <name>` / `sidecar image ready: <tag> (..)` and are ensured one at a time so two builds never
+  interleave, while their label reads stay concurrent. stdout is untouched, so `outrig mcp`'s
+  JSON-RPC channel is unaffected, and a failed build no longer repeats its output inside the
+  error. (#478)
+
+### Fixed
+
+- **An image's `org.outrig.mcp` label may reference only the host variables the global config
+  allows.** A server a label declares can put `${VAR}` in its `env`, and any variable in your
+  environment resolved: the label comes from a Dockerfile in the repo, which the agent can edit,
+  or from an image the repo names, and the `[repo] env-allow` list that holds a repo config file
+  did not see it. `outrig run` and `outrig mcp`, `mcp show-merged` included, now refuse a label
+  entry that references a variable the list omits when the session starts, naming the server, the
+  `env` key, the variable and the image. That is before any sidecar starts or any server runs, so
+  the variable is never read. It covers the primary image's label and each named sidecar's,
+  whoever named the image: your global config and `--image` too. A server your config declares by
+  name still replaces the label's whole entry, so a repo-built image -- whose label `outrig build`
+  stamps with a copy of every config entry -- starts as before. If an image of your own
+  references a variable, such as one built by `outrig image build` from an `image.toml` with
+  `${DB_TOKEN}`, list it once:
+
+  ```toml
+  [repo]
+  env-allow = ["DB_TOKEN"]
+  ```
+
+  `--env` values and the live test of `outrig image build` are not held to the list. Fixed in
+  `outrig`; see that crate's changelog. (#624)
+- **A repo config file may reference only the host variables the global config allows.**
+  `outrig run`, `outrig mcp`, and `outrig build` refuse a `${VAR}` in `build-args` or in an MCP
+  server's `env` that `.agents/outrig/config.toml`, or a `--config` file, declares, naming the
+  image, the key, the variable and the file, unless the variable is listed in the new
+  global-only `[repo] env-allow` of `~/.outrig/config.toml` or a `--global-config` file. Before,
+  any variable in your environment resolved, so a cloned repo -- or one whose config the agent
+  edited during the previous session -- could hand `GITHUB_TOKEN` or a cloud credential to a build
+  of its own Dockerfile or to a server command it chose. The list is empty by default, so a repo
+  that references a variable needs it added once:
+
+  ```toml
+  [repo]
+  env-allow = ["GITHUB_TOKEN"]
+  ```
+
+  A variable on the list is the repo's to route, so list only what you would hand to everyone who
+  can change that repo's config, the agent included. `--env` values, the images in your own global
+  config, and literal values are not held to the list. A global `env-allow` that is misspelled or
+  not a list is set aside with a warning, printed before the refusal it causes. Fixed in `outrig`;
+  see that crate's changelog. (#444)
+- **A workspace outrig picks can no longer contain the global config.** With no config declaring
+  `[workspace] host-path`, the workspace is the repo root, or the current directory when there is
+  no repo config, and it is mounted read-write. Only the home-directory rule (#411) judged it, so
+  `outrig run` or `outrig mcp` from a directory that held the global config file, was its
+  directory (`cd ~/.outrig`), or held a directory its path is looked up through, such as a
+  symlink, let the agent rewrite the provider `api-key`, `[network]` policy, and `session-root`
+  the next session loads. Such a session is now refused before anything starts, naming the
+  directory, why, and what chose the workspace. A workspace the global config declares, and
+  `--volume`, are unchanged. A global config kept inside a project (a dotfiles repo, or an
+  `XDG_CONFIG_HOME` under the project) has to move out of it, or declare `host-path` in the
+  global config (#609).
+- **`outrig run` and `outrig mcp` report the MCP configuration step at startup again.** Nothing
+  was printed between `container user ready` and `MCP <server>: initializing`, though that stretch
+  reads the images' `org.outrig.mcp` labels, ensures sidecar images, and builds the placement
+  plan, so a malformed label, two labels claiming one server name, a sidecar image that would not
+  build, or an `--env SERVER:...` naming an undeclared server printed its error directly under
+  `container user ready`, as if the user bootstrap had failed. The step is bracketed by
+  `reading and merging MCP configuration` and `MCP configuration ready: <n> servers (<elapsed>)`
+  again, as `doc/usage/run.md` shows, and the page's other stale startup lines (`resolving agent
+  and image-config`) now match what is printed (#269).
+- **A subagent's transcript now says which model answered when a model alias failed over.** The
+  transcript header, the launch trace, and the tool result name the alias's first candidate, so a
+  subagent whose calls moved to a later candidate (head rate-limited, down, or refusing its key)
+  was attributed to a model that wrote none of it, with no trace of the move but stderr. Each round
+  that a later candidate answered now writes an `--- answered by ---` block naming every model that
+  answered a call in it, in alias order; the header still names where the subagent started. A
+  subagent that never left its first candidate, or a launch under a single model, is unchanged
+  (#265).
+- **A repo mount can no longer cover a directory the global config's path passes through
+  read-write.** The #445 rule compared a mount with where that path resolves today, but the next
+  session resolves it again, so an agent that could write a directory in it could redirect it: by
+  replacing a symlink there, or by creating a missing component that a `..` after it had popped
+  (`XDG_CONFIG_HOME=/t/a/absent/../../conf` with `/t/a` mounted), and `config.toml` was then read
+  wherever the agent chose. A read-write repo mount covering such a directory is refused, naming
+  it and the path (#605).
+- **A repo config can no longer mount your home directory or the global config read-write.** A
+  repo `[workspace] host-path`, `[[workspace.mounts]]`, or sidecar mount covering `$HOME` (or an ancestor), or a
+  read-write one covering the global config file or its directory, is refused, naming the file
+  that declared it. Such a mount would let an agent rewrite the global config -- providers,
+  `[network]`, `session-root` -- for the next session. Mounts declared in the global config and
+  `--volume` are unchanged. A repo that declared `host-path = "~"` now needs it in the global
+  config (#445).
+- **A glibc `view = "primary"` sidecar no longer loads the primary's `/etc/ld.so.preload`.** Fixed
+  in `outrig` (#268). glibc's loader reads that file on every start, and inside the primary's mount
+  namespace it was the primary's: a library it listed was loaded into the sidecar's server, and one
+  built for a newer glibc than the sidecar's stopped the server from starting. For a payload whose
+  loader is not musl's, the launcher now masks the file with `/dev/null`: the primary keeps it, and
+  the server, and everything the server starts, sees it empty, until the primary replaces the file
+  after the start, which takes the mask with it. A musl or static payload is unchanged. See
+  [Primary filesystem view](../../doc/concepts/mcp-servers.md#primary-filesystem-view) and the
+  `outrig` changelog.
+- **A local model's cut-off turn names its finish reason and ceiling.** With `local-llm`, a turn
+  that produced no text and no tool call -- in practice a reasoning model cut off at `max-tokens`
+  inside its `<think>` block -- was reported without the line a remote turn gets, so it was told
+  only that such a cut-off "usually" means the output-token ceiling, not which one. It now gets
+  that line first: `[outrig] the model produced no text and no tool call this turn (provider
+  finish reason: "length"); the request carried max-tokens = 256.`, or "the request carried no
+  max-tokens, so the provider's own default applied" when none was set. A local row in a model
+  alias chain is reported the same way (#459).
+- **A session record that does not parse can be removed, and no longer blames the configuration.**
+  `outrig discard <sid>` and `discard --session-dir` remove it after the usual confirmation,
+  which says why it is unreadable, and the refusal elsewhere reads `session record <path> is
+  unreadable: ...` instead of `error: configuration: ...` (#261).
+- **A `--session-dir` link whose directory is gone is no longer invisible.** `outrig ls` reports
+  it, `outrig discard <sid>` and `discard --session-dir <gone-dir>` remove it, and `outrig clean`
+  removes one older than the cutoff. `outrig logs <sid>` says the directory is gone instead of
+  claiming no session matches. `outrig discard --session-dir` also now removes the
+  `<session-root>/<sid>` link it leaves behind, which means it resolves the session root like
+  `discard <sid>` does (#260, #278).
+- **`outrig clean --older-than` rejects a non-ASCII unit instead of panicking.** A value ending in
+  a character wider than one byte (`7д`, `7日`, `é`) split the string inside that character and
+  panicked (`end byte index 2 is not a char boundary`), exiting `101`, where every other bad
+  duration is a usage error that exits `2`. It is now that usage error: `7д` and `7日` get
+  `duration unit must be one of s, m, h, or d`, and a lone `é` gets the same too-short message a
+  lone `d` does. (#364)
+
+- **`model-cache-root` is where a `model-id` GGUF is downloaded.** With `--features local-llm`, a
+  `style = "mistralrs"` model that named a Hugging Face repo with `model-id` was fetched into
+  Hugging Face's own cache -- `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else
+  `~/.cache/huggingface/hub` -- whatever `model-cache-root` said. mistralrs-core 0.8.1 replaces the
+  cache it is handed with that one whenever a home directory resolves, so the key never worked:
+  pointing it at a large volume still filled the home directory, and clearing
+  `~/.cache/outrig/models` freed nothing. outrig now downloads the `model-file` entries itself, into
+  `model-cache-root`, and hands mistralrs the directory they landed in, as it does for a
+  `model-path`. The repo's `generation_config.json`, which names stop tokens a GGUF may not (Llama
+  3's `<|eom_id|>`), comes with them when the repo has one. All of it comes from the commit the
+  revision is at when the download starts, so a branch that advances mid-download cannot split a
+  model between two snapshots.
+
+  Three things change with it. A model already in the Hugging Face cache is downloaded again, once,
+  into `model-cache-root`; the old copy is neither read nor removed, unless the key points at that
+  cache (`model-cache-root = "~/.cache/huggingface/hub"`). The directory needs a filesystem that
+  supports symbolic links, which the Hugging Face cache layout uses. And a model already in the
+  cache is used as it is: `generation_config.json` is fetched only along with a download, so a model
+  that another tool cached without it stays without it, and a cached model loads with no network.
+  mistralrs also pulled a repo's `chat_template.json`, `preprocessor_config.json` and
+  `processor_config.json` when it had them; they are not fetched, as a GGUF carries its own chat
+  template and the `model-path` form never had them. A token is read as before, from `HF_TOKEN`,
+  `HF_HUB_TOKEN`, or the file that `huggingface-cli login` writes. (#423)
+
+- **A subagent's cut-off-report warning names the ceiling that was sent (#258).** The line
+  quoted the configured `max-tokens`, which on an `anthropic` provider is not always what the
+  request carried: a value above the identifier's published ceiling is lowered to it, an unset
+  one becomes that ceiling or outrig's 32768 fallback, and each candidate of an alias chain sends
+  its own. The warning now names the number sent, drops "raise it" where no setting can, and for
+  a chain lists every candidate's ceiling.
+- **Terminal pickers show each option's description.** On a TTY the `config init` and
+  `image add` pickers (provider style, base image, toolchains, MCP servers) listed option
+  values only; the help block -- description, one line per option, doc link -- now prints above
+  the picker, as `?` does on piped stdin. `?` is still not a help command inside a terminal picker.
+
+- **An unreachable LLM endpoint names why.** A refused connection, a failed DNS lookup, and a
+  TLS mismatch all printed `connection error: error sending request for url (...)`; the retry
+  line, the end-of-turn line, and an alias chain's `trying <next>` and `tried:` lines now end
+  with the underlying cause (`Connection refused`, `failed to lookup address information`, ...).
+  A transport failure inside a chain reads as it does outside one.
+
+- **A `node` toolchain whose NodeSource setup failed no longer builds.** On a Debian-family
+  base the toolchain ran NodeSource's `setup_24.x` and then `apt-get install nodejs`, and that
+  script exits 0 whatever goes wrong in it: it reports each error it handles through
+  `handle_error "$?"` after an `if !`, where `$?` is 0. When a step failed after it had refreshed
+  the package indexes -- a signing key that would not download, say -- the install took the
+  distro's own `nodejs`, Node 18 with no `npm`, and the build succeeded and was cached. Nothing
+  said so until something in the image ran `node` or `npm`. The step now fails the build, naming
+  the Node it found, unless `node` is the major its `setup_N.x` URL names and `npm` runs; that
+  major is set once, as `node_major` at the top of the step. A Dockerfile generated earlier
+  keeps its old lines; replace its `# node toolchain` section with the one `image add` writes
+  now. (#565)
+
+- **A sidecar whose entrypoint exits at once reports why.** Fixed in `outrig` (#422). An
+  entrypoint-stdio server that printed a line and exited within milliseconds -- `outrig-enter`
+  naming the program a `view = "primary"` sidecar's image lacks, a server rejecting its arguments
+  -- failed the session with `stderr (<session_dir>/logs/<server>.stderr): (empty)`, because
+  `podman start --attach` had dropped the line. The container is now created with a log of its
+  own, and a start that fails with nothing in the stderr file gets the container's stderr copied
+  into it, so the error and `outrig logs <server>` show it. See the `outrig` changelog for the
+  mechanism. These containers no longer log to the host's default driver (`journald` on most
+  systemd hosts); `podman logs` works while one runs. Under SELinux nothing changes.
+
+- **`outrig image add` installs Node 24, not Node 20.** The `node` toolchain on a Debian-family
+  base ran NodeSource's `setup_20.x`, and the curated `node` base was `node:20-bookworm-slim`;
+  Node 20 reached end-of-life on 2026-04-30. Both are now Node 24, the active LTS, and the base
+  variant is `Node24BookwormSlim`. The help text said the toolchain came from "the base image's
+  package manager" in one place and "NodeSource" in another; it now says NodeSource, with `apk`
+  on Alpine. `outrig design prompt`'s Node example uses `node:24-bookworm-slim`. A Dockerfile
+  generated earlier keeps its old lines; replace its `# node toolchain` section (or a
+  `FROM node:20-bookworm-slim` line) with what `image add` writes now.
+- **A local model keeps its reasoning across a tool call.** The in-process `mistralrs` adapter
+  dropped a reasoning step when it replayed history, so a chat template that renders in-progress
+  reasoning (Qwen3's) gave the model each tool result back without the plan that asked for it.
+  The replayed assistant message now carries it as a `reasoning_content` string; whether the
+  template renders it is the template's call.
+- **A subagent whose report stands is no longer told to send an error over it.** When a subagent
+  had reported with `outrig__set_result` and then tried a longer report that was cut off at the
+  output-token ceiling, the first two retry asks offered, then demanded, a one-sentence
+  `status: "error"`. A compliant model sent it, it fit, and it replaced the report in the inbox:
+  the parent read "did not fit" and never saw the findings. While the report stands, the asks now
+  say so and ask for a shorter revision or for the subagent to stop. A parent that sent a message
+  after the report still gets the short-error ask, since the report does not answer it. (#521)
+- **`outrig clean --build-containers` no longer stops when a build elsewhere removes a working
+  container mid-listing.** buildah lists working containers in two steps -- every container, then
+  each one's directory -- so a container removed between them failed the whole listing with
+  `Error: reading build containers: container not known`, and the sweep ended on that error.
+  `podman ps -a --external`, the sweep's other listing, fails the same way, with
+  `Error: determining buildah container for container <id>: container not known`. A build on the
+  machine finishing or being cancelled while the sweep lists is enough, which is the situation
+  the `--older-than` cutoff exists for. Each listing is now taken again when it fails with
+  `container not known`, up to five attempts in all; the container that vanished is not in the
+  next one. Any other failure, and the same one five times running, is still an error. (#418)
+
+- **`outrig mcp --listen` finishes shutting down while an HTTP request body is incomplete.**
+  Fixed in `outrig-cli` (#433). A signal now waits up to five seconds for in-flight requests,
+  then abandons them and tears the session down; a second signal skips the wait. A client that
+  stalled mid-body used to hold shutdown open indefinitely, leaving the container running and
+  the session record unfinalized.
+- **Two launches started at once with one `--session-dir` no longer both register.** Fixed in
+  `outrig-cli` (#430). Of two `outrig run` or `outrig mcp` processes given the same directory at
+  the same moment, one now claims it and the other is refused, saying another session claimed it;
+  the first keeps its record. Both used to pass the check that the directory was empty, so the
+  second `session.json` replaced the first: `outrig ls` listed the survivor twice and the other
+  not at all, and `outrig discard` of the lost id removed the survivor's directory and link.
+  A same-second collision between two *auto-allocated* session ids is a separate case (#382).
+
+- **`--network audit` and `--network filter`, or the same `[network] mode`, refuse a container
+  that holds `NET_ADMIN`.** Fixed in `outrig` (#363). An image-config or sidecar with
+  `cap-add = ["NET_ADMIN"]` (or `ALL` without `NET_ADMIN` in `cap-drop`) used to start under
+  interception, where a root process in it could delete the redirect table and the policy with it.
+  The session now fails at `starting network audit interceptor` -- before any MCP server launches
+  -- with an error naming `cap-add`, and a sidecar follows its `on-failure`: `warn` drops it,
+  `abort` ends the session. `cap-add = ["SYS_ADMIN"]`, which the nested-runtime recipe uses, is
+  unaffected. To keep `NET_ADMIN`, run with `--network default`. See
+  [`[network]`](../../doc/reference/config.md#network).
+
+- **Under `--network filter` and a deny default, a container resolves only the names an `allow`
+  hostname entry could match, and every lookup is in `network.jsonl`.** Fixed in `outrig` (#361).
+  Name lookups, which the interceptor forwarded to the host's resolvers whatever the policy, are
+  now decided by it: a name no `allow` hostname entry matches is answered REFUSED without any
+  resolver being asked, so nothing about it leaves the host. That includes a name that used to
+  resolve only because it fell in an allowed address or CIDR, which now needs an `allow` entry of
+  its own; `allow = ["*"]` still opens every name. Under an allow default, a name a hostname
+  `deny` entry matches stops resolving rather than being denied at connect. Each lookup, answered
+  or refused, writes a `network.jsonl` record with `proto` `udp`, `service` `dns`, and the name
+  in `outrig.host`, in `--network audit` too. See
+  [Name lookups](../../doc/reference/config.md#name-lookups).
+
+- **An empty or relative `XDG_CONFIG_HOME` no longer moves the global config into the working
+  directory.** The variable was used as written, so `XDG_CONFIG_HOME= outrig run` read
+  `./outrig/config.toml` as the global config and `XDG_CONFIG_HOME=conf` read
+  `./conf/outrig/config.toml`. Provider keys, `session-root`, and the `[network]` policy then
+  changed with the directory outrig was started in, and a checked-out repo holding such a file
+  could declare what only the global config may: a provider with an `api-key` and a `base-url`
+  of its choosing, which a repo config is refused. Both values are now ignored, as the XDG Base
+  Directory Specification says, and the global config is `~/.outrig/config.toml`. A home
+  directory that is missing or not absolute is ignored the same way; with no other location
+  there is no default global config, where there used to be `<cwd>/.outrig/config.toml`.
+  `outrig run`, `mcp`, `build`, `image add`, and the session commands then go on without one,
+  and `outrig init` and `outrig config init`, which have nowhere to write it, stop and ask for
+  `--global-config`. See [Global flags](../../doc/reference/cli.md#global-flags). (#368)
+
+- **That a dynamically linked `view = "primary"` payload cannot re-execute itself is now
+  documented.** It runs through the sidecar's own loader, so its `/proc/self/exe` is the loader
+  and its `argv[0]` is a graft path the kernel cannot run by name. A server that starts a copy of
+  itself -- Node `child_process.fork()`, Python `multiprocessing` or `subprocess` with
+  `sys.executable`, Go `os.Executable()`, Rust `current_exe()` -- fails, and obliquely: `ENOENT`
+  for a file that is there. A static payload can still execute the literal path `/proc/self/exe`;
+  its `argv[0]` and the path `current_exe()` reads back do not work. Behavior is unchanged, since
+  the primary's rootfs is where the kernel looks for the loader and the view cannot move it; a
+  server that needs more belongs in a sidecar with `workspace`, not `view = "primary"`.
+  See [Primary filesystem view](../../doc/concepts/mcp-servers.md#primary-filesystem-view).
+  (#358)
+
+- **A base image's unreadable `org.outrig.mcp` label no longer fails `outrig build` and `outrig run`
+  naming a tag that is gone.** An image-config whose Dockerfile inherits an `org.outrig.mcp` label
+  outrig cannot decode -- invalid JSON, a placement key, `args`, an invalid name, an empty
+  command -- fails after buildah has built it, and the error named a temporary
+  `<name>:outrig-tmp-...` tag that is removed before the message is printed. It now reads
+  `image "coding" embedded config: ...` and ends with a `help:` line: put
+  `LABEL org.outrig.mcp='{}'` after the Dockerfile's `FROM` to replace the label with an empty
+  one, or set a corrected value. The build still fails; only what it says changed. See
+  [MCP servers](../../doc/concepts/mcp-servers.md#embedding-mcp-config-in-the-image). (#356)
+
+- **A sidecar whose raw image ref is not local is refused by name, with the fix.** A
+  `[sidecars.<sc>] image` -- or an inline `image` on an MCP entry -- that is not an
+  `[images.<name>]` and was never pulled failed with `--image "<ref>" did not match any
+  [images.<name>]`, a flag the run never took. The error now names where the ref was written,
+  `image "<ref>" (from [sidecars.tools]) is not an [images.<name>] ...`, and says to
+  `podman pull <ref>` it first, since outrig never pulls a raw ref. `outrig run --image` reads the
+  same way, `(from --image)`. See [Sidecar containers](../../doc/concepts/containers.md#sidecar-containers). (#355)
+
+- **A subagent launched after `/sidecar add` has the sidecar's tools.** `/sidecar add` gave its
+  tools to the primary agent alone: every subagent launched afterwards, at any depth, ran with the
+  tools the session started with, so one asked to use the new server reported it could not while
+  `/tools` listed it. A launch now takes the session's tools as they stand, sidecar tools
+  included. A subagent already running keeps the tools it was launched with; release it and
+  launch it again to give it the new ones. See
+  [Subagents](../../doc/concepts/subagents.md). (#351)
+
+- **A subagent's report outlasts a revision that does not fit.** When a subagent reported with
+  `outrig__set_result` and later in the round tried a longer report that was cut off at the
+  output-token ceiling three times, outrig gave up on it by publishing `subagent hit its output
+  token limit while writing its report, so nothing was recorded` over the report that fit. A
+  parent that read after that was told nothing was recorded, and the report was gone from the
+  inbox and from the transcript's outcome. The report now stands, and the give-up is noted beside
+  it, on stderr and in the subagent's transcript. A parent that sent a message after the report
+  reads the report if it had not, then, once the round ends, that the answer did not fit. (#350)
+
+- **A panic a task survives no longer removes the session's containers.** outrig's panic hook
+  removed every container the process had started on any panic -- including one in a subagent
+  round, an MCP connection, or the sidecar watcher, which `outrig run` and `outrig mcp` carry on
+  from -- so the session would have gone on against containers that were gone. Only a panic
+  that ends outrig sweeps them now. No panic that reaches this is known; the path is closed
+  rather than a crash fixed. (#349)
+
+- **A line of piped or redirected input that is not valid UTF-8 no longer ends `outrig run`.**
+  One byte that was not UTF-8 failed the read with `error: stream did not contain valid UTF-8`,
+  exit 1, and the containers were torn down, so `outrig run < prompts.txt` with a single Latin-1
+  byte never ran the prompts after it. The line is now sent with U+FFFD in place of each bad
+  sequence, and the session goes on. The line editor, which reads when stdin is the terminal you
+  are typing at, is not covered: the `rustyline` release it is built on fails the read at the
+  first byte that is not UTF-8, from an `Alt` key that sets the eighth bit or a paste from a
+  Latin-1 source, and the session ends with an error. Redirect stdin to send such input. See
+  [Line editing and history](../../doc/usage/run.md#line-editing-and-history). (#344, #516)
+
+- **`outrig config init` asks again for an answer the config would refuse.** An API key variable
+  that was not a variable name -- `openai_api_key`, `${OPENAI_API_KEY}` as the prompt's help
+  suggested, or the key itself pasted in -- a `max-tokens` or `context-length` that was not a
+  number, or a `Base URL` that was not an `http://` or `https://` URL ended the wizard with
+  nothing written, and every earlier answer had to be given again. A pasted key was printed back
+  in the error. Each is now asked for again after a line saying why, and the API key's line never
+  repeats the answer. `${VAR}` is taken as typed, beside the bare name. The `max-tokens` and
+  `context-length` prompts in `outrig init`'s repo phase ask again the same way. (#347)
+
+- **`outrig config init` no longer drops a provider or model whose name repeats.** Each name
+  prompt suggested the same default every time -- the style for a provider, `fast` for a model
+  -- so a second `openai` provider or a second model left at that default replaced the first,
+  and nothing said so. With a model lost, the default-model prompt then asked about the one
+  model left. A name already given in the run is now asked for again, after a line naming the
+  ones defined, and the suggestion moves on to the first free `<name>-2`, `<name>-3`, ... The
+  model prompts in `outrig init`'s repo phase do the same; a repo model may still share a
+  global model's name, which it overrides. (#346)
+
+- **A request the HTTP client will not send is final at once.** A `base-url` with a typo'd scheme,
+  such as `htps://`, loaded, and every LLM call was then retried for the whole
+  `retry-budget-secs` -- ten minutes by default, not the 30 seconds an endpoint that never answers
+  gets -- before the turn ended. A redirect loop that reached reqwest's limit of ten hops was
+  retried the same way. Both now fail on the first attempt and end `outrig run` as a `401` does,
+  since no resend can satisfy them; a failover chain moves to its next model at once. A
+  `base-url` that is not an `http://` or `https://` URL is also refused when the config loads,
+  with an error naming the key. That check is fixed in `outrig` (#343).
+
+- **A `--global-config` that does not exist is an error.** A path the flag named with nothing
+  there was read as an empty global config, so a typo surfaced as some other failure, or as none:
+  `outrig run` reported the agent's `model` as naming no `[models.<name>]`, and a global
+  `[network] mode = "filter"` was dropped without a word, so the session started with Podman's
+  default networking. Every command that reads the global config now stops with an error naming
+  the path: `outrig run`, `outrig mcp`, and `outrig build`; `outrig image add` when it bootstraps
+  a repo config; and `ls`, `logs`, `discard`, and `clean` when they look up the session root,
+  which `--session-root` or `--session-dir` skips. Only the default location may be missing. If
+  you passed a nonexistent path to run without a global config, pass `--global-config /dev/null`
+  instead, or point `XDG_CONFIG_HOME` at an empty directory. `outrig init` and `outrig config
+  init` write the file the flag names, so it need not exist for them (#342).
+
+- **Ctrl-C cancels a slash command.** Nothing heard a Ctrl-C while a slash command ran, so a
+  `/sidecar add` waiting on an image build or on a server that never answers `initialize` held
+  the session until it ended on its own -- two minutes, for a server stuck in `initialize`.
+  Ctrl-C now cancels the command, prints `[outrig] interrupted`, and returns to the prompt, as it
+  does for a turn; a second Ctrl-C exits. An interrupted add is undone like a failed one: its
+  container is removed, the containers already running keep their network interception, and the
+  add can be run again. SIGTERM or SIGHUP during an add's network attach also no longer drops
+  the session's interceptor ahead of teardown, which then had nothing to shut down. (#345)
+
+- **The host's proxy, password included, no longer reaches the agent.** podman copied
+  `HTTPS_PROXY`, `http_proxy`, `NO_PROXY`, and the other proxy variables from outrig's
+  environment into every container -- the primary of `outrig run` and `outrig mcp`, every
+  sidecar, and `outrig image build`'s validation container -- so a proxy URL such as
+  `http://user:secret@proxy:3128` was readable by every tool the agent ran. None of them reaches
+  a container now. Behind a proxy, name it on the MCP servers that need it, with
+  `env = { HTTPS_PROXY = "${HTTPS_PROXY}" }` or `outrig run --env 'HTTPS_PROXY=${HTTPS_PROXY}'`;
+  a server that reached the network only through the copied proxy has none until you do. Fixed
+  in `outrig` (#455).
+
+- **A bootstrap helper that dies before replying says why.** If the forked helper that writes
+  the runtime user into a container was killed before replying (the OOM killer, a signal),
+  startup failed with `bootstrapping the runtime user failed at fork: Success (os error 0)`. It
+  now fails at `receive the helper's reply` and names the signal, e.g. `namespace helper was
+  killed by SIGKILL before reporting a status`. Fixed in `outrig` (#357).
+
+- **`outrig init` asks again for a workspace path a load would refuse, and writes no repo config
+  the next load would refuse.** The repo phase -- which `outrig image add` also runs in a repo with
+  no config -- wrote `host-path` and `container-path` as typed, so a directory that doesn't
+  exist, or a relative or `/` container path, was written, reported done, and refused only by
+  the next `outrig run` or `outrig build`. Each is now asked for again, after a line saying what
+  is wrong. The finished file is then read the way the next `outrig run` will read it, merged
+  over the global config, and nothing is written if that would fail: the error names both files
+  and the reason, such as a global `default-model` that names no model. Two things count as
+  settled: the image-config `image add` writes next, whatever names it, and the agent's `model`
+  when no model is defined anywhere, which `init` already says it writes without. `outrig config
+  init` validates the global config it writes, too (#348).
+
+- **A `[workspace] container-path` that is relative or `/` is refused when the config loads.** A
+  relative one loaded, and `outrig run` failed only when podman created the container, after the
+  image build, with podman's `invalid container path` error, which names neither the key nor the
+  file. `/` was taken, and the repo then covered the image's whole root filesystem. `outrig run`,
+  `outrig mcp`, and `outrig build` now refuse both at load, as they already refused them on an
+  extra mount, with an error naming the key and the value. Fixed in `outrig` (#341).
+
+- **A name a container sends in more than one piece is still read.** Under `--network audit` or
+  `filter`, the interceptor read a connection's opening bytes once, so a TLS `ClientHello` or
+  HTTP request head that arrived in pieces lost its name: a `deny` entry only that name matched
+  let the connection through, and its `network.jsonl` record showed `service` `"-"` and no host
+  -- or, for a `Host:` line cut short, just the part of the name that had arrived. The
+  interceptor now reads until the record or the head is complete, for at most 750 ms after its
+  first bytes, before it decides or forwards anything. A client whose first bytes begin a request
+  head it never finishes, such as an inline `GET key` to Redis, now waits up to those 750 ms.
+  Fixed in `outrig` (#353).
+
+- **A misspelled key in an `[images.<name>.mcp]` table entry is named.** Every other table
+  refused unknown keys, but this one dropped them without a word: `enviroment = { ... }` started
+  the server with no environment, and a misspelled `command` beside `sidecar` or `image` quietly
+  ran the container's ENTRYPOINT as the server instead. A config file's load now warns about the
+  misspelled key by name, as it does in every table (#507), and an image's `org.outrig.mcp` label
+  or a standalone image's `image.toml` fails at the key and lists the keys an entry accepts.
+  `get_config_schema` now says so. Fixed in `outrig` (#340).
+
+- **An MCP server whose `tools/list` pages never end fails startup at once.** A server that kept
+  handing back a `nextCursor` -- the one it was sent, a cycle of them, or a fresh one forever --
+  held `outrig run`, `outrig mcp`, and `outrig image build`'s live test for the full 120-second
+  `tools/list` bound while its listing grew. A cursor an earlier page already sent, or a listing
+  still paging after 1,000 pages, now fails startup straight away with the server's stderr in
+  the error. Fixed in `outrig` (#339).
+
+- **With the host's resolver down, a container's lookups fail instead of hanging.** Under
+  `--network audit` or `filter`, a lookup no host resolver answered got no reply at all, so every
+  name a tool looked up waited out its resolver library's own timeouts and retries before failing.
+  It is now answered SERVFAIL, at once when the resolver refuses (systemd-resolved stopped, say),
+  and `outrig` warns about the first one in each container. A host `/etc/resolv.conf` listing an
+  IPv6 nameserver first on a kernel booted with `ipv6.disable=1` failed every lookup; that
+  resolver is now passed over. Fixed in `outrig` (#354).
+
+- **An MCP server that never answers no longer holds a session forever.** A server that took
+  stdin and never spoke MCP -- `fs = ["cat"]` was enough -- kept `outrig run`, `outrig mcp`, and
+  `outrig image build`'s live test at `MCP <name>: initializing` until interrupted, and a tool
+  that blocked held its turn the same way. `initialize` and `tools/list` now fail after 120
+  seconds each, with the server's exit status and stderr in the error, and a tool call after its
+  deadline (above). A call Ctrl-C abandons mid-turn, and a call an `outrig mcp` client cancels,
+  are now cancelled at the backing server with `notifications/cancelled` instead of left
+  running; the server may still finish the work, since cancellation is advisory (#338).
+
+- **The session root is the global config's, from every directory.** `outrig ls`, `logs`, `discard`,
+  and `clean` read `session-root` from the repo config found from the working directory, unvalidated
+  and as written. A relative value named a different root from each directory, `~` was a directory
+  literally named `~`, and a value `outrig run` refused as not absolute was obeyed. `run` and `mcp`
+  let a repo value win as well, so a committed config chose where this machine writes records, where
+  `clean` and `discard` delete, and which containers `clean` takes for strays. `session-root` and
+  `model-cache-root` are now global-only: a repo config that sets either is rejected at load with an
+  error naming the key. In the global config a relative value resolves against that file's
+  directory, and a leading `~` is your home directory. The session commands read only the global
+  config, so they answer the same from any directory, no longer fail beneath another user's
+  `.agents/outrig/config.toml`, and ignore `--config`. To migrate, move the key to the global
+  config; records under a root a repo chose stay reachable with `--session-root`. `model-cache-root`
+  is deprecated along with `style = "mistralrs"`, and a repo config that sets it fails to load too
+  (#336).
+
+- **A repo config may not declare a provider that carries an `api-key`.** `outrig run`,
+  `outrig mcp`, and `outrig build` refuse a `.agents/outrig/config.toml`, or a `--config` file,
+  that declares an `openai` or `anthropic` provider, naming the provider and the variable. A repo
+  entry used to replace the global provider of the same name wholesale, so a cloned repo -- or
+  one whose config the agent edited during the previous session -- could send the operator's key
+  to a `base-url` of its choosing, and the banner showed nothing different. The repo phase of
+  `outrig init` and the `outrig image add` bootstrap no longer offer to define a provider: a
+  model there names one from the global config, and an unknown name is asked again. Move any
+  remote provider a repo config declares to `~/.outrig/config.toml` or a `--global-config` file;
+  the repo's models keep naming it. Fixed in `outrig`; see that crate's changelog.
+- **Ctrl-C during a turn no longer takes the session's tools with it.** The terminal sends
+  `SIGINT` to its whole foreground process group, and every `podman exec` transport to an MCP
+  server was in outrig's group. The podman client exited on it, so after `[outrig] interrupted`
+  every tool call failed with `Transport closed` until the session ended. These transports now
+  run in a process group of their own, so the next prompt can call tools again, as
+  [Interrupting and exiting](../../doc/usage/run.md#interrupting-and-exiting) describes. The same
+  applies to the `podman start --attach` clients of entrypoint-stdio sidecars and to the
+  `podman events` watcher. A Ctrl-C used to end that watcher, which silently stopped sidecars
+  being reaped when the primary died. Ctrl-C still reaches one-shot commands such as a
+  `buildah build`.
+- **Ctrl-C during `outrig image build`'s validation removes the validation container.** The
+  command left SIGINT at its default, so a Ctrl-C killed outrig before anything could clean up.
+  The container it had started to test the image kept running `sleep infinity` until it was
+  removed by hand, and `outrig clean` skips a running container. A server that never answers
+  `initialize` is the usual reason to press Ctrl-C there. SIGINT, SIGTERM, and SIGHUP now stop the
+  probe and remove the container before outrig exits with `130`, `143`, or `129`. The build step
+  is unchanged: there buildah gets the Ctrl-C itself and removes its own working containers.
+- **`outrig` raises its soft open-file limit to the hard limit when it starts.** The soft limit is
+  commonly 1024. Under `--network audit` or `filter` each connection a container makes holds two
+  of outrig's descriptors, so a few busy containers could exhaust the limit together. LLM calls
+  and `podman exec` pipes then failed with the container's connections. The library's
+  per-container cap of 256 connections keeps one container from doing this alone; the higher
+  limit covers several. A limit that cannot be raised is left as it was.
+- **Every `5xx` from an LLM endpoint is retried, as documented.** Only `500`, `502`, `503`, and
+  `504` were. Any other `5xx` -- Anthropic's `529` "overloaded", Cloudflare's `520`-`527` in
+  front of a proxied endpoint -- ended `outrig run` on its first occurrence and tore the session
+  down. These are now retried within `retry-budget-secs` like the rest. If the endpoint never
+  recovers, the turn ends with the usual notice and the conversation is kept. A failover chain
+  also counts these failures as recoverable now.
+- **`outrig__wait_results` no longer waits on a subagent you already collected that is idle.**
+  Its description told the model that a collected name came back again immediately. In fact a
+  collected name counted only once the subagent reported again, and an idle subagent reports again
+  only after `outrig__subagent_send`, which the parent cannot call while it waits. So the natural
+  pattern -- wait for one, read it, wait on every name again -- blocked until Ctrl-C, since the
+  default `min_count` needed every name. Such a subagent is now left out of the wait: it does not
+  count toward `min_count` and is not listed, and a call naming only such subagents fails with an
+  error that says to send them more work. One still working after its result was collected is
+  waited on as before. The description now says so.
+- **The walk up from the current directory takes only a config you own.** It took the first
+  `.agents/outrig/config.toml` above the working directory, whoever had written it. So on a
+  shared host, a config another user planted in `/tmp` or a group-writable directory became the
+  config of every `run`, `mcp`, `build`, `image add`, `ls`, `logs`, `discard`, and `clean` below
+  it that had none of its own. It could mount your home read-write, run MCP commands as you,
+  resolve build-args from your environment, and send your API key to a host of its choosing. A
+  config found by the walk is now refused, with an error naming it, unless you own it, the
+  `.agents/` and `outrig/` directories above it, and the directory they sit in; symlinks are
+  judged as themselves. As with git's refusal of another user's repository, this is an error
+  rather than a fall back to a config-less run. `--config` names a file on purpose and is not
+  refused. `run` and `mcp` now name the config file they read, and the workspace they mount,
+  before anything is built or started.
+- **A signal ends `outrig run` and `outrig mcp` through teardown.** A Ctrl-C before the REPL's
+  first prompt, or a SIGTERM or SIGHUP at any time -- `kill <pid>`, a closed terminal, a service
+  manager or CI timeout -- killed outrig outright. The containers ran on, and the record never
+  ended, so `outrig discard` refused it as still running and `outrig clean` skipped it, leaving
+  `podman rm -f` as the only way out. `outrig mcp` did the same during startup, and while serving
+  it ignored SIGHUP. Both now stop what the session started, finalize its record, and exit with
+  128 plus the signal number: `130`, `143`, or `129`, which the record keeps too. `outrig mcp`
+  still exits `0` on a signal once it is serving. A SIGINT or SIGTERM while containers are being
+  stopped ends the wait, and the rest are force-removed in the background.
+- **A session that ends with stdin still open exits once it is torn down.** `outrig mcp` over
+  stdio, stopped by a signal while its client held the pipe open, and `outrig run` left by a
+  second Ctrl-C at the prompt both finished teardown and then waited -- for the client to close
+  the pipe, or for someone to press Enter. The read in flight on stdin no longer holds the exit.
+- **`outrig discard` and `outrig clean` remove only what outrig wrote.** `--session-dir` took any
+  existing directory, and discard and clean later removed it recursively with the session, so
+  `--session-dir .` in a checkout, or a directory of notes, went with it. `--session-dir` now has
+  to be empty or not exist yet -- outrig creates it -- and one that holds anything, even a
+  `.gitkeep`, is refused. Removal deletes `session.json`, `logs/`, and `outrig-enter`, then the
+  directory only if that empties it; a directory that holds anything else stays, and the command
+  names what it kept. That covers sessions already written into such a directory, except that a
+  `logs/` the directory had before the session goes with the session's logs. And `discard
+  --session-dir` given a session's link under the session root removes the directory the link
+  names; it removed only the link, and reported the directory removed.
+- **`host.containers.internal` reaches the host under `--network audit` and `filter` on podman
+  5.** A tool reaching a service on the host by that name, or `host.docker.internal`, timed out
+  after 20 seconds once interception was on, and the connection was recorded as allowed with zero
+  bytes. Podman 5's pasta maps the alias to `169.254.1.2`, an address only the container
+  understands, and the interceptor now dials it where pasta would. Its record still names
+  `169.254.1.2`, so a filter entry for the host names that address; see the `[network]` reference.
+  Fixed in `outrig`; see that crate's changelog.
+- **A local model loaded by `model-path` answers prompts.** The model loaded, and then every
+  request to it failed with `ModelNotFound("<file name>")`, including a subagent's and a local
+  fallback's in an alias chain. The request named the GGUF file, and mistralrs had registered the
+  model under its directory. A request now names no model, and the engine, which holds only that
+  one, routes it there. A `model-id` model was unaffected.
 
 ## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.1) - 2026-10-04
 
