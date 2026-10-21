@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`outrig clean` leaves a stray container whose creation time it cannot read.** The stray sweep
+  gave such a container the Unix epoch for a creation time, so it counted as older than any
+  `--older-than` and `podman rm -f` removed it, even one created a second ago. A creation time it
+  cannot read is a `Created` that is missing, is neither an integer nor an RFC 3339 string, or is
+  at or before the epoch; podman writes an unset time as Go's zero time, `-62135596800`. No
+  supported podman is known to report one for its own containers, so nothing is known to have
+  triggered this. Such a container is now left alone and listed under
+  `skipped labeled containers with no creation time`, as `--build-containers` already treats a
+  working container. A `Created` that is an RFC 3339 string is now read as that time instead of
+  as 1970. (#276)
+
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
 
 The second patch release since 0.2.0. Most of it is fixes, and the `outrig run` prompt becomes a

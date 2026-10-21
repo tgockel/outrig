@@ -8,7 +8,9 @@
 //! catches *stray* containers -- ones carrying `org.outrig.session` whose
 //! session record is gone (lost record, SIGKILLed outrig, failed `--rm`) --
 //! and `podman rm -f`s the stopped ones older than the cutoff in one
-//! invocation. Running containers are never removed, labeled or not.
+//! invocation. Running containers are never removed, labeled or not, and
+//! neither is one whose creation time cannot be read: with no age to measure
+//! against the cutoff, it is reported instead.
 //!
 //! `--build-containers` adds a third sweep, off by default and answered from
 //! its own listings. Separate for a reason beyond tidiness: buildah working
@@ -86,7 +88,11 @@ pub struct LabeledContainer {
     pub session_label: String,
     pub sidecar_label: Option<String>,
     pub running: bool,
-    pub created: SystemTime,
+    /// `None` when the row's `Created` is not a readable time: absent, neither
+    /// an integer nor an RFC 3339 string, or at or before the epoch. Such a
+    /// container is reported and left alone: an unknown age cannot clear a
+    /// cutoff, and the container may be seconds old.
+    pub created: Option<SystemTime>,
 }
 
 pub async fn execute(
@@ -255,7 +261,7 @@ where
         .map(|s| s.entry.as_str())
         .filter(|entry| !target_ids.contains(entry))
         .collect();
-    let (stray_targets, stray_running) = classify_strays(
+    let (stray_targets, stray_running, stray_undatable) = classify_strays(
         &sessions,
         &target_ids,
         &unreadable,
@@ -276,7 +282,18 @@ where
     .await?;
     write_unreadable_left(stderr, &unreadable_left, &retention).await?;
     write_unreadable_unsure(stderr, &unreadable_unsure, &retention).await?;
-    write_stray_running(stderr, &stray_running).await?;
+    write_stray_skipped(
+        stderr,
+        "[outrig] skipped running labeled containers (no session record):\n",
+        &stray_running,
+    )
+    .await?;
+    write_stray_skipped(
+        stderr,
+        "[outrig] skipped labeled containers with no creation time (no session record):\n",
+        &stray_undatable,
+    )
+    .await?;
     write_build_undatable(stderr, &build_undatable).await?;
 
     if targets.is_empty()
@@ -446,13 +463,16 @@ struct CleanTarget {
     dir: PathBuf,
 }
 
-/// Split labeled containers into `(removable strays, running strays)`.
+/// Split labeled containers into `(removable, running, undatable)` strays.
 /// A stray is a labeled container with no *surviving* session record -- a
 /// record being removed this run counts as gone, so a failed `--rm` and its
 /// record clean up together. `unreadable` names entries that exist on disk but
 /// couldn't be parsed; they survive too, so their containers are record-backed
 /// rather than stray. Running containers are never removable, and stopped
-/// strays must be older than the cutoff (podman `Created` time).
+/// strays must be older than the cutoff (podman `Created` time). A stopped
+/// stray with no readable `Created` is `undatable`, never removable: the
+/// cutoff is what keeps a sweep off a container made a moment ago, and a
+/// container that cannot be measured against it is reported instead.
 fn classify_strays(
     sessions: &[Session],
     removed_ids: &BTreeSet<&str>,
@@ -460,7 +480,11 @@ fn classify_strays(
     labeled: Vec<LabeledContainer>,
     older_than: Duration,
     now: SystemTime,
-) -> (Vec<LabeledContainer>, Vec<LabeledContainer>) {
+) -> (
+    Vec<LabeledContainer>,
+    Vec<LabeledContainer>,
+    Vec<LabeledContainer>,
+) {
     let surviving_ids: BTreeSet<&str> = sessions
         .iter()
         .map(|s| s.id.as_str())
@@ -469,21 +493,25 @@ fn classify_strays(
         .collect();
     let mut removable = Vec::new();
     let mut running = Vec::new();
+    let mut undatable = Vec::new();
     for container in labeled {
         if surviving_ids.contains(container.session_label.as_str()) {
             continue; // the record walk owns record-backed containers
         }
         if container.running {
             running.push(container);
-        } else if now
-            .duration_since(container.created)
-            .map(|age| age >= older_than)
-            .unwrap_or(false)
-        {
-            removable.push(container);
+        } else if let Some(created) = container.created {
+            if now
+                .duration_since(created)
+                .is_ok_and(|age| age >= older_than)
+            {
+                removable.push(container);
+            }
+        } else {
+            undatable.push(container);
         }
     }
-    (removable, running)
+    (removable, running, undatable)
 }
 
 fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
@@ -711,16 +739,19 @@ fn clean_summary(sessions: usize, strays: usize, builds: usize) -> String {
     }
 }
 
-async fn write_stray_running<E>(stderr: &mut E, strays: &[LabeledContainer]) -> Result<()>
+/// `header`, then one line per stray that is skipped rather than removed.
+async fn write_stray_skipped<E>(
+    stderr: &mut E,
+    header: &str,
+    strays: &[LabeledContainer],
+) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {
     if strays.is_empty() {
         return Ok(());
     }
-    stderr
-        .write_all(b"[outrig] skipped running labeled containers (no session record):\n")
-        .await?;
+    stderr.write_all(header.as_bytes()).await?;
     for stray in strays {
         let line = format!("  {}  session {}\n", stray.name, stray.session_label);
         stderr.write_all(line.as_bytes()).await?;
@@ -902,8 +933,9 @@ async fn still_present(names: &[String]) -> Result<Vec<String>> {
 /// `podman ps -a --format json`, decoded into the labeled-container rows (the
 /// stray-sweep input) plus the set of *all* running container names (the
 /// record-walk running check). Unfiltered so an attach session's borrowed,
-/// outrig-unlabeled primary still shows up in the running set. Rows missing the
-/// expected fields are skipped rather than failing the sweep.
+/// outrig-unlabeled primary still shows up in the running set. A row missing its
+/// name or session label is skipped rather than failing the sweep; one with no
+/// readable `Created` is kept, with no creation time.
 async fn list_all_containers() -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {
     let listing =
         engine::capture("podman", &["ps", "-a", "--format", "json"], "outrig clean").await?;
@@ -943,17 +975,12 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
             .and_then(|labels| labels.get(LABEL_SIDECAR))
             .and_then(|value| value.as_str())
             .map(str::to_string);
-        let created = row
-            .get("Created")
-            .and_then(|created| created.as_i64())
-            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         labeled.push(LabeledContainer {
             name: name.to_string(),
             session_label: session_label.to_string(),
             sidecar_label,
             running: is_running,
-            created,
+            created: build_containers::created_time(&row),
         });
     }
     Ok((labeled, running))
@@ -962,6 +989,38 @@ fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A stopped, labeled row for `session`. `created` is the JSON text of its
+    /// `Created`, or `None` for a row that has no such field.
+    fn stopped_row(session: &str, created: Option<&str>) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "Names": [format!("outrig-{session}")],
+            "Labels": {"org.outrig.session": session},
+            "State": "exited",
+        });
+        if let Some(created) = created {
+            row["Created"] = serde_json::from_str(created).expect("created is JSON");
+        }
+        row
+    }
+
+    fn stray(name: &str, running: bool, created: Option<SystemTime>) -> LabeledContainer {
+        LabeledContainer {
+            name: name.to_string(),
+            session_label: name.to_string(),
+            sidecar_label: None,
+            running,
+            created,
+        }
+    }
+
+    fn names(containers: &[LabeledContainer]) -> Vec<&str> {
+        containers.iter().map(|c| c.name.as_str()).collect()
+    }
 
     #[test]
     fn parse_all_containers_splits_labeled_rows_and_running_names() {
@@ -1000,10 +1059,7 @@ mod tests {
         assert_eq!(labeled[0].session_label, "abc");
         assert_eq!(labeled[0].sidecar_label, None);
         assert!(labeled[0].running);
-        assert_eq!(
-            labeled[0].created,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-        );
+        assert_eq!(labeled[0].created, Some(at(1_700_000_000)));
         assert_eq!(labeled[1].name, "outrig-abc-tools");
         assert_eq!(labeled[1].sidecar_label.as_deref(), Some("tools"));
         assert!(!labeled[1].running);
@@ -1020,5 +1076,66 @@ mod tests {
     #[test]
     fn parse_all_containers_rejects_bad_json() {
         assert!(parse_all_containers(b"not json").is_err());
+    }
+
+    /// podman writes an unset creation time as Go's zero `time.Time`. Read as
+    /// the epoch, that and every other `Created` that is not a time would clear
+    /// any cutoff, so each is read as no time at all.
+    #[test]
+    fn parse_all_containers_reads_a_created_that_is_no_time_as_unknown() {
+        for created in [
+            None,
+            Some("null"),
+            Some("-62135596800"),
+            Some("0"),
+            Some(r#""0001-01-01T00:00:00Z""#),
+            Some(r#""yesterday""#),
+            Some("1700000000.5"),
+        ] {
+            let stdout = serde_json::json!([stopped_row("gone", created)]).to_string();
+            let (labeled, _) = parse_all_containers(stdout.as_bytes()).expect("parse");
+            assert_eq!(labeled.len(), 1, "for {created:?}");
+            assert_eq!(labeled[0].created, None, "for {created:?}");
+        }
+    }
+
+    #[test]
+    fn parse_all_containers_reads_an_rfc3339_created() {
+        let row = stopped_row("gone", Some(r#""2023-11-14T22:13:20Z""#));
+        let stdout = serde_json::json!([row]).to_string();
+        let (labeled, _) = parse_all_containers(stdout.as_bytes()).expect("parse");
+        assert_eq!(labeled[0].created, Some(at(1_700_000_000)));
+    }
+
+    /// The cutoff is what keeps the sweep off a container made a moment ago, so
+    /// one whose age cannot be read is reported at every cutoff and removable at
+    /// none. #276: it was dated 1970 and removed under any cutoff below 56 years.
+    #[test]
+    fn classify_strays_reports_a_stray_with_no_creation_time_at_every_cutoff() {
+        let now = at(1_800_000_000);
+        let day = Duration::from_secs(24 * 60 * 60);
+        let labeled = vec![
+            stray("undated", false, None),
+            stray("undated-running", true, None),
+            stray("old", false, Some(now - 40 * day)),
+            stray("young", false, Some(now - Duration::from_secs(60))),
+        ];
+        let cutoffs = [
+            (Duration::from_secs(1), vec!["old", "young"]),
+            (30 * day, vec!["old"]),
+            (3650 * day, vec![]),
+            (36500 * day, vec![]),
+        ];
+        for (cutoff, expected) in cutoffs {
+            let (removable, running, undatable) =
+                classify_strays(&[], &BTreeSet::new(), &[], labeled.clone(), cutoff, now);
+            assert_eq!(names(&removable), expected, "removable at {cutoff:?}");
+            assert_eq!(
+                names(&running),
+                ["undated-running"],
+                "running at {cutoff:?}"
+            );
+            assert_eq!(names(&undatable), ["undated"], "undatable at {cutoff:?}");
+        }
     }
 }

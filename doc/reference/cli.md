@@ -523,7 +523,9 @@ until the record itself is gone. A record cut off before it names its container 
 since an `outrig mcp --attach` session borrows a container that is not `outrig-<sid>`; `discard`
 removes it. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
-Stopped strays older than the cutoff are removed; running ones are only reported.
+Stopped strays older than the cutoff are removed; running ones are only reported. A stray whose
+creation time cannot be read has no age to compare with the cutoff, so it is reported and left
+alone.
 
 `--session <id>` narrows both sweeps to one session: only that session's record is considered
 for removal, and only containers labeled `org.outrig.session=<id>` are stray candidates.

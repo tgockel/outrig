@@ -1439,7 +1439,19 @@ fn labeled(
         session_label: session_label.to_string(),
         sidecar_label: sidecar.map(str::to_string),
         running,
-        created: now - age,
+        created: Some(now - age),
+    }
+}
+
+/// A stopped stray `parse_all_containers` could not date: its `Created` was
+/// absent, or was Go's zero time.
+fn undated(name: &str, session_label: &str) -> clean::LabeledContainer {
+    clean::LabeledContainer {
+        name: name.to_string(),
+        session_label: session_label.to_string(),
+        sidecar_label: None,
+        running: false,
+        created: None,
     }
 }
 
@@ -1638,6 +1650,90 @@ async fn clean_removes_old_stopped_stray_containers() {
     assert!(
         err.contains("cleaned 2 stray containers"),
         "summary should mention strays: {err}"
+    );
+}
+
+/// The cutoff is what keeps this sweep off a container made a moment ago, and a
+/// container whose creation time cannot be read cannot be measured against it.
+/// It is reported and left alone even at a one-second cutoff, while an old
+/// stray beside it is removed as usual. #276: a `Created` of Go's zero time was
+/// dated 1970 and removed.
+#[tokio::test]
+async fn clean_reports_a_stray_with_no_creation_time_and_leaves_it() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let strays = vec![
+        labeled("outrig-old", "old", None, false, days(40), now),
+        undated("outrig-undated", "undated"),
+    ];
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(Duration::from_secs(1), true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        strays,
+        Vec::new(),
+        // The batch is the assertion: the undated name reaching this hook is
+        // the defect, and it has to fail here rather than in a count afterwards.
+        |names: Vec<String>| async move {
+            assert_eq!(
+                names,
+                vec!["outrig-old".to_string()],
+                "a stray with no creation time must not be handed to podman"
+            );
+            Ok(Vec::new())
+        },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("[outrig] removed container outrig-old"),
+        "the datable stray is removed as before: {err}"
+    );
+    assert!(
+        err.contains(
+            "[outrig] skipped labeled containers with no creation time (no session record):\n  \
+             outrig-undated  session undated\n"
+        ),
+        "the undated stray is reported: {err}"
+    );
+    assert_eq!(
+        err.matches("outrig-undated").count(),
+        1,
+        "and only reported, neither previewed nor removed: {err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_with_only_a_stray_of_no_creation_time_removes_nothing() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let args = clean_args(Duration::from_secs(1), true);
+    let strays = vec![undated("outrig-undated", "undated")];
+
+    // `no_removals` panics if the container were handed to `podman rm`.
+    let err = run_clean(&store, &args, BTreeSet::new(), strays).await;
+
+    assert!(
+        err.contains("skipped labeled containers with no creation time"),
+        "{err}"
+    );
+    assert!(
+        err.contains("no stopped sessions or stray containers older than 1s"),
+        "{err}"
     );
 }
 
@@ -2497,7 +2593,7 @@ async fn clean_does_not_sweep_the_container_of_a_record_it_kept() {
         session_label: sid.to_string(),
         sidecar_label: None,
         running: false,
-        created: clean_now() - days(40),
+        created: Some(clean_now() - days(40)),
     };
 
     // `no_removals` panics if the container were handed to `podman rm`.
@@ -2584,7 +2680,7 @@ async fn clean_unreadable_sweeps_the_removed_records_stopped_container() {
         session_label: sid.to_string(),
         sidecar_label: None,
         running: false,
-        created: clean_now() - days(40),
+        created: Some(clean_now() - days(40)),
     };
     let args = clean::CleanArgs {
         unreadable: true,

@@ -350,6 +350,9 @@ $ outrig clean --older-than 7d
 Clean 1 session and 1 stray container? [y/N]:
 ```
 
+A stray whose creation time cannot be read has no age to compare with the cutoff, so `clean`
+reports it under `skipped labeled containers with no creation time` and leaves it alone.
+
 Each `[outrig] removed container <name>` line is a claim about that container, checked by
 re-reading the container list rather than inferred from the batched `podman rm -f`'s exit
 status -- one status for every name in the batch cannot say which of them went away. A name the
