@@ -285,6 +285,14 @@ pub struct ChainExhaustion<'a> {
     pub recoverable: bool,
 }
 
+/// The line printed as the chain moves from one candidate to the next.
+fn move_announcement(from: &str, error: &CompletionError, to: &str) -> String {
+    format!(
+        "[outrig] model {from} failed ({}); trying {to}",
+        super::retry::candidate_failure_label(error),
+    )
+}
+
 /// The failure a chain returns when every candidate has been abandoned.
 ///
 /// Rendered as one line per candidate, mirroring the shape the static half
@@ -381,10 +389,8 @@ impl CompletionModel for FailoverModel {
                     // version of the same hazard and wants the same mitigation.
                     if let Some(next) = self.candidates.get(index + 1) {
                         eprintln!(
-                            "[outrig] model {} failed ({}); trying {}",
-                            candidate.model_name(),
-                            super::retry::candidate_failure_label(&error),
-                            next.model_name(),
+                            "{}",
+                            move_announcement(candidate.model_name(), &error, next.model_name())
                         );
                     }
                     abandoned.push(Abandoned {
@@ -462,6 +468,39 @@ mod tests {
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
+
+    fn status(code: u16, body: &str) -> CompletionError {
+        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
+            reqwest::StatusCode::from_u16(code).unwrap(),
+            body.to_string(),
+        ))
+    }
+
+    #[test]
+    fn the_tried_report_is_one_row_per_candidate_without_bodies() {
+        let html = "<html>\n<head><title>503</title></head>\n<body>nginx</body>\n</html>\n";
+        let json = "{\"error\": {\"message\": \"Rate limit reached\"}}";
+        let CompletionError::ProviderError(report) = exhausted(vec![
+            Abandoned { model_name: "head".into(), error: status(503, html) },
+            Abandoned { model_name: "next".into(), error: status(429, json) },
+        ]) else {
+            panic!("a chain's exhaustion is a ProviderError");
+        };
+        let rows: Vec<_> = report.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{report}");
+        assert!(rows[0].contains("HTTP 503 Service Unavailable"), "{report}");
+        assert!(rows[1].contains("HTTP 429 Too Many Requests"), "{report}");
+        assert!(!report.contains("nginx") && !report.contains("Rate limit"), "{report}");
+    }
+
+    #[test]
+    fn the_move_announcement_names_the_status_without_the_body() {
+        let line = move_announcement("a", &status(429, "{\"error\":\n\"slow down\"}"), "b");
+        assert_eq!(
+            line,
+            "[outrig] model a failed (HTTP 429 Too Many Requests); trying b"
+        );
+    }
 
     /// A candidate that answers however the test says, and counts its calls.
     struct Scripted {

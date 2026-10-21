@@ -826,13 +826,32 @@ fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// The label for a failed candidate in a failover chain's move line and
-/// `tried` rows: a transport failure reads as it does outside a chain, and
-/// anything else keeps rig's own text.
+/// `tried` rows, held to one line so the report stays one row per candidate.
+///
+/// A transient failure reads as it does outside a chain, via [`failure_label`]:
+/// the status or the transport cause, never the body. A terminal status keeps
+/// its body after the status, collapsed onto one line, because a `400` or
+/// `401` body says what to fix. Anything else keeps rig's own text.
 pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
     match err {
-        CompletionError::HttpError(http @ HttpError::Instance(_)) => failure_label(http),
-        other => other.to_string(),
+        // Every transport failure, permanent ones too: the cause is the whole message.
+        CompletionError::HttpError(http @ HttpError::Instance(_)) => {
+            one_line(&failure_label(http))
+        }
+        CompletionError::HttpError(http) if is_transient(http) => failure_label(http),
+        CompletionError::HttpError(http @ HttpError::InvalidStatusCodeWithMessage(_, body)) => {
+            match one_line(body).as_str() {
+                "" => failure_label(http),
+                body => format!("{}: {body}", failure_label(http)),
+            }
+        }
+        other => one_line(&other.to_string()),
     }
+}
+
+/// `text` with every run of whitespace, newlines included, as one space.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Classify an HTTP failure as transient -- the same predicate the retry loop
@@ -1799,8 +1818,40 @@ mod tests {
             candidate_failure_label(&err),
             "connection error: error sending request: Connection refused"
         );
-        let status = http_status(503);
-        assert_eq!(candidate_failure_label(&status), status.to_string());
+    }
+
+    fn http_status_with(code: u16, body: &str) -> CompletionError {
+        CompletionError::HttpError(HttpError::InvalidStatusCodeWithMessage(
+            StatusCode::from_u16(code).unwrap(),
+            body.to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_permanent_transport_failure_keeps_its_cause() {
+        let sent = reqwest::Client::new().get("ftp://example.invalid/").send().await;
+        let source = sent.expect_err("reqwest refuses a scheme other than http(s)");
+        assert!(is_permanent(&source), "premise: this failure is permanent");
+        let err = CompletionError::HttpError(HttpError::Instance(Box::new(source)));
+        let label = candidate_failure_label(&err);
+        assert!(label.starts_with("connection error: "), "{label}");
+        assert!(label.contains("scheme"), "{label}");
+        assert!(!label.contains('\n'), "{label}");
+    }
+
+    #[test]
+    fn a_transient_candidate_failure_is_the_status_alone() {
+        let err = http_status_with(503, "<html>\n<body>\nnginx\n</body>\n</html>\n");
+        assert_eq!(candidate_failure_label(&err), "HTTP 503 Service Unavailable");
+    }
+
+    #[test]
+    fn a_terminal_candidate_failure_keeps_its_body_on_one_line() {
+        let err = http_status_with(401, "{\n  \"error\": \"bad key\"\n}\n");
+        assert_eq!(
+            candidate_failure_label(&err),
+            "HTTP 401 Unauthorized: { \"error\": \"bad key\" }"
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@ runtime fallback: a model call that fails against candidate one is retried again
 and outrig says so as it happens.
 
 ```text
-[outrig] model opus-5-bedrock failed (HTTP 429); trying opus-5-anthropic
+[outrig] model opus-5-bedrock failed (HTTP 429 Too Many Requests); trying opus-5-anthropic
 ```
 
 A move happens when a candidate's own retry loop has given up -- so everything under

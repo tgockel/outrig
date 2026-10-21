@@ -23,6 +23,9 @@ injected into `FailoverModel`, which is production surface existing only for a t
 
 ## Sketch
 
+The wording is now pinned: `move_announcement` (`failover.rs`) holds the text and has a unit
+test. What remains is the second option below, proving `completion` still prints it.
+
 Two options, neither obviously right:
 
 - Extract the message into a `fn move_announcement(from, error, to) -> String` beside
