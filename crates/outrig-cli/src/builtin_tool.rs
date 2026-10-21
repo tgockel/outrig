@@ -199,7 +199,10 @@ impl ToolDyn for SubagentTool {
                     let suffix = launched_as.map_or(String::new(), |label| {
                         format!(" (model: {})", label.display_name())
                     });
-                    eprintln!("[outrig] subagent {} started{suffix}", args.name);
+                    eprintln!(
+                        "[outrig] subagent {} started{suffix}",
+                        self.registry.path_of(&args.name)
+                    );
                     Ok(format!(
                         "subagent {:?} started{suffix}; collect it with outrig__get_result",
                         args.name
@@ -626,7 +629,7 @@ const LEAVE_THE_REPORT: &str = "\
 #[derive(Clone)]
 pub struct SetResultTool {
     shared: Arc<SubagentShared>,
-    /// This subagent's handle, for the trace prefix, matching the shape the
+    /// This subagent's whole path, for the trace prefix, matching the shape the
     /// agent loop's own traces use.
     label: Arc<str>,
     /// The agent whose turns hit the ceiling. Carried only to name the fix

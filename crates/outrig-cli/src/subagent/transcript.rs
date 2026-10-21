@@ -57,7 +57,6 @@ impl Transcript {
             .ok();
         let mut this = Self { file };
 
-        let path: Vec<&str> = ancestry.iter().map(String::as_str).chain([name]).collect();
         // The model detail only when the launch named one: an inherited launch
         // has nothing to confirm.
         let detail = label
@@ -65,8 +64,11 @@ impl Transcript {
             .unwrap_or_default();
         // The trailing newline keeps the next `=== prompt ===` block's leading
         // blank line, so the header does not run into it.
-        this.write(&format!("=== subagent {}{detail} ===\n", path.join("/")))
-            .await;
+        this.write(&format!(
+            "=== subagent {}{detail} ===\n",
+            super::subagent_path(ancestry, name)
+        ))
+        .await;
         this
     }
 

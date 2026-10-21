@@ -277,7 +277,9 @@ subagent, or ending the session, tears down everything it launched with it.
 Nothing reaches stdout except the primary agent's reply, so `outrig run > out.txt` still captures
 only the model's text. Subagent activity shows up two other ways:
 
-- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name. A
+- On stderr, with each trace labeled by the subagent's path: `audit` for one the primary launched,
+  `parent-a/audit` for one `parent-a` launched, as its transcript header spells it. Concurrent
+  subagents interleave; filter by label. A
   round that ends early -- at its tool-call max, at the repeat breaker, or on a model call that
   failed for good -- says why on a line labeled the same way. It leaves out the advice printed
   when the primary's turn ends early: `continue`, `/reset`, and the rest act on the primary's

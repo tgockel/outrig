@@ -189,6 +189,12 @@ impl SubagentRegistry {
         self.entries.lock().expect("subagent registry poisoned")
     }
 
+    /// The label stderr traces about the subagent `name` of this registry
+    /// carry: its whole path, as its transcript header spells it.
+    pub fn path_of(&self, name: &str) -> String {
+        subagent_path(&self.ctx.ancestry, name)
+    }
+
     fn spawned_lock(&self) -> std::sync::MutexGuard<'_, Vec<Spawned>> {
         self.spawned.lock().expect("subagent registry poisoned")
     }
@@ -277,8 +283,9 @@ impl SubagentRegistry {
             && !self.ctx.registry.is_loaded(resolved.model_name())
         {
             eprintln!(
-                "[outrig] subagent {name}: loading in-process model {} (first use; this may take \
+                "[outrig] subagent {}: loading in-process model {} (first use; this may take \
                  several minutes)",
+                self.path_of(name),
                 resolved.model_name()
             );
         }
@@ -870,7 +877,7 @@ async fn build_subagent_agent(
     let ceilings = Arc::new(std::sync::OnceLock::new());
     tools.push(SessionTool::new(crate::builtin_tool::SetResultTool::new(
         shared.clone(),
-        name,
+        &subagent_path(&ctx.ancestry, name),
         ctx.resolved.agent_name.as_deref(),
         ceilings.clone(),
     )));
@@ -957,6 +964,9 @@ async fn run_rounds(
 ) {
     let mut history = Vec::new();
     let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref()).await;
+    // What every trace below calls this subagent; `name` alone is ambiguous
+    // between parents (#305).
+    let path = subagent_path(&ancestry, &name);
 
     loop {
         let prompt = shared.next_round().await;
@@ -982,7 +992,7 @@ async fn run_rounds(
         };
 
         let outcome = agent
-            .run_turn_captured(&prompt, &mut history, &name, injections)
+            .run_turn_captured(&prompt, &mut history, &path, injections)
             .await;
         // Asked whether the turn succeeded or not: the calls before a failing
         // one may already have been answered by a fallback.
@@ -1048,7 +1058,7 @@ async fn run_rounds(
             // a failure after reporting does.
             let note = "a later report was cut off at the output-token limit; the earlier one \
                         was kept";
-            eprintln!("[outrig]   [{name}] {note}");
+            eprintln!("[outrig]   [{path}] {note}");
             log.record_outcome("report cut off after reporting", note)
                 .await;
         }
@@ -1061,11 +1071,11 @@ async fn run_rounds(
                 // Not when the parent steered the round after the report,
                 // though: the report cannot answer that, and a parent waiting
                 // for the answer would wait forever.
-                eprintln!("[outrig]   [{name}] round failed after reporting: {reason}");
+                eprintln!("[outrig]   [{path}] round failed after reporting: {reason}");
                 log.record_outcome("round failed after reporting", reason)
                     .await;
             } else {
-                publish_round_failure(&shared, &name, reason);
+                publish_round_failure(&shared, &path, reason);
             }
         }
         shared.end_round();
@@ -1092,10 +1102,22 @@ async fn run_rounds(
 /// Publish a round failure to the parent. Publish only -- the transcript entry
 /// comes from the outcome block at the end of the round, which would otherwise
 /// record it twice.
-fn publish_round_failure(shared: &SubagentShared, name: &str, reason: &str) {
+fn publish_round_failure(shared: &SubagentShared, path: &str, reason: &str) {
     let message = format!("round failed: {reason}");
-    eprintln!("[outrig]   [{name}] {message}");
+    eprintln!("[outrig]   [{path}] {message}");
     shared.publish(Outcome::Error(message));
+}
+
+/// A subagent's whole path, `parent-a/audit`: names are unique only within the
+/// registry that launched them, so this is what tells two `audit`s apart. The
+/// primary's own subagents have no ancestry and read as their bare name.
+pub(crate) fn subagent_path(ancestry: &[String], name: &str) -> String {
+    ancestry
+        .iter()
+        .map(String::as_str)
+        .chain([name])
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn width_limit_error(limit: u32) -> String {
@@ -4073,6 +4095,24 @@ mod tests {
                 "{file} must hold its own prompt: {text}"
             );
         }
+    }
+
+    /// The label a trace carries is the whole path, so the same `audit` under
+    /// two parents reads as two subagents (#305).
+    #[tokio::test(start_paused = true)]
+    async fn trace_labels_name_the_whole_path() {
+        let (registry, _log_dir) = test_registry();
+        assert_eq!(registry.path_of("audit"), "audit");
+        assert_eq!(
+            subagent_path(&["parent-a".to_string(), "scan".to_string()], "audit"),
+            "parent-a/scan/audit"
+        );
+        registry
+            .launch("parent-a", None, None, "go".to_string())
+            .await
+            .expect("launch");
+        let child = child_registry(&registry, "parent-a");
+        assert_eq!(child.path_of("audit"), "parent-a/audit");
     }
 
     /// An alias is usable when *any* candidate is, which is what lets one name
