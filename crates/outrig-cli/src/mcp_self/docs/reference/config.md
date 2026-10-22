@@ -917,6 +917,9 @@ access         = "read-write"
 - `mounts[*].access` (string, optional, default: `"read-only"`): either
   `"read-only"` or `"read-write"`.
 
+No path here may contain `:`, which is how podman separates the fields of a bind mount -- see
+[Validation rules](#validation-rules).
+
 A repo config may not declare a `host-path` (primary, extra, or sidecar mount) that covers your home
 directory or one above it, or -- read-write -- the global config file, its directory, or a
 directory its path passes through (a symlink or missing component there could be swapped to
@@ -1763,6 +1766,15 @@ image-config in the merged config but does not require agent/model/provider wiri
   `.`, the repo root.
 - `workspace.container-path` and every `workspace.mounts[*].container-path` must be absolute and
   must not be `/`.
+- No bind-mount path may contain `:` -- `workspace.host-path`, `workspace.container-path`, and
+  both halves of every `workspace.mounts[*]` and `[sidecars.<sc>.mounts][*]` entry. Podman reads
+  a bind mount as `<host>:<container>[:<options>]`, so a path carrying one becomes a fourth
+  field it refuses at launch, after the image is acquired and naming neither the key nor the
+  file. This rule is about the path as written. A relative path that spells no `:` but resolves
+  through a directory whose name has one is refused when a session starts, not here: it is a
+  fact about this machine, and attaching to an existing container (`outrig mcp --attach`)
+  mounts nothing and is unaffected. There is no escape for one in either case; a host directory
+  whose name contains `:` cannot be mounted.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`. Container paths are compared after folding `.` and `..`,
   so `/workspace/../workspace` duplicates `/workspace` and `/a/..` is `/`.

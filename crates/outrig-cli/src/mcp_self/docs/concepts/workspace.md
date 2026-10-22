@@ -154,6 +154,13 @@ See [path resolution](../reference/config.md#path-resolution). Their container p
 absolute, cannot be `/`, and must not duplicate the primary workspace or another extra mount.
 Exact duplicates fail during config validation instead of relying on podman mount ordering.
 
+No path in a bind mount may contain `:`, host or container, here or on a sidecar: podman reads
+a mount as `<host>:<container>[:<options>]`, so a `:` in a path makes a fourth field it refuses
+at launch -- long after the config was read, naming neither the key nor the file. Config
+validation refuses what a config spelled, and a session that would mount a path *resolving*
+through such a directory -- a repo root with a `:` in its name, say -- is refused as it starts.
+There is no escaping form: a host directory whose name contains `:` cannot be mounted.
+
 Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
 really should mutate that host directory, such as a scratch cache under `/var/tmp`.
 

@@ -638,6 +638,7 @@ impl Container {
         // for Container` can do, because no `Container` exists yet.
         reject_reserved_labels(&launch.labels)?;
         reject_malformed_capabilities(&launch.capabilities)?;
+        reject_bind_mount_separators(&launch)?;
         let reserved = NameGuard::reserve(&name);
 
         let cmd = build_podman_run_cmd(
@@ -697,6 +698,7 @@ impl Container {
         // guard removes nothing.
         reject_reserved_labels(&options.launch.labels)?;
         reject_malformed_capabilities(&options.launch.capabilities)?;
+        reject_bind_mount_separators(&options.launch)?;
         let reserved = NameGuard::reserve(&options.name);
 
         let selinux = selinux_enforcing().await;
@@ -1833,6 +1835,60 @@ fn canonical_capability_name(entry: &str) -> Option<String> {
     normalize_capability_name(&entry.to_ascii_uppercase())
 }
 
+/// Reject a bind-mount path carrying podman's `-v` field separator.
+///
+/// [`append_bind_mount`] renders each mount as one colon-joined
+/// `<host>:<container>:<options>` value, so a `:` in either path makes a
+/// fourth field that podman refuses -- at `podman run`, after the image is
+/// acquired, naming neither the mount nor where it came from. Config
+/// validation already refuses one (`MountRuleViolation::HostFieldSeparator` /
+/// `ContainerFieldSeparator`); this holds a hand-built [`ContainerLaunchSpec`]
+/// to the same rule, as [`reject_malformed_capabilities`] does for a
+/// capability entry, so that the rendering below can stay a `format!`.
+///
+/// Not an injection: podman reads options only from the third field, which a
+/// path cannot reach without pushing the real options past where podman stops
+/// reading. This is about naming the malformed mount before podman sees it.
+///
+/// A `view = "primary"` sidecar's helper bind is checked too. Its container
+/// side is outrig's own [`PRIMARY_VIEW_HELPER_MOUNT`] and its nsfs bind is
+/// `/proc/<pid>/ns`, but the helper's *host* side is materialized into the
+/// session directory, which `--session-dir` or a configured `session-root`
+/// can put anywhere -- including under a name with a `:` in it. Left
+/// unchecked, that bind reached podman with four fields and failed the
+/// sidecar after the primary was up and bootstrapped.
+fn reject_bind_mount_separators(launch: &ContainerLaunchSpec) -> Result<()> {
+    let workspace = launch
+        .workspace
+        .as_ref()
+        .map(|ws| ("workspace", ws.host.as_path(), ws.container.as_path()));
+    let mounts = launch
+        .mounts
+        .iter()
+        .map(|mount| ("mount", mount.host.as_path(), mount.container.as_path()));
+    let helper = launch.primary_view.as_ref().map(|pv| {
+        (
+            "primary-view helper",
+            pv.helper_host.as_path(),
+            // The container side is a constant; paired here so the one loop
+            // below reads both halves of every bind this spec renders.
+            Path::new(PRIMARY_VIEW_HELPER_MOUNT),
+        )
+    });
+    for (what, host, container) in workspace.into_iter().chain(mounts).chain(helper) {
+        for (field, path) in [("host", host), ("container", container)] {
+            if path.as_os_str().as_encoded_bytes().contains(&b':') {
+                return Err(OutrigError::Configuration(format!(
+                    "{what} {field} path {path:?} must not contain `:`: podman reads a `-v` \
+                     value as `<host>:<container>[:<options>]`, so a path carrying one \
+                     becomes a fourth field the engine refuses at launch"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject a `cap-add` or `cap-drop` entry that is not one capability name.
 ///
 /// podman reads each `--cap-add`/`--cap-drop` value as a CSV list: it would
@@ -2108,6 +2164,10 @@ fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -
     cmd
 }
 
+/// One `-v <host>:<container>:<options>`. Neither path may contain a `:` --
+/// [`reject_bind_mount_separators`] refuses a spec whose does, before anything
+/// is started -- so the colons here are the engine's field separators and
+/// nothing else.
 fn append_bind_mount(
     cmd: Cmd,
     host: &Path,
@@ -3754,6 +3814,78 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{entry:?} is one name: {e}"));
         }
         reject_malformed_capabilities(&ContainerCapabilities::default()).unwrap();
+    }
+
+    /// A `:` in either half of a bind mount renders as a four-field `-v`
+    /// value, which podman refuses at launch, after the image is acquired and
+    /// naming neither the mount nor where it came from (#365). Config
+    /// validation refuses one; a hand-built spec is held to the same rule, so
+    /// `append_bind_mount` can keep rendering with `format!`.
+    #[test]
+    fn a_bind_mount_path_with_a_colon_is_refused() {
+        let workspace = |host: &str, container: &str| ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace::new(
+                host,
+                container,
+                MountAccess::ReadWrite,
+            )),
+            ..Default::default()
+        };
+        let extra = |host: &str, container: &str| ContainerLaunchSpec {
+            mounts: vec![ContainerMount::new(host, container, MountAccess::ReadOnly)],
+            ..Default::default()
+        };
+
+        for (what, field, launch) in [
+            ("workspace", "host", workspace("/host/a:b", "/workspace")),
+            ("workspace", "container", workspace("/host", "/work:space")),
+            ("mount", "host", extra("/host/a:b", "/data")),
+            ("mount", "container", extra("/host", "/data:extra")),
+            // The options podman acts on live in the third field only, so
+            // this cannot smuggle one in -- it is still a malformed value,
+            // and still refused.
+            ("mount", "container", extra("/host", "/data:rw,Z")),
+        ] {
+            let error = reject_bind_mount_separators(&launch)
+                .expect_err(&format!("{what} {field} path with a colon is refused"));
+            let OutrigError::Configuration(message) = error else {
+                panic!("{what} {field}: expected Configuration, got {error:?}");
+            };
+            assert!(
+                message.contains(what) && message.contains(field),
+                "names what and which half: {message}"
+            );
+        }
+
+        // The helper's host side is materialized into the session directory,
+        // which `--session-dir` can put under a name with a `:` in it. Left
+        // unchecked, this bind failed the sidecar after the primary was up.
+        let primary_view = |helper_host: &str| ContainerLaunchSpec {
+            primary_view: Some(PrimaryView::new(
+                "outrig-primary",
+                42,
+                helper_host,
+                "/home/agent",
+            )),
+            ..Default::default()
+        };
+        let error = reject_bind_mount_separators(&primary_view("/sessions/a:b/outrig-enter"))
+            .expect_err("the helper bind carries the colon");
+        let OutrigError::Configuration(message) = error else {
+            panic!("expected Configuration, got {error:?}");
+        };
+        assert!(
+            message.contains("primary-view helper") && message.contains("host"),
+            "names the bind: {message}"
+        );
+        reject_bind_mount_separators(&primary_view("/sessions/clean/outrig-enter"))
+            .expect("a clean session directory is fine");
+
+        reject_bind_mount_separators(&ContainerLaunchSpec::workspace("/host", "/workspace"))
+            .expect("no colon, nothing to refuse");
+        reject_bind_mount_separators(&extra("/host/a-b.c_d", "/data"))
+            .expect("other punctuation is not the separator");
+        reject_bind_mount_separators(&ContainerLaunchSpec::default()).unwrap();
     }
 
     /// The classifier and the flags are two readings of the same entry, so

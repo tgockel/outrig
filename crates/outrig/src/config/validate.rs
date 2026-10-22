@@ -203,9 +203,20 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
-    // No `declared_in` on these two: only `host-path` records the file it came
-    // from, and `container-path` is inherited from the global config apart
-    // from it.
+    #[error(
+        "workspace host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceHostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    // No `declared_in` on these three: only `host-path` records the file it
+    // came from, and `container-path` is inherited from the global config
+    // apart from it.
     #[error("workspace container-path {path:?} must be absolute")]
     #[non_exhaustive]
     WorkspaceContainerNotAbsolute { path: PathBuf },
@@ -214,8 +225,16 @@ pub enum ConfigValidationError {
     #[non_exhaustive]
     WorkspaceContainerRoot {},
 
-    // The five below restate `MountRuleViolation` in workspace terms, so their
-    // `declared_in` means exactly what the variant it is mapped from means.
+    #[error(
+        "workspace container-path {path:?} must not contain `:`; {}",
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceContainerFieldSeparator { path: PathBuf },
+
+    // The seven below restate `MountRuleViolation` in workspace terms, so
+    // their `declared_in` means exactly what the variant it is mapped from
+    // means.
     #[error(
         "workspace mount host-path {path:?} does not exist{}",
         declared_in_clause(declared_in)
@@ -259,6 +278,28 @@ pub enum ConfigValidationError {
     )]
     #[non_exhaustive]
     WorkspaceMountContainerDuplicate {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "workspace mount host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceMountHostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "workspace mount container-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    WorkspaceMountContainerFieldSeparator {
         path: PathBuf,
         declared_in: Option<PathBuf>,
     },
@@ -1620,14 +1661,36 @@ fn validate_capability_list(
     Ok(seen)
 }
 
-/// Hold the primary `host-path` to the rule [`check_mount_list`] applies to
-/// every extra mount: when a repo root is known, it must exist and be a
-/// directory. Podman refuses a bind source that is missing, but only at
-/// `podman run`, and without naming the key or the file that declared it.
+/// Hold the primary `host-path` to the rules [`check_mount_list`] applies to
+/// every extra mount: it must carry no `:`, and -- when a repo root is known
+/// -- must exist and be a directory. Podman refuses a bind source that is
+/// missing, or a `-v` value a `:` gave a fourth field, but only at `podman
+/// run`, and without naming the key or the file that declared it.
+///
+/// The `:` rule is applied to the path *as declared* and not to what it
+/// resolves to, which is the one place this differs from the extra mounts. An
+/// undeclared `host-path` resolves to the repo root -- outrig's own pick, the
+/// current directory when no config was found -- so a `:` there is a fact
+/// about where the user is standing rather than anything a config said. A
+/// session that mounts it is still refused, by the caller that knows whether
+/// this launch mounts anything at all: `outrig mcp --attach` borrows a
+/// running container and serializes no `-v`, and it used to be able to do
+/// that from such a directory. See `refuse_workspace_field_separator` in the
+/// CLI, which holds the resolved path to this rule for every launch that is
+/// not an attach.
 fn validate_workspace_host_path(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
+    // Structural, so it runs with or without a repo root, as the
+    // container-path rules do: a `:` here malforms the `-v` value whatever it
+    // resolves against.
+    if has_field_separator(cfg.workspace.host_path()) {
+        return Err(ConfigValidationError::WorkspaceHostFieldSeparator {
+            path: cfg.workspace.host_path().to_path_buf(),
+            declared_in: cfg.workspace.declared_in(),
+        });
+    }
     let Some(root) = repo_root else {
         return Ok(());
     };
@@ -1644,14 +1707,22 @@ fn validate_workspace_host_path(
 }
 
 /// Hold the primary `container-path` to the shape [`check_mount_list`] asks of
-/// every extra mount: absolute, and not `/`. Podman refuses a relative one only
-/// once it creates the container, after the image is built; it takes `/`, and
-/// the workspace then covers the image's whole root filesystem. Structural, so
-/// it runs with or without a repo root.
+/// every extra mount: absolute, free of podman's `-v` field separator, and not
+/// `/`. Podman refuses a relative one only once it creates the container,
+/// after the image is built; it takes `/`, and the workspace then covers the
+/// image's whole root filesystem. Structural, so it runs with or without a
+/// repo root.
 fn validate_workspace_container_path(cfg: &Config) -> Result<(), ConfigValidationError> {
     let path = cfg.workspace.container_path();
     if !path.is_absolute() {
         return Err(ConfigValidationError::WorkspaceContainerNotAbsolute {
+            path: path.to_path_buf(),
+        });
+    }
+    // Before the root check, as in `check_mount_list`: a path that carries one
+    // is malformed as a whole, and folding it would report the fold instead.
+    if has_field_separator(path) {
+        return Err(ConfigValidationError::WorkspaceContainerFieldSeparator {
             path: path.to_path_buf(),
         });
     }
@@ -1684,6 +1755,12 @@ pub(super) fn validate_workspace_mounts(
             }
             MountRuleViolation::HostNotDirectory { path, declared_in } => {
                 ConfigValidationError::WorkspaceMountHostNotDirectory { path, declared_in }
+            }
+            MountRuleViolation::HostFieldSeparator { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountHostFieldSeparator { path, declared_in }
+            }
+            MountRuleViolation::ContainerFieldSeparator { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountContainerFieldSeparator { path, declared_in }
             }
         },
     )
@@ -1755,6 +1832,55 @@ pub enum MountRuleViolation {
         path: PathBuf,
         declared_in: Option<PathBuf>,
     },
+
+    #[error(
+        "host-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    HostFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "container-path {path:?} must not contain `:`{}; {}",
+        declared_in_clause(declared_in),
+        BIND_MOUNT_COLON_DETAIL
+    )]
+    #[non_exhaustive]
+    ContainerFieldSeparator {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+}
+
+/// Why a `:` in a bind-mount path is refused here rather than at launch. Every
+/// `*FieldSeparator` message ends with it, so the two scopes say the same
+/// thing.
+const BIND_MOUNT_COLON_DETAIL: &str = "podman reads a `-v` value as \
+     `<host>:<container>[:<options>]`, so a path carrying one becomes a \
+     fourth field the engine refuses at launch";
+
+/// Whether a path carries podman's `-v` field separator.
+///
+/// Checked on both halves of every bind mount, and on the primary workspace,
+/// because [`append_bind_mount`] renders them into one colon-joined value:
+/// `<host>:<container>:<options>`. A path with a `:` makes that four fields,
+/// which podman refuses -- after the image is acquired and naming neither the
+/// key nor the file. It is a shape error, not an injection: the options podman
+/// would act on live only in the third field, and a path cannot reach it
+/// without pushing the real options further right, where podman stops reading.
+///
+/// A host path that happens to exist with a `:` in its name is unreachable by
+/// this route, and podman offers no escape for one in a `-v`; the `--mount`
+/// form would take it. Refusing it is what lets a diagnostic name the key and
+/// the file.
+///
+/// [`append_bind_mount`]: crate::container
+fn has_field_separator(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().contains(&b':')
 }
 
 /// An absolute in-container path with `.` and `..` folded by component, the way
@@ -1776,7 +1902,8 @@ fn fold_container_path(path: &Path) -> PathBuf {
 }
 
 /// Shared rules for any bind-mount list: absolute container paths, never `/`,
-/// no duplicates (including against `reserved` paths already claimed by the
+/// neither half *as declared* carrying podman's `-v` field separator, no
+/// duplicates (including against `reserved` paths already claimed by the
 /// owning block), and -- when a repo root is known -- host paths that exist
 /// and are directories.
 fn check_mount_list(
@@ -1794,6 +1921,23 @@ fn check_mount_list(
                 declared_in,
             });
         }
+        // Both halves: a `:` makes the rendered `-v` value a different shape
+        // rather than a different path, so the entry is malformed whatever it
+        // points at. Structural, like the container rules around it -- the
+        // host half is checked here even with no repo root, since the rule is
+        // about the spelling and not about what is on disk.
+        if has_field_separator(mount.container_path()) {
+            return Err(MountRuleViolation::ContainerFieldSeparator {
+                path: mount.container_path().to_path_buf(),
+                declared_in,
+            });
+        }
+        if has_field_separator(mount.host_path()) {
+            return Err(MountRuleViolation::HostFieldSeparator {
+                path: mount.host_path().to_path_buf(),
+                declared_in,
+            });
+        }
         let folded = fold_container_path(mount.container_path());
         if folded == Path::new("/") {
             return Err(MountRuleViolation::ContainerRoot { declared_in });
@@ -1807,6 +1951,13 @@ fn check_mount_list(
 
         if let Some(root) = repo_root {
             let resolved = mount.resolved_host_path(root);
+            // Deliberately no `:` check on the resolved path, for the reason
+            // `validate_workspace_host_path` gives: what a clean path resolves
+            // *through* is a fact about this machine and this launch, not
+            // about the config, and a launch that serializes no mount at all
+            // (`outrig mcp --attach`) must not be stopped by it. The CLI's
+            // `refuse_mount_field_separators` holds the resolved paths to the
+            // rule for every launch that does mount.
             if !resolved.exists() {
                 return Err(MountRuleViolation::HostMissing {
                     path: mount.host_path().to_path_buf(),

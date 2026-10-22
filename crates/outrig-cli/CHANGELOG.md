@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A config mount path containing `:` is refused when the config is read, not by podman at
+  launch.** `workspace.host-path`, `workspace.container-path`, and either half of a
+  `[[workspace.mounts]]` or `[sidecars.<sc>.mounts]` entry render into podman's
+  `-v <host>:<container>:<options>`, so a `:` in a path made a fourth field podman rejected
+  when it created the container -- after the image was built or pulled, naming neither the key
+  nor the file. `run`, `mcp`, and `build` now refuse it while validating, naming the path and
+  the file that declared it. A path that spells none but *resolves* through a directory whose
+  name has one -- the repo root, or the directory of the declaring file -- is refused as the
+  session starts instead, by the same launches that mount: `outrig mcp --attach` borrows a
+  running container and serializes no mount, so it still works from such a directory. A host
+  directory whose name contains `:` cannot be mounted: podman's `-v` offers no way to escape
+  one. (#365)
 - **`outrig clean` and `outrig discard` no longer remove a session whose image is still
   building.** Both decided a session was live by looking up the container named in its record,
   and that container does not exist until the image is built and started -- minutes, for a cold

@@ -266,6 +266,9 @@ outrig run [--agent <name>]
   must be empty or not exist yet.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist.
+  `:` separates the fields, so neither path can contain one; a relative host path that
+  *resolves* through a directory whose name does is refused as the session starts, as the same
+  path in `[[workspace.mounts]]` is.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
 When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and

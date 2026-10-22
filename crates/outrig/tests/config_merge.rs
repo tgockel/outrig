@@ -874,6 +874,159 @@ container-path = "/resources/../res"
         cfg.validate(None).expect("folds to /res");
     }
 
+    /// podman renders a bind mount as `<host>:<container>:<options>`, so a
+    /// `:` in either half makes a fourth field it refuses at launch, after the
+    /// image is acquired and naming neither the key nor the file (#365). Both
+    /// halves are structural rules: no repo root is needed to see the shape.
+    #[test]
+    fn workspace_mount_container_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/a:b"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountContainerFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/resources/a:b"));
+            }
+            other => panic!("expected WorkspaceMountContainerFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_host_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "/host/a:b"
+container-path = "/resources/docs"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceMountHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceMountHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// The mount is refused for its shape before the host half is looked for
+    /// on disk: `/host/a:b` does not exist either, and the missing-host error
+    /// would send the reader after the wrong thing.
+    #[test]
+    fn workspace_mount_colon_is_reported_before_host_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "/host/a:b"
+container-path = "/resources/docs"
+"#,
+        );
+        match expect_validation_err(&cfg, Some(tmp.path())) {
+            ConfigValidationError::WorkspaceMountHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceMountHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// The rule is about what the config *spelled*. A clean relative
+    /// `host-path` that merely resolves through a directory with a `:` in its
+    /// name still validates: whether that matters depends on whether the
+    /// launch mounts anything, which the config layer cannot know, so the
+    /// CLI asks instead (`refuse_mount_field_separators`). Pinned here so the
+    /// check is not quietly moved back and `outrig mcp --attach` broken from
+    /// such a directory a second time (#365).
+    #[test]
+    fn workspace_mount_host_path_resolving_through_a_colon_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        // The primary workspace is given a clean absolute path of its own, so
+        // this pins the mount's rule and not the workspace's.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        let cfg = parse(&format!(
+            r#"
+[workspace]
+host-path = "{}"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/docs"
+"#,
+            clean.display()
+        ));
+        cfg.validate(Some(&root))
+            .expect("the entry spelled no colon; what it resolves through is the CLI's question");
+    }
+
+    /// The primary workspace is rendered by the same `-v` builder as the extra
+    /// mounts, so both of its paths are held to the same rule.
+    #[test]
+    fn workspace_container_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[workspace]
+container-path = "/work:space"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceContainerFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/work:space"));
+            }
+            other => panic!("expected WorkspaceContainerFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_host_path_with_colon_errors() {
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "/host/a:b"
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::WorkspaceHostFieldSeparator { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("/host/a:b"));
+            }
+            other => panic!("expected WorkspaceHostFieldSeparator, got: {other:?}"),
+        }
+    }
+
+    /// An undeclared `host-path` is the repo root -- outrig's own pick, the
+    /// current directory when no config was found -- so a `:` in it is a fact
+    /// about where the user is standing and not about any config. It stays
+    /// valid here; the CLI refuses it for a launch that mounts, and lets
+    /// `outrig mcp --attach`, which serializes no `-v`, proceed (#365).
+    #[test]
+    fn workspace_host_path_resolving_through_a_colon_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = parse("[workspace]\ncontainer-path = \"/workspace\"\n");
+        cfg.validate(Some(&root))
+            .expect("no config spelled a colon; the repo root's name is not a config error");
+    }
+
+    /// The rule is about `:` and nothing else: every other punctuation mark a
+    /// path may carry still validates.
+    #[test]
+    fn workspace_mount_without_a_colon_validates() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/a-b.c_d"
+"#,
+        );
+        cfg.validate(None).expect("no colon, no rule broken");
+    }
+
     #[test]
     fn workspace_mount_duplicate_container_path_errors() {
         let cfg = parse(
@@ -4200,6 +4353,58 @@ context    = "ctx"
                 }
             ),
             "expected a duplicate-container-path SidecarMount, got: {err:?}"
+        );
+    }
+
+    /// A sidecar mount goes through the same `-v` builder, so a `:` in either
+    /// half is the same malformed value (#365).
+    #[test]
+    fn sidecar_mount_container_path_with_colon_errors() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/data:extra"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerFieldSeparator { .. },
+                    ..
+                }
+            ),
+            "expected a container-field-separator SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_host_path_with_colon_errors() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "/host/a:b"
+  container-path = "/data"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::HostFieldSeparator { .. },
+                    ..
+                }
+            ),
+            "expected a host-field-separator SidecarMount, got: {err:?}"
         );
     }
 

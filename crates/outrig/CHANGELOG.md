@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`MountRuleViolation::HostFieldSeparator` / `ContainerFieldSeparator`, and the four
+  `ConfigValidationError` variants that restate them**
+  (`WorkspaceHostFieldSeparator`, `WorkspaceContainerFieldSeparator`,
+  `WorkspaceMountHostFieldSeparator`, `WorkspaceMountContainerFieldSeparator`): a bind-mount path
+  that contains `:`. See the fix below for why it is now refused. (#365)
+
+### Fixed
+
+- **A bind-mount path containing `:` is refused by validation instead of by podman at launch.**
+  A mount renders as one `-v <host>:<container>:<options>` value, so a `:` in either path made a
+  fourth field podman rejected when it created the container -- after the image was built or
+  pulled, and naming neither the key nor the file that declared it. `Config::validate` and
+  `Config::validate_workspace_mounts` now refuse one in `workspace.host-path`,
+  `workspace.container-path`, and either half of every `[[workspace.mounts]]` or
+  `[sidecars.<sc>.mounts]` entry, naming the path and the file. The rule is applied to each
+  path as the config spelled it: what a clean relative path *resolves through* is a fact about
+  the machine rather than the config, and a caller that serializes no mount at all must not be
+  stopped by it, so that half belongs to the launcher. `Container::start` and
+  `Container::create_initialized` hold a hand-built `ContainerLaunchSpec` to the same rule, as
+  they already do for a malformed capability entry -- the `view = "primary"` helper bind, whose
+  host side comes from the session directory, included. Not an injection:
+  podman reads options only from the third field of a `-v`, which a path cannot reach. A host
+  directory whose name contains `:` is now unmountable rather than unmountable with a worse
+  error -- podman's `-v` has no escape for one. (#365)
+
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.2) - 2026-10-20
 
 The second patch release since 0.2.0. Every change to the public surface is additive, and no

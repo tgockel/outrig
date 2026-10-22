@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, ProjectDirs};
 use tempfile::NamedTempFile;
 
-use outrig::config::{Config, ConfigSource, MountAccess};
+use outrig::config::{Config, ConfigSource, MountAccess, Workspace};
 use outrig::error::{IoPathExt, OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
@@ -311,6 +311,76 @@ fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -
     )))
 }
 
+/// Refuse a workspace whose *resolved* host path contains `:`, podman's bind-mount
+/// field separator.
+///
+/// Config validation refuses a `:` in a `host-path` as written, which is a
+/// config error wherever the config is read. This is the other half: a path
+/// that spells none can still resolve through a directory whose name has one
+/// -- the repo root for the built-in `.`, or the declaring file's directory
+/// for a relative value -- and the resolved path is what becomes the `-v`.
+///
+/// It lives here, and not in validation, because it is a fact about this
+/// launch rather than about the config: `outrig mcp --attach` borrows a
+/// running container and serializes no mount at all, so a session started
+/// from such a directory is none of its business. Every launch that does
+/// mount asks, before the image is acquired, so the diagnostic arrives in
+/// place of podman's -- which would come after the build and name neither the
+/// workspace nor the directory the colon is in.
+///
+/// Why that path is the workspace is read off `workspace`, not guessed: a
+/// declared `host-path` is the config's pick and is named with the file that
+/// declared it, since telling its author to run from somewhere else would be
+/// advice that cannot work -- a file-relative value resolves against that
+/// file's directory wherever outrig is invoked from. Only an undeclared
+/// workspace is outrig's own pick, and only it gets the
+/// [`implicit_workspace_origin`] explanation and the cwd advice that follows
+/// from it.
+pub(crate) fn refuse_workspace_field_separator(
+    resolved: &Path,
+    workspace: &Workspace,
+    repo_root: &Path,
+) -> Result<()> {
+    if !resolved.as_os_str().as_encoded_bytes().contains(&b':') {
+        return Ok(());
+    }
+    let (origin, help) = match workspace.declared_host_path() {
+        // Declared. Validation already refused a `:` this value spelled, so
+        // the colon is in what it resolved *through*: the directory of the
+        // file that declared it, or the repo root when nothing did.
+        Some(declared) => (
+            format!(
+                "[workspace] host-path {}{} resolves there",
+                declared.display(),
+                declared_in_clause(workspace.config_source())
+            ),
+            "help: podman offers no way to escape one, so point [workspace] host-path at a \
+             directory whose path has none",
+        ),
+        // Undeclared, so the path is outrig's own pick and the cwd is one of
+        // the two things that can have made it.
+        None => (
+            implicit_workspace_origin(repo_root),
+            "help: podman offers no way to escape one, so run outrig from a directory whose \
+             path has no `:`, or declare [workspace] host-path pointing at one",
+        ),
+    };
+    Err(OutrigError::Configuration(format!(
+        "refusing to mount {} as the workspace: its path contains `:`, which podman reads \
+         as the field separator of a `-v <host>:<container>[:<options>]` value, so the mount \
+         would be refused at launch; {origin}\n{help}",
+        resolved.display()
+    )))
+}
+
+/// ` declared in <file>` for a diagnostic, or nothing when no config file
+/// declared the value: a `--volume`, or one a library caller built.
+fn declared_in_clause(source: Option<&ConfigSource>) -> String {
+    source.map_or_else(String::new, |source| {
+        format!(" declared in {}", source.config_path().display())
+    })
+}
+
 /// What made `repo_root` the workspace when no config declared one, for a
 /// refusal to name: the repo config at the root, or no repo config at all, which
 /// leaves the current directory.
@@ -431,6 +501,44 @@ pub(crate) fn refuse_workspace_covering_global_config(
         workspace.display(),
         implicit_workspace_origin(repo_root)
     )))
+}
+
+/// Refuse an extra mount whose *resolved* host path contains `:`.
+///
+/// The companion to [`refuse_workspace_field_separator`], and there for the
+/// same reason: config validation refuses a `:` an entry spelled, but a
+/// relative `host-path` resolves against the directory of the file that
+/// declared it (or the repo root), and it is the resolved path that becomes
+/// the `-v`. Both the primary workspace's extra mounts and every sidecar's
+/// are checked, since one builder renders them all.
+///
+/// Named as resolved, which is where the colon is, with the entry as written
+/// beside it so the line to edit is identifiable.
+pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> Result<()> {
+    let workspace = cfg.workspace.mounts.iter().map(|m| ("mount".to_string(), m));
+    let sidecars = cfg.sidecars.iter().flat_map(|(name, sc)| {
+        sc.mounts
+            .iter()
+            .map(move |m| (format!("sidecar {name:?} mount"), m))
+    });
+    for (what, mount) in workspace.chain(sidecars) {
+        let resolved = mount.resolved_host_path(repo_root);
+        if !resolved.as_os_str().as_encoded_bytes().contains(&b':') {
+            continue;
+        }
+        // A `--volume` carries no file. Its own parser splits on `:`, so the
+        // colon is in what the path resolved through.
+        let declared = declared_in_clause(mount.config_source());
+        return Err(OutrigError::Configuration(format!(
+            "refusing {what} host-path {}{declared}: it resolves to {}, which contains `:` \
+             -- podman reads that as the field separator of a `-v \
+             <host>:<container>[:<options>]` value, so the mount would be refused at launch\n\
+             help: podman offers no way to escape one; point it at a path with no `:` in it",
+            mount.host_path().display(),
+            resolved.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a repo-declared host path that reaches the operator's own files. The
@@ -1024,6 +1132,111 @@ mod tests {
         let err = refusal(&root, &links, "read-write", &links.join("config.toml"))
             .expect("the symlink's directory");
         assert!(err.contains(&looked_up_through(&links)), "{err}");
+    }
+
+    /// A workspace resolving through a directory whose name carries `:` is
+    /// refused for a launch that mounts: podman would read it as the field
+    /// separator of the `-v` value and refuse the container after the image
+    /// was acquired. Undeclared, the path is outrig's own pick, so the
+    /// refusal says which default chose it and what to do about that (#365).
+    #[test]
+    fn an_undeclared_workspace_resolving_through_a_colon_is_refused() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("a:b");
+        fs::create_dir_all(&root).unwrap();
+
+        let implicit = Config::load_from_str("").unwrap().workspace;
+        let err = refuse_workspace_field_separator(&root, &implicit, &root)
+            .expect_err("the colon");
+        let err = err.to_string();
+        assert!(err.contains(&root.display().to_string()), "{err}");
+        assert!(err.contains("`:`"), "{err}");
+        assert!(err.contains("no repo config was found"), "names the default: {err}");
+        assert!(err.contains("run outrig from a directory"), "advises the cwd: {err}");
+
+        let clean = tmp.path().join("clean");
+        fs::create_dir_all(&clean).unwrap();
+        refuse_workspace_field_separator(&clean, &implicit, &clean)
+            .expect("no colon, nothing to refuse");
+    }
+
+    /// A *declared* `host-path` is the config's pick, not outrig's, and a
+    /// relative one resolves against the directory of the file that declared
+    /// it -- so where outrig was invoked from has nothing to do with it. The
+    /// refusal names that file and the key, and advises an edit rather than a
+    /// `cd` that could not help.
+    #[test]
+    fn a_declared_workspace_resolving_through_a_colon_names_its_file() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("a:b").join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("proj")).unwrap();
+        fs::write(&file, "[workspace]\nhost-path = \"proj\"\n").unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        // Nothing the file spelled holds a `:`, so validation passes it.
+        cfg.validate(Some(&repo)).expect("the entry itself is clean");
+        let resolved = cfg.workspace.resolved_host_path(&repo);
+
+        let err = refuse_workspace_field_separator(&resolved, &cfg.workspace, &repo)
+            .expect_err("the resolved colon");
+        let err = err.to_string();
+        assert!(err.contains(&resolved.display().to_string()), "{err}");
+        assert!(err.contains("host-path proj"), "names the key as written: {err}");
+        assert!(err.contains(&file.display().to_string()), "names the file: {err}");
+        assert!(
+            !err.contains("no repo config was found") && !err.contains("run outrig from"),
+            "neither claims the cwd chose it nor advises a cd: {err}"
+        );
+    }
+
+    /// The same question for the extra mounts, which resolve against the
+    /// directory of the file that declared them. The refusal names the entry
+    /// as written, the path it resolved to, and that file.
+    #[test]
+    fn a_mount_resolving_through_a_colon_is_refused() {
+        let tmp = tempdir().unwrap();
+        // The colon is in the repo root, which the entry resolves against.
+        let repo = tmp.path().join("a:b").join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            &file,
+            "[[workspace.mounts]]\nhost-path = \"docs\"\ncontainer-path = \"/docs\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        // The entry itself spells no colon, so config validation passes it.
+        cfg.validate(Some(&repo)).expect("nothing a config file said is malformed");
+
+        let err = refuse_mount_field_separators(&cfg, &repo).expect_err("the resolved colon");
+        let err = err.to_string();
+        assert!(err.contains("\"docs\"") || err.contains("docs"), "names the entry: {err}");
+        assert!(
+            err.contains(&repo.join("docs").display().to_string()),
+            "names what it resolved to: {err}"
+        );
+        assert!(err.contains(&file.display().to_string()), "names the file: {err}");
+        assert!(err.contains("`:`"), "{err}");
+    }
+
+    /// Only the resolved path is this rule's business, so a mount that
+    /// resolves cleanly passes however the repo root is spelled.
+    #[test]
+    fn a_mount_resolving_clean_is_not_refused() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            &file,
+            "[[workspace.mounts]]\nhost-path = \"docs\"\ncontainer-path = \"/docs\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_unvalidated(&repo, None).unwrap();
+        refuse_mount_field_separators(&cfg, &repo).expect("no colon anywhere");
     }
 
     /// The refusal says which default put the workspace there: a repo config
