@@ -63,8 +63,10 @@ outrig run [--agent <name>]
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Access defaults to read-only; append `:rw`
-  for read-write. The host directory must exist; relative host paths resolve against the
-  workspace root, and a leading `~` is your home directory.
+  for read-write. The host directory must exist; a relative host path resolves against the
+  directory you ran outrig from, the way your shell reads one, and a leading `~` is your home
+  directory. A config file's `[[workspace.mounts]]` resolves against that file instead -- see
+  [path resolution](../reference/config.md#path-resolution).
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 

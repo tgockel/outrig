@@ -96,6 +96,7 @@ pub struct McpArgs {
 
     /// Mount an extra host directory into the container. Repeatable. Format
     /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
+    /// A relative host path resolves against the current directory.
     #[arg(long = "volume", global = true, value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
     pub volume: Vec<CliVolume>,
 }

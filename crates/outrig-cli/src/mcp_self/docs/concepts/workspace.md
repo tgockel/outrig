@@ -150,6 +150,8 @@ Extra `workspace.mounts` entries are for supporting directories: sibling repos, 
 SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
 when the repo config declares it, and beside the file that declares it otherwise -- the global
 config, or a `--config` file kept outside `.agents/outrig/`; a leading `~` is your home directory.
+A `--volume` on the command line is declared in no file, so its relative host path resolves
+against the directory you ran outrig from, as your shell would read it.
 See [path resolution](../reference/config.md#path-resolution). Their container paths must be
 absolute, cannot be `/`, and must not duplicate the primary workspace or another extra mount.
 Exact duplicates fail during config validation instead of relying on podman mount ordering.

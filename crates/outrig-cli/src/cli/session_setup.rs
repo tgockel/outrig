@@ -426,12 +426,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             )
             .into());
         }
+        // Against the working directory, not `repo_root`: the flag was typed
+        // at a shell, which reads a relative path from where it was typed,
+        // and a `--volume` is declared in no config file (#367). Resolved
+        // before validation so the existence check and any diagnostic speak
+        // of the directory the user meant.
+        let cwd = crate::paths::current_dir()?;
         for vol in args.volumes {
-            cfg.workspace.mounts.push(MountConfig::new(
-                vol.host.clone(),
-                vol.container.clone(),
-                vol.access,
-            ));
+            cfg.workspace.mounts.push(vol.to_mount(&cwd));
         }
         cfg.validate_workspace_mounts(Some(&repo_root))?;
     }

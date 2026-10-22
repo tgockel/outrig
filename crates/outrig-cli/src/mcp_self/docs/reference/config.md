@@ -1414,10 +1414,16 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 | `--config <path>`            | `<path>`'s parent directory            |
 | `~/.outrig/config.toml`      | that file's directory (`~/.outrig/`)   |
 | `--global-config <path>`     | `<path>`'s parent directory            |
+| `--volume` (no file at all)  | the current directory                  |
 
 A `--config` path that ends in `.agents/outrig/config.toml` is that repo's own config and takes the
 first row; any other takes the second. See
 [Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
+
+The last row is not a config file: `outrig run --volume` and `outrig mcp --volume` add a mount
+that no file declared, and the base that gives a typed path its meaning is the directory it was
+typed in -- the one the shell itself would resolve it against. The repo root is not that
+directory for a `--volume` passed from a subdirectory of the repo.
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
 `[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, to `host-path` in

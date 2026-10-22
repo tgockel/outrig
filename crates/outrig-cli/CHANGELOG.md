@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A relative `--volume` host path is read from the directory you ran outrig in.** It was
+  resolved against the repo root -- the directory holding `.agents/outrig/` -- because a mount
+  built from the flag carries no config file to resolve against, and the launch path falls back
+  to the repo root for such an entry. A shell reads a relative path from the current directory,
+  so `outrig run --volume data:/data` issued from a subdirectory of a repo mounted the repo's
+  `data/` when the user meant the subdirectory's: silently the wrong directory when both exist,
+  and a refusal naming a path nobody typed when only the intended one does. The flag now
+  resolves against the current directory, before the mount rules are checked, so the existence
+  check and every diagnostic speak of the directory the flag means. Absolute paths are
+  unaffected, a leading `~` is still your home directory, and a `[[workspace.mounts]]` entry in
+  a config file still resolves against the file that declared it. (#367)
 - **A config mount path containing `:` is refused when the config is read, not by podman at
   launch.** `workspace.host-path`, `workspace.container-path`, and either half of a
   `[[workspace.mounts]]` or `[sidecars.<sc>.mounts]` entry render into podman's

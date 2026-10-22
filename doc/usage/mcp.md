@@ -53,7 +53,8 @@ outrig mcp self
   sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Read-only unless `:rw` is given; the host
-  directory must exist. Rejected with `--attach`.
+  directory must exist. A relative host path resolves against the directory you ran outrig
+  from, not against the repo root. Rejected with `--attach`.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
