@@ -42,7 +42,7 @@ use crate::paths::{
     RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
     refuse_workspace_covering_global_config, repo_config_path,
 };
-use crate::session::{self, Session, SessionId, SessionStore};
+use crate::session::{self, Session, SessionId, SessionLock, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
     SidecarOnFailure, SidecarStart, SidecarView,
@@ -253,6 +253,13 @@ pub struct SessionRuntime {
     pub mcp_arcs: Vec<Arc<McpClient>>,
     pub network: Option<NetworkInterceptor>,
     pub containers: SessionContainers,
+    /// This launch's claim on the record as a live session, from
+    /// [`SessionStore::create`]. Out of teardown order deliberately:
+    /// [`teardown`] takes it out before the stops and drops it only after the
+    /// record is finalized, so nothing can remove the record while the
+    /// session is being torn down (#366). `None` when the claim could not be
+    /// taken -- see [`session::claim_owner`].
+    pub session_lock: Option<SessionLock>,
 }
 
 impl SessionRuntime {
@@ -262,12 +269,14 @@ impl SessionRuntime {
         watcher: Option<SessionWatcher>,
         network: Option<NetworkInterceptor>,
         containers: SessionContainers,
+        session_lock: Option<SessionLock>,
     ) -> Self {
         Self {
             watcher,
             mcp_arcs: Vec::new(),
             network,
             containers,
+            session_lock,
         }
     }
 }
@@ -304,6 +313,11 @@ pub struct SessionSetup {
     /// at its default disposition. The command races its own slow steps
     /// against these, as setup did.
     pub signals: Signals,
+    /// The claim that says this session is live, taken as the record was
+    /// written. The command hands it to [`SessionRuntime::new`], which hands
+    /// it to [`teardown`]; dropping it early would expose the record to
+    /// `clean` and `discard` while the session still runs (#366).
+    pub session_lock: Option<SessionLock>,
 }
 
 #[derive(Debug)]
@@ -582,9 +596,16 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // ends the process without the session torn down: each slow step below
     // is raced against these, and a signal takes that step's bail-out.
     let mut signals = Signals::install()?;
-    let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
+    // `session_lock` is this launch's claim on the record as a live one, held
+    // from here to `teardown`'s finalize. Without it `clean` and `discard`
+    // decide liveness by the recorded container, which does not exist until
+    // the image is built and started below -- minutes, for a cold build
+    // (#366).
+    let (session_dir, session_lock) = store.create(&sid, args.explicit_session_dir, &mut session)?;
     // Every bail-out before there are containers to stop: end the record with
-    // the exit code `e` carries, and pass `e` on.
+    // the exit code `e` carries, and pass `e` on. `session_lock` is still a
+    // local here, so it outlives the finalize and is dropped as the `?`
+    // returns -- the order `teardown` spells out.
     let fail = |e: CliError| {
         let _ = store.finalize(&sid, SystemTime::now(), e.exit_code());
         e
@@ -679,7 +700,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
     let span = ProgressSpan::start("bootstrapping container user");
     if let Err(e) = signals.race(containers.primary.bootstrap_user()).await {
-        return Err(abort_containers(containers, &store, &sid, e).await);
+        return Err(abort_containers(containers, &store, &sid, session_lock, e).await);
     }
     span.done("container user ready");
 
@@ -705,13 +726,13 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let sidecars_and_network = setup_sidecars_and_network(phase, &mut containers);
     let (mcp_plan, network) = match signals.race(sidecars_and_network).await {
         Ok(outcome) => outcome,
-        Err(e) => return Err(abort_containers(containers, &store, &sid, e).await),
+        Err(e) => return Err(abort_containers(containers, &store, &sid, session_lock, e).await),
     };
 
     if !containers.sidecars.is_empty() {
         let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
-            return Err(abort_containers(containers, &store, &sid, e).await);
+            return Err(abort_containers(containers, &store, &sid, session_lock, e).await);
         }
         session.sidecar_container_names = names;
     }
@@ -748,6 +769,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         mcp_plan,
         watcher,
         signals,
+        session_lock,
     })
 }
 
@@ -1489,10 +1511,15 @@ async fn create_one_entrypoint_sidecar(
 ///
 /// A signal during the stops ends the wait, not the cleanup -- see
 /// [`signals::unless_signaled`] -- and the record is finalized either way.
+///
+/// `lock` is the session's liveness claim, taken by value and dropped on
+/// return: a bail-out is still a live session until its record says it
+/// ended, exactly as in [`teardown`].
 async fn abort_containers(
     containers: SessionContainers,
     store: &SessionStore,
     sid: &SessionId,
+    lock: Option<SessionLock>,
     cause: CliError,
 ) -> CliError {
     signals::unless_signaled(async move {
@@ -1512,6 +1539,7 @@ async fn abort_containers(
     })
     .await;
     let _ = store.finalize(sid, SystemTime::now(), cause.exit_code());
+    drop(lock);
     cause
 }
 
@@ -1694,16 +1722,23 @@ pub async fn connect_mcp_clients(
 /// A SIGINT or SIGTERM during the stops ends the wait, not the cleanup --
 /// see [`signals::unless_signaled`]. The record is finalized either way,
 /// which is why it is not part of the sequence that signal can cut short.
+/// The session's liveness claim outlasts all of it and is released last, so
+/// the record cannot be removed between the last stop and the finalize.
 ///
 /// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
 /// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
 pub async fn teardown(
-    runtime: SessionRuntime,
+    mut runtime: SessionRuntime,
     store: &SessionStore,
     sid: &SessionId,
     outcome: &Result<i32>,
 ) {
+    // Out of `runtime` before the stops, so it is not dropped with the rest
+    // of it: the session is live until the record says it ended, and a
+    // `clean` or `discard` landing between the last stop and the finalize
+    // would remove the record this is about to write (#366).
+    let session_lock = runtime.session_lock.take();
     signals::unless_signaled(stop_session(runtime)).await;
     let exit_code = outcome
         .as_ref()
@@ -1714,6 +1749,9 @@ pub async fn teardown(
             "session finalize failed: {e}"
         );
     }
+    // The record is finalized: the session is no longer live, and this is
+    // what says so to anything probing the directory.
+    drop(session_lock);
 }
 
 /// Everything [`teardown`] does before it finalizes the record.
@@ -1723,6 +1761,11 @@ async fn stop_session(runtime: SessionRuntime) {
         mcp_arcs,
         network,
         containers,
+        // `teardown` took it out before calling this, so the stops cannot
+        // drop the session's liveness claim ahead of the finalize. Anything
+        // else dropping a `SessionRuntime` wholesale releases it here, which
+        // is right: there is no finalize coming.
+        session_lock: _,
     } = runtime;
     if let Some(watcher) = watcher {
         watcher.shutdown();

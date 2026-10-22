@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
 use outrig_cli::error::CliError;
-use outrig_cli::session::{SessionId, SessionStore};
+use outrig_cli::session::{self, SessionId, SessionStore};
 
 mod common;
 use common::{
@@ -22,7 +22,7 @@ fn auto_path_creates_session_json() {
     let dir = root.path().join(sid.as_str());
     let mut session = sample_session(&sid);
 
-    let returned = store.create(&sid, None, &mut session).expect("create");
+    let returned = store.create(&sid, None, &mut session).expect("create").0;
     assert_eq!(returned, dir);
     assert_eq!(
         session.session_dir, dir,
@@ -50,7 +50,8 @@ fn explicit_path_creates_session_and_symlink() {
 
     let returned = store
         .create(&sid, Some(explicit.path()), &mut session)
-        .expect("create");
+        .expect("create")
+        .0;
     assert_eq!(returned, canon_explicit);
     assert_eq!(session.session_dir, canon_explicit);
 
@@ -144,7 +145,8 @@ fn explicit_path_that_does_not_exist_is_created() {
 
     let returned = store
         .create(&sid, Some(&explicit), &mut session)
-        .expect("create");
+        .expect("create")
+        .0;
     let canon = std::fs::canonicalize(&explicit).expect("the directory should be created");
     assert_eq!(returned, canon);
     assert!(canon.join("session.json").exists());
@@ -392,7 +394,8 @@ fn remove_by_id_symlinked_keeps_what_outrig_did_not_write() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     write_user_files(&canon);
 
@@ -412,7 +415,8 @@ fn remove_by_id_auto_keeps_what_outrig_did_not_write() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&dir);
     write_user_files(&dir);
 
@@ -429,7 +433,8 @@ fn remove_by_path_keeps_what_outrig_did_not_write() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     write_user_files(&canon);
 
@@ -454,7 +459,8 @@ fn remove_by_id_keeps_a_logs_that_is_not_a_directory() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     std::fs::write(canon.join("logs"), b"my log\n").expect("write logs file");
 
     let left = store.remove_by_id(&sid).expect("remove");
@@ -478,7 +484,8 @@ fn remove_by_id_keeps_record_names_of_another_type() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     std::fs::create_dir_all(canon.join("outrig-enter/inside")).expect("mkdir");
     std::os::unix::fs::symlink(elsewhere.path(), canon.join("logs")).expect("symlink");
 
@@ -509,7 +516,8 @@ fn remove_by_path_through_the_link_removes_the_record_it_names() {
     let sid = SessionId("20261003T110000-dddd".into());
     let canon = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&canon);
     let link = root.path().join(sid.as_str());
 
@@ -827,4 +835,126 @@ fn frozen_on_disk_records_still_load() {
             "fixture {name} must not be skipped"
         );
     }
+}
+
+// -------- #366: the claim that says a session is live --------
+
+#[test]
+/// The window the issue is about: a record exists, `ended_at` is `None`, and
+/// no container has been created yet because the image is still building.
+/// The claim `create` hands back is the only thing that can say the session
+/// is live, and it says so for as long as it is held.
+fn create_claims_the_directory_until_the_lock_is_dropped() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let (dir, lock) = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+
+    assert!(lock.is_some(), "a tempdir supports the claim");
+    assert!(
+        session::owner_is_live(&dir),
+        "the launch still holds the session"
+    );
+
+    drop(lock);
+    assert!(
+        !session::owner_is_live(&dir),
+        "the claim ends with the launch, as teardown's drop does"
+    );
+}
+
+#[test]
+/// The same for a `--session-dir` session: the claim is on the directory the
+/// record is in, which is the link's target, not the link.
+fn an_explicit_directory_is_claimed_too() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let (dir, lock) = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+
+    assert!(session::owner_is_live(&dir), "the target is claimed");
+    drop(lock);
+    assert!(!session::owner_is_live(&dir));
+}
+
+#[test]
+/// Every update to the record renames a new file over `session.json`, so a
+/// claim on *that* would be left behind on the replaced inode. The claim is
+/// on the directory, which survives the rename.
+fn the_claim_survives_updates_to_the_record() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let (dir, _lock) = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+
+    store
+        .set_sidecar_containers(&sid, &["outrig-20260501T134412-3f2a-tools".to_string()])
+        .expect("set sidecars");
+    assert!(
+        session::owner_is_live(&dir),
+        "a record rewritten under the claim is still claimed"
+    );
+
+    store
+        .finalize(&sid, SystemTime::now(), 0)
+        .expect("finalize");
+    assert!(
+        session::owner_is_live(&dir),
+        "finalize does not release the claim; teardown drops it afterwards"
+    );
+}
+
+#[test]
+/// A record with no live owner -- what a session that ended, or one whose
+/// process was killed outright, leaves behind. The kernel drops the claim
+/// with the process, so these stay removable.
+fn a_record_without_a_live_owner_is_not_claimed() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+
+    assert!(
+        !session::owner_is_live(&dir),
+        "nothing holds the claim once create's caller drops it"
+    );
+    assert!(
+        !session::owner_is_live(&root.path().join("20260501T134412-0000")),
+        "a directory that does not exist has no live owner"
+    );
+}
+
+#[test]
+/// Two launches at once each claim their own directory, and neither reads as
+/// the owner of the other's.
+fn claims_are_per_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let a = SessionId("20260501T134412-3f2a".into());
+    let b = SessionId("20260501T134413-44d2".into());
+    let (dir_a, lock_a) = store
+        .create(&a, None, &mut sample_session(&a))
+        .expect("create a");
+    let (dir_b, _lock_b) = store
+        .create(&b, None, &mut sample_session(&b))
+        .expect("create b");
+
+    assert!(session::owner_is_live(&dir_a));
+    assert!(session::owner_is_live(&dir_b));
+    drop(lock_a);
+    assert!(!session::owner_is_live(&dir_a));
+    assert!(
+        session::owner_is_live(&dir_b),
+        "one launch ending does not release another's claim"
+    );
 }

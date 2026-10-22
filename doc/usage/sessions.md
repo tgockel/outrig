@@ -293,8 +293,14 @@ $ outrig discard 20261003T120000-aaaa --yes
 If such a directory had a `logs/` of its own before the session, the session's logs went into
 it, and it goes with them.
 
-A session that's still running can't be discarded; outrig refuses with an error pointing at the
-running container.
+A session that's still running can't be discarded; outrig refuses with an error pointing at what
+is holding it. Two things count as running, and either is enough: the process that launched the
+session still holds its session directory, or the container named in the record is up. The first
+is what protects a session whose container does not exist yet -- a cold image build takes
+minutes, and until it finishes the record looks exactly like a session that ended without
+writing an `ended_at`. The hold is released once the session's record is finalized, and the
+kernel releases it however the launching process dies, so a record left behind by a killed
+`outrig run` stays discardable.
 
 ## `outrig clean`
 
@@ -327,7 +333,8 @@ $ outrig clean --older-than 30d --yes
 remove the session directory, while sessions created with `--session-dir` remove both the
 symlink target and the symlink under the session root. A directory that holds anything besides
 the record stays, and clean says what it kept. Running sessions are skipped so cleanup doesn't
-race a live `outrig run` or `outrig mcp` writer.
+race a live `outrig run` or `outrig mcp` writer -- by the same two-part test `discard` uses, so
+a short `--older-than` cannot sweep up a session that is still building its image.
 
 A record outrig cannot read is not shown to you, so `--yes` does not remove it: `clean` names
 it and leaves it. Add `--unreadable` to have it previewed and removed with the rest, aged by the

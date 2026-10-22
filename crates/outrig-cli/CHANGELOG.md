@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig clean` and `outrig discard` no longer remove a session whose image is still
+  building.** Both decided a session was live by looking up the container named in its record,
+  and that container does not exist until the image is built and started -- minutes, for a cold
+  build. Until then the record looked like a finished session that never got an `ended_at`, so
+  `outrig discard <id>` removed it, and so did an `outrig clean` whose `--older-than` reached
+  its start time, pulling `session.json` and `logs/` out from under a launch that was still
+  running. Both now also ask whether a live process is holding the session directory: the
+  launching process claims it as it writes the record and releases the claim only once teardown
+  has finalized it, so a session is protected for the whole of its life, from before its
+  container exists to after its last container is stopped. The claim is a lock on the directory,
+  held by an open file descriptor and nothing on disk, so it leaves no fourth name in the
+  session directory and the kernel releases it however the process dies, SIGKILL included. A
+  record left unfinalized by a killed launch therefore stays removable, as before. On a
+  filesystem that does not support these locks -- some network mounts -- no claim is taken and
+  neither command's behavior changes. (#366)
 - **A released subagent's last transcript record cannot land under its relaunch's header.**
   Records were written through `tokio::fs`, which hands the bytes to a blocking thread and leaves
   only `flush` to wait for them. Releasing a subagent aborts its task, which dropped that wait and

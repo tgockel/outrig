@@ -316,7 +316,7 @@ async fn logs_no_server_lists_files_with_sizes() {
     let store = SessionStore::new(root.path().to_path_buf());
     let sid = SessionId("20260501T134412-3f2a".into());
     let mut s = sample_session(&sid);
-    let dir = store.create(&sid, None, &mut s).expect("create");
+    let dir = store.create(&sid, None, &mut s).expect("create").0;
     write_log(&dir, "fs.stderr", b"hello fs\n");
     write_log(&dir, "shell.stderr", &vec![b'x'; 1228]);
 
@@ -350,7 +350,7 @@ async fn logs_no_server_lists_nested_subagent_transcripts() {
     let store = SessionStore::new(root.path().to_path_buf());
     let sid = SessionId("20260501T134412-3f2a".into());
     let mut s = sample_session(&sid);
-    let dir = store.create(&sid, None, &mut s).expect("create");
+    let dir = store.create(&sid, None, &mut s).expect("create").0;
     std::fs::create_dir_all(dir.join("logs/subagent-audit/subagent-audit")).expect("nested dirs");
     let names = [
         "subagent-audit.log",
@@ -383,7 +383,7 @@ async fn logs_with_server_cats_file() {
     let store = SessionStore::new(root.path().to_path_buf());
     let sid = SessionId("20260501T134412-3f2a".into());
     let mut s = sample_session(&sid);
-    let dir = store.create(&sid, None, &mut s).expect("create");
+    let dir = store.create(&sid, None, &mut s).expect("create").0;
     let body = b"line one\nline two\n";
     write_log(&dir, "fs.stderr", body);
 
@@ -407,7 +407,8 @@ async fn logs_substring_resolves_uniquely() {
         let sid = SessionId(sid_s.into());
         let dir = store
             .create(&sid, None, &mut sample_session(&sid))
-            .expect("create");
+            .expect("create")
+            .0;
         write_log(&dir, "fs.stderr", format!("body {sid_s}\n").as_bytes());
     }
 
@@ -648,7 +649,8 @@ async fn discard_yes_removes_auto_session() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     assert!(dir.exists());
 
     let (mut ew, _stderr_r) = duplex(4096);
@@ -670,7 +672,8 @@ async fn discard_yes_removes_symlinked_session() {
     let sid = SessionId("20260501T141907-9b1c".into());
     let target = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     let link = root.path().join(sid.as_str());
     assert!(target.exists());
     assert!(
@@ -704,7 +707,8 @@ async fn discard_refuses_when_running() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, _stderr_r) = duplex(4096);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
@@ -727,7 +731,8 @@ async fn discard_session_dir_path_works() {
     let sid = SessionId("20260501T141907-9b1c".into());
     let target = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     assert!(target.exists());
 
     let (mut ew, _stderr_r) = duplex(4096);
@@ -756,7 +761,8 @@ async fn discard_keeps_files_outrig_did_not_write() {
     let sid = SessionId("20261003T120000-aaaa".into());
     let target = store
         .create(&sid, Some(notes.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&target);
     write_user_files(&target);
 
@@ -797,7 +803,8 @@ async fn discard_session_dir_through_the_link_removes_the_record() {
     let sid = SessionId("20261003T110000-dddd".into());
     let target = store
         .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&target);
     let link = root.path().join(sid.as_str());
 
@@ -825,7 +832,8 @@ async fn discard_without_yes_aborts_on_n() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, _stderr_r) = duplex(4096);
     let stdin = tokio::io::BufReader::new(&b"n\n"[..]);
@@ -845,7 +853,8 @@ async fn discard_accepts_yes_at_prompt() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, _stderr_r) = duplex(4096);
     let stdin = tokio::io::BufReader::new(&b"yes\n"[..]);
@@ -977,7 +986,8 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
             None,
             &mut session_with_age(&old_sid, now, days(40), Some(days(31))),
         )
-        .expect("old create");
+        .expect("old create")
+        .0;
     let recent_sid = SessionId("20260502T134412-4a4a".into());
     let recent_dir = store
         .create(
@@ -985,7 +995,8 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
             None,
             &mut session_with_age(&recent_sid, now, days(29), Some(days(29))),
         )
-        .expect("recent create");
+        .expect("recent create")
+        .0;
 
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
@@ -1032,7 +1043,8 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
                 Some(Duration::from_secs(7_200)),
             ),
         )
-        .expect("old create");
+        .expect("old create")
+        .0;
     let recent_sid = SessionId("20260502T134412-4a4a".into());
     let recent_dir = store
         .create(
@@ -1045,7 +1057,8 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
                 Some(Duration::from_secs(1_000)),
             ),
         )
-        .expect("recent create");
+        .expect("recent create")
+        .0;
 
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
@@ -1084,7 +1097,8 @@ async fn clean_without_yes_aborts_on_n() {
             None,
             &mut session_with_age(&sid, now, days(40), Some(days(31))),
         )
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(&b"n\n"[..]);
@@ -1124,7 +1138,8 @@ async fn clean_accepts_yes_at_prompt() {
             None,
             &mut session_with_age(&sid, now, days(40), Some(days(31))),
         )
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, _stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(&b"yes\n"[..]);
@@ -1156,7 +1171,8 @@ async fn clean_skips_running_sessions() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
-        .expect("create");
+        .expect("create")
+        .0;
     let running = format!("outrig-{}", sid.as_str());
 
     let (mut ew, stderr_r) = duplex(8192);
@@ -1195,7 +1211,8 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
     let sid = SessionId("20260501T134412-3f2a".into());
     let dir = store
         .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
-        .expect("create");
+        .expect("create")
+        .0;
 
     let (mut ew, _stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
@@ -1232,7 +1249,8 @@ async fn clean_removes_symlinked_session_target_and_link() {
             Some(explicit.path()),
             &mut session_with_age(&sid, now, days(40), Some(days(31))),
         )
-        .expect("create");
+        .expect("create")
+        .0;
     let link = root.path().join(sid.as_str());
     assert!(target.exists());
     assert!(
@@ -1286,7 +1304,8 @@ async fn clean_keeps_files_outrig_did_not_write() {
             Some(notes.path()),
             &mut session_with_age(&sid, now, days(40), Some(days(31))),
         )
-        .expect("create");
+        .expect("create")
+        .0;
     write_outrig_entries(&target);
     write_user_files(&target);
 
@@ -1342,7 +1361,8 @@ async fn clean_carries_on_past_a_logs_that_is_not_a_directory() {
             Some(notes.path()),
             &mut session_with_age(&legacy, now, days(40), Some(days(31))),
         )
-        .expect("create legacy");
+        .expect("create legacy")
+        .0;
     std::fs::write(target.join("logs"), b"my log\n").expect("write logs file");
     let older = SessionId("20260501T090000-bbbb".into());
     let older_dir = store
@@ -1351,7 +1371,8 @@ async fn clean_carries_on_past_a_logs_that_is_not_a_directory() {
             None,
             &mut session_with_age(&older, now, days(41), Some(days(32))),
         )
-        .expect("create older");
+        .expect("create older")
+        .0;
 
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
@@ -2385,7 +2406,8 @@ fn unreadable_session(root: &std::path::Path) -> (SessionStore, SessionId, PathB
     let sid = SessionId("20260501T141907-9b1c".into());
     let dir = store
         .create(&sid, None, &mut sample_session(&sid))
-        .expect("create");
+        .expect("create")
+        .0;
     let record = dir.join("session.json");
     let len = std::fs::metadata(&record).expect("stat").len();
     std::fs::OpenOptions::new()
@@ -2407,7 +2429,7 @@ fn unreadable_session_naming(
     let sid = SessionId("20260501T141907-9b1c".into());
     let mut session = sample_session(&sid);
     session.container_name = container.to_string();
-    let dir = store.create(&sid, None, &mut session).expect("create");
+    let dir = store.create(&sid, None, &mut session).expect("create").0;
     let record = dir.join("session.json");
     let text = std::fs::read_to_string(&record).expect("read");
     let cut = text.find("\"image_tag\"").expect("image_tag") - 1;
@@ -2741,4 +2763,179 @@ async fn discard_yes_still_warns_when_an_unreadable_record_names_no_container() 
         );
         assert!(!dir.exists());
     }
+}
+
+// -------- #366: a session still building its image is protected --------
+
+/// The window the issue describes: the record is on disk with `ended_at:
+/// None`, the launch holds its claim, and the container named in the record
+/// does not exist yet because the image is still building. `podman inspect`
+/// on a container that does not exist reads as "not running", so every
+/// `is_running`/`running` hook below says so, exactly as podman would.
+fn building_session(root: &std::path::Path, now: SystemTime) -> (SessionStore, SessionId, PathBuf) {
+    let store = SessionStore::new(root.to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    // Aged well past any cutoff, so nothing but liveness keeps `clean` off
+    // it. The real window is minutes long and the cutoff can be `1m`; this
+    // is the same condition without the wait.
+    let (dir, lock) = store
+        .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
+        .expect("create");
+    assert!(
+        lock.is_some(),
+        "the fixture needs a real claim to be testing anything"
+    );
+    // Leaked rather than returned: the launch holds it for the whole of the
+    // command under test, and the test's assertions are about what that
+    // command did. Each case gets a fresh tempdir, which goes away with it.
+    std::mem::forget(lock);
+    (store, sid, dir)
+}
+
+#[tokio::test]
+/// `outrig discard <id>` during an image build. Before the fix this passed
+/// its only check -- the record's container is not running -- and removed
+/// the record of a launch that was still going.
+async fn discard_refuses_a_session_whose_image_is_still_building() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let (store, sid, dir) = building_session(root.path(), SystemTime::now());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect_err("a launch still holding its session must not be discarded");
+    drop(ew);
+
+    let msg = format!("{err}");
+    assert!(msg.contains("still running"), "{msg}");
+    assert!(
+        msg.contains(&dir.display().to_string()),
+        "the refusal should name what is held: {msg}"
+    );
+    assert!(dir.exists(), "the record must survive the refusal");
+    assert!(
+        dir.join("session.json").exists(),
+        "and so must the record itself"
+    );
+}
+
+#[tokio::test]
+/// The same window reached through `discard --session-dir <dir>`, which
+/// resolves the session by path rather than by id.
+async fn discard_by_dir_refuses_a_session_whose_image_is_still_building() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let (store, _sid, dir) = building_session(root.path(), SystemTime::now());
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_dir(&dir, true);
+    let err = discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect_err("--session-dir must refuse it too");
+    drop(ew);
+
+    assert!(format!("{err}").contains("still running"), "{err}");
+    assert!(dir.join("session.json").exists());
+}
+
+#[tokio::test]
+/// `outrig clean --older-than 1m --yes` during a three-minute build. The
+/// cutoff is short enough to reach the record, and before the fix only the
+/// container check stood between it and removal.
+async fn clean_skips_a_session_whose_image_is_still_building() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let now = clean_now();
+    let (store, sid, dir) = building_session(root.path(), now);
+
+    // No running containers at all: the build has not started one.
+    let err = run_clean(
+        &store,
+        &clean_args(Duration::from_secs(60), true),
+        BTreeSet::new(),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(dir.exists(), "the record of a live launch must remain");
+    assert!(err.contains("skipped running sessions"), "{err}");
+    assert!(err.contains(sid.as_str()), "{err}");
+}
+
+#[tokio::test]
+/// The claim covers a record too damaged to parse as well -- `clean
+/// --unreadable` ages those by the id in the directory name and would
+/// otherwise remove one whose launch is still writing it.
+async fn clean_unreadable_skips_a_record_with_a_live_owner() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let (store, sid, dir) = building_session(root.path(), clean_now());
+    let record = dir.join("session.json");
+    let len = std::fs::metadata(&record).expect("stat").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .expect("open")
+        .set_len(len / 2)
+        .expect("truncate");
+
+    let args = clean::CleanArgs {
+        unreadable: true,
+        ..clean_args(Duration::from_secs(60), true)
+    };
+    let err = run_clean(&store, &args, BTreeSet::new(), Vec::new()).await;
+
+    assert!(dir.exists(), "a live owner outranks --unreadable");
+    assert!(err.contains("skipped running sessions"), "{err}");
+    assert!(err.contains(sid.as_str()), "{err}");
+}
+
+#[tokio::test]
+/// The other side of the same rule: once the launch is gone, its record is
+/// removable again -- including the one a killed `outrig run` left with
+/// `ended_at: None` and no container, which has no owner to hold it and
+/// would otherwise be unremovable forever.
+async fn an_unfinalized_record_whose_launch_is_gone_is_still_removable() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let (dir, lock) = store
+        .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
+        .expect("create");
+    // What the kernel does when the launching process dies, by SIGKILL or
+    // otherwise: the claim goes with it.
+    drop(lock);
+
+    let err = run_clean(
+        &store,
+        &clean_args(Duration::from_secs(60), true),
+        BTreeSet::new(),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(!dir.exists(), "an ownerless record is removable: {err}");
+}
+
+#[tokio::test]
+/// And the same record through `discard`, which has no cutoff at all.
+async fn discard_removes_an_unfinalized_record_whose_launch_is_gone() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+
+    let (mut ew, _stderr_r) = duplex(4096);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = args_for_id(sid.as_str(), true);
+    discard::execute_with(&mut ew, stdin, &store, &args, |_| async { Ok(false) })
+        .await
+        .expect("no owner, no container: removable");
+    drop(ew);
+
+    assert!(!dir.exists());
 }

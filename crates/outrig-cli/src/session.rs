@@ -12,12 +12,22 @@
 //! Either way the record is `session.json`, `logs/`, and -- for a session with
 //! a `view = "primary"` sidecar -- `outrig-enter`. Removal deletes those three
 //! names and nothing else, then the directory if that empties it.
+//!
+//! A record on disk does not mean a session is running, and `ended_at: None`
+//! does not either -- a launch killed outright leaves one of those forever.
+//! What says a session is live is [`SessionLock`]: the launching process
+//! claims the session directory as it creates it and holds the claim until
+//! the record is finalized, and `clean` and `discard` ask [`owner_is_live`]
+//! before removing anything. See [`claim_owner`] for why that is a lock on
+//! the directory and not a file in it.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use nix::fcntl::{FcntlArg, fcntl};
+use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{
@@ -257,12 +267,19 @@ impl SessionStore {
     /// that nothing in it predates the session. Writing the record claims the
     /// directory: of two launches given one at once, the second to write is
     /// refused.
+    ///
+    /// The [`SessionLock`] alongside the path is the caller's claim on the
+    /// session as a *live* one, and it lasts exactly as long as the value is
+    /// held: a caller that drops it at once has a record `clean` and
+    /// `discard` may remove from under it before its container exists (#366).
+    /// Every launch holds it until teardown has finalized the record; the
+    /// tests that only want a record on disk drop it.
     pub fn create(
         &self,
         sid: &SessionId,
         explicit_dir: Option<&Path>,
         session: &mut Session,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, Option<SessionLock>)> {
         // Before the root is created, so a root nested inside the explicit
         // directory is not taken for something already there. These checks are
         // the policy and the messages for a directory that is plainly taken;
@@ -312,7 +329,13 @@ impl SessionStore {
             }
         };
 
-        Ok(actual_dir)
+        // After the record, so the claim covers a directory that is already
+        // the session's: taken before it, the explicit-directory checks above
+        // could still turn this launch away, and a claim outliving them by
+        // even a moment would read as a live owner of a directory this
+        // process does not own.
+        let lock = claim_owner(&actual_dir);
+        Ok((actual_dir, lock))
     }
 
     /// Update `ended_at` + `exit_code` on a session that's already on disk.
@@ -569,6 +592,111 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
         Ok(Some((path.to_path_buf(), None)))
     } else {
         Ok(None)
+    }
+}
+
+/// A live owner's claim on a session directory, held from the moment the
+/// record is written until it is finalized.
+///
+/// The claim is an [OFD] read lock on the session directory itself, taken
+/// through a `File` this value owns. Nothing is written: a lock *file* would
+/// be a fourth name in a directory [`remove_record`] is contracted to leave
+/// alone but for three, and one left behind by a killed process would read as
+/// a live owner forever. A lock on the directory has neither problem -- the
+/// kernel drops it when the last descriptor holding it closes, which includes
+/// the process dying by any means, SIGKILL included.
+///
+/// It is the directory rather than `session.json` because every update to the
+/// record ([`SessionStore::finalize`], [`SessionStore::set_sidecar_containers`])
+/// renames a fresh file over it. The lock would stay with the replaced inode
+/// and a prober opening the current `session.json` would find nothing.
+///
+/// The descriptor is close-on-exec (every `std::fs` open is), so none of the
+/// podman children a session spawns inherits the lock and outlives outrig
+/// still holding it.
+///
+/// [OFD]: https://man7.org/linux/man-pages/man2/fcntl.2.html#Open_file_description_locks
+#[derive(Debug)]
+pub struct SessionLock {
+    /// Held only to keep the open file description -- and with it the lock --
+    /// alive. Dropping this releases the claim.
+    _dir: fs::File,
+}
+
+/// Describe a whole-file lock of `kind`, as both the claim and the probe want
+/// it: `l_whence`/`l_start`/`l_len` of `SEEK_SET`/0/0 is "the entire file".
+fn whole_file_lock(kind: libc::c_short) -> libc::flock {
+    libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    }
+}
+
+/// Claim `dir` for this process until the returned [`SessionLock`] is dropped,
+/// so that [`owner_is_live`] answers `true` for it meanwhile.
+///
+/// `None` when the claim could not be taken: a filesystem with no OFD locks
+/// (some network mounts), or a directory this process cannot open. A session
+/// then runs exactly as it did before locking existed -- unprotected during
+/// the window before its container starts -- rather than refusing to launch
+/// over a liveness hint. A *read* lock because a directory can only be opened
+/// read-only, and `F_WRLCK` on such a descriptor is `EBADF`; the probe asks
+/// for a write lock, which a read lock is enough to block.
+pub fn claim_owner(dir: &Path) -> Option<SessionLock> {
+    let file = fs::File::open(dir)
+        .inspect_err(|e| {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be opened to claim: {e}",
+                dir.display()
+            );
+        })
+        .ok()?;
+    let lock = whole_file_lock(libc::F_RDLCK as libc::c_short);
+    fcntl(&file, FcntlArg::F_OFD_SETLK(&lock))
+        .inspect_err(|e| {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be claimed: {e}",
+                dir.display()
+            );
+        })
+        .ok()?;
+    Some(SessionLock { _dir: file })
+}
+
+/// Whether a live process holds `dir` through [`claim_owner`] -- the session
+/// is being launched, is running, or is being torn down, whether or not its
+/// container exists yet.
+///
+/// `false` whenever the question cannot be answered: a directory that is gone,
+/// or a filesystem that does not implement these locks, where no claim was
+/// taken either. The caller's own check on the recorded container still
+/// stands; this only widens what counts as live, so an unanswerable probe
+/// leaves the behavior that was there before it.
+pub fn owner_is_live(dir: &Path) -> bool {
+    let Ok(file) = fs::File::open(dir) else {
+        return false;
+    };
+    // `F_OFD_GETLK` reports a conflicting lock without taking one, so a probe
+    // can never itself hold a directory up -- and it reports locks held by
+    // *this* process through another descriptor too, unlike the POSIX
+    // process-associated locks, which is what lets a test hold a claim and
+    // probe it in one process.
+    let mut probe = whole_file_lock(libc::F_WRLCK as libc::c_short);
+    match fcntl(&file, FcntlArg::F_OFD_GETLK(&mut probe)) {
+        Ok(_) => probe.l_type != libc::F_UNLCK as libc::c_short,
+        Err(e) => {
+            tracing::debug!(
+                target: "outrig::cli::session",
+                "session directory {} could not be probed for a live owner: {e}",
+                dir.display()
+            );
+            false
+        }
     }
 }
 

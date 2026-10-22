@@ -187,7 +187,14 @@ where
         if !older_than(session, args.older_than, now) {
             continue;
         }
-        if running.contains(&session.container_name) {
+        // Either answer means live. `owner_is_live` is what covers a launch
+        // whose container does not exist yet -- a cold image build takes
+        // minutes, and a cutoff shorter than one used to sweep the record out
+        // from under it (#366); `running` covers the record whose owner died
+        // without finalizing and left its container up.
+        if session::owner_is_live(&session.session_dir)
+            || running.contains(&session.container_name)
+        {
             skipped_running.push(session.clone());
             continue;
         }
@@ -236,7 +243,7 @@ where
         if !aged || args.session.as_deref().is_some_and(|id| id != skipped.entry) {
             continue;
         }
-        if running.contains(&skipped.container_name()) {
+        if session::owner_is_live(&skipped.dir) || running.contains(&skipped.container_name()) {
             unreadable_running.push(skipped);
         } else if args.unreadable && !skipped.container_known() {
             // The record never got as far as naming its container, and an

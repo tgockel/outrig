@@ -61,7 +61,8 @@ hf-hub             = { workspace = true, optional = true, features = ["ureq"] }
 indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
 mistralrs-core     = { workspace = true, optional = true }
-nix                = { workspace = true, features = ["resource", "term", "user"] }
+# `fs` carries `fcntl`, which `session.rs` takes the owner-liveness lock with.
+nix                = { workspace = true, features = ["fs", "resource", "term", "user"] }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }

@@ -148,12 +148,14 @@ pub async fn execute(
         watcher,
         used_builtin_default,
         mut signals,
+        session_lock,
         attached: _,
         session: _,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
-    // the only thing that finalizes the session record.
-    let mut runtime = SessionRuntime::new(watcher, network, containers);
+    // the only thing that finalizes the session record -- and the only thing
+    // that releases the claim saying this session is live.
+    let mut runtime = SessionRuntime::new(watcher, network, containers, session_lock);
     // Shared from here on: the subagent registry keeps a handle so a launch can
     // re-resolve the agent against another `[models.<name>]`, against the same
     // merged config the session resolved from.
@@ -1639,6 +1641,7 @@ mod tests {
                             instance_salt: "test-salt".to_string(),
                             primary,
                         },
+                        None,
                     ),
                     agent: llm::RebuildingAgent::new(
                         rig_agent,

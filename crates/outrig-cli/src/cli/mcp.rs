@@ -178,13 +178,15 @@ async fn serve(
         watcher,
         used_builtin_default,
         mut signals,
+        session_lock,
         cfg: _,
         session: _,
         repo_root: _,
     } = setup;
     // Nothing between here and `teardown` may return early: `teardown` is
-    // the only thing that finalizes the session record.
-    let mut runtime = SessionRuntime::new(watcher, network, containers);
+    // the only thing that finalizes the session record -- and the only thing
+    // that releases the claim saying this session is live.
+    let mut runtime = SessionRuntime::new(watcher, network, containers, session_lock);
 
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(
@@ -217,6 +219,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         network,
         mcp_plan,
         watcher,
+        session_lock,
         cfg: _,
         image_cfg_name: _,
         image_tag: _,
@@ -229,7 +232,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
 
     let outcome = signals.race(write_merged_mcp(&mcp_plan)).await.map(|()| 0);
     session_setup::teardown(
-        SessionRuntime::new(watcher, network, containers),
+        SessionRuntime::new(watcher, network, containers, session_lock),
         &store,
         &sid,
         &outcome,

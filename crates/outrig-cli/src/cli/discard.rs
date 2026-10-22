@@ -1,8 +1,16 @@
 //! `outrig discard` -- delete a session's on-disk record.
 //!
-//! Refuses if the session's container is still running (would race the
-//! `outrig run` writer). The running-check is closure-injected so tests can
-//! drive both branches without a podman dependency.
+//! Refuses if the session is still live (would race the `outrig run` writer).
+//! Two things say so, and either is enough: the launching process still holds
+//! its claim on the session directory ([`session::owner_is_live`]), or the
+//! container named in the record is running. The claim is the one that covers
+//! a launch whose container does not exist yet -- it is taken as the record
+//! is written and held through teardown, while the container appears only
+//! once the image is built, minutes later for a cold build (#366). The
+//! container check stays beside it for the record whose owner died without
+//! finalizing, leaving a container behind. The running-check is
+//! closure-injected so tests can drive both branches without a podman
+//! dependency.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -76,6 +84,17 @@ where
             target.container_name
         );
         stderr.write_all(msg.as_bytes()).await?;
+    }
+
+    // The claim first: it is a local probe, and it is the one that answers
+    // for a session whose container has not been created yet.
+    if session::owner_is_live(&target.dir) {
+        return Err(OutrigError::Configuration(format!(
+            "session {} is still running (its launch holds {}); stop it before discarding",
+            target.id,
+            target.dir.display()
+        ))
+        .into());
     }
 
     if is_running(target.container_name.clone()).await? {
