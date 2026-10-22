@@ -1860,11 +1860,15 @@ fn a_cancel_before_the_first_step_is_reported_rather_than_lost() {
     // Admitted, and queued behind the task holding the loop; then cancelled.
     k.submit(2, "import os\nos.write(2, b'RAN\\n')");
     k.cancel(2);
+    // The reader thread handles lines in order, so once it answers, the cancel
+    // is queued on the loop behind the start and ahead of anything the
+    // released loop schedules.
+    k.cpu(3);
     hold.raise();
 
     let error = error_of(&k.result_of(2));
     assert!(error.contains("stopped before it started"), "{error}");
-    let stderr = k.stderr_through(3);
+    let stderr = k.stderr_through(4);
     assert!(!stderr.contains("RAN"), "its body ran: {stderr}");
 }
 
