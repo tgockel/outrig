@@ -82,7 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository's applies only when the global config says nothing.
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py
   <session>` renders a recording to one HTML page, written beside it as `report.html`; it takes
-  a session id as `outrig logs` does, or a session directory.
+  a session id as `outrig logs` does, or a session directory. Its `--host [[HOST]:[PORT]]`
+  serves that page until Ctrl-C instead of writing it, printing the URL it bound -- the loopback
+  on a port the kernel picks unless the argument says otherwise -- and building the page again
+  for each request, so a reload follows a session still being written.
 - **`run-new` hosts `[bindings.<name>]`.** Each declared binding's packages are installed, and one
   process on the host that holds every binding is started before the agent's interpreter
   (`installing binding packages`, `starting bindings`); the agent is told each name and description,

@@ -12,6 +12,9 @@ over it, and reads the page back. Going through `uv` rather than importing the s
 point: the PEP 723 block, the dependency it provisions, and the Jinja environment as the script
 configures it are what the escaping assertions are about.
 
+`--host` is exercised the same way: the script is started serving, the page is fetched over
+HTTP, and Ctrl-C stops it, so what is asserted is what a browser would be handed.
+
 The page is the one output of the event log that a browser executes. So escaping is asserted per
 field -- submitted source, a traceback, captured output, and a message body each reach the page by
 a different path -- and then swept: every field of every event type carries a payload that must
@@ -27,15 +30,22 @@ skipping.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -46,6 +56,51 @@ UV = os.environ.get("UV") or shutil.which("uv")
 EVENTS = Path("logs") / "events.jsonl"
 NETWORK = Path("logs") / "network.jsonl"
 REPORT = "report.html"
+
+
+def free_port() -> int:
+    """A port nothing was listening on a moment ago. Nothing holds it between here and the bind
+    under test, so this is for the cases where the number itself is what is asserted."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def has_ipv6_loopback() -> bool:
+    """Whether `::1` can be bound here: a container or a runner can be built without it."""
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def fetch(url: str, method: str = "GET") -> tuple[int, dict[str, str], str]:
+    """A request to the served page, as a browser makes it: status, headers, and body."""
+    request = urllib.request.Request(url, method=method)  # noqa: S310 - http, built by the test
+    try:
+        with urllib.request.urlopen(request, timeout=30) as answer:  # noqa: S310
+            return answer.status, dict(answer.headers), answer.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+
+def refused(url: str, within: float = 10.0) -> bool:
+    """Whether nothing answers at `url` within `within` seconds. Polled rather than asked once:
+    the signal that stops the server reaches it a moment after the process that sent it
+    returns."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            fetch(url)
+        except urllib.error.URLError:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
 
 
 @functools.cache
@@ -626,6 +681,9 @@ class RenderSession(unittest.TestCase):
         self.assertIsNotNone(UV, "uv is not on PATH; these tests run the renderer through it")
         self.dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "session"
         (self.dir / "logs").mkdir(parents=True)
+        # What a `serving` run printed, filled in as it ends, and what it printed before its URL.
+        self.served = subprocess.CompletedProcess[str]([], 0, "", "")
+        self.printed_first: list[str] = []
 
     def write(
         self,
@@ -675,6 +733,17 @@ class RenderSession(unittest.TestCase):
         }
         return home, env
 
+    def environment(self, env: dict[str, str | None] | None = None) -> dict[str, str]:
+        """The environment a run gets: this one, laid over with `env`, a None in it taking a
+        variable away."""
+        environment = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+        for name, value in (env or {}).items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
+        return environment
+
     def run_renderer(
         self,
         *args: str | Path,
@@ -683,20 +752,50 @@ class RenderSession(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         """Run the renderer as a person does. `env` is laid over the environment, a None in it
         taking a variable away; `cwd` is where it runs, the repo being where a test runs."""
-        environment = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-        for name, value in (env or {}).items():
-            if value is None:
-                environment.pop(name, None)
-            else:
-                environment[name] = value
         return subprocess.run(
             [UV, "run", "--quiet", "--script", RENDERER, *args],
             capture_output=True,
             text=True,
-            env=environment,
+            env=self.environment(env),
             cwd=cwd,
             timeout=300,
         )
+
+    @contextlib.contextmanager
+    def serving(self, *args: str | Path) -> Iterator[str]:
+        """The renderer serving `self.dir`, as `--host` does. Yields the URL it printed, leaving
+        in `self.printed_first` what it printed before that, and on the way out stops it with the
+        Ctrl-C a terminal sends: SIGINT to the whole group, so that `uv` and the script it runs
+        each get the one a person would send. The finished run is left in `self.served`."""
+        process = subprocess.Popen(  # noqa: S603 - the renderer, through uv, as a person runs it
+            [UV, "run", "--quiet", "--script", RENDERER, self.dir, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.environment(),
+            start_new_session=True,
+        )
+        try:
+            url = ""
+            assert process.stdout is not None
+            for line in process.stdout:
+                url = line.strip()
+                if url.startswith("http://"):
+                    break
+                self.printed_first.append(url)
+            else:
+                self.fail(f"it stopped without a URL, having printed {self.printed_first}")
+            yield url
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGINT)
+            out, err = process.communicate(timeout=120)
+            self.served = subprocess.CompletedProcess(process.args, process.returncode, out, err)
+        self.assertNotIn("Traceback", self.served.stderr)
+        # 0 when the script answered the signal, which is what it does; a status of
+        # killed-by-SIGINT when `uv`, which gets the same signal, ends on it rather than on its
+        # child's exit. Either way the serving stopped, which the case after this one asserts.
+        self.assertIn(self.served.returncode, (0, -signal.SIGINT), self.served.stderr)
 
     def page(self, events: list | None = None, **kw: object) -> str:
         """Render `events`, which must succeed, and return the page."""
@@ -1046,6 +1145,149 @@ class RenderSession(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing to write the page over", result.stderr)
         self.assertEqual(log.read_bytes(), before)
+
+    # -- serving it instead of writing it ----------------------------------------------------
+
+    def test_host_serves_the_page_and_writes_nothing(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertTrue(url.startswith("http://127.0.0.1:"), url)
+            status, headers, body = fetch(url)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
+            self.assertIn("Done.", body)
+        self.assertFalse((self.dir / REPORT).exists(), "serving left a page behind")
+
+    def test_a_served_page_escapes_what_a_written_one_does(self) -> None:
+        self.write(ordinary(source=payload("SERVED")))
+        with self.serving("--host") as url:
+            body = fetch(url)[2]
+        self.assert_escaped(body, "SERVED")
+
+    def test_a_served_page_carries_the_policy_as_a_header_too(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            headers, body = fetch(url)[1:]
+        meta = re.search(r'http-equiv="Content-Security-Policy"\s+content="([^"]*)"', body)
+        self.assertIsNotNone(meta)
+        self.assertEqual(headers["Content-Security-Policy"], meta.group(1))
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_a_reload_shows_what_the_record_has_grown(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertNotIn("LATER", fetch(url)[2])
+            with (self.dir / EVENTS).open("a") as log:
+                log.write(json.dumps(envelope(99, "interpreter.diagnostic", {"text": "LATER"})))
+                log.write("\n")
+            self.assertIn("LATER", fetch(url)[2])
+
+    def test_nothing_but_the_page_is_served(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertEqual(fetch(url + "logs/events.jsonl")[0], 404)
+            self.assertEqual(fetch(url + "../../etc/passwd")[0], 404)
+            self.assertEqual(fetch(url, "HEAD")[0], 200)
+            self.assertEqual(fetch(url, "HEAD")[2], "")
+
+    def test_a_record_that_goes_away_mid_serve_does_not_end_the_serving(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertEqual(fetch(url)[0], 200)
+            (self.dir / EVENTS).unlink()
+            self.assertEqual(fetch(url)[0], 500)
+            self.write(ordinary())
+            self.assertEqual(fetch(url)[0], 200)
+
+    def test_a_given_port_is_the_one_bound(self) -> None:
+        self.write(ordinary())
+        port = free_port()
+        with self.serving("--host", f"127.0.0.1:{port}") as url:
+            self.assertEqual(url, f"http://127.0.0.1:{port}/")
+            self.assertEqual(fetch(url)[0], 200)
+
+    def test_a_port_alone_is_the_loopback(self) -> None:
+        self.write(ordinary())
+        port = free_port()
+        with self.serving("--host", f":{port}") as url:
+            self.assertEqual(url, f"http://127.0.0.1:{port}/")
+            self.assertEqual(fetch(url)[0], 200)
+
+    def test_every_interface_is_bound_on_request_and_said_to_be_wide(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host", "0.0.0.0:0") as url:
+            port = url.rsplit(":", 1)[1].rstrip("/")
+            self.assertEqual(url, f"http://0.0.0.0:{port}/")
+            self.assertEqual(fetch(f"http://127.0.0.1:{port}/")[0], 200)
+        self.assertIn("reachable from other machines", self.served.stderr)
+
+    def test_the_loopback_is_not_said_to_be_wide(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertEqual(fetch(url)[0], 200)
+        self.assertNotIn("reachable from other machines", self.served.stderr)
+
+    def test_an_ipv6_address_is_bound_and_its_url_is_bracketed(self) -> None:
+        if not has_ipv6_loopback():
+            self.skipTest("no IPv6 loopback here")
+        self.write(ordinary())
+        port = free_port()
+        with self.serving("--host", f"[::1]:{port}") as url:
+            self.assertEqual(url, f"http://[::1]:{port}/")
+            self.assertEqual(fetch(url)[0], 200)
+
+    def test_ctrl_c_stops_the_serving(self) -> None:
+        self.write(ordinary())
+        with self.serving("--host") as url:
+            self.assertEqual(fetch(url)[0], 200)
+        self.assertTrue(refused(url), f"something still answers at {url}")
+
+    def test_out_beside_host_writes_the_page_and_serves_it(self) -> None:
+        self.write(ordinary())
+        out = self.dir.parent / "elsewhere.html"
+        with self.serving("--host", "--out", out) as url:
+            self.assertEqual(self.printed_first, [str(out)])
+            self.assertIn("Done.", out.read_text())
+            self.assertIn("Done.", fetch(url)[2])
+
+    def test_a_port_already_taken_is_reported(self) -> None:
+        self.write(ordinary())
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen()
+            port = held.getsockname()[1]
+            result = self.run_renderer(self.dir, "--host", f"127.0.0.1:{port}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"binding 127.0.0.1:{port}", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_an_address_this_machine_does_not_have_is_reported(self) -> None:
+        self.write(ordinary())
+        # 192.0.2.0/24 is the documentation range: no machine routes it, so no machine has it.
+        result = self.run_renderer(self.dir, "--host", "192.0.2.1:0")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("binding 192.0.2.1:0", result.stderr)
+
+    def test_an_address_that_is_not_one_is_a_usage_error(self) -> None:
+        self.write(ordinary())
+        for given in (":twenty", "127.0.0.1:99999", "[::1", "[not-v6]:80"):
+            with self.subTest(given=given):
+                result = self.run_renderer(self.dir, "--host", given)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--host", result.stderr)
+
+    def test_the_session_after_host_is_not_taken_for_an_address(self) -> None:
+        self.write(ordinary())
+        result = self.run_renderer("--host", self.dir)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is a path, not an address", result.stderr)
+        self.assertIn("the session goes before it", result.stderr)
+
+    def test_a_session_that_did_not_record_is_not_served(self) -> None:
+        result = self.run_renderer(self.dir, "--host")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Only `outrig run-new` records one", result.stderr)
 
     # -- naming a session by its id, as the outrig subcommands take one ----------------------
 

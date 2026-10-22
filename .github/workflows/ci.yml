@@ -311,7 +311,8 @@ jobs:
   # `scripts/render-session.py` turns a session's event log into a page a browser opens, and
   # everything on that page -- source, tracebacks, output, message bodies -- was written by a
   # model or a user. Its tests run it the way a person does, `uv run --script`, over sessions
-  # whose every field tries to become markup.
+  # whose every field tries to become markup. The cases for `--host` start it serving and fetch
+  # the page over HTTP, which binds loopback ports on the runner and nothing outside it.
   #
   # `uv` is all this job installs, and `only-managed` keeps uv off the runner's own Python: the
   # interpreter and Jinja both come from uv, which is the claim the script's docs make about

@@ -306,7 +306,13 @@ not a grant, and a call refused before dispatch is refused whether or not anyone
 A single Python script that reads a session *directory* -- `session.json` for what the session was,
 `events.jsonl` for the timeline, `network.jsonl` when it is there -- and writes one self-contained
 HTML file. Deliberately minimal: a timeline, per-agent REPL history with tracebacks, the messages,
-and a token summary. Nothing interactive, no server.
+and a token summary. Nothing on the page is interactive, and nothing on it runs.
+
+`--host` hands that same page out over HTTP instead of writing it, building it again for each
+request, so a reload follows a session still being written. It is the directory reader behind a
+socket and not a step toward a live view: no stream is read, no state is kept between requests,
+and the page is the one the file would have held. The default bind is the loopback on a port the
+kernel picks, because the page holds what `events.jsonl` holds.
 
 That is where it starts, not where it is expected to stay: the script is expected to become a
 live monitoring page, reading the stream while the session runs and coupled more closely to
@@ -327,7 +333,7 @@ block:
 ```
 
 ```
-uv run --script scripts/render-session.py <session-dir> [--out PATH]
+uv run --script scripts/render-session.py <session-dir> [--out PATH] [--host [[HOST]:[PORT]]]
 ```
 
 The page goes to `<session-dir>/report.html` by default, owner-only like `events.jsonl`, because it

@@ -314,6 +314,27 @@ holds; `outrig discard` removes it with the rest. `--out <path>` writes it elsew
 terms. A log still being written, or one whose session died mid-line, renders anyway: a line that
 does not parse is skipped and listed on the page.
 
+`--host` serves the page instead of writing it, until you stop it with Ctrl-C, and prints the
+URL it bound on stdout before anything else. Bare, it binds the loopback on a port the kernel
+picks, so nothing else on the network can reach it and no port of yours is taken:
+
+```sh
+$ uv run --script scripts/render-session.py 3f2a --host
+http://127.0.0.1:38417/
+render-session: serving /home/me/.local/share/outrig/sessions/20260501T134412-3f2a; Ctrl-C to stop
+```
+
+The argument is `[HOST][:PORT]`, each half optional: `--host :9090` takes that port on the
+loopback, `--host 127.0.0.1:9090` says the same, `--host 0.0.0.0:0` binds every interface on a
+port the kernel picks, and an IPv6 literal is bracketed, `--host '[::1]:9090'`. A host that is a
+name is resolved. Binding past the loopback prints a line saying so, because the page holds what
+`events.jsonl` holds -- submitted source, captured output, and message bodies -- and the server
+asks for no password.
+
+Each request builds the page again, so a reload follows a session still being written. Only `/`
+is served; nothing else in the session directory is. Serving writes no file unless `--out` is
+given as well, in which case the page is written first and then served.
+
 The script is in OutRig's repository, not in the installed binary. If you installed with `cargo
 install`, take the copy from the `outrig-cli-vX.Y.Z` tag matching your `outrig --version`: the
 event log can change between versions, and each copy reads its own version's.

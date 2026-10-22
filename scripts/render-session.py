@@ -6,6 +6,7 @@
 """Render an OutRig session to one self-contained HTML page.
 
     uv run --script scripts/render-session.py <session> [--session-root PATH] [--out PATH]
+                                              [--host [ADDRESS]]
 
 `<session>` is a session directory, or a session id -- or enough of one to name a single session,
 as `outrig logs` takes it -- looked up under the session root, found the way `outrig` finds it:
@@ -24,11 +25,19 @@ attributes: never through `|safe` or `Markup`, never into a URL or a `<style>`. 
 here, from integer ids alone. A Content-Security-Policy that allows no script is a second line,
 not the first.
 
+`--host` serves the page over HTTP instead of writing it, until Ctrl-C, and prints the URL it
+bound. Bare, it binds `127.0.0.1:0`: the loopback, on a port the kernel picks. `--host :9090`
+takes that port, `--host 0.0.0.0:0` binds every interface, and `--host '[::1]:9090'` is the same
+in IPv6. Each request renders the session again, so reloading follows a session still being
+written. The page holds what `events.jsonl` holds, which is why the default is the loopback and
+why binding anything wider says so. `--out` alongside `--host` writes the page as well.
+
 A record still being written, or one whose session died, can end in a partial line. A line that
 does not parse is skipped and listed on the page rather than ending the render.
 
-Exit status: 0 when the page was written, 1 when the session could not be read or the page could
-not be written, 2 on a usage error.
+Exit status: 0 when the page was written, or when serving ended on Ctrl-C; 1 when the session
+could not be read, the page could not be written, or the address could not be bound; 2 on a
+usage error.
 
 Unlike the repo's CI scripts this is not standard-library only. It is run by a person, `uv`
 provisions what the block above declares, and that block is kept short enough to read first.
@@ -38,15 +47,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import math
 import os
+import socket
+import socketserver
 import sys
 import tempfile
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from jinja2 import Environment, StrictUndefined
@@ -57,6 +70,14 @@ NETWORK = Path("logs") / "network.jsonl"
 SESSION = Path("session.json")
 REPORT = "report.html"
 REPO_CONFIG = Path(".agents") / "outrig" / "config.toml"
+# Where `--host` binds when it is given no address: the loopback, on a port the kernel picks.
+DEFAULT_ADDRESS = "127.0.0.1:0"
+# What a served page's Content-Security-Policy header says, which is what the page's own `<meta>`
+# says: the header is the copy a browser honors first, and the one no page the renderer built
+# could have written. A test holds the two to each other, so neither drifts.
+CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+# What the served answers that are not the page are.
+TEXT = "text/plain; charset=utf-8"
 # The token table's usage columns: each field as the record names it, and as the page does.
 USAGE = (
     ("input_tokens", "input"),
@@ -1013,6 +1034,163 @@ def fail(message: str) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# Serving. `--host` hands the page out over HTTP, built again for each request,
+# so a reload follows a session still being written.
+
+
+@dataclass(frozen=True)
+class Address:
+    """Where to bind: a host as typed -- a literal or a name -- and a port, 0 for one the kernel
+    picks."""
+
+    host: str
+    port: int
+
+    def url(self) -> str:
+        """How to reach it, with an IPv6 literal bracketed as a URL wants it."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}/"
+
+
+def split_address(value: str) -> tuple[str, str]:
+    """`--host`'s argument as a host and a port, either of which can be empty: `HOST:PORT`,
+    `:PORT`, a bare `PORT`, a bare `HOST`, and an IPv6 literal bracketed -- `[::1]:9090` -- or,
+    bare when it carries no port."""
+    if value.startswith("["):
+        host, closed, rest = value[1:].partition("]")
+        if not closed or (rest and not rest.startswith(":")):
+            raise argparse.ArgumentTypeError(f"{value}: expected [IPV6]:PORT")
+        return host, rest[1:]
+    if value.count(":") > 1:  # An unbracketed IPv6 literal, which leaves no room for a port.
+        return value, ""
+    host, _, port = value.partition(":")
+    return ("", host) if port == "" and host.isdigit() else (host, port)
+
+
+def address(value: str) -> Address:
+    """`--host`'s argument as `argparse` takes it. A host left out is the loopback, since the
+    page holds what the session's log holds; a port left out is 0, which the kernel picks. What
+    does not parse raises `ArgumentTypeError`, which argparse reports as the usage error it
+    is."""
+    value = value.strip()
+    if "/" in value:
+        # `--host <session>`: argparse gives an optional argument the word after it, so the
+        # session was taken for an address. No host holds a slash, so this is always that.
+        raise argparse.ArgumentTypeError(
+            f"{value} is a path, not an address; --host takes [HOST][:PORT], and the session "
+            "goes before it: render-session.py <session> --host"
+        )
+    host, port = split_address(value)
+    if port and not (port.isdigit() and int(port) <= 65535):
+        raise argparse.ArgumentTypeError(f"{value}: {port} is not a port")
+    # Brackets, and a host holding a colon without them, are IPv6 and nothing else; a host
+    # without one is left as typed, for `getaddrinfo` to resolve or refuse.
+    if (value.startswith("[") or ":" in host) and not valid_ipv6(host):
+        raise argparse.ArgumentTypeError(f"{value}: {host} is not an IPv6 address")
+    return Address(host or "127.0.0.1", int(port or 0))
+
+
+def valid_ipv6(host: str) -> bool:
+    """Whether `host` is an IPv6 literal -- `::1`, not `127.0.0.1` and not a name."""
+    try:
+        return ipaddress.ip_address(host).version == 6
+    except ValueError:
+        return False
+
+
+def reachable_elsewhere(host: str) -> bool:
+    """Whether what was bound can be reached from another machine: any address that is not a
+    loopback one. A host that is not a literal is taken as wider rather than narrower."""
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
+def handler(directory: Path) -> type[BaseHTTPRequestHandler]:
+    """A handler answering `/` with `directory` built and rendered again, and anything else with
+    404. Nothing from the request reaches the page: not the path, not a header, not a query."""
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "render-session"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+
+        def respond(self, status: int, body: bytes, kind: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            # The record is still being written, so a cached page is a stale one.
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def answer(self) -> None:
+            if self.path.partition("?")[0] not in ("/", "/index.html"):
+                self.respond(404, b"nothing here; the session is at /\n", TEXT)
+                return
+            try:
+                page = render(build(directory)).encode()
+            except Exception as e:  # noqa: BLE001 - one bad render ends the request, not the run
+                self.log_error("rendering %s: %s", directory, e)
+                self.respond(500, b"the session could not be rendered; see the terminal\n", TEXT)
+                return
+            self.respond(200, page, "text/html; charset=utf-8")
+
+        do_GET = answer
+        do_HEAD = answer
+
+    return Handler
+
+
+def serve(directory: Path, where: Address) -> int:
+    """Serve `directory`'s page at `where` until Ctrl-C, printing first the URL that was bound --
+    the port the kernel gave, not the 0 that asked for it, so `:0` names itself."""
+    try:
+        # The first answer, which is what a client connecting to the same host would reach
+        # first; a name with both an IPv6 and an IPv4 address is bound on one of them, and
+        # `--host` takes a literal when it has to be the other.
+        family, _, _, _, sockaddr = socket.getaddrinfo(
+            where.host, where.port, type=socket.SOCK_STREAM
+        )[0]
+    except OSError as e:
+        return fail(f"{where.host} is not an address to bind: {e}")
+
+    class Server(ThreadingHTTPServer):
+        # Threaded so that one browser holding a keep-alive connection open does not keep the
+        # next request waiting; the threads are daemons, which `ThreadingHTTPServer` sets.
+        address_family = family
+
+        def server_bind(self) -> None:
+            # `HTTPServer`'s looks the bound address's name up, which is a reverse DNS query for
+            # a name nothing here shows. `TCPServer`'s binds and stops.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
+    try:
+        server = Server(sockaddr, handler(directory))
+    except OSError as e:
+        return fail(f"binding {where.host}:{where.port}: {e}")
+    with server:
+        bound = Address(*server.server_address[:2])
+        print(bound.url(), flush=True)
+        if reachable_elsewhere(bound.host):
+            print(
+                f"render-session: {bound.host} is reachable from other machines, and the page "
+                "holds what the log holds -- source, output, and message bodies",
+                file=sys.stderr,
+            )
+        print(f"render-session: serving {directory}; Ctrl-C to stop", file=sys.stderr)
+        with contextlib.suppress(KeyboardInterrupt):
+            server.serve_forever()
+    return 0
+
+
 def session_root() -> Path:
     """Where sessions live, decided as `outrig` decides it: the `session-root` key of the repo
     config -- the nearest `.agents/outrig/config.toml` at or above the working directory -- else
@@ -1056,6 +1234,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--out", type=Path, help=f"where to write the page (default: <session>/{REPORT})"
     )
+    parser.add_argument(
+        "--host",
+        type=address,
+        nargs="?",
+        const=DEFAULT_ADDRESS,
+        metavar="ADDRESS",
+        help="serve the page until Ctrl-C instead of writing it, and print the URL bound: "
+        f"[HOST][:PORT], default {DEFAULT_ADDRESS}, a host left out meaning the loopback and "
+        "port 0 one the kernel picks (with --out, the page is written as well)",
+    )
     args = parser.parse_args(argv)
 
     session: str = args.session
@@ -1091,6 +1279,10 @@ def main(argv: list[str]) -> int:
             f"no {EVENTS} in {directory}. Only `outrig run-new` records one, and only when its "
             'config has [events] mode = "record"'
         )
+    # Serving alone writes nothing: the page is held and handed out, never left behind.
+    if args.host is not None and args.out is None:
+        return serve(directory, args.host)
+
     out: Path = args.out or directory / REPORT
     inputs = [directory / EVENTS, directory / NETWORK, directory / SESSION]
     if any(out.resolve() == p.resolve() for p in inputs):
@@ -1107,7 +1299,7 @@ def main(argv: list[str]) -> int:
     except OSError as e:
         return fail(f"writing {out}: {e}; choose another place with --out")
     print(out)
-    return 0
+    return serve(directory, args.host) if args.host is not None else 0
 
 
 TEMPLATE = """\

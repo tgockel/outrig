@@ -64,7 +64,8 @@ uv run --script scripts/render-session-test.py
 
 They need only [uv](https://docs.astral.sh/uv/). Run them after changing the renderer, and after
 adding or renaming an event in `crates/outrig/src/events.rs`: one test fails until the renderer's
-fixture covers every event the log can hold.
+fixture covers every event the log can hold. The cases for `--host`, which serves the page
+instead of writing it, bind loopback ports and fetch over HTTP; they stop what they start.
 
 ## Packaging
 
