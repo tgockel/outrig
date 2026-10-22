@@ -434,3 +434,7 @@ mod agent_tests;
 #[cfg(test)]
 #[path = "children_tests.rs"]
 mod children_tests;
+
+#[cfg(test)]
+#[path = "typed_tests.rs"]
+mod typed_tests;

@@ -446,6 +446,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `total`, the attempts and spend of the children a round launched, and `model.round.usage`
   records what they spent after the round ended. `ShutdownReport::requests` lists each request
   open at the close as a `RequestOutcome`.
+- **`@outrig.agent` declares an `async def` as typed agent work.** Its parameters are the
+  inputs, its docstring the child's instructions, and its return annotation the type of the
+  result; every type is checked at the declaration through `outrig.schema`, and a function
+  with no docstring, an unannotated parameter, `*args` or `**kwargs` is refused with
+  `TypeError` naming it. The body is never run and never read, so a function declared in a
+  submission is declared as one in a module is. Calling it binds and checks the arguments,
+  launches a fresh work child whose prompt is the docstring -- never passed through
+  `str.format`, so its braces stay braces and no argument's text is put into it -- gives the
+  child the arguments as a submission, and returns the handle at once: `await
+  analyze_code(section)` gives the result decoded strictly, or raises an `outrig.AgentError`;
+  `h = analyze_code(section)` keeps the handle, and `asyncio.gather` over calls runs them in
+  parallel under the session's limits. A call nobody awaits still runs. The child is released
+  however the call settles, and the call settles once the child is gone, so a call past
+  `children-max` fails `AgentLimitReached` at once and the next call after a release has room.
+  `validate=` names a pure function called in the caller with the decoded result and the
+  arguments by name, returning a list of problems; each answer runs it once, and its problems
+  reach the child as decoding problems do, under the same attempt limit; one that raises ends
+  the call with its exception and counts no attempt. `model=` names a configured model or
+  alias, and an unknown name fails the call with the configured names listed.
+  `inspect.iscoroutinefunction` is false of a declared function, and `help()` on it says that
+  a call returns a handle and the body is not run. Two events bracket each call under the
+  child's subject: `agent.call.started`, with the declaration's `module`, `qualname` and a
+  `digest` of the source that declared it, and `agent.call.settled`, with the outcome and the
+  child's usage, after the `agent.released` that ended the child.
 - **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
   `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
   model talks while it works records each thing it said, not only the closing reply.

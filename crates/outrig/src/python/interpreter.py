@@ -2400,6 +2400,8 @@ def _load_outrig(directory):
     import outrig.schema
 
     outrig._kernel.install(_calling)
+    outrig._agents._call = _call
+    outrig._agents._submitted_source = _submitted_source
     _schema = outrig.schema
     _agents = outrig._agents
 
@@ -2408,6 +2410,30 @@ def _calling():
     """The kernel of the execution this code belongs to, or `None` outside every execution."""
     execution = _CURRENT.get()
     return None if execution is None else execution.kernel
+
+
+# The source of each submission, by the id of every code object compiled from it -- its own, and
+# each function's in it. `outrig.agent` digests a declaration compiled in a submission from this,
+# whichever execution runs the declaring: one a factory from an earlier submission makes is still
+# that submission's. Keyed by id, since code objects compare by value; an entry goes with its
+# code, so a reused id never finds a dead one's source.
+_sources = {}
+
+
+def _remember_source(code, source):
+    """Record `source` as what compiled `code`, and every code object nested in it."""
+    # A worklist, not recursion: what compiled may nest functions deeper than the recursion limit.
+    pending = [code]
+    while pending:
+        code = pending.pop()
+        _sources[id(code)] = source
+        weakref.finalize(code, _sources.pop, id(code), None)
+        pending.extend(const for const in code.co_consts if type(const) is types.CodeType)
+
+
+def _submitted_source(code):
+    """The source of the submission that compiled `code`, or `None` when none did."""
+    return _sources.get(id(code))
 
 
 def _load_rpyc(directory):
@@ -4050,15 +4076,16 @@ class WorkRuntime(Runtime):
 
 _ids = itertools.count(1)  # every id the interpreter gives: a request, an ask, a message
 _works = {}  # each request not yet ended, by id
+_launching = {}  # each typed call (`outrig.agent`) not yet ended, by its id, the submission's
 _works_lock = threading.Lock()
+# What a typed call's status reads when its launch -- its spawn, or its submission -- was refused.
+_REFUSED = {"AgentLimitReached": "limit", "SessionClosing": "closed", "AgentReleased": "released"}
 # Each child agent's record, by its agent id, for as long as anything holds it: its parent's `Child`,
 # a request made of it, its kernel. The host says what each is doing for as long as its parent can
 # ask, its release included.
 _children = weakref.WeakValueDictionary()
 _spawning = {}  # what a spawn waiting on the host holds for its child, by the spawn's id
 _ENDED = ("accepted", "failed")
-# Names an input cannot take: the child's own runtime and what every kernel binds at boot.
-_RESERVED = frozenset({"runtime", "asyncio"})
 _agents = None  # `outrig._agents`, once the package is loaded
 
 
@@ -4155,7 +4182,7 @@ def _inputs(inputs, where):
             or not name.isidentifier()
             or keyword.iskeyword(name)
             or name.startswith("__")
-            or name in _RESERVED
+            or name in _agents.RESERVED
         ):
             raise ValueError(f"{where}: input {name!r} cannot name a variable in the child")
         encoded, shape, found = _agents.walk(value, name, _hosted_name)
@@ -4266,8 +4293,8 @@ class _Work:
     it first, and nothing after changes that.
     """
 
-    def __init__(self, child, sender, kind, channel, body, declared, attempts_max):
-        self.id = next(_ids)
+    def __init__(self, child, sender, kind, channel, body, declared, attempts_max, work_id=None):
+        self.id = next(_ids) if work_id is None else work_id
         self.child = child
         self.sender = sender  # the sending kernel, whose loop its handle settles on
         self.kind = kind  # "submission" or "request"
@@ -4284,6 +4311,9 @@ class _Work:
         self.final = None
         self.future = sender.loop.create_future()
         self.progress = None  # a submission's progress, as its sender reads it
+        # A typed call's validator, and the call's arguments it is called with; `None` otherwise.
+        self.validate = None
+        self.arguments = None
 
     def __str__(self):
         if self.channel is None:
@@ -4370,6 +4400,29 @@ class _Work:
         if ended:
             raise self.refused()
         accepted, problems = _answered(self.declared, value)
+        if not problems and self.validate is not None:
+            # A validator that raises, whatever it raises, or returns what is not a list of str,
+            # is a defect in the sender's code, which another attempt cannot fix: the request ends
+            # failed with it, and no attempt is counted.
+            try:
+                found = self.validate(accepted, **self.arguments)
+                if type(found) not in (list, tuple) or any(type(p) is not str for p in found):
+                    raise TypeError(f"it returned {found!r}, not a list of str")
+            except BaseException as e:
+                try:
+                    message = str(e)
+                except BaseException:
+                    message = "<a message that could not be read>"
+                text = _agents.cut(f"the validator raised {_type_qualname(type(e))}: {message}")
+                if not self.end("failed", error=e, message=text):
+                    raise self.refused()
+                raise RuntimeError(text)
+            # Bounded as the decoder's problems are, so the notice and the error stay lines the
+            # host reads: `PROBLEMS_MAX` of them, each cut, and the rest counted.
+            kept = found[: _schema.PROBLEMS_MAX]
+            problems = tuple(_schema.Problem("$", _agents.cut(text)) for text in kept)
+            if len(found) > len(kept):
+                problems += (_schema.Problem("$", f"... and {len(found) - len(kept)} more"),)
         said = None
         if _observing:
             said = (_agents.preview(self.declared.encode(accepted)) if not problems
@@ -4603,35 +4656,48 @@ class Child:
                             f"send one with child.channels[name].request(body)")
         _refuse_closing()
         attempts = _attempts(attempts)
-        manifest, copies, classes, encoded = _inputs(inputs, "submit")
-        declared, used = _agents.declared_with_classes(result, "the result of a submission cannot be")
-        _agents.one_name_each(used, copies)
-        _agents.one_name_each(list(used) + sorted(classes, key=_type_qualname))
         kernel = _sending_kernel("a submission")
-        work = _Work(child, kernel, "submission", None, {"inputs": copies, "classes": used},
-                     declared, attempts)
-        notice = {"t": "agent.request", "agent": kernel.agent, "request": work.id,
-                  "child": child.id, "channel": None, "attempts": attempts, "manifest": manifest,
-                  "result": {"type": _schema._describe(result), "schema": declared.text()},
-                  "body": _agents.preview(encoded) if _observing else None}
-        _refuse_long(notice, "submission", "submit fewer inputs, or a smaller result type")
-        child.take("submission")
-        work.progress = _Progress(kernel.agent, child.id, work.id)
-        with _works_lock:
-            _works[work.id] = work
-        _notify(notice)
-        with child.lock:
-            if child.released:
-                queued = False
-            else:
-                child.queue.append(work)
-                queued = True
-        if not queued:
-            work.end("released", error=_agents.AgentReleased(f"{child} was released"))
-        return Handle(work)
+        return Handle(_submit(child, kernel, inputs, result, attempts))
 
     def __repr__(self):
         return f"<{self._child}, a {self._child.kind} child, {self._child.state}>"
+
+
+def _submit(child, kernel, inputs, result, attempts, call=None):
+    """Queue a submission of `inputs` on work child `child` from `kernel`, and return its `_Work`:
+    what `Child.submit` does, and a typed call, whose `call` gives the submission its id, its
+    progress endpoint and its validator."""
+    manifest, copies, classes, encoded = _inputs(inputs, "submit")
+    declared, used = _agents.declared_with_classes(result, "the result of a submission cannot be")
+    _agents.one_name_each(used, copies)
+    _agents.one_name_each(list(used) + sorted(classes, key=_type_qualname))
+    work = _Work(child, kernel, "submission", None, {"inputs": copies, "classes": used}, declared,
+                 attempts, None if call is None else call.id)
+    notice = {"t": "agent.request", "agent": kernel.agent, "request": work.id, "child": child.id,
+              "channel": None, "attempts": attempts, "manifest": manifest,
+              "result": {"type": _schema._describe(result), "schema": declared.text()},
+              "body": _agents.preview(encoded) if _observing else None}
+    _refuse_long(notice, "submission", "submit fewer inputs, or a smaller result type")
+    child.take("submission")
+    if call is None:
+        work.progress = _Progress(kernel.agent, child.id, work.id)
+    else:
+        work.progress = call.progress
+        work.validate = call.declaration.validate
+        work.arguments = call.arguments
+    with _works_lock:
+        _works[work.id] = work
+    # Queued and told of in one step against the assign that gives the child its next
+    # submission: the host hears of it once it is queued, and the child takes it only once the
+    # host has heard, so what the child says of it names a request the host knows.
+    with child.lock:
+        queued = not child.released
+        if queued:
+            child.queue.append(work)
+        _notify(notice)
+    if not queued:
+        work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+    return work
 
 
 class _Progress(Endpoint):
@@ -4647,6 +4713,138 @@ class _Progress(Endpoint):
     def _took(self, message):
         # Recorded as the child sent it, on its request; when its sender reads it is its own.
         return None
+
+
+class _Call(_Work):
+    """A typed call, `@outrig.agent`'s: the request its handle reads from the call on, before any
+    child exists. Its id is its submission's; the submission is `work` once the child exists, and
+    the call ends -- its future settles -- once the child has been released, so a caller awaiting
+    it finds the child's place free."""
+
+    def __init__(self, declaration, arguments, sender):
+        super().__init__(None, sender, "submission", None, None, declaration.schema, 3)
+        self.declaration = declaration
+        self.arguments = arguments
+        self.progress = _Progress(sender.agent, None, self.id)
+        self.work = None  # the submission, once made
+        self.task = None
+
+    def __str__(self):
+        return f"call {self.id} of {self.declaration.name}"
+
+    def status(self):
+        with self.lock:
+            if self.final is not None:
+                return self.final
+        if self.work is not None:
+            return self.work.status()
+        return _agents.Status("queued", None, "idle")
+
+    def end(self, reason, *, value=None, error=None, **said):
+        """Record how the call ended, which its handle reads at once; the future is the task's to
+        settle, once the child is released. Whether this ended it. Any thread."""
+        with self.lock:
+            if self.state in _ENDED:
+                return False
+            self.state = "accepted" if reason is None else "failed"
+            self.reason = reason
+            self.value, self.error = value, error
+            self.final = _agents.Status(
+                self.state, reason, "released" if self.child is None else self.child.state
+            )
+        with _works_lock:
+            _launching.pop(self.id, None)
+        return True
+
+    def settle(self):
+        """Settle the future with how the call ended, from any thread: what the session's close
+        does for a call still launching, whose task may never hear the spawn's answer."""
+        try:
+            self.sender.loop.call_soon_threadsafe(self._settle)
+        except RuntimeError:
+            pass  # the caller's loop has closed with its kernel: nothing waits on this
+
+    def cancel(self):
+        """Cancel the call: one not yet started sends nothing; one whose child is launching
+        releases it once it exists; one whose submission exists cancels that. Whether this ended
+        it: not once the submission has an outcome."""
+        work = self.work
+        if work is not None and work.state in _ENDED:
+            return False
+        ended = self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"))
+        if work is not None:
+            work.cancel()
+        return ended
+
+    def start(self, context):
+        """Run the call as a task of the sender's loop, in `context`, the caller's."""
+        self.task = asyncio.Task(
+            self.run(), loop=self.sender.loop, context=context, name=f"call-{self.id}"
+        )
+
+    async def run(self):
+        """The whole call: launch the child, give it the submission, wait for that to end,
+        release the child, and settle. A call ended by nothing here -- its task cancelled with
+        its kernel -- ends cancelled, so its waiters hear either way."""
+        kernel, d = self.sender, self.declaration
+        try:
+            if self.state in _ENDED:
+                return  # cancelled before this started: nothing is sent
+            try:
+                child = await kernel.runtime.spawn(d.fn.__name__[:64], prompt=d.doc, model=d.model)
+            except Exception as e:
+                self.end(_REFUSED.get(type(e).__name__, "failed"), error=e)
+                return
+            self.child = child._child
+            _notify({"t": "agent.call", "agent": kernel.agent, "request": self.id,
+                     "child": child.id, "module": d.module, "qualname": d.qualname,
+                     "digest": d.digest})
+            if self.state not in _ENDED:
+                try:
+                    _refuse_closing()
+                    self.work = _submit(self.child, kernel, self.arguments, d.result, 3, self)
+                except Exception as e:
+                    self.end(_REFUSED.get(type(e).__name__, "failed"), error=e)
+            work = self.work
+            if work is not None:
+                if self.state in _ENDED:
+                    # Cancelled from another thread as the submission was made.
+                    work.cancel()
+                await asyncio.wait([work.future])
+            if self.state in _ENDED:
+                reason, value, error = self.reason, self.value, self.error
+            else:
+                reason, value, error = work.reason, work.value, work.error
+            if reason not in ("released", "closed") and _closing is None:
+                with contextlib.suppress(Exception):
+                    await kernel.runtime.release([child])
+            _notify({"t": "agent.call.ended", "agent": kernel.agent, "request": self.id,
+                     "child": child.id, "outcome": reason or "accepted"})
+            self.end(reason, value=value, error=error)
+        finally:
+            self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"))
+            self._settle()
+
+
+def _call(declaration, arguments):
+    """Make a typed call -- `@outrig.agent`'s -- from the calling kernel, and return its handle at
+    once: the call runs as a task on that kernel's loop, in the caller's context, so
+    `outrig.runtime` is the caller's inside it."""
+    kernel = _sending_kernel("a call")
+    _refuse_closing()
+    # Copied now, so the child and the validator get the arguments as they were passed, whatever
+    # the caller does to them before the call's task sends them.
+    call = _Call(declaration, copy.deepcopy(arguments), kernel)
+    with _works_lock:
+        _launching[call.id] = call
+    try:
+        kernel.loop.call_soon_threadsafe(call.start, contextvars.copy_context())
+    except RuntimeError:
+        # The kernel's loop has closed with it: nothing will run the call.
+        with _works_lock:
+            _launching.pop(call.id, None)
+        raise
+    return Handle(call)
 
 
 class _ProgressOut(Endpoint):
@@ -5054,6 +5252,7 @@ class Kernel:
                 raise asyncio.CancelledError("stopped before it started")
             self.globals["__outrig_echo__"] = _echo
             code = _with_room(_compile, source)
+            _remember_source(code, source)
             # Agent code runs with the reserve held, so that whatever it does to memory there is
             # some left to report it with.
             _hold_reserve()
@@ -5571,9 +5770,12 @@ def _close(message):
             _say(said)
     with _works_lock:
         open_works = list(_works.values())
-    for work in open_works:
+        launching = list(_launching.values())
+    for work in open_works + launching:
         work.end("closed", error=_agents.SessionClosing(
             f"the session closed before {work} was answered: {text}"))
+    for call in launching:
+        call.settle()
 
 
 def _unbind(message):

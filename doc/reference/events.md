@@ -350,6 +350,18 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   it took; and `rounds`, the child's rounds it was open during.
 - `agent.request.refused` -- an answer to a request that had already ended, refused: `request`,
   and `ended`, how it had ended.
+- `agent.call.started` -- a call of a function declared with `@outrig.agent` launched the
+  subject, a child, to do its work: `request`, the id of the submission the call gives it, which
+  is the id the call's handle carries; `parent`, the subject of the agent whose code called;
+  `module` and `qualname`, the declaration's `__module__` and `__qualname__`; and `digest`, a
+  SHA-256 of the source that declared it -- its module's file, or the submission's source for a
+  function declared in one -- or `null` when none could be read. A call whose launch was refused,
+  by a limit say, has no child and records neither event; its handle raises the refusal.
+- `agent.call.settled` -- the call settled and its child, the subject, was released: `request`;
+  `outcome`, as `agent.request.settled` says it; and `usage`, the sum over every model request the
+  child made, or `null` when none reported any. It follows the `agent.released` that ended the
+  child, except at the session's close, which ends every call `closed` at once and tears its
+  children down afterward: a call settled `closed` precedes its child's release.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
   `from` and `to`, each `user` or `agent/primary`; and `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,

@@ -604,6 +604,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ),
         ("agent.request.refused", {"request": 7, "ended": "failed"}, c),
         (
+            "agent.call.started",
+            {"request": 8, "parent": a, "module": "review", "qualname": "analyze_code", "digest": "3b4c"},
+            c,
+        ),
+        (
             "agent.request.sent",
             {"request": 8, "channel": None, "sender": a, "body": '{"xs": [1]}', "attempts_max": 3},
             c,
@@ -611,6 +616,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("agent.request.progress", {"request": 8, "body": "p"}, c),
         ("agent.request.cancelled", {"request": 8, "received": True}, c),
         ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
+        ("agent.call.settled", {"request": 8, "outcome": "cancelled", "usage": usage}, c),
         ("agent.wedged", {}, "agent/c2"),
         ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
         (

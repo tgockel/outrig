@@ -1162,6 +1162,16 @@ pub outrig::harness::event::Operation::Setattr
 pub outrig::harness::event::Operation::Str
 pub outrig::harness::event::Operation::Unknown
 #[non_exhaustive] pub enum outrig::harness::event::Payload
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentCallSettled
+pub outrig::harness::event::Payload::AgentCallSettled::outcome: outrig::harness::event::RequestEnd
+pub outrig::harness::event::Payload::AgentCallSettled::request: outrig::harness::event::AgentRequestId
+pub outrig::harness::event::Payload::AgentCallSettled::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentCallStarted
+pub outrig::harness::event::Payload::AgentCallStarted::digest: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentCallStarted::module: alloc::string::String
+pub outrig::harness::event::Payload::AgentCallStarted::parent: alloc::string::String
+pub outrig::harness::event::Payload::AgentCallStarted::qualname: alloc::string::String
+pub outrig::harness::event::Payload::AgentCallStarted::request: outrig::harness::event::AgentRequestId
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentReleased
 pub outrig::harness::event::Payload::AgentReleased::ended: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::AgentReleased::released: alloc::vec::Vec<alloc::string::String>

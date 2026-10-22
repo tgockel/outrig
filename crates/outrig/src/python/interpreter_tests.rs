@@ -5051,3 +5051,829 @@ fn an_ended_kernel_releases_its_requests_and_is_gone() {
         "{raised}"
     );
 }
+
+// ---------------------------------------------------------------------------- declared functions
+//
+// `@outrig.agent`, the interpreter's half: a call of a declared function launches a child, gives
+// it the call's arguments as a submission, and releases it once that has ended, with the test
+// standing where the host stands. The checks a declaration itself makes need no host at all.
+
+/// The module a submission's declarations belong to: the primary's kernel module.
+const PRIMARY_MODULE: &str = "outrig_session_primary";
+
+/// A result type, and a declared function whose body would raise if it ever ran, with braces in
+/// its docstring.
+const ADD: &str = r#"
+from dataclasses import dataclass
+import inspect, outrig
+@dataclass
+class Total:
+    total: int
+
+@outrig.agent
+async def add(xs: list[int], scale: int = 1) -> Total:
+    """ROLE adder: add up `xs`, then scale by `scale`; {scale} and {} stay braces."""
+    raise AssertionError("the body ran")
+"#;
+
+/// `bytes` as the digest a declaration carries.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl Interpreter {
+    /// Read messages until one of kind `kind`, looking in `pending` first. Returns what came
+    /// before it, in order, and then it.
+    fn until(&mut self, kind: &str, pending: Vec<Value>) -> (Vec<Value>, Value) {
+        let mut before = Vec::new();
+        let mut pending = pending.into_iter();
+        loop {
+            let message = match pending.next() {
+                Some(message) => message,
+                None => self.recv(),
+            };
+            if message["t"] == kind {
+                before.extend(pending);
+                return (before, message);
+            }
+            before.push(message);
+        }
+    }
+
+    /// Run `source` in the primary, which calls one declared function, and return its result
+    /// and the spawn the call asked for, in whichever order they came.
+    fn calling(&mut self, id: u64, source: &str) -> (Value, Value) {
+        self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}));
+        let (mut result, mut asked) = (None, None);
+        while result.is_none() || asked.is_none() {
+            let message = self.recv();
+            if message["t"] == "result" && message["id"] == id {
+                result = Some(message);
+            } else if message["t"] == "agent.spawn" {
+                asked = Some(message);
+            } else {
+                panic!("unexpected before the spawn was asked: {message}");
+            }
+        }
+        (result.expect("result"), asked.expect("spawn"))
+    }
+
+    /// Answer `asked`, a spawn, as the host does, opening `child`'s kernel for it, and return
+    /// the `agent.call` notice the call sends once it has its child.
+    fn launched(&mut self, asked: &Value, child: &str) -> Value {
+        self.opened(json!({
+            "t": "open", "agent": child, "main": false,
+            "child": {"kind": asked["kind"], "spawn": asked["id"], "requests_max": 4},
+        }));
+        self.send(json!({
+            "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": child, "requests_max": 4,
+        }));
+        let call = self.recv();
+        assert_eq!(call["t"], "agent.call", "{call}");
+        assert_eq!(call["child"], child, "{call}");
+        call
+    }
+
+    /// `calling` and `launched` in one, for a call that goes on to its submission: the exec's
+    /// output, the spawn as asked, the `agent.call` notice, and the `agent.request` notice.
+    fn called(&mut self, id: u64, source: &str, child: &str) -> (String, Value, Value, Value) {
+        let (result, asked) = self.calling(id, source);
+        assert_eq!(result["status"], "ok", "unexpected raise: {result}");
+        let call = self.launched(&asked, child);
+        let request = self.recv();
+        assert_eq!(request["t"], "agent.request", "{request}");
+        assert_eq!(
+            request["request"], call["request"],
+            "one id names the call and its request"
+        );
+        (text(&result["output"]), asked, call, request)
+    }
+
+    /// Give `child` the submission waiting for it, as the host does between rounds, and return
+    /// the request's id.
+    fn assigned(&mut self, child: &str, id: u64) -> Value {
+        self.send(json!({"t": "assign", "agent": child, "id": id}));
+        let received = self.recv();
+        assert_eq!(received["t"], "agent.received", "{received}");
+        let assigned = self.recv();
+        assert_eq!(assigned["t"], "agent.assigned", "{assigned}");
+        assigned["request"].clone()
+    }
+
+    /// Answer the release of `child` that `ask` asks for, as the host does: end its kernel, say
+    /// it is released, and answer. Returns the `agent.call.ended` notice that follows.
+    fn release_answered(&mut self, child: &str, ask: &Value) -> Value {
+        assert_eq!(ask["children"], json!([child]), "{ask}");
+        self.send(json!({"t": "end", "agent": child, "id": 900}));
+        let (_, ended) = self.until("ended", Vec::new());
+        assert_eq!(ended["agent"], child, "{ended}");
+        self.send(json!({
+            "t": "child", "agent": PRIMARY, "id": 0, "child": child, "state": "released",
+        }));
+        self.send(json!({"t": "released", "agent": PRIMARY, "id": ask["id"], "error": null}));
+        let (rest, settled) = self.until("agent.call.ended", Vec::new());
+        assert!(
+            rest.is_empty(),
+            "between the release and the call's end: {rest:?}"
+        );
+        assert_eq!(settled["child"], child, "{settled}");
+        settled
+    }
+
+    /// Wait for the primary to ask for `child`'s release -- `pending` holds messages read
+    /// already -- and answer it. Returns what came before the ask, and the call's end.
+    fn released(&mut self, child: &str, pending: Vec<Value>) -> (Vec<Value>, Value) {
+        let (before, ask) = self.until("agent.release", pending);
+        let settled = self.release_answered(child, &ask);
+        (before, settled)
+    }
+}
+
+/// A declaration is read, not run: its wrapper is no coroutine function, keeps the signature, and
+/// says in `help()` that a call returns a handle and the body never runs; a declaration that is
+/// wrong is refused with `TypeError` naming it.
+#[test]
+fn a_declaration_is_read_and_a_wrong_one_is_refused() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.output(
+            1,
+            &format!(
+                "{ADD}\nprint(inspect.iscoroutinefunction(add), inspect.signature(add), \
+                 add.__module__, add.__qualname__)"
+            ),
+        ),
+        format!(
+            "False (xs: list[int], scale: int = 1) -> {PRIMARY_MODULE}.Total {PRIMARY_MODULE} add\n"
+        )
+    );
+    let help = k.output(2, "help(add)");
+    assert!(
+        help.contains("add(xs: list[int], scale: int = 1)")
+            && help.contains("{scale} and {} stay braces")
+            && help.contains("returns its handle at once")
+            && help.contains("body is never run"),
+        "{help}"
+    );
+    let refused = py(r#"
+        cases = {}
+        def case(name):
+            def keep(make):
+                try:
+                    make()
+                except TypeError as e:
+                    cases[name] = str(e)
+                else:
+                    cases[name] = 'accepted'
+            return keep
+        @case('no docstring')
+        def _():
+            @outrig.agent
+            async def f(x: int) -> int: ...
+        @case('unannotated')
+        def _():
+            @outrig.agent
+            async def f(x) -> int:
+                "d"
+        @case('star')
+        def _():
+            @outrig.agent
+            async def f(**kw: int) -> int:
+                "d"
+        @case('no return')
+        def _():
+            @outrig.agent
+            async def f(x: int):
+                "d"
+        @case('outside')
+        def _():
+            @outrig.agent
+            async def f(x: int) -> set:
+                "d"
+        @case('unresolved')
+        def _():
+            @outrig.agent
+            async def f(x: 'Nowhere') -> int:
+                "d"
+        @case('default')
+        def _():
+            @outrig.agent
+            async def f(x: int = 'one') -> int:
+                "d"
+        @case('reserved')
+        def _():
+            @outrig.agent
+            async def f(runtime: int) -> int:
+                "d"
+        @case('validator')
+        def _():
+            def check(result, other): return []
+            @outrig.agent(validate=check)
+            async def f(x: int) -> int:
+                "d"
+        @case('model')
+        def _():
+            @outrig.agent(model=3)
+            async def f(x: int) -> int:
+                "d"
+        @case('not async')
+        def _():
+            @outrig.agent
+            def f(x: int) -> int:
+                "d"
+        @case('class named like an input')
+        def _():
+            @outrig.agent
+            async def f(Total: int) -> Total:
+                "d"
+        for name, said in cases.items():
+            print(f'{name}: {said}')
+        "#);
+    let said = k.output(3, &refused);
+    for (case, expect) in [
+        ("no docstring", "has no docstring"),
+        ("unannotated", "parameter 'x' has no type annotation"),
+        ("star", "takes **kw"),
+        ("no return", "has no return annotation"),
+        ("outside", "the result cannot be set"),
+        ("unresolved", "cannot be resolved: NameError"),
+        ("default", "the default of parameter 'x'"),
+        ("reserved", "parameter 'runtime' cannot name a variable"),
+        (
+            "validator",
+            "validate cannot be called as validate(result, x=...)",
+        ),
+        ("model", "model names a configured model"),
+        ("not async", "declares an `async def` function"),
+        (
+            "class named like an input",
+            "would be bound in the child under 'Total'",
+        ),
+    ] {
+        let line = said
+            .lines()
+            .find(|line| line.starts_with(&format!("{case}: ")))
+            .unwrap_or_else(|| panic!("no line for {case:?} in {said}"));
+        assert!(line.contains(expect), "{case}: {line}");
+        assert!(line.contains(".f"), "{case} names the function: {line}");
+    }
+}
+
+/// A call returns its handle before the child exists, with the request's id already; the spawn
+/// carries the docstring as written, the submission the arguments with the default applied; the
+/// start notice names the declaration and digests the submission that declared it; the body
+/// never runs; and the call settles accepted once the child is released, which the call asks.
+#[test]
+fn a_call_launches_a_child_gives_it_the_inputs_and_releases_it() {
+    let mut k = Interpreter::start();
+    k.output(1, ADD);
+    let (said, asked, call, request) = k.called(
+        2,
+        "h = add([1, 2, 3])\nprint(h.id, h.status, h.done())",
+        "c1",
+    );
+    assert_eq!(
+        said,
+        format!("{} queued (child idle) False\n", call["request"])
+    );
+    assert_eq!(asked["name"], "add");
+    assert_eq!(asked["kind"], "work");
+    assert_eq!(asked["model"], Value::Null);
+    assert_eq!(
+        asked["prompt"],
+        "ROLE adder: add up `xs`, then scale by `scale`; {scale} and {} stay braces.",
+        "the docstring as written, with no argument in it"
+    );
+    assert_eq!(
+        asked["manifest"],
+        json!([]),
+        "the arguments travel with the submission"
+    );
+    assert_eq!(call["module"], PRIMARY_MODULE);
+    assert_eq!(call["qualname"], "add");
+    assert_eq!(call["digest"], sha256_hex(ADD.as_bytes()));
+    assert_eq!(
+        request["manifest"],
+        json!([
+            {"name": "xs", "type": "list[int]", "preview": "[1, 2, 3]"},
+            {"name": "scale", "type": "int", "preview": "1"},
+        ])
+    );
+    assert_eq!(request["result"]["type"], "Total");
+    assert_eq!(request["attempts"], 3);
+    assert_eq!(k.output(3, "print(h.status)"), "queued (child idle)\n");
+
+    assert_eq!(k.assigned("c1", 50), call["request"]);
+    assert_eq!(k.output(4, "print(h.status)"), "running (child idle)\n");
+    assert_eq!(
+        k.output_in("c1", 5, "print(xs, scale, Total.__name__)"),
+        "[1, 2, 3] 1 Total\n"
+    );
+    let (completed, pending) = k.exec_collecting(
+        "c1",
+        6,
+        "await runtime.complete(Total(total=sum(xs) * scale))",
+    );
+    assert_eq!(completed["status"], "ok", "{completed}");
+    let (before, settled) = k.released("c1", pending);
+    let kinds: Vec<&str> = before.iter().filter_map(|m| m["t"].as_str()).collect();
+    assert_eq!(kinds, ["agent.answered", "agent.ended"], "{before:?}");
+    assert_eq!(settled["outcome"], "accepted");
+    assert_eq!(settled["request"], call["request"]);
+    assert_eq!(
+        k.output(
+            7,
+            "r = await h\nprint(r, type(r) is Total, h.status, h.done(), h.result() is r, await h is r)"
+        ),
+        "Total(total=6) True accepted (child released) True True True\n"
+    );
+}
+
+/// A call nobody awaits runs all the same, and its child is released when it settles; one
+/// whose argument is of the wrong type, or missing, is refused before anything is sent; and a
+/// body of `pass`, `...` or a `raise` is declared and ignored alike.
+#[test]
+fn an_unawaited_call_runs_and_a_wrong_argument_sends_nothing() {
+    let mut k = Interpreter::start();
+    k.output(1, ADD);
+    for (id, source) in [(2, "add('x')"), (3, "add()"), (4, "add([1], scale='two')")] {
+        let (result, notices) = k.exec_collecting(PRIMARY, id, source);
+        assert!(text(&result["error"]).contains("TypeError"), "{result}");
+        assert!(notices.is_empty(), "nothing sent: {notices:?}");
+    }
+    let (result, _) = k.exec_collecting(PRIMARY, 5, "add('x')");
+    assert!(
+        text(&result["error"]).contains("xs: expected list[int], not str"),
+        "{result}"
+    );
+
+    let bodies = py(r#"
+        @outrig.agent
+        async def dots(n: int) -> int:
+            "ROLE dots"
+            ...
+        @outrig.agent
+        async def passes(n: int) -> int:
+            "ROLE passes"
+            pass
+        @outrig.agent
+        async def raises(n: int) -> int:
+            "ROLE raises"
+            raise AssertionError("ran")
+        "#);
+    k.output(6, &bodies);
+    let (_, _, call, _) = k.called(7, "dots(1)", "c1");
+    assert_eq!(call["qualname"], "dots");
+    let (_, _, call, _) = k.called(8, "passes(1)", "c2");
+    assert_eq!(call["qualname"], "passes");
+    let (_, _, call, _) = k.called(9, "raises(1)", "c3");
+    assert_eq!(call["qualname"], "raises");
+
+    let (_, _, call, _) = k.called(10, "add([4, 5])", "c4");
+    assert_eq!(k.assigned("c4", 51), call["request"]);
+    let (_, pending) = k.exec_collecting("c4", 11, "await runtime.complete({'total': 9})");
+    let (_, settled) = k.released("c4", pending);
+    assert_eq!(settled["outcome"], "accepted");
+    assert_eq!(settled["request"], call["request"]);
+    assert_eq!(
+        k.output(
+            12,
+            "import __main__\nprint(len(__main__._launching), 'c4' in __main__._kernels)"
+        ),
+        "3 False\n",
+        "the unawaited call is done with; the three whose children wait are not"
+    );
+}
+
+/// `h.cancel()` before the child exists ends the call at once and releases the child the host
+/// launches anyway; after the child has the submission, it cancels that, the child's completion
+/// is refused, and the child is released all the same.
+#[test]
+fn cancelling_a_call_releases_its_child() {
+    let mut k = Interpreter::start();
+    k.output(1, ADD);
+    let (result, notices) = k.exec_collecting(
+        PRIMARY,
+        2,
+        "first = add([1])\nprint(first.cancel(), first.status)\ntry:\n    await first\n\
+         except outrig.RequestCancelled as e:\n    print('cancelled:', e)",
+    );
+    let said = text(&result["output"]);
+    assert!(
+        said.starts_with("True failed: cancelled (child released)\ncancelled: call ")
+            && said.ends_with(" of outrig_session_primary.add was cancelled\n"),
+        "{said}"
+    );
+    assert!(
+        notices.is_empty(),
+        "cancelled before its task ran: {notices:?}"
+    );
+    let (_, asked) = k.calling(3, "early = add([1])");
+    let (said, notices) = k.noted(PRIMARY, 9, "print(early.cancel(), early.status)");
+    assert_eq!(said, "True failed: cancelled (child released)\n");
+    assert!(
+        notices.is_empty(),
+        "the spawn is still pending: {notices:?}"
+    );
+    let call = k.launched(&asked, "c1");
+    let (before, settled) = k.released("c1", Vec::new());
+    assert!(before.is_empty(), "no submission was made: {before:?}");
+    assert_eq!(settled["outcome"], "cancelled");
+    assert_eq!(settled["request"], call["request"]);
+    let (raised, _) = k.exec_collecting(PRIMARY, 8, "await early");
+    assert!(
+        text(&raised["error"]).contains("RequestCancelled"),
+        "{raised}"
+    );
+
+    let (_, _, call, _) = k.called(4, "late = add([2])", "c2");
+    k.assigned("c2", 52);
+    let (said, pending) = k.noted(PRIMARY, 5, "print(late.cancel(), late.status, late.done())");
+    assert_eq!(said, "True failed: cancelled (child idle) True\n");
+    let (before, ask) = k.until("agent.release", pending);
+    let ended = before
+        .iter()
+        .find(|m| m["t"] == "agent.ended")
+        .unwrap_or_else(|| panic!("no agent.ended among {before:?}"));
+    assert_eq!(
+        (&ended["outcome"], &ended["received"]),
+        (&json!("cancelled"), &json!(true))
+    );
+    let (refused, _) = k.exec_collecting("c2", 6, "await runtime.complete(Total(total=2))");
+    assert!(
+        text(&refused["error"]).contains("RequestCancelled"),
+        "{refused}"
+    );
+    let settled = k.release_answered("c2", &ask);
+    assert_eq!(settled["outcome"], "cancelled");
+    assert_eq!(settled["request"], call["request"]);
+    let (raised, _) = k.exec_collecting(PRIMARY, 7, "await late");
+    assert!(
+        text(&raised["error"]).contains("RequestCancelled"),
+        "{raised}"
+    );
+}
+
+/// `validate=` runs in the caller on each answer with the declared shape, once per answer, with
+/// the call's arguments by name; its problems reach the child as decoding problems do and count
+/// an attempt; one that raises ends the call with that exception and counts none.
+#[test]
+fn a_validator_checks_each_answer_and_one_that_raises_ends_the_call() {
+    let mut k = Interpreter::start();
+    let declared = py(r#"
+        checks = []
+        def policy(result, xs, scale):
+            checks.append(result.total)
+            return [] if result.total == sum(xs) * scale else [f"total {result.total} is not the sum"]
+        @outrig.agent(validate=policy)
+        async def checked(xs: list[int], scale: int = 1) -> Total:
+            "ROLE checked"
+        def broken(result, xs):
+            raise ValueError("policy bug")
+        @outrig.agent(validate=broken)
+        async def unchecked(xs: list[int]) -> Total:
+            "ROLE broken"
+        "#);
+    k.output(1, &format!("{ADD}\n{declared}"));
+    let (_, _, call, _) = k.called(2, "h = checked([1, 2], scale=2)", "c1");
+    k.assigned("c1", 50);
+    let (wrong, notices) = k.exec_collecting("c1", 3, "await runtime.complete(Total(total=5))");
+    let error = text(&wrong["error"]);
+    assert!(
+        error.contains("DecodeError")
+            && error.contains("attempt 1 of 3")
+            && error.contains("$: total 5 is not the sum"),
+        "{wrong}"
+    );
+    let answered = notices
+        .iter()
+        .find(|m| m["t"] == "agent.answered")
+        .unwrap_or_else(|| panic!("no agent.answered among {notices:?}"));
+    assert_eq!(answered["attempt"], 1);
+    assert_eq!(answered["problems"], json!(["$: total 5 is not the sum"]));
+    assert_eq!(k.output(4, "print(checks, h.done())"), "[5] False\n");
+    let (_, pending) = k.exec_collecting("c1", 5, "await runtime.complete(Total(total=6))");
+    let (before, settled) = k.released("c1", pending);
+    let answered = before
+        .iter()
+        .find(|m| m["t"] == "agent.answered")
+        .unwrap_or_else(|| panic!("no agent.answered among {before:?}"));
+    assert_eq!(answered["attempt"], 2);
+    assert_eq!(settled["outcome"], "accepted");
+    assert_eq!(settled["request"], call["request"]);
+    assert_eq!(
+        k.output(6, "print(await h, checks)"),
+        "Total(total=6) [5, 6]\n"
+    );
+
+    let (_, _, call, _) = k.called(7, "g = unchecked([3])", "c2");
+    k.assigned("c2", 51);
+    let (raised, notices) = k.exec_collecting("c2", 8, "await runtime.complete(Total(total=3))");
+    let error = text(&raised["error"]);
+    assert!(
+        error.contains("RuntimeError")
+            && error.contains("the validator raised ValueError: policy bug"),
+        "{raised}"
+    );
+    assert!(
+        notices.iter().all(|m| m["t"] != "agent.answered"),
+        "no answer was counted: {notices:?}"
+    );
+    let (before, settled) = k.released("c2", notices);
+    let ended = before
+        .iter()
+        .find(|m| m["t"] == "agent.ended")
+        .unwrap_or_else(|| panic!("no agent.ended among {before:?}"));
+    assert_eq!(ended["outcome"], "failed");
+    assert!(
+        text(&ended["message"]).contains("the validator raised ValueError: policy bug"),
+        "{ended}"
+    );
+    assert_eq!(settled["outcome"], "failed");
+    assert_eq!(settled["request"], call["request"]);
+    let (raised, _) = k.exec_collecting(PRIMARY, 9, "await g");
+    assert!(
+        text(&raised["error"]).contains("ValueError: policy bug"),
+        "{raised}"
+    );
+    assert_eq!(
+        k.output(10, "print(g.status)"),
+        "failed: failed (child released)\n"
+    );
+}
+
+/// A spawn the host refuses settles the call with the refusal and no child: a limit as
+/// `AgentLimitReached`, an unknown model as `ValueError` naming the configured ones; and the
+/// close ends a call still launching with the closing error.
+#[test]
+fn a_refused_launch_settles_the_call_and_the_close_ends_one_launching() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &format!(
+            "{ADD}\n@outrig.agent(model='nope')\nasync def fast(n: int) -> int:\n    'ROLE fast'\n"
+        ),
+    );
+    let (_, asked) = k.calling(2, "h = add([1])");
+    k.send(json!({"t": "spawned", "agent": PRIMARY, "id": asked["id"],
+                  "error": {"kind": "limit", "message": "children-max (64) reached"}}));
+    let (raised, notices) = k.exec_collecting(PRIMARY, 3, "await h");
+    assert!(
+        text(&raised["error"]).contains("AgentLimitReached: children-max (64)"),
+        "{raised}"
+    );
+    assert!(notices.is_empty(), "no call began: {notices:?}");
+    assert_eq!(
+        k.output(4, "print(h.status)"),
+        "failed: limit (child released)\n"
+    );
+
+    let (_, asked) = k.calling(5, "m = fast(1)");
+    assert_eq!(asked["model"], "nope");
+    k.send(json!({"t": "spawned", "agent": PRIMARY, "id": asked["id"],
+                  "error": {"kind": "model", "message": "unknown model 'nope'; configured: sonnet, fast"}}));
+    let (raised, _) = k.exec_collecting(PRIMARY, 6, "await m");
+    assert!(
+        text(&raised["error"])
+            .contains("ValueError: unknown model 'nope'; configured: sonnet, fast"),
+        "{raised}"
+    );
+
+    let (_, asked) = k.calling(7, "c = add([2])");
+    k.send(json!({"t": "close", "reason": "the owner closed it"}));
+    let (raised, _) = k.exec_collecting(PRIMARY, 8, "await c");
+    assert!(
+        text(&raised["error"]).contains("SessionClosing")
+            && text(&raised["error"]).contains("owner"),
+        "{raised}"
+    );
+    k.send(json!({"t": "spawned", "agent": PRIMARY, "id": asked["id"],
+                  "error": {"kind": "closed", "message": "the session is closing"}}));
+    assert_eq!(
+        k.output(9, "print(c.status)"),
+        "failed: closed (child released)\n"
+    );
+}
+
+/// A call copies its arguments as it is made: one the caller changes afterward reaches the
+/// child, and the validator, as it was at the call.
+#[test]
+fn an_argument_changed_after_the_call_goes_as_it_was() {
+    let mut k = Interpreter::start();
+    let declared = py(r#"
+        seen = []
+        def policy(result, xs, scale):
+            seen.append(list(xs))
+            return []
+        @outrig.agent(validate=policy)
+        async def checked(xs: list[int], scale: int = 1) -> Total:
+            "ROLE checked"
+        "#);
+    k.output(1, &format!("{ADD}\n{declared}"));
+    let (_, _, call, request) = k.called(2, "xs = [1]\nh = checked(xs)\nxs.append('oops')", "c1");
+    assert_eq!(request["manifest"][0]["preview"], "[1]");
+    assert_eq!(k.assigned("c1", 50), call["request"]);
+    assert_eq!(k.output_in("c1", 3, "print(xs)"), "[1]\n");
+    let (_, pending) = k.exec_collecting("c1", 4, "await runtime.complete(Total(total=1))");
+    let (_, settled) = k.released("c1", pending);
+    assert_eq!(settled["outcome"], "accepted");
+    assert_eq!(
+        k.output(5, "print(await h, seen, xs)"),
+        "Total(total=1) [[1]] [1, 'oops']\n"
+    );
+}
+
+/// A submission is queued on its child and told to the host in one step against the assign that
+/// gives the child its next: an assign that lands as one is made takes it only once the host has
+/// heard of it, so what the child says of it names a request the host knows.
+#[test]
+fn a_submission_is_told_of_before_the_child_can_take_it() {
+    let mut k = Interpreter::start();
+    k.spawn_as(1, "child = await runtime.spawn('w', prompt='p')", "c1");
+    let (said, notices) = k.noted(
+        PRIMARY,
+        2,
+        &py(r#"
+            import threading, time, __main__ as m
+            real = m._notify
+            taker = threading.Thread(target=m._assign, args=(m._kernels['c1'], 77, {}))
+            def notify(message):
+                if message['t'] == 'agent.request':
+                    taker.start()  # an assign arriving as the submission is made
+                    time.sleep(0.2)
+                real(message)
+            m._notify = notify
+            try:
+                h = child.submit({'x': 2}, result=int)
+                taker.join(5)
+            finally:
+                m._notify = real
+            print(taker.is_alive(), h.status)
+            "#),
+    );
+    assert_eq!(said, "False running (child idle)\n");
+    let kinds: Vec<&str> = notices.iter().filter_map(|m| m["t"].as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["agent.request", "agent.received", "agent.assigned"],
+        "{notices:?}"
+    );
+    assert_eq!(notices[2]["id"], 77);
+    assert_eq!(notices[1]["request"], notices[0]["request"]);
+}
+
+/// A validator ends the call with whatever it raised, a `BaseException` and one whose message
+/// cannot be read included; and the problems one returns reach the child bounded as the
+/// decoder's are: `PROBLEMS_MAX` of them, each cut, and the rest counted.
+#[test]
+fn a_validator_that_raises_anything_ends_the_call_and_its_problems_are_bounded() {
+    let mut k = Interpreter::start();
+    let declared = py(r#"
+        class Loud(Exception):
+            def __str__(self):
+                raise ValueError("unspeakable")
+        def loud(result, xs):
+            raise Loud()
+        @outrig.agent(validate=loud)
+        async def shouted(xs: list[int]) -> Total:
+            "ROLE loud"
+        class Halt(BaseException):
+            pass
+        def halting(result, xs):
+            raise Halt("stop")
+        @outrig.agent(validate=halting)
+        async def halted(xs: list[int]) -> Total:
+            "ROLE halt"
+        def many(result, xs):
+            return [f"problem {i} " + "x" * (2000 if i == 0 else 10) for i in range(25)]
+        @outrig.agent(validate=many)
+        async def flooded(xs: list[int]) -> Total:
+            "ROLE many"
+        "#);
+    k.output(1, &format!("{ADD}\n{declared}"));
+    for (id, source, child, raised) in [
+        (
+            2,
+            "h = shouted([1])",
+            "c1",
+            "Loud: <a message that could not be read>",
+        ),
+        (5, "h = halted([1])", "c2", "Halt: stop"),
+    ] {
+        let (_, _, call, _) = k.called(id, source, child);
+        k.assigned(child, id + 50);
+        let (refused, notices) =
+            k.exec_collecting(child, id + 1, "await runtime.complete(Total(total=1))");
+        let error = text(&refused["error"]);
+        assert!(
+            error.contains("RuntimeError")
+                && error.contains(&format!("the validator raised {raised}")),
+            "{refused}"
+        );
+        assert!(
+            notices.iter().all(|m| m["t"] != "agent.answered"),
+            "no answer was counted: {notices:?}"
+        );
+        let (_, settled) = k.released(child, notices);
+        assert_eq!(settled["outcome"], "failed");
+        assert_eq!(settled["request"], call["request"]);
+        assert_eq!(
+            k.output(
+                id + 2,
+                "try:\n    await h\nexcept BaseException as e:\n    print(type(e).__name__, h.status)",
+            ),
+            format!(
+                "{} failed: failed (child released)\n",
+                raised.split(':').next().expect("a type")
+            )
+        );
+    }
+
+    k.called(8, "h = flooded([1])", "c3");
+    k.assigned("c3", 58);
+    let (wrong, notices) = k.exec_collecting("c3", 9, "await runtime.complete(Total(total=1))");
+    let error = text(&wrong["error"]);
+    assert!(
+        error.contains("DecodeError") && error.contains("$: ... and 5 more"),
+        "{wrong}"
+    );
+    let answered = notice(&notices, "agent.answered");
+    let problems = answered["problems"].as_array().expect("problems");
+    assert_eq!(problems.len(), 21);
+    let first = text(&problems[0]);
+    assert!(
+        first.starts_with("$: problem 0 xxx") && first.ends_with("... [986 more characters]"),
+        "{first}"
+    );
+    assert_eq!(problems[20], "$: ... and 5 more");
+    assert!(serde_json::to_string(answered).expect("json").len() < 32 * 1024);
+}
+
+/// A function declared in a submission is digested from that submission wherever the
+/// declaration runs: one a factory makes in a later execution carries the factory's source, and
+/// one the agent's own `exec` compiled has none to digest.
+#[test]
+fn a_declaration_is_digested_from_the_source_that_declared_it() {
+    let mut k = Interpreter::start();
+    let factory = py(r#"
+        import outrig
+        def make():
+            @outrig.agent
+            async def made(n: int) -> int:
+                "ROLE made"
+            return made
+        "#);
+    k.output(1, &factory);
+    k.output(2, "g = make()");
+    assert_eq!(
+        k.output(
+            3,
+            &format!(
+                "print(g.__outrig_agent__.digest == {:?})",
+                sha256_hex(factory.as_bytes())
+            )
+        ),
+        "True\n"
+    );
+    assert_eq!(
+        k.output(
+            4,
+            "exec(\"@outrig.agent\\nasync def e(n: int) -> int:\\n    'ROLE e'\\n\", globals())\n\
+             print(e.__outrig_agent__.digest)",
+        ),
+        "None\n"
+    );
+}
+
+#[test]
+fn a_submission_nesting_functions_past_the_recursion_limit_still_runs() {
+    // Recording the source against every code object compiled walks the whole nest, which can
+    // be deeper than the recursion limit. The result is read in a second execution: a trailing
+    // bare expression this deep would not compile.
+    let mut k = Interpreter::start();
+    let depth = 1100;
+    let source = format!("f = {}42", "lambda: ".repeat(depth));
+    assert_eq!(k.output(1, &source), "");
+    assert_eq!(
+        k.output(
+            2,
+            &py(&format!(
+                r#"
+                import types, __main__ as m
+                g = f
+                for _ in range({depth}):
+                    g = g()
+                codes = [f.__code__]
+                while inner := [c for c in codes[-1].co_consts if type(c) is types.CodeType]:
+                    codes.append(inner[0])
+                print(g, len(codes), all(m._submitted_source(c) == {source:?} for c in codes))
+                "#
+            ))
+        ),
+        format!("42 {depth} True\n")
+    );
+}

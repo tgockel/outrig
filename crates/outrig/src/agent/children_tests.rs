@@ -31,7 +31,7 @@ use crate::python::testing::{Flag, py};
 
 /// A config whose `sonnet` model is the mock at `addr`, a `fast` alias of it,
 /// and `top` among the top-level keys.
-fn config(addr: std::net::SocketAddr, var: &str, top: &str) -> Config {
+pub(super) fn config(addr: std::net::SocketAddr, var: &str, top: &str) -> Config {
     let cfg = Config::load_from_str(&format!(
         r#"
 default-model = "sonnet"
@@ -63,20 +63,22 @@ preamble = "You write Python."
 /// A session of the `coding` agent, `top` among its config's top-level keys,
 /// every model call answered by `routes` -- the last of them the primary's --
 /// and the events it publishes.
-struct Tree {
-    session: Session,
-    requests: UnboundedReceiver<RecordedRequest>,
-    gauge: Arc<Gauge>,
-    /// Every event, gathered while the session runs, so a busy one misses
-    /// none.
-    events: JoinHandle<Vec<Arc<Event>>>,
+pub(super) struct Tree {
+    pub(super) session: Session,
+    pub(super) requests: UnboundedReceiver<RecordedRequest>,
+    pub(super) gauge: Arc<Gauge>,
+    /// Every event so far, gathered while the session runs, so a busy one
+    /// misses none; read by `seen` for a test that waits on one.
+    pub(super) events: Arc<std::sync::Mutex<Vec<Arc<Event>>>>,
+    /// The task gathering them, which ends with the subscription.
+    gathering: JoinHandle<()>,
 }
 
-async fn tree(var: &str, top: &str, routes: Vec<(&'static str, Responder)>) -> Tree {
+pub(super) async fn tree(var: &str, top: &str, routes: Vec<(&'static str, Responder)>) -> Tree {
     tree_held(var, top, routes, None).await
 }
 
-async fn tree_held(
+pub(super) async fn tree_held(
     var: &str,
     top: &str,
     routes: Vec<(&'static str, Responder)>,
@@ -91,36 +93,64 @@ async fn tree_held(
         .start_on_host()
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    let events = tokio::spawn(async move {
-        let mut events = Vec::new();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let gathering = tokio::spawn(async move {
         while let Some(received) = subscription.recv().await {
             match received {
-                Received::Event(event) => events.push(event),
+                Received::Event(event) => seen.lock().expect("events").push(event),
                 Received::Missed(missed) => panic!("missed {missed} events"),
             }
         }
-        events
     });
     Tree {
         session,
         requests,
         gauge,
         events,
+        gathering,
     }
 }
 
 impl Tree {
     /// Shut the session down, and return its report and every event it
     /// published.
-    async fn end(mut self) -> (ShutdownReport, Vec<Arc<Event>>, Vec<RecordedRequest>) {
+    pub(super) async fn end(mut self) -> (ShutdownReport, Vec<Arc<Event>>, Vec<RecordedRequest>) {
         let report = shut_down(self.session).await;
-        let events = self.events.await.expect("the events were gathered");
+        self.gathering.await.expect("the events were gathered");
+        let events = std::mem::take(&mut *self.events.lock().expect("events"));
         (report, events, mock_http::drain(&mut self.requests))
+    }
+
+    /// Wait until `count` events of `kind` have been published, failing
+    /// rather than hanging: for work a round left running, which the test
+    /// has no other way to wait on.
+    pub(super) async fn seen(&self, kind: &str, count: usize) {
+        let events = Arc::clone(&self.events);
+        tokio::time::timeout(Duration::from_secs(20), async move {
+            loop {
+                let so_far = events
+                    .lock()
+                    .expect("events")
+                    .iter()
+                    .filter(|event| event.kind() == kind)
+                    .count();
+                if so_far >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} {kind} events in time"));
     }
 }
 
 /// Every request `marker`'s agent made, in order.
-fn of_agent<'a>(requests: &'a [RecordedRequest], marker: &str) -> Vec<&'a RecordedRequest> {
+pub(super) fn of_agent<'a>(
+    requests: &'a [RecordedRequest],
+    marker: &str,
+) -> Vec<&'a RecordedRequest> {
     requests
         .iter()
         .filter(|request| system_text(&request.body).contains(marker))
@@ -128,7 +158,7 @@ fn of_agent<'a>(requests: &'a [RecordedRequest], marker: &str) -> Vec<&'a Record
 }
 
 /// Every request the primary made: those carrying no child's marker.
-fn primary(requests: &[RecordedRequest]) -> Vec<&RecordedRequest> {
+pub(super) fn primary(requests: &[RecordedRequest]) -> Vec<&RecordedRequest> {
     requests
         .iter()
         .filter(|request| !system_text(&request.body).contains("ROLE "))
@@ -136,7 +166,7 @@ fn primary(requests: &[RecordedRequest]) -> Vec<&RecordedRequest> {
 }
 
 /// What the primary's call `id` printed, read from the call after it.
-fn printed(requests: &[RecordedRequest], id: &str) -> String {
+pub(super) fn printed(requests: &[RecordedRequest], id: &str) -> String {
     let primary = primary(requests);
     let after = primary
         .iter()
@@ -151,7 +181,11 @@ fn printed(requests: &[RecordedRequest], id: &str) -> String {
 }
 
 /// The events of `kind`, whose subject is `subject` when one is given.
-fn kind<'a>(events: &'a [Arc<Event>], kind: &str, subject: Option<&str>) -> Vec<&'a Event> {
+pub(super) fn kind<'a>(
+    events: &'a [Arc<Event>],
+    kind: &str,
+    subject: Option<&str>,
+) -> Vec<&'a Event> {
     events
         .iter()
         .filter(|event| event.kind() == kind)
@@ -164,21 +198,21 @@ fn kind<'a>(events: &'a [Arc<Event>], kind: &str, subject: Option<&str>) -> Vec<
 }
 
 /// The `data` an event carries.
-fn data(event: &Event) -> Value {
+pub(super) fn data(event: &Event) -> Value {
     serde_json::to_value(&event.payload).expect("encodes")
 }
 
 /// The primary's one call: run `source`, then say `done`.
-fn primary_runs(source: &str) -> Responder {
+pub(super) fn primary_runs(source: &str) -> Responder {
     scripted(vec![submit("p1", &py(source)), text_reply("done")])
 }
 
 /// A child's round: run `source`, then end the round.
-fn child_runs(id: &str, source: &str) -> Vec<CannedResponse> {
+pub(super) fn child_runs(id: &str, source: &str) -> Vec<CannedResponse> {
     vec![submit(id, &py(source)), text_reply("ended")]
 }
 
-const TOTAL: &str = r#"
+pub(super) const TOTAL: &str = r#"
 from dataclasses import dataclass
 @dataclass
 class Total:
@@ -554,13 +588,13 @@ async def until(test):
 
 /// The primary's one call, as [`primary_runs`], with `Thing`, `Total` and
 /// `until` defined before `source`.
-fn primary_waits(source: &str) -> Responder {
+pub(super) fn primary_waits(source: &str) -> Responder {
     primary_runs(&format!("{THING}{TOTAL}{UNTIL}\n{}", py(source)))
 }
 
 /// The text of the message `request` ended on: for a round's first call, its
 /// opening.
-fn opening(request: &RecordedRequest) -> String {
+pub(super) fn opening(request: &RecordedRequest) -> String {
     text_of(&messages(request).last().expect("a message")["content"])
 }
 
@@ -1355,7 +1389,7 @@ const ANSWER_ONE: &str =
 /// A responder for any number of children's rounds, each served the same:
 /// a round's first call runs `source`, and the call after its result ends the
 /// round.
-fn serving(source: &str) -> Responder {
+pub(super) fn serving(source: &str) -> Responder {
     let source = source.to_string();
     let next = Arc::new(AtomicUsize::new(0));
     Arc::new(move |request: &RecordedRequest| {
@@ -1437,7 +1471,11 @@ fn exec_outputs(events: &[Arc<Event>], subject: &str) -> Vec<String> {
 }
 
 /// Where the event of `kind` that `test` picks sits among `events`.
-fn position(events: &[Arc<Event>], kind: &str, test: impl Fn(&Event) -> bool) -> Vec<usize> {
+pub(super) fn position(
+    events: &[Arc<Event>],
+    kind: &str,
+    test: impl Fn(&Event) -> bool,
+) -> Vec<usize> {
     events
         .iter()
         .enumerate()

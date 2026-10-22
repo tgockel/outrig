@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-31` | A decorated function is typed agent work                           |
 | `0003-34` | An agent class answers requests                                    |
 | `0003-35` | A host program drives an agent class                               |
 

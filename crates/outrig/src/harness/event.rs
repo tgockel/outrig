@@ -375,6 +375,28 @@ pub enum Payload {
     /// yielded, so its thread runs on until the session ends.
     #[non_exhaustive]
     AgentWedged {},
+    /// A typed call -- `@outrig.agent`'s -- that `parent`'s code made, whose
+    /// child is the event's subject: the declaration's `__module__` and
+    /// `__qualname__`, and the SHA-256 digest of the source that declared it,
+    /// or `None` when none could be read. The submission's request events
+    /// follow under the same `request`.
+    #[non_exhaustive]
+    AgentCallStarted {
+        request: AgentRequestId,
+        parent: String,
+        module: String,
+        qualname: String,
+        digest: Option<String>,
+    },
+    /// The call settled, its child released: how its submission ended, and
+    /// what every model request the child made used, or `None` when none
+    /// reported anything.
+    #[non_exhaustive]
+    AgentCallSettled {
+        request: AgentRequestId,
+        outcome: RequestEnd,
+        usage: Option<Usage>,
+    },
 
     // Integration audit: what crossed to a provider, or across a channel.
     /// A round ended as its model yielded, or as a limit stopped it.
@@ -584,6 +606,8 @@ impl Payload {
             Payload::AgentRequestRefused { .. } => "agent.request.refused",
             Payload::AgentReleased { .. } => "agent.released",
             Payload::AgentWedged {} => "agent.wedged",
+            Payload::AgentCallStarted { .. } => "agent.call.started",
+            Payload::AgentCallSettled { .. } => "agent.call.settled",
             Payload::ModelRoundUsage { .. } => "model.round.usage",
             Payload::HostedReceived { .. } => "hosted.received",
             Payload::HostedDispatched { .. } => "hosted.dispatched",

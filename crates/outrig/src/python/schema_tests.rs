@@ -639,3 +639,36 @@ fn help_documents_the_schema() {
         "#);
     assert_eq!(out, "[] True\n");
 }
+
+/// `@outrig.agent` declares on the host as it does in a kernel -- the
+/// maintainer's `analyze_code` against `ReviewResult`, checked as written --
+/// and a call there says that it needs an agent's kernel, sending nothing.
+#[test]
+fn a_declared_function_declares_on_the_host_and_a_call_says_it_needs_a_kernel() {
+    let out = run(r#"
+        import inspect
+        @outrig.agent
+        async def analyze_code(section: str) -> ReviewResult:
+            """Review one section of a unified diff for correctness and safety."""
+            ...
+        print(inspect.iscoroutinefunction(analyze_code), analyze_code.__outrig_agent__.qualname,
+              analyze_code.__outrig_agent__.digest is None)
+        try:
+            analyze_code('diff')
+        except RuntimeError as e:
+            print(e)
+        try:
+            @outrig.agent
+            async def nameless(section: str) -> ReviewResult:
+                ...
+        except TypeError as e:
+            print(e)
+        "#);
+    assert_eq!(
+        out,
+        "False analyze_code True\n\
+         a call to __main__.analyze_code runs in an agent's kernel, where OutRig runs agent \
+         code, and this Python is not one\n\
+         __main__.nameless has no docstring, which is what a declaration tells its child\n"
+    );
+}

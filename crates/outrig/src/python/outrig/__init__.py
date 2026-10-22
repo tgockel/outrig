@@ -13,6 +13,8 @@ the configuration it loaded, and `outrig.Session` enters a session the engine st
 
 Agent code launches a child agent with `runtime.spawn`, and the work it gives one ends with a
 value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(outrig.Request)`.
+`@outrig.agent` declares such work as a typed `async def`, each call of which runs in a child of
+its own: see `help(outrig.agent)`.
 """
 
 from . import schema
@@ -28,6 +30,7 @@ from ._agents import (
     RequestSettled,
     SessionClosing,
     Status,
+    agent,
 )
 
 __all__ = [
@@ -43,6 +46,7 @@ __all__ = [
     "RequestSettled",
     "SessionClosing",
     "Status",
+    "agent",
 ]
 
 # What only a kernel has. `outrig._kernel` binds each as the interpreter starts; anywhere else,

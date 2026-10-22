@@ -376,6 +376,9 @@ struct SlotState {
     /// The attempts the round in progress has made, failed ones included: its
     /// members, which its total is the sum over.
     round: Vec<AttemptId>,
+    /// Every attempt the agent has made, in every round: what a typed call
+    /// settles with the sum over.
+    attempts: Vec<AttemptId>,
     /// The attempts children made under the round in progress, at any depth,
     /// while it ran.
     descendants: Vec<AttemptId>,
@@ -490,6 +493,11 @@ impl CallSlot {
     pub(crate) fn current_round(&self) -> Option<u32> {
         let state = self.state();
         state.open.or(state.last)
+    }
+
+    /// Every attempt the agent has made, in every round so far.
+    pub(crate) fn attempts(&self) -> Vec<AttemptId> {
+        self.state().attempts.clone()
     }
 
     /// A child under this slot's agent made `attempt`, under its round
@@ -622,6 +630,7 @@ impl CallSlot {
                 in_flight.last = Some(attempt);
             }
             state.round.push(attempt);
+            state.attempts.push(attempt);
         }
         // Up the tree, outside this slot's lock: each round above this agent's
         // that it was launched under counts what it spent.

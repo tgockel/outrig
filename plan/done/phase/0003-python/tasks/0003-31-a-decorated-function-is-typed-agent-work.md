@@ -151,3 +151,74 @@ check; no source is read.
   validation and repair.
 - `plan/phase/0003-python/work.md` -- the handle's rules, and the session-wide limits.
 - `plan/phase/0003-python/agent-classes.md` -- the same decorator on a method of an agent class.
+
+## Decisions
+
+Fork 1 was taken as recommended. What no doc settled is recorded here.
+
+- **Where the pieces live.** The declaration -- the checks, the wrapper, the digest -- is
+  `outrig._agents.agent`, which imports on the host as the rest of the package does, so a
+  program declares as a kernel does and a call there raises `RuntimeError` saying it needs a
+  kernel. The call is the interpreter's: `_load_outrig` installs `_agents._call` and
+  `_agents._submitted_source`, as `outrig._kernel.install` gives the package its executions.
+  The wrapper is a plain `def` under `functools.wraps`, so `inspect.signature` follows
+  `__wrapped__` to the real signature and `inspect.iscoroutinefunction` is false; the
+  declaration, a frozen dataclass, is kept as `wrapper.__outrig_agent__`, which `0003-34`
+  reads to find marked methods. The docstring is passed through `inspect.cleandoc` and
+  nothing else: the child's prompt is the docstring with its indentation removed, braces and
+  all.
+- **The digest is taken at the declaration**, a SHA-256 of the source that declared the
+  function: the submission's for a function one compiled, found through the function's code
+  object -- each execution records its source against every code object it compiled, under a
+  weak reference, so a declaration a factory makes in a later execution is digested from the
+  factory's submission, not the caller's, and one the agent's own `exec` compiled has none;
+  the module's file otherwise, or what its loader's `get_source` gives; `null` when none can
+  be read. A declaration's identity is the source that made it, as a skill's digest is of its
+  files when they were loaded (`skills.md`); a changed file imported again makes a new
+  declaration with a new digest.
+- **A call copies its arguments as it is made.** The wrapper checks each argument against its
+  type, and the call deep-copies the bound arguments before the handle returns, so what the
+  child is given, and what the validator is called with, is the value as passed, whatever the
+  caller does to it afterward; the submission copies again for the child, as every submission
+  does.
+- **A submission is queued and told of under the child's lock**, which the assign that gives
+  the child its next submission also takes: the host hears of a submission once it is queued,
+  and the child takes it only once the host has heard, so `agent.received` never names a
+  request the host does not know. Telling first, as `0003-30` did, let an assign find nothing;
+  queueing first and telling after let an assign in flight take a submission the host had not
+  heard of, which its record then held as queued for good.
+- **A call is a `_Work` with no child yet.** `_Call` subclasses the request the handle reads,
+  taking its id from the interpreter's counter as the call is made and giving the submission
+  that id, so the handle has it before the child exists and `agent.call.started`,
+  `agent.call.settled` and the request family all name the same request. Calls not yet ended
+  are `_launching`, under the works' lock, which the close sweeps beside `_works`, settling
+  each at once, since a call still launching may never hear its spawn's answer. Of two
+  implementations compared for complexity, this one -- a subclass, one registry, a straight
+  task -- replaced one that duck-typed `_Work` with a parallel class and a second lock.
+- **The call settles once the child is gone.** The task running a call awaits the release
+  before it settles the handle, so `await analyze_code(s)` returns with the child's place under
+  `children-max` free, and a loop of calls at the cap never races the last child's departure.
+  Before the child exists the handle's status reads `queued (child idle)`; a spawn refused
+  reads `failed: limit`, a reason added to `Status` beside the request family's, and a settled
+  call with no child says `child released`, since none remains.
+- **No call events for a refused launch.** A call whose spawn is refused -- a limit, the depth,
+  an unknown model, the close -- has no child and records neither `agent.call.started` nor
+  `agent.call.settled`, as a refused `spawn` has no spawn in the record; the handle raises the
+  refusal. Both events carry the child's subject, with `parent` naming the caller as
+  `agent.spawned` does, and `agent.call.settled` follows `agent.released`, carrying the sum
+  over every attempt the child made, which `CallSlot` now keeps. The session's close is the
+  exception: it ends every call `closed` with its submission, before the children are torn
+  down, so a call settled `closed` precedes its child's release, as `events.md` says.
+- **A validator's problems are `Problem`s at `$`**, the value's root, since they are about the
+  value as a whole, and are counted and raised in the child exactly as decoding problems are,
+  and bounded as they are: the first `PROBLEMS_MAX`, each cut to the preview length, and a
+  count of the rest, so the notice stays a line the host reads. A validator is called as
+  `validate(result, **arguments)`, the inputs by name, and one whose signature cannot take
+  that is refused at the declaration. One that raises -- anything, a `BaseException` included,
+  since the raise of a function called synchronously is its own -- ends the request `failed`
+  with the exception itself -- `await h` raises it -- recording no answer and counting no
+  attempt; in the child, `complete` raises `RuntimeError` saying the validator raised and the
+  submission has ended, with a message whose own `__str__` raises named as unreadable.
+- **Public API.** `public-api.txt` gains the two `Payload` variants and their fields, not only
+  the start event's: the acceptance's wording assumed the variants existed, and `0003-30` had
+  left them to this task.

@@ -667,6 +667,26 @@ fn each_event_has_exactly_its_data_fields() {
             &["request", "ended"],
         ),
         (
+            Payload::AgentCallStarted {
+                request: AgentRequestId::new(7),
+                parent: text("agent/primary"),
+                module: text("review"),
+                qualname: text("analyze_code"),
+                digest: Some(text("3b4c")),
+            },
+            "agent.call.started",
+            &["request", "parent", "module", "qualname", "digest"],
+        ),
+        (
+            Payload::AgentCallSettled {
+                request: AgentRequestId::new(7),
+                outcome: RequestEnd::Accepted,
+                usage: Some(usage),
+            },
+            "agent.call.settled",
+            &["request", "outcome", "usage"],
+        ),
+        (
             Payload::AgentReleased {
                 released: vec![text("c1")],
                 ended: vec![text("c1"), text("c2")],

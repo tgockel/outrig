@@ -332,6 +332,8 @@ impl Inner {
                 tokio::spawn(async move { inner.release(agent, line).await });
             }
             "agent.request" => self.requested(agent, &line),
+            "agent.call" => self.called(agent, &line),
+            "agent.call.ended" => self.call_ended(&line),
             "agent.received" => self.received(&line),
             "agent.answered" => self.answered(&line),
             "agent.ended" => self.ended(&line),
@@ -664,6 +666,43 @@ impl Inner {
             sender: Subject::agent(sender).to_string(),
             body: line["body"].as_str().unwrap_or_default().to_string(),
             attempts_max: line["attempts"].as_u64().unwrap_or_default() as u32,
+        });
+    }
+
+    /// A typed call `caller`'s code made -- `@outrig.agent`'s -- whose child
+    /// the line names: recorded under the child, with the declaration's name
+    /// and digest, ahead of its submission's events.
+    fn called(&self, caller: &str, line: &Value) {
+        let Some(id) = line["request"].as_u64() else {
+            return;
+        };
+        self.events_of(&text(&line["child"]))
+            .emit(Payload::AgentCallStarted {
+                request: AgentRequestId::new(id),
+                parent: Subject::agent(caller).to_string(),
+                module: text(&line["module"]),
+                qualname: text(&line["qualname"]),
+                digest: line["digest"].as_str().map(str::to_string),
+            });
+    }
+
+    /// The call settled and its child was released: how it ended, and what
+    /// every model request the child made used.
+    fn call_ended(&self, line: &Value) {
+        let Some(id) = line["request"].as_u64() else {
+            return;
+        };
+        let child = text(&line["child"]);
+        let attempts = self
+            .state()
+            .agents
+            .get(&child)
+            .map(|node| node.slot.attempts())
+            .unwrap_or_default();
+        self.events_of(&child).emit(Payload::AgentCallSettled {
+            request: AgentRequestId::new(id),
+            outcome: outcome(line["outcome"].as_str().unwrap_or_default()),
+            usage: self.ledger.total(&attempts),
         });
     }
 
