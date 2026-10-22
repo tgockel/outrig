@@ -9,6 +9,7 @@ use crate::cli::build::{self, BuildArgs};
 use crate::cli::clean::{self, CleanArgs};
 use crate::cli::design_prompt::{self, DesignArgs};
 use crate::cli::discard::{self, DiscardArgs};
+use crate::cli::log_divert::LogWriter;
 use crate::cli::logs::{self, LogsArgs};
 use crate::cli::ls::{self, LsArgs};
 use crate::cli::mcp::{self, McpArgs};
@@ -245,6 +246,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 global_config.as_deref(),
                 cli.session_root.as_deref(),
                 args,
+                cli.verbose,
             ))
         }
         Cmd::Mcp(args) => {
@@ -394,7 +396,9 @@ fn init_tracing(verbose: u8) {
     }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        // stderr, unless `run-new`'s screen holds the terminal and has taken
+        // the records for itself.
+        .with_writer(LogWriter::global().clone())
         // Its default, true, reports an event that could not be written with an
         // `eprintln!` of its own, which panics when stderr's reader has gone:
         // one log line would end the command with a 101.

@@ -9,6 +9,7 @@ pub mod design_prompt;
 pub mod discard;
 pub mod engine;
 pub mod env_arg;
+pub(crate) mod log_divert;
 pub mod logs;
 pub mod ls;
 pub mod mcp;

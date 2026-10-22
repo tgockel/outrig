@@ -365,7 +365,7 @@ The model has one tool, `submit_python`, which runs source in a persistent CPyth
 session's primary container, with the workspace as its working directory. Names the agent binds
 stay bound from one message to the next. The interpreter is a static build OutRig mounts
 read-only, so the image needs no Python of its own. Each submission's source is printed on stderr
-as it starts running.
+as it starts running; on a terminal, it is in the detail view instead (see **On a terminal**).
 
 **A reply is not the work being done.** A round ends when the model yields, and Python it started
 can still be running. So a round closes on a line after the model's reply that names what its code
@@ -399,7 +399,8 @@ describes anything in at most 8 KiB.
 `runtime.channels["user"]` in its Python, and the model is told how many messages are waiting
 there -- never what they say. It reads one by running code that receives it, and answers by
 sending on the same channel. A line typed while the agent is still working is queued the same
-way, and `[outrig] queued for the agent (N waiting)` says so; it does not start a second round.
+way, and `[outrig] queued for the agent (N waiting)` says so, or on a terminal the status line
+counts it; it does not start a second round.
 The model hears of it in the next result its code returns, or in a round of its own once the
 current one ends. A channel holds 256 unread messages and refuses the next, saying so; a message
 is at most 1 MiB either way.
@@ -488,19 +489,46 @@ such as a key every model refuses, it says that sending another fails the same w
 correct the cause and start a new session. With `[events] mode = "record"`, the event log
 records each retry and each move, and names the model that answered each call.
 
-stdout carries only what the agent sends on the channel -- including a send from code still
-running after its round ended, which is printed when it arrives, at the prompt or not. The agent
-is held to the terminal's pace: its code waits once it is 21 messages ahead of what has been
-printed. A stdout that is slow or has stopped, such as a paused pager, delays what is printed and
-nothing else: the round, stderr, and Ctrl-C carry on. When input ends -- the end of piped input,
-or Ctrl-D -- the lines typed before it that were refused are reported and what the agent had
-already sent is printed, then `run-new` exits; a task still sending is not waited for. `/quit` and
-a second Ctrl-C do not wait for a stdout that has stopped, so the few messages queued for it are
-dropped. With stdout and stderr on one pipe, as in `outrig run-new 2>&1`, each message and each
-line is written whole, one at a time, so a line of stderr's never cuts a message; a stdout that has
-stopped then holds stderr up too, and `/quit` and a second Ctrl-C do not wait for either. The
-model's own text is commentary and goes to stderr with everything else, so `outrig run-new >
-out.txt` keeps exactly the messages the agent meant you to have.
+**On a terminal.** When stdin and stdout are both the terminal `run-new` was started from, it holds
+that terminal with a screen. The conversation -- each line you send, marked `›`, and each message
+the agent sends you -- is printed into the terminal's own scrollback, where it stays after the
+session ends, and a status line and an input box sit below it. The status line says what the session
+is doing: the model working, Python running and for how long, a failed call and when it is retried,
+how many of your messages the agent has yet to read, what the last round left running, and the
+tokens spent. The agent's working -- the model's own text, each submission's source and what it
+printed, retries and failovers, and log lines -- stays out of the conversation. Ctrl-O opens it in a
+view of its own, scrolled with the arrow keys, PgUp and PgDn, Home and End, and closed with Esc;
+with `-v` it is printed in the conversation too. A round in which the agent sent you nothing ends on
+a line saying so. The agent is held to the terminal's pace as below, and while the detail view is
+open, its messages wait for it to close. A terminal that has stopped reading what is written to it
+holds up what is drawn there and nothing else: what you type, Ctrl-C included, still reaches the
+session.
+
+Enter sends what is in the box. Alt-Enter starts a new line in it, as does Enter after a `\` that
+ends the box, and a paste is one message however many lines it has. The usual line-editing keys
+work, and Up and Down recall what you sent, kept in memory and never written to a file. Ctrl-C
+clears the box when something is typed in it, and is otherwise the Ctrl-C described below.
+Ctrl-D at an empty box ends input, and Ctrl-Z suspends `run-new` as it would any program. A byte
+that is not UTF-8 is dropped as it is typed, and becomes U+FFFD in a paste. SIGTERM and SIGHUP
+end `run-new` as they do without the screen, and the terminal is put back first.
+
+With stdin or stdout piped or redirected, on a terminal other than the one it was started from,
+or with `TERM` set to `dumb`, `cons25`, or `emacs`, `run-new` reads and writes plain lines, as
+the rest of this section describes; `outrig run-new | cat` asks for that on a terminal.
+
+Without the screen, stdout carries only what the agent sends on the channel -- including a send from
+code still running after its round ended, which is printed when it arrives, at the prompt or not.
+The agent is held to the terminal's pace: its code waits once it is 21 messages ahead of what has
+been printed. A stdout that is slow or has stopped, such as a paused pager, delays what is printed
+and nothing else: the round, stderr, and Ctrl-C carry on. When input ends -- the end of piped input,
+or Ctrl-D -- the lines typed before it that were refused are reported and what the agent had already
+sent is printed, then `run-new` exits; a task still sending is not waited for. `/quit` and a second
+Ctrl-C do not wait for a stdout that has stopped, so the few messages queued for it are dropped.
+With stdout and stderr on one pipe, as in `outrig run-new 2>&1`, each message and each line is
+written whole, one at a time, so a line of stderr's never cuts a message; a stdout that has stopped
+then holds stderr up too, and `/quit` and a second Ctrl-C do not wait for either. The model's own
+text is commentary and goes to stderr with everything else, so `outrig run-new > out.txt` keeps
+exactly the messages the agent meant you to have.
 
 **No MCP server and no sidecar starts**, including servers an image declares in its
 `org.outrig.mcp` label; startup names the configured ones it left out. The model could not call
@@ -599,7 +627,8 @@ if any.
 `run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
 `--max-tool-result-bytes`, nor a flag for `[events]`. The config keys behind the last two,
 `tool-call-max` and `tool-result-max`, apply, as do `[network]`, `[workspace]`, and `[events]`.
-`-v` writes no `logs/container.log` here; `-vv` still turns on trace logging.
+`-v` writes no `logs/container.log` here; on a terminal it prints the agent's working in the
+conversation instead. `-vv` still turns on trace logging.
 
 ### `outrig mcp`
 

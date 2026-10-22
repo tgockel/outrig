@@ -33,6 +33,8 @@
 mod editor;
 mod line_source;
 
+pub(crate) use self::editor::{HISTORY_SIZE, is_controlling_tty, tty_capable};
+
 use std::fmt::Write as _;
 use std::future::Future;
 

@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   programs it starts inherit the ceiling, and can raise their own. The agent's Python imports
   modules from the workspace, and `pip install` from it adds pure-Python packages that import at
   once; a package with compiled parts cannot load, and the error says so.
+- **On a terminal, `outrig run-new` shows the conversation and keeps the agent's working aside.**
+  With stdin and stdout both the terminal, what you send and what the agent sends you print into
+  the terminal's scrollback, and below them a status line says what the session is doing -- the
+  model working, Python running and for how long, a retry, your messages the agent has yet to
+  read, the tokens spent -- above an input box with line editing, in-memory recall, Alt-Enter for
+  a new line, and a paste sent as one message. The model's own text, each submission and what it
+  printed, retries, and log lines open in a view of their own on Ctrl-O, or print in the
+  conversation with `-v`. Ctrl-C clears what is typed before it interrupts anything; Ctrl-Z
+  suspends; SIGTERM and SIGHUP put the terminal back before they end the process, as they did
+  before. Piped or redirected stdin or stdout, another terminal, or `TERM=dumb` keep the plain
+  lines `run-new` has always written.
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
   ignores it, saying so in one line at startup.

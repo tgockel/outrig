@@ -54,7 +54,7 @@ use crate::error::Result;
 const UNSUPPORTED_TERMS: [&str; 3] = ["dumb", "cons25", "emacs"];
 
 /// Prompts recalled by Up/Down. In memory, for one session.
-const HISTORY_SIZE: usize = 500;
+pub(crate) const HISTORY_SIZE: usize = 500;
 
 /// Whether rustyline can drive this terminal.
 ///
@@ -65,7 +65,11 @@ const HISTORY_SIZE: usize = 500;
 /// that is not the controlling one; the stream reader consumes it, as it
 /// always has, where an editor on `/dev/tty` would read the user's own
 /// terminal instead and ignore the one supplied.
-fn tty_capable(stdin_is_tty: bool, stdin_is_controlling_tty: bool, term: Option<&str>) -> bool {
+pub(crate) fn tty_capable(
+    stdin_is_tty: bool,
+    stdin_is_controlling_tty: bool,
+    term: Option<&str>,
+) -> bool {
     stdin_is_tty
         && stdin_is_controlling_tty
         && !term.is_some_and(|term| {
@@ -78,7 +82,7 @@ fn tty_capable(stdin_is_tty: bool, stdin_is_controlling_tty: bool, term: Option<
 /// Whether `fd` is this process's controlling terminal. `TIOCGSID` answers
 /// for the controlling terminal only: for any other tty -- a `/dev/pts/N` the
 /// shell redirected onto stdin -- Linux refuses with `ENOTTY`.
-fn is_controlling_tty(fd: &impl AsRawFd) -> bool {
+pub(crate) fn is_controlling_tty(fd: &impl AsRawFd) -> bool {
     // SAFETY: `tcgetsid` reads the terminal's session id and touches nothing
     // else; a descriptor that is not a tty just makes it fail.
     let session = unsafe { libc::tcgetsid(fd.as_raw_fd()) };

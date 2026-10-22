@@ -26,6 +26,10 @@
 //! report found, and exit with the status the report decides. A conversation
 //! that fails, or a record that cannot be written, closes the session the same
 //! way, and its error is printed after the report.
+//!
+//! On a terminal the conversation is held on a [`screen`]: a status line and an
+//! input box below a conversation that keeps only what the user and the agent
+//! sent each other. Anywhere else it is plain lines, as `converse` describes.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -50,9 +54,14 @@ use crate::paths::{
 };
 use crate::session::{self, Session, SessionId, SessionStore, resolve_session_root};
 
+use self::converse::{Frontend, Interrupts};
+use self::output::{Failures, Output};
+use self::screen::{Screen, Started};
+
 mod approve;
 mod converse;
 mod output;
+mod screen;
 
 /// How long, once the session is stopped and its record finished, the report
 /// is waited for. A destination that has stopped -- a pager paused, a pipe
@@ -86,12 +95,14 @@ pub struct RunNewArgs {
 }
 
 /// Run one `outrig run-new` invocation end to end. Returns the process exit
-/// code.
+/// code. With `verbose`, a screen shows the agent's working in the
+/// conversation too.
 pub async fn execute(
     repo: &RepoConfig,
     global_cfg_path: Option<&Path>,
     session_root_flag: Option<&Path>,
     args: &RunNewArgs,
+    verbose: u8,
 ) -> Result<i32> {
     let repo_root = repo.root.clone();
     let span = ProgressSpan::start("loading config");
@@ -173,7 +184,7 @@ pub async fn execute(
     // agent sends. The banner and the report of a failed start are written
     // directly: nothing is queued on it yet, so nothing is being written to
     // compete with them.
-    let (out, mut failures) = output::Output::stdio()?;
+    let (out, mut failures) = Output::stdio()?;
     let started = start(Start {
         builder,
         cfg: &cfg,
@@ -217,7 +228,7 @@ pub async fn execute(
         session_id: sid.as_str(),
     }));
 
-    let conversed = converse::converse(&mut running, &mut shown, &out, &mut failures).await;
+    let conversed = conversation(&mut running, &mut shown, &out, &mut failures, verbose > 0).await;
 
     // Said first, since stopping can take a few seconds and a Ctrl-C there
     // does nothing. Queued, not written here: with stdout and stderr one pipe,
@@ -243,6 +254,61 @@ pub async fn execute(
     // written, and the `error:` line printed once this returns follows it.
     out.finish(tokio::time::sleep(REPORT_GRACE)).await;
     outcome
+}
+
+/// The conversation: on the screen when the terminal can hold one, and in
+/// plain lines on `out` otherwise. The screen gives the terminal back before
+/// this returns, so what the session says as it closes is written below the
+/// conversation, through `out`, as in the line mode.
+async fn conversation(
+    running: &mut harness::Session,
+    shown: &mut harness::event::Subscription,
+    out: &Output,
+    failures: &mut Failures,
+    verbose: bool,
+) -> Result<()> {
+    // Before the screen takes the terminal, which turns Ctrl-C into a key.
+    let mut interrupts = Interrupts::new()?;
+    let started = if screen::wanted() {
+        Screen::start(verbose)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(target: "outrig::cli::run_new", "no screen, reading plain lines: {e}");
+            })
+            .ok()
+    } else {
+        None
+    };
+    let Some(Started {
+        mut screen,
+        typed,
+        keys,
+        failures: mut drawn,
+    }) = started
+    else {
+        let typed = converse::read_lines()?;
+        return converse::converse(
+            running,
+            shown,
+            Frontend::Lines(out),
+            typed,
+            &mut interrupts,
+            failures,
+        )
+        .await;
+    };
+    interrupts.listen(keys);
+    let conversed = converse::converse(
+        running,
+        shown,
+        Frontend::Screen(&screen),
+        typed,
+        &mut interrupts,
+        &mut drawn,
+    )
+    .await;
+    screen.finish().await;
+    converse::reconcile(conversed, &mut drawn)
 }
 
 /// What [`execute`] returns once the session is stopped: the status its report

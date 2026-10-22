@@ -37,6 +37,12 @@
 //! Stdin is read on a thread of its own rather than through tokio. A read is
 //! always in flight, and tokio's blocking read would hold the runtime open at
 //! exit until the user pressed Enter; a thread does not hold up the process.
+//!
+//! On a terminal the loop is the same and only what it shows changes: the
+//! [`Screen`] draws the conversation, reads what is typed, and turns Ctrl-C,
+//! which raw mode makes a key rather than a signal, into the same interrupt.
+//! Everything above about stdout and stderr is then the line mode's, which
+//! `run-new` keeps whenever the screen is not used.
 
 use std::error::Error;
 use std::future::Future;
@@ -50,7 +56,8 @@ use outrig::harness::{RoundEnd, RoundOutcome, Session, SessionError, StillRunnin
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc};
 
-use super::output::{Failures, Output, PROMPT};
+use super::output::{self, Failures, Output, PROMPT};
+use super::screen::{self, Screen, Typed};
 use crate::error::Result;
 use crate::repl::{INTERRUPT_NOTICE, compose_help};
 
@@ -84,11 +91,10 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// and counts as the first of the two that exit, so Ctrl-C Ctrl-C leaves
 /// whether or not the code could be stopped.
 ///
-/// SIGINT is received through one listener for the whole session rather than
-/// a fresh `ctrl_c()` per wait, which would miss a press landing between two
-/// of them -- and a quick second press is the one that stops waiting.
+/// Every Ctrl-C comes through `interrupts`, which says why it is one
+/// listener.
 ///
-/// `out` is where everything is written, and is the caller's: what it says as
+/// `view` is where everything is shown, and is the caller's: what it says as
 /// the session closes goes through it too, queued behind what this showed, so
 /// it is written in turn and not while a write this left stuck holds the
 /// destination. End of input and the interpreter's exit show everything the
@@ -101,22 +107,85 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// the session as one made while it runs does.
 ///
 /// `shown` is the terminal's subscription to the session's events, which is
-/// where the Python each round runs is shown from.
+/// where the Python each round runs is shown from. `typed` is what the user
+/// types, and `failures` the writes `view` could not make.
 pub(super) async fn converse(
     session: &mut Session,
     shown: &mut Subscription,
-    out: &Output,
+    view: Frontend<'_>,
+    typed: Typed,
+    interrupts: &mut Interrupts,
     failures: &mut Failures,
 ) -> Result<()> {
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut term = Terminal { out, reading: true };
-    let left = drive(session, shown, &mut term, &mut sigint, failures).await;
+    let mut term = Terminal {
+        view,
+        reading: true,
+    };
+    let left = drive(session, shown, &mut term, typed, interrupts, failures).await;
     if left.is_err() {
         // A failure does not wait on a stdout that may have stopped either.
-        out.abandon();
+        term.abandon();
     }
-    out.settle(sigint.recv()).await;
+    term.settle(interrupts.recv()).await;
     reconcile(left, failures)
+}
+
+/// Where the conversation is shown: plain lines on stdout and stderr, or the
+/// screen.
+#[derive(Clone, Copy)]
+pub(super) enum Frontend<'a> {
+    Lines(&'a Output),
+    Screen(&'a Screen),
+}
+
+impl<'a> Frontend<'a> {
+    /// Room for one more of the agent's messages; see [`Output::room`].
+    async fn room(self) -> Option<Room<'a>> {
+        match self {
+            Frontend::Lines(out) => out.room().await.map(Room::Lines),
+            Frontend::Screen(screen) => screen.room().await.map(Room::Screen),
+        }
+    }
+}
+
+/// Each Ctrl-C: SIGINT, as a terminal in canonical mode sends it, and with the
+/// screen up, the key itself, which raw mode reads instead.
+///
+/// One listener for the whole session rather than a fresh `ctrl_c()` per
+/// wait, which would miss a press landing between two of them -- and a quick
+/// second press is the one that stops waiting. It is made before the screen
+/// takes the terminal, so a SIGINT from elsewhere meets tokio's handler and
+/// never its default action, which would end the process with the terminal
+/// still raw.
+pub(super) struct Interrupts {
+    sigint: Option<Signal>,
+    keys: Option<mpsc::UnboundedReceiver<()>>,
+}
+
+impl Interrupts {
+    pub(super) fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            sigint: Some(signal(SignalKind::interrupt())?),
+            keys: None,
+        })
+    }
+
+    /// Ctrl-C pressed at the screen, too.
+    pub(super) fn listen(&mut self, keys: mpsc::UnboundedReceiver<()>) {
+        self.keys = Some(keys);
+    }
+
+    /// The next Ctrl-C. Completes for nothing else: every caller reads a
+    /// completion as a press, so once the screen's keys have ended, SIGINT is
+    /// the one listened to.
+    pub(super) async fn recv(&mut self) -> Option<()> {
+        let Self { sigint, keys } = self;
+        tokio::select! {
+            Some(()) = async { sigint.as_mut()?.recv().await } => Some(()),
+            Some(()) = async { keys.as_mut()?.recv().await } => Some(()),
+            else => std::future::pending().await,
+        }
+    }
 }
 
 /// `left`, unless it is a success and a write has failed: that left output
@@ -136,7 +205,8 @@ async fn drive(
     session: &mut Session,
     shown: &mut Subscription,
     term: &mut Terminal<'_>,
-    sigint: &mut Signal,
+    mut lines: Typed,
+    interrupts: &mut Interrupts,
     failures: &mut Failures,
 ) -> Result<()> {
     // `run-new` always starts its session with a primary agent.
@@ -144,7 +214,7 @@ async fn drive(
         return Err(SessionError::NoPrimary.into());
     };
     let closer = session.closer();
-    let mut lines = read_lines()?;
+    let view = term.view;
     let session = Mutex::new(session);
     let help = compose_help(&[]);
 
@@ -162,7 +232,7 @@ async fn drive(
         if round.is_none() {
             if gone {
                 // What the interpreter sent is shown before this.
-                term.out.settle(sigint.recv()).await;
+                term.settle(interrupts.recv()).await;
                 term.note("[outrig] the Python interpreter exited; the session is over");
                 return Ok(());
             }
@@ -178,10 +248,10 @@ async fn drive(
                     term.answered(queued, mid_round);
                 }
                 tokio::select! {
-                    () = show(term.out, user.receive_waiting()) => {}
-                    _ = sigint.recv() => {
+                    () = show(view, user.receive_waiting()) => {}
+                    _ = interrupts.recv() => {
                         closer.close_admission();
-                        term.out.abandon();
+                        term.abandon();
                         return Ok(());
                     }
                 }
@@ -193,24 +263,24 @@ async fn drive(
         // so a steady stream of the agent's messages cannot starve the round,
         // what the user types, or anything else.
         tokio::select! {
-            Some(()) = sigint.recv() => {
+            Some(()) = interrupts.recv() => {
                 if round.is_some() {
                     if let Some(said) = interrupt() {
                         term.note(&format!("\n[outrig] {said}"));
                         continue;
                     }
                     round = None;
-                    term.out.text(INTERRUPT_NOTICE);
+                    term.interrupted();
                 } else if last_was_interrupt {
-                    term.out.text("\n");
+                    term.newline();
                     closer.close_admission();
-                    term.out.abandon();
+                    term.abandon();
                     return Ok(());
                 } else if let Some(said) = session.lock().await.stop_held() {
                     // No round holds the lock.
                     term.note(&format!("\n[outrig] {said} (Ctrl-C again exits)"));
                 } else {
-                    term.out.text("\n");
+                    term.newline();
                 }
                 last_was_interrupt = true;
                 term.prompt();
@@ -220,7 +290,7 @@ async fn drive(
             // slower than the agent leaves the rest with the agent, whose code
             // waits, and leaves this loop free.
             Some((room, sent)) = async {
-                let room = term.out.room().await?;
+                let room = view.room().await?;
                 Some((room, user.receive().await))
             }, if !gone => match sent {
                 Some(text) => room.send(text, round.is_none() && term.reading),
@@ -252,7 +322,7 @@ async fn drive(
                     Ok(_) => term.prompt(),
                     Err(e) => {
                         // Not retried: a failure that persists would loop.
-                        term.note(&format!("[outrig] error: {e}"));
+                        term.error(&format!("[outrig] error: {e}"));
                         term.prompt();
                     }
                 }
@@ -261,7 +331,7 @@ async fn drive(
             line = lines.recv(), if term.reading => {
                 let Some(line) = line else {
                     if round.is_none() {
-                        term.out.text("\n");
+                        term.newline();
                     }
                     term.reading = false;
                     continue;
@@ -281,7 +351,7 @@ async fn drive(
                             // Closed first, so a round dropped here publishes
                             // nothing more of its own.
                             closer.close_admission();
-                            term.out.abandon();
+                            term.abandon();
                             drop(round.take());
                             return Ok(());
                         }
@@ -306,10 +376,10 @@ async fn drive(
     }
 }
 
-/// Queue `messages` for stdout, each as room is made for it.
-async fn show(out: &Output, messages: Vec<String>) {
+/// Queue `messages` to be shown, each as room is made for it.
+async fn show(view: Frontend<'_>, messages: Vec<String>) {
     for text in messages {
-        let Some(room) = out.room().await else {
+        let Some(room) = view.room().await else {
             return;
         };
         room.send(text, false);
@@ -343,17 +413,22 @@ fn tasks(running: &StillRunning) -> Option<(&[String], usize)> {
     }
 }
 
-/// The line a round's end closes on: why a limit stopped it, and what its
-/// code left running, so a prompt that returns is not taken for work done.
-/// `None` when the model yielded and left nothing running.
-fn closing_line(stopped: Option<&str>, running: Option<(&[String], usize)>) -> Option<String> {
-    let running = match running {
+/// What a round's code left running, as its closing line names it; `None`
+/// when it left nothing.
+fn still_running(running: Option<(&[String], usize)>) -> Option<String> {
+    match running {
         Some(([], _)) => None,
         Some((names, 0)) => Some(names.join(", ")),
         Some((names, more)) => Some(format!("{} and {more} more", names.join(", "))),
         None => Some("could not tell -- Python did not answer".to_string()),
-    };
-    match (stopped, running) {
+    }
+}
+
+/// The line a round's end closes on: why a limit stopped it, and what its
+/// code left running, so a prompt that returns is not taken for work done.
+/// `None` when the model yielded and left nothing running.
+fn closing_line(stopped: Option<&str>, running: Option<(&[String], usize)>) -> Option<String> {
+    match (stopped, still_running(running)) {
         (None, None) => None,
         (Some(reason), None) => Some(format!("(round ended: {reason})")),
         (None, Some(running)) => Some(format!("(still running: {running})")),
@@ -367,7 +442,7 @@ fn closing_line(stopped: Option<&str>, running: Option<(&[String], usize)>) -> O
 /// the first read that fails. A line that is not UTF-8 is still a line: read
 /// as bytes and decoded lossily, as `outrig run`'s prompt reads one, rather
 /// than ending input the way `BufRead::lines` would.
-fn read_lines() -> std::io::Result<mpsc::UnboundedReceiver<std::io::Result<String>>> {
+pub(super) fn read_lines() -> std::io::Result<Typed> {
     let (typed, lines) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("stdin".to_string())
@@ -402,40 +477,105 @@ fn decode_line(bytes: &[u8]) -> String {
 }
 
 /// The subject of the main agent's events (`doc/reference/events.md`).
-const MAIN_AGENT: &str = "agent/primary";
+pub(super) const MAIN_AGENT: &str = "agent/primary";
 
-/// What the session shows, rendered and queued on [`Output`], which writes it.
+/// What the session shows, handed to whichever frontend shows it: rendered
+/// and queued on [`Output`], which writes it, or handed to the [`Screen`].
 /// Nothing here waits on the terminal.
 struct Terminal<'a> {
-    out: &'a Output,
+    view: Frontend<'a>,
     /// Whether input is still being read. Once it is not, there is no prompt
     /// to draw.
     reading: bool,
 }
 
+/// A place for one of the agent's messages, in whichever frontend shows it.
+enum Room<'a> {
+    Lines(output::Room<'a>),
+    Screen(screen::Room<'a>),
+}
+
+impl Room<'_> {
+    /// `framed` is the line mode's: whether the message came while the prompt
+    /// showed. The screen draws its prompt apart from the conversation.
+    fn send(self, text: String, framed: bool) {
+        match self {
+            Room::Lines(room) => room.send(text, framed),
+            Room::Screen(room) => room.send(text),
+        }
+    }
+}
+
 impl Terminal<'_> {
     fn prompt(&self) {
-        if self.reading {
-            self.out.text(PROMPT);
+        if let Frontend::Lines(out) = self.view
+            && self.reading
+        {
+            out.text(PROMPT);
         }
     }
 
-    /// A line on stderr.
+    /// A line about the session: on stderr, or in the conversation.
     fn note(&self, text: &str) {
-        self.out.line(text);
+        match self.view {
+            Frontend::Lines(out) => out.line(text),
+            Frontend::Screen(screen) => screen.note(text),
+        }
     }
 
-    /// What the terminal shows of one of the session's events: each of the
-    /// main agent's submissions as it starts, and a note when some were not
-    /// shown. A child's code runs under the child's own subject, and is left
-    /// to the event log.
+    fn error(&self, text: &str) {
+        match self.view {
+            Frontend::Lines(_) => self.note(text),
+            Frontend::Screen(screen) => screen.error(text),
+        }
+    }
+
+    /// A Ctrl-C dropped the round.
+    fn interrupted(&self) {
+        match self.view {
+            Frontend::Lines(out) => out.text(INTERRUPT_NOTICE),
+            Frontend::Screen(screen) => screen.note(&String::from_utf8_lossy(INTERRUPT_NOTICE)),
+        }
+    }
+
+    /// End the line a Ctrl-C or the end of input left the prompt on. The
+    /// screen's prompt is not on a line of the conversation.
+    fn newline(&self) {
+        if let Frontend::Lines(out) = self.view {
+            out.text("\n");
+        }
+    }
+
+    fn abandon(&self) {
+        match self.view {
+            Frontend::Lines(out) => out.abandon(),
+            Frontend::Screen(screen) => screen.abandon(),
+        }
+    }
+
+    /// Wait for what is queued to be shown; see [`Output::settle`].
+    async fn settle(&self, interrupted: impl Future) {
+        match self.view {
+            Frontend::Lines(out) => out.settle(interrupted).await,
+            Frontend::Screen(screen) => screen.settle(interrupted).await,
+        }
+    }
+
+    /// What the terminal shows of one of the session's events. The line mode
+    /// shows each of the main agent's submissions as it starts, and a note
+    /// when some were not shown; a child's code runs under the child's own
+    /// subject, and is left to the event log. The screen reads them all.
     fn event(&self, received: Received) {
+        let out = match self.view {
+            Frontend::Lines(out) => out,
+            Frontend::Screen(screen) => return screen.event(&received),
+        };
         match received {
             Received::Event(event) => {
                 if let Payload::ExecSubmitted { source, .. } = &event.payload
                     && event.subject.as_ref().map(|s| s.as_str()) == Some(MAIN_AGENT)
                 {
-                    self.out.text(render_submission(source));
+                    out.text(render_submission(source));
                 }
             }
             Received::Missed(missed) => {
@@ -451,39 +591,78 @@ impl Terminal<'_> {
     /// How a round ended: the model's reply, the reasoning of a turn that held
     /// only that, and the line it closes on.
     fn ended(&self, end: &RoundEnd) {
-        if !end.reply.trim().is_empty() {
-            self.note(&end.reply);
-        }
-        if let Some(reasoning) = &end.reasoning {
+        let reasoning = end.reasoning.as_ref().map(|reasoning| {
             // Said as `run` says it, so the two describe the same outcome alike.
             let silent = crate::llm::TurnEnd {
                 reply: String::new(),
                 stopped: None,
                 recovered: Some(reasoning.clone()),
             };
-            self.note(&silent.silent_report());
-        }
-        if let Some(line) = closing_line(end.stopped.as_deref(), tasks(&end.still_running)) {
-            self.note(&line);
+            silent.silent_report()
+        });
+        let running = tasks(&end.still_running);
+        let closing = closing_line(end.stopped.as_deref(), running);
+        match self.view {
+            Frontend::Lines(_) => {
+                if !end.reply.trim().is_empty() {
+                    self.note(&end.reply);
+                }
+                if let Some(reasoning) = &reasoning {
+                    self.note(reasoning);
+                }
+                if let Some(line) = &closing {
+                    self.note(line);
+                }
+            }
+            Frontend::Screen(screen) => {
+                screen.ended(&end.reply, reasoning, closing, still_running(running));
+            }
         }
     }
 
     /// What became of a typed line: whether the agent's channel took it, and
-    /// if it was typed while a round ran, that it waits there.
+    /// if it was typed while a round ran, that it waits there -- which the
+    /// screen keeps for its detail view, its status line counting them.
     fn answered(&self, queued: std::result::Result<usize, BoxError>, mid_round: bool) {
-        match queued {
-            Ok(waiting) if mid_round => {
-                self.note(&format!("[outrig] queued for the agent ({waiting} waiting)"));
+        let waiting = match queued {
+            Ok(waiting) => waiting,
+            Err(e) => return self.error(&format!("[outrig] error: {e}")),
+        };
+        if let Frontend::Screen(screen) = self.view {
+            screen.queued(waiting);
+        }
+        if mid_round {
+            let note = format!("[outrig] queued for the agent ({waiting} waiting)");
+            match self.view {
+                Frontend::Lines(out) => out.line(&note),
+                Frontend::Screen(screen) => screen.detail(&note),
             }
-            Ok(_) => {}
-            Err(e) => self.note(&format!("[outrig] error: {e}")),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// A key pressed at the screen is a Ctrl-C, as SIGINT is. The screen's
+    /// keys ending is not one: every caller reads a completion as a press, so
+    /// once they end the wait goes on for SIGINT alone.
+    #[tokio::test]
+    async fn a_key_is_an_interrupt_and_the_keys_ending_is_not() {
+        let (press, keys) = mpsc::unbounded_channel();
+        let mut interrupts = Interrupts {
+            sigint: None,
+            keys: Some(keys),
+        };
+        press.send(()).expect("pressed");
+        assert_eq!(interrupts.recv().await, Some(()));
+        drop(press);
+        let waited = tokio::time::timeout(Duration::from_millis(100), interrupts.recv()).await;
+        assert!(waited.is_err(), "the keys ending completed the wait");
+    }
 
     /// A byte that is not UTF-8 costs only itself: the line is kept, with
     /// U+FFFD in its place, and line endings go as `lines` drops them.

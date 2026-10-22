@@ -67,7 +67,7 @@ pub(super) const PROMPT: &[u8] = b"> ";
 
 /// How many of the agent's messages wait for stdout, beyond the one being
 /// written.
-const OUTBOX: usize = 4;
+pub(super) const OUTBOX: usize = 4;
 
 enum ToStderr {
     /// Written as it is.
@@ -259,7 +259,7 @@ fn lined(text: &str) -> Vec<u8> {
 }
 
 /// Whether `a` and `b` are one file, pipe or terminal.
-fn same_destination(a: &impl AsFd, b: &impl AsFd) -> bool {
+pub(super) fn same_destination(a: &impl AsFd, b: &impl AsFd) -> bool {
     match (nix::sys::stat::fstat(a), nix::sys::stat::fstat(b)) {
         (Ok(a), Ok(b)) => (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino),
         _ => false,

@@ -74,6 +74,7 @@ jiff               = { version = "0.2.35",  default-features = false }
 miniz_oxide        = { version = "0.9.1",   default-features = false }
 nix                = { version = "0.31.3",  default-features = false }
 rand               = { version = "0.10.2",  default-features = false }
+ratatui            = { version = "0.30.2",  default-features = false }
 regex              = { version = "1.12.4",  default-features = false }
 reqwest            = { version = "0.13.4",  default-features = false }
 rig                = { version = "0.40.0",  default-features = false, package = "rig-core" }
@@ -96,8 +97,10 @@ toml_edit          = { version = "0.25.13", default-features = false }
 tracing            = { version = "0.1.44",  default-features = false }
 tracing-subscriber = { version = "0.3.23",  default-features = false }
 trybuild           = { version = "1.0.121", default-features = false }
+unicode-segmentation = { version = "1.13.3", default-features = false }
 tokio-util         = { version = "0.7.19",  default-features = false }
 ureq               = { version = "3.4.2",   default-features = false }
+vt100              = { version = "0.16.2",  default-features = false }
 walkdir            = { version = "2.5.0",   default-features = false }
 
 # The embedded Python payload is a 36 MB zstd archive that `build.rs` hashes

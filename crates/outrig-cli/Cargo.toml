@@ -45,6 +45,10 @@ heck               = { workspace = true, default-features = true }
 jiff               = { workspace = true, default-features = true }
 nix                = { workspace = true, features = ["fs", "resource", "term", "user"] }
 rand               = { workspace = true, default-features = true }
+# `scrolling-regions` lets `run-new`'s screen scroll the conversation above it without
+# redrawing it. crossterm comes with it, and is used only through `ratatui::crossterm`, so
+# the two never disagree on a version.
+ratatui            = { workspace = true, features = ["crossterm", "scrolling-regions"] }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }
 rig                = { workspace = true, features = ["reqwest", "rustls"] }
@@ -65,6 +69,7 @@ toml               = { workspace = true, default-features = true, features = ["s
 toml_edit          = { workspace = true, default-features = true }
 tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 # A dependency on self, so the integration tests -- separate crates -- see the
@@ -79,3 +84,7 @@ tokio = { workspace = true, default-features = true, features = ["test-util"] }
 # `setsid` -- and signals it and its program's group; `tests/signals.rs` signals its own
 # process with `raise`.
 nix = { workspace = true, features = ["fs", "process", "signal", "term"] }
+
+# `run_new_e2e.rs` reads what `run-new`'s screen drew on a pty the way a terminal would, and
+# answers its cursor-position queries from the emulated cursor.
+vt100 = { workspace = true }

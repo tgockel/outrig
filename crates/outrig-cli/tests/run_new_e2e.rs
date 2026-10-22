@@ -163,6 +163,17 @@ image-name = "docker.io/library/alpine:latest"
 /// `outrig run-new` in `repo`, with stdin piped and everything but stdout and
 /// stderr, which the caller wires, set up.
 fn run_new_command(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, String)]) -> Command {
+    let mut command = outrig_run_new(repo, sessions, global, env);
+    command
+        .stdin(Stdio::piped())
+        // A group of its own, led by outrig, as a shell's foreground job is.
+        .process_group(0);
+    command
+}
+
+/// `outrig run-new` in `repo`, with its environment set up and its stdio and
+/// process group left to the caller.
+fn outrig_run_new(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, String)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_outrig"));
     command
         .args(["--global-config"])
@@ -177,10 +188,7 @@ fn run_new_command(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, St
         .env("OUTRIG_LOG", "info")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .stdin(Stdio::piped())
-        .kill_on_drop(true)
-        // A group of its own, led by outrig, as a shell's foreground job is.
-        .process_group(0);
+        .kill_on_drop(true);
     command
 }
 
@@ -388,10 +396,8 @@ fn sigkill(pid: &str) {
 
 /// The id the banner named: the word after `[outrig] session id: `, ahead of
 /// the hint in parentheses.
-fn banner_session_id(stderr: &Mutex<String>) -> String {
+fn banner_session_id(stderr: &str) -> String {
     stderr
-        .lock()
-        .expect("unpoisoned")
         .lines()
         .find_map(|line| line.strip_prefix("[outrig] session id: "))
         .and_then(|rest| rest.split_whitespace().next())
@@ -1237,7 +1243,7 @@ async fn a_killed_session_leaves_a_labeled_stray_clean_can_find() {
     let session = Session::start(repo.path(), sessions.path());
     wait_for(&session.stderr, "(Ctrl-D to exit", TEST_TIMEOUT).await;
 
-    let sid = banner_session_id(&session.stderr);
+    let sid = banner_session_id(&session.stderr.lock().expect("unpoisoned"));
     let container = format!("outrig-{sid}");
     let tidy = RemoveOnDrop(container.clone());
     assert!(
@@ -1644,16 +1650,31 @@ fn wheels_only(dir: &Path) -> Vec<(&'static str, String)> {
 
 /// Every record of the one session under `sessions`.
 fn the_log(sessions: &Path) -> Vec<Value> {
+    the_log_text(sessions)
+        .expect("the event log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a whole record"))
+        .collect()
+}
+
+/// The records of the running session under `sessions` written so far, but for one still being
+/// written.
+fn the_log_so_far(sessions: &Path) -> Vec<Value> {
+    the_log_text(sessions)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn the_log_text(sessions: &Path) -> std::io::Result<String> {
     let dir = std::fs::read_dir(sessions)
         .expect("the session root")
         .next()
         .expect("one session")
         .expect("an entry")
         .path();
-    let text = std::fs::read_to_string(dir.join("logs/events.jsonl")).expect("the event log");
-    text.lines()
-        .map(|line| serde_json::from_str(line).expect("a whole record"))
-        .collect()
+    std::fs::read_to_string(dir.join("logs/events.jsonl"))
 }
 
 /// Each hosted request in `log`, in the order received: its id and the kinds
@@ -1944,5 +1965,359 @@ async fn a_gitpython_binding_is_used_as_plain_code() {
         raised,
         ["builtins.StopIteration", "git.exc.GitCommandError"],
         "{requests:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------ on a terminal
+
+const ROWS: u16 = 30;
+const COLUMNS: u16 = 100;
+
+/// What the emulated terminal answers when outrig asks where its cursor is, `CSI 6 n`, as a
+/// terminal does: the cursor's row and column, written back as if typed.
+struct Answer(std::fs::File);
+
+impl vt100::Callbacks for Answer {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        intermediate: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        use std::io::Write as _;
+        if c == 'n' && intermediate.is_none() && matches!(params, [[6]]) {
+            let (row, column) = screen.cursor_position();
+            write!(self.0, "\x1b[{};{}R", row + 1, column + 1).expect("answered");
+        }
+    }
+}
+
+/// `outrig run-new` on a terminal of its own, as a shell's foreground job runs: the leader of a
+/// new session whose controlling terminal is a fresh pty. What it writes there is read by a
+/// terminal emulator, which answers when it asks where the cursor is, as a terminal does.
+struct OnTerminal {
+    child: Child,
+    master: std::fs::File,
+    /// The pty's terminal side, held so its modes can be read once outrig has exited.
+    slave: std::os::fd::OwnedFd,
+    emulator: Arc<Mutex<vt100::Parser<Answer>>>,
+    reader: std::thread::JoinHandle<()>,
+    /// Set while the reader leaves what is written unread: a terminal that has stopped, as Ctrl-S
+    /// or a hung terminal program leaves it.
+    paused: Arc<AtomicBool>,
+}
+
+impl OnTerminal {
+    fn start(repo: &Path, sessions: &Path) -> Self {
+        use std::os::fd::OwnedFd;
+
+        let size = nix::pty::Winsize {
+            ws_row: ROWS,
+            ws_col: COLUMNS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = nix::pty::openpty(Some(&size), None).expect("openpty");
+        // Kept from what this process starts meanwhile: another test's outrig, or what that
+        // starts, holding this terminal's side would keep its reader from ever seeing the end.
+        for fd in [&pty.master, &pty.slave] {
+            let cloexec = nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC);
+            nix::fcntl::fcntl(fd, cloexec).expect("close on exec");
+        }
+        let stdio = |fd: &OwnedFd| Stdio::from(fd.try_clone().expect("dup the pty"));
+        let env = [("TERM", "xterm-256color".to_string())];
+        let mut command = outrig_run_new(repo, sessions, &global_config(repo), &env);
+        command
+            .env_remove("NO_COLOR")
+            .stdin(stdio(&pty.slave))
+            .stdout(stdio(&pty.slave))
+            .stderr(stdio(&pty.slave));
+        // SAFETY: two async-signal-safe calls between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid()?;
+                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("outrig starts");
+        let master = std::fs::File::from(pty.master);
+        let answer = Answer(master.try_clone().expect("dup the master"));
+        let emulator = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            ROWS, COLUMNS, 0, answer,
+        )));
+        let mut from = master.try_clone().expect("dup the master");
+        let screen = Arc::clone(&emulator);
+        let paused = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&paused);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0; 8192];
+            loop {
+                while held.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                // `EIO` once the last descriptor of the terminal side closes.
+                let Ok(n @ 1..) = from.read(&mut buf) else {
+                    return;
+                };
+                screen.lock().expect("unpoisoned").process(&buf[..n]);
+            }
+        });
+        Self {
+            child,
+            master,
+            slave: pty.slave,
+            emulator,
+            reader,
+            paused,
+        }
+    }
+
+    /// Stop reading what outrig writes, or start again.
+    fn pause(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Whether the terminal's modes are the shell's again.
+    fn cooked(&self) -> bool {
+        use nix::sys::termios::LocalFlags;
+        let modes = nix::sys::termios::tcgetattr(&self.slave).expect("the terminal's modes");
+        modes
+            .local_flags
+            .contains(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG)
+    }
+
+    /// What the terminal shows now.
+    fn screen(&self) -> String {
+        self.emulator
+            .lock()
+            .expect("unpoisoned")
+            .screen()
+            .contents()
+    }
+
+    /// Wait for the terminal to show `text`.
+    async fn shows(&self, text: &str) {
+        self.until(text, true).await;
+    }
+
+    /// Wait for the terminal to stop showing `text`.
+    async fn hides(&self, text: &str) {
+        self.until(text, false).await;
+    }
+
+    async fn until(&self, text: &str, shown: bool) {
+        let done = || self.screen().contains(text) == shown;
+        timeout(STEP_TIMEOUT, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let state = if shown { "never" } else { "still" };
+            panic!("{text:?} {state} on the terminal:\n{}", self.screen())
+        });
+    }
+
+    /// Keys, as the terminal sends them: a line ends with a carriage return.
+    fn press(&mut self, keys: &str) {
+        use std::io::Write as _;
+        self.master.write_all(keys.as_bytes()).expect("typed");
+    }
+
+    /// Wait for outrig to exit, and check it gave the terminal back as the shell gave it. Returns
+    /// how it exited, and what the terminal last showed.
+    async fn exit(mut self) -> (std::process::ExitStatus, String) {
+        let status = timeout(STEP_TIMEOUT, self.child.wait())
+            .await
+            .expect("exits")
+            .expect("wait");
+        assert!(self.cooked(), "the terminal is left raw");
+        let Self {
+            master,
+            slave,
+            emulator,
+            reader,
+            ..
+        } = self;
+        drop(slave);
+        // Bounded: something outrig started and left holding the terminal keeps the reader
+        // going, and what was written by then is what is checked.
+        let _ = timeout(
+            STEP_TIMEOUT,
+            tokio::task::spawn_blocking(move || reader.join()),
+        )
+        .await;
+        drop(master);
+        let emulator = emulator.lock().expect("unpoisoned");
+        let screen = emulator.screen();
+        let contents = screen.contents();
+        assert!(!screen.bracketed_paste(), "bracketed paste is left on");
+        assert!(
+            !screen.alternate_screen(),
+            "the alternate screen is left up"
+        );
+        assert!(!screen.hide_cursor(), "the cursor is left hidden");
+        (status, contents)
+    }
+}
+
+/// On a terminal the conversation is what the user and the agent sent each other: a typed line
+/// brings the agent's send into view, and not the Python that sent it, which the detail view
+/// shows. The status line says what runs and what waits, and a line typed meanwhile waits for a
+/// later round, since the round it was typed in was told of it and ended. Ctrl-C, which raw mode
+/// reads as a key, still exits twice pressed. The terminal is given back as the shell gave it,
+/// with the session's closing lines below the conversation.
+#[tokio::test]
+async fn on_a_terminal_the_conversation_is_what_was_sent() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_echo",
+            "ch = runtime.channels['user']\nm = await ch.receive()\n\
+             await ch.send('echo: ' + m.body)\nimport os\n\
+             while not os.path.exists('release'):\n    await asyncio.sleep(0.05)",
+        ),
+        text_reply("commentary on the first"),
+        submit(
+            "toolu_second",
+            "m = await runtime.channels['user'].receive()\n\
+             await runtime.channels['user'].send('got ' + m.body)",
+        ),
+        text_reply("commentary on the second"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut terminal = OnTerminal::start(repo.path(), sessions.path());
+
+    // The status line's hint: the screen is up.
+    terminal.shows("Ctrl-O detail").await;
+    terminal.press("hello\r");
+    terminal.shows("› hello").await;
+    terminal.shows("echo: hello").await;
+    terminal.shows("Python running").await;
+    terminal.press("second\r");
+    terminal.shows("1 waiting for the agent").await;
+    assert!(
+        !terminal.screen().contains("ch.receive()"),
+        "the Python is detail:\n{}",
+        terminal.screen()
+    );
+
+    // Ctrl-O shows the detail, and Esc returns to the conversation as it was.
+    terminal.press("\x0f");
+    terminal.shows("python · execution").await;
+    terminal.shows("ch.receive()").await;
+    terminal.press("\x1b");
+    terminal.hides("python · execution").await;
+    terminal.shows("echo: hello").await;
+
+    std::fs::write(repo.path().join("release"), b"").expect("release the first round");
+    terminal.shows("ready · 1 waiting").await;
+    // A round of its own, whose code reads the oldest message waiting.
+    terminal.press("third\r");
+    terminal.shows("got second").await;
+    terminal.shows("ready · 1 waiting").await;
+    assert!(
+        !terminal.screen().contains("commentary"),
+        "the model's own text is detail:\n{}",
+        terminal.screen()
+    );
+
+    terminal.press("\x03");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    terminal.press("\x03");
+    let (status, screen) = terminal.exit().await;
+    assert!(status.success(), "{status}:\n{screen}");
+    assert!(screen.contains("[outrig] closing the session"), "{screen}");
+}
+
+/// A terminal that has stopped reading what is written to it -- Ctrl-S, a terminal program that
+/// hangs -- holds the screen's drawing up, and the agent's messages with it, and nothing else:
+/// Ctrl-C, which raw mode reads as a key, still reaches the conversation, and pressed twice ends
+/// `run-new`, which puts the terminal's modes back without waiting on the drawing.
+#[tokio::test]
+async fn ctrl_c_ends_run_new_on_a_terminal_that_stopped_reading() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_stalled",
+            "async def flood():\n    while True:\n        \
+             await runtime.channels['user'].send('tick ' + 'x' * 16000)\n\
+             flooding = asyncio.create_task(flood())\nawait asyncio.sleep(0.5)",
+        ),
+        text_reply("the flood is running"),
+    ])
+    .await;
+    let repo = repo_with(addr, "[events]\nmode = \"record\"");
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut terminal = OnTerminal::start(repo.path(), sessions.path());
+    terminal.shows("Ctrl-O detail").await;
+
+    terminal.pause(true);
+    terminal.press("go\r");
+    // The agent's sends stop once the messages waiting to be drawn fill the outbox: the drawing
+    // is held up.
+    let sent = || {
+        let log = the_log_so_far(sessions.path());
+        log.iter()
+            .filter(|e| e["type"] == "org.outrig.message.sent" && e["data"]["to"] == "user")
+            .count()
+    };
+    timeout(STEP_TIMEOUT, async {
+        let mut last = 0;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let now = sent();
+            if now > 0 && now == last {
+                return;
+            }
+            last = now;
+        }
+    })
+    .await
+    .expect("the agent's sends are held up");
+
+    terminal.press("\x03");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    terminal.press("\x03");
+    let status = timeout(STEP_TIMEOUT, terminal.child.wait())
+        .await
+        .expect("exits with the terminal stopped")
+        .expect("wait");
+    assert!(status.success(), "{status}");
+    assert!(terminal.cooked(), "the terminal is left raw");
+    terminal.pause(false);
+}
+
+/// SIGTERM ends `run-new` on a terminal by its default action, as it does on pipes, and the
+/// screen gives the terminal back first, so the shell is left one it can type in.
+#[tokio::test]
+async fn sigterm_on_a_terminal_gives_the_terminal_back() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let terminal = OnTerminal::start(repo.path(), sessions.path());
+    terminal.shows("Ctrl-O detail").await;
+    // The default action leaves the container running.
+    let id = banner_session_id(&terminal.screen());
+    let _container = RemoveOnDrop(format!("outrig-{id}"));
+    let pid = terminal.child.id().expect("a pid") as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("SIGTERM");
+    let (status, screen) = terminal.exit().await;
+    assert_eq!(
+        status.signal(),
+        Some(nix::libc::SIGTERM),
+        "{status}:\n{screen}"
     );
 }
