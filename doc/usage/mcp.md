@@ -299,6 +299,32 @@ outrig mcp --listen unix:/tmp/outrig.sock --image coding
 Socket filesystem permissions are the access boundary. HTTP clients still use the
 Streamable HTTP protocol and the `/mcp` path over that socket.
 
+#### Browser defenses
+
+Two request headers are checked before anything is dispatched, and both are about pages in
+a browser rather than about MCP clients:
+
+- `Host` guards against DNS rebinding. A loopback TCP listener accepts only `localhost`,
+  `127.0.0.1`, and `::1`, so a name that resolves to the loopback address does not reach the
+  tools under a hostname outrig does not serve. A non-loopback bind and a Unix socket are
+  reached under names outrig cannot enumerate -- whatever a reverse proxy publishes -- so
+  the check is off for them.
+- `Origin` guards against a web page driving the listener, which the MCP transport spec
+  requires a local server to do. A loopback listener accepts the origins that name itself,
+  port included (`http://localhost:7331`, `http://127.0.0.1:7331`, `http://[::1]:7331`);
+  every other origin is refused with `403`, including another local port, because a page on
+  `http://localhost:3000` is as cross-origin as one on the internet. A non-loopback bind and
+  a Unix socket recognize no origin as their own and refuse every one.
+
+A request that carries no `Origin` header is served in all cases. That is what every
+non-browser client sends -- an editor, a CLI, a script, rmcp's own HTTP transport -- so these
+rules cost an ordinary client nothing. A browser is what attaches the header, and a browser is
+what the rules are for.
+
+Neither check is authentication. They keep a page a user did not open from reaching tools that
+the user's own machine can; anything that can send a request without a browser attaching
+headers to it is still limited only by what can reach the port or the socket.
+
 ## What Happens, in Order
 
 1. **Locate config.** Walks up from the current directory until

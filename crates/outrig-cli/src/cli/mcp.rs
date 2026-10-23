@@ -425,24 +425,27 @@ async fn serve_http_transport(
 ) -> Result<i32> {
     let ct = CancellationToken::new();
     let session_manager = Arc::new(LocalSessionManager::default());
-    let router = streamable_http_router(proxy, listen, ct.child_token(), session_manager.clone());
 
     let outcome = match listen {
         ListenAddr::Tcp(addr) => {
+            // Bind before the router is built: the config pins its allowed
+            // Origins to the port this ends up on, which `--listen 127.0.0.1:0`
+            // does not know until the kernel has picked one.
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            let local_addr = listener.local_addr()?;
-            if let Some(warning) = listen_exposure_warning(&ListenAddr::Tcp(local_addr)) {
+            let bound = ListenAddr::Tcp(listener.local_addr()?);
+            if let Some(warning) = listen_exposure_warning(&bound) {
                 eprintln!("{warning}");
             }
-            eprintln!(
-                "[outrig] listen: {}",
-                listen_endpoint(&ListenAddr::Tcp(local_addr))
-            );
+            eprintln!("[outrig] listen: {}", listen_endpoint(&bound));
+            let router =
+                streamable_http_router(proxy, &bound, ct.child_token(), session_manager.clone());
             let shutdown = http_shutdown(ct.clone());
             let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
             wait_for_http_shutdown(server, ct, monitor, signals).await
         }
         ListenAddr::Unix(path) => {
+            let router =
+                streamable_http_router(proxy, listen, ct.child_token(), session_manager.clone());
             serve_unix_http_transport(router, path, ct, monitor, signals).await
         }
     };
@@ -484,28 +487,95 @@ async fn serve_unix_http_transport(
     )
 }
 
-fn streamable_http_router(
-    proxy: ProxyServer,
+/// Mount the MCP service at `/mcp`.
+///
+/// Generic over the handler so a test can drive the same router -- the same
+/// `Host`/`Origin` gate in front of it -- without a container behind it.
+/// Production always passes a [`ProxyServer`].
+fn streamable_http_router<S>(
+    handler: S,
     listen: &ListenAddr,
     ct: CancellationToken,
     session_manager: Arc<LocalSessionManager>,
-) -> axum::Router {
+) -> axum::Router
+where
+    S: rmcp::ServerHandler + Clone + Send + 'static,
+{
     let service = StreamableHttpService::new(
-        move || Ok(proxy.clone()),
+        move || Ok(handler.clone()),
         session_manager,
         streamable_http_config(listen, ct),
     );
     axum::Router::new().nest_service("/mcp", service)
 }
 
+/// The transport's browser defenses for one listen address.
+///
+/// Two headers, two jobs. `Host` is what stops DNS rebinding: a name that
+/// resolves to the loopback address only carries a request this far if the
+/// name is one of ours, so a loopback bind keeps rmcp's loopback allowlist and
+/// anything else -- a public bind, a Unix socket, both reached under names
+/// outrig cannot enumerate -- turns it off.
+///
+/// `Origin` is what stops a page in a browser from driving the listener, and
+/// the MCP transport spec says a local server MUST check it. rmcp's default is
+/// an empty allowlist, which means *no* validation, so every `Origin` passed.
+/// Nothing today turns that into a drive-by tool call: rmcp demands
+/// `Content-Type: application/json` on POST, which puts a CORS preflight in
+/// front of the request that the service answers with 405. But that is one
+/// rmcp change away from being false, and the header is free to check, so it
+/// is checked here (#372).
+///
+/// Validation is enforced on every address, including the ones whose allowlist
+/// is empty: an empty *enforced* list rejects every request that carries an
+/// `Origin` at all. A request without the header still passes, which is what
+/// every non-browser MCP client sends -- `Origin` is a browser's word for the
+/// page that asked, and rmcp's own HTTP client does not set one. So the rule
+/// costs nothing to an editor, a CLI, or a script, and a page is refused.
+///
+/// A loopback listener allows exactly the origins that name itself, port and
+/// all, so a same-origin fetch to its own endpoint works. Every other origin,
+/// loopback or not, is not ours: a page on `http://localhost:3000` is a
+/// different origin from this endpoint, and allowing it would mean allowing
+/// whatever else answers on a port we do not serve.
 fn streamable_http_config(
     listen: &ListenAddr,
     ct: CancellationToken,
 ) -> StreamableHttpServerConfig {
-    let config = StreamableHttpServerConfig::default().with_cancellation_token(ct);
+    let config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(ct)
+        .with_allowed_origins(self_origins(listen))
+        .enforce_origin_validation();
     match listen {
         ListenAddr::Tcp(addr) if addr.ip().is_loopback() => config,
         ListenAddr::Tcp(_) | ListenAddr::Unix(_) => config.disable_allowed_hosts(),
+    }
+}
+
+/// The browser origins that name this listener itself.
+///
+/// Only a loopback TCP bind has any: the three spellings rmcp's `Host`
+/// allowlist accepts, each carrying the port actually bound -- an entry
+/// without a port would match the same host on *any* port, which is a
+/// different server. The address must therefore be the bound one, not the
+/// requested one, or `--listen 127.0.0.1:0` would pin port 0.
+///
+/// A public bind and a Unix socket get none. Their endpoint is reached under a
+/// name outrig never learns -- whatever a reverse proxy publishes, or no URL
+/// at all -- so there is no origin to recognize, and the empty list means
+/// "refuse every `Origin`". A proxy that fronts browser traffic validates the
+/// header itself; forwarding it here is asking to be refused.
+fn self_origins(listen: &ListenAddr) -> Vec<String> {
+    match listen {
+        ListenAddr::Tcp(addr) if addr.ip().is_loopback() => {
+            let port = addr.port();
+            vec![
+                format!("http://localhost:{port}"),
+                format!("http://127.0.0.1:{port}"),
+                format!("http://[::1]:{port}"),
+            ]
+        }
+        ListenAddr::Tcp(_) | ListenAddr::Unix(_) => Vec::new(),
     }
 }
 
@@ -1091,6 +1161,193 @@ named  = { sidecar = "serve" }
     #[test]
     fn render_merged_mcp_empty_plan_is_bare_header() {
         assert_eq!(render_merged_mcp(&SessionMcpPlan::default()), "[mcp]\n");
+    }
+
+    /// A handler with nothing behind it: every method is rmcp's default. The
+    /// `Origin` gate runs in the transport, ahead of any dispatch, so what the
+    /// handler would answer does not enter into it -- and a test that reaches
+    /// the handler at all has proven the request was let through.
+    #[derive(Clone)]
+    struct BareHandler;
+
+    impl rmcp::ServerHandler for BareHandler {}
+
+    /// The bound endpoint of an `outrig mcp --listen 127.0.0.1:0` server,
+    /// configured exactly as production configures it. The server is a task;
+    /// it stops when `ct` is cancelled.
+    async fn serve_loopback(ct: CancellationToken) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let bound = ListenAddr::Tcp(listener.local_addr().expect("local addr"));
+        let endpoint = listen_endpoint(&bound);
+        let router = streamable_http_router(
+            BareHandler,
+            &bound,
+            ct.child_token(),
+            Arc::new(LocalSessionManager::default()),
+        );
+        let shutdown = http_shutdown(ct);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        endpoint
+    }
+
+    /// An `initialize` POST, carrying `origin` when one is given.
+    async fn post_initialize(
+        client: &reqwest::Client,
+        endpoint: &str,
+        origin: Option<&str>,
+    ) -> reqwest::StatusCode {
+        let mut request = client
+            .post(endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "outrig-test", "version": "1.0.0" }
+                    }
+                })
+                .to_string(),
+            );
+        if let Some(origin) = origin {
+            request = request.header("Origin", origin);
+        }
+        request.send().await.expect("POST initialize").status()
+    }
+
+    /// The MCP transport spec says a local HTTP server MUST validate `Origin`.
+    /// rmcp's default allowlist is empty, which disables the check rather than
+    /// failing it closed, so every origin reached the proxy -- a page's
+    /// included, the moment anything upstream relaxes the content-type rule
+    /// that currently forces a preflight. A page claiming an origin that is
+    /// not this endpoint is now refused before dispatch (#372).
+    #[tokio::test]
+    async fn a_listener_refuses_a_cross_origin_page_and_serves_a_client_that_sends_no_origin() {
+        let ct = CancellationToken::new();
+        let endpoint = serve_loopback(ct.clone()).await;
+        let client = reqwest::Client::new();
+
+        // Every non-browser MCP client -- an editor, a CLI, rmcp's own HTTP
+        // transport -- sends no `Origin` at all, and must go on working.
+        assert!(
+            post_initialize(&client, &endpoint, None).await.is_success(),
+            "a request with no Origin is not a browser's and must be served"
+        );
+
+        // Same-origin: the page is this endpoint's own.
+        let self_origin = endpoint
+            .strip_suffix("/mcp")
+            .expect("endpoint ends in /mcp")
+            .to_string();
+        assert!(
+            post_initialize(&client, &endpoint, Some(&self_origin))
+                .await
+                .is_success(),
+            "a page served by this listener is same-origin: {self_origin}"
+        );
+
+        for origin in [
+            "http://evil.example",
+            "https://evil.example",
+            // Loopback is not a trust boundary: a page on another local port
+            // is as cross-origin as one on the internet.
+            "http://localhost:3000",
+            "null",
+        ] {
+            assert_eq!(
+                post_initialize(&client, &endpoint, Some(origin)).await,
+                reqwest::StatusCode::FORBIDDEN,
+                "cross-origin {origin} should be refused"
+            );
+        }
+
+        ct.cancel();
+    }
+
+    /// A listener whose endpoint outrig cannot name -- a public bind behind
+    /// whatever a reverse proxy publishes, a Unix socket with no URL at all --
+    /// has no origin of its own, and the empty allowlist is enforced rather
+    /// than waved through: every `Origin` is refused, while the header-free
+    /// requests real clients send still pass.
+    #[tokio::test]
+    async fn a_public_bind_refuses_every_origin_and_still_serves_header_free_clients() {
+        let ct = CancellationToken::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        // Configured as a public bind (no `Host` allowlist, no self origin)
+        // but bound on loopback, which is what the test can reach.
+        let public = ListenAddr::Tcp(format!("0.0.0.0:{port}").parse().expect("socket addr"));
+        let router = streamable_http_router(
+            BareHandler,
+            &public,
+            ct.child_token(),
+            Arc::new(LocalSessionManager::default()),
+        );
+        let shutdown = http_shutdown(ct.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+
+        let client = reqwest::Client::new();
+        assert!(
+            post_initialize(&client, &endpoint, None).await.is_success(),
+            "a request with no Origin must be served"
+        );
+        let own_address = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            post_initialize(&client, &endpoint, Some(&own_address)).await,
+            reqwest::StatusCode::FORBIDDEN,
+            "a listener outrig cannot name recognizes no origin as its own"
+        );
+
+        ct.cancel();
+    }
+
+    /// The origins a loopback listener recognizes as itself carry the port it
+    /// is actually on. `--listen 127.0.0.1:0` asks the kernel for a port, so
+    /// the list has to be derived from the bound address: derived from the
+    /// requested one it would name port 0, which is no endpoint at all.
+    #[test]
+    fn a_loopback_listeners_self_origins_name_its_bound_port() {
+        let bound = ListenAddr::Tcp("127.0.0.1:7331".parse().expect("socket addr"));
+        assert_eq!(
+            self_origins(&bound),
+            vec![
+                "http://localhost:7331".to_string(),
+                "http://127.0.0.1:7331".to_string(),
+                "http://[::1]:7331".to_string(),
+            ]
+        );
+    }
+
+    /// A public bind and a Unix socket are reached under names outrig never
+    /// learns, so neither has an origin of its own to allow. The empty list is
+    /// enforced rather than ignored, which is the whole point: it refuses
+    /// every `Origin` instead of passing every one.
+    #[test]
+    fn a_listener_outrig_cannot_name_has_no_self_origin() {
+        assert!(
+            self_origins(&ListenAddr::Tcp(
+                "0.0.0.0:7331".parse().expect("socket addr")
+            ))
+            .is_empty()
+        );
+        assert!(self_origins(&ListenAddr::Unix(PathBuf::from("/tmp/outrig.sock"))).is_empty());
     }
 
     #[test]

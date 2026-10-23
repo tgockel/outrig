@@ -537,6 +537,35 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
     wait_for_stderr_value(stderr_buf.clone(), "[outrig] mcp server ready").await;
 
     let client = reqwest::Client::new();
+
+    // A page's request is refused before it reaches the proxy. The binary is
+    // what is being asked here, not the config function the unit tests drive:
+    // what a real `--listen 127.0.0.1:0` serves has the `Origin` gate in front
+    // of it, on the port it actually bound (#372).
+    let cross_origin = client
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("Origin", "http://evil.example")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "outrig-test", "version": "1.0.0" }
+            }
+        }))
+        .send()
+        .await
+        .expect("POST initialize with a cross-origin Origin");
+    assert_eq!(
+        cross_origin.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cross-origin page should not reach the proxy"
+    );
+
     let session_a = initialize_http_session(&client, &url, 1, "2025-06-18").await;
     // A revision outside the pinned list still opens a live session, answered in
     // the server's default. Routed by the revision it asked for instead, this

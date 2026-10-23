@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig mcp --listen` validates the `Origin` header.** The MCP transport spec says a
+  server MUST check it; rmcp's default allowlist is empty, which *disables* the check rather
+  than failing closed, so every origin was accepted. Nothing turned that into a drive-by tool
+  call today -- rmcp requires `Content-Type: application/json` on POST, which puts a CORS
+  preflight in front that the service answers with 405 -- but one upstream change to CORS or
+  content-type handling would have made a loopback listener a page's route to `shell__exec`.
+  A loopback listener now accepts only the origins that name itself, port included, and
+  refuses every other with `403`, another local port among them: a page on
+  `http://localhost:3000` is as cross-origin as one on the internet. A non-loopback bind or a
+  Unix socket is reached under a name outrig cannot know, so it recognizes no origin as its
+  own and refuses every one. A request carrying no `Origin` is served in all cases, which is
+  what every non-browser client sends, so editors, CLIs, and scripts are unaffected. (#372)
 - **A `[sidecars.<sc>.security]` error names the sidecar, and a whitespace-only `image-name` is
   refused at load.** A security rule that failed in a sidecar block reported it as ``image
   "sidecars.tools": ...``, pointing at an `[images.<name>]` block that does not exist; it now

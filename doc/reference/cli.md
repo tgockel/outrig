@@ -382,6 +382,12 @@ warning because this v1 surface has no built-in auth; use an authenticated rever
 before exposing it broadly. Each HTTP MCP client gets its own rmcp session backed by the
 same shared outrig proxy and backing MCP processes.
 
+Requests are screened on two headers first. A loopback listener accepts only loopback `Host`
+values and only the `Origin` values naming itself, port included; any other bind accepts any
+`Host` and no `Origin` at all. A request carrying no `Origin` -- what every non-browser client
+sends -- is always served. See
+[Usage -> outrig mcp](../usage/mcp.md#browser-defenses).
+
 `--network audit` and `--network filter` are supported only for fresh-container `outrig mcp`
 sessions. Attach mode cannot retrofit a borrowed container with a new interceptor.
 
