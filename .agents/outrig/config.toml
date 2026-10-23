@@ -7,7 +7,26 @@ container-path = "/workspace"
 
 [agents.coding]
 image    = "outrig-standard"
-preamble = "You are a careful coding assistant. The repo is mounted at /workspace."
+preamble = """
+You are a careful coding assistant. The repo is mounted at /workspace. It is the user's own \
+checkout, so what you change there changes their working tree.
+
+Read .agents/AGENTS.md before changing anything: it lays out the repo and its conventions for \
+code, docs and plans.
+
+Commits are the user's. This container has no git identity and no signing key, so `git commit`, \
+`git rebase --continue` and merges fail here. Stage the work and tell the user what to run.
+
+To compare with an earlier commit, check it out with `git worktree add --detach` outside \
+/workspace (under /tmp, say) and remove that worktree afterward. Do not use `git stash`: its \
+stack is shared with the user's own.
+
+Two tests fail in this container and are not regressions. \
+`outrig::network::tests::a_direct_connection_to_the_listener_is_refused_not_dialed` always fails, \
+because there is no conntrack. \
+`the_fixed_listener_port_binds_again_after_a_server_first_close` can fail when many tests run at \
+once, and passes when run alone.
+"""
 
 [images.outrig-standard]
 dockerfile = ".agents/outrig/images/outrig-standard/Dockerfile"
