@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `env` or `build-args` key podman would misread is refused when the config is read, and
+  `--env` refuses one as it parses.** podman and buildah split each entry at its first `=`, so
+  `env = { "A=B" = "c" }` set `A` to `B=c`, and an empty key reached podman as `--env =x` and
+  failed the first MCP connect with the engine's message rather than the config's. `run`, `mcp`,
+  and `build` now refuse a key that is not `^[A-Za-z_][A-Za-z0-9_]*$` while validating, naming
+  the image, the server, the key, and the file that declared it; `--env KEY=VALUE` and
+  `--env SERVER:KEY=VALUE` refuse one in argument parsing, as they already refused an empty key.
+  The value still keeps its own `=` -- the split is at the first one, and only the key is held
+  to the grammar -- and a lower-case key is fine: it names a variable inside the container,
+  not in your environment. An image's `org.outrig.mcp` label and a standalone `image.toml` are
+  held to the same rule, so `outrig image build` refuses a key before stamping it. (#369)
 - **`outrig ls` lines its columns up around a name that is not plain ASCII.** Column widths were
   measured in bytes while the padding that applied them counted `char`s, so a multi-byte
   image-config name threw the table off twice over. An `IMAGE` cell is the key of an

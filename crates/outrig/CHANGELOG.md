@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`config::is_env_key`**: whether a string can name a variable an `env` or `build-args` table
+  sets (`^[A-Za-z_][A-Za-z0-9_]*$`). It is the grammar validation now holds those keys to, and
+  the one that already decided whether a resolved `${VAR}` could be passed to podman by name;
+  public so a caller building an `McpServerSpec` or an `--env` overlay can refuse the same keys
+  with the same answer. (#369)
+- **`ConfigValidationError::BuildArgKeyInvalid` / `McpEnvKeyInvalid`**, and
+  **`EmbeddedImageConfigError::EnvKeyInvalid` / `StandaloneImageTomlError::EnvKeyInvalid`**: an
+  `env` or `build-args` key that is not a variable name, in a config file and in an image's
+  label or `image.toml` respectively. See the fix below. (#369)
 - **`container::embedded::read_embedded_mcp_of`**: the `org.outrig.mcp` of the image a running
   `Container` was started from, by the engine's id for it. The by-tag
   `read_embedded_mcp` remains, and remains right for the caller deciding what to *start*, since
@@ -22,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `env` or `build-args` key that podman would misread is refused where it was written.**
+  podman and buildah read each entry as `KEY=value` and split it at the first `=`, so
+  `env = { "A=B" = "c" }` set `A` to `B=c` -- a variable nobody named, holding a value nobody
+  wrote -- and an empty key reached podman as `--env =x`, which failed the first MCP connect
+  with the engine's own message, naming neither the key nor the file that declared it.
+  `Config::validate` now holds every `[images.<name>.mcp]` `env` key and every `build-args` key
+  to `config::is_env_key`, naming the image, the server, the key, and the file. The grammar is
+  wider than a `${VAR}` reference's, which is upper-case only: a key names a variable inside the
+  container, where `http_proxy` is ordinary. Every image-config is checked, whoever declared it
+  -- a key grants no access to the host environment, so unlike a reference it is not a question
+  of trust. An image's `org.outrig.mcp` label and a standalone `image.toml` are held to the same
+  rule, so `outrig image build` refuses a key before stamping it and a session refuses a label
+  that carries one. The fallback that kept a reference's value on the command line for a key
+  podman could not take by name is unchanged, and is now unreachable from a config file. (#369)
 - **`embedded::merged_mcp` answers for the image its container is running, not for whatever that
   container's tag names now.** The label was read with `podman image inspect <tag>`, taking the
   tag off the handle -- and a tag is a pointer. A pull of a re-pushed `registry/x:latest`

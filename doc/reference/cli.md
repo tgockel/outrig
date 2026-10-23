@@ -245,7 +245,9 @@ outrig run [--agent <name>]
   the `${VAR}` host-env-reference syntax described in
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax); you typed them, so they are
   not held to the global config's [`[repo]` `env-allow`](config.md#repo) list, which governs
-  the references in a repo config and in an image's label. Within a scope, last wins on
+  the references in a repo config and in an image's label. The key is held to
+  `^[A-Za-z_][A-Za-z0-9_]*$`, as a config file's `env` key is: the split is at the first `=`,
+  so a value may hold one but a key may not. Within a scope, last wins on
   duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   **deprecated** with the in-process backend it selects hardware for; override the in-process

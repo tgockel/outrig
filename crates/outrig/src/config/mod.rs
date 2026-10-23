@@ -20,6 +20,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef};
+pub use env_ref::is_env_key;
 pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
@@ -27,9 +28,9 @@ pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
 };
 pub(crate) use validate::{
-    check_entrypoint_hosting, check_mcp_call_timeout_secs, check_sidecar_image, check_sidecar_name,
-    check_view_exclusions, is_valid_mcp_server_name, mcp_call_timeout_secs_in_range,
-    mcp_command_is_empty,
+    check_entrypoint_hosting, check_env_keys, check_mcp_call_timeout_secs, check_sidecar_image,
+    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
+    mcp_call_timeout_secs_in_range, mcp_command_is_empty,
 };
 
 use crate::error::{IoPathExt, OutrigError, Result};

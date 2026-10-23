@@ -15,7 +15,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{
-    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, is_valid_mcp_server_name,
+    MCP_CALL_TIMEOUT_SECS_CEILING, McpServerSpec, check_env_keys, is_valid_mcp_server_name,
     mcp_call_timeout_secs_in_range, mcp_command_is_empty,
 };
 use crate::container::Container;
@@ -135,6 +135,14 @@ pub enum EmbeddedImageConfigError {
     ArgsInLabel { server: String },
 
     #[error(
+        "mcp server {server:?} env key {key:?} is not an environment variable name; \
+         podman reads each entry as `KEY=value`, so a key holding `=` sets a shorter \
+         name with the rest of itself in the value, and an empty one is refused when \
+         the engine runs; write a name matching ^[A-Za-z_][A-Za-z0-9_]*$"
+    )]
+    EnvKeyInvalid { server: String, key: String },
+
+    #[error(
         "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
          got {value}"
     )]
@@ -184,6 +192,14 @@ pub enum StandaloneImageTomlError {
          ENTRYPOINT and is repo-config-only"
     )]
     ArgsInLabel { server: String },
+
+    #[error(
+        "mcp server {server:?} env key {key:?} is not an environment variable name; \
+         podman reads each entry as `KEY=value`, so a key holding `=` sets a shorter \
+         name with the rest of itself in the value, and an empty one is refused when \
+         the engine runs; write a name matching ^[A-Za-z_][A-Za-z0-9_]*$"
+    )]
+    EnvKeyInvalid { server: String, key: String },
 
     #[error(
         "mcp server {server:?} call-timeout-secs must be between 1 and {max} seconds; \
@@ -521,6 +537,15 @@ fn parse_mcp_table(
             });
         }
     }
+    // After the per-server rules above, so a label whose server is also
+    // malformed in some other way is reported by that rule first, as it was
+    // before keys were checked at all.
+    if let Some((server, key)) = check_env_keys(&mcp) {
+        return Err(EmbeddedImageConfigError::EnvKeyInvalid {
+            server: server.to_string(),
+            key: key.to_string(),
+        });
+    }
     Ok(mcp)
 }
 
@@ -633,6 +658,12 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     max: MCP_CALL_TIMEOUT_SECS_CEILING,
                 });
             }
+        }
+        if let Some((server, key)) = check_env_keys(&mcp) {
+            return Err(StandaloneImageTomlError::EnvKeyInvalid {
+                server: server.to_string(),
+                key: key.to_string(),
+            });
         }
 
         Ok(Self {
@@ -1036,6 +1067,31 @@ mod tests {
         }
     }
 
+    /// A label is read off an image the repo only names, so its `env` keys are
+    /// held to the same grammar a config file's are: `"A=B"` would otherwise
+    /// reach podman as `--env A=B=c` and set `A`.
+    #[test]
+    fn parse_mcp_table_refuses_an_env_key_that_is_not_a_variable_name() {
+        for key in ["A=B", "", "my-key", "K*"] {
+            let json = serde_json::json!({"build": {"command": ["cargo-mcp"], "env": {key: "v"}}});
+            let err = parse_mcp_table(&json.to_string()).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    EmbeddedImageConfigError::EnvKeyInvalid { server, key: k }
+                        if server == "build" && k == key
+                ),
+                "{key:?}: {err:?}"
+            );
+        }
+
+        let ok = parse_mcp_table(
+            r#"{"build": {"command": ["cargo-mcp"], "env": {"http_proxy": "http://p:3128"}}}"#,
+        )
+        .expect("a lower-case key is a key");
+        assert_eq!(ok["build"].env()["http_proxy"].to_raw(), "http://p:3128");
+    }
+
     #[test]
     fn embedded_mcp_missing_label_is_empty() {
         let mcp =
@@ -1318,6 +1374,36 @@ mod tests {
         let labels = standalone_config_to_labels(&cfg).expect("stamp labels");
         let read = parse_mcp_table(&labels[LABEL_MCP]).expect("read the label back");
         assert_eq!(read["build"].call_timeout_secs(), Some(1800));
+    }
+
+    /// `outrig image build` refuses a key before it stamps the label, as it
+    /// refuses an out-of-range deadline: an image whose label every runtime
+    /// would then refuse is not worth building.
+    #[test]
+    fn standalone_image_toml_refuses_an_env_key_that_is_not_a_variable_name() {
+        let err = parse_standalone_image_toml(
+            r#"
+            [image]
+            ref = "rust-dev"
+
+            [mcp]
+            build = { command = ["cargo-mcp"], env = { "A=B" = "c" } }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StandaloneImageTomlError::EnvKeyInvalid { server, key }
+                    if server == "build" && key == "A=B"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(r#"env key "A=B" is not an environment variable name"#),
+            "{err}"
+        );
     }
 
     fn env_ref(var: &str) -> EnvValue {

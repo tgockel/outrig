@@ -38,7 +38,7 @@
 //! transport, test tooling. Redo that sweep when a new engine release is
 //! supported.
 
-use crate::config::EnvValue;
+use crate::config::{EnvValue, is_env_key};
 use crate::process::Cmd;
 
 /// Variables podman, buildah, or the processes they run read from their own
@@ -158,21 +158,14 @@ pub(crate) fn shown_value(value: &str, source: Option<&EnvValue>) -> String {
 
 /// Whether a reference's value can go through the client's environment.
 ///
-/// The key has to be a plain variable name besides: podman reads a bare key
-/// ending in `*` as a glob over its environment and trims whitespace from it,
-/// and a key holding `=` would be split by the client into a different key
-/// and a value.
+/// The key has to be a plain variable name besides -- [`is_env_key`], the same
+/// grammar config validation holds an `env` or `build-args` key to: podman
+/// reads a bare key ending in `*` as a glob over its environment and trims
+/// whitespace from it, and a key holding `=` would be split by the client into
+/// a different key and a value. Validation makes that unreachable from a
+/// config file; a hand-built `ExecOptions` still arrives here.
 fn by_name(key: &str, var: &str) -> bool {
-    is_plain_env_name(key) && (!is_engine_read(key) || (key == var && is_proxy(key)))
-}
-
-/// `^[A-Za-z_][A-Za-z0-9_]*$`.
-fn is_plain_env_name(key: &str) -> bool {
-    let mut chars = key.chars();
-    chars
-        .next()
-        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    is_env_key(key) && (!is_engine_read(key) || (key == var && is_proxy(key)))
 }
 
 fn is_engine_read(key: &str) -> bool {
@@ -330,7 +323,7 @@ mod tests {
     #[test]
     fn a_plain_name_is_a_letter_or_underscore_then_alphanumerics() {
         for key in ["K", "_", "_K1", "lower_case", "GH_TOKEN"] {
-            assert!(is_plain_env_name(key), "{key}");
+            assert!(is_env_key(key), "{key}");
         }
     }
 }

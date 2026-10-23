@@ -15,7 +15,7 @@
 //! only checks cross-references, MCP server-name shape, and disk-existence of
 //! config-declared paths.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -27,7 +27,7 @@ use super::{
     McpServerSpec, MistralrsDeviceSpec, Model, ModelSourceRef, NetworkMode,
     REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
     SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
-    TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
+    TOOL_RESULT_MAX_FLOOR_BYTES, is_env_key, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -495,6 +495,37 @@ pub enum ConfigValidationError {
         declared_in: Option<PathBuf>,
     },
 
+    // As with the two above, the key comes from a config file and prints with
+    // `{:?}`: it is exactly the keys that are not variable names that land
+    // here, and one could otherwise carry a control character to the terminal.
+    #[error(
+        "image {image:?} build-arg key {key:?} is not an environment variable name{}; {}",
+        declared_in_clause(declared_in),
+        ENV_KEY_DETAIL
+    )]
+    #[non_exhaustive]
+    BuildArgKeyInvalid {
+        image: String,
+        key: String,
+        /// The config file that declared the image, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} env key {key:?} is not an environment \
+         variable name{}; {}",
+        declared_in_clause(declared_in),
+        ENV_KEY_DETAIL
+    )]
+    #[non_exhaustive]
+    McpEnvKeyInvalid {
+        image: String,
+        server: String,
+        key: String,
+        /// The config file that declared the image, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
+
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
          model-id or model-path; got neither"
@@ -680,6 +711,14 @@ pub enum ConfigValidationError {
     SidecarNameCollision { image: String, name: String },
 }
 
+/// Why a key that is not a variable name is refused here rather than by the
+/// engine. Both `*KeyInvalid` messages end with it, so the two tables say the
+/// same thing.
+const ENV_KEY_DETAIL: &str = "podman and buildah read each entry as \
+     `KEY=value`, so a key holding `=` sets a shorter name with the rest of \
+     itself in the value, and an empty one is refused when the engine runs; \
+     write a name matching ^[A-Za-z_][A-Za-z0-9_]*$";
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ValidationOptions<'a> {
     pub agent_model_override: Option<&'a str>,
@@ -793,6 +832,7 @@ pub(super) fn validate_with_options(
             });
         }
         validate_image_security(image_name, image)?;
+        validate_env_keys(image_name, image)?;
         validate_repo_env_refs(cfg, image_name, image)?;
 
         for (server_name, spec) in &image.mcp {
@@ -1103,6 +1143,69 @@ fn validate_repo_env_refs(
         }
     }
     Ok(())
+}
+
+/// Hold every `env` and `build-args` key of an image-config to the variable
+/// name grammar, before anything renders one into a `KEY=value` argument.
+///
+/// podman and buildah split each such argument at its first `=`, so a key
+/// holding one names a shorter variable and leaves the rest of itself at the
+/// head of the value: `"A=B" = "c"` set `A` to `B=c`, which is a typo that
+/// configured something. An empty key reached podman as `--env =x` and failed
+/// the first server connect with the engine's own message, naming neither the
+/// key nor the file. Both are refused when the config loads instead.
+///
+/// The grammar is [`is_env_key`]'s, which is also what decides whether a
+/// resolved `${VAR}` may be passed to the engine by name: a key outside it
+/// kept its value on the command line, so this rule makes that fallback
+/// unreachable from a config file rather than removing it -- a hand-built
+/// `ExecOptions` still reaches it.
+///
+/// Every image-config is checked, whoever declared it: a key is misread the
+/// same way wherever it was written, and unlike a `${VAR}` reference it grants
+/// no access to the operator's environment. `declared_in` names the file when
+/// the entry records one.
+fn validate_env_keys(image_name: &str, image: &ImageConfig) -> Result<(), ConfigValidationError> {
+    for key in image.build_args.keys() {
+        if !is_env_key(key) {
+            return Err(ConfigValidationError::BuildArgKeyInvalid {
+                image: image_name.to_string(),
+                key: key.clone(),
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    for (server, spec) in &image.mcp {
+        if let Some(key) = first_invalid_env_key(spec) {
+            return Err(ConfigValidationError::McpEnvKeyInvalid {
+                image: image_name.to_string(),
+                server: server.clone(),
+                key: key.to_string(),
+                declared_in: image.declared_in(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The first key of `spec`'s `env` that is not a variable name, in key order.
+fn first_invalid_env_key(spec: &McpServerSpec) -> Option<&str> {
+    spec.env()
+        .keys()
+        .map(String::as_str)
+        .find(|key| !is_env_key(key))
+}
+
+/// The first `env` key of `mcp` that is not a variable name, with the server
+/// that declared it, in server then key order.
+///
+/// The two paths that read MCP servers from outside a config file -- an
+/// image's `org.outrig.mcp` label and a standalone `image.toml` -- hold their
+/// tables to the same grammar through this, framing the pair in their own
+/// errors, so one rule decides for everything that becomes `--env` arguments.
+pub(crate) fn check_env_keys(mcp: &BTreeMap<String, McpServerSpec>) -> Option<(&str, &str)> {
+    mcp.iter()
+        .find_map(|(server, spec)| first_invalid_env_key(spec).map(|key| (server.as_str(), key)))
 }
 
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {

@@ -1302,6 +1302,14 @@ build = { command = ["cargo-mcp"], env = {
 } }
 ```
 
+The key on the left is held to `^[A-Za-z_][A-Za-z0-9_]*$`, which is the wider of the two
+grammars on this line: a key names a variable *inside* the container, where `http_proxy` is
+ordinary, while a `${VAR}` reference names one in your own environment. podman and buildah read
+each entry as `KEY=value` and split it at the first `=`, so a key holding one -- `"A=B" = "c"`
+-- would set `A` to `B=c`, and an empty key is refused by the engine itself; both are refused
+when the config loads, naming the key and the file. The same rule holds a `build-args` key, an
+`org.outrig.mcp` label's `env` key, a standalone `image.toml`'s, and a `--env` key you type.
+
 The reference form is exactly `"${VAR}"`, where `VAR` matches `^[A-Z_][A-Z0-9_]*$` -- the
 same syntax `api-key` accepts. Anything else is treated as a literal and passed through
 verbatim, including malformed-looking references (lower-case names, unmatched braces, or
@@ -1348,8 +1356,8 @@ A proxy key that references the variable of its own name, such as
 `HTTPS_PROXY = "${HTTPS_PROXY}"`, is passed by name all the same: podman and buildah already
 have that value and read proxies as they find them. No other key on the list is, even
 self-referenced, because the engine may rewrite its own copy first -- buildah makes a relative
-`TMPDIR` absolute. A key that is not a plain variable name (`^[A-Za-z_][A-Za-z0-9_]*$`) keeps
-its value on the command line too. To keep a secret off it, give the secret a key outside these.
+`TMPDIR` absolute. To keep a secret off it, give the secret a key outside these -- a key is
+yours to choose, and the server reads whichever name you set.
 
 outrig cannot redact what the server, or a build step, prints itself.
 
@@ -1704,6 +1712,15 @@ image-config in the merged config but does not require agent/model/provider wiri
   because the label is read off the image rather than from a config file. A server the config
   declares by name replaces the label's entry whole and is not held here, and `outrig image
   build` does not hold the `image.toml` it is pointed at.
+- Every `env` key on an MCP entry and every `build-args` key must match
+  `^[A-Za-z_][A-Za-z0-9_]*$`. podman and buildah read each entry as `KEY=value`, so a key
+  holding `=` sets a shorter name with the rest of itself at the head of the value, and an
+  empty key is refused by the engine as it runs -- after the image is acquired, naming neither
+  the key nor the file. Every image-config is checked, whoever declared it: a key grants no
+  access to your environment, so unlike a `${VAR}` reference it is not a question of trust.
+  The same grammar holds an `org.outrig.mcp` label's `env` key and a standalone `image.toml`'s
+  -- `outrig image build` refuses one before stamping the label, and a session refuses a label
+  that carries one -- and a `--env KEY=VALUE` you type, refused by argument parsing.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.

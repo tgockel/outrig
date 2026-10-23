@@ -7,12 +7,18 @@
 //! The right-hand side is processed through [`EnvValue::from_raw`] so that
 //! `${VAR}` references resolve from the host environment at MCP startup,
 //! identically to config-file values.
+//!
+//! The key is held to the grammar a config file's `env` key is held to,
+//! [`outrig::config::is_env_key`]: podman reads each entry as `KEY=value`, and
+//! what it would misread is refused here rather than at the first server
+//! connect. The split is at the *first* `=`, so a key cannot hold one; the
+//! rest of the grammar is what this adds.
 
 use std::collections::BTreeMap;
 
 use thiserror::Error;
 
-use outrig::config::EnvValue;
+use outrig::config::{EnvValue, is_env_key};
 
 /// Errors specific to `--env` parsing.
 #[derive(Debug, Error)]
@@ -22,6 +28,12 @@ pub enum CliEnvParseError {
 
     #[error("invalid value '{raw}' for '--env <KEY=VALUE>': empty key")]
     EmptyKey { raw: String },
+
+    #[error(
+        "invalid value '{raw}' for '--env <KEY=VALUE>': key {key:?} is not an environment \
+         variable name (^[A-Za-z_][A-Za-z0-9_]*$)"
+    )]
+    InvalidKey { raw: String, key: String },
 }
 
 /// Parsed `--env` entries, split into global and per-server maps.
@@ -79,12 +91,26 @@ impl CliEnvEntries {
                     return Err(CliEnvParseError::EmptyKey { raw: entry.clone() });
                 }
 
+                if !is_env_key(key) {
+                    return Err(CliEnvParseError::InvalidKey {
+                        raw: entry.clone(),
+                        key: key.to_string(),
+                    });
+                }
+
                 result
                     .per_server
                     .entry(server.to_string())
                     .or_default()
                     .insert(key.to_string(), env_value);
             } else {
+                if !is_env_key(key_side) {
+                    return Err(CliEnvParseError::InvalidKey {
+                        raw: entry.clone(),
+                        key: key_side.to_string(),
+                    });
+                }
+
                 result.global.insert(key_side.to_string(), env_value);
             }
         }
@@ -214,6 +240,28 @@ mod tests {
         let err = CliEnvEntries::parse(&[":KEY=value".to_string()]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("empty key"), "got: {msg}");
+    }
+
+    /// The issue's case: podman reads `--env A=B=c` as `A` set to `B=c`, so a
+    /// key holding `=` configures a variable nobody named. The value keeps its
+    /// own `=` -- the split is at the first one, and only the key side is held
+    /// to the grammar.
+    #[test]
+    fn parse_rejects_a_key_that_is_not_a_variable_name() {
+        for raw in ["my-key=v", "1AB=v", "K*=v", " K=v", "K =v", "fs:my-key=v"] {
+            let err = CliEnvEntries::parse(&[raw.to_string()]).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("is not an environment variable name"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn parse_allows_a_lower_case_key() {
+        let entries = CliEnvEntries::parse(&["http_proxy=http://p:3128".to_string()]).unwrap();
+        assert_eq!(
+            entries.global["http_proxy"],
+            EnvValue::Literal("http://p:3128".to_string())
+        );
     }
 
     #[test]

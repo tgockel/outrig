@@ -370,6 +370,112 @@ context    = "ctx"
         ));
     }
 
+    /// The issue's case. podman and buildah split an entry at its first `=`,
+    /// so `"A=B" = "c"` sets `A` to `B=c`: a key nobody wrote, configured
+    /// with a value nobody wrote. It is refused when the config loads rather
+    /// than acted on at the first server connect.
+    #[test]
+    fn mcp_env_key_with_an_equals_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = { command = ["cargo-mcp"], env = { "A=B" = "c" } }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::McpEnvKeyInvalid {
+                ref image,
+                ref server,
+                ref key,
+                ..
+            } => {
+                assert_eq!(image, "coding");
+                assert_eq!(server, "build");
+                assert_eq!(key, "A=B");
+            }
+            other => panic!("expected McpEnvKeyInvalid, got: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"env key "A=B" is not an environment variable name"#),
+            "{msg}"
+        );
+        assert!(msg.contains("^[A-Za-z_][A-Za-z0-9_]*$"), "{msg}");
+    }
+
+    /// Every shape podman misreads, and the empty key the engine refuses
+    /// outright -- the one that failed the session with podman's own message
+    /// rather than with the config's.
+    #[test]
+    fn mcp_env_key_that_is_not_a_variable_name_errors() {
+        for key in ["", "A=B", "my-key", "1AB", "K*", " K", "K ", "a.b"] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = {{ command = ["cargo-mcp"], env = {{ {key:?} = "v" }} }}
+"#
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(&err, ConfigValidationError::McpEnvKeyInvalid { key: k, .. } if k == key),
+                "{key:?}: {err:?}"
+            );
+        }
+    }
+
+    /// A key sets a variable inside the container, where lower case is
+    /// ordinary -- the grammar is wider than a `${VAR}` reference's.
+    #[test]
+    fn mcp_env_key_may_be_lower_case() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.mcp]
+  build = { command = ["cargo-mcp"], env = { http_proxy = "http://p:3128", _k1 = "v" } }
+"#,
+        );
+        cfg.validate(None).expect("a lower-case env key is a key");
+    }
+
+    #[test]
+    fn build_arg_key_that_is_not_a_variable_name_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+build-args = { "A=B" = "c" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::BuildArgKeyInvalid {
+                ref image, ref key, ..
+            } => {
+                assert_eq!(image, "coding");
+                assert_eq!(key, "A=B");
+            }
+            other => panic!("expected BuildArgKeyInvalid, got: {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("build-arg key \"A=B\" is not an environment variable name"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn build_image_name_invalid_errors() {
         // A build image's name becomes its container image repository, so an
