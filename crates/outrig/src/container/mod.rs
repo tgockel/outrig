@@ -48,7 +48,7 @@ use crate::config::{
 };
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
-use crate::image::ImageTag;
+use crate::image::{ImageId, ImageTag, image_id};
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::Reissue;
 
@@ -129,6 +129,16 @@ pub struct Container {
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
+    /// The engine's id for the image this container is running, cached by
+    /// [`Container::image_id`] after the first `podman inspect`.
+    ///
+    /// `image_tag` is what the container was *asked* for, and a tag is a
+    /// pointer: a pull can move `registry/x:latest` while this container goes
+    /// on running the image it started from. The id names that image for as
+    /// long as it exists, so every read of what the running image declares
+    /// goes through this. Like the PID it cannot go stale -- a container's
+    /// image is fixed at creation.
+    image_id: OnceCell<ImageId>,
     /// The engine's own id for this container, from the `create`/`run` that
     /// made it. `None` for a container outrig only borrowed, which it never
     /// stops.
@@ -146,7 +156,8 @@ pub struct Container {
     ctr_log: Option<CtrLog>,
     /// Stands in for the engine call whose rendering contains the fragment,
     /// first match winning, so a test can wedge the stop or the removal in
-    /// particular and hold the other one still. Every bounded-call path here
+    /// particular and hold the other one still, or answer an inspect as a
+    /// podman that is not installed here would. Every call path this covers
     /// ends at a `podman` a test cannot install.
     #[cfg(test)]
     engine_override: Vec<(&'static str, Cmd)>,
@@ -808,6 +819,7 @@ impl Container {
             dns_preconfigured,
             net_admin,
             pid: OnceCell::new(),
+            image_id: OnceCell::new(),
             id,
             ctr_log: None,
             #[cfg(test)]
@@ -1007,7 +1019,7 @@ impl Container {
     /// one: a container named with this one's full id is not this container.
     async fn inspect_format(&self, format: &str) -> Result<String> {
         let output = process::run_capture_logged(
-            self.inspect_cmd(&format!("{{{{.Id}}}} {format}")),
+            self.engine_call(self.inspect_cmd(&format!("{{{{.Id}}}} {format}"))),
             "podman",
             self.transcript.as_ref(),
         )
@@ -1039,8 +1051,57 @@ impl Container {
         self.net_admin
     }
 
+    /// The image this container was asked for.
+    ///
+    /// Not necessarily the one it is *running*: a tag is a pointer, and a pull
+    /// can move it to another image while this container goes on running the
+    /// one it started from. So this is the tag for reporting -- a banner, a
+    /// session record, an error naming what the caller asked for -- while a
+    /// read of what the running image declares goes through the engine's id
+    /// for it, as
+    /// [`embedded::read_embedded_mcp_of`] does.
     pub fn image_tag(&self) -> &ImageTag {
         &self.image_tag
+    }
+
+    /// The engine's id for the image this container is actually running, from
+    /// `podman inspect --format {{.Image}}`.
+    ///
+    /// The answer is cached after the first success, and cannot go stale: a
+    /// container's image is fixed when it is created, whatever happens to the
+    /// tag afterwards.
+    ///
+    /// An inspect that does not report an id -- the container is gone, or the
+    /// engine printed something that is not one -- is an error rather than a
+    /// fallback to [`image_tag`](Self::image_tag). The tag is the thing being
+    /// avoided here, so falling back to it would quietly answer about a
+    /// different image than the one that was asked about.
+    pub(crate) async fn image_id(&self) -> Result<ImageId> {
+        if let Some(known) = self.image_id.get() {
+            return Ok(known.clone());
+        }
+        let id = self.inspect_image_id().await?;
+        Ok(self.image_id.get_or_init(|| async { id }).await.clone())
+    }
+
+    async fn inspect_image_id(&self) -> Result<ImageId> {
+        let printed = self.inspect_format("{{.Image}}").await?;
+        image_id(&printed).ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "podman inspect {} did not report an image id for the running container; it \
+                 printed {printed:?}, and the tag {} it was started from may since have been \
+                 moved to another image",
+                self.name, self.image_tag,
+            ))
+        })
+    }
+
+    /// The OCI labels of the image this container is running, read by
+    /// [`image_id`](Self::image_id) so a pull that moved the tag cannot change
+    /// the answer.
+    pub(crate) async fn image_labels(&self) -> Result<BTreeMap<String, String>> {
+        let id = self.image_id().await?;
+        crate::image::read_image_labels_by_id(&id, self.transcript.as_ref()).await
     }
 
     pub fn host_workspace(&self) -> &Path {
@@ -2614,6 +2675,90 @@ mod tests {
         }
         // Not text at all.
         assert_eq!(engine_id(&[0xff, 0xfe]), None);
+    }
+
+    /// The issue #370 shape, at the read that answers it: what a container is
+    /// running is asked of the engine, not taken from the tag the handle
+    /// carries. A borrowed container's tag was read out of an inspect at
+    /// attach time and names whatever the last pull put there, so merging the
+    /// servers *it* declares merges another image's.
+    #[tokio::test]
+    async fn the_running_image_is_asked_of_the_engine_not_taken_from_the_tag() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let digest = "7f1e9b2d5c4a3e8f0d1c2b3a49586770819243a5b6c7d8e9f0a1b2c3d4e5f607";
+        let mut container = Container::stops_cleanly();
+        container.image_tag = ImageTag::new("registry.example/x:latest");
+        // `inspect_format` asks for the container's own id first and splits
+        // it off, so the stand-in answers in that shape.
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/echo").arg(format!("the-container {digest}")),
+        )];
+
+        let id = container.image_id().await.expect("the engine answered");
+
+        assert_eq!(id.as_str(), digest);
+        assert_ne!(
+            id.as_str(),
+            container.image_tag().as_str(),
+            "the tag is what a pull moves; the id is what the container runs"
+        );
+    }
+
+    /// The answer is cached, like the PID and for the same reason: a
+    /// container's image is fixed when it is created, so a second read cannot
+    /// disagree with the first -- and startup takes several.
+    #[tokio::test]
+    async fn the_running_image_is_asked_for_once() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let counter = tempfile::NamedTempFile::new().expect("counter file");
+        let path = counter.path().to_string_lossy().into_owned();
+        let mut container = Container::stops_cleanly();
+        // Appends a line per run and prints the id, so the file length counts
+        // the inspects this handle actually issued.
+        container.engine_override = vec![(
+            "inspect",
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("echo ran >> {path}; echo the-container {digest}")),
+        )];
+
+        let first = container.image_id().await.expect("first read");
+        let second = container.image_id().await.expect("second read");
+
+        assert_eq!(first, second);
+        let runs = std::fs::read_to_string(counter.path()).expect("read counter");
+        assert_eq!(runs.lines().count(), 1, "the engine was asked twice");
+    }
+
+    /// An inspect that answers with something that is not an id fails the
+    /// read. The tempting fallback -- "use the tag, it is right nearly
+    /// always" -- would silently answer about whatever the tag names now,
+    /// which is exactly the case this read exists to tell apart.
+    #[tokio::test]
+    async fn an_inspect_that_names_no_image_does_not_fall_back_to_the_tag() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        let mut container = Container::stops_cleanly();
+        container.image_tag = ImageTag::new("registry.example/x:latest");
+        // A container that is gone: podman prints nothing for it, so the
+        // field where the image id belongs is empty.
+        container.engine_override = vec![("inspect", Cmd::new("/bin/echo").arg("the-container "))];
+
+        let err = container
+            .image_id()
+            .await
+            .expect_err("no id means no answer");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("registry.example/x:latest"),
+            "the message should name the tag the caller knows: {message}"
+        );
+        assert!(
+            message.contains("did not report an image id"),
+            "and say what was missing: {message}"
+        );
     }
 
     /// A stop whose client never returns is given up on, and the container

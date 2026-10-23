@@ -148,6 +148,56 @@ impl From<String> for ImageTag {
     }
 }
 
+/// The engine's own content id for one image, as podman reports it: the
+/// `sha256:` digest of its config, which names a fixed set of layers and
+/// labels for as long as that image exists on the machine.
+///
+/// A tag is a *pointer*: `registry/x:latest` means whatever the last pull put
+/// there, and a pull between a container starting and something asking about
+/// its image moves it. An id does not move, so a read addressed by one is a
+/// read of the image that is actually running. The field is private and there
+/// is no `From<String>`, so the only way to have one is [`image_id`] taking it
+/// out of what the engine printed -- without that, "the image" is a `String`
+/// like any other and every fallback that produces one, a tag included,
+/// type-checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageId(String);
+
+impl ImageId {
+    /// The id as podman wants it where it takes an image.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Length of the hex digest in an image id, `sha256:` prefix excluded.
+const IMAGE_DIGEST_LEN: usize = 64;
+
+/// The image id in what `podman inspect --format {{.Image}}` printed, if what
+/// it printed is one.
+///
+/// Podman writes the bare 64-character digest; an engine that writes the
+/// `sha256:`-prefixed form is read too, since podman accepts either where it
+/// takes an image. Anything else -- a tag, a short id, an empty field, an
+/// error -- is `None` rather than something to address an image by: the
+/// caller's alternative is the tag it is trying not to use, so a lenient read
+/// here would put the moving pointer back on the path it was taken off.
+pub(crate) fn image_id(printed: &str) -> Option<ImageId> {
+    let trimmed = printed.trim();
+    let digest = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    (digest.len() == IMAGE_DIGEST_LEN
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then(|| ImageId(trimmed.to_string()))
+}
+
 impl fmt::Display for ImageTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -807,10 +857,31 @@ pub async fn read_image_labels(
     tag: &ImageTag,
     transcript: Option<&Transcript>,
 ) -> Result<BTreeMap<String, String>> {
+    read_labels_of(tag.as_str(), transcript).await
+}
+
+/// [`read_image_labels`], addressed by the engine's image id instead of a tag.
+///
+/// A tag is a pointer and a pull moves it, so a label read that a running
+/// container's behavior depends on goes through the id of the image that
+/// container was started from -- see [`crate::container::Container::image_id`].
+pub(crate) async fn read_image_labels_by_id(
+    id: &ImageId,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
+    read_labels_of(id.as_str(), transcript).await
+}
+
+/// `podman image inspect <image>` for its labels, where `image` is whatever
+/// the caller addresses the image by.
+async fn read_labels_of(
+    image: &str,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
     let cmd = Cmd::new("podman")
         .arg("image")
         .arg("inspect")
-        .arg(tag.as_str())
+        .arg(image)
         .arg("--format")
         .arg("{{json .Config.Labels}}");
     let output = process::run_capture_logged(cmd, "podman", transcript).await?;
@@ -821,7 +892,7 @@ pub async fn read_image_labels(
     }
     serde_json::from_str(trimmed).map_err(|source| {
         OutrigError::Configuration(format!(
-            "podman image inspect {tag}: invalid labels JSON: {source}"
+            "podman image inspect {image}: invalid labels JSON: {source}"
         ))
     })
 }
@@ -1847,6 +1918,49 @@ mod tests {
 
     use super::*;
     use crate::config::EnvValue;
+
+    /// An image id is taken only from output that is one. Anything else --
+    /// a tag, a short id, an error podman printed -- is `None`, because the
+    /// caller's only alternative is the tag whose moving is the whole reason
+    /// the id is being asked for. Accepting a token would put that pointer
+    /// back on the path, under a type that says it cannot be there. The same
+    /// argument the container's `engine_id` makes about a container selector.
+    #[test]
+    fn an_image_id_is_taken_only_from_output_that_is_one() {
+        let digest = "c1a1b4b8ff0d48b4e2ee1dd5c6cf5f0e0ac0bd0a7a8a4d1c5b7e8f90a1b2c3d4";
+        assert_eq!(digest.len(), IMAGE_DIGEST_LEN);
+        // What podman's `{{.Image}}` prints, and the prefixed spelling podman
+        // also accepts where it takes an image.
+        assert_eq!(image_id(digest).as_ref().map(ImageId::as_str), Some(digest));
+        let prefixed = format!("sha256:{digest}");
+        assert_eq!(
+            image_id(&format!("{prefixed}\n"))
+                .as_ref()
+                .map(ImageId::as_str),
+            Some(prefixed.as_str()),
+            "the prefix is kept: it is part of what podman is handed"
+        );
+
+        for not_an_id in [
+            // Nothing at all: a container that is gone inspects to this.
+            String::new(),
+            "   \n".to_string(),
+            // A tag. This is the one the fallback would have reached for.
+            "registry.example/x:latest".to_string(),
+            "<none>".to_string(),
+            // A short id, which podman would resolve -- and which is why it is
+            // not accepted as an identity here.
+            digest[..12].to_string(),
+            // Right length, wrong alphabet, and the uppercase spelling of a
+            // digest that is written lowercase everywhere podman prints one.
+            "z".repeat(IMAGE_DIGEST_LEN),
+            digest.to_uppercase(),
+            // Right shape, but two of them.
+            format!("{digest} {digest}"),
+        ] {
+            assert_eq!(image_id(&not_an_id), None, "not an id: {not_an_id:?}");
+        }
+    }
 
     /// The issue #355 shape: a sidecar's raw ref that is not local was blamed
     /// on `--image`, and the error never named the command that fixes it.

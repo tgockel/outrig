@@ -117,6 +117,14 @@ With `--attach`, image-config selection is different:
 `--network audit` and `--network filter` are rejected with `--attach`; borrowed containers are
 not retrofitted with a new interceptor.
 
+The primary's label is read off the image its container is *running*, by the
+engine's id for that image, not off whatever its tag names at the time of the read. The two
+differ once a tag moves: a pull of a re-pushed `registry/x:latest` re-points the ref while
+every container started from the old one keeps running it. This matters most with `--attach`,
+which borrows a container someone else may have started long ago -- the servers merged are the
+ones that container can actually run. A repo-local build's tag is content-addressed and cannot
+move, so nothing changes there.
+
 The selected image must expose at least one backing MCP server after image
 `org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. Repo-local
 build cache images already stamp that merged table into their labels on cache misses, but startup

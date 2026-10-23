@@ -322,6 +322,13 @@ define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
 
+"The image" there is the one the primary container is *running*, addressed by the engine's id
+for it, not whatever the tag it was started from names at the moment of the read. A tag is a
+pointer and a pull of a re-pushed ref moves it, while every container already started from the
+old image goes on running that one. So the merged servers are always ones the container can
+serve, even when `outrig mcp --attach` borrows a container started before the last pull. A
+repo-local build image is named by a content hash, which no pull can re-point.
+
 A label entry may carry `call-timeout-secs`, since the image's author knows how long its tools
 run (see [What if a server hangs?](#what-if-a-server-hangs)). The placement keys and `args` are
 rejected in a label.

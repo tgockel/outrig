@@ -211,9 +211,7 @@ pub fn parse_standalone_image_toml(
 pub async fn read_standalone_image_mcp(
     container: &Container,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
-    let labels =
-        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
-            .await?;
+    let labels = container.image_labels().await?;
     standalone_mcp_from_labels(&labels)
 }
 
@@ -321,12 +319,33 @@ fn to_json_label<T: serde::Serialize>(key: &str, value: &T) -> Result<String> {
 /// missing label is an empty map, a malformed one is a hard error. Sidecar
 /// planning uses this to materialize label-declared servers before any
 /// sidecar container exists.
+///
+/// A tag is a pointer and a pull moves it, so this answers for whatever the
+/// tag names *now*. That is what a caller deciding what to start wants, since
+/// the launch that follows resolves the same tag. Once a container is running,
+/// what it will serve is declared by the image it started from, and
+/// [`read_embedded_mcp_of`] is the read for that.
 pub async fn read_embedded_mcp(
     tag: &crate::image::ImageTag,
     transcript: Option<&crate::process::Transcript>,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
     let labels = crate::image::read_image_labels(tag, transcript).await?;
     embedded_mcp_from_labels(tag.as_str(), &labels)
+}
+
+/// [`read_embedded_mcp`] for a container that is already running: the label is
+/// read off the image that container was started from, by the engine's id for
+/// it, so a pull that has since moved the tag cannot change the answer.
+///
+/// This is the read for a borrowed container (`outrig mcp --attach`), which may
+/// have been started long enough ago for its tag to have been re-pointed, and
+/// for any other container outrig holds a handle to. Errors name the handle's
+/// tag, which is what the caller asked for; the id names nothing a user wrote.
+pub async fn read_embedded_mcp_of(
+    container: &Container,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    let labels = container.image_labels().await?;
+    embedded_mcp_from_labels(container.image_tag().as_str(), &labels)
 }
 
 /// The MCP table a running container will actually serve: the servers
@@ -360,9 +379,12 @@ pub(crate) async fn merged_mcp_with_source(
     config_mcp: &BTreeMap<String, McpServerSpec>,
     config_source: McpDeclarationSource,
 ) -> Result<BTreeMap<String, McpServerSpecWithSource>> {
-    let labels =
-        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
-            .await?;
+    // By image id, not by `container.image_tag()`: the tag is what the
+    // container was asked for and a pull can move it, and what this container
+    // will actually serve is declared by the image it is running.
+    let labels = container.image_labels().await?;
+    // The error still names the tag, which is what the caller asked for and
+    // what they can act on; the id names nothing a user wrote down.
     let image_mcp = embedded_mcp_from_labels(container.image_tag().as_str(), &labels)?;
     Ok(merge_mcp_with_source(image_mcp, config_mcp, config_source))
 }

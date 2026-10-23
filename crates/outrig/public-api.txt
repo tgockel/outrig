@@ -790,6 +790,7 @@ pub async fn outrig::container::embedded::merged_mcp(&outrig::container::Contain
 pub fn outrig::container::embedded::parse_standalone_image_labels(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<outrig::container::embedded::StandaloneImageLabels>
 pub fn outrig::container::embedded::parse_standalone_image_toml(&str) -> core::result::Result<outrig::container::embedded::StandaloneImageToml, outrig::container::embedded::StandaloneImageTomlError>
 pub async fn outrig::container::embedded::read_embedded_mcp(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub async fn outrig::container::embedded::read_embedded_mcp_of(&outrig::container::Container) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
 pub async fn outrig::container::embedded::read_standalone_image_mcp(&outrig::container::Container) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
 pub fn outrig::container::embedded::standalone_config_to_labels(&outrig::container::embedded::StandaloneImageToml) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub mod outrig::container::enter

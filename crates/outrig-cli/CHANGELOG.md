@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig mcp --attach` proxies the servers its container's image declares, not the ones its
+  tag now declares.** The primary's `org.outrig.mcp` label was read by image tag, and a tag is a
+  pointer: a pull of a re-pushed `registry/x:latest` re-points it while the container someone
+  started from the old image goes on running it. Attaching after such a pull merged the new
+  image's servers into a container that cannot run them -- commands it does not have, and `env`
+  held only to the new image's declarations -- which surfaced as servers failing to start, or
+  worse, as a different tool set than the session believed it had. The label is now read off the
+  image the container is running, by the engine's id for it. A fresh `outrig run`/`outrig mcp`
+  has a much narrower window for the same race and takes the same path. Repo-local build images
+  are named by a content hash and were never affected, and the image a session reports is still
+  the tag it asked for. (#370)
 - **A relative `--volume` host path is read from the directory you ran outrig in.** It was
   resolved against the repo root -- the directory holding `.agents/outrig/` -- because a mount
   built from the flag carries no config file to resolve against, and the launch path falls back

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`container::embedded::read_embedded_mcp_of`**: the `org.outrig.mcp` of the image a running
+  `Container` was started from, by the engine's id for it. The by-tag
+  `read_embedded_mcp` remains, and remains right for the caller deciding what to *start*, since
+  the launch that follows resolves the same tag; this is the read for a container that is
+  already running. See the fix below. (#370)
 - **`MountRuleViolation::HostFieldSeparator` / `ContainerFieldSeparator`, and the four
   `ConfigValidationError` variants that restate them**
   (`WorkspaceHostFieldSeparator`, `WorkspaceContainerFieldSeparator`,
@@ -17,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`embedded::merged_mcp` answers for the image its container is running, not for whatever that
+  container's tag names now.** The label was read with `podman image inspect <tag>`, taking the
+  tag off the handle -- and a tag is a pointer. A pull of a re-pushed `registry/x:latest`
+  re-points the ref while every container already started from the old image goes on running it,
+  so between a container's start and this read the two can name different images. The merge then
+  returned the *new* image's servers for a container that cannot run them: commands it does not
+  have installed, and `env` from an image its operator never approved. The read now goes through
+  the engine's id for the image the container was created from (`podman inspect {{.Image}}`,
+  asked once per handle and cached, since a container's image is fixed at creation), which no
+  pull can move. An inspect that reports no id is an error rather than a fall back to the tag:
+  the tag is the thing being avoided, so falling back would quietly answer about a different
+  image. Content-addressed repo-build tags were never affected. `read_standalone_image_mcp` and
+  the CLI's startup merge move with it; `Container::image_tag` is unchanged and remains what the
+  container was asked for, which is what banners, session records, and error messages
+  report. (#370)
 - **A bind-mount path containing `:` is refused by validation instead of by podman at launch.**
   A mount renders as one `-v <host>:<container>:<options>` value, so a `:` in either path made a
   fourth field podman rejected when it created the container -- after the image was built or

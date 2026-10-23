@@ -98,6 +98,34 @@ async fn ensure_image_with_mcp(mcp: &BTreeMap<String, McpServerSpec>) -> ImageTa
     ensure_image_with_labels(&[(embedded::LABEL_MCP, json.as_str())]).await
 }
 
+/// Build the fixture image under a *fixed* `tag`, carrying `mcp_label` as its
+/// `org.outrig.mcp`. Called twice with the same tag, the second build moves
+/// that tag to a different image, as a pull of a re-pushed ref would.
+///
+/// Deliberately not [`ensure_image_with_mcp`], whose tags are content-addressed
+/// and so can never move: the point here is the tag that can.
+async fn build_labeled_image(tag: &ImageTag, mcp_label: &str) {
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache nodejs npm shadow\n\
+         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
+         {}",
+        label_line(embedded::LABEL_MCP, mcp_label),
+    );
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    image::build_standalone(
+        ctx.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        tag,
+        false,
+        &BTreeMap::new(),
+    )
+    .await
+    .expect("build fixture image under a fixed tag");
+}
+
 /// Build a label-free image (the committed mcp-fs fixture has the tool binaries
 /// but no `org.outrig.*` labels) -- runtime must fall back to repo config.
 async fn ensure_label_free_image() -> ImageTag {
@@ -316,13 +344,68 @@ async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
         .expect("raw image ref should pass ensure_image without label validation")
         .tag;
 
-    // merged_mcp reads labels off the handle's image tag without ever exec'ing
-    // into the container, so an attached handle stands in for a running one.
-    let container = Container::attach("raw-malformed-runtime-read", image, None, None);
+    // merged_mcp reads the label off the image the container is *running*, by
+    // the engine's id for it, so this needs a real container rather than a
+    // handle to a name. Nothing is exec'd into it; `sleep infinity` on the
+    // alpine base is enough, and no user bootstrap is needed for a label read.
+    let container = Container::start(&image, ContainerLaunchSpec::default())
+        .await
+        .expect("start raw malformed-label container");
     let err = embedded::merged_mcp(&container, &BTreeMap::new())
         .await
         .expect_err("malformed org.outrig.mcp label should fail the runtime read");
     assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// Issue #370: the merge answers for the image the container is *running*,
+/// not for whatever its tag names by the time the merge runs.
+///
+/// A tag is a pointer. `outrig mcp --attach` borrows a container someone else
+/// started, possibly long ago, from a ref like `registry/x:latest` -- and a
+/// pull in between re-points that ref at another image while the container
+/// goes on running the one it started from. Reading the label by tag then
+/// merges servers the running container cannot serve: commands that are not
+/// installed in it, and `env` from an image its operator never approved.
+///
+/// Pulling is not simulated here; a local rebuild under the same tag moves the
+/// pointer exactly as a pull does, which is the only part of a pull this read
+/// can tell apart.
+#[tokio::test]
+async fn a_tag_moved_after_the_container_started_does_not_change_its_servers() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let tag = ImageTag::new("outrig-moving-tag:e2e");
+
+    // What the container will run: `fs`, which the fixture image can serve.
+    let mut started_with = BTreeMap::new();
+    started_with.insert("fs".to_string(), fs_spec());
+    build_labeled_image(&tag, &mcp_label_json(&started_with)).await;
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let container = start_and_bootstrap(&tag, host_ws.path()).await;
+
+    // The pull. The new image declares a different server, under a name the
+    // running container has never heard of.
+    let mut moved_to = BTreeMap::new();
+    moved_to.insert("intruder".to_string(), crash_spec());
+    build_labeled_image(&tag, &mcp_label_json(&moved_to)).await;
+
+    let merged = embedded::merged_mcp(&container, &BTreeMap::new())
+        .await
+        .expect("merged mcp");
+
+    assert_eq!(
+        merged.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["fs"],
+        "the servers are the running image's, not the ones the tag now names",
+    );
+    assert_eq!(merged["fs"], fs_spec());
+    // And they are servers this container can actually run.
+    assert_servers_boot(&container, &merged, &["fs"]).await;
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
 #[tokio::test]

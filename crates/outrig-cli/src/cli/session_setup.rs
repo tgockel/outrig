@@ -723,7 +723,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         repo_root: &repo_root,
         image_cfg_name: &image_cfg_name,
         image_cfg: &image_cfg,
-        image_tag: &image_tag,
         sid: &sid,
         host_workspace: &host_workspace,
         container_workspace: &container_workspace,
@@ -793,7 +792,6 @@ struct SidecarPhaseArgs<'a> {
     instance_salt: &'a str,
     image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
-    image_tag: &'a ImageTag,
     sid: &'a SessionId,
     host_workspace: &'a Path,
     container_workspace: &'a Path,
@@ -892,7 +890,14 @@ async fn setup_sidecars_and_network(
 ) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
     let span = ProgressSpan::start("reading and merging MCP configuration");
     let mut plan = sidecar::plan_from_config(args.cfg, args.image_cfg);
-    let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
+    // Off the image the primary is *running*, by the engine's id for it,
+    // rather than off whatever its tag names now. The two differ when a pull
+    // moved the tag between the container starting and this read -- a wide
+    // window with `--attach`, which borrows a container someone else started
+    // from an `image-name` ref, and a narrow one for a fresh session, whose
+    // image was ensured a moment ago. Either way the servers merged here are
+    // the ones this container can actually run.
+    let image_mcp = embedded::read_embedded_mcp_of(&containers.primary).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
     // Phase A -- ensure each distinct sidecar image (and read its labels when a
