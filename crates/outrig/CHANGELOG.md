@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `read_embedded_mcp` remains, and remains right for the caller deciding what to *start*, since
   the launch that follows resolves the same tag; this is the read for a container that is
   already running. See the fix below. (#370)
+- **`config::SecurityRuleViolation`, and `ConfigValidationError::SidecarSecurity` which carries
+  it**: a `[security]` rule failure with no owning block baked into it, and the variant that
+  frames one for a sidecar. `Display` on the violation is the rule alone -- ``` `devices` entry
+  "dev/fuse" must be an absolute path` ``` -- so the caller supplies the owner. The fifteen
+  per-image variants (`DevicePathEmpty`, `CapabilityNameInvalid`, `UnmaskAllNotAlone`, and the
+  rest) keep their `image: String` field and their messages exactly as they were: an
+  `[images.<name>]` failure is unchanged, and a `match` written against 0.2.2 goes on compiling.
+  See the fix below. (#378)
 - **`MountRuleViolation::HostFieldSeparator` / `ContainerFieldSeparator`, and the four
   `ConfigValidationError` variants that restate them**
   (`WorkspaceHostFieldSeparator`, `WorkspaceContainerFieldSeparator`,
@@ -31,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A security error on a sidecar names the sidecar, and a whitespace-only `image-name` is
+  refused.** A `[sidecars.<sc>.security]` block reuses the image blocks' `[security]` rules, and
+  it reused their errors too by passing the string `sidecars.<sc>` where an image-config name was
+  expected -- so a relative device path in `[sidecars.tools.security]` reported ``image
+  "sidecars.tools": `devices` entry ... must be an absolute path``, naming an `[images.<name>]`
+  block that does not exist and sending the reader to the wrong part of their config. The rules
+  now produce a `SecurityRuleViolation` that names no block, which the image caller restates as
+  the per-image variant it always used and a sidecar carries in `SidecarSecurity`, so the message
+  opens with `sidecar "tools": `. Separately, `image-name = "  "` passed validation where a
+  sidecar's `image = "  "` was refused, because only the latter trimmed; both now use the trimmed
+  test, and a reference of nothing but blanks is refused at load instead of reaching podman as an
+  `image not known` at launch. Purely additive: no existing variant loses a field, so this ships
+  in a patch release. (#378)
 - **An `env` or `build-args` key that podman would misread is refused where it was written.**
   podman and buildah read each entry as `KEY=value` and split it at the first `=`, so
   `env = { "A=B" = "c" }` set `A` to `B=c` -- a variable nobody named, holding a value nobody

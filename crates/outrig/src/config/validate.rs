@@ -598,6 +598,18 @@ pub enum ConfigValidationError {
         violation: MountRuleViolation,
     },
 
+    /// A `[sidecars.<name>.security]` rule, carried whole rather than restated:
+    /// a sidecar reuses the image blocks' `[security]` rules, and this is the
+    /// variant that lets its message open with `sidecar` instead of borrowing
+    /// the `image {image:?}` variants above and naming a block that does not
+    /// exist. The image-config side keeps those variants, so this is additive.
+    #[error("sidecar {sidecar:?}: {violation}")]
+    #[non_exhaustive]
+    SidecarSecurity {
+        sidecar: String,
+        violation: SecurityRuleViolation,
+    },
+
     #[error(
         "image {image:?} mcp server {server:?} sets both `sidecar` and `image`; \
          they are mutually exclusive"
@@ -1219,27 +1231,101 @@ fn validate_image_security(
     image_name: &str,
     image: &ImageConfig,
 ) -> Result<(), ConfigValidationError> {
-    validate_security(image_name, &image.security)
+    check_security(&image.security).map_err(|violation| image_security_error(image_name, violation))
 }
 
-/// Validate a `[security]` block. `scope` names the owning block in errors --
-/// the image-config name, or `<image>.sidecars.<sc>` for a sidecar block.
-fn validate_security(
-    scope: &str,
-    security: &super::ContainerSecurity,
-) -> Result<(), ConfigValidationError> {
-    let drops = validate_capability_list(scope, "cap-drop", &security.cap_drop)?;
-    let adds = validate_capability_list(scope, "cap-add", &security.cap_add)?;
+/// Restate a [`SecurityRuleViolation`] as the per-image variant that has
+/// carried it since before the rule enum existed. The image-config side of the
+/// surface is unchanged by design: `[images.<name>]` errors are what a 0.2
+/// consumer already matches on, and a patch release may not take those fields
+/// away. Only the sidecar side is new, as
+/// [`ConfigValidationError::SidecarSecurity`].
+fn image_security_error(
+    image_name: &str,
+    violation: SecurityRuleViolation,
+) -> ConfigValidationError {
+    let image = image_name.to_string();
+    match violation {
+        SecurityRuleViolation::CapabilityNameEmpty { field } => {
+            ConfigValidationError::CapabilityNameEmpty { image, field }
+        }
+        SecurityRuleViolation::CapabilityNameInvalid { field, capability } => {
+            ConfigValidationError::CapabilityNameInvalid {
+                image,
+                field,
+                capability,
+            }
+        }
+        SecurityRuleViolation::CapabilityNameDuplicate { field, capability } => {
+            ConfigValidationError::CapabilityNameDuplicate {
+                image,
+                field,
+                capability,
+            }
+        }
+        SecurityRuleViolation::CapabilityDropAddConflict { capability } => {
+            ConfigValidationError::CapabilityDropAddConflict { image, capability }
+        }
+        SecurityRuleViolation::DevicePathEmpty {} => {
+            ConfigValidationError::DevicePathEmpty { image }
+        }
+        SecurityRuleViolation::DevicePathRelative { device } => {
+            ConfigValidationError::DevicePathRelative { image, device }
+        }
+        SecurityRuleViolation::DevicePathMalformed { device, detail } => {
+            ConfigValidationError::DevicePathMalformed {
+                image,
+                device,
+                detail,
+            }
+        }
+        SecurityRuleViolation::DevicePathDuplicate { device } => {
+            ConfigValidationError::DevicePathDuplicate { image, device }
+        }
+        SecurityRuleViolation::UnmaskPathEmpty {} => {
+            ConfigValidationError::UnmaskPathEmpty { image }
+        }
+        SecurityRuleViolation::UnmaskPathRelative { path } => {
+            ConfigValidationError::UnmaskPathRelative { image, path }
+        }
+        SecurityRuleViolation::UnmaskPathListSeparator { path } => {
+            ConfigValidationError::UnmaskPathListSeparator { image, path }
+        }
+        SecurityRuleViolation::UnmaskPathDuplicate { path } => {
+            ConfigValidationError::UnmaskPathDuplicate { image, path }
+        }
+        SecurityRuleViolation::UnmaskAllNotCanonical { path } => {
+            ConfigValidationError::UnmaskAllNotCanonical { image, path }
+        }
+        SecurityRuleViolation::UnmaskAllNotAlone {} => {
+            ConfigValidationError::UnmaskAllNotAlone { image }
+        }
+        SecurityRuleViolation::UnmaskPathBadGlob { path, detail } => {
+            ConfigValidationError::UnmaskPathBadGlob {
+                image,
+                path,
+                detail,
+            }
+        }
+    }
+}
+
+/// Validate a `[security]` block against rules that name no owning block, so
+/// the caller can frame the failure as the block it came from. Every rule here
+/// applies identically to an `[images.<name>.security]` and a
+/// `[sidecars.<sc>.security]`: a sidecar reuses the whole block.
+fn check_security(security: &super::ContainerSecurity) -> Result<(), SecurityRuleViolation> {
+    let drops = check_capability_list("cap-drop", &security.cap_drop)?;
+    let adds = check_capability_list("cap-add", &security.cap_add)?;
 
     if let Some(capability) = drops.intersection(&adds).next() {
-        return Err(ConfigValidationError::CapabilityDropAddConflict {
-            image: scope.to_string(),
+        return Err(SecurityRuleViolation::CapabilityDropAddConflict {
             capability: capability.clone(),
         });
     }
 
-    validate_device_list(scope, &security.devices)?;
-    validate_unmask_list(scope, &security.unmask)
+    check_device_list(&security.devices)?;
+    check_unmask_list(&security.unmask)
 }
 
 /// Shape-check the `devices` list. Whether the node exists is deliberately not
@@ -1248,35 +1334,30 @@ fn validate_security(
 ///
 /// An entry is podman's `--device` value, `<host>[:<container>][:<perms>]`,
 /// and the shape check refuses only what podman refuses at launch. This is
-/// the opposite of `validate_unmask_list`'s treatment of `:` on purpose:
+/// the opposite of `check_unmask_list`'s treatment of `:` on purpose:
 /// podman splits an `unmask` value into several paths, but the colons of a
 /// `--device` value separate the parts of one device.
-fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigValidationError> {
+fn check_device_list(devices: &[String]) -> Result<(), SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for device in devices {
         if device.trim().is_empty() {
-            return Err(ConfigValidationError::DevicePathEmpty {
-                image: scope.to_string(),
-            });
+            return Err(SecurityRuleViolation::DevicePathEmpty {});
         }
         let fields: Vec<&str> = device.split(':').collect();
         if !Path::new(fields[0]).is_absolute() {
-            return Err(ConfigValidationError::DevicePathRelative {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathRelative {
                 device: device.clone(),
             });
         }
         if let Err(detail) = check_device_suffix(&fields[1..]) {
-            return Err(ConfigValidationError::DevicePathMalformed {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathMalformed {
                 device: device.clone(),
                 detail: detail.to_string(),
             });
         }
         if !seen.insert(device.clone()) {
-            return Err(ConfigValidationError::DevicePathDuplicate {
-                image: scope.to_string(),
+            return Err(SecurityRuleViolation::DevicePathDuplicate {
                 device: device.clone(),
             });
         }
@@ -1333,14 +1414,12 @@ fn check_device_suffix(rest: &[&str]) -> Result<(), &'static str> {
 /// - A malformed glob is a no-op, not an error: podman logs `syntax error in
 ///   pattern` and creates the container with the path still masked, so the
 ///   failure surfaces later as an unrelated-looking one.
-fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigValidationError> {
+fn check_unmask_list(unmask: &[String]) -> Result<(), SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for path in unmask {
         if path.trim().is_empty() {
-            return Err(ConfigValidationError::UnmaskPathEmpty {
-                image: scope.to_string(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathEmpty {});
         }
         // Unlike `devices`, where `:` joins the parts of one device, podman
         // splits an unmask value on it. Checked before the absolute-path rule:
@@ -1348,43 +1427,28 @@ fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigVali
         // absolute paths, so the rule below would wave it through into an
         // argument podman then splits back into several.
         if path.contains(':') {
-            return Err(ConfigValidationError::UnmaskPathListSeparator {
-                image: scope.to_string(),
-                path: path.clone(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathListSeparator { path: path.clone() });
         }
         if path.eq_ignore_ascii_case(UNMASK_ALL) {
             if path != UNMASK_ALL {
-                return Err(ConfigValidationError::UnmaskAllNotCanonical {
-                    image: scope.to_string(),
-                    path: path.clone(),
-                });
+                return Err(SecurityRuleViolation::UnmaskAllNotCanonical { path: path.clone() });
             }
             if unmask.len() > 1 {
-                return Err(ConfigValidationError::UnmaskAllNotAlone {
-                    image: scope.to_string(),
-                });
+                return Err(SecurityRuleViolation::UnmaskAllNotAlone {});
             }
         } else {
             if !Path::new(path).is_absolute() {
-                return Err(ConfigValidationError::UnmaskPathRelative {
-                    image: scope.to_string(),
-                    path: path.clone(),
-                });
+                return Err(SecurityRuleViolation::UnmaskPathRelative { path: path.clone() });
             }
             if let Err(detail) = check_glob_syntax(path) {
-                return Err(ConfigValidationError::UnmaskPathBadGlob {
-                    image: scope.to_string(),
+                return Err(SecurityRuleViolation::UnmaskPathBadGlob {
                     path: path.clone(),
                     detail,
                 });
             }
         }
         if !seen.insert(path.clone()) {
-            return Err(ConfigValidationError::UnmaskPathDuplicate {
-                image: scope.to_string(),
-                path: path.clone(),
-            });
+            return Err(SecurityRuleViolation::UnmaskPathDuplicate { path: path.clone() });
         }
     }
 
@@ -1706,8 +1770,12 @@ fn validate_sidecar(
     check_sidecar_name(sidecar_name)?;
     check_sidecar_image(sidecar_name, &sidecar.image)?;
 
-    let scope = format!("sidecars.{sidecar_name}");
-    validate_security(&scope, &sidecar.security)?;
+    check_security(&sidecar.security).map_err(|violation| {
+        ConfigValidationError::SidecarSecurity {
+            sidecar: sidecar_name.to_string(),
+            violation,
+        }
+    })?;
 
     check_view_exclusions(
         sidecar_name,
@@ -1730,31 +1798,25 @@ fn validate_sidecar(
     })
 }
 
-fn validate_capability_list(
-    image_name: &str,
+fn check_capability_list(
     field: &'static str,
     capabilities: &[String],
-) -> Result<BTreeSet<String>, ConfigValidationError> {
+) -> Result<BTreeSet<String>, SecurityRuleViolation> {
     let mut seen = BTreeSet::new();
 
     for capability in capabilities {
         let Some(normalized) = normalize_capability_name(capability) else {
             if super::capability_name_without_prefix(capability).is_empty() {
-                return Err(ConfigValidationError::CapabilityNameEmpty {
-                    image: image_name.to_string(),
-                    field,
-                });
+                return Err(SecurityRuleViolation::CapabilityNameEmpty { field });
             }
-            return Err(ConfigValidationError::CapabilityNameInvalid {
-                image: image_name.to_string(),
+            return Err(SecurityRuleViolation::CapabilityNameInvalid {
                 field,
                 capability: capability.clone(),
             });
         };
 
         if !seen.insert(normalized.clone()) {
-            return Err(ConfigValidationError::CapabilityNameDuplicate {
-                image: image_name.to_string(),
+            return Err(SecurityRuleViolation::CapabilityNameDuplicate {
                 field,
                 capability: normalized,
             });
@@ -1867,6 +1929,105 @@ pub(super) fn validate_workspace_mounts(
             }
         },
     )
+}
+
+/// Scope-agnostic `[security]` rule violation. The image-config caller maps it
+/// onto the per-image variants of [`ConfigValidationError`] that predate this
+/// type; a sidecar's is carried whole by
+/// [`ConfigValidationError::SidecarSecurity`]. Splitting the rule from the
+/// block it failed in is what lets a sidecar's error say `sidecar`, where it
+/// used to borrow the image variants and read `image "sidecars.<name>"`.
+///
+/// `Display` is the rule alone, with no owner prefix, so each caller supplies
+/// the one its block wants: `image "coding": ` or `sidecar "tools": `.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SecurityRuleViolation {
+    #[error("`{field}` capability name must not be empty")]
+    #[non_exhaustive]
+    CapabilityNameEmpty { field: &'static str },
+
+    #[error(
+        "`{field}` capability {capability:?} must match \
+         ^[A-Z0-9_]+$ after optional CAP_ stripping"
+    )]
+    #[non_exhaustive]
+    CapabilityNameInvalid {
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error("`{field}` capability {capability:?} is declared more than once")]
+    #[non_exhaustive]
+    CapabilityNameDuplicate {
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error("capability {capability:?} is listed in both `cap-drop` and `cap-add`")]
+    #[non_exhaustive]
+    CapabilityDropAddConflict { capability: String },
+
+    #[error("`devices` entry must not be empty")]
+    #[non_exhaustive]
+    DevicePathEmpty {},
+
+    #[error("`devices` entry {device:?} must be an absolute path")]
+    #[non_exhaustive]
+    DevicePathRelative { device: String },
+
+    #[error(
+        "`devices` entry {device:?} is malformed: {detail}; expected \
+         `<host-path>[:<container-path>][:<permissions>]`"
+    )]
+    #[non_exhaustive]
+    DevicePathMalformed { device: String, detail: String },
+
+    #[error("`devices` entry {device:?} is declared more than once")]
+    #[non_exhaustive]
+    DevicePathDuplicate { device: String },
+
+    #[error("`unmask` entry must not be empty")]
+    #[non_exhaustive]
+    UnmaskPathEmpty {},
+
+    #[error("`unmask` entry {path:?} must be an absolute path or `ALL`")]
+    #[non_exhaustive]
+    UnmaskPathRelative { path: String },
+
+    #[error(
+        "`unmask` entry {path:?} must not contain `:`; podman splits an \
+         unmask value on it, so declare one path per entry"
+    )]
+    #[non_exhaustive]
+    UnmaskPathListSeparator { path: String },
+
+    #[error("`unmask` entry {path:?} is declared more than once")]
+    #[non_exhaustive]
+    UnmaskPathDuplicate { path: String },
+
+    #[error(
+        "`unmask` entry {path:?} must be spelled `ALL`; podman only lifts \
+         the read-only paths for that exact casing, so {path:?} would leave `/sys/fs/cgroup` \
+         read-only while looking like a full unmask"
+    )]
+    #[non_exhaustive]
+    UnmaskAllNotCanonical { path: String },
+
+    #[error(
+        "`unmask` must be exactly [\"ALL\"] when it lists `ALL`; podman \
+         applies the full unmask only when `ALL` comes first, and every other entry is \
+         redundant beside it"
+    )]
+    #[non_exhaustive]
+    UnmaskAllNotAlone {},
+
+    #[error(
+        "`unmask` entry {path:?} {detail}; podman logs a pattern syntax \
+         error and leaves the path masked instead of failing the launch"
+    )]
+    #[non_exhaustive]
+    UnmaskPathBadGlob { path: String, detail: &'static str },
 }
 
 /// Scope-agnostic mount-list rule violation. The workspace caller maps it
@@ -2552,7 +2713,11 @@ fn validate_image_source(
             });
         }
         let name = image.image_name.as_deref().unwrap();
-        if name.is_empty() {
+        // Trimmed, as `check_sidecar_image` holds a sidecar's `image` to: a
+        // ref of nothing but blanks names no image either way, and left to
+        // podman it surfaces at launch as `image not known`, naming neither
+        // the key nor the file that declared it.
+        if name.trim().is_empty() {
             return Err(ConfigValidationError::ImageNameEmpty {
                 image: image_name.to_string(),
             });

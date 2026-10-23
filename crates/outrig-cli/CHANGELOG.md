@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `[sidecars.<sc>.security]` error names the sidecar, and a whitespace-only `image-name` is
+  refused at load.** A security rule that failed in a sidecar block reported it as ``image
+  "sidecars.tools": ...``, pointing at an `[images.<name>]` block that does not exist; it now
+  reads ``sidecar "tools": ...``. An `image-name` of nothing but blanks also used to pass
+  validation and fail later at launch as podman's `image not known`, where a sidecar's `image`
+  was already refused; both are now refused when the config is read, naming the key. (#378)
 - **An `env` or `build-args` key podman would misread is refused when the config is read, and
   `--env` refuses one as it parses.** podman and buildah split each entry at its first `=`, so
   `env = { "A=B" = "c" }` set `A` to `B=c`, and an empty key reached podman as `--env =x` and

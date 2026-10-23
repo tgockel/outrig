@@ -241,6 +241,9 @@ pub outrig::config::ConfigValidationError::SidecarNameCollision::image: alloc::s
 pub outrig::config::ConfigValidationError::SidecarNameCollision::name: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarNameInvalid
 pub outrig::config::ConfigValidationError::SidecarNameInvalid::sidecar: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarSecurity
+pub outrig::config::ConfigValidationError::SidecarSecurity::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarSecurity::violation: outrig::config::SecurityRuleViolation
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint
@@ -477,6 +480,38 @@ pub fn outrig::config::NetworkMode::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for outrig::config::NetworkMode
 pub type outrig::config::NetworkMode::Err = alloc::string::String
 pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self, Self::Err>
+#[non_exhaustive] pub enum outrig::config::SecurityRuleViolation
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityDropAddConflict
+pub outrig::config::SecurityRuleViolation::CapabilityDropAddConflict::capability: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate
+pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate::capability: alloc::string::String
+pub outrig::config::SecurityRuleViolation::CapabilityNameDuplicate::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameEmpty
+pub outrig::config::SecurityRuleViolation::CapabilityNameEmpty::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid
+pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid::capability: alloc::string::String
+pub outrig::config::SecurityRuleViolation::CapabilityNameInvalid::field: &'static str
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathDuplicate
+pub outrig::config::SecurityRuleViolation::DevicePathDuplicate::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathEmpty
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathMalformed
+pub outrig::config::SecurityRuleViolation::DevicePathMalformed::detail: alloc::string::String
+pub outrig::config::SecurityRuleViolation::DevicePathMalformed::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::DevicePathRelative
+pub outrig::config::SecurityRuleViolation::DevicePathRelative::device: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskAllNotAlone
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskAllNotCanonical
+pub outrig::config::SecurityRuleViolation::UnmaskAllNotCanonical::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob
+pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob::detail: &'static str
+pub outrig::config::SecurityRuleViolation::UnmaskPathBadGlob::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathDuplicate
+pub outrig::config::SecurityRuleViolation::UnmaskPathDuplicate::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathEmpty
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathListSeparator
+pub outrig::config::SecurityRuleViolation::UnmaskPathListSeparator::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::SecurityRuleViolation::UnmaskPathRelative
+pub outrig::config::SecurityRuleViolation::UnmaskPathRelative::path: alloc::string::String
 #[non_exhaustive] pub enum outrig::config::SidecarOnFailure
 pub outrig::config::SidecarOnFailure::Abort
 pub outrig::config::SidecarOnFailure::Warn

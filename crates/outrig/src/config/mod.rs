@@ -25,7 +25,8 @@ pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use lenient::{ConfigWarning, ConfigWarningKind};
 pub use merge::merge;
 pub use validate::{
-    BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
+    BuildImageNameError, ConfigValidationError, MountRuleViolation, SecurityRuleViolation,
+    check_build_image_name,
 };
 pub(crate) use validate::{
     check_entrypoint_hosting, check_env_keys, check_mcp_call_timeout_secs, check_sidecar_image,

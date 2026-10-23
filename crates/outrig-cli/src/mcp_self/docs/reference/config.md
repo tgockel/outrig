@@ -1742,13 +1742,20 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
-- `image-name` must not be empty.
+- `image-name` must not be empty or whitespace-only. A reference that is nothing but blanks
+  names no image, and left to podman it fails at launch as `image not known`, naming neither
+  the key nor the file; a sidecar's `image` has always been held to the trimmed test, and now
+  both are.
 - A build-from-Dockerfile `[images.<name>]` block key must be a valid container image
   repository component -- lowercase letters and digits, separated by one `.`, one or two `_`,
   or a run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), the separators podman accepts -- and
   at most 237 characters, because it becomes the built image's repository and buildah refuses
   one over 255 once it prepends `docker.io/library/`. Image-name configs are exempt: their block
   key is just a label.
+- Every `[security]` rule below holds for a `[sidecars.<sc>.security]` block as well as an
+  `[images.<name>.security]` one -- a sidecar reuses the whole block. A sidecar's failure is
+  reported against the sidecar, `sidecar "tools": `devices` entry ... must be an absolute
+  path`, rather than against an image config named `sidecars.tools`, which does not exist.
 - Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match

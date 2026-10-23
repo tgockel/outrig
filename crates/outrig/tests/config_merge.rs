@@ -10,8 +10,9 @@ use tempfile::tempdir;
 use outrig::config::{
     ApiKeyRef, BuildImageNameError, Config, ConfigSource, ConfigValidationError, EnvValue,
     ImageConfig, LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation,
-    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SidecarOnFailure,
-    SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
+    NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy, OpenAiOptions, SecurityRuleViolation,
+    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
+    check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -1443,7 +1444,8 @@ devices = ["/dev/fuse", "/dev/kvm", "/dev/fuse"]
     }
 
     /// Sidecars reuse the whole `[security]` block, so the device rules reach
-    /// them too -- and the error names the sidecar's scope, not the bare image.
+    /// them too -- and the failure is a `SidecarSecurity`, which names the
+    /// sidecar, rather than one of the `image` variants wearing a scope string.
     #[test]
     fn sidecar_device_path_errors_name_the_sidecar_scope() {
         let cfg = parse(
@@ -1460,13 +1462,27 @@ devices = ["dev/fuse"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::DevicePathRelative { image, device } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(device, "dev/fuse");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::DevicePathRelative { device, .. } => {
+                        assert_eq!(device, "dev/fuse");
+                    }
+                    other => panic!("expected DevicePathRelative, got: {other:?}"),
+                }
             }
-            other => panic!("expected DevicePathRelative, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        // The point of the variant: it opens with the sidecar, where the image
+        // variants it used to borrow read `image "sidecars.tools"`.
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": `devices` entry \"dev/fuse\" must be an absolute path"
+        );
     }
 
     #[test]
@@ -1678,7 +1694,7 @@ unmask = ["{value}"]
     }
 
     /// Sidecars reuse the whole `[security]` block, so the unmask rules reach
-    /// them too -- and the error names the sidecar's scope.
+    /// them too -- and the failure names the sidecar, not an image.
     #[test]
     fn sidecar_unmask_path_errors_name_the_sidecar_scope() {
         let cfg = parse(
@@ -1695,13 +1711,25 @@ unmask = ["proc/acpi"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::UnmaskPathRelative { image, path } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(path, "proc/acpi");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::UnmaskPathRelative { path, .. } => {
+                        assert_eq!(path, "proc/acpi");
+                    }
+                    other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+                }
             }
-            other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": `unmask` entry \"proc/acpi\" must be an absolute path or `ALL`"
+        );
     }
 
     #[test]
@@ -4016,6 +4044,60 @@ image-name = ""
         );
     }
 
+    /// Whitespace-only is empty: a ref of nothing but blanks names no image,
+    /// and `check_sidecar_image` has always held a sidecar's `image` to the
+    /// trimmed test. Left to podman it surfaced at launch as `image not
+    /// known`, naming neither the key nor the file.
+    #[test]
+    fn whitespace_only_image_name_errors() {
+        for value in ["  ", "\t", " \t "] {
+            let cfg = parse(&format!(
+                r#"
+[images.bad]
+image-name = "{}"
+"#,
+                value.escape_default(),
+            ));
+            let err = expect_validation_err(&cfg, None);
+            assert!(
+                matches!(err, ConfigValidationError::ImageNameEmpty { .. }),
+                "expected ImageNameEmpty for {value:?}, got: {err:?}"
+            );
+        }
+    }
+
+    /// The companion to the sidecar scope tests: an image-config's `[security]`
+    /// failure is still the same variant carrying the same `image` field it
+    /// carried before `SecurityRuleViolation` existed. This is a patch release,
+    /// so a consumer's `DevicePathRelative { image, device }` match has to go
+    /// on compiling and go on seeing the image-config name.
+    #[test]
+    fn image_security_errors_keep_their_image_field() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["dev/fuse"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
+        match err {
+            ConfigValidationError::DevicePathRelative { image, device } => {
+                assert_eq!(image, "coding");
+                assert_eq!(device, "dev/fuse");
+            }
+            other => panic!("expected DevicePathRelative, got: {other:?}"),
+        }
+        assert_eq!(
+            rendered,
+            "image \"coding\": `devices` entry \"dev/fuse\" must be an absolute path"
+        );
+    }
+
     #[test]
     fn dockerfile_without_context_errors() {
         let cfg = parse(
@@ -4569,13 +4651,25 @@ context    = "ctx"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
         match err {
-            ConfigValidationError::CapabilityDropAddConflict { image, capability } => {
-                assert_eq!(image, "sidecars.tools");
-                assert_eq!(capability, "NET_RAW");
+            ConfigValidationError::SidecarSecurity {
+                sidecar, violation, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                match violation {
+                    SecurityRuleViolation::CapabilityDropAddConflict { capability, .. } => {
+                        assert_eq!(capability, "NET_RAW");
+                    }
+                    other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+                }
             }
-            other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+            other => panic!("expected SidecarSecurity, got: {other:?}"),
         }
+        assert_eq!(
+            rendered,
+            "sidecar \"tools\": capability \"NET_RAW\" is listed in both `cap-drop` and `cap-add`"
+        );
     }
 
     #[test]
