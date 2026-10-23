@@ -32,7 +32,7 @@ use super::build::RigAgent;
 use super::failover::{self, FailoverModel};
 use super::history::{self, History};
 use super::ledger::{CallSlot, Refusal};
-use super::retry::BudgetSpent;
+use super::retry::{BudgetSpent, prompt_failure_text};
 use super::tool::{self, Interrupts};
 use crate::config::RoleAlternation;
 use crate::harness::event::{AttemptId, CallUsage, Payload, Usage};
@@ -236,7 +236,11 @@ fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<Finished, AgentEr
         ),
         (other, _) => {
             let Some(reason) = unfit(&other) else {
-                let text = format!("{other}{}", hook.refusal_hint(&other));
+                let text = format!(
+                    "{}{}",
+                    prompt_failure_text(&other),
+                    hook.refusal_hint(&other)
+                );
                 let ran = hook.keep_what_ran();
                 return Err(match (ran, may_clear(&other)) {
                     (false, true) => AgentError::Prompt(text),

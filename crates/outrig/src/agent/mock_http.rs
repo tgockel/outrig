@@ -477,6 +477,60 @@ async fn start_with(
     (addr, rx)
 }
 
+/// The discard port: assigned to a service essentially nothing runs, and below
+/// the ephemeral range so no test can be handed it. Every unreachable-endpoint
+/// fixture points here.
+pub(super) const REFUSED_PORT: u16 = 9;
+
+/// The innermost `source()` text of a refused connect to [`REFUSED_PORT`],
+/// which is what a failure line should name instead of reqwest's outer text.
+/// Taken from the error itself because the OS wording varies.
+///
+/// `no_proxy` for the same reason `remote_http_client` sets it under
+/// `cfg(test)`: on a machine behind a proxy the request would go to the proxy
+/// and never be refused.
+pub(super) async fn refused_cause() -> String {
+    let err = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a bare client builds")
+        .get(format!("http://127.0.0.1:{REFUSED_PORT}/"))
+        .send()
+        .await
+        .expect_err("nothing listens");
+    let mut cause: &(dyn std::error::Error + 'static) = &err;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause.to_string()
+}
+
+/// A chain of errors: each link's `Display` is its own text, and its `source()`
+/// the next link.
+#[derive(Debug)]
+pub(super) struct Link(pub(super) &'static str, pub(super) Option<Box<Link>>);
+
+impl std::fmt::Display for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Link {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.1.as_deref().map(|link| link as _)
+    }
+}
+
+/// A transport failure as reqwest raises one: the outer text says only that
+/// sending failed, and the cause is in its `source()`.
+pub(super) fn transport_failure() -> rig::completion::CompletionError {
+    rig::completion::CompletionError::HttpError(rig::http_client::Error::Instance(Box::new(Link(
+        "error sending request",
+        Some(Box::new(Link("Connection refused", None))),
+    ))))
+}
+
 /// Everything the mock has recorded so far.
 pub(crate) fn drain(rx: &mut mpsc::UnboundedReceiver<RecordedRequest>) -> Vec<RecordedRequest> {
     let mut out = Vec::new();

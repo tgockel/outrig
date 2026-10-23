@@ -735,7 +735,10 @@ impl Settling {
             Err(CompletionError::ResponseError(message)) => {
                 (Some(super::retry::unusable(message)), from_body())
             }
-            Err(error) => (Some(error.to_string()), from_body()),
+            Err(error) => (
+                Some(super::retry::candidate_failure_label(error)),
+                from_body(),
+            ),
         };
         self.slot
             .record(call, answered.attempt, &settings, error, usage);

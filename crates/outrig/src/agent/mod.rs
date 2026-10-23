@@ -420,7 +420,7 @@ impl From<OutrigError> for AgentError {
 /// paths, the whole conversation.
 impl From<PromptError> for AgentError {
     fn from(e: PromptError) -> Self {
-        AgentError::Prompt(e.to_string())
+        AgentError::Prompt(retry::prompt_failure_text(&e))
     }
 }
 

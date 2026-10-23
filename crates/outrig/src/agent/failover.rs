@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use super::budget::Budget;
 use super::history::{Adjacent, History, TooLarge};
 use super::ledger::CallSlot;
-use super::retry::{BudgetSpent, RetryPolicy};
+use super::retry::{BudgetSpent, RetryPolicy, candidate_failure_label};
 use crate::harness::event::{CallId, Payload};
 
 /// One candidate of a chain, behind an object-safe interface.
@@ -340,7 +340,7 @@ impl FailoverModel {
     /// one round can be half one model's work, which is the stronger version of
     /// the same hazard and wants the same mitigation.
     fn announce(&self, from: &str, to: &str, error: &CompletionError, call: CallId) {
-        let error = error.to_string();
+        let error = candidate_failure_label(error);
         tracing::warn!("model {from} failed ({error}); trying {to}");
         self.slot.events().emit(Payload::ModelFailover {
             from: from.to_string(),
@@ -406,7 +406,7 @@ impl fmt::Display for Exhausted {
         let rows: Vec<_> = self
             .abandoned
             .iter()
-            .map(|a| (a.model_name.as_str(), a.error.to_string()))
+            .map(|a| (a.model_name.as_str(), candidate_failure_label(&a.error)))
             .collect();
         let failed = if self.may_clear() {
             "every model candidate failed"
@@ -677,6 +677,7 @@ mod tests {
     use super::*;
     use crate::agent::history::Role;
     use crate::agent::ledger::{Ledger, Refusal};
+    use crate::agent::mock_http::transport_failure;
 
     /// What a call to a test's candidate may carry: a window of no consequence,
     /// and `max_tokens`.
@@ -783,6 +784,7 @@ mod tests {
             CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(status)) => {
                 CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(*status))
             }
+            CompletionError::HttpError(rig::http_client::Error::Instance(_)) => transport_failure(),
             CompletionError::JsonError(_) => undecodable(),
             CompletionError::ProviderResponse(response) => {
                 CompletionError::ProviderResponse(response.clone())
@@ -995,6 +997,26 @@ mod tests {
             text.starts_with("every model candidate failed; tried:\n"),
             "one transient candidate is enough to make waiting worth it: {text}",
         );
+    }
+
+    /// A transport failure in a `tried` row names its cause, as it does on the
+    /// retry line, rather than rig's `Http client error:` wrapper.
+    #[tokio::test]
+    async fn a_transport_failure_is_reported_with_its_cause() {
+        let err = chain(vec![
+            Box::new(Scripted::failing("head", transport_failure())),
+            Box::new(Scripted::failing("next", http_status(503))),
+        ])
+        .completion(request())
+        .await
+        .expect_err("every candidate failed");
+
+        let text = exhaustion(err);
+        assert!(
+            text.contains("error sending request: Connection refused"),
+            "{text}"
+        );
+        assert!(!text.contains("Http client error"), "{text}");
     }
 
     /// What the round reads of a failure is the typed exhaustion, never its

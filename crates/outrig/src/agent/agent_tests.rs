@@ -555,6 +555,44 @@ async fn a_failed_first_model_call_leaves_the_conversation_alone() {
     assert_eq!(sent.len(), 1, "{sent:#?}");
 }
 
+/// A round that ends on a refused connection says what refused it, not only
+/// that sending the request failed: a refused connect, a failed lookup, and a
+/// TLS mismatch all read as the latter, and are the cause a fix starts from.
+/// The model is alone, so its error reaches the round as it stands.
+#[tokio::test]
+async fn a_round_that_ends_on_a_refused_connection_names_the_cause() {
+    let var = "OUTRIG_TEST_AGENT_REFUSED_CONNECTION";
+    // Nothing listens there, so every connection is refused.
+    let cfg = config_in(
+        Style::Anthropic,
+        std::net::SocketAddr::from(([127, 0, 0, 1], mock_http::REFUSED_PORT)),
+        var,
+        MODEL,
+        "",
+        "max-tokens = 4096",
+    );
+    let mut agent = agent_of(&cfg, var, Events::off()).await;
+
+    post(&agent, "hello").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("nothing answers on the discard port"),
+    );
+
+    let cause = mock_http::refused_cause().await;
+    assert!(
+        err.starts_with("agent round failed: connection error: ") && err.contains(&cause),
+        "{err}"
+    );
+    assert!(
+        err.contains(RESEND_WORKS),
+        "a refused connect may clear: {err}"
+    );
+    assert!(!ran, "no Python ran: {err}");
+    shut_down(agent).await;
+}
+
 /// rig reads a tool's output as JSON when it can, and an object carrying
 /// `response` reaches the model as that field alone. What a program printed is
 /// not a message to rig, so it arrives whole.
@@ -3923,6 +3961,14 @@ async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering
         "{}",
         moves[0]
     );
+    // The cause, which is only in the error's `source()`, and none of rig's
+    // wrapper around the text.
+    let error = moves[0]["error"].as_str().expect("an error");
+    assert!(
+        error.starts_with("connection error: ")
+            && error.ends_with(&mock_http::refused_cause().await),
+        "{error}"
+    );
     let ended = events::of_kind(&records, "model.round.completed");
     assert_eq!(
         ended[0]["calls"][0]["model"], "tail",
@@ -4904,9 +4950,21 @@ async fn a_redirect_loop_moves_on_without_retrying() {
 /// after the wait, and the call does not move.
 #[tokio::test]
 async fn an_overloaded_model_is_retried_rather_than_left() {
-    let vars = "OUTRIG_TEST_AGENT_RETRY_OVERLOADED";
+    assert_retried_rather_than_left("OUTRIG_TEST_AGENT_RETRY_OVERLOADED", 529).await;
+}
+
+/// Cloudflare's `520`, in front of a proxied endpoint, is in no list of the
+/// standard statuses and is as temporary: every `5xx` is retried.
+#[tokio::test]
+async fn a_cloudflare_status_is_retried_rather_than_left() {
+    assert_retried_rather_than_left("OUTRIG_TEST_AGENT_RETRY_CLOUDFLARE", 520).await;
+}
+
+/// A head that answers `status` once and then replies: the call is asked of
+/// the head again after the wait, and does not move to the tail.
+async fn assert_retried_rather_than_left(vars: &str, status: u16) {
     let (head, mut head_requests) = mock_http::start(vec![
-        failure(529).header("Retry-After", 0),
+        failure(status).header("Retry-After", 0),
         text_reply("from the head"),
     ])
     .await;
@@ -4931,7 +4989,7 @@ async fn an_overloaded_model_is_retried_rather_than_left() {
     assert!(
         retries[0]["error"]
             .as_str()
-            .is_some_and(|error| error.contains("529")),
+            .is_some_and(|error| error.contains(&status.to_string())),
         "{}",
         retries[0]
     );

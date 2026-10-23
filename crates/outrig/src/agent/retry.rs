@@ -79,6 +79,7 @@ use rand::RngExt;
 use reqwest::StatusCode;
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
+    PromptError,
 };
 use rig::http_client::{
     Error as HttpError, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request,
@@ -934,14 +935,14 @@ where
 }
 
 /// The retry-worthy statuses: request timeouts, "too early", rate limits, and
-/// the server-side 5xx family, Anthropic's `529` -- its documented, temporary
-/// `overloaded_error` -- included. Everything else -- other 4xx especially --
-/// is terminal, because replaying it would fail the same way.
+/// the server-side 5xx family. Everything else -- other 4xx especially -- is
+/// terminal, because replaying it would fail the same way.
+///
+/// The 5xx family is taken whole because providers put nonstandard codes in
+/// it -- Anthropic's `529` overloaded, Cloudflare's `520`-`527` -- that an
+/// explicit list of the standard ones misses.
 fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        408 | 425 | 429 | 500 | 502 | 503 | 504 | 529
-    )
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
 }
 
 /// A transport error that no replay of the same request can clear: one reqwest
@@ -1018,14 +1019,74 @@ fn next_delay(
 /// A short label for a failure: the status line, or the transport error. Never
 /// the provider's error body -- a rate-limited gateway's body runs to kilobytes
 /// of nested JSON.
+///
+/// A code with no standard reason phrase is shown bare: `StatusCode`'s own
+/// `Display` would print `529 <unknown status code>`, which says nothing more
+/// and runs the line long.
 fn failure_label(err: &HttpError) -> String {
     match err {
         HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
-            format!("HTTP {code}")
+            match code.canonical_reason() {
+                Some(_) => format!("HTTP {code}"),
+                None => format!("HTTP {}", code.as_u16()),
+            }
         }
-        HttpError::Instance(inner) => format!("connection error: {inner}"),
+        HttpError::Instance(inner) => {
+            format!("connection error: {}", with_innermost_cause(inner.as_ref()))
+        }
         other => other.to_string(),
     }
+}
+
+/// An error's `Display` followed by the innermost link of its `source()` chain.
+///
+/// reqwest's own text is the kind of failure and the URL; whether the connect
+/// was refused, the lookup failed, or TLS did not match is only in the chain.
+/// One link rather than all of them, since this is a status line. Left alone
+/// when there is no source or the outer text already says it.
+fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let outer = err.to_string();
+    let mut innermost = None;
+    let mut link = err.source();
+    while let Some(cause) = link {
+        innermost = Some(cause);
+        link = cause.source();
+    }
+    match innermost.map(ToString::to_string) {
+        Some(cause) if !outer.contains(&cause) => format!("{outer}: {cause}"),
+        _ => outer,
+    }
+}
+
+/// [`failure_label`] for a transport failure, which is the one kind of failure
+/// it words better than rig's `Display` does: that wraps the same outer text
+/// behind `HttpError: Http client error:` and drops the cause. `None` for
+/// anything else.
+fn transport_label(err: &CompletionError) -> Option<String> {
+    match err {
+        CompletionError::HttpError(http @ HttpError::Instance(_)) => Some(failure_label(http)),
+        _ => None,
+    }
+}
+
+/// The label for a failed candidate in a failover chain's move line and
+/// `tried` rows: a transport failure reads as it does on a retry line, and
+/// anything else keeps rig's own text.
+pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
+    transport_label(err).unwrap_or_else(|| err.to_string())
+}
+
+/// A failed round's cause, as its error words it: a transport failure reads as
+/// it does on a retry line, and anything else keeps rig's own text.
+///
+/// For a lone candidate, whose error reaches the round unwrapped; a chain's is
+/// worded row by row with [`candidate_failure_label`].
+pub(crate) fn prompt_failure_text(err: &PromptError) -> String {
+    match err {
+        PromptError::CompletionError(failed) => transport_label(failed),
+        _ => None,
+    }
+    .unwrap_or_else(|| err.to_string())
 }
 
 /// Classify an HTTP failure as transient -- the same predicate the retry loop
@@ -1069,6 +1130,7 @@ pub(crate) fn is_recoverable(err: &CompletionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::mock_http::{Link, REFUSED_PORT, refused_cause, transport_failure};
 
     fn http_status(code: u16) -> CompletionError {
         CompletionError::HttpError(HttpError::InvalidStatusCodeWithMessage(
@@ -1081,9 +1143,12 @@ mod tests {
         text.parse().expect("fixed timestamp")
     }
 
+    /// The only 4xx statuses that retry; the tables below split 4xx on it.
+    const RETRYABLE_4XX: [u16; 3] = [408, 425, 429];
+
     #[test]
     fn retryable_status_codes_are_transient() {
-        for code in [408, 425, 429, 500, 502, 503, 504, 529] {
+        for code in RETRYABLE_4XX.into_iter().chain(500..=599) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(is_retryable_status(status), "{code} should retry");
             assert!(
@@ -1095,7 +1160,7 @@ mod tests {
 
     #[test]
     fn client_errors_are_terminal() {
-        for code in [400, 401, 403, 404, 422] {
+        for code in (400..=499).filter(|code| !RETRYABLE_4XX.contains(code)) {
             let status = StatusCode::from_u16(code).unwrap();
             assert!(!is_retryable_status(status), "{code} should not retry");
             assert!(
@@ -1103,6 +1168,18 @@ mod tests {
                 "{code} should stay terminal to a chain",
             );
         }
+    }
+
+    #[test]
+    fn a_nonstandard_status_is_labeled_by_its_code() {
+        let label_of = |code| {
+            let CompletionError::HttpError(err) = http_status(code) else {
+                unreachable!("an HTTP failure")
+            };
+            failure_label(&err)
+        };
+        assert_eq!(label_of(529), "HTTP 529");
+        assert_eq!(label_of(503), "HTTP 503 Service Unavailable");
     }
 
     #[test]
@@ -1792,11 +1869,6 @@ mod tests {
         );
     }
 
-    /// The discard port: assigned to a service essentially nothing runs, and
-    /// below the ephemeral range so no test can be handed it. The crate's other
-    /// unreachable-endpoint fixtures already point here.
-    const REFUSED_PORT: u16 = 9;
-
     /// The client the socket tests drive the loop with.
     ///
     /// `no_proxy` for the same reason `remote_http_client` sets it under
@@ -1887,6 +1959,10 @@ mod tests {
         assert!(
             label.starts_with("connection error"),
             "the loop must have failed connecting, not on {label}",
+        );
+        assert!(
+            label.ends_with(&refused_cause().await),
+            "the label must carry the connect failure's own cause: {label}",
         );
         assert!(
             elapsed <= policy.connect_budget,
@@ -2010,5 +2086,58 @@ mod tests {
         let label = failure_label(&err);
         assert!(label.contains("429"), "{label}");
         assert!(!label.contains("boom"), "the body must not leak: {label}");
+    }
+
+    #[test]
+    fn the_innermost_cause_is_appended_once() {
+        let err = Link(
+            "outer",
+            Some(Box::new(Link("middle", Some(Box::new(Link("root", None)))))),
+        );
+        assert_eq!(with_innermost_cause(&err), "outer: root");
+    }
+
+    #[test]
+    fn a_cause_the_outer_message_already_has_is_not_repeated() {
+        let err = Link("failed: root", Some(Box::new(Link("root", None))));
+        assert_eq!(with_innermost_cause(&err), "failed: root");
+    }
+
+    #[test]
+    fn an_error_with_no_source_renders_as_it_always_did() {
+        assert_eq!(with_innermost_cause(&Link("alone", None)), "alone");
+    }
+
+    /// The transport failure as the retry line words it, with the cause its
+    /// outer text lacks and none of rig's `Http client error:` wrapper.
+    #[test]
+    fn a_candidate_transport_failure_carries_the_cause_without_rigs_prefix() {
+        assert_eq!(
+            candidate_failure_label(&transport_failure()),
+            "connection error: error sending request: Connection refused"
+        );
+        let status = http_status(503);
+        assert_eq!(candidate_failure_label(&status), status.to_string());
+    }
+
+    /// A lone candidate's failed round says the same, and everything that is
+    /// not a transport failure keeps rig's text to the byte.
+    #[test]
+    fn a_failed_rounds_transport_cause_is_named_and_nothing_else_changes() {
+        assert_eq!(
+            prompt_failure_text(&PromptError::CompletionError(transport_failure())),
+            "connection error: error sending request: Connection refused"
+        );
+        for other in [
+            PromptError::CompletionError(http_status(401)),
+            PromptError::CompletionError(CompletionError::ProviderError("nope".into())),
+            PromptError::MaxTurnsError {
+                max_turns: 3,
+                chat_history: Box::default(),
+                prompt: Box::new("hi".into()),
+            },
+        ] {
+            assert_eq!(prompt_failure_text(&other), other.to_string());
+        }
     }
 }

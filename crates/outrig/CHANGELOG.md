@@ -92,15 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal of a call whose shortened history put one role after itself says so, and names that
   provider row's `role-alternation` as the remedy.
 
-  Each model call retries a provider's transient failures -- a retryable status, Anthropic's
-  `529` included, honoring `Retry-After`, a dropped connection, a response rig cannot use --
-  within `retry-budget-secs`, as `outrig run` does, and says so through `tracing`. A request that
-  cannot succeed as sent, such as a redirect loop, is not retried. An alias naming several models
-  resolves to each this build can reach, in order, and a call that still fails moves to the next,
-  starting again at the first on every call. Each model a call goes to is sent a view assembled
-  for its own window, and carries its own reply ceiling, so a turn too large for the first
-  model's window goes to the next whose window holds it, and the round ends as above only when
-  none does. A call to an Anthropic
+  Each model call retries a provider's transient failures -- a `408`, `425`, `429`, or any `5xx`
+  (Anthropic's `529` and Cloudflare's `520`-`527` among them), honoring `Retry-After`, a dropped
+  connection, a response rig cannot use -- within `retry-budget-secs`, as `outrig run` does, and
+  says so through `tracing`. A failed connection's line names its cause -- a refused connect, a
+  failed lookup, a TLS mismatch -- in a retry, a move to another model, and a failed round. A
+  request that cannot succeed as sent, such as a redirect loop, is not retried. An alias naming
+  several models resolves to each this build can reach, in order, and a call that still fails moves
+  to the next, starting again at the first on every call. Each model a call goes to is sent a
+  view assembled for its own window, and carries its own reply ceiling, so a turn too large for
+  the first model's window goes to the next whose window holds it, and the round ends as above
+  only when none does. A call to an Anthropic
   model leaves out reasoning another provider wrote, which has no signature for Anthropic to take
   it back with. When every model has failed, the round fails with each one's reason, keeping what
   it ran, as any failed round does.
