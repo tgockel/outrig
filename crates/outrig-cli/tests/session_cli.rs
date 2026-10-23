@@ -29,13 +29,20 @@ async fn drain<R: AsyncReadExt + Unpin>(mut r: R) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// The display column each cell of a rendered `ls` row starts in. Cells are
-/// separated by at least the two spaces `render_table` writes between them,
-/// and no cell holds two spaces of its own, so a run of two or more ends one.
+/// The display column each cell of a rendered `ls` row starts in, and -- for a
+/// symlinked row -- the column its `-> <target>` suffix starts in.
+///
+/// Cells are separated by at least the two spaces `render_table` writes
+/// between them, and no cell it lays out holds two spaces of its own, so a run
+/// of two or more ends one. The link target is the exception: it is a path,
+/// which may hold anything a filesystem allows, two consecutive spaces
+/// included -- a `TMPDIR` that holds a pair would otherwise read as another
+/// cell boundary here. So the scan stops at the arrow, and the target is one
+/// cell however it is spelled.
 ///
 /// Counted in display columns rather than `char`s, since that is the unit the
-/// reader's alignment is in and the unit a `"日本語"` cell differs from its
-/// `char` count in. The width rules this needs are only the East Asian ones
+/// reader's alignment is in and the unit a CJK cell differs from its `char`
+/// count in. The width rules this needs are only the East Asian ones
 /// (`width 2`), so it reimplements that much rather than giving the test crate
 /// its own `unicode-width` dependency -- and reimplementing it keeps the
 /// assertion independent of the table the code under test measures with.
@@ -48,10 +55,16 @@ fn cell_columns(line: &str) -> Vec<usize> {
             || ('\u{FF00}'..='\u{FF60}').contains(&c)
             || ('\u{FFE0}'..='\u{FFE6}').contains(&c)
     };
+    // Split at the separator before the arrow, so the scan below sees only
+    // cells the table laid out and never the target's own spacing.
+    let (head, linked) = match line.find("  -> ") {
+        Some(at) => (&line[..at], true),
+        None => (line, false),
+    };
     let mut cols = vec![0];
     let mut col = 0;
     let mut spaces = 0;
-    for c in line.chars() {
+    for c in head.chars() {
         if c == ' ' {
             spaces += 1;
         } else {
@@ -61,6 +74,11 @@ fn cell_columns(line: &str) -> Vec<usize> {
             spaces = 0;
         }
         col += if wide(c) { 2 } else { 1 };
+    }
+    if linked {
+        // `col` is the display width of `head`, and the arrow follows the
+        // two-space separator that `find` matched.
+        cols.push(col + 2);
     }
     cols
 }
@@ -205,29 +223,30 @@ async fn ls_aligns_columns_around_a_non_ascii_image_name() {
 
 /// The `-> <target>` of a symlinked row sits past a padded EXIT cell, so the
 /// targets line up under each other as the columns before them do.
+///
+/// The target directories hold two consecutive spaces in their names, which a
+/// filesystem allows and `--session-dir` therefore accepts. Nothing in the
+/// table's own spacing may be inferred from inside them: a reader locates the
+/// arrow and so must `cell_columns`, or a `TMPDIR` of such a name would fail
+/// this test for a table that is lined up correctly.
 #[tokio::test]
 async fn ls_aligns_the_link_targets_of_symlinked_rows() {
     let root = tempfile::tempdir().expect("tempdir root");
     let store = SessionStore::new(root.path().to_path_buf());
 
-    let dirs: Vec<tempfile::TempDir> = (0..2)
-        .map(|_| tempfile::tempdir().expect("tempdir session"))
-        .collect();
+    let targets = tempfile::tempdir().expect("tempdir targets");
     // The exit codes differ in width, so only padding the EXIT cell can line
     // the two targets up.
-    for ((sid_s, image, exit), dir) in [
-        ("20260430T091203-44d2", "日本語", 0),
-        ("20260501T134412-3f2a", "web", 130),
-    ]
-    .iter()
-    .zip(&dirs)
-    {
-        let sid = SessionId((*sid_s).into());
+    for (sid_s, image, exit, dir) in [
+        ("20260430T091203-44d2", "日本語", 0, "two  spaces"),
+        ("20260501T134412-3f2a", "web", 130, "and  two  more"),
+    ] {
+        let sid = SessionId(sid_s.into());
         let mut s = sample_session(&sid);
-        s.image_config_name = Some((*image).to_string());
-        s.exit_code = Some(*exit);
+        s.image_config_name = Some(image.to_string());
+        s.exit_code = Some(exit);
         store
-            .create(&sid, Some(dir.path()), &mut s)
+            .create(&sid, Some(&targets.path().join(dir)), &mut s)
             .expect("create");
     }
 
@@ -254,6 +273,10 @@ async fn ls_aligns_the_link_targets_of_symlinked_rows() {
     assert_eq!(
         arrows[0], arrows[1],
         "both link targets should start in the same column; got\n{out}"
+    );
+    assert!(
+        out.contains("two  spaces") && out.contains("and  two  more"),
+        "the targets should render whole, spaces included; got\n{out}"
     );
 }
 
