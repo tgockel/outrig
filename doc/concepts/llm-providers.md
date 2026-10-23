@@ -469,6 +469,15 @@ applies here, since a `200 OK` is by definition an endpoint that answered. It is
 that count as well: an unusable response comes back in milliseconds, so the budget alone
 would spend ten minutes on dozens of tries where a hiccup wants two.
 
+One empty reply is not a failure. When the provider says the model stopped of its own accord --
+a finish reason of `stop` (OpenAI-style) or `end_turn` (Anthropic) -- a reply with nothing in it
+is a model with nothing to add, most often right after the agent sent the user a message. It is
+not retried: the round ends with an empty reply and no error, keeps the Python it ran, and adds
+nothing to the conversation for the empty turn. A reply that is empty for any other reason, such
+as `length` or `content_filter`, or that names none, is still retried and then fails the round.
+So is one with anything in it the agent cannot use, such as a refusal, whatever its finish reason.
+The event log's `model.attempt` records the finish reason either way.
+
 Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
 model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that
 already happened. Tools run between model calls, never inside one, so replaying either an

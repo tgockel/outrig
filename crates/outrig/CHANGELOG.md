@@ -97,15 +97,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection, a response rig cannot use -- within `retry-budget-secs`, as `outrig run` does, and
   says so through `tracing`. A failed connection's line names its cause -- a refused connect, a
   failed lookup, a TLS mismatch -- in a retry, a move to another model, and a failed round. A
-  request that cannot succeed as sent, such as a redirect loop, is not retried. An alias naming
-  several models resolves to each this build can reach, in order, and a call that still fails moves
-  to the next, starting again at the first on every call. Each model a call goes to is sent a
-  view assembled for its own window, and carries its own reply ceiling, so a turn too large for
-  the first model's window goes to the next whose window holds it, and the round ends as above
-  only when none does. A call to an Anthropic
-  model leaves out reasoning another provider wrote, which has no signature for Anthropic to take
-  it back with. When every model has failed, the round fails with each one's reason, keeping what
-  it ran, as any failed round does.
+  request that cannot succeed as sent, such as a redirect loop, is not retried. Nor is a reply
+  with nothing in it that the provider says the model ended of its own accord, with the finish
+  reason `stop` or `end_turn`: that is a model with nothing to add, most often right after it sent
+  the user a message, so the round ends with an empty reply, keeping what it ran, rather than
+  failing. A reply that ended for any other reason, or none, or that holds anything the agent
+  cannot use, such as a refusal, is still retried. An alias naming several models resolves to each
+  this build can reach, in order, and a call that still fails moves to the next, starting again at
+  the first on every call. Each model a call goes to is sent a view assembled for its own window,
+  and carries its own reply ceiling, so a turn too large for the first model's window goes to the
+  next whose window holds it, and the round ends as above only when none does. A call to an
+  Anthropic model leaves out reasoning another provider wrote, which has no signature for Anthropic
+  to take it back with. When every model has failed, the round fails with each one's reason,
+  keeping what it ran, as any failed round does.
 
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
@@ -156,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session's own state -- starting, idle, round running, executing, closing, reported -- is among
   them. Every model call has a `CallId` and every request sent for it an `AttemptId`; each request
   is recorded once as `model.attempt`, and a round's total is the sum over its attempts. One that
-  failed before an answer carries a `null` usage. A `200` that cannot be made a completion of --
+  failed before an answer carries a `null` usage, and each names the `finish_reason` its response
+  gave, `null` when it named none. A `200` that cannot be made a completion of --
   an Anthropic message with no content, an OpenAI reply with no choices -- is billed all the same,
   so its attempt carries the usage its body reported beside its error, and every total counts it.
   The history and event types are `#[non_exhaustive]`, so a later field or kind is not a break.

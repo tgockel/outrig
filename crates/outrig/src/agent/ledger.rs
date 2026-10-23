@@ -599,6 +599,7 @@ impl CallSlot {
         settings: &Settings,
         error: Option<String>,
         usage: Option<Usage>,
+        finish_reason: Option<String>,
     ) {
         self.ledger.record(
             ModelAttempt {
@@ -609,6 +610,7 @@ impl CallSlot {
                 max_tokens: settings.max_tokens,
                 error,
                 usage,
+                finish_reason,
             },
             self.events(),
         );
@@ -648,8 +650,14 @@ impl Pending {
     /// leads to.
     pub(crate) fn failed(mut self, error: String) -> (CallId, AttemptId) {
         self.done = true;
-        self.slot
-            .record(self.call, self.attempt, &self.settings, Some(error), None);
+        self.slot.record(
+            self.call,
+            self.attempt,
+            &self.settings,
+            Some(error),
+            None,
+            None,
+        );
         (self.call, self.attempt)
     }
 
@@ -696,6 +704,7 @@ impl Drop for Pending {
                 &self.settings,
                 Some("cancelled".to_string()),
                 None,
+                None,
             );
         }
     }
@@ -708,11 +717,19 @@ pub(crate) struct Settling {
 }
 
 impl Settling {
+    /// The body of the `2xx` the call's latest request got, once the HTTP layer
+    /// has read it: what the model layer reads of a response rig could make
+    /// nothing of.
+    pub(crate) fn body(&self) -> Option<Bytes> {
+        let state = self.slot.state();
+        state.call.as_ref()?.answered.as_ref()?.body.get().cloned()
+    }
+
     /// Record the answered attempt as `outcome` says: its usage when rig made a
     /// completion of it, and why not otherwise -- with the usage its body
-    /// reported, which the provider billed whether or not rig could use it.
-    /// The ids, or `None` when no request was answered -- a failure the HTTP
-    /// layer already recorded.
+    /// reported, which the provider billed whether or not rig could use it --
+    /// and the finish reason its body named. The ids, or `None` when no request
+    /// was answered -- a failure the HTTP layer already recorded.
     pub(crate) fn settle<R>(
         mut self,
         outcome: &Result<CompletionResponse<R>, CompletionError>,
@@ -724,12 +741,8 @@ impl Settling {
             let answered = in_flight.answered.take()?;
             (in_flight.call, answered, Arc::clone(&in_flight.settings))
         };
-        let from_body = || {
-            answered
-                .body
-                .get()
-                .and_then(|body| super::retry::body_usage(body))
-        };
+        let body = answered.body.get();
+        let from_body = || body.and_then(|body| super::retry::body_usage(body));
         let (error, usage) = match outcome {
             Ok(response) => (None, reported(response.usage)),
             Err(CompletionError::ResponseError(message)) => {
@@ -740,8 +753,15 @@ impl Settling {
                 from_body(),
             ),
         };
-        self.slot
-            .record(call, answered.attempt, &settings, error, usage);
+        let finish_reason = body.and_then(|body| super::retry::body_finish_reason(body));
+        self.slot.record(
+            call,
+            answered.attempt,
+            &settings,
+            error,
+            usage,
+            finish_reason,
+        );
         // `answered` gives its request's place back as it drops, after this
         // record.
         Some((call, answered.attempt))
@@ -766,6 +786,7 @@ impl Drop for Settling {
                 attempt,
                 &settings,
                 Some("cancelled".to_string()),
+                None,
                 None,
             );
         }

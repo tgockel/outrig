@@ -685,6 +685,7 @@ fn each_event_has_exactly_its_data_fields() {
                 max_tokens: Some(4096),
                 error: Some(text("HTTP 429 Too Many Requests")),
                 usage: None,
+                finish_reason: None,
             }),
             "model.attempt",
             &[
@@ -695,6 +696,7 @@ fn each_event_has_exactly_its_data_fields() {
                 "max_tokens",
                 "error",
                 "usage",
+                "finish_reason",
             ],
         ),
         (

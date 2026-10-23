@@ -1516,6 +1516,7 @@ pub fn outrig::harness::event::MessageId::fmt(&self, &mut core::fmt::Formatter<'
 pub outrig::harness::event::ModelAttempt::attempt_id: outrig::harness::event::AttemptId
 pub outrig::harness::event::ModelAttempt::call_id: outrig::harness::event::CallId
 pub outrig::harness::event::ModelAttempt::error: core::option::Option<alloc::string::String>
+pub outrig::harness::event::ModelAttempt::finish_reason: core::option::Option<alloc::string::String>
 pub outrig::harness::event::ModelAttempt::identifier: alloc::string::String
 pub outrig::harness::event::ModelAttempt::max_tokens: core::option::Option<u32>
 pub outrig::harness::event::ModelAttempt::model: alloc::string::String

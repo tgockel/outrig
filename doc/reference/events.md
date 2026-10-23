@@ -278,7 +278,11 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   - `model`: the `[models.<name>]` row it was sent for; `identifier`: the model the request named
     on the wire; `max_tokens`: the reply ceiling it carried, or `null`.
   - `error`: why it failed -- an HTTP status, a connection error, an unusable response, or
-    `cancelled` for one whose round was dropped -- or `null` when it answered.
+    `cancelled` for one whose round was dropped -- or `null` when it answered. A reply with
+    nothing in it that the provider ended with `stop` or `end_turn` is an answer: the model had
+    nothing to add.
+  - `finish_reason`: the provider's own reason the model stopped, such as `stop`, `end_turn`,
+    `tool_calls`, or `length`, or `null` when its response named none or no response came back.
   - `usage`: what the provider reported it used, or `null`. A request that failed before a
     response came back reports none. An unusable response -- a `200` OutRig could not make a
     completion of -- carries the usage its body reported beside its `error`, because the provider

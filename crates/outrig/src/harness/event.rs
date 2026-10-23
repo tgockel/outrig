@@ -995,6 +995,10 @@ pub struct ModelAttempt {
     pub error: Option<String>,
     /// What the provider reported it used, or `None` when it reported nothing.
     pub usage: Option<Usage>,
+    /// The provider's own reason the model stopped -- `stop`, `end_turn`,
+    /// `tool_calls`, `length` -- or `None` when its response named none, or no
+    /// response came back.
+    pub finish_reason: Option<String>,
 }
 
 /// Which kind of child an agent launched: one that takes submissions and

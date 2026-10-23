@@ -148,7 +148,7 @@ pub(super) fn message(content: Value, stop_reason: &str) -> CannedResponse {
 /// A `200 OK` rig cannot make a completion of: no content at all. Its
 /// `stop_reason` is not `end_turn`, which rig would read as an empty reply.
 pub(super) fn unusable() -> CannedResponse {
-    message(json!([]), "max_tokens")
+    Style::Anthropic.unusable()
 }
 
 /// One text block, round over.
@@ -187,11 +187,29 @@ impl Style {
         }
     }
 
-    /// A `200 OK` rig cannot make a completion of: no content at all.
+    /// A `200 OK` rig cannot make a completion of: no content at all, cut off.
     pub(super) fn unusable(self) -> CannedResponse {
         match self {
-            Style::Anthropic => unusable(),
-            Style::OpenAi => chat(json!({"role": "assistant", "content": ""}), "length"),
+            Style::Anthropic => self.empty("max_tokens"),
+            Style::OpenAi => self.empty("length"),
+        }
+    }
+
+    /// A `200 OK` with no content at all, whose finish reason is
+    /// `finish_reason`.
+    pub(super) fn empty(self, finish_reason: &str) -> CannedResponse {
+        match self {
+            Style::Anthropic => message(json!([]), finish_reason),
+            Style::OpenAi => chat(json!({"role": "assistant", "content": ""}), finish_reason),
+        }
+    }
+
+    /// A model with nothing to add ending its turn: no content, and the
+    /// finish reason a provider gives for the model stopping of its own accord.
+    pub(super) fn empty_stop(self) -> CannedResponse {
+        match self {
+            Style::Anthropic => self.empty("end_turn"),
+            Style::OpenAi => self.empty("stop"),
         }
     }
 
@@ -271,7 +289,7 @@ impl Style {
 
 /// A chat completion choosing `message`, in the shape rig's OpenAI
 /// `CompletionResponse` deserializes.
-fn chat(message: Value, finish_reason: &str) -> CannedResponse {
+pub(super) fn chat(message: Value, finish_reason: &str) -> CannedResponse {
     CannedResponse::new(
         200,
         json!({

@@ -46,7 +46,8 @@
 //! attempt count on top, because an unusable body comes back immediately -- the
 //! budget alone would spend itself on dozens of tries instead of the handful a
 //! hiccup deserves. Sharing the budget keeps `retry-budget-secs = 0` the one
-//! "no retries" knob.
+//! "no retries" knob. It does not retry an empty reply the model ended of its own
+//! accord ([`empty_turn`]).
 //!
 //! The obvious "just use the ecosystem crate" answer is `reqwest-retry`, which
 //! rig itself carries as a dev-dependency. It does not fit: as of 0.9 it does
@@ -77,9 +78,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::RngExt;
 use reqwest::StatusCode;
+use rig::OneOrMany;
 use rig::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage,
-    PromptError,
+    AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
+    GetTokenUsage, PromptError,
 };
 use rig::http_client::{
     Error as HttpError, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request,
@@ -460,7 +462,12 @@ impl HttpClientExt for RetryingHttpClient {
 /// variant means exactly "the provider's body could not be turned into a
 /// completion", which is always the provider's doing and never a local
 /// misconfiguration, and matching the variant leaves no wording to keep in sync
-/// with rig.
+/// with rig. The exception is a reply with nothing in it that the provider says
+/// the model ended on its own ([`is_empty_stop`]): rig's Anthropic provider reads
+/// an empty `end_turn` as a legal empty turn, and the same turn from the
+/// OpenAI-style provider it rejects is no defect either, so it is made the same
+/// completion ([`empty_turn`]). A reply with anything in it, a refusal for one,
+/// is still rig's error.
 ///
 /// A model-layer wrapper is what `deedd83` deliberately removed when the
 /// transient retry moved down to [`RetryingHttpClient`], and it brings back the
@@ -539,7 +546,8 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
 impl<M: CompletionModel> RetryingModel<M> {
     /// One completion from the inner model, and the attempt it settled, once
     /// recorded: with the usage rig gave its completion, or -- when rig could
-    /// make none -- the usage the body reported, and why not.
+    /// make none -- the usage the body reported, and why not. An [`empty_turn`]
+    /// is the completion it comes back as, in place of rig's error.
     async fn attempt(
         &self,
         request: CompletionRequest,
@@ -548,7 +556,12 @@ impl<M: CompletionModel> RetryingModel<M> {
         Option<(CallId, AttemptId)>,
     ) {
         let settling = self.retries.slot.awaiting();
-        let outcome = self.inner.completion(request).await;
+        let mut outcome = self.inner.completion(request).await;
+        if matches!(outcome, Err(CompletionError::ResponseError(_)))
+            && let Some(empty) = settling.body().and_then(|body| empty_turn(&body))
+        {
+            outcome = Ok(empty);
+        }
         let ids = settling.settle(&outcome);
         (outcome, ids)
     }
@@ -660,11 +673,96 @@ impl fmt::Display for BudgetSpent {
 
 impl std::error::Error for BudgetSpent {}
 
+/// The completion of a turn the model ended with nothing to add, for a `200`
+/// rig rejected as empty: the one rig's Anthropic provider makes of an empty
+/// `end_turn`, a lone empty text part. `None` unless the body is an
+/// [`is_empty_stop`] and its own response type; anything else is the provider's
+/// defect, and still rig's `ResponseError`.
+///
+/// rig's run loop reads that completion as a turn that finished, and appends
+/// nothing to the conversation for it, so the round ends with an empty reply,
+/// keeping what it ran, and the attempt is recorded as the answer it was.
+fn empty_turn<R: serde::de::DeserializeOwned>(body: &[u8]) -> Option<CompletionResponse<R>> {
+    if !is_empty_stop(body) {
+        return None;
+    }
+    Some(CompletionResponse {
+        choice: OneOrMany::one(AssistantContent::text("")),
+        usage: body_token_usage(body).unwrap_or_default(),
+        raw_response: serde_json::from_slice(body).ok()?,
+        message_id: None,
+    })
+}
+
+/// Whether `body` is an OpenAI-style reply that has nothing in it and says the
+/// model stopped of its own accord: the first choice's message is the
+/// assistant's, with every field but its role null or empty, and its finish
+/// reason is a normal stop ([`is_normal_stop`]).
+///
+/// A normal stop does not make a reply empty. rig sees only the message's text
+/// and tool calls, so a message that carries a `refusal`, reasoning or anything
+/// else rig sets aside is rejected as empty, too, yet is the provider saying
+/// something, and turning it into a clean empty turn would lose it -- and the
+/// retry and the move to the next model that would have been its answer. So a
+/// field that holds anything, or one of no kind this reads, is not empty, and
+/// neither is a message that is not the assistant's.
+///
+/// Only OpenAI's shape is read. rig reads an empty Anthropic `end_turn` itself,
+/// and the Anthropic reply it rejects has content it could not convert.
+fn is_empty_stop(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Choice {
+        message: serde_json::Map<String, serde_json::Value>,
+        finish_reason: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        choices: Vec<Choice>,
+    }
+    use serde_json::Value;
+
+    let Ok(Envelope { choices }) = serde_json::from_slice(body) else {
+        return false;
+    };
+    let Some(Choice {
+        message,
+        finish_reason,
+    }) = choices.first()
+    else {
+        return false;
+    };
+    // rig reads `model` as the assistant, for the gateways that answer so.
+    let assistant = message
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| matches!(role, "assistant" | "model"));
+    assistant
+        && finish_reason.as_deref().is_some_and(is_normal_stop)
+        && message.iter().all(|(field, value)| {
+            field == "role"
+                || match value {
+                    Value::Null => true,
+                    Value::String(text) => text.is_empty(),
+                    Value::Array(items) => items.is_empty(),
+                    Value::Object(fields) => fields.is_empty(),
+                    Value::Bool(_) | Value::Number(_) => false,
+                }
+        })
+}
+
+/// Whether `reason`, a provider's finish reason, says the model chose to stop:
+/// OpenAI's `stop` and Anthropic's `end_turn`. Every other reason of an empty
+/// reply -- a truncation, a filter -- is a turn that was cut short, and the
+/// provider's defect to retry.
+pub(crate) fn is_normal_stop(reason: &str) -> bool {
+    matches!(reason, "stop" | "end_turn")
+}
+
 /// What a `200`'s body says it used, for a body rig made no completion of and
 /// so took no usage from: `None` when it carries no `usage`, or one of neither
 /// provider's shape.
 ///
-/// Both dialects are tried, as in [`provider_finish_reason`], and each is read
+/// Both dialects are tried, as in [`body_finish_reason`], and each is read
 /// as rig reads its own, through [`GetTokenUsage`], so a count means here what
 /// it means for a response rig could use -- Anthropic's total includes its
 /// cached input, for one.
@@ -677,19 +775,24 @@ impl std::error::Error for BudgetSpent {}
 /// Only the failure path calls it, so the body of a response rig could use is
 /// never parsed twice.
 pub(crate) fn body_usage(body: &[u8]) -> Option<Usage> {
+    reported(body_token_usage(body)?)
+}
+
+/// What a `200`'s body says it used, as rig counts it: [`body_usage`], before
+/// what the provider did not report is told from zeros.
+fn body_token_usage(body: &[u8]) -> Option<rig::completion::Usage> {
     #[derive(Deserialize)]
     struct Envelope {
         usage: Option<serde_json::Value>,
     }
     let envelope: Envelope = serde_json::from_slice(body).ok()?;
     let usage = envelope.usage?;
-    let usage = openai::completion::Usage::deserialize(&usage)
+    openai::completion::Usage::deserialize(&usage)
         .map(|usage| usage.token_usage())
         .or_else(|_| {
             anthropic::completion::Usage::deserialize(&usage).map(|usage| usage.token_usage())
         })
-        .ok()?;
-    reported(usage)
+        .ok()
 }
 
 /// Report a completion that came back with nothing to show for itself.
@@ -737,24 +840,40 @@ fn report_textless_completion<R: serde::Serialize>(
     }
 }
 
-/// The provider's own word for why generation stopped.
+/// The provider's own word for why generation stopped, from the completion's
+/// raw response.
 ///
 /// Rig parses this out of the wire and then drops it before any type outrig
-/// sees, so the only way back to it is the raw response the completion still
-/// carries. Both dialects are checked because both are reachable:
-/// `choices[].finish_reason` is the OpenAI shape and `stop_reason` the
-/// Anthropic one. Returns `None` for a provider that names neither, which
-/// costs the report one clause and nothing else.
+/// sees, so a completion rig made carries it only in the raw response. A
+/// response rig made nothing of is read from its bytes instead
+/// ([`body_finish_reason`]), which is the same reading.
 fn provider_finish_reason<R: serde::Serialize>(raw: &R) -> Option<String> {
-    let value = serde_json::to_value(raw).ok()?;
-    let openai = value
-        .get("choices")
-        .and_then(|choices| choices.get(0))
-        .and_then(|choice| choice.get("finish_reason"));
-    openai
-        .or_else(|| value.get("stop_reason"))
-        .and_then(|reason| reason.as_str())
-        .map(str::to_string)
+    body_finish_reason(&serde_json::to_vec(raw).ok()?)
+}
+
+/// The provider's own word for why generation stopped, from a `200`'s body:
+/// `None` when it names none, or is of neither provider's shape.
+///
+/// Both dialects are checked because both are reachable:
+/// `choices[0].finish_reason` is the OpenAI shape and `stop_reason` the
+/// Anthropic one. It is read for every attempt that is answered, so it names
+/// only the two fields and builds nothing of the reply.
+pub(crate) fn body_finish_reason(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Choice {
+        finish_reason: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        choices: Option<Vec<Choice>>,
+        stop_reason: Option<String>,
+    }
+    let envelope: Envelope = serde_json::from_slice(body).ok()?;
+    envelope
+        .choices
+        .and_then(|choices| choices.into_iter().next())
+        .and_then(|choice| choice.finish_reason)
+        .or(envelope.stop_reason)
 }
 
 /// The retry loop. A free function rather than a method because the future
@@ -1358,6 +1477,131 @@ mod tests {
 
     fn usage_in(body: serde_json::Value) -> Option<Usage> {
         body_usage(&serde_json::to_vec(&body).expect("serializes"))
+    }
+
+    #[test]
+    fn a_finish_reason_is_read_from_either_dialect_and_only_a_stop_is_normal() {
+        let reason = |body: serde_json::Value| {
+            body_finish_reason(&serde_json::to_vec(&body).expect("serializes"))
+        };
+        assert_eq!(
+            reason(serde_json::json!({ "choices": [{ "finish_reason": "stop" }] })),
+            Some("stop".to_string())
+        );
+        assert_eq!(
+            reason(serde_json::json!({ "content": [], "stop_reason": "end_turn" })),
+            Some("end_turn".to_string())
+        );
+        for none in [
+            serde_json::json!({ "choices": [{ "finish_reason": null }] }),
+            serde_json::json!({ "choices": [] }),
+            serde_json::json!({ "stop_reason": null }),
+            serde_json::json!({ "not": "a message" }),
+        ] {
+            assert_eq!(reason(none.clone()), None, "{none}");
+        }
+        assert_eq!(body_finish_reason(b"<html>bad gateway</html>"), None);
+        assert_eq!(body_finish_reason(b""), None);
+
+        for normal in ["stop", "end_turn"] {
+            assert!(is_normal_stop(normal), "{normal}");
+        }
+        for cut_short in ["length", "max_tokens", "content_filter", "tool_calls", ""] {
+            assert!(!is_normal_stop(cut_short), "{cut_short}");
+        }
+    }
+
+    #[test]
+    fn an_empty_body_a_model_ended_on_its_own_is_the_empty_text_completion() {
+        let reply = |message: serde_json::Value, finish_reason: serde_json::Value| {
+            let body = serde_json::json!({
+                "choices": [{ "message": message, "finish_reason": finish_reason }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+            });
+            empty_turn::<serde_json::Value>(&serde_json::to_vec(&body).expect("serializes"))
+        };
+        let turn = |finish_reason: serde_json::Value| {
+            reply(
+                serde_json::json!({ "role": "assistant", "content": "" }),
+                finish_reason,
+            )
+        };
+
+        for stop in ["stop", "end_turn"] {
+            let completion = turn(serde_json::json!(stop)).expect(stop);
+            assert!(
+                matches!(
+                    completion.choice.first(),
+                    AssistantContent::Text(text) if text.text.is_empty()
+                ),
+                "{stop}"
+            );
+            assert_eq!(completion.choice.len(), 1, "{stop}");
+            assert_eq!(completion.usage.total_tokens, 7, "the provider billed it");
+            assert_eq!(completion.raw_response["choices"][0]["finish_reason"], stop);
+        }
+        for cut_short in ["length", "content_filter", "tool_calls"] {
+            assert!(turn(serde_json::json!(cut_short)).is_none(), "{cut_short}");
+        }
+        assert!(turn(serde_json::Value::Null).is_none(), "no finish reason");
+        assert!(empty_turn::<serde_json::Value>(b"<html>bad gateway</html>").is_none());
+
+        // However the provider spells nothing, it is nothing.
+        for nothing in [
+            serde_json::json!({ "role": "assistant" }),
+            serde_json::json!({ "role": "assistant", "content": null, "refusal": null }),
+            serde_json::json!({ "role": "model", "content": [], "tool_calls": [], "audio": {} }),
+            serde_json::json!({ "role": "assistant", "content": "", "reasoning_content": "" }),
+        ] {
+            assert!(
+                reply(nothing.clone(), serde_json::json!("stop")).is_some(),
+                "{nothing}"
+            );
+        }
+    }
+
+    /// A normal stop is not a reply with nothing in it: whatever else the
+    /// message carries is the provider saying something rig set aside, so the
+    /// reply stays rig's error, retried and failed over as it was.
+    #[test]
+    fn a_reply_with_anything_in_it_is_not_an_empty_turn_whatever_its_finish_reason() {
+        let stopped = |message: serde_json::Value| {
+            let body = serde_json::json!({
+                "choices": [{ "message": message, "finish_reason": "stop" }],
+            });
+            empty_turn::<serde_json::Value>(&serde_json::to_vec(&body).expect("serializes"))
+        };
+
+        for something in [
+            // A refusal in the field rig does not read, with nothing else.
+            serde_json::json!({ "role": "assistant", "content": null, "refusal": "I can't" }),
+            // Reasoning and nothing to show for it.
+            serde_json::json!({ "role": "assistant", "content": "", "reasoning_details": [{}] }),
+            serde_json::json!({ "role": "assistant", "content": "", "reasoning_content": "hm" }),
+            // Text of a kind rig does not take, a call it cannot use.
+            serde_json::json!({ "role": "assistant", "content": [{ "type": "text" }] }),
+            serde_json::json!({ "role": "assistant", "tool_calls": [{ "id": "c" }] }),
+            serde_json::json!({ "role": "assistant", "content": "", "something": 1 }),
+            // Not the assistant's, or not saying whose.
+            serde_json::json!({ "role": "tool", "content": "" }),
+            serde_json::json!({ "role": "user", "content": "" }),
+            serde_json::json!({ "role": null, "content": "" }),
+            serde_json::json!({ "content": "" }),
+        ] {
+            assert!(stopped(something.clone()).is_none(), "{something}");
+        }
+        // No message to say it of, or no choice to hold one.
+        for body in [
+            serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }),
+            serde_json::json!({ "choices": [] }),
+            serde_json::json!({ "choices": [null] }),
+            // Anthropic's reply is read by rig, or it has content rig could not use.
+            serde_json::json!({ "content": [], "stop_reason": "end_turn" }),
+            serde_json::json!({ "content": [{ "type": "other" }], "stop_reason": "end_turn" }),
+        ] {
+            let body = serde_json::to_vec(&body).expect("serializes");
+            assert!(empty_turn::<serde_json::Value>(&body).is_none());
+        }
     }
 
     #[test]

@@ -3923,6 +3923,231 @@ async fn an_unusable_openai_response_is_counted_unless_its_body_reported_no_usag
     );
 }
 
+/// A model with nothing to add after a tool call can end its turn with an
+/// empty reply, which is the model's to give -- the provider says it stopped of
+/// its own accord -- and no defect. The round ends on it as it would on a reply
+/// of nothing: no retry, no failure, the Python it ran kept, and the attempt
+/// recorded as the answer it was, with what the provider billed and why the
+/// model stopped. rig reads one wire's empty reply this way and rejects the
+/// other's, so both are held to it.
+#[tokio::test]
+async fn an_empty_reply_the_model_ended_on_its_own_ends_the_round_without_a_retry() {
+    for style in Style::ALL {
+        let var = format!(
+            "OUTRIG_TEST_AGENT_EMPTY_STOP_{}",
+            style.name().to_uppercase()
+        );
+        let dir = tempfile::tempdir().expect("a log dir");
+        let (events, mut submitted) = watched(Some(dir.path())).await;
+        let (mut agent, mut requests) = retrying_agent_in(
+            style,
+            &var,
+            events,
+            vec![style.submit("call_1", "print('ran')"), style.empty_stop()],
+        )
+        .await;
+
+        let end = round_end(&mut agent, "run it").await;
+        shut_down(agent).await;
+
+        assert_eq!(end.reply, "", "{style:?}");
+        assert_eq!(end.stopped, None, "{style:?}");
+        assert_eq!(submissions(&mut submitted), ["print('ran')"], "{style:?}");
+        assert_eq!(
+            mock_http::drain(&mut requests).len(),
+            2,
+            "{style:?}: the call, then one after its result"
+        );
+        let records = events::recorded(dir.path());
+        assert!(
+            events::of_kind(&records, "model.retry").is_empty(),
+            "{style:?}"
+        );
+        let (asked, stopped) = match style {
+            Style::Anthropic => ("tool_use", "end_turn"),
+            Style::OpenAi => ("tool_calls", "stop"),
+        };
+        let attempts = events::of_kind(&records, "model.attempt");
+        assert_eq!(attempts.len(), 2, "{style:?}: {attempts:#?}");
+        assert_eq!(attempts[0]["finish_reason"], asked, "{style:?}");
+        assert_eq!(attempts[1]["error"], json!(null), "{style:?}");
+        assert_eq!(attempts[1]["usage"], usage_json(12, 7), "{style:?}");
+        assert_eq!(attempts[1]["finish_reason"], stopped, "{style:?}");
+        let ended = events::of_kind(&records, "model.round.completed");
+        assert_eq!(ended.len(), 1, "{style:?}");
+        assert_eq!(ended[0]["stopped"], json!(null), "{style:?}");
+        assert_eq!(ended[0]["usage"], usage_json(24, 14), "{style:?}");
+        assert_eq!(
+            ended[0]["calls"].as_array().map(Vec::len),
+            Some(2),
+            "{style:?}: the empty reply is a call of the round, as any other"
+        );
+        assert!(
+            events::of_kind(&records, "model.round.failed").is_empty(),
+            "{style:?}"
+        );
+    }
+}
+
+/// Nothing is committed for a turn the model ended with nothing to say, so the
+/// conversation the next round is sent has no empty message of the model's in
+/// it, which a provider may refuse.
+#[tokio::test]
+async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
+    for style in Style::ALL {
+        let var = format!(
+            "OUTRIG_TEST_AGENT_AFTER_EMPTY_{}",
+            style.name().to_uppercase()
+        );
+        let (mut agent, mut requests) = retrying_agent_in(
+            style,
+            &var,
+            Events::default(),
+            vec![
+                style.submit("call_1", "print('ran')"),
+                style.empty_stop(),
+                style.text("done"),
+            ],
+        )
+        .await;
+
+        assert_eq!(round(&mut agent, "run it").await, "", "{style:?}");
+        assert_eq!(round(&mut agent, "again").await, "done", "{style:?}");
+        shut_down(agent).await;
+
+        let recorded = mock_http::drain(&mut requests);
+        assert_eq!(recorded.len(), 3, "{style:?}");
+        // The request after the empty reply is the one before it, which ended on
+        // the `send`'s result, and the round's opening: no message of the model's
+        // between them.
+        assert_eq!(
+            messages(&recorded[2]).len(),
+            messages(&recorded[1]).len() + 1,
+            "{style:?}: {:#}",
+            recorded[2].body
+        );
+    }
+}
+
+/// A reply rig rejects that is not an empty reply the model ended on its own --
+/// cut off or filtered, or with something in it rig set aside -- is the
+/// provider's defect: retried twice, and then the round fails, keeping the
+/// Python it ran. The attempts record why each stopped.
+async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+    style: Style,
+    kind: &str,
+    reply: mock_http::CannedResponse,
+    finish_reason: &str,
+) {
+    let var = format!(
+        "OUTRIG_TEST_AGENT_EMPTY_{}_{}",
+        style.name().to_uppercase(),
+        kind.to_uppercase()
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (events, mut submitted) = watched(Some(dir.path())).await;
+    let (mut agent, mut requests) = retrying_agent_in(
+        style,
+        &var,
+        events,
+        vec![style.submit("call_1", "print('ran')"), reply],
+    )
+    .await;
+
+    post(&agent, "run it").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("a reply that is never usable"),
+    );
+    shut_down(agent).await;
+
+    assert!(ran, "{err}");
+    assert_eq!(submissions(&mut submitted), ["print('ran')"]);
+    assert_eq!(
+        mock_http::drain(&mut requests).len(),
+        4,
+        "the call, the empty reply, and its two retries"
+    );
+    let records = events::recorded(dir.path());
+    assert_eq!(events::of_kind(&records, "model.retry").len(), 2);
+    let attempts = events::of_kind(&records, "model.attempt");
+    for attempt in &attempts[1..] {
+        assert!(
+            attempt["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("unusable response")),
+            "{attempt}"
+        );
+        assert_eq!(attempt["finish_reason"], finish_reason);
+    }
+    assert!(events::of_kind(&records, "model.round.completed").is_empty());
+    assert_eq!(events::of_kind(&records, "model.round.failed").len(), 1);
+}
+
+#[tokio::test]
+async fn an_anthropic_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
+    let style = Style::Anthropic;
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        style,
+        "max_tokens",
+        style.empty("max_tokens"),
+        "max_tokens",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_openai_reply_cut_off_with_nothing_in_it_still_fails_the_round() {
+    let style = Style::OpenAi;
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        style,
+        "length",
+        style.empty("length"),
+        "length",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
+    let style = Style::OpenAi;
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        style,
+        "content_filter",
+        style.empty("content_filter"),
+        "content_filter",
+    )
+    .await;
+}
+
+/// The model said something -- a refusal, in the field rig does not read -- and
+/// stopped. A normal finish reason does not make that an empty turn, and
+/// calling it one would end the round without the provider's word, with no retry.
+#[tokio::test]
+async fn an_openai_refusal_that_stopped_normally_is_not_an_empty_turn() {
+    let reply = mock_http::chat(
+        json!({ "role": "assistant", "content": null, "refusal": "I can't help with that." }),
+        "stop",
+    );
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(Style::OpenAi, "refusal", reply, "stop")
+        .await;
+}
+
+/// A message that is not the assistant's, however it stopped, is not the model
+/// ending its turn.
+#[tokio::test]
+async fn an_openai_reply_that_is_not_the_assistants_is_not_an_empty_turn() {
+    let reply = mock_http::chat(json!({ "role": "user", "content": "" }), "stop");
+    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+        Style::OpenAi,
+        "wrong_role",
+        reply,
+        "stop",
+    )
+    .await;
+}
+
 /// A chain whose first model cannot be reached answers from the second, and
 /// the record says so: the move, and the model that answered the call.
 #[tokio::test]
@@ -5435,7 +5660,8 @@ async fn a_stalled_subscriber_never_delays_a_round() {
 /// call of three attempts: each request sent is recorded once, failed ones
 /// included, with what it was sent with -- the model, its identifier, its
 /// ceiling -- and a usage that is null where the provider reported none, and
-/// what it reported where it did.
+/// what it reported where it did, and a `finish_reason` that is null where no
+/// response came back.
 #[tokio::test]
 async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
     let vars = "OUTRIG_TEST_AGENT_ATTEMPTS";
@@ -5477,6 +5703,7 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
                 "max_tokens": 1024,
                 "error": "HTTP 429 Too Many Requests",
                 "usage": null,
+                "finish_reason": null,
             }),
             &json!({
                 "call_id": 1,
@@ -5486,6 +5713,7 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
                 "max_tokens": 1024,
                 "error": "HTTP 401 Unauthorized",
                 "usage": null,
+                "finish_reason": null,
             }),
             &json!({
                 "call_id": 1,
@@ -5495,6 +5723,7 @@ async fn a_retried_then_moved_call_has_one_call_id_and_three_attempts() {
                 "max_tokens": 2048,
                 "error": null,
                 "usage": usage_json(40, 5),
+                "finish_reason": "end_turn",
             }),
         ]
     );

@@ -476,7 +476,9 @@ window mends that.
 
 **A failing provider is retried, then left for the next model.** A call that fails in a way that
 may clear -- a rate limit, a 5xx, a dropped connection, a response OutRig cannot use -- is made
-again within `retry-budget-secs`, as in `run`, and stderr says so. When the model is an alias of
+again within `retry-budget-secs`, as in `run`, and stderr says so. A reply with nothing in it that
+the provider ends with `stop` or `end_turn` is no such failure: it is a model with nothing to add,
+and the round ends without an error, keeping any Python it ran. When the model is an alias of
 several, a call that still fails moves to the next, as in `run`, and each call starts again at
 the first. Each model a call goes to is sent a conversation chosen for its own window, which may
 leave out more than another's did. When every model has failed, the round ends with each one's
