@@ -1361,6 +1361,8 @@ pub outrig::harness::event::Payload::ModelRoundFailed::usage: core::option::Opti
 pub outrig::harness::event::Payload::ModelRoundUsage::attempts: alloc::vec::Vec<outrig::harness::event::AttemptId>
 pub outrig::harness::event::Payload::ModelRoundUsage::round: u32
 pub outrig::harness::event::Payload::ModelRoundUsage::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelText
+pub outrig::harness::event::Payload::ModelText::text: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::ModelUsageRefused
 pub outrig::harness::event::Payload::ModelUsageRefused::attempt_id: outrig::harness::event::AttemptId
 pub outrig::harness::event::Payload::ModelUsageRefused::call_id: core::option::Option<outrig::harness::event::CallId>

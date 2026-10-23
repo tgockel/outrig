@@ -99,6 +99,8 @@ pub(super) enum Fact {
     Taken,
     /// The agent sent the user a message.
     AgentSent,
+    /// The model said this in a reply, tool calls or not.
+    Said(String),
     /// A line about the session, for the conversation or for the detail
     /// view.
     Note {
@@ -340,6 +342,7 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
             ),
             inline: true,
         },
+        Payload::ModelText { text, .. } => Fact::Said(text.clone()),
         Payload::ModelInstructions { .. }
         | Payload::TurnCommitted { .. }
         | Payload::ModelUsageReplaced { .. }

@@ -176,7 +176,8 @@ impl Entry {
             | Fact::Attempted
             | Fact::Posted
             | Fact::Taken
-            | Fact::AgentSent => return None,
+            | Fact::AgentSent
+            | Fact::Said(_) => return None,
         };
         Some(entry)
     }
@@ -326,6 +327,7 @@ mod tests {
             Fact::Posted,
             Fact::Taken,
             Fact::AgentSent,
+            Fact::Said("hello".into()),
             Fact::Attempted,
             Fact::AgentStarted { model: "m".into() },
         ] {

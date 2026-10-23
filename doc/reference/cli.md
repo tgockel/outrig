@@ -493,9 +493,10 @@ records each retry and each move, and names the model that answered each call.
 that terminal with a screen. The conversation -- each line you send, marked `›`, and each message
 the agent sends you -- is printed into the terminal's own scrollback, where it stays after the
 session ends, and a status line and an input box sit below it. The status line says what the session
-is doing: the model working, Python running and for how long, a failed call and when it is retried,
-how many of your messages the agent has yet to read, what the last round left running, and the
-tokens spent. The agent's working -- the model's own text, each submission's source and what it
+is doing: the model working -- the latest thing it said, once it has said anything, each message
+replacing the last -- Python running and for how long, a failed call and when it is retried, how
+many of your messages the agent has yet to read, what the last round left running, and the tokens
+spent. The agent's working -- the model's own text in full, each submission's source and what it
 printed, retries and failovers, and log lines -- stays out of the conversation. Ctrl-O opens it in a
 view of its own, scrolled with the arrow keys, PgUp and PgDn, Home and End, and closed with Esc;
 with `-v` it is printed in the conversation too. A round in which the agent sent you nothing ends on

@@ -172,6 +172,10 @@ pub enum Payload {
         incomplete: bool,
         messages: Vec<Value>,
     },
+    /// The text of a model's reply, as the call that made it returned. A
+    /// reply with no text says nothing here.
+    #[non_exhaustive]
+    ModelText { text: String },
     /// What a model call was sent of the conversation, and why.
     ModelCall(ModelCall),
     #[non_exhaustive]
@@ -533,6 +537,7 @@ impl Payload {
         match self {
             Payload::ModelInstructions { .. } => "model.instructions",
             Payload::TurnCommitted { .. } => "turn.committed",
+            Payload::ModelText { .. } => "model.text",
             Payload::ModelCall(_) => "model.call",
             Payload::ExecSubmitted { .. } => "exec.submitted",
             Payload::SessionState { .. } => "session.state",

@@ -132,6 +132,9 @@ category says what it may hold.
     are OutRig's note saying so.
   - `messages`: the turn's messages, in [rig](https://docs.rs/rig-core)'s own JSON form, which can
     change when OutRig upgrades rig. The first turn of a round begins with the round's opening.
+- `model.text` -- what a model said in a reply, as the call returns: its text parts joined. A reply
+  with no text, only tool calls or reasoning, records none.
+  - `text`: the text.
 - `model.call` -- a model call, as it is made: its manifest.
   - `call`: the session's manifests counted from 0.
   - `call_id`: the model call it was assembled for, from 1, which names the call in every model

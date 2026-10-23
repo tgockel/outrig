@@ -439,6 +439,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `total`, the attempts and spend of the children a round launched, and `model.round.usage`
   records what they spent after the round ended. `ShutdownReport::requests` lists each request
   open at the close as a `RequestOutcome`.
+- **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
+  `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
+  model talks while it works records each thing it said, not only the closing reply.
 
 ### Changed
 

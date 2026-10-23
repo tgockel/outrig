@@ -64,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **On a terminal, `outrig run-new` shows the conversation and keeps the agent's working aside.**
   With stdin and stdout both the terminal, what you send and what the agent sends you print into
   the terminal's scrollback, and below them a status line says what the session is doing -- the
-  model working, Python running and for how long, a retry, your messages the agent has yet to
+  model working -- the latest thing it said, once it has said anything -- Python running and
+  for how long, a retry, your messages the agent has yet to
   read, the tokens spent -- above an input box with line editing, in-memory recall, Alt-Enter for
   a new line, and a paste sent as one message. The model's own text, each submission and what it
   printed, retries, and log lines open in a view of their own on Ctrl-O, or print in the

@@ -487,6 +487,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
+        ("model.text", {"text": "t"}, a),
         (
             "model.attempt",
             {

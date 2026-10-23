@@ -129,6 +129,18 @@ pub(crate) async fn round(
     ended
 }
 
+/// The text parts of `content`, joined: what a model said, less its tool
+/// calls and reasoning.
+fn spoken(content: &OneOrMany<AssistantContent>) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Whether `reply` says nothing a person could read.
 fn is_blank(reply: &str) -> bool {
     reply.trim().is_empty()
@@ -631,6 +643,12 @@ impl AgentHook<FailoverModel> for RoundHook {
             StepEvent::CompletionResponse { response, .. } => {
                 let mut journal = self.journal();
                 journal.latest.reply = Some(response.choice.clone());
+                let text = spoken(&response.choice);
+                if !is_blank(&text) {
+                    self.history
+                        .events()
+                        .emit_with(|| Payload::ModelText { text });
+                }
                 // rig counts its turns from one; the event log counts calls
                 // from zero.
                 // The chain has just recorded the request that answered.

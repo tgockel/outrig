@@ -14,6 +14,9 @@ use super::facts::{Fact, Phase, cut};
 /// How many characters of a retried call's error the line shows.
 const ERROR_MAX: usize = 60;
 
+/// How many characters of what the model said the line shows.
+const SAID_MAX: usize = 200;
+
 #[derive(Debug)]
 pub(super) struct Status {
     phase: Phase,
@@ -29,6 +32,9 @@ pub(super) struct Status {
     waiting: Option<u64>,
     /// What the last round's code left running.
     still_running: Option<String>,
+    /// What the model last said this round, which stands in for "is working"
+    /// until it says more.
+    said: Option<String>,
     /// Whether the agent has sent the user anything since the round started.
     sent: bool,
 }
@@ -51,6 +57,7 @@ impl Default for Status {
             tokens: 0,
             waiting: Some(0),
             still_running: None,
+            said: None,
             sent: false,
         }
     }
@@ -74,6 +81,7 @@ impl Status {
             Fact::RoundStarted { .. } => {
                 self.sent = false;
                 self.still_running = None;
+                self.said = None;
             }
             Fact::Submitted { exec, .. } => {
                 self.running = Some((*exec, now));
@@ -100,6 +108,7 @@ impl Status {
             Fact::RoundEnded { tokens, .. } => {
                 self.tokens += tokens.unwrap_or(0);
                 self.retry = None;
+                self.said = None;
             }
             Fact::Spent(tokens) => {
                 self.tokens += tokens;
@@ -119,6 +128,7 @@ impl Status {
                 self.sent = true;
                 return false;
             }
+            Fact::Said(text) => self.said = Some(text.clone()),
             Fact::Missed(_) => self.waiting = None,
             Fact::Exec { .. } | Fact::Note { .. } | Fact::Other { .. } => return false,
         }
@@ -163,9 +173,10 @@ impl Status {
                     "{model} failed ({error}); retrying in {}",
                     elapsed(at.saturating_duration_since(now))
                 )),
-                _ => parts.push(match &self.model {
-                    Some(model) => format!("{model} is working"),
-                    None => "the model is working".to_string(),
+                _ => parts.push(match (&self.said, &self.model) {
+                    (Some(said), _) => cut(&said.split_whitespace().collect::<Vec<_>>().join(" "), SAID_MAX),
+                    (None, Some(model)) => format!("{model} is working"),
+                    (None, None) => "the model is working".to_string(),
                 }),
             },
             Phase::Ready => {
@@ -302,6 +313,38 @@ mod tests {
             "sonnet is working"
         );
         status.apply(&Fact::Attempted, now);
+        assert_eq!(status.shown(now).text, "sonnet is working");
+    }
+
+    /// What the model said stands in for "is working", each message replaces
+    /// the last, and the round's start and end clear it.
+    #[test]
+    fn the_latest_thing_the_model_said_replaces_is_working() {
+        let now = Instant::now();
+        let mut status = after(
+            &[
+                Fact::AgentStarted {
+                    model: "sonnet".into(),
+                },
+                Fact::Phase(Phase::Model),
+            ],
+            now,
+        );
+        assert!(status.apply(&Fact::Said("Reading\n  the   code".into()), now));
+        assert_eq!(status.shown(now).text, "Reading the code");
+        status.apply(&Fact::Said("Now testing".into()), now);
+        assert_eq!(status.shown(now).text, "Now testing");
+        // It outlasts the call it came from, and the Python that call ran.
+        status.apply(&Fact::Phase(Phase::Python), now);
+        status.apply(&Fact::Phase(Phase::Model), now);
+        status.apply(
+            &Fact::Calling {
+                model: "sonnet".into(),
+            },
+            now,
+        );
+        assert_eq!(status.shown(now).text, "Now testing");
+        status.apply(&Fact::RoundStarted { round: 2 }, now);
         assert_eq!(status.shown(now).text, "sonnet is working");
     }
 
