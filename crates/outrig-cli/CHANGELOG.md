@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig ls` lines its columns up around a name that is not plain ASCII.** Column widths were
+  measured in bytes while the padding that applied them counted `char`s, so a multi-byte
+  image-config name threw the table off twice over. An `IMAGE` cell is the key of an
+  `[images.<name>]` block, and for an `image-name` config that key is only a label held to no
+  grammar -- any UTF-8 the user wrote. Because the widest cell sets the column, one such name
+  misaligned every *other* row as well, not just its own. Widths are now counted in terminal
+  display columns and the padding is applied in the same unit, so a double-width character (any
+  CJK name, an emoji) costs the two columns it occupies rather than one or three. The `EXIT` cell
+  of a symlinked row is padded the same way, so the `-> <target>` suffixes line up under each
+  other. A cell wider than its column still pushes its own row out rather than being cut. (#371)
 - **`outrig mcp --attach` proxies the servers its container's image declares, not the ones its
   tag now declares.** The primary's `org.outrig.mcp` label was read by image tag, and a tag is a
   pointer: a pull of a re-pushed `registry/x:latest` re-points it while the container someone

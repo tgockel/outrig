@@ -84,6 +84,11 @@ toml               = { workspace = true, default-features = true, features = ["s
 toml_edit          = { workspace = true, default-features = true }
 tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }
+# `outrig ls` pads its columns to a display width, which is neither a byte
+# count nor a `char` count. No `cjk`: the table is not rendered differently in
+# an East Asian locale, and the feature only changes how *ambiguous*-width
+# characters are counted -- a context this has no way to know it is in.
+unicode-width      = { workspace = true, default-features = false }
 walkdir            = { workspace = true, default-features = true }
 
 [dev-dependencies]

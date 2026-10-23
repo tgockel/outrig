@@ -29,6 +29,42 @@ async fn drain<R: AsyncReadExt + Unpin>(mut r: R) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// The display column each cell of a rendered `ls` row starts in. Cells are
+/// separated by at least the two spaces `render_table` writes between them,
+/// and no cell holds two spaces of its own, so a run of two or more ends one.
+///
+/// Counted in display columns rather than `char`s, since that is the unit the
+/// reader's alignment is in and the unit a `"日本語"` cell differs from its
+/// `char` count in. The width rules this needs are only the East Asian ones
+/// (`width 2`), so it reimplements that much rather than giving the test crate
+/// its own `unicode-width` dependency -- and reimplementing it keeps the
+/// assertion independent of the table the code under test measures with.
+fn cell_columns(line: &str) -> Vec<usize> {
+    let wide = |c: char| {
+        ('\u{1100}'..='\u{115F}').contains(&c)
+            || ('\u{2E80}'..='\u{A4CF}').contains(&c)
+            || ('\u{AC00}'..='\u{D7A3}').contains(&c)
+            || ('\u{F900}'..='\u{FAFF}').contains(&c)
+            || ('\u{FF00}'..='\u{FF60}').contains(&c)
+            || ('\u{FFE0}'..='\u{FFE6}').contains(&c)
+    };
+    let mut cols = vec![0];
+    let mut col = 0;
+    let mut spaces = 0;
+    for c in line.chars() {
+        if c == ' ' {
+            spaces += 1;
+        } else {
+            if spaces >= 2 {
+                cols.push(col);
+            }
+            spaces = 0;
+        }
+        col += if wide(c) { 2 } else { 1 };
+    }
+    cols
+}
+
 // -------- ls --------
 
 #[tokio::test]
@@ -110,6 +146,114 @@ async fn ls_renders_image_column_for_legacy_and_absent_records() {
     assert!(
         drain(stderr_r).await.is_empty(),
         "neither shape is a skip -- both parsed"
+    );
+}
+
+/// Column widths are display widths: neither byte counts nor `char` counts.
+/// An image-config name is the key of an `[images.<name>]` block, which for an
+/// `image-name` config is only a label held to no grammar -- so it can be any
+/// UTF-8 the user wrote.
+///
+/// `"日本語"` is three characters in nine bytes that occupy six columns, so it
+/// separates all three measures, and it is the longest IMAGE cell, so it is
+/// the one that sets the column. Measuring it in bytes made the column nine
+/// wide and then padded it by `char`s to nine, pushing this row six columns
+/// past every other (#371); measuring it in `char`s moves the same row the
+/// other way. Only measuring and padding in display columns lines them up.
+#[tokio::test]
+async fn ls_aligns_columns_around_a_non_ascii_image_name() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    for (sid_s, image) in [
+        ("20260430T091203-44d2", "日本語"),
+        ("20260501T134412-3f2a", "web"),
+    ] {
+        let sid = SessionId(sid_s.into());
+        let mut s = sample_session(&sid);
+        s.image_config_name = Some(image.to_string());
+        s.ended_at = Some(s.started_at + Duration::from_secs(90));
+        s.exit_code = Some(0);
+        store.create(&sid, None, &mut s).expect("create");
+    }
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+    let rc = ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    let out = drain(stdout_r).await;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "a header and two rows; got\n{out}");
+    let exits: Vec<usize> = lines
+        .iter()
+        .map(|l| {
+            let cols = cell_columns(l);
+            assert_eq!(cols.len(), 5, "five columns in {l:?}");
+            cols[4]
+        })
+        .collect();
+    assert!(
+        exits.iter().all(|c| *c == exits[0]),
+        "every EXIT cell should start in the same column; got\n{out}"
+    );
+}
+
+/// The `-> <target>` of a symlinked row sits past a padded EXIT cell, so the
+/// targets line up under each other as the columns before them do.
+#[tokio::test]
+async fn ls_aligns_the_link_targets_of_symlinked_rows() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    let dirs: Vec<tempfile::TempDir> = (0..2)
+        .map(|_| tempfile::tempdir().expect("tempdir session"))
+        .collect();
+    // The exit codes differ in width, so only padding the EXIT cell can line
+    // the two targets up.
+    for ((sid_s, image, exit), dir) in [
+        ("20260430T091203-44d2", "日本語", 0),
+        ("20260501T134412-3f2a", "web", 130),
+    ]
+    .iter()
+    .zip(&dirs)
+    {
+        let sid = SessionId((*sid_s).into());
+        let mut s = sample_session(&sid);
+        s.image_config_name = Some((*image).to_string());
+        s.exit_code = Some(*exit);
+        store
+            .create(&sid, Some(dir.path()), &mut s)
+            .expect("create");
+    }
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+    let rc = ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    let out = drain(stdout_r).await;
+    let arrows: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("-> "))
+        .map(|l| {
+            let cols = cell_columns(l);
+            assert_eq!(cols.len(), 6, "the target is a sixth column in {l:?}");
+            cols[5]
+        })
+        .collect();
+    assert_eq!(arrows.len(), 2, "both rows are symlinked; got\n{out}");
+    assert_eq!(
+        arrows[0], arrows[1],
+        "both link targets should start in the same column; got\n{out}"
     );
 }
 

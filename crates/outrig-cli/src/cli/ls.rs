@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use clap::Parser;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use unicode_width::UnicodeWidthStr;
 
 use crate::error::Result;
 use crate::session::{self, Session, SessionStore};
@@ -79,6 +80,10 @@ where
 /// Hand-rolled column padding (per task notes: don't pull in a table crate).
 /// Columns: `ID`, `STARTED`, `DURATION`, `IMAGE`, `EXIT`. The `EXIT`
 /// column trails with `-> <target>` for symlinked entries.
+///
+/// Every width here is a count of terminal display columns, which is what the
+/// reader's alignment is in. See [`padded`] for why the format specifier's own
+/// padding can't be used for it.
 fn render_table(sessions: &[Session], now: SystemTime) -> String {
     let rows: Vec<Row> = sessions.iter().map(|s| Row::from_session(s, now)).collect();
 
@@ -90,37 +95,35 @@ fn render_table(sessions: &[Session], now: SystemTime) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<image_w$}  EXIT",
-        "ID",
-        "STARTED",
-        "DURATION",
-        "IMAGE",
-        id_w = id_w,
-        started_w = started_w,
-        duration_w = duration_w,
-        image_w = image_w,
+        "{}  {}  {}  {}  EXIT",
+        padded("ID", id_w),
+        padded("STARTED", started_w),
+        padded("DURATION", duration_w),
+        padded("IMAGE", image_w),
     );
     for r in &rows {
         let exit_cell = match &r.link_target {
-            Some(t) => format!("{:<3}  -> {}", r.exit, t),
+            Some(t) => format!("{}  -> {}", padded(&r.exit, EXIT_W), t),
             None => r.exit.clone(),
         };
         let _ = writeln!(
             out,
-            "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<image_w$}  {}",
-            r.id,
-            r.started,
-            r.duration,
-            r.image,
+            "{}  {}  {}  {}  {}",
+            padded(&r.id, id_w),
+            padded(&r.started, started_w),
+            padded(&r.duration, duration_w),
+            padded(&r.image, image_w),
             exit_cell,
-            id_w = id_w,
-            started_w = started_w,
-            duration_w = duration_w,
-            image_w = image_w,
         );
     }
     out
 }
+
+/// What the `EXIT` cell of a symlinked row is padded to before its
+/// `-> <target>` suffix, so the targets line up under each other. Exit codes
+/// are at most three digits (`130`, `143`) and `-` for a session still
+/// running.
+const EXIT_W: usize = 3;
 
 struct Row {
     id: String,
@@ -156,12 +159,33 @@ impl Row {
     }
 }
 
+/// The widest of `header` and `values`, in terminal display columns.
+///
+/// Not bytes: an `IMAGE` cell is an image-config name, and the key of an
+/// `image-name` block is only a label -- it is held to no grammar, so it can
+/// be any UTF-8 the user wrote. Counting its bytes padded every row of the
+/// table by that name's continuation bytes (#371).
 fn max_width<'a, I: IntoIterator<Item = &'a str>>(header: &str, values: I) -> usize {
-    let mut w = header.len();
-    for v in values {
-        if v.len() > w {
-            w = v.len();
-        }
-    }
-    w
+    values
+        .into_iter()
+        .map(UnicodeWidthStr::width)
+        .fold(header.width(), usize::max)
+}
+
+/// `cell`, then the spaces that carry the next column to `w` display columns.
+///
+/// `{:<w$}` is not this and cannot be made into it: it pads to `w` *`char`s*,
+/// so a cell holding a double-width character -- any CJK name, an emoji -- is
+/// left one space too wide for each one however the width was counted. Doing
+/// the padding here keeps one answer for "how wide is this text" across the
+/// measuring and the writing, which is what [`UnicodeWidthStr::width`] gives.
+///
+/// A cell wider than `w` is written whole and pushes its row out of line,
+/// which is the honest rendering: the alternative is to cut a name in half.
+fn padded(cell: &str, w: usize) -> String {
+    let pad = w.saturating_sub(cell.width());
+    let mut out = String::with_capacity(cell.len() + pad);
+    out.push_str(cell);
+    out.extend(std::iter::repeat_n(' ', pad));
+    out
 }
