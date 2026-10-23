@@ -1,5 +1,6 @@
 //! What the model is told before anything else: the system prompt's opening,
-//! ahead of whatever preamble the agent's config supplies.
+//! ahead of whatever preamble the agent's config supplies and of the
+//! repository's own instructions for agents, which follow that.
 //!
 //! It carries only what an agent cannot learn by looking and will need every
 //! round (`plan/phase/0003-python/discovery.md`). That names persist and that
@@ -29,6 +30,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::history::Window;
+use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
 use crate::harness::event::InputBrief;
 
@@ -37,7 +39,8 @@ const ACT: &str = "You act on this project by writing Python. Your one tool, `su
                    code in a persistent interpreter inside the project's container; it is the \
                    only way to read a file, run a command, or change anything.\n\n";
 
-/// The orientation, then `configured` after a blank line when there is one.
+/// The orientation, then `configured` after a blank line when there is one,
+/// then the repository's `instructions` after another.
 ///
 /// `workspace` is where the interpreter's working directory is: the primary's
 /// `-w`, which is its workspace mount. Without one there is nothing true to
@@ -48,6 +51,7 @@ pub(crate) fn preamble(
     workspace: Option<&Path>,
     bindings: &[Brief],
     configured: Option<&str>,
+    instructions: Option<&Instructions>,
     window: Window,
 ) -> String {
     let mut text = String::from(ACT);
@@ -74,6 +78,10 @@ pub(crate) fn preamble(
     if let Some(configured) = configured {
         text.push_str("\n\n");
         text.push_str(configured);
+    }
+    if let Some(instructions) = instructions {
+        text.push_str("\n\n");
+        text.push_str(&instructions.section());
     }
     text
 }

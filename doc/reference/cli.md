@@ -353,7 +353,9 @@ outrig run-new [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block, as for
-  `run`. Its `preamble` follows OutRig's own orientation in the system prompt.
+  `run`. Its `preamble` follows OutRig's own orientation in the system prompt, and the
+  workspace's `AGENTS.md` follows that unless `repo-instructions` turns it off (see
+  [`[agents.<name>]`](config.md#agentsname)).
 - `--image <name>` (default: from agent or `default-image`, else the built-in default): the
   `[images.<name>]` block to launch. Unlike `run`, a local image ref no block names is refused.
 - `--model <name>` (default: agent's `model`, else `default-model`): as for `run`, aliases and

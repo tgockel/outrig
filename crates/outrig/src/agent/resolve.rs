@@ -18,7 +18,7 @@ use super::AgentError;
 use super::budget::Budget;
 use crate::config::{
     Agent, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
-    RoleAlternation, Secrets,
+    RepoInstructions, RoleAlternation, Secrets,
 };
 use crate::error::OutrigError;
 
@@ -207,6 +207,9 @@ pub(crate) struct ResolvedAgent {
     /// The agent's configured preamble, which the system prompt carries after
     /// the orientation.
     pub(crate) preamble: Option<String>,
+    /// Whether the system prompt also carries the repository's instructions
+    /// for agents, which it puts after the preamble.
+    pub(crate) repo_instructions: RepoInstructions,
     pub(crate) temperature: Option<f32>,
     pub(crate) tool_call_max: usize,
     pub(crate) tool_result_max_bytes: usize,
@@ -390,6 +393,7 @@ pub(crate) fn resolve_agent(
         model: model_name.to_string(),
         candidates,
         preamble: agent.preamble.clone(),
+        repo_instructions: agent.repo_instructions.unwrap_or_default(),
         temperature: agent.temperature,
         tool_call_max: agent
             .tool_call_max

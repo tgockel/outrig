@@ -473,6 +473,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
   `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
   model talks while it works records each thing it said, not only the closing reply.
+- **`[agents.<name>].repo-instructions`, `"agents-md"` or `"none"`, and `RepoInstructions`.** A
+  harness session's primary agent has its repository's instructions for agents at the end of its
+  system prompt, after the orientation and the agent's `preamble`: `AGENTS.md` at the
+  workspace's root, else `.agents/AGENTS.md`, whichever exists first. They are read inside the
+  container, at the workspace's container path, as the session starts, so the prompt carries what
+  the agent would see by reading the file; the read is not one of the agent's executions. Up to
+  32,768 bytes are carried, cut on a character boundary, and a longer file ends with a note
+  naming it and its size. A file with nothing in it is passed over for the next place; one that
+  is not UTF-8 or cannot be read loads nothing, with a warning. `"none"` leaves them out, and a
+  workspace with neither file, or a session with no workspace, is unchanged. The text is in the
+  `preamble` of the agent's `model.instructions` event and counts against the model's context
+  window. A child agent is not given them. `outrig run` ignores the key. (#672)
 
 ### Changed
 

@@ -72,6 +72,16 @@
 //! made it, so it has been handed over by the time that execution's outcome is
 //! here.
 //!
+//! # Reading a file
+//!
+//! [`Interpreter::read_file`] asks the interpreter for the text of a regular
+//! file in its container, up to a byte limit and never part of a character.
+//! It is answered by a thread of the interpreter's own, so a read that stalls
+//! on a mount that has stopped answering holds nothing else: the interpreter
+//! still takes the next message. It is not one of the agent's executions, and
+//! nothing of it is recorded as the agent's. The wait is bounded by
+//! [`READY_TIMEOUT`], so such a read cannot hold a session's start either.
+//!
 //! # What owns what
 //!
 //! The [`Child`] here is the host-side `podman exec` client, not the
@@ -87,6 +97,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::future::Future;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -299,6 +310,9 @@ pub(crate) enum InterpreterError {
     /// A message the channel did not take. Nothing was queued.
     #[error("not delivered: {0}")]
     Refused(String),
+    /// The interpreter could not read a file it was asked for.
+    #[error("the Python interpreter could not read the file: {0}")]
+    Read(String),
     /// The session was closed to new work. Nothing was sent.
     #[error(transparent)]
     Closed(#[from] Closed),
@@ -311,6 +325,17 @@ pub(crate) struct Tasks {
     pub(crate) names: Vec<String>,
     /// How many there are past those named.
     pub(crate) more: usize,
+}
+
+/// What the interpreter read of a regular file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct FileText {
+    /// The file's size in bytes, which is more than `text` holds when the
+    /// read was cut short.
+    pub(crate) size: usize,
+    /// The file's text, up to the bytes asked for and never part of a
+    /// character.
+    pub(crate) text: String,
 }
 
 /// A handle on a session's interpreter, addressing one of its kernels: the
@@ -505,6 +530,8 @@ enum Query {
     Post(oneshot::Sender<Result<usize, String>>),
     Pending(oneshot::Sender<Channels>),
     Tasks(oneshot::Sender<Tasks>),
+    /// A file read: what the interpreter made of it, or why it could not.
+    File(oneshot::Sender<Result<Option<FileText>, String>>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -559,6 +586,13 @@ enum Reply {
         id: ExecId,
         #[serde(flatten)]
         tasks: Tasks,
+    },
+    /// The answer to a file read: the file, when there was a regular file, or
+    /// why there is none to give.
+    File {
+        id: ExecId,
+        file: Option<FileText>,
+        error: Option<String>,
     },
     /// A message the agent sent, which nothing asked for.
     #[serde(rename = "send")]
@@ -1063,6 +1097,27 @@ impl Interpreter {
     /// loop is not turning.
     pub(crate) async fn tasks(&self) -> Result<Tasks, InterpreterError> {
         self.query("tasks", Query::Tasks).await
+    }
+
+    /// The text of the regular file at `path` in the interpreter's container,
+    /// as much of it as `max` bytes hold and never part of a character, and
+    /// the file's whole size. `None` when `path` is not a regular file. A file
+    /// that is not UTF-8 is an error, not an empty answer, and so is a read
+    /// the interpreter does not answer within [`READY_TIMEOUT`].
+    pub(crate) async fn read_file(
+        &self,
+        path: &Path,
+        max: usize,
+    ) -> Result<Option<FileText>, InterpreterError> {
+        let receiver = self.request(
+            json!({"t": "file", "path": &*path.to_string_lossy(), "max": max}),
+            Query::File,
+            |_, _| {},
+        )?;
+        let answered = tokio::time::timeout(READY_TIMEOUT, answer(&self.table, receiver))
+            .await
+            .map_err(|_| InterpreterError::Read(format!("no answer within {READY_TIMEOUT:?}")))??;
+        answered.map_err(InterpreterError::Read)
     }
 
     /// The session's admission, without a way to send: what decides whether a
@@ -2093,6 +2148,12 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 let _ = waiter.send(tasks);
             }
             _ => tracing::warn!("ignored task listing {id}, which nothing asked for"),
+        },
+        Reply::File { id, file, error } => match lock(table).queries.remove(&id) {
+            Some(Query::File(waiter)) => {
+                let _ = waiter.send(error.map_or(Ok(file), Err));
+            }
+            _ => tracing::warn!("ignored the answer about a file {id}, which nothing asked for"),
         },
         Reply::Sent { channel, body } => {
             let mut table = lock(table);

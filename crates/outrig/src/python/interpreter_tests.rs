@@ -1999,6 +1999,142 @@ fn the_cpu_clock_tells_a_spinning_loop_from_a_blocked_one() {
     assert!(error_of(&k.result_of(2)).contains(INTERRUPTED));
 }
 
+// ---------------------------------------------------------------------------- reading a file
+
+impl Interpreter {
+    /// The answer to asking the primary for as much of the file at `path` as
+    /// `max` bytes hold.
+    fn file(&mut self, id: u64, path: &Path, max: usize) -> Value {
+        self.ask(json!({"t": "file", "agent": PRIMARY, "id": id, "path": path, "max": max}))
+    }
+}
+
+#[test]
+fn a_regular_file_is_read_with_its_size() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("AGENTS.md");
+    std::fs::write(&path, "hello\n").expect("the file");
+    let reply = k.file(1, &path, 100);
+    assert_eq!(
+        reply["file"],
+        json!({"size": 6, "text": "hello\n"}),
+        "{reply}"
+    );
+    assert_eq!(reply["error"], Value::Null, "{reply}");
+}
+
+/// The limit is in bytes, and what it cuts through a character is held back,
+/// so the text is always whole characters and the size is still the file's.
+#[test]
+fn a_file_past_the_limit_is_cut_before_a_character_it_would_split() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("AGENTS.md");
+    std::fs::write(&path, "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}").expect("the file");
+    // `a`, one two-byte character, and the first byte of the next.
+    let reply = k.file(1, &path, 4);
+    assert_eq!(
+        reply["file"],
+        json!({"size": 11, "text": "a\u{e9}"}),
+        "{reply}"
+    );
+    let reply = k.file(2, &path, 0);
+    assert_eq!(reply["file"], json!({"size": 11, "text": ""}), "{reply}");
+}
+
+/// A name that is not a regular file is answered with no file, and is not an
+/// error: the host asks for places a file may be, and most are empty. A pipe in
+/// particular is not opened for reading, which would wait for a writer.
+#[test]
+fn a_name_that_is_not_a_regular_file_has_no_file() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("a directory");
+    let file = dir.path().join("file");
+    std::fs::write(&file, "x").expect("the file");
+    let fifo = dir.path().join("fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    for (id, path) in [
+        (1, dir.path().join("missing")),
+        (2, dir.path().to_path_buf()),
+        (3, file.join("below-a-file")),
+        (4, fifo),
+    ] {
+        let reply = k.file(id, &path, 100);
+        assert_eq!(
+            (&reply["file"], &reply["error"]),
+            (&Value::Null, &Value::Null),
+            "{}: {reply}",
+            path.display()
+        );
+    }
+}
+
+/// A file that is not UTF-8 is an error that says so, which is not the same
+/// answer as no file.
+#[test]
+fn a_file_that_is_not_utf8_is_an_error() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("AGENTS.md");
+    std::fs::write(&path, [0xff, 0xfe, b'\n']).expect("the file");
+    let reply = k.file(1, &path, 100);
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.starts_with("UnicodeDecodeError"), "{reply}");
+    assert_eq!(reply["file"], Value::Null, "{reply}");
+}
+
+/// A read that stalls -- on a mount that has stopped answering -- holds nothing
+/// else: the interpreter still takes the next message, and answers the read
+/// when it comes. The read here waits on a gate, as one waits on the kernel.
+#[test]
+fn a_file_read_that_stalls_does_not_hold_the_reader() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("AGENTS.md");
+    std::fs::write(&path, "hello\n").expect("the file");
+    let held = k.exec(
+        1,
+        &py(r#"
+            import __main__, threading
+            gate = threading.Event()
+            real = __main__._read_file
+            __main__._read_file = lambda *args: (gate.wait(), real(*args))[1]
+            "#),
+    );
+    assert_eq!(held["status"], "ok", "{held}");
+
+    k.send(json!({"t": "file", "agent": PRIMARY, "id": 2, "path": &path, "max": 100}));
+    // Answered, with the read still waiting: the next message would otherwise
+    // be this one's.
+    k.cpu(3);
+
+    k.submit(4, "gate.set()");
+    let mut answers = [k.recv(), k.recv()];
+    answers.sort_by_key(|answer| answer["t"].as_str().unwrap_or_default().to_string());
+    let [file, result] = &answers;
+    assert!(file["t"] == "file" && file["id"] == 2, "got: {file}");
+    assert_eq!(
+        file["file"],
+        json!({"size": 6, "text": "hello\n"}),
+        "{file}"
+    );
+    assert!(
+        result["t"] == "result" && result["id"] == 4,
+        "got: {result}"
+    );
+}
+
+/// The host is answered even by a request it malformed, so it is never left
+/// waiting on one.
+#[test]
+fn a_file_request_without_a_limit_is_answered_with_the_reason() {
+    let mut k = Interpreter::start();
+    let reply = k.ask(json!({"t": "file", "agent": PRIMARY, "id": 1, "path": "/etc/hostname"}));
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.contains("needs a path and a byte limit"), "{reply}");
+}
+
 /// A synchronous `subprocess.run` blocks the main thread in `waitpid`. The
 /// signal is aimed at that thread, so it breaks the wait; `run` then kills
 /// the child it started. What that child started is another matter.

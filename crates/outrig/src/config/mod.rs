@@ -1351,6 +1351,26 @@ pub enum ModelSourceRef<'a> {
     Alias { targets: &'a [String] },
 }
 
+/// Whether an agent's system prompt carries the repository's own instructions
+/// for agents: `[agents.<name>].repo-instructions`.
+///
+/// `outrig run-new` reads the file inside the session's container, from the
+/// workspace's container path, so the text is what the agent would see by
+/// reading it. `outrig run` reads the key without acting on it, and a child
+/// agent is never given the file: its parent writes its prompt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum RepoInstructions {
+    /// `AGENTS.md` at the workspace's root, else `.agents/AGENTS.md`, whichever
+    /// is found first, follows the orientation and the agent's `preamble`. A
+    /// workspace with neither adds nothing. The default.
+    #[default]
+    AgentsMd,
+    /// The system prompt carries none of the repository's files.
+    None,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -1361,6 +1381,10 @@ pub struct Agent {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preamble: Option<String>,
+    /// Whether the system prompt carries the repository's instructions for
+    /// agents, after the preamble. Unset means [`RepoInstructions::AgentsMd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_instructions: Option<RepoInstructions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

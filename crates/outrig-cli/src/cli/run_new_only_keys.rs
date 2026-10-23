@@ -1,9 +1,10 @@
 //! The config keys only `outrig run-new` reads, and the startup warning
 //! `outrig run` prints when a config sets one.
 //!
-//! `[models.<name>].context-window`, `[events] mode = "record"` and the
-//! limits on `run-new`'s children and model calls live on types both loops
-//! share, so `run` parses them and does nothing with them.
+//! `[models.<name>].context-window`, `[events] mode = "record"`, the limits on
+//! `run-new`'s children and model calls, and `[agents.<name>].repo-instructions`
+//! live on types both loops share, so `run` parses them and does nothing with
+//! them.
 //! Honoring them in `run`'s loop would be a second implementation of what
 //! `run-new` does; saying so at startup is the cheap fix. See
 //! `plan/phase/0003-python/crate-split-tradeoffs.md`.
@@ -62,6 +63,11 @@ pub(crate) fn warnings<'a>(
         if top || own {
             lines.push(ignored(key));
         }
+    }
+
+    // `run` sends the agent's preamble alone, whichever way the key is set.
+    if agent.is_some_and(|a| a.repo_instructions.is_some()) {
+        lines.push(ignored("repo-instructions"));
     }
 
     lines
@@ -174,5 +180,33 @@ requests-max = 4
             warnings(&cfg, None, ["fast"]),
             [ignored("token-budget")]
         );
+    }
+
+    /// `run` loads no instructions file, so a config that says whether the
+    /// session's agent should is named; another agent's setting is not the
+    /// session's.
+    #[test]
+    fn repo_instructions_are_named_for_the_sessions_agent_only() {
+        let cfg = config(
+            r#"
+[models.fast]
+provider = "openai"
+
+[agents.coding]
+repo-instructions = "agents-md"
+
+[agents.other]
+repo-instructions = "none"
+
+[agents.plain]
+preamble = "You write Python."
+"#,
+        );
+        assert_eq!(
+            warnings(&cfg, Some("coding"), ["fast"]),
+            [ignored("repo-instructions")]
+        );
+        assert!(warnings(&cfg, Some("plain"), ["fast"]).is_empty());
+        assert!(warnings(&cfg, None, ["fast"]).is_empty());
     }
 }

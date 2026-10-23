@@ -470,6 +470,9 @@ pub fn outrig::config::NetworkMode::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for outrig::config::NetworkMode
 pub type outrig::config::NetworkMode::Err = alloc::string::String
 pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self, Self::Err>
+#[non_exhaustive] pub enum outrig::config::RepoInstructions
+pub outrig::config::RepoInstructions::AgentsMd
+pub outrig::config::RepoInstructions::None
 #[non_exhaustive] pub enum outrig::config::RoleAlternation
 pub outrig::config::RoleAlternation::Relaxed
 pub outrig::config::RoleAlternation::Strict
@@ -498,6 +501,7 @@ pub outrig::config::Agent::max_tokens: core::option::Option<u32>
 pub outrig::config::Agent::model: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::model_concurrency_max: core::option::Option<u32>
 pub outrig::config::Agent::preamble: core::option::Option<alloc::string::String>
+pub outrig::config::Agent::repo_instructions: core::option::Option<outrig::config::RepoInstructions>
 pub outrig::config::Agent::requests_max: core::option::Option<u32>
 pub outrig::config::Agent::subagent_depth_max: core::option::Option<u32>
 pub outrig::config::Agent::subagent_width_max: core::option::Option<u32>

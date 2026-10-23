@@ -854,6 +854,18 @@ preamble = "You are a meticulous code reviewer..."
   `[models.<name>]`.
 - `preamble` (string, optional, default: none): system prompt for this agent. If it is
   omitted, requests carry no system prompt.
+- `repo-instructions` (string, optional, default: `"agents-md"`): whether the system prompt also
+  carries the repository's own instructions for agents, after `preamble`. `"agents-md"` loads
+  `AGENTS.md` at the workspace's root or else `.agents/AGENTS.md`, whichever exists first, and
+  adds nothing for a workspace with neither. `"none"` leaves the repository's files out.
+  `run-new` reads the file inside the container, at the workspace's container path, once as the
+  session starts, so the prompt carries what the agent would see by reading the file itself.
+  It carries the first 32,768 bytes, cut on a character boundary, and when the file is longer
+  it ends with a note naming the file and its size. The text counts against every call's
+  context window, so set `"none"` for an agent whose model has little room. A file with
+  nothing in it is passed over for the next place; one that is not UTF-8 or cannot be read
+  loads nothing, and a warning on the host says so. A child agent is never given the file: its
+  parent writes its prompt. `outrig run` ignores the key and says so at startup.
 - `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.

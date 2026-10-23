@@ -102,6 +102,9 @@ pub struct SessionBuilder {
     /// A host session's id, in place of `test`.
     #[cfg(test)]
     host_id: Option<String>,
+    /// The workspace a host session names, in place of none.
+    #[cfg(test)]
+    host_workspace: Option<PathBuf>,
     /// Why the session's shutdown is to say it is not proven stopped.
     #[cfg(test)]
     fail_stop: Option<String>,
@@ -142,6 +145,8 @@ impl SessionBuilder {
             events: None,
             #[cfg(test)]
             host_id: None,
+            #[cfg(test)]
+            host_workspace: None,
             #[cfg(test)]
             fail_stop: None,
             primary: true,
@@ -509,6 +514,14 @@ impl SessionBuilder {
         self
     }
 
+    /// Give a host session `dir` as its workspace: the path its agent names as
+    /// its working directory, which on the host is where the files are.
+    #[cfg(test)]
+    pub(crate) fn host_workspace(mut self, dir: &Path) -> Self {
+        self.host_workspace = Some(dir.to_path_buf());
+        self
+    }
+
     /// Make the session's shutdown report it not proven stopped, for
     /// `reason`, as a container stop that failed would: the report, its
     /// verdict and its `session.report` event all say so.
@@ -537,9 +550,10 @@ impl SessionBuilder {
     }
 
     /// [`SessionBuilder::start`] over an interpreter on the host, which has no
-    /// container and no workspace: bindings run in the repository root, and
-    /// the interpreter imports their packages from where they are on the
-    /// host. The session's id is `test`.
+    /// container and no workspace unless [`SessionBuilder::host_workspace`]
+    /// gives one: bindings run in the repository root, and the interpreter
+    /// imports their packages from where they are on the host. The session's
+    /// id is `test`.
     #[cfg(test)]
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
         let resolved = self.resolution()?;
@@ -558,7 +572,8 @@ impl SessionBuilder {
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
         self.report(Progress::Finished(Step::Python));
-        let setup = self.child_setup(None);
+        let workspace = self.host_workspace.take();
+        let setup = self.child_setup(workspace.clone());
         let session = Session::new(
             id,
             interpreter,
@@ -569,7 +584,7 @@ impl SessionBuilder {
             setup,
         )
         .failing(self.fail_stop.take());
-        assemble(session, resolved.as_ref(), None).await
+        assemble(session, resolved.as_ref(), workspace.as_deref()).await
     }
 }
 

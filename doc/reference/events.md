@@ -118,7 +118,8 @@ category says what it may hold.
   conversation.
   - `model`: the `[models.<name>]` row every call is tried against first. For an alias, that is
     the first of its models this build can reach.
-  - `preamble`: the system prompt.
+  - `preamble`: the system prompt: OutRig's orientation, the agent's configured preamble, then
+    the repository's instructions for agents when the agent loaded any.
   - `tools`: each tool's `name`, `description`, and `parameters` schema.
   - `max_tokens`: that model's reply ceiling, after its published ceiling filled it in or
     lowered it; `null` when none is sent. A call that moves to another of an alias's models

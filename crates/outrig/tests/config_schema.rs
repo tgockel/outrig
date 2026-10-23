@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use outrig::config::{
-    CapabilityProfile, Config, ConfigWarningKind, EnvValue, LlmProvider, McpServerSpec, MountAccess,
+    CapabilityProfile, Config, ConfigWarningKind, EnvValue, LlmProvider, McpServerSpec,
+    MountAccess, RepoInstructions,
 };
 use outrig::error::OutrigError;
 
@@ -595,6 +596,54 @@ subagents = false
         let reserialized = toml::to_string(&cfg).expect("config serializes");
         let again = Config::load_from_str(&reserialized).expect("reserialized parses");
         assert!(!again.agents["coding"].subagents_enabled());
+    }
+
+    /// Absent from nearly every config, so what the default is called is what
+    /// almost all agents get: the repository's instructions, loaded.
+    #[test]
+    fn repo_instructions_absent_means_the_default() {
+        let cfg = Config::load_from_str(
+            r#"
+[agents.coding]
+preamble = "you are a coding agent"
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(cfg.agents["coding"].repo_instructions, None);
+        assert_eq!(RepoInstructions::default(), RepoInstructions::AgentsMd);
+    }
+
+    #[test]
+    fn repo_instructions_takes_both_values_and_round_trips() {
+        for (value, expected) in [
+            ("agents-md", RepoInstructions::AgentsMd),
+            ("none", RepoInstructions::None),
+        ] {
+            let cfg = Config::load_from_str(&format!(
+                "[agents.coding]\nrepo-instructions = \"{value}\"\n"
+            ))
+            .expect("config parses");
+            assert_eq!(cfg.agents["coding"].repo_instructions, Some(expected));
+
+            let reserialized = toml::to_string(&cfg).expect("config serializes");
+            assert!(
+                reserialized.contains(&format!("repo-instructions = \"{value}\"")),
+                "{reserialized}"
+            );
+            let again = Config::load_from_str(&reserialized).expect("reserialized parses");
+            assert_eq!(cfg, again);
+        }
+    }
+
+    #[test]
+    fn repo_instructions_refuses_another_value() {
+        let err = Config::load_from_str("[agents.coding]\nrepo-instructions = \"claude-md\"\n")
+            .expect_err("a value that is neither fails");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude-md") && (msg.contains("agents-md") || msg.contains("none")),
+            "error should quote the value and name a legal one, got: {msg}"
+        );
     }
 
     #[test]

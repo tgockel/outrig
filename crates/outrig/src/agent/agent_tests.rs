@@ -858,6 +858,93 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     );
 }
 
+/// A `coding` agent over a host-run interpreter whose workspace is
+/// `workspace`, recording to `events`, and the requests its mock model
+/// receives. `agent_keys` is config the agent has beside its `max-tokens`.
+async fn agent_in_workspace(
+    var: &str,
+    agent_keys: &str,
+    workspace: &std::path::Path,
+    events: Events,
+) -> (
+    Session,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let (addr, requests) = mock_http::start(vec![text_reply("hi")]).await;
+    let keys = format!("max-tokens = 4096\n{agent_keys}");
+    let cfg = config_in(Style::Anthropic, addr, var, MODEL, "", &keys);
+    let session = host_session(&cfg, Some("coding"), None, events)
+        .host_workspace(workspace)
+        .secrets(keyed(var))
+        .start_on_host()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    (session, requests)
+}
+
+/// The repository's instructions end the system prompt, after the agent's own
+/// preamble, and the event that records the prompt carries them.
+#[tokio::test]
+async fn the_system_prompt_ends_with_the_instructions_the_workspace_holds() {
+    let workspace = tempfile::tempdir().expect("a workspace");
+    let file = workspace.path().join(".agents/AGENTS.md");
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("its directory");
+    std::fs::write(&file, "Run the tests before you finish.\n").expect("the file");
+    let logs = tempfile::tempdir().expect("a log directory");
+    let (events, _subscription) = watched(Some(logs.path())).await;
+
+    let (mut agent, mut requests) = agent_in_workspace(
+        "OUTRIG_TEST_AGENT_REPO_INSTRUCTIONS",
+        "",
+        workspace.path(),
+        events,
+    )
+    .await;
+    round(&mut agent, "hello").await;
+    let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+    let section = format!(
+        "The project's instructions for agents, from `{}`:\n\nRun the tests before you finish.",
+        file.display()
+    );
+    assert!(
+        system.ends_with(&format!("\n\nYou write Python.\n\n{section}")),
+        "{system}"
+    );
+
+    shut_down(agent).await;
+    let records = events::recorded(logs.path());
+    assert_eq!(
+        events::of_kind(&records, "model.instructions")[0]["preamble"],
+        system.as_str()
+    );
+}
+
+/// A workspace that holds no instructions, or an agent told to leave them out,
+/// is sent the prompt it always was: the preamble last.
+#[tokio::test]
+async fn without_instructions_the_system_prompt_ends_with_the_preamble() {
+    for (var, agent_keys, file) in [
+        ("OUTRIG_TEST_AGENT_REPO_INSTRUCTIONS_NONE_THERE", "", None),
+        (
+            "OUTRIG_TEST_AGENT_REPO_INSTRUCTIONS_OFF",
+            "repo-instructions = \"none\"",
+            Some("Run the tests."),
+        ),
+    ] {
+        let workspace = tempfile::tempdir().expect("a workspace");
+        if let Some(text) = file {
+            std::fs::write(workspace.path().join("AGENTS.md"), text).expect("the file");
+        }
+        let (mut agent, mut requests) =
+            agent_in_workspace(var, agent_keys, workspace.path(), Events::off()).await;
+        round(&mut agent, "hello").await;
+        let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+        assert!(system.ends_with("\n\nYou write Python."), "{system}");
+        assert!(!system.contains("instructions for agents"), "{system}");
+        assert!(!system.contains("Run the tests."), "{system}");
+    }
+}
+
 #[test]
 fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
     use crate::harness::bindings::Brief;
@@ -874,6 +961,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
             brief("tasks", "The task tracker.", false),
         ],
         Some("You write Python."),
+        None,
         Window::DEFAULT,
     );
     assert!(
@@ -897,7 +985,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
     }
     assert!(text.ends_with("\n\nYou write Python."), "{text}");
 
-    let without = super::orientation::preamble(None, &[], None, Window::DEFAULT);
+    let without = super::orientation::preamble(None, &[], None, None, Window::DEFAULT);
     assert!(!without.contains("on the host"), "{without}");
 }
 
@@ -906,6 +994,7 @@ fn the_orientation_names_the_workspace_when_there_is_one() {
     let text = super::orientation::preamble(
         Some(std::path::Path::new("/workspace")),
         &[],
+        None,
         None,
         Window::DEFAULT,
     );
@@ -6269,6 +6358,60 @@ mod e2e {
             .await
             .expect("podman ps runs");
         String::from_utf8_lossy(&listed.stdout).trim().is_empty()
+    }
+
+    /// The repository's instructions are read through the interpreter in the
+    /// container, from the workspace mounted there: the prompt the model is
+    /// sent ends with the file the host directory holds, under the path the
+    /// container knows it by, and the read is none of the agent's executions.
+    #[tokio::test]
+    async fn the_instructions_are_read_from_the_workspace_in_the_container() {
+        pull(ALPINE).await;
+        let session = tempfile::tempdir().expect("a session dir");
+        let logs = session.path().join("logs");
+        let workspace = tempfile::tempdir().expect("a workspace");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "Run the tests before you finish.\n",
+        )
+        .expect("the file");
+
+        let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
+        let var = "OUTRIG_TEST_AGENT_E2E_INSTRUCTIONS";
+        let cfg = config_in(
+            Style::Anthropic,
+            addr,
+            var,
+            MODEL,
+            "[events]\nmode = \"record\"",
+            "max-tokens = 4096",
+        );
+        let spec = LaunchSpec::from_image(ALPINE, BTreeMap::new(), logs.clone())
+            .with_workspace(crate::WorkspaceSpec::new(workspace.path(), "/workspace"));
+        let mut agent = within(
+            SessionBuilder::new(cfg.clone(), Some("coding"), None)
+                .secrets(keyed(var))
+                .container(spec)
+                .record_events()
+                .start(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        round(&mut agent, "hello").await;
+        let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+        assert!(
+            system.ends_with(
+                "\n\nYou write Python.\n\nThe project's instructions for agents, from \
+                 `/workspace/AGENTS.md`:\n\nRun the tests before you finish."
+            ),
+            "{system}"
+        );
+
+        let report = within(agent.shutdown(DEFAULT_DRAIN)).await;
+        assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+        let records = events::recorded(&logs);
+        assert!(events::of_kind(&records, "exec.submitted").is_empty());
     }
 
     /// The public entry end to end: the session launches its container,

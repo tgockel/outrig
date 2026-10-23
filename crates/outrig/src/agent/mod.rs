@@ -29,6 +29,7 @@ mod channel;
 pub(crate) mod children;
 mod failover;
 mod history;
+mod instructions;
 pub(crate) mod ledger;
 mod orientation;
 mod resolve;
@@ -210,8 +211,10 @@ impl Agent {
 
     /// An agent over `interpreter`, in the container named `container_name`
     /// whose workspace is `workspace`, recording its spend in `ledger` and
-    /// moving `lifecycle` through each round.
-    pub(crate) fn build(
+    /// moving `lifecycle` through each round. Its system prompt ends with the
+    /// repository's instructions, read through `interpreter`, when `resolved`
+    /// asks for them and `workspace` holds them.
+    pub(crate) async fn build(
         resolved: &ResolvedAgent,
         interpreter: Interpreter,
         container_name: &str,
@@ -221,8 +224,15 @@ impl Agent {
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
         let window = Window::DEFAULT;
-        let preamble =
-            orientation::preamble(workspace, bindings, resolved.preamble.as_deref(), window);
+        let instructions =
+            instructions::load(&interpreter, workspace, resolved.repo_instructions).await;
+        let preamble = orientation::preamble(
+            workspace,
+            bindings,
+            resolved.preamble.as_deref(),
+            instructions.as_ref(),
+            window,
+        );
         let slot = CallSlot::new(ledger, interpreter.events().clone(), None);
         let user = UserChannel::new(interpreter.clone());
         Self::assemble(

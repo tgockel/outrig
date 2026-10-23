@@ -160,7 +160,8 @@ impl Session {
             &self.bindings.briefs(),
             self.ledger.clone(),
             Arc::clone(&self.lifecycle),
-        )?;
+        )
+        .await?;
         self.children
             .root(PRIMARY, &resolved.model, agent.slot().clone());
         self.agent = Some(agent);

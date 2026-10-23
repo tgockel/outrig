@@ -46,6 +46,7 @@ import ast
 import asyncio
 import base64
 import builtins
+import codecs
 import collections
 import concurrent.futures.thread
 import contextlib
@@ -70,6 +71,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -6015,6 +6017,65 @@ def _pending(kernel, request_id, _):
     _send({"t": "pending", "agent": kernel.agent, "id": request_id, "channels": channels})
 
 
+def _file(kernel, request_id, message):
+    """Start the answer to a file request, which a thread of its own gives. Reader thread only.
+
+    A read of a file on a mount that has stopped answering never returns, and `O_NONBLOCK` does not
+    bound it. Done here it would hold the reader, and with it every message the host sends next --
+    an execution, its cancel, the end of the session. Held by a thread of its own, it holds that
+    thread alone.
+    """
+    reply = {"t": "file", "agent": kernel.agent, "id": request_id}
+    try:
+        threading.Thread(
+            target=_read_file, args=(reply, message), name=f"file-{request_id}", daemon=True
+        ).start()
+    except MemoryError:
+        raise
+    except Exception as e:
+        reply["error"] = f"{type(e).__name__}: {e}"
+        _send(reply)
+
+
+def _read_file(reply, message):
+    """Send `reply`, the answer to the file request `message`: the size of the regular file at its
+    `path` and as much of its text as its `max` bytes hold.
+
+    Anything that is not a regular file -- missing, a directory, a pipe -- is answered with no
+    file, and the file is opened without blocking so that a pipe cannot hold this thread. A file
+    that is not UTF-8 is an error, except that a cut which falls inside a character stops short of
+    it. A read that fails otherwise is answered with the reason, so the host is never left waiting.
+    """
+    path, limit = message.get("path"), message.get("max")
+    try:
+        if not isinstance(path, str) or type(limit) is not int or limit < 0:
+            raise ValueError("a file request needs a path and a byte limit")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode):
+                data = b""
+                while len(data) < limit:
+                    part = os.read(fd, limit - len(data))
+                    if not part:
+                        break
+                    data += part
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                text = decoder.decode(data, final=len(data) >= info.st_size)
+                reply["file"] = {"size": info.st_size, "text": text}
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except Exception as e:
+        reply["error"] = f"{type(e).__name__}: {e}"
+    try:
+        _send(reply)
+    except Exception as e:
+        # The host is gone, or there is no room to say; no one else is waiting on this thread.
+        _diag(f"agent {reply['agent']!r}: the answer to a file request was not sent: {e!r}")
+
+
 def _rpc(kernel, number, message):
     """Hand one part of an RPyC frame to the channel of connection `number`, or drop it. Reader
     thread only.
@@ -6066,11 +6127,13 @@ def _rpc_notice(agent, binding, number, reason):
 
 
 # What each message addressed to an agent does, with the id it carries. `inv` and `tasks` are
-# answered on the agent's loop; the rest are handled here, on the reader thread.
+# answered on the agent's loop and `file` by a thread of its own; the rest are handled here, on
+# the reader thread.
 _ROUTES = {
     "exec": _exec,
     "msg": _msg,
     "pending": _pending,
+    "file": _file,
     "received": _received,
     "turn": _turn,
     "inv": _inventory,

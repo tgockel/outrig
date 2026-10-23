@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the event log, under the child's own subject. The page `scripts/render-session.py` renders keeps
   the main agent's model, max tokens and instructions as a child starts, and lists each agent's
   instructions under its subject.
+- **`[agents.<name>].repo-instructions` in `run-new`.** The agent's system prompt ends with the
+  workspace's `AGENTS.md`, or else `.agents/AGENTS.md`, unless the key is `"none"` (see `outrig`'s
+  changelog). `run` ignores the key, with a line at startup when the session's agent sets it.
+  (#672)
 
 ### Changed
 
