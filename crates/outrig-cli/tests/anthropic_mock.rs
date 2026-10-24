@@ -21,8 +21,9 @@
 //!   `CompletionModel::with_model` (which would silently cap replies at 2048);
 //! * the shared retry client covers this provider too -- including that a
 //!   `Retry-After` sets the wait, that a spent budget ends the turn without
-//!   taking the session with it, and that a redirect loop, which no wait can
-//!   clear, is final at once;
+//!   taking the session with it, and that a redirect, which no wait can
+//!   clear and which the client is configured not to follow (#380), is final
+//!   at once;
 //! * a `200` carrying no usable content is retried above the HTTP client,
 //!   which is the only place it is visible at all, and ends the turn rather
 //!   than the session when it persists;
@@ -926,11 +927,13 @@ async fn a_rejected_api_key_stays_fatal() {
     );
 }
 
-/// A redirect loop is terminal at the transport: reqwest follows it to its
-/// limit and gives up, and a replay would do the same. So it is sent once --
-/// one request and the redirects reqwest follows -- and stays fatal, as a
-/// `401` does, rather than ending only the turn. The budget is the shipped
-/// default, so a loop that is retried runs into the timeout.
+/// A redirect is terminal at the transport: `remote_http_client` turns
+/// redirect-following off (#380 -- Anthropic's `x-api-key`, unlike
+/// `Authorization`, is not a header reqwest strips on a cross-host redirect,
+/// so following one would hand the key, and the request body, to whatever
+/// host the `Location` named). So a redirect comes back as its own status
+/// rather than being chased, costs exactly the one request, and stays fatal,
+/// as a `401` does, rather than ending only the turn.
 #[tokio::test]
 async fn a_redirect_loop_is_fatal_at_once() {
     let (addr, mut requests) = start_mock_http(vec![
@@ -949,17 +952,17 @@ async fn a_redirect_loop_is_fatal_at_once() {
         ),
     )
     .await
-    .expect("a redirect loop must not be retried for the whole budget")
-    .expect_err("no resend can satisfy a redirect loop, so it must not end up an Ok turn");
+    .expect("a redirect must not be retried for the whole budget")
+    .expect_err("no resend can satisfy a redirect, so it must not end up an Ok turn");
 
     assert!(
-        err.to_string().contains("redirect"),
-        "the error should say a redirect failed: {err}",
+        err.to_string().contains("307"),
+        "the error should name the status the redirect came back as: {err}",
     );
-    let sent = drain_recorded(&mut requests).len();
-    assert!(
-        (2..=11).contains(&sent),
-        "one request and the redirects reqwest follows, once: {sent}",
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "the redirect must not be followed, so exactly one request is sent",
     );
 }
 
