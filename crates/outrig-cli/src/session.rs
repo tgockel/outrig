@@ -30,11 +30,9 @@ use nix::fcntl::{FcntlArg, fcntl};
 use nix::libc;
 use serde::{Deserialize, Serialize};
 
-use crate::paths::{
-    default_session_root, load_global_or_empty, report_config_warnings, resolve_global_config,
-};
-use outrig::config::Config;
 use crate::error::{CliError, Result};
+use crate::paths::{default_session_root, report_config_warnings, resolve_global_config};
+use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError};
 
 const SESSION_JSON: &str = "session.json";
@@ -723,6 +721,9 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
 /// default location to look in, falls through to the XDG default.
 /// `global_override` is `--global-config` as given, resolved only without
 /// `flag`: given the flag, the global config is neither read nor checked.
+///
+/// A global config that does not load at all is not necessarily fatal here --
+/// see [`session_root_from_global`].
 pub fn resolve_session_root_for_cli(
     flag: Option<&Path>,
     global_override: Option<&Path>,
@@ -730,9 +731,59 @@ pub fn resolve_session_root_for_cli(
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let global = load_global_or_empty(resolve_global_config(global_override)?.as_deref())?;
-    report_config_warnings(&global);
-    Ok(global.session_root.unwrap_or_else(default_session_root))
+    let global = resolve_global_config(global_override)?;
+    Ok(session_root_from_global(global.as_deref())?.unwrap_or_else(default_session_root))
+}
+
+/// `session-root` as the global config at `path` declares it, or `None` for
+/// the default -- including when there is no global config to read.
+///
+/// The whole-file read comes first and is what succeeds normally, warnings and
+/// all. When it fails, this falls back to
+/// [`Config::salvage_global_session_root`], which reads that one key, and
+/// warns that the rest of the file was not read (#384).
+///
+/// The fallback is for these four commands alone. They need one key out of a
+/// file shared by every outrig on the machine, and a repo config mid-edit used
+/// to be enough to stop them; now a *global* config mid-edit is not either.
+/// Nothing else degrades: `run`, `mcp`, and `build` read the file for
+/// everything in it -- providers, models, `[network]`, `[repo].env-allow` --
+/// and still refuse a file they cannot load, which is also why the warning
+/// says the error is still there to fix.
+///
+/// Both failures are reported with the error [`Config::load_global`] gave,
+/// never the salvage's: the whole-file read is the one that looked at the
+/// whole file, so it is the one with something to say about it.
+fn session_root_from_global(path: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let error = match Config::load_global(path) {
+        Ok(global) => {
+            report_config_warnings(&global);
+            return Ok(global.session_root);
+        }
+        Err(error) => error,
+    };
+    // The salvage's own `Err` is it refusing to guess, not a second diagnosis
+    // of the file, so the whole-file error is what the user is shown.
+    let Ok(salvaged) = Config::salvage_global_session_root(path) else {
+        return Err(error.into());
+    };
+    // Which of the two is said depends on what was salvaged, because they are
+    // different facts about where this command is about to look: a root the
+    // damaged file still names, or the default, which is very likely not where
+    // the sessions are.
+    let took = match &salvaged {
+        Some(root) => format!("only its session-root, {}, was taken from it", root.display()),
+        None => "no session-root could be read from it, so the default is in use".to_string(),
+    };
+    eprintln!(
+        "[outrig] warning: the global config {} could not be read in full: {took}. Nothing \
+         else it sets is in effect here, and `outrig run` still refuses it:\n{error}",
+        path.display()
+    );
+    Ok(salvaged)
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is

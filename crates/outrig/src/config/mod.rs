@@ -516,6 +516,46 @@ impl Config {
         }
     }
 
+    /// The global config's `session-root`, read from a file that may not load
+    /// as a whole: the one key the session commands (`outrig ls`, `logs`,
+    /// `discard`, `clean`) need, and the only part of the file that answers
+    /// for them.
+    ///
+    /// Try [`load_global`](Self::load_global) first; this is the fallback for
+    /// the error it returns, so an unrelated fault in a shared file does not
+    /// stop a command that reads one key out of it (#384). `Ok(None)` means
+    /// the file cannot be declaring a session root at all, so the caller's
+    /// default stands; `Err` means the file cannot be asked, and the caller
+    /// should report it rather than guess.
+    ///
+    /// Only a root the damaged file states outright is read back: one plain,
+    /// non-empty string, declared once, no part of which the parser's recovery
+    /// had to repair. A parse error that reaches the declaration, a value with
+    /// a broken escape or an unterminated string, and a key declared twice are
+    /// each an `Err` rather than an answer -- what recovery makes of them is a
+    /// reading of a damaged file, not of what its writer meant.
+    ///
+    /// The value resolves against the file's directory and a leading `~`
+    /// expands, exactly as `load_global` resolves it -- the promise that a
+    /// `session-root` handed out by this module is absolute holds here too, so
+    /// callers need not learn a second rule for the degraded read.
+    ///
+    /// A file that loads in full has no business here: `load_global` reads
+    /// every key, holds the strict tables to their rules, and reports what it
+    /// set aside. This answers one key and reports nothing else about the
+    /// file, which is right only once the whole-file read has already failed.
+    pub fn salvage_global_session_root(path: &Path) -> Result<Option<PathBuf>> {
+        let (path, text) = read_resolved(path)?;
+        let text = match text {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).path_ctx("read", &path),
+        };
+        let base = ConfigSource::Global { path }.base_dir().to_path_buf();
+        Ok(lenient::salvage_top_level_string(&text, "session-root")?
+            .map(|root| resolve_against(&base, Path::new(&root))))
+    }
+
     /// [`load`](Self::load) up to the validation: both files read, each held
     /// to its own rules, and merged, but the merged config not validated.
     ///
