@@ -228,7 +228,8 @@ program"). A program's session directory, `<session-root>/<id>/logs`, holds its 
 no `session.json`, so `outrig ls` does not list it yet
 (`plan/next/host-program-sessions-are-listed.md`). What a program does not have in this phase: rounds and a user
 channel, since it has no primary; an approver, which is a `plan/next/` entry; skill sources of its
-own; and the explicit child API. The Python API is fixed at the 0.3.0 release with the Rust one.
+own (#698); and the explicit child API. The Python API is fixed at the 0.3.0 release with the Rust
+one.
 
 ## Stopping
 

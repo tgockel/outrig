@@ -21,14 +21,17 @@ use super::mock_http::{
     self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, strict_refusal,
     submit, text_reply, undecodable,
 };
+use super::orientation::Holdings;
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::retry::RetryingHttpClient;
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use crate::config::{Config, EnvSecrets, LlmProvider, RoleAlternation};
 use crate::events::{self, Events, StreamBuilder};
 use crate::harness::event::{DEFAULT_CAPACITY, Payload, Received, Subscription};
+use crate::harness::skills::SkillBrief;
 use crate::harness::{
-    DEFAULT_DRAIN, RoundEnd, RoundOutcome, Session, SessionBuilder, SessionError, ShutdownReport,
+    DEFAULT_DRAIN, DirectorySource, RoundEnd, RoundOutcome, Session, SessionBuilder, SessionError,
+    ShutdownReport,
 };
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
@@ -38,6 +41,12 @@ pub(super) const KEY: &str = "sk-ant-mock-key";
 
 /// An identifier rig publishes no ceiling for.
 const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
+
+/// A session that holds no binding and no skill.
+const NOTHING_HELD: Holdings<'static> = Holdings {
+    bindings: &[],
+    skills: &[],
+};
 
 /// Run `f` with the api-key variable `var` set.
 ///
@@ -956,10 +965,13 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
     };
     let text = super::orientation::preamble(
         None,
-        &[
-            brief("repo", "The project's Git repository.", true),
-            brief("tasks", "The task tracker.", false),
-        ],
+        Holdings {
+            bindings: &[
+                brief("repo", "The project's Git repository.", true),
+                brief("tasks", "The task tracker.", false),
+            ],
+            skills: &[],
+        },
         Some("You write Python."),
         None,
         Window::DEFAULT,
@@ -985,7 +997,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
     }
     assert!(text.ends_with("\n\nYou write Python."), "{text}");
 
-    let without = super::orientation::preamble(None, &[], None, None, Window::DEFAULT);
+    let without = super::orientation::preamble(None, NOTHING_HELD, None, None, Window::DEFAULT);
     assert!(!without.contains("on the host"), "{without}");
 }
 
@@ -993,7 +1005,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
 fn the_orientation_names_the_workspace_when_there_is_one() {
     let text = super::orientation::preamble(
         Some(std::path::Path::new("/workspace")),
-        &[],
+        NOTHING_HELD,
         None,
         None,
         Window::DEFAULT,
@@ -1005,6 +1017,123 @@ fn the_orientation_names_the_workspace_when_there_is_one() {
         ),
         "{text}"
     );
+}
+
+/// This repository's root, whose `.agents/skills` holds its own skills.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The description `SKILL.md`'s frontmatter gives on one line of its own.
+fn description_of(skill_md: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(skill_md).expect("a SKILL.md");
+    text.lines()
+        .find_map(|line| line.strip_prefix("description: "))
+        .expect("a description")
+        .to_string()
+}
+
+/// The primary is told each skill the session serves, by name and description, and the package
+/// of one with code -- this repository's own among them, through a project source -- and finding
+/// them ran none of their code.
+#[tokio::test]
+async fn the_primary_is_told_the_skills_and_listing_them_ran_none() {
+    let skills = tempfile::tempdir().expect("a skills directory");
+    let sentinel = skills.path().join("ran");
+    let review = skills.path().join("review");
+    std::fs::create_dir(&review).expect("a skill");
+    std::fs::write(
+        review.join("SKILL.md"),
+        "---\nname: review\ndescription: Reviews a\n  change.\n---\nSteps.\n",
+    )
+    .expect("its instructions");
+    std::fs::write(
+        review.join("skill.py"),
+        format!("open({:?}, 'w').close()\n", sentinel.to_string_lossy()),
+    )
+    .expect("its code");
+    let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
+    let var = "OUTRIG_TEST_AGENT_SKILLS";
+    let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    let mut agent = host_session(&cfg, Some("coding"), None, Events::off())
+        .secrets(keyed(var))
+        .skill_source("temporary", DirectorySource::new(skills.path()))
+        .skill_source(
+            "project",
+            DirectorySource::within(repo_root(), ".agents/skills"),
+        )
+        .start_on_host()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    round(&mut agent, "hello").await;
+    let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+    assert!(
+        system.contains("\n- `review` (`outrig_skills.review`): Reviews a change.\n"),
+        "{system}"
+    );
+    for skill in ["groom-plan", "next-task"] {
+        let skill_md = repo_root()
+            .join(".agents/skills")
+            .join(skill)
+            .join("SKILL.md");
+        let line = format!("\n- `{skill}`: {}", description_of(&skill_md));
+        assert!(system.contains(&line), "{line}: {system}");
+    }
+    assert!(
+        system.contains("`outrig.skills.read(name)` returns them"),
+        "{system}"
+    );
+    assert!(!sentinel.exists(), "listing a skill ran its code");
+}
+
+#[test]
+fn the_orientation_lists_skills_within_its_bounds_and_counts_the_rest() {
+    let brief = |name: String, description: String| SkillBrief {
+        name,
+        description,
+        package: None,
+    };
+    let told = |skills: &[SkillBrief]| {
+        super::orientation::preamble(
+            None,
+            Holdings {
+                bindings: &[],
+                skills,
+            },
+            None,
+            None,
+            Window::DEFAULT,
+        )
+    };
+    let many: Vec<SkillBrief> = (0..60)
+        .map(|i| brief(format!("s{i}"), "d".into()))
+        .collect();
+    let text = told(&many);
+    assert!(
+        text.contains("\n- `s49`: d") && !text.contains("`s50`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("10 more are not listed here; `outrig.skills.catalog()` has every one."),
+        "{text}"
+    );
+    let text = told(&many[..51]);
+    assert!(text.contains("1 more is not listed here"), "{text}");
+    let text = told(&many[..50]);
+    assert!(!text.contains("not listed here"), "{text}");
+
+    let long: Vec<SkillBrief> = (0..20)
+        .map(|i| brief(format!("l{i}"), "x".repeat(1024)))
+        .collect();
+    let text = told(&long);
+    let listed = text.matches("\n- `l").count();
+    assert!((1..20).contains(&listed), "{listed}");
+    assert!(
+        text.contains(&format!("{} more are not listed", 20 - listed)),
+        "{text}"
+    );
+
+    assert!(!told(&[]).contains("outrig.skills"));
 }
 
 /// What a startup line reports: the model row the agent runs against, never
@@ -6424,6 +6553,84 @@ mod e2e {
                 BTreeMap::new(),
                 logs.to_path_buf(),
             ))
+    }
+
+    /// What the container named `name` mounts, each as its source, destination and whether it is
+    /// writable, read off the engine.
+    async fn mounts(name: &str) -> String {
+        let output = tokio::process::Command::new("podman")
+            .args(["container", "inspect", "--format"])
+            .arg("{{range .Mounts}}{{.Source}} {{.Destination}} {{.RW}}\n{{end}}")
+            .arg(name)
+            .output()
+            .await
+            .expect("podman container inspect runs");
+        assert!(output.status.success(), "{output:?}");
+        let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// A session with skills mounts nothing a session without them does, and its agent imports a
+    /// skill in the container all the same: the skill's files cross the interpreter's pipe, and
+    /// its module names no file.
+    #[tokio::test]
+    async fn a_skill_imports_in_the_container_with_nothing_mounted_for_it() {
+        pull(ALPINE).await;
+        let skills = tempfile::tempdir().expect("a skills directory");
+        let greet = skills.path().join("greet");
+        std::fs::create_dir(&greet).expect("a skill");
+        std::fs::write(
+            greet.join("SKILL.md"),
+            "---\nname: greet\ndescription: Greets.\n---\nSay hello.\n",
+        )
+        .expect("its instructions");
+        std::fs::write(greet.join("skill.py"), "def hello():\n    return 'hello'\n")
+            .expect("its code");
+        let (addr, mut requests) = mock_http::start(vec![
+            submit(
+                "toolu_skill",
+                "import outrig_skills.greet.skill as g\nprint(g.hello(), hasattr(g, '__file__'))",
+            ),
+            text_reply("greeted"),
+        ])
+        .await;
+        let var = "OUTRIG_TEST_AGENT_E2E_SKILLS";
+        let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+        let (with_logs, without_logs) = (
+            tempfile::tempdir().expect("a log dir"),
+            tempfile::tempdir().expect("a log dir"),
+        );
+        let mut with = within(
+            in_a_container(&cfg, var, with_logs.path())
+                .skill_source("project", DirectorySource::new(skills.path()))
+                .start(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let without = within(in_a_container(&cfg, var, without_logs.path()).start())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (mounted, plain) = (
+            mounts(with.container_name()).await,
+            mounts(without.container_name()).await,
+        );
+        assert_eq!(mounted, plain, "the skills mounted something");
+        assert!(
+            !mounted.contains(&*skills.path().to_string_lossy()),
+            "{mounted}"
+        );
+
+        assert_eq!(round(&mut with, "greet").await, "greeted");
+        let recorded = mock_http::drain(&mut requests);
+        assert_eq!(tool_result(&recorded[1], "toolu_skill"), "hello False\n");
+        for session in [with, without] {
+            let report = within(session.shutdown(DEFAULT_DRAIN)).await;
+            assert_eq!(report.verdict(), Verdict::Clean, "{report:?}");
+        }
     }
 
     /// Whether the container named `name` is gone.

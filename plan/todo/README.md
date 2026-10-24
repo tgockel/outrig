@@ -109,7 +109,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-32` | Skills import as modules from pluggable sources                    |
 | `0003-33` | `/name` reaches the main agent as a call it makes                  |
 
 **Live objects**

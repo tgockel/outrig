@@ -87,10 +87,11 @@ For each skill a source lists, discovery reads two things.
 **`SKILL.md`'s frontmatter.** `name` must match the directory's name and follow the standard's
 rule -- 1 to 64 lowercase letters, digits and hyphens, with no hyphen first, last, or next to
 another -- and `description` must be present. A skill that fails either is reported as
-`metadata-invalid` and left out. Parsing frontmatter with a YAML crate or with a subset that takes
-only scalars is `0003-32`'s fork. Either way the parser reads untrusted text on the host, so it
-refuses YAML anchors and aliases, or limits how far they expand, and bounds the size of its input
-and the time it spends parsing; that requirement is part of the same fork.
+`metadata-invalid` and left out. **Decided in `0003-32`: frontmatter is read as YAML by
+`saphyr-parser`**, whose own runner passes the official yaml-test-suite, one event at a time. The
+parser reads untrusted text on the host, so an anchor or an alias anywhere, a key that appears
+twice, or collections nested past 32 deep refuse the skill, and its tree loader, which recurses
+without a limit, is never used; the source bounds the file it reads.
 
 **The `# /// script` block in `skill.py`**, the inline script metadata of PEP 723, now a PyPA
 specification. Only the standardized `script` type is read, since the specification says tools
@@ -594,20 +595,20 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
 
 ## Open questions
 
-- How an embedder's sources rank against the project's and the user's. An ordered list in which
-  the first source holding a name wins extends "the project wins"; `0003-32` decides.
+- How an embedder's sources rank against the project's and the user's. **Decided in `0003-32`:**
+  one ordered list, the first source holding a name serving it.
 - How an embedder's front end sends a directive. The skill is named on the message the host posts,
   so the session's user channel needs a way to name one (`embedding.md`, `0003-33`).
-- How the preamble bounds a large catalog. The standard puts a skill's metadata at about 100
-  tokens, so a hundred skills is about 10,000 tokens on every round. Listing a capped number with a
-  count, and answering the rest from `outrig.skills`, would follow `discovery.md`'s inventory.
-- Whether a child's instructions list the catalog. A child can use every skill, and the list costs
-  tokens on every model call of every child.
+- How the preamble bounds a large catalog. **Decided in `0003-32`:** at most 50 skills and 12 KiB
+  of them, then a count, the rest in `outrig.skills.catalog()`.
+- Whether a child's instructions list the catalog. **Decided in `0003-32`:** they do not; a child
+  can still use every skill.
 - A reload while an invocation of the same skill runs in any kernel: refused with `skill-busy`, or
   made to wait.
-- What the digest covers: every file of the skill, or only its Python. Data read through
-  `importlib.resources` argues for every file.
-- What `__file__` is on a skill module: unset, or a value that names the skill and is not a path.
+- What the digest covers. **Decided in `0003-32`:** every file the source lists, by each file's
+  version, so no file is read to tell a change.
+- What `__file__` is on a skill module. **Decided in `0003-32`:** unset; tracebacks and
+  `inspect.getsource` name the skill through its code's filename, `<skill NAME>/PATH`.
 - Whether metadata may narrow what a skill reaches. A narrowing would be presentation only, since
   a skill's code shares the interpreter with every binding (`agent-placement.md`).
 
@@ -627,7 +628,7 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
   replaced was checked under the payload's Python before it was dropped, and that check is what
   showed `just the auth changes` parsing as four paths. Nothing else on this page has been run.
 - That `importlib.resources.files()` works for a package whose loader supplies a resource reader,
-  and `inspect.getsource` through a loader's `get_source`, was read from the 3.13 documentation,
-  not tried with a loader that fetches over the pipe.
+  and `inspect.getsource` through a loader's `get_source`, is now run: `0003-32`'s tests import
+  skills whose files cross the pipe, in an interpreter on the host and in a container.
 - The cost of fetching over the pipe was not measured. Each module imported is a round trip to the
   host and through the source, so a skill of many small modules costs one round trip each.

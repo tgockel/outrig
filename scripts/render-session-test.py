@@ -346,6 +346,37 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             None,
         ),
         (
+            "skill.discovered",
+            {
+                "skills": [
+                    {
+                        "name": "s",
+                        "source": "project",
+                        "description": "d",
+                        "digest": "ab",
+                        "executable": True,
+                    }
+                ],
+                "diagnostics": [
+                    {"skill": "t", "source": "user", "code": "shadowed", "message": "m"}
+                ],
+            },
+            None,
+        ),
+        (
+            "skill.imported",
+            {
+                "skill": "s",
+                "source": "project",
+                "agent": "primary",
+                "digest": "ab",
+                "reload": False,
+                "code": None,
+                "reason": None,
+            },
+            a,
+        ),
+        (
             "agent.started",
             {
                 "model": "m",

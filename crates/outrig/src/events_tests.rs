@@ -356,6 +356,40 @@ fn each_event_has_exactly_its_data_fields() {
             &["binding", "declared_in", "reason"],
         ),
         (
+            Payload::SkillDiscovered {
+                skills: vec![DiscoveredSkill {
+                    name: text("review"),
+                    source: text("project"),
+                    description: text("Reviews a change."),
+                    digest: text("ab12"),
+                    executable: true,
+                }],
+                diagnostics: vec![SkillDiagnostic {
+                    skill: Some(text("review")),
+                    source: text("user"),
+                    code: text("shadowed"),
+                    message: text("skill \"review\" from the \"user\" source is shadowed"),
+                }],
+            },
+            "skill.discovered",
+            &["skills", "diagnostics"],
+        ),
+        (
+            Payload::SkillImported {
+                skill: text("review"),
+                source: text("project"),
+                agent: Some(text("primary")),
+                digest: Some(text("ab12")),
+                reload: false,
+                code: None,
+                reason: None,
+            },
+            "skill.imported",
+            &[
+                "skill", "source", "agent", "digest", "reload", "code", "reason",
+            ],
+        ),
+        (
             Payload::AgentStarted {
                 model: text("sonnet"),
                 python: text("3.13.15"),

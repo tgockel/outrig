@@ -284,6 +284,30 @@ pub enum Payload {
         bindings: Vec<String>,
         cause: String,
     },
+    /// What the session's skill sources hold, as the session started: each
+    /// skill served, and why any other was left out, shadowed by an earlier
+    /// source's, or served with a warning. Read from each skill's metadata
+    /// alone, with no Python run.
+    #[non_exhaustive]
+    SkillDiscovered {
+        skills: Vec<DiscoveredSkill>,
+        diagnostics: Vec<SkillDiagnostic>,
+    },
+    /// A skill's package was imported in the interpreter -- again, after
+    /// `outrig.skills.reload`, when `reload` -- by `agent`'s code, or by code
+    /// outside every execution when that is `None`. `digest` is its files'
+    /// when it was imported; `code` and `reason` say why the import failed,
+    /// when it did.
+    #[non_exhaustive]
+    SkillImported {
+        skill: String,
+        source: String,
+        agent: Option<String>,
+        digest: Option<String>,
+        reload: bool,
+        code: Option<String>,
+        reason: Option<String>,
+    },
     /// A child agent was launched, by `parent`; the event's subject is the
     /// child's.
     #[non_exhaustive]
@@ -594,6 +618,8 @@ impl Payload {
             Payload::MessageRefused { .. } => "message.refused",
             Payload::MessageReceived { .. } => "message.received",
             Payload::BindingExited { .. } => "binding.exited",
+            Payload::SkillDiscovered { .. } => "skill.discovered",
+            Payload::SkillImported { .. } => "skill.imported",
             Payload::AgentSpawned { .. } => "agent.spawned",
             Payload::AgentRequestSent { .. } => "agent.request.sent",
             Payload::AgentRequestReceived { .. } => "agent.request.received",
@@ -627,7 +653,10 @@ impl Payload {
             | Self::InterpreterDiagnostic { .. }
             | Self::InterpreterExited { .. }
             | Self::BindingRefused { .. }
-            | Self::BindingExited { .. } => None,
+            | Self::BindingExited { .. }
+            | Self::SkillDiscovered { .. } => None,
+            // An import is the agent's whose code made it, which may be none.
+            Self::SkillImported { agent, .. } => agent.as_deref().map(Subject::agent),
             Self::HostedReceived { agent, .. }
             | Self::HostedDispatched { agent, .. }
             | Self::HostedEnded { agent, .. }
@@ -1048,6 +1077,33 @@ pub struct InputBrief {
     #[serde(rename = "type")]
     pub type_name: String,
     pub preview: String,
+}
+
+/// One skill the session serves, as discovery found it: its name, the source
+/// serving it, its description, the digest of its files then, and whether it
+/// has a `skill.py`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct DiscoveredSkill {
+    pub name: String,
+    pub source: String,
+    pub description: String,
+    pub digest: String,
+    pub executable: bool,
+}
+
+/// Something discovery found wrong with a skill, or with a source when
+/// `skill` is `None`. `code` is `shadowed` for a copy an earlier source's
+/// serves in its place, `unknown-key` for a warning about one that is still
+/// served, and otherwise why it was left out: `metadata-invalid`,
+/// `duplicate-metadata-block` or `source-error`. `message` says it in full.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct SkillDiagnostic {
+    pub skill: Option<String>,
+    pub source: String,
+    pub code: String,
+    pub message: String,
 }
 
 /// One of a request child's channels: its name, and the type of a request on

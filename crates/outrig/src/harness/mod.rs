@@ -22,6 +22,11 @@
 //!   repository's config declared starts only once its [`Approver`] approves
 //!   that exact declaration; each starts before the interpreter and stops with
 //!   the session.
+//! - **Skills.** The instructions and Python each [`SkillSource`] given to
+//!   [`SessionBuilder::skill_source`] holds, the first source holding a name
+//!   serving it. Their metadata is read as the session starts, with no Python
+//!   run, and the primary agent is told each by name and description; a
+//!   skill's files reach the container only as its code imports or reads them.
 //! - **Stopping.** [`Session::close_admission`] refuses new work at once, and
 //!   [`Session::shutdown`] stops what is left and returns a
 //!   [`ShutdownReport`]: whether everything is proven stopped, and how each
@@ -46,6 +51,7 @@ pub mod event;
 pub(crate) mod lifecycle;
 mod report;
 mod session;
+pub(crate) mod skills;
 
 use std::time::Duration;
 
@@ -59,6 +65,7 @@ pub use self::report::{
     RequestOutcome, ShutdownReport, Stopped, Verdict,
 };
 pub use self::session::{Closer, RoundEnd, RoundOutcome, Session, StillRunning, Tasks};
+pub use self::skills::{DirectorySource, SkillFile, SkillSource};
 pub use crate::agent::UserChannel;
 pub use crate::config::{EnvSecrets, Secrets};
 pub use crate::owner::{HostProgram, LeftOpen, ProgramExit, RunningProgram, SessionEnd};

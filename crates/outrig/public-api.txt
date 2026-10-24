@@ -1400,6 +1400,17 @@ pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::St
 pub outrig::harness::event::Payload::SessionReport::verdict: outrig::harness::Verdict
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionState
 pub outrig::harness::event::Payload::SessionState::state: outrig::harness::event::SessionState
+#[non_exhaustive] pub outrig::harness::event::Payload::SkillDiscovered
+pub outrig::harness::event::Payload::SkillDiscovered::diagnostics: alloc::vec::Vec<outrig::harness::event::SkillDiagnostic>
+pub outrig::harness::event::Payload::SkillDiscovered::skills: alloc::vec::Vec<outrig::harness::event::DiscoveredSkill>
+#[non_exhaustive] pub outrig::harness::event::Payload::SkillImported
+pub outrig::harness::event::Payload::SkillImported::agent: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillImported::code: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillImported::digest: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillImported::reason: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillImported::reload: bool
+pub outrig::harness::event::Payload::SkillImported::skill: alloc::string::String
+pub outrig::harness::event::Payload::SkillImported::source: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::ToolResultTruncated
 pub outrig::harness::event::Payload::ToolResultTruncated::execid: outrig::harness::event::ExecId
 pub outrig::harness::event::Payload::ToolResultTruncated::kept: u64
@@ -1499,6 +1510,12 @@ pub outrig::harness::event::ChannelBrief::request: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::Chosen
 pub outrig::harness::event::Chosen::turn: u64
 pub outrig::harness::event::Chosen::why: outrig::harness::event::Why
+#[non_exhaustive] pub struct outrig::harness::event::DiscoveredSkill
+pub outrig::harness::event::DiscoveredSkill::description: alloc::string::String
+pub outrig::harness::event::DiscoveredSkill::digest: alloc::string::String
+pub outrig::harness::event::DiscoveredSkill::executable: bool
+pub outrig::harness::event::DiscoveredSkill::name: alloc::string::String
+pub outrig::harness::event::DiscoveredSkill::source: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::Event
 pub outrig::harness::event::Event::id: u64
 pub outrig::harness::event::Event::payload: outrig::harness::event::Payload
@@ -1556,6 +1573,11 @@ impl outrig::harness::event::RequestId
 pub fn outrig::harness::event::RequestId::get(self) -> u64
 impl core::fmt::Display for outrig::harness::event::RequestId
 pub fn outrig::harness::event::RequestId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct outrig::harness::event::SkillDiagnostic
+pub outrig::harness::event::SkillDiagnostic::code: alloc::string::String
+pub outrig::harness::event::SkillDiagnostic::message: alloc::string::String
+pub outrig::harness::event::SkillDiagnostic::skill: core::option::Option<alloc::string::String>
+pub outrig::harness::event::SkillDiagnostic::source: alloc::string::String
 pub struct outrig::harness::event::Subject(_)
 impl outrig::harness::event::Subject
 pub fn outrig::harness::event::Subject::as_str(&self) -> &str
@@ -1661,6 +1683,14 @@ pub fn outrig::harness::Closer::close_admission(&self)
 #[non_exhaustive] pub struct outrig::harness::ContainerSpec
 pub outrig::harness::ContainerSpec::left_out: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::ContainerSpec::spec: outrig::LaunchSpec
+pub struct outrig::harness::DirectorySource
+impl outrig::harness::DirectorySource
+pub fn outrig::harness::DirectorySource::new(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::harness::DirectorySource::within(impl core::convert::Into<std::path::PathBuf>, impl core::convert::AsRef<std::path::Path>) -> Self
+impl outrig::harness::SkillSource for outrig::harness::DirectorySource
+pub fn outrig::harness::DirectorySource::files(&self, &str) -> std::io::error::Result<alloc::vec::Vec<outrig::harness::SkillFile>>
+pub fn outrig::harness::DirectorySource::read(&self, &str, &str) -> std::io::error::Result<alloc::vec::Vec<u8>>
+pub fn outrig::harness::DirectorySource::skills(&self) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
 pub struct outrig::harness::EnvSecrets
 impl outrig::config::Secrets for outrig::config::EnvSecrets
 pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
@@ -1744,6 +1774,7 @@ pub fn outrig::harness::SessionBuilder::progress(self, impl core::ops::function:
 pub fn outrig::harness::SessionBuilder::record_events(self) -> Self
 pub fn outrig::harness::SessionBuilder::repo_root(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::harness::SessionBuilder::secrets(self, impl outrig::config::Secrets + 'static) -> Self
+pub fn outrig::harness::SessionBuilder::skill_source(self, impl core::convert::Into<alloc::string::String>, impl outrig::harness::SkillSource + 'static) -> Self
 pub async fn outrig::harness::SessionBuilder::start(self) -> core::result::Result<outrig::harness::Session, outrig::harness::SessionError>
 pub fn outrig::harness::SessionBuilder::subscribe(&mut self) -> outrig::harness::event::Subscription
 pub fn outrig::harness::SessionBuilder::subscribe_with_capacity(&mut self, usize) -> outrig::harness::event::Subscription
@@ -1757,6 +1788,11 @@ pub outrig::harness::ShutdownReport::requests: alloc::vec::Vec<outrig::harness::
 pub outrig::harness::ShutdownReport::stopped: outrig::harness::Stopped
 impl outrig::harness::ShutdownReport
 pub fn outrig::harness::ShutdownReport::verdict(&self) -> outrig::harness::Verdict
+#[non_exhaustive] pub struct outrig::harness::SkillFile
+pub outrig::harness::SkillFile::path: alloc::string::String
+pub outrig::harness::SkillFile::version: alloc::string::String
+impl outrig::harness::SkillFile
+pub fn outrig::harness::SkillFile::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub struct outrig::harness::StillRunning
 pub outrig::harness::StillRunning::tasks: outrig::harness::Tasks
 impl outrig::harness::StillRunning
@@ -1777,6 +1813,14 @@ impl outrig::config::Secrets for outrig::config::EnvSecrets
 pub fn outrig::config::EnvSecrets::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
 impl<F> outrig::config::Secrets for F where F: core::ops::function::Fn(&str) -> core::option::Option<alloc::string::String> + core::marker::Send + core::marker::Sync
 pub fn F::resolve(&self, &str) -> core::result::Result<alloc::string::String, outrig::config::ApiKeyError>
+pub trait outrig::harness::SkillSource: core::marker::Send + core::marker::Sync
+pub fn outrig::harness::SkillSource::files(&self, &str) -> std::io::error::Result<alloc::vec::Vec<outrig::harness::SkillFile>>
+pub fn outrig::harness::SkillSource::read(&self, &str, &str) -> std::io::error::Result<alloc::vec::Vec<u8>>
+pub fn outrig::harness::SkillSource::skills(&self) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
+impl outrig::harness::SkillSource for outrig::harness::DirectorySource
+pub fn outrig::harness::DirectorySource::files(&self, &str) -> std::io::error::Result<alloc::vec::Vec<outrig::harness::SkillFile>>
+pub fn outrig::harness::DirectorySource::read(&self, &str, &str) -> std::io::error::Result<alloc::vec::Vec<u8>>
+pub fn outrig::harness::DirectorySource::skills(&self) -> std::io::error::Result<alloc::vec::Vec<alloc::string::String>>
 pub async fn outrig::harness::container_spec(&outrig::config::Config, &str, core::option::Option<&outrig::image::ImageTag>, &std::path::Path, std::path::PathBuf) -> core::result::Result<outrig::harness::ContainerSpec, outrig::error::OutrigError>
 pub mod outrig::image
 #[non_exhaustive] pub enum outrig::image::BuildOutput

@@ -234,7 +234,11 @@ each:
 - `0003-36`: each live object a host program injects, `binding.injected`, with its name and
   host-side type; its calls produce the same `hosted.*` events as a factory binding's.
 
-Three more tasks add events beside them that are execution diagnostics, not integration audit:
+Four more tasks add events beside them that are execution diagnostics, not integration audit:
+
+- `0003-32`: what the session's skill sources hold, `skill.discovered`, published once as it
+  starts -- each skill served, and why any other was left out, shadowed or warned of -- and each
+  import of a skill's package, `skill.imported`, with the digest of the files it was made from;
 
 - `0003-30`: each request a child is given -- a submission, or a request on one of its request
   channels -- as one family, `agent.request.sent`, `received`, `replied`, `invalid`, `failed`,

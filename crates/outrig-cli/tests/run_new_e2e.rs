@@ -1527,6 +1527,72 @@ async fn an_unapproved_repo_binding_with_no_terminal_does_not_start() {
     );
 }
 
+/// The repository's skills reach run-new's agent: its preamble lists each one,
+/// its code imports one in the container, and a skill whose metadata is wrong
+/// is left out and said as the session starts.
+#[tokio::test]
+async fn a_repository_skill_is_listed_and_imports_and_a_bad_one_is_said() {
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_1",
+            "import outrig_skills.greet.skill as g\nprint(g.hello())",
+        ),
+        text_reply("greeted"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let skills = repo.path().join(".agents/skills");
+    for (path, text) in [
+        (
+            "greet/SKILL.md",
+            "---\nname: greet\ndescription: Greets whoever asks.\n---\nSay hello.\n",
+        ),
+        (
+            "greet/skill.py",
+            "def hello():\n    return 'hello from greet'\n",
+        ),
+        ("Bad/SKILL.md", "---\nname: Bad\ndescription: d\n---\n"),
+        // Metadata whose parser error quotes a terminal's escape and bell.
+        ("noisy/SKILL.md", "---\nname: noisy\ndescription: d\n---\n"),
+        (
+            "noisy/skill.py",
+            "# /// script\n# x = \x1b]0;pwned\x07\n# ///\n",
+        ),
+    ] {
+        let path = skills.join(path);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+    session.type_line("greet").await;
+    wait_for(&session.stderr, "greeted", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "[outrig] skill \"Bad\" from the \"project\" source is left out (metadata-invalid)"
+        ),
+        "{stderr}"
+    );
+    // The line the parser quotes is said with its controls escaped, so the repository's text
+    // cannot drive the terminal.
+    let quoted = stderr
+        .lines()
+        .find(|line| line.contains("pwned"))
+        .expect("the quoted line");
+    assert!(quoted.contains(r"\u{1b}]0;pwned\u{7}"), "{quoted:?}");
+    assert!(!quoted.contains(char::is_control), "{quoted:?}");
+    let recorded = drain_recorded(&mut requests);
+    let system = recorded[0].body["system"].to_string();
+    assert!(
+        system.contains("- `greet` (`outrig_skills.greet`): Greets whoever asks."),
+        "{system}"
+    );
+    assert_eq!(tool_result(&recorded[1], "toolu_1"), "hello from greet\n");
+}
+
 /// A round whose code leaves a task running says so as it closes, so a prompt
 /// that returns is not taken for work done.
 #[tokio::test]

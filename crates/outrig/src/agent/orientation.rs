@@ -24,6 +24,11 @@
 //! agent's event loop until the host answers -- since
 //! `repo.head.commit.hexsha` reads like a plain attribute chain
 //! (`plan/phase/0003-python/discovery.md`).
+//!
+//! So are the session's skills, for the primary agent alone, each by name and
+//! description as the Agent Skills standard lists them, and no more of each:
+//! no skill's file is in the container until it is used, so the agent cannot
+//! find them by looking. A child is told none; it can still use every one.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -33,23 +38,31 @@ use super::history::Window;
 use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
 use crate::harness::event::InputBrief;
+use crate::harness::skills::SkillBrief;
 
 /// What every agent is told first: how it acts.
 const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
                    code in a persistent interpreter inside the project's container; it is the \
                    only way to read a file, run a command, or change anything.\n\n";
 
+/// What a session holds for its primary agent besides the interpreter: its
+/// bindings and its skills, each in the session's order.
+pub(crate) struct Holdings<'a> {
+    pub(crate) bindings: &'a [Brief],
+    pub(crate) skills: &'a [SkillBrief],
+}
+
 /// The orientation, then `configured` after a blank line when there is one,
 /// then the repository's `instructions` after another.
 ///
 /// `workspace` is where the interpreter's working directory is: the primary's
 /// `-w`, which is its workspace mount. Without one there is nothing true to
-/// say about it, so the line is left out. `bindings` are the session's, in its
-/// order; with none, nothing is said of them. `window` is what each model call
-/// is sent of the conversation.
+/// say about it, so the line is left out. `holdings` are the session's
+/// bindings and skills; with none of either, nothing is said of it. `window`
+/// is what each model call is sent of the conversation.
 pub(crate) fn preamble(
     workspace: Option<&Path>,
-    bindings: &[Brief],
+    holdings: Holdings<'_>,
     configured: Option<&str>,
     instructions: Option<&Instructions>,
     window: Window,
@@ -71,10 +84,13 @@ pub(crate) fn preamble(
     );
     text.push_str(&rest(
         workspace,
-        bindings,
+        holdings.bindings,
         window,
         "each time you are told messages are waiting",
     ));
+    if !holdings.skills.is_empty() {
+        text.push_str(&skilled(holdings.skills));
+    }
     if let Some(configured) = configured {
         text.push_str("\n\n");
         text.push_str(configured);
@@ -264,6 +280,49 @@ fn hosted(bindings: &[Brief]) -> String {
          asyncio.to_thread(lambda: {example}.f(x))` runs the whole expression on a worker thread \
          and keeps the loop turning. `runtime.bindings` lists them."
     );
+    text
+}
+
+/// The most skills the preamble lists.
+const SKILLS_LISTED_MAX: usize = 50;
+
+/// The most bytes of the preamble's list of skills: some 3,000 tokens.
+const SKILLS_TEXT_MAX: usize = 12 * 1024;
+
+/// What the primary agent is told of the session's skills, of which there is
+/// at least one: as many as fit [`SKILLS_LISTED_MAX`] and
+/// [`SKILLS_TEXT_MAX`], each by name and description, then how many more
+/// there are and where they are listed.
+fn skilled(skills: &[SkillBrief]) -> String {
+    let mut text = String::from(
+        "\n\nThese skills come with the session, each instructions for a kind of work: \
+         `outrig.skills.read(name)` returns them, to read when a skill's description fits what \
+         you are doing. One that names a package also has Python, its entry module that \
+         package's `skill`, which you import as any module. `help(outrig.skills)` says more.\n",
+    );
+    let mut listed = 0;
+    let mut size = 0;
+    for skill in skills {
+        let mut line = format!("\n- `{}`", skill.name);
+        if let Some(package) = &skill.package {
+            let _ = write!(line, " (`{package}`)");
+        }
+        let _ = write!(line, ": {}", skill.description);
+        if listed == SKILLS_LISTED_MAX || size + line.len() > SKILLS_TEXT_MAX {
+            break;
+        }
+        size += line.len();
+        listed += 1;
+        text.push_str(&line);
+    }
+    let more = skills.len() - listed;
+    if more > 0 {
+        let _ = write!(
+            text,
+            "\n\n{more} more {} not listed here; `outrig.skills.catalog()` has every one.",
+            if more == 1 { "is" } else { "are" }
+        );
+    }
     text
 }
 

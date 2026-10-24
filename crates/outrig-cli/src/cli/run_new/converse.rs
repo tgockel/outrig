@@ -577,6 +577,12 @@ impl Terminal<'_> {
                 {
                     out.text(render_submission(source));
                 }
+                // What discovery left out or warned of, as the session starts.
+                if let Payload::SkillDiscovered { diagnostics, .. } = &event.payload {
+                    for diagnostic in diagnostics {
+                        self.note(&format!("[outrig] {}", diagnostic.message));
+                    }
+                }
             }
             Received::Missed(missed) => {
                 self.note(&format!(

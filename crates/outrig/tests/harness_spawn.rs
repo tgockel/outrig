@@ -1,7 +1,7 @@
 //! A session starts on whatever task its owner chooses: the futures that start
 //! one are `Send`, so `tokio::spawn` takes them, with a progress callback or
-//! without, with a container given or the default one, and with a primary
-//! agent or none.
+//! without, with a container given or the default one, with a primary agent
+//! or none, and with skill sources or none.
 //!
 //! Nothing here runs: what is checked is that each future compiles as a
 //! spawnable one. A borrow of something not `Sync` held across an await
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use outrig::LaunchSpec;
 use outrig::config::Config;
-use outrig::harness::{DEFAULT_DRAIN, Session, SessionBuilder};
+use outrig::harness::{DEFAULT_DRAIN, DirectorySource, Session, SessionBuilder};
 
 fn spawnable<F: Future + Send + 'static>(_: F) {}
 
@@ -45,6 +45,12 @@ fn every_way_to_start_a_session_can_be_spawned() {
     spawnable(
         SessionBuilder::new(Config::default(), None, None)
             .no_primary()
+            .start(),
+    );
+    spawnable(
+        SessionBuilder::new(Config::default(), None, None)
+            .skill_source("project", DirectorySource::within(".", ".agents/skills"))
+            .skill_source("user", DirectorySource::new("skills"))
             .start(),
     );
     spawnable(Session::start(Config::default(), None, None));

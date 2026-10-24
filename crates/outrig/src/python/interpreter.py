@@ -1444,6 +1444,32 @@ def _compiled_file(name):
     return None
 
 
+def _compiled_cause(exc):
+    """The module a failed import could not load, and the compiled file found where it looked, or
+    `None` when nothing says compiled code is why: a compiled file found and not loaded, or one
+    beside a module that was not found -- including `from p import m`, which reports `m` as a name
+    `p` lacks rather than as a module. Only `ImportError` and `ModuleNotFoundError` themselves are
+    read, never a subclass, so no agent code runs."""
+    kind = type(exc)
+    if kind is not ImportError and kind is not ModuleNotFoundError:
+        return None
+    name = exc.name
+    if type(name) is not str:
+        return None
+    if kind is ModuleNotFoundError:
+        compiled = _compiled_file(name)
+        return None if compiled is None else (name, compiled)
+    path = exc.path
+    if type(path) is str and path.endswith(_COMPILED_SUFFIXES):
+        return name, path
+    name_from = exc.name_from
+    if type(name_from) is not str:
+        return None
+    module = f"{name}.{name_from}"
+    compiled = _compiled_file(module)
+    return None if compiled is None else (module, compiled)
+
+
 def _explain_import(exc):
     """Rewrite a failed import's message to say why it failed here, if the reason is this
     interpreter: compiled code, or a top-level module that is nowhere. Only `ImportError` and
@@ -1454,19 +1480,17 @@ def _explain_import(exc):
     name, message = exc.name, exc.msg
     if type(name) is not str or type(message) is not str or _NO_COMPILED in message:
         return
-    path = exc.path
-    if kind is ImportError:
-        compiled = path if type(path) is str and path.endswith(_COMPILED_SUFFIXES) else None
-        if compiled is None:
-            return
-    else:
-        compiled = _compiled_file(name)
-    if compiled is not None:
+    found = _compiled_cause(exc)
+    if found is None and _skills is not None:
+        # A skill's files are in its listing, not on disk.
+        found = _skills._compiled_in_skill(exc)
+    if found is not None:
+        module, compiled = found
         text = (
-            f"cannot import {name!r}: {compiled} is compiled code, and {_NO_COMPILED}, however it "
-            f"is installed. {_elsewhere()}"
+            f"cannot import {module!r}: {compiled} is compiled code, and {_NO_COMPILED}, however "
+            f"it is installed. {_elsewhere()}"
         )
-    elif "." not in name and name not in sys.stdlib_module_names:
+    elif kind is ModuleNotFoundError and "." not in name and name not in sys.stdlib_module_names:
         text = (
             f"{message}. If a pure-Python package provides it, `pip install` that package and "
             f"import it again. A package with compiled parts will not import however it is "
@@ -1693,6 +1717,8 @@ LABEL_CALLABLE = 105
 # `outrig.schema`, from OutRig's own package, which `main` imports from the directory it is given:
 # what checks a channel's contract, and turns a message into what crosses.
 _schema = None
+# `outrig.skills`, from the same package: what serves `outrig_skills`, given the catalog.
+_skills = None
 # The vendored RPyC, imported by `main` from the directory it is given, and the connection class
 # built over it; `None` when the interpreter was started without one.
 _rpyc = None
@@ -2394,18 +2420,22 @@ def _coroutine_function(fn):
 
 def _load_outrig(directory):
     """Import OutRig's own package from `directory`, and give it this process's executions:
-    `outrig.runtime` and `outrig.bindings` are those of the execution reading them."""
-    global _schema, _agents
+    `outrig.runtime` and `outrig.bindings` are those of the execution reading them. Its skills
+    module gets the way to ask the host for a skill's files, and puts its finder in place."""
+    global _schema, _agents, _skills
     sys.path.append(directory)
     import outrig._agents
     import outrig._kernel
     import outrig.schema
+    import outrig.skills
 
     outrig._kernel.install(_calling)
     outrig._agents._call = _call
     outrig._agents._submitted_source = _submitted_source
+    outrig.skills._install(_ask_host, _notify, _compiled_cause)
     _schema = outrig.schema
     _agents = outrig._agents
+    _skills = outrig.skills
 
 
 def _calling():
@@ -4136,6 +4166,59 @@ def _notify(message):
             pass
 
 
+# How long a request about a skill waits for the host's answer. The host gives up on a source
+# well before this, so only an answer that was lost reaches it -- and a child's kernel, which no
+# interrupt reaches, still never waits for good.
+ASK_TIMEOUT = 60
+# Where the reader thread puts the host's answer to each request about a skill still waited for,
+# by the request's id.
+_answers = {}
+# This thread's request about a skill that an interrupt may end, as `left`: a list where an
+# interrupt's signal that could not raise where it landed -- in the line's write, say -- leaves its
+# exception, for the wait to raise.
+_asking = threading.local()
+
+
+def _ask_host(line):
+    """Send `line`, a request about a skill, and return the host's answer to it, a line with `ok`
+    or with `error`. Blocks only the calling thread, which may be any but the reader's: an
+    import on a kernel's loop holds that loop meanwhile, as a hosted call does.
+
+    An interrupt of the primary raises in the wait -- or, by `_on_sigint`'s rule, is left for it
+    when it landed in this program's machinery, and raised rather than any answer, for a request
+    agent code made: one this program makes for itself is not an interrupt's to end. The wait
+    looks for one every `SIGNAL_CHECK` seconds, since the handler cannot wake it. An answer that
+    comes after its asker gave up is dropped."""
+    if threading.current_thread() is _reader_thread or _PROTO_OUT is None:
+        where = "from a forked process" if _PROTO_OUT is None else "from the reader thread"
+        return {"error": {"code": "source-error", "message": f"the host cannot be asked {where}"}}
+    ask_id = line["id"] = next(_ids)
+    execution = _CURRENT.get()
+    interruptible = execution is not None and _agent_code_outward(
+        sys._getframe(), execution.kernel
+    )
+    outer = getattr(_asking, "left", None)
+    try:
+        answers = _answers[ask_id] = queue.SimpleQueue()
+        left = _asking.left = [] if interruptible else None
+        _write_line(_encode(line))
+        deadline = time.monotonic() + ASK_TIMEOUT
+        answer = None
+        while answer is None and not left:
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                text = f"the host did not answer within {ASK_TIMEOUT} s"
+                return {"error": {"code": "source-error", "message": text}}
+            with contextlib.suppress(queue.Empty):
+                answer = answers.get(timeout=min(wait, SIGNAL_CHECK))
+        if left:
+            raise left[0]
+        return answer
+    finally:
+        _answers.pop(ask_id, None)
+        _asking.left = outer
+
+
 def _refuse_long(message, what, how):
     """Raise `ValueError`, saying `how` to shorten it, if `message` -- a `what` agent code sends
     the host -- would be a protocol line longer than `MESSAGE_MAX`, which bounds a channel message
@@ -5653,8 +5736,10 @@ def _on_sigint(signum, frame):
     When only the second fails and the main thread is in a hosted call an interrupt may end, the
     interrupt is left on the call, which raises it at its next check: before it waits, as its
     wait looks again -- every `SIGNAL_CHECK` seconds, since nothing here wakes it -- or as it
-    ends. Outside one -- a call taking the pool's lock before it has begun, a proxy's finalizer --
-    it is dropped, and the host's next interrupt reaches the code.
+    ends. So it is on a request about a skill's files the main thread waits on (`_ask_host`),
+    which an import from agent code makes. Outside both -- a call taking the pool's lock before
+    it has begun, a proxy's finalizer -- it is dropped, and the host's next interrupt reaches the
+    code.
     """
     kernel = _primary
     if kernel is None:
@@ -5683,6 +5768,12 @@ def _on_sigint(signum, frame):
     wait = _waits.get(threading.get_ident())
     if wait is not None and wait.interruptible and wait.exc is None:
         wait.exc, wait.by = KeyboardInterrupt(_woken_text(wait, "interrupted")), kernel
+        return
+    left = getattr(_asking, "left", None)
+    if left is not None and not left:
+        exc = KeyboardInterrupt("interrupted by outrig")
+        kernel._landed = (exc, asyncio.current_task(kernel.loop), _CURRENT.get())
+        left.append(exc)
 
 
 def _agent_code_outward(frame, kernel):
@@ -6221,6 +6312,15 @@ def _route(line):
         return
     if kind == "unbind":
         _unbind(message)
+        return
+    if kind == "skills":
+        _skills._declare(message["skills"])
+        return
+    if kind == "skill":
+        # The answer to a request about a skill, for the thread still waiting for it.
+        answers = _answers.pop(message.get("id"), None)
+        if answers is not None:
+            answers.put(message)
         return
     handle = _ROUTES.get(kind) if isinstance(kind, str) else None
     if handle is None:

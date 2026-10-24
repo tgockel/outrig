@@ -31,7 +31,7 @@ mod failover;
 mod history;
 mod instructions;
 pub(crate) mod ledger;
-mod orientation;
+pub(crate) mod orientation;
 mod resolve;
 mod retry;
 pub(crate) mod round;
@@ -208,16 +208,17 @@ impl Agent {
     }
 
     /// An agent over `interpreter`, in the container named `container_name`
-    /// whose workspace is `workspace`, recording its spend in `ledger` and
-    /// moving `lifecycle` through each round. Its system prompt ends with the
-    /// repository's instructions, read through `interpreter`, when `resolved`
-    /// asks for them and `workspace` holds them.
+    /// whose workspace is `workspace`, told of the bindings and skills in
+    /// `holdings`, recording its spend in `ledger` and moving `lifecycle`
+    /// through each round. Its system prompt ends with the repository's
+    /// instructions, read through `interpreter`, when `resolved` asks for them
+    /// and `workspace` holds them.
     pub(crate) async fn build(
         resolved: &ResolvedAgent,
         interpreter: Interpreter,
         container_name: &str,
         workspace: Option<&Path>,
-        bindings: &[crate::harness::bindings::Brief],
+        holdings: orientation::Holdings<'_>,
         ledger: Ledger,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
@@ -226,7 +227,7 @@ impl Agent {
             instructions::load(&interpreter, workspace, resolved.repo_instructions).await;
         let preamble = orientation::preamble(
             workspace,
-            bindings,
+            holdings,
             resolved.preamble.as_deref(),
             instructions.as_ref(),
             window,

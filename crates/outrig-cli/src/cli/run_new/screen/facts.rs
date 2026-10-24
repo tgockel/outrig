@@ -342,6 +342,16 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
             ),
             inline: true,
         },
+        // What discovery left out or warned of, as the session started.
+        Payload::SkillDiscovered { diagnostics, .. } if !diagnostics.is_empty() => Fact::Note {
+            text: diagnostics
+                .iter()
+                .map(|diagnostic| format!("[outrig] {}", diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            inline: true,
+        },
+        Payload::SkillDiscovered { .. } => return None,
         Payload::ModelText { text, .. } => Fact::Said(text.clone()),
         Payload::ModelInstructions { .. }
         | Payload::TurnCommitted { .. }

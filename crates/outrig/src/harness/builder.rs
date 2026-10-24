@@ -9,6 +9,7 @@ use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
+use super::skills::{self, SkillBrief, SkillSource};
 use super::{Failure, Session, SessionError};
 use crate::agent::{self, AgentError, ResolvedAgent};
 use crate::config::{Config, ConfigValidationError, EnvSecrets, ImageConfig, Secrets, lexical};
@@ -89,6 +90,8 @@ pub struct SessionBuilder {
     bindings_env: Option<Vec<(OsString, OsString)>>,
     approver: Option<Arc<dyn Approver>>,
     repo_root: Option<PathBuf>,
+    /// The sources of the session's skills, by name, in precedence order.
+    skill_sources: Vec<(String, Arc<dyn SkillSource>)>,
     /// Where a test's bindings install and remember approvals, in place of
     /// the user's own.
     #[cfg(test)]
@@ -137,6 +140,7 @@ impl SessionBuilder {
             bindings_env: None,
             approver: None,
             repo_root: None,
+            skill_sources: Vec::new(),
             #[cfg(test)]
             places: None,
             #[cfg(test)]
@@ -261,6 +265,25 @@ impl SessionBuilder {
         self
     }
 
+    /// Serve the skills `source` holds, under `name`, which the session's
+    /// events and the agent's `outrig.skills` report it by. Sources rank in
+    /// the order given: a skill more than one holds is served from the first,
+    /// and each later copy is reported as shadowed. A source with no name, or
+    /// one another source has, fails the start.
+    ///
+    /// Each skill's metadata is read as the session starts, with no Python
+    /// run, and the primary agent is told the skills by name and description.
+    /// A skill's files reach the container only as its code imports or opens
+    /// them, and nothing is mounted for them.
+    pub fn skill_source(
+        mut self,
+        name: impl Into<String>,
+        source: impl SkillSource + 'static,
+    ) -> Self {
+        self.skill_sources.push((name.into(), Arc::new(source)));
+        self
+    }
+
     /// A subscription to the session's events, from its first, holding up to
     /// [`DEFAULT_CAPACITY`] of them for its reader.
     pub fn subscribe(&mut self) -> Subscription {
@@ -293,6 +316,8 @@ impl SessionBuilder {
             agent::find_agent(&self.config, name).map_err(|e| SessionError::Resolve(Failure(e)))?;
         }
         bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        skills::check_sources(&self.skill_sources)
+            .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         Ok(())
     }
 
@@ -352,6 +377,8 @@ impl SessionBuilder {
     pub async fn start(mut self) -> Result<Session, SessionError> {
         let resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
+        skills::check_sources(&self.skill_sources)
+            .map_err(|e| start_error(OutrigError::Configuration(e)))?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let mut spec = match self.container.take() {
             Some(spec) => spec,
@@ -362,6 +389,12 @@ impl SessionBuilder {
         let id = resolve_session_id(&spec).map_err(start_error)?;
         spec.session_id = Some(id.clone());
         let (events, lifecycle) = self.open_stream(&id, &spec.log_dir).await?;
+        let catalog = skills::discover(
+            std::mem::take(&mut self.skill_sources),
+            &events,
+            skills::SOURCE_TIMEOUT,
+        )
+        .await;
 
         let cwd = spec
             .workspace
@@ -399,6 +432,7 @@ impl SessionBuilder {
         };
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, bindings::container_path);
+        skills::serve(&catalog, &interpreter, &events);
         self.report(Progress::Finished(Step::Python));
 
         let primary = outrig.primary();
@@ -419,7 +453,13 @@ impl SessionBuilder {
         );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
-        assemble(session, resolved.as_ref(), workspace.as_deref()).await
+        assemble(
+            session,
+            resolved.as_ref(),
+            workspace.as_deref(),
+            &catalog.briefs(),
+        )
+        .await
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -562,6 +602,12 @@ impl SessionBuilder {
         let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
         let log_dir = self.host_log.clone().unwrap_or_default();
         let (events, lifecycle) = self.open_stream(&id, &log_dir).await?;
+        let catalog = skills::discover(
+            std::mem::take(&mut self.skill_sources),
+            &events,
+            skills::SOURCE_TIMEOUT,
+        )
+        .await;
         let mut bindings = self
             .start_bindings(declared, &repo_root, &repo_root, &events)
             .await
@@ -571,6 +617,7 @@ impl SessionBuilder {
             crate::python::testing::start_on_host_rpyc(events.clone(), bindings.rpyc_dir()).await;
         bindings.connect(&interpreter, &events);
         bindings.declare(&interpreter, Path::to_path_buf);
+        skills::serve(&catalog, &interpreter, &events);
         self.report(Progress::Finished(Step::Python));
         let workspace = self.host_workspace.take();
         let setup = self.child_setup(workspace.clone());
@@ -584,7 +631,13 @@ impl SessionBuilder {
             setup,
         )
         .failing(self.fail_stop.take());
-        assemble(session, resolved.as_ref(), workspace.as_deref()).await
+        assemble(
+            session,
+            resolved.as_ref(),
+            workspace.as_deref(),
+            &catalog.briefs(),
+        )
+        .await
     }
 }
 
@@ -632,15 +685,17 @@ async fn default_container(
 }
 
 /// `session`, with the primary agent `resolved` names -- none, for a session
-/// with no primary agent -- in a container whose workspace is `workspace`, and
-/// idle. A primary that cannot be built stops what the start launched.
+/// with no primary agent -- in a container whose workspace is `workspace`,
+/// told of the session's skills by `skills`, and idle. A primary that cannot be
+/// built stops what the start launched.
 async fn assemble(
     mut session: Session,
     resolved: Option<&ResolvedAgent>,
     workspace: Option<&Path>,
+    skills: &[SkillBrief],
 ) -> Result<Session, SessionError> {
     if let Some(resolved) = resolved
-        && let Err(e) = session.build_primary(resolved, workspace).await
+        && let Err(e) = session.build_primary(resolved, workspace, skills).await
     {
         session.abandon().await;
         return Err(SessionError::Start(Failure(e)));

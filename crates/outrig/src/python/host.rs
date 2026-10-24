@@ -448,6 +448,8 @@ struct Table {
     ending: HashMap<String, oneshot::Sender<()>>,
     /// Where the lines about child agents go, once the session listens.
     children: Option<ChildLines>,
+    /// Where the lines about skills go, once the session serves any.
+    skills: Option<SkillLines>,
     /// The writer's queue, held weakly, for the close's own line to the
     /// interpreter when no relay carries it.
     lines: Option<Lines>,
@@ -456,6 +458,11 @@ struct Table {
 /// What hears the lines a kernel sends about child agents -- a spawn, a
 /// release, what became of a request -- with the agent that sent each.
 pub(crate) type ChildLines = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+/// What hears the lines the interpreter sends about skills -- a request for a
+/// skill's listing or one of its files, a notice of an import -- from
+/// whichever thread sent them, inside an execution or not.
+pub(crate) type SkillLines = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// What the host holds for one kernel.
 struct KernelState {
@@ -930,6 +937,18 @@ impl Interpreter {
     /// on.
     pub(crate) fn attach_children(&self, lines: ChildLines) {
         lock(&self.table).children = Some(lines);
+    }
+
+    /// Hand each line the interpreter sends about skills to `lines`, from now
+    /// on. Until then each request is answered that the session serves none.
+    pub(crate) fn attach_skills(&self, lines: SkillLines) {
+        lock(&self.table).skills = Some(lines);
+    }
+
+    /// Tell the interpreter the session's skills, before anything runs, as
+    /// [`Interpreter::declare_bindings`] tells it the bindings.
+    pub(crate) fn declare_skills(&self, message: &Value) {
+        self.lines.send(format!("{message}\n"));
     }
 
     /// Queue `line` for the kernel it names, as it is: one the session sends
@@ -2043,6 +2062,24 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         match lock(table).children.clone() {
             Some(children) => children(&agent, value),
             None => tracing::warn!("ignored a {kind} line from agent {agent:?}: nothing reads it"),
+        }
+        return;
+    }
+    // A line about skills is the session's too, and one sent outside every
+    // execution names no agent. A request is always answered, so no thread
+    // waits on one for good.
+    if let Some(kind) = value["t"].as_str()
+        && kind.starts_with("skill.")
+    {
+        // Its own statement, so the table is not locked while the hook runs.
+        let skills = lock(table).skills.clone();
+        match skills {
+            Some(skills) => skills(value),
+            None => {
+                if let Some(answer) = crate::harness::skills::unserved(&value) {
+                    lines.send(format!("{answer}\n"));
+                }
+            }
         }
         return;
     }

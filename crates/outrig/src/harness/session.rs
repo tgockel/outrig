@@ -12,10 +12,12 @@ use super::lifecycle::Lifecycle;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
+use super::skills::SkillBrief;
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
 use crate::agent::children::{self, Children};
 use crate::agent::ledger::Ledger;
+use crate::agent::orientation::Holdings;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
 use crate::python::host::{Interpreter, PRIMARY};
@@ -144,12 +146,14 @@ impl Session {
 
     /// Open the primary agent's kernel, on the interpreter's main thread, and
     /// build the agent `resolved` names over it, in a container whose
-    /// workspace is `workspace`: its spend recorded in the session's ledger,
-    /// and its rounds moving the session's state.
+    /// workspace is `workspace`, told of the session's skills by `skills`: its
+    /// spend recorded in the session's ledger, and its rounds moving the
+    /// session's state.
     pub(crate) async fn build_primary(
         &mut self,
         resolved: &ResolvedAgent,
         workspace: Option<&Path>,
+        skills: &[SkillBrief],
     ) -> Result<(), AgentError> {
         self.interpreter.open(PRIMARY).await?;
         let agent = Agent::build(
@@ -157,7 +161,10 @@ impl Session {
             self.interpreter.clone(),
             &self.container_name,
             workspace,
-            &self.bindings.briefs(),
+            Holdings {
+                bindings: &self.bindings.briefs(),
+                skills,
+            },
             self.ledger.clone(),
             Arc::clone(&self.lifecycle),
         )

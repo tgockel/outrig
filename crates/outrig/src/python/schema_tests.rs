@@ -640,6 +640,32 @@ fn help_documents_the_schema() {
     assert_eq!(out, "[] True\n");
 }
 
+/// `help(outrig.skills)` says what a skill is to the agent within what a kernel's `help()` shows,
+/// and on the host, where no session serves skills, each function says so.
+#[test]
+fn help_documents_skills_and_the_host_has_none() {
+    let out = run(r#"
+        import pydoc
+        text = pydoc.render_doc(outrig.skills, renderer=pydoc.plaintext)
+        names = ('read(name)', 'reload(name)', 'catalog()', 'class SkillError', 'class Origin',
+                 'class Skill', 'importlib.resources.files', 'requires-python')
+        print([name for name in names if name not in text], len(text) <= 8 * 1024)
+        for call in (lambda: outrig.skills.read("a"), outrig.skills.catalog):
+            try:
+                call()
+            except RuntimeError as e:
+                print(e)
+        "#);
+    assert_eq!(
+        out,
+        "[] True\n\
+         outrig.skills reaches the session's skills, which only an agent's kernel has, and this \
+         Python is not one\n\
+         outrig.skills reaches the session's skills, which only an agent's kernel has, and this \
+         Python is not one\n"
+    );
+}
+
 /// `@outrig.agent` declares on the host as it does in a kernel -- the
 /// maintainer's `analyze_code` against `ReviewResult`, checked as written --
 /// and a call there says that it needs an agent's kernel, sending nothing.

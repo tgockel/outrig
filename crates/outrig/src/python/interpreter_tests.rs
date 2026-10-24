@@ -6062,3 +6062,117 @@ fn a_submission_nesting_functions_past_the_recursion_limit_still_runs() {
         format!("42 {depth} True\n")
     );
 }
+
+// ---------------------------------------------------------------------------- skills
+
+impl Interpreter {
+    /// Tell the interpreter the session serves the skills `names`, each with code.
+    fn skills(&mut self, names: &[&str]) {
+        let skills: Vec<Value> = names
+            .iter()
+            .map(|name| json!({"name": name, "description": "d", "source": "test", "executable": true}))
+            .collect();
+        self.send(json!({"t": "skills", "skills": skills}));
+    }
+
+    /// The next message, which must be about skills and of `kind`.
+    fn skill_line(&mut self, kind: &str) -> Value {
+        let line = self.recv_unnamed();
+        assert_eq!(line["t"], kind, "{line}");
+        line
+    }
+
+    /// Answer `request`, a skill's load, with a package that holds nothing but its metadata.
+    fn loaded(&mut self, request: &Value, digest: &str) {
+        self.send(json!({
+            "t": "skill",
+            "id": request["id"],
+            "ok": {
+                "source": "test",
+                "digest": digest,
+                "files": ["SKILL.md"],
+                "requires_python": null,
+                "dependencies": [],
+            },
+        }));
+    }
+}
+
+/// An interrupt ends an import waiting on the host for a skill's listing, and the import fails
+/// as interrupted. The host's answer, when it comes, is dropped, and importing again asks again.
+#[test]
+fn an_interrupt_ends_an_import_waiting_on_the_host() {
+    let mut k = Interpreter::start();
+    k.skills(&["held"]);
+    k.submit(1, "import outrig_skills.held");
+    let first = k.skill_line("skill.load");
+    assert_eq!(
+        (&first["skill"], &first["agent"]),
+        (&json!("held"), &json!(PRIMARY))
+    );
+    k.interrupt(1, false);
+    let notice = k.skill_line("skill.imported");
+    assert_eq!(notice["error"]["code"], "import-failed", "{notice}");
+    let result = k.recv();
+    assert_eq!(result["raised"], "KeyboardInterrupt", "{result}");
+
+    k.loaded(&first, "late");
+    k.submit(
+        2,
+        "import outrig_skills.held\nprint(outrig_skills.held.__outrig_skill__.digest)",
+    );
+    let second = k.skill_line("skill.load");
+    assert_ne!(second["id"], first["id"]);
+    k.loaded(&second, "fresh");
+    assert!(k.skill_line("skill.imported")["error"].is_null());
+    let result = k.recv();
+    assert_eq!(
+        (&result["id"], &result["output"]),
+        (&json!(2), &json!("fresh\n")),
+        "{result}"
+    );
+}
+
+/// A kernel waiting on the host for a skill holds only that skill's import: another imports what
+/// it likes meanwhile.
+#[test]
+fn a_kernel_imports_while_another_waits_on_the_host_for_a_skill() {
+    let mut k = Interpreter::start();
+    k.open("b");
+    k.skills(&["held"]);
+    k.submit(1, "import outrig_skills.held\nprint('held')");
+    let load = k.skill_line("skill.load");
+    let other = k.exec_in("b", 1, "import graphlib\nprint(graphlib.__name__)");
+    assert_eq!(other["output"], "graphlib\n", "{other}");
+    k.loaded(&load, "d");
+    k.skill_line("skill.imported");
+    assert_eq!(k.recv()["output"], "held\n");
+}
+
+/// A forked process cannot reach the host, so its import of a skill fails at once rather than
+/// waiting for an answer that cannot come.
+#[test]
+fn a_forked_process_cannot_fetch_a_skill() {
+    let mut k = Interpreter::start();
+    k.skills(&["held"]);
+    let out = k.output(
+        1,
+        &py(r#"
+            import os, outrig
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                try:
+                    import outrig_skills.held
+                    os.write(w, b"imported")
+                except outrig.skills.SkillError as e:
+                    os.write(w, e.code.encode())
+                os._exit(0)
+            os.close(w)
+            os.waitpid(pid, 0)
+            print(os.read(r, 100).decode())
+            "#),
+    );
+    assert_eq!(out, "source-error\n");
+}

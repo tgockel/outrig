@@ -155,6 +155,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace's `AGENTS.md`, or else `.agents/AGENTS.md`, unless the key is `"none"` (see `outrig`'s
   changelog). `run` ignores the key, with a line at startup when the session's agent sets it.
   (#672)
+- **`run-new` serves the repository's skills, then the user's.** `.agents/skills` in the
+  repository and `~/.agents/skills` are the session's skill sources, in that order (see `outrig`'s
+  changelog): the agent is told each skill by name and description, reads a skill's instructions
+  with `outrig.skills.read`, and imports its code as `outrig_skills.<name>`, fetched as it is used
+  and never mounted. A skill in both is served from the repository, and the user's copy is
+  reported as shadowed as the session starts, as each skill left out is, with why. The
+  repository's `.agents/skills` may be a link inside the repository, never one out of it.
 
 ### Changed
 

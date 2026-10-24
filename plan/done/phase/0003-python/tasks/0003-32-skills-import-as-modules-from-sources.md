@@ -191,3 +191,165 @@ whose files arrive when they are used.
 - `plan/phase/0003-python/discovery.md` -- what the preamble carries.
 - `crates/outrig/src/agent/orientation.rs` -- the preamble this extends.
 - `plan/next/skill-dependency-installation.md` -- installation, deferred.
+
+## Decisions
+
+Forks 2, 4, 5, 6 and 7 were taken as recommended, fork 1 as the maintainer chose, and fork 3 as
+recorded below. What no doc settled is recorded here.
+
+- **Fork 1: `saphyr-parser` 0.2.2 (the maintainer's call).** Its own runner passes the official
+  yaml-test-suite with no exclusions of its own, as yaml-rust2's does; saphyr is the line under
+  development. The official matrix (data of 2022) lists only the original yaml-rust, at 317 of
+  402, before both forks' fixes; serde_yaml was archived in 2024 and its libyaml translation
+  scores 330 of 402. Frontmatter is read one event at a time, never through the tree loader, which
+  recurses once per nesting level with no limit. An alias, a nonzero anchor id, a duplicate
+  top-level key, a key that is not a scalar, a second document, nesting past 32, or YAML that does
+  not parse refuses the skill as `metadata-invalid`; tags are ignored, and every key but `name`
+  and `description` is read and ignored whatever its shape, so another tool's fields cost nothing.
+  A plain `~`, `null` or empty value is no value. The scanner caps flow nesting at 255 itself, and
+  the file is bounded at 8 MiB before it is parsed.
+- **Fork 2.** A directory source's version is `<size>:<mtime>.<nsec>:<inode>`: the inode catches a
+  same-size replace within one timestamp tick, which ext4's coarse clock allows. The digest is
+  blake3 over every listed path and version, length-prefixed, in path order. A load re-reads
+  `SKILL.md` and `skill.py` only when the digest has moved since they were last read. Every
+  answer that reads a file lists the skill again after the read and is refused as
+  `skill-changed` when the digest moved, whatever the read returned: a file saved while it was
+  read would otherwise be served under the old digest, part one version and part the next, or
+  its failed read reported as the skill's fault. A load keeps the metadata it read only once
+  that check passes.
+- **Fork 3: `pip._vendor.packaging` from the payload's pip** (26.2.1, `packaging` 26.2), the only
+  option with no build step, crate, mount or protocol. Checked under the payload's 3.13.15: it
+  imports, evaluates markers, and loads no `pip._internal`. The payload's site-packages precedes
+  the environment the agent's pip installs into, so `pip install pip` cannot replace it. Markers
+  are evaluated, a requirement whose marker is false is skipped, and `prereleases=True` is passed,
+  since a check is not a resolver. Extras are not followed into the distribution's own
+  requirements. A specifier that does not parse is `metadata-invalid` at import.
+- **Fork 4.** The first source that lists a name decides it even when that copy proves invalid:
+  the project's broken skill is reported, never silently replaced by the user's. Every later copy
+  is `shadowed` and never read.
+- **Fork 5.** At most 50 skills or 12 KiB of them, whichever comes first, then a count and
+  `outrig.skills.catalog()`. The bytes bound is there because the standard allows 1,024-character
+  descriptions, which 50 of would cost some 13,000 tokens a call. Descriptions are put on one line
+  in the preamble. A child is told none.
+- **Fork 6.** No `__file__`; the code's filename is `<skill NAME>/PATH`, relative and not
+  angle-bracket-wrapped, and the source is registered in `linecache` with `mtime` `None`, which
+  `checkcache` keeps, so a traceback or `inspect.getsource` never looks for the path in the
+  workspace. The loader keeps the source before the module runs, so `@outrig.agent`'s digest of a
+  declaration made in a skill (`0003-31`, which reads `get_source`; its body check is gone) fetches
+  nothing more. Checked under the payload's Python before any code was written.
+- **One module, `outrig/skills.py`**, rather than a public module beside a private `_skills.py`:
+  its machinery is underscore names, `__all__` keeps them out of `help()`, and no circular import
+  arises. `Origin` and `Skill` are slotted classes, as `outrig.schema`'s `Problem` is: as frozen
+  dataclasses they put `help(outrig.skills)` at 9,391 characters, past the 8 KiB bound.
+- **The trait** is `skills()`, `files(skill)` and `read(skill, path)`, synchronous, with `io::Error`
+  for failures and `SkillFile { path, version }` its one listing type. A separate `files` lets the
+  host re-list one skill on every read, which a whole-source listing would make cost every skill.
+  Each operation runs on a thread of its own within 30 seconds, the wait for its place included,
+  at most 8 at once per session -- discovery's and serving's alike -- the permit going with the
+  thread so a source that never returns keeps its place rather than taking more threads. Not on
+  tokio's blocking pool: dropping a runtime waits for every task on it, so a source stuck on a
+  mount that stopped answering would hold `run-new`'s exit.
+  Discovery lists every source at once and then reads every skill at once, so a source that hangs
+  costs the start one bound, not one per skill. Past the bound the answer is `source-error`, so an
+  embedder's hung service never strands an import. The host applies the source's own bounds to
+  any source: 1,024 files, valid paths with no duplicate, 8 MiB per read.
+- **`DirectorySource` follows no link below its root.** The root is the operator's path, opened at
+  first use and held, so swapping `.agents/skills` mid-session changes nothing. Below it every
+  component is opened `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY` and never `O_DIRECTORY`, so a link of
+  either kind fails as `ELOOP` and is said to be one (`O_DIRECTORY` makes a linked directory
+  `ENOTDIR`); `fstat` must then say regular file. A listing reads each entry with `fstatat`,
+  following nothing. A link inside a skill is listed, so reading it fails saying it is a link
+  rather than the file seeming absent; a skill directory that is a link is `source-error`.
+  Installing a user skill by symlinking its directory into `~/.agents/skills` therefore does not
+  work; symlinking the whole directory does. `openat2(RESOLVE_BENEATH)` would have allowed links
+  that stay inside, at the cost of Linux 5.6 and a fallback. A skill's files may be 16 directories
+  deep; a 17th is refused. Names beginning `.` and `__pycache__` are not served: a checkout's
+  `.git` would pass the entry bound, and a local run's bytecode would move the digest.
+- **`DirectorySource::within(base, path)`**: a repository can commit `.agents/skills` as a link to
+  another checkout's skills (the design review found it). The root's real path is read back from
+  `/proc/self/fd` after it is opened and must lie inside `base`, so the check is of what was
+  opened; a link inside the repository works. A missing root holds no skills.
+- **Discovery** checks the directory's name against the standard's rule first and reads nothing
+  of a name that fails it. Three codes join the task's two: `shadowed`, `unknown-key` (the skill
+  is still served) and `source-error`. Every untrusted name in a message is quoted with `{:?}`, and
+  a diagnostic's message, like an import's reason, escapes each control character but a line
+  break or a tab: a TOML or YAML parser's error quotes the line it stopped at, which can hold a
+  terminal's escape sequences, and the line mode writes notes to stderr as they are.
+  `[tool.outrig.skill]` knows `entry` and `bind` only, as
+  the task says; `parameters` warns until `0003-33`, whose task says it will teach the parser that
+  key. An unknown key directly in `[tool.outrig]` warns too. Neither `entry` nor `bind` is kept
+  yet: `0003-33` reads them.
+- **The PEP 723 regex** agrees between Rust's `regex` and Python's `re` on blank-separated blocks
+  (two), adjacent blocks (one block, whose `///` lines are not TOML), unclosed blocks and CRLF
+  (none) -- checked in both engines. CRLF and a BOM are normalized first, as Python's text mode
+  would.
+- **The wire.** The host routes any `skill.`-prefixed line ahead of the `Envelope` parse, whose
+  `agent` is required, since code outside every execution names none; the hook is cloned out of
+  the table in its own statement (the `children` route's `match lock(..)` holds the guard through
+  its arms), and answers go through the weak writer `relay_line()` gives. A session given no
+  source still answers each request, `unknown-skill`, so no thread waits on one for good.
+- **The interpreter's half is small** (its `-c` bootstrap was 108,790 of 131,072 bytes):
+  `_ask_host` and `_compiled_cause`, with everything else in the package. Each request has a
+  queue of its own, which `_route` hands the answer to; one that comes after its asker gave up
+  finds none and is dropped. A request is refused on the reader thread and in a forked child; the
+  wait looks every `SIGNAL_CHECK` seconds; a 60-second backstop ends a wait whose answer was lost.
+  Running the full suite found an interrupt lost under load: the SIGINT landed while the main
+  thread was still in `_write_line`, which `_on_sigint` treats as machinery and dropped it. A
+  request agent code makes now leaves the handler a thread-local list before it writes, as a
+  hosted call leaves its wait; the handler puts its `KeyboardInterrupt` there and records it as
+  landed, so one that ends a background task is reported to its owner, and the wait raises it in
+  preference to any answer. A request this program makes for itself is not an interrupt's to end.
+  A child's kernel takes no SIGINT; its wait ends by the answer or the backstop (#699).
+- **The finder never asks the host**: the import system holds its global lock across every
+  `find_spec`, so modules are found from the catalog and the listing the package was imported
+  with, and fetched in `exec_module`, under that module's lock alone. A test shows another kernel
+  importing while one waits. One loader per import of a skill's package serves the package and
+  each of its modules, holding the listing and digest it was imported at and each module's
+  source; a directory's `__init__.py` wins over a module of the same name, as with Python's own
+  finder. `outrig_skills` is a spec with no loader, as a namespace package is, and a node of the
+  listing is its own resource reader, its `read_text` taking the `errors` that
+  `importlib.resources.read_text` passes on 3.13 and `Traversable`'s own lacks.
+- **What a skill's code raises while it is imported is raised as it was, whoever imports it.**
+  Raising a `SkillError` in its place broke a skill's own `except` -- the fallback for an optional
+  sibling, or an `except ImportError` that then swallowed a sibling's `ValueError` -- and sparing
+  only the skill's imports meant telling whose each import was: a walk of the frames, then hooks
+  on threads, pools and tasks, and still wrong for work handed between them. What it bought was a
+  type agent code could catch, which little code does. So a failure is labeled where it is
+  reported, as `0003-10` decided for every import: `_explain_imports` says when compiled code is
+  why, reading the skill's listing as well as the disk, and `skill.imported` carries
+  `import-failed` or `native-extension-unavailable`. `SkillError` is what OutRig's own checks and
+  fetches raise. A package that fails is labeled before its listing goes, the listing being
+  evidence, and takes every module below it out of `sys.modules`, so its next import fetches each
+  again at the files' new digest; Python's own import leaves such a module in place. The native
+  evidence is `0003-10`'s, now also read through `name_from`:
+  `from . import fast` swallows the `ModuleNotFoundError` and raises an `ImportError` naming the
+  parent and `name_from`, with no cause, so the chain held no evidence. `_compiled_cause` is
+  factored out of `_explain_import`, which as a result explains the `from p import m` form too. A
+  compiled file in the skill's own listing where the import looked is evidence as well. A failed
+  package's listing is gone by the time its failure is reported, so the report finds it through
+  the frames the exception passed, each skill module's `__spec__` holding its loader. The chain
+  is followed through every link, so an `ImportError` a skill wraps in another exception still
+  counts; only `ImportError` and `ModuleNotFoundError` themselves are read, and a notice names the
+  raised type and never its text, so labeling runs no agent code.
+- **Events.** `skill.discovered` is published only when the builder was given a source.
+  `skill.imported` is one per package import, success or not -- a module that fails later is
+  raised to the code that imported it, not evented -- with the importing agent as its subject, or
+  none outside every execution.
+- **The preamble.** `Agent::build` was at clippy's seven arguments, so the bindings and skills
+  travel as `orientation::Holdings`; the skill briefs go to `build_primary` through `assemble`
+  rather than being kept on `Session`, which would have taken `Session::new` to eight.
+- **The CLI** gives `DirectorySource::within(repo_root, ".agents/skills")`, then the user's
+  `~/.agents/skills` unless the home is the repository root -- a run from `~` with
+  `~/.agents/outrig/config.toml` makes it so, and every skill would shadow itself. Diagnostics
+  print as `[outrig]` notes in line mode and as inline notes on the screen, right after the
+  banner.
+- **Host programs get no skill sources**: giving them the CLI's would add a public method to
+  `HostProgram`, outside the additions the acceptance allows, and `embedding.md` lists skill
+  sources among what a program lacks in this phase (#698).
+- **Tests.** Discovery, the parsers and `DirectorySource` in `harness/skills_tests.rs`, with the
+  host's answers driven through `testing::Fake` and the loader through an interpreter on the host
+  and a `Counting` source; withheld and late answers, an interrupt, another kernel's import and a
+  fork in `interpreter_tests.rs`; the preamble with a mock model in `agent_tests.rs`, this
+  repository's own skills included; and two e2e tests, one in `agent_tests.rs` comparing a session's
+  mounts with and without a source while its agent imports a skill in Alpine, one through
+  `run-new` in `run_new_e2e.rs`.

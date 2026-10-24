@@ -66,6 +66,7 @@ const PACKAGE: &[(&str, &str)] = &[
     ("outrig/_host.py", include_str!("outrig/_host.py")),
     ("outrig/_kernel.py", include_str!("outrig/_kernel.py")),
     ("outrig/schema.py", include_str!("outrig/schema.py")),
+    ("outrig/skills.py", include_str!("outrig/skills.py")),
 ];
 
 /// The pinned archive, as `build.rs` verified it; empty when that build could

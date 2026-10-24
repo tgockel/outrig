@@ -69,9 +69,10 @@ session's own: the one `session.json` and `outrig ls` show, which its containers
 
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`,
-and neither do the session's own, `session.state` and `session.report`, or those of the process
-holding its bindings, `binding.refused` and `binding.exited`. A request to a binding is the
-agent's that made it.
+and neither do the session's own, `session.state` and `session.report`, those of the process
+holding its bindings, `binding.refused` and `binding.exited`, or what its skill sources hold,
+`skill.discovered`. A request to a binding is the agent's that made it, and so is the import of a
+skill, which code outside every execution makes for no agent.
 
 A child agent, which an agent's code launches with `runtime.spawn`, is named `c1`, `c2`, and so on
 in launch order, and its events carry its own subject, `agent/c1`: its `agent.started`,
@@ -222,6 +223,20 @@ the same call, and records no new `model.call`.
   `bindings`, the names it held, and `cause`, such as `it was killed by SIGKILL`. The session goes
   on without them: each request the process was running ends `unknown`, and a later one raises an
   error saying how the process ended.
+- `skill.discovered` -- what the session's skill sources hold, published once as it starts when it
+  was given any source, read from each skill's metadata with no Python run:
+  - `skills`: each skill served, as `{name, source, description, digest, executable}`; `digest`
+    is of its files then, and `executable` says it has a `skill.py`.
+  - `diagnostics`: each as `{skill, source, code, message}`, `skill` `null` for a source that
+    could not be listed. `code` is `shadowed` for a copy an earlier source's serves in its place,
+    `unknown-key` for a warning about one still served, and otherwise why the skill was left
+    out: `metadata-invalid`, `duplicate-metadata-block`, or `source-error`. `message` escapes
+    each control character but a line break or a tab, as `\u{1b}`.
+- `skill.imported` -- a skill's package was imported in the interpreter: `skill`, `source`,
+  `agent`, whose code imported it, or `null` outside every execution; `digest`, of its files then,
+  or `null` when the host gave none; `reload`, true when `outrig.skills.reload` imported it again;
+  and `code` and `reason`, `null` unless the import failed, such as `unsatisfied-dependency` with
+  each requirement it lacks. `reason` escapes control characters as a diagnostic's `message` does.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
   and `tool_result_max`. A child's is recorded as it is launched.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the

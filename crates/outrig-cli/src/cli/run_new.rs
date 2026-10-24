@@ -36,10 +36,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
+use directories::BaseDirs;
 use nix::fcntl::{Flock, FlockArg};
 use outrig::config::{Config, EnvSecrets, EventsMode, ImageConfig};
 use outrig::error::IoPathExt;
-use outrig::harness::{self, DEFAULT_DRAIN, Progress, SessionBuilder, Step, Verdict};
+use outrig::harness::{
+    self, DEFAULT_DRAIN, DirectorySource, Progress, SessionBuilder, Step, Verdict,
+};
 use outrig::image::{self, BuildOutput, ImageTag};
 use outrig::LaunchSpec;
 
@@ -137,7 +140,12 @@ pub async fn execute(
         .secrets(EnvSecrets)
         .repo_root(&repo_root)
         .approver(approve::TerminalApprover)
-        .progress(progress_lines());
+        .progress(progress_lines())
+        .skill_source("project", DirectorySource::within(&repo_root, SKILLS_DIR));
+    let home = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    if let Some(home) = user_skills_home(&repo_root, home) {
+        builder = builder.skill_source("user", DirectorySource::new(home.join(SKILLS_DIR)));
+    }
     if matches!(cfg.events.mode(), EventsMode::Record) {
         builder = builder.record_events();
     }
@@ -254,6 +262,22 @@ pub async fn execute(
     // written, and the `error:` line printed once this returns follows it.
     out.finish(tokio::time::sleep(REPORT_GRACE)).await;
     outcome
+}
+
+/// Where skills live, beneath a repository and beneath a home directory.
+const SKILLS_DIR: &str = ".agents/skills";
+
+/// The home directory whose `.agents/skills` holds the user's skills, served
+/// after the repository's: none when there is no home, or when the home is the
+/// repository root, whose `.agents/skills` the project's source already
+/// serves.
+fn user_skills_home(repo_root: &Path, home: Option<PathBuf>) -> Option<PathBuf> {
+    let home = home?;
+    let same = match (std::fs::canonicalize(&home), std::fs::canonicalize(repo_root)) {
+        (Ok(home), Ok(root)) => home == root,
+        _ => home == repo_root,
+    };
+    (!same).then_some(home)
 }
 
 /// The conversation: on the screen when the terminal can hold one, and in
@@ -574,6 +598,23 @@ fn render_banner(banner: &Banner<'_>) -> String {
 mod tests {
     use super::*;
     use outrig::EmbeddedMcpPolicy;
+
+    /// The user's skills are served after the project's, from the home directory, unless the
+    /// repository is the home directory -- reached through a link or not -- whose
+    /// `.agents/skills` the project's source already serves.
+    #[test]
+    fn the_users_skills_are_served_unless_home_is_the_repository() {
+        let home = tempfile::tempdir().expect("a home");
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).expect("a repository");
+        let at_home = Some(home.path().to_path_buf());
+        assert_eq!(user_skills_home(&repo, at_home.clone()), at_home);
+        assert_eq!(user_skills_home(home.path(), at_home.clone()), None);
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).expect("a link to the repository");
+        assert_eq!(user_skills_home(&link, Some(repo.clone())), None);
+        assert_eq!(user_skills_home(&repo, None), None);
+    }
 
     /// A config whose image carries a primary server holding a secret and a
     /// sidecar-hosted server, the two ways an MCP server could start.

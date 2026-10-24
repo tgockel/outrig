@@ -42,6 +42,8 @@ required-features = ["seal-tests"]
 anyhow             = { workspace = true, features = ["std"] }
 async-stream       = { workspace = true }
 axum               = { workspace = true, features = ["http1", "tokio"] }
+# A skill's files cross the interpreter's pipe in JSON, base64-encoded.
+base64             = { workspace = true, features = ["std"] }
 blake3             = { workspace = true, features = ["std"] }
 bytes              = { workspace = true, features = ["std"] }
 futures-util       = { workspace = true, features = ["std", "async-await", "async-await-macro"] }
@@ -49,7 +51,7 @@ heck               = { workspace = true }
 http               = { workspace = true, features = ["std"] }
 ignore             = { workspace = true }
 jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
-nix                = { workspace = true, features = ["user", "fs", "process", "signal", "net", "uio"] }
+nix                = { workspace = true, features = ["user", "fs", "dir", "process", "signal", "net", "uio"] }
 rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
 # The agent loop's; private, so no rig or reqwest type reaches the public surface.
@@ -57,6 +59,8 @@ reqwest            = { workspace = true, features = ["rustls"] }
 rig                = { workspace = true, features = ["reqwest", "rustls"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 ruzstd             = { workspace = true, features = ["std"] }
+# A skill's `SKILL.md` frontmatter, read as events and never built into a tree.
+saphyr-parser      = { workspace = true }
 schemars           = { workspace = true, features = ["derive"] }
 serde              = { workspace = true, features = ["std", "derive"] }
 serde_json         = { workspace = true, features = ["std"] }

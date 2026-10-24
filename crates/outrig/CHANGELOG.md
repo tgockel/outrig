@@ -477,6 +477,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child's subject: `agent.call.started`, with the declaration's `module`, `qualname` and a
   `digest` of the source that declared it, and `agent.call.settled`, with the outcome and the
   child's usage, after the `agent.released` that ended the child.
+- **Skills: `SkillSource`, `DirectorySource` and `SessionBuilder::skill_source`.** A skill is a
+  directory holding a `SKILL.md` -- Agent Skills frontmatter, then instructions -- and, optionally,
+  a `skill.py`. A session serves the skills of the sources it is given, in order: the first that
+  holds a name serves it, and each later copy is reported as shadowed. As the session starts, each
+  skill's frontmatter, and the `# /// script` block (PEP 723) its `skill.py` opens with before its
+  first statement, are read on the host with no Python run; one whose metadata is wrong is left
+  out, and what was found is the `skill.discovered` event. The primary agent's instructions list
+  the skills by name and description, up to 50 of them or 12 KiB, and a child's list none. In the
+  interpreter a skill imports as the package `outrig_skills.<name>`, its hyphens underscores,
+  whose files cross the interpreter's pipe as they are imported or read through
+  `importlib.resources`: nothing is mounted for them, and the skill's directory is never on
+  `sys.path`, so its own `json.py` shadows nothing. Importing its package checks the
+  `requires-python` and `dependencies` it declares, and installs nothing; each failure of those
+  checks is an `outrig.skills.SkillError` whose `code` says why. What a skill's own code raises
+  while it is imported is raised as it was, and its report says when compiled code is why. A
+  skill whose files change after its package was imported, or while one is read, is refused as
+  `skill-changed`, and `outrig.skills.reload(name)` imports it again, leaving every other
+  skill's modules as they were; `outrig.skills.read(name)` returns its instructions and
+  `outrig.skills.catalog()` lists every skill. Each import is a `skill.imported` event, with the
+  digest of the files it was made from and a failed one's code: `import-failed`, or
+  `native-extension-unavailable` when compiled code is why. `DirectorySource` follows no link
+  below its root, serves nothing hidden, at most 1,024 entries per skill and 8 MiB per file, and
+  holds its root open from its first listing; `DirectorySource::within` keeps a repository's root
+  inside the repository. A source's operation runs on a thread of its own, so one that never
+  returns holds up no runtime's shutdown, and a diagnostic escapes the control characters it
+  quotes.
 - **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
   `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
   model talks while it works records each thing it said, not only the closing reply.
