@@ -283,7 +283,10 @@ only the model's text. Subagent activity shows up two other ways:
   round that ends early -- at its tool-call max, at the repeat breaker, or on a model call that
   failed for good -- says why on a line labeled the same way. It leaves out the advice printed
   when the primary's turn ends early: `continue`, `/reset`, and the rest act on the primary's
-  conversation, and what a subagent does next is its parent's call.
+  conversation, and what a subagent does next is its parent's call. Lines about the model call
+  itself carry the label too -- a retry, a move to the next candidate of an alias chain, a turn
+  that produced no text -- so a fan-out's waits and failures are attributable to the round that
+  is having them. The primary agent's own lines are unlabeled.
 - In a transcript holding that subagent's prompts, replies, and published outcomes. A subagent the
   primary launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
   logs. One launched by a subagent writes into a directory named for its parent, beside the

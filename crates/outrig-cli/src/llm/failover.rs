@@ -287,10 +287,10 @@ pub struct ChainExhaustion<'a> {
 
 /// The line printed as the chain moves from one candidate to the next.
 fn move_announcement(from: &str, error: &CompletionError, to: &str) -> String {
-    format!(
-        "[outrig] model {from} failed ({}); trying {to}",
+    super::labeled_line(format!(
+        "model {from} failed ({}); trying {to}",
         super::retry::candidate_failure_label(error),
-    )
+    ))
 }
 
 /// The failure a chain returns when every candidate has been abandoned.

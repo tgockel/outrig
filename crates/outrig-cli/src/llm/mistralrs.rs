@@ -553,10 +553,13 @@ fn response_stream(
         // ends, with no usage, and warn that text may be missing.
         if !state.saw_final_response {
             eprintln!(
-                "[outrig] warning: the local model's reply ended without a finish reason, \
-                 so some or all of it may be missing. The likely cause is mistralrs \
-                 dropping the last chunk of a reply that stops partway through a \
-                 multi-byte character, such as an emoji cut off at max-tokens."
+                "{}",
+                crate::llm::labeled_line(
+                    "warning: the local model's reply ended without a finish reason, \
+                     so some or all of it may be missing. The likely cause is mistralrs \
+                     dropping the last chunk of a reply that stops partway through a \
+                     multi-byte character, such as an emoji cut off at max-tokens."
+                )
             );
             yield RawStreamingChoice::FinalResponse(MistralrsStreamResponse { usage: None });
         }

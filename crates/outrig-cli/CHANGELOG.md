@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent's model-layer stderr lines carry its label.** Everything a subagent's round
+  printed *above* the model was labeled already, but the lines from beneath it were not: a
+  retry, a move to the next candidate of an alias chain, and the report for a turn that
+  produced no text and no tool call all reached stderr naming no one. With two subagents in
+  flight, a reasoning-only turn in one printed `[outrig] the model produced no text...` among
+  the parent's traces, attributable to nothing. Those lines now carry the subagent's path in
+  the column its tool-call traces use -- `[outrig]   [parent-a/audit] ...` -- because the label
+  is scoped to the turn rather than stored on the model, which the in-process registry shares
+  between every agent naming that row. The primary agent's lines are unchanged. (#381)
 - **`outrig mcp --listen` validates the `Origin` header.** The MCP transport spec says a
   server MUST check it; rmcp's default allowlist is empty, which *disables* the check rather
   than failing closed, so every origin was accepted. Nothing turned that into a drive-by tool

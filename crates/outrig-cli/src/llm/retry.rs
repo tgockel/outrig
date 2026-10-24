@@ -484,11 +484,14 @@ impl<M: CompletionModel> RetryingModel<M> {
             };
 
             eprintln!(
-                "[outrig] model returned an unusable response ({message}); retry in {:.1}s \
-                 (attempt {}/{})",
-                delay.as_secs_f64(),
-                attempt + 2,
-                RESPONSE_RETRY_ATTEMPTS + 1,
+                "{}",
+                super::labeled_line(format!(
+                    "model returned an unusable response ({message}); retry in {:.1}s \
+                     (attempt {}/{})",
+                    delay.as_secs_f64(),
+                    attempt + 2,
+                    RESPONSE_RETRY_ATTEMPTS + 1,
+                ))
             );
             tokio::time::sleep(delay).await;
             attempt += 1;
@@ -548,7 +551,9 @@ pub(super) fn textless_line(finish_reason: Option<&str>, max_tokens: Option<u64>
         Some(limit) => format!("the request carried max-tokens = {limit}"),
         None => "the request carried no max-tokens, so the provider's own default applied".into(),
     };
-    format!("[outrig] the model produced no text and no tool call this turn{reason}; {ceiling}.")
+    super::labeled_line(format!(
+        "the model produced no text and no tool call this turn{reason}; {ceiling}."
+    ))
 }
 
 /// The provider's own word for why generation stopped.
@@ -660,16 +665,19 @@ where
         // shown is the one actually being spent against, so a connect failure
         // does not count down against a ten-minute bound it will never reach.
         eprintln!(
-            "[outrig] LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",
-            failure_label(&err),
-            delay.as_secs_f64(),
-            if retry_after.is_some() {
-                "Retry-After"
-            } else {
-                "backoff"
-            },
-            elapsed.as_secs(),
-            policy.bound(answered).as_secs(),
+            "{}",
+            super::labeled_line(format!(
+                "LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",
+                failure_label(&err),
+                delay.as_secs_f64(),
+                if retry_after.is_some() {
+                    "Retry-After"
+                } else {
+                    "backoff"
+                },
+                elapsed.as_secs(),
+                policy.bound(answered).as_secs(),
+            ))
         );
         tokio::time::sleep(delay).await;
         attempt += 1;

@@ -500,7 +500,9 @@ with Ctrl-C changes nothing either, and either one can simply be run again.
 The agent can hand scoped work to subagents that share this session's container and tools, using
 the built-in `outrig__` tools. They are on by default; `subagents = false` on the
 `[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name
-(`parent/child` for a nested one), and each one's transcript is written to
+(`parent/child` for a nested one), as do the lines about their model calls -- the retries and
+chain moves shown above -- so a fan-out's waits are attributable to the round having them. The
+primary agent's own lines are unlabeled. Each subagent's transcript is written to
 `<session_dir>/logs/subagent-<name>.log` -- or, for one a subagent launched, under a
 `subagent-<parent>/` directory there.
 
