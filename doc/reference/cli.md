@@ -69,6 +69,29 @@ file the flag names, so for them it need not exist yet.
 directory. Given `--session-root`, or `--session-dir` for `logs`, they read no
 global config either, so a `--global-config` path is not checked.
 
+Those four commands need one key out of the global config, so a global config that does not load
+in full does not stop them. When the whole-file read fails -- a TOML syntax error, or a value
+refused rather than set aside, such as a bad `[network].mode` -- outrig re-reads the file for
+`session-root` alone, warns on stderr that nothing else in it is in effect, and carries on. The
+fault is not thereby fixed: `run`, `mcp`, and `build` read the file for everything in it and
+still refuse it.
+
+The degraded read never guesses a root. It uses only a `session-root` the damaged file still
+states outright: one plain, non-empty string, declared once, with nothing the parser had to
+repair. A file whose text cannot be declaring the key at all falls back to the default, which is
+the usual case for a file broken while a model or provider was being edited. Anything between the
+two -- the parse error landed on the value, the value holds an invalid escape or an unterminated
+string, the key is declared twice -- stops the command and reports the parse error. A root that is
+not the one the operator chose is worse than no answer: `clean` turned loose on a directory
+holding no records reads every container outrig labeled as a stray.
+
+"Declared once" is judged from the file's text rather than from what the parser managed to read,
+because a syntax error can stop its recovery part-way and hide a second declaration below. So a
+damaged file that so much as mentions `session-root` anywhere outside the one declaration -- in a
+comment, inside another value, or behind a `\` escape the broken file leaves unresolvable --
+stops the command too. The test is coarse on purpose: the alternative to refusing is acting on a
+root the operator did not choose.
+
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
 enable trace-level logs from outrig's own modules for that invocation. It does not change

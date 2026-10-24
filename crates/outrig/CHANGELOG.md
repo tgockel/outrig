@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Config::salvage_global_session_root`**: the global config's `session-root` read out of a
+  file that does not load as a whole, resolved beside the file and `~`-expanded exactly as
+  `load_global` resolves it. Only a declaration the damaged file states outright is read: one
+  plain, non-empty string, declared once, no part of which the parser's recovery had to repair.
+  `Ok(None)` is "this file cannot be declaring the key", so the caller's default stands; `Err` is
+  the file refusing to be asked, which is what a parse error reaching the declaration, a repaired
+  value, or a second mention of the key anywhere in the file produces -- the file's text answers
+  for uniqueness, because a syntax error can stop the parser's recovery before a second
+  declaration below it. For a caller that needs this one
+  machine-level key and can go on without the rest of the file -- `outrig ls` and its three
+  siblings. See the fix below. (#384)
 - **`config::is_env_key`**: whether a string can name a variable an `env` or `build-args` table
   sets (`^[A-Za-z_][A-Za-z0-9_]*$`). It is the grammar validation now holds those keys to, and
   the one that already decided whether a resolved `${VAR}` could be passed to podman by name;
@@ -39,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A global config that does not load no longer stops the commands that need one key out of
+  it.** `session-root` is global-only, so `outrig ls`, `logs`, `discard`, and `clean` read the
+  global config and nothing else -- but they read all of it, through `Config::load_global`, so a
+  TOML syntax error anywhere in that one machine-wide file, or a value it refuses rather than
+  sets aside (a bad `[network].mode`), failed a listing over something that had nothing to do
+  with sessions. A file mid-edit cost the user every session command until they finished
+  editing. Those four now fall back to `Config::salvage_global_session_root`, taking that one key
+  and warning that nothing else in the file is in effect. `run`, `mcp`, and `build` read the file
+  for everything in it and still refuse it, which the warning says. The fallback does not guess:
+  it uses only a root the damaged file states outright, falls back to the default only for a file
+  whose text cannot be declaring the key, and otherwise still fails the command -- a parse error
+  may have swallowed the declaration, a repaired escape or unterminated string yields a path
+  nobody has, a key the file mentions twice says nothing about which was meant, and `clean`
+  pointed at a root holding no records reads every labeled container as a stray. (#384)
 - **A security error on a sidecar names the sidecar, and a whitespace-only `image-name` is
   refused.** A `[sidecars.<sc>.security]` block reuses the image blocks' `[security]` rules, and
   it reused their errors too by passing the string `sidecars.<sc>` where an image-config name was

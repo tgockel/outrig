@@ -591,6 +591,7 @@ pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self
 pub fn outrig::config::Config::load_global(&std::path::Path) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_unvalidated(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
+pub fn outrig::config::Config::salvage_global_session_root(&std::path::Path) -> outrig::error::Result<core::option::Option<std::path::PathBuf>>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_for_build(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>

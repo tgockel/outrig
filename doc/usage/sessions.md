@@ -28,6 +28,14 @@ keeps one root, so `outrig ls` finds the same sessions from any directory, and a
 sets `session-root` is rejected at load. See
 [Reference -> Config](../reference/config.md#top-level).
 
+Because `ls`, `logs`, `discard`, and `clean` need this one key and nothing else from the file, a
+global config that does not load does not stop them: outrig takes `session-root` out of it, warns
+that nothing else it sets is in effect, and carries on. `outrig run` reads the whole file and
+still refuses it. Only a root the damaged file states outright is used -- one plain string,
+nothing the parser had to repair, and the only mention of the key in the file. If the damage
+reaches the `session-root` declaration, or the file names the key anywhere else, the session
+commands stop too -- better than quietly listing, or cleaning, some other directory.
+
 ## Layout under the root
 
 Each session is a subdirectory of the root, named by session id (a UTC timestamp plus four
