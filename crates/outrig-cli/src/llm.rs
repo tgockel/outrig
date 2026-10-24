@@ -1072,7 +1072,19 @@ fn remote_http_client(
     // never answered could not stop it (see [`retry::CONNECT_TIMEOUT`]).
     let builder = reqwest::Client::builder()
         .timeout(timeout)
-        .connect_timeout(retry::CONNECT_TIMEOUT);
+        .connect_timeout(retry::CONNECT_TIMEOUT)
+        // Rig posts to fixed, provider-documented paths; no provider's API
+        // issues a redirect as part of normal operation. Anthropic's
+        // `x-api-key` header -- unlike `Authorization` -- is not one reqwest
+        // strips when a redirect changes host, so without this a 307/308 from
+        // a mistyped or parked `base-url` would re-send the key (and the
+        // request body) to whatever host the redirect names. With no policy
+        // to follow it, reqwest hands the 3xx back as an ordinary response
+        // rather than an error; `send_with_retry` then reads its status as
+        // not one of the retryable codes and returns it as a terminal
+        // `InvalidStatusCodeWithMessage`, which is what turns a silent
+        // redirect into a visible failure instead of a leaked header.
+        .redirect(reqwest::redirect::Policy::none());
 
     // Unit tests point providers at loopback fixtures. reqwest picks up
     // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of
@@ -4242,6 +4254,71 @@ mod tests {
     #[test]
     fn model_display_is_the_bare_name_for_a_direct_model() {
         assert_eq!(test_resolved_for_display().model_display(), "opus-5");
+    }
+
+    /// #380: Anthropic's `x-api-key` is not one reqwest strips on a
+    /// cross-host redirect (only `Authorization`, cookies,
+    /// `proxy-authorization`, and `www-authenticate` are), so a 307/308 from a
+    /// mistyped or parked `base-url` used to re-send the key -- and the body
+    /// -- to whatever host the redirect named. `remote_http_client` now turns
+    /// `redirect::Policy::none()` on, so the loop reads the 3xx back as a
+    /// response rather than following it, and (being neither 2xx nor one of
+    /// the retryable statuses) returns it as a terminal, visible failure.
+    #[tokio::test]
+    async fn a_cross_host_redirect_is_surfaced_rather_than_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a one-shot redirect fixture");
+        let port = listener.local_addr().expect("loopback address").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_in_task = accepted.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("one connection arrives");
+            accepted_in_task.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\n\
+                      content-length: 0\r\n\
+                      location: http://attacker.invalid/v1/chat/completions\r\n\
+                      connection: close\r\n\r\n",
+                )
+                .await
+                .expect("the redirect is written");
+            let _ = socket.shutdown().await;
+            // Left running: a client that followed the redirect would open a
+            // second connection here, which `accepted` would then show.
+        });
+
+        let http = remote_http_client(None, retry_policy(Some(5)))
+            .expect("a loopback client builds without I/O");
+        let request = rig::http_client::Request::builder()
+            .method(rig::http_client::Method::POST)
+            .uri(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .body(bytes::Bytes::from_static(b"{}"))
+            .expect("a bare request builds");
+        let err = rig::http_client::HttpClientExt::send::<_, bytes::Bytes>(&http, request)
+            .await
+            .err()
+            .expect("a redirect must not be followed to success");
+
+        assert!(
+            matches!(
+                err,
+                rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
+                    if status.as_u16() == 307
+            ),
+            "the redirect must come back as its own status, not be swallowed: {err}",
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "exactly one connection -- to the configured host -- may be opened; \
+             a second would mean the redirect was followed",
+        );
     }
 
     /// Tools `/sidecar add` gives the primary join the shared MCP list too,
