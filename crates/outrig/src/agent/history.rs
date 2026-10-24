@@ -34,7 +34,7 @@ use rig::completion::Message;
 use rig::completion::message::{AssistantContent, ToolCall, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 
-use super::budget::{self, Budget, Wire};
+use super::budget::{self, Budget, Scale, Wire};
 use crate::config::RoleAlternation;
 use crate::events;
 use crate::harness::event::{self, CallId, Payload};
@@ -294,6 +294,7 @@ impl Manifest {
                 window_assumed: self.budget.window_assumed,
                 reserve: self.budget.reserve,
                 overhead: self.budget.overhead,
+                estimate_scale: self.budget.scale.ratio(),
                 max_tokens: self.budget.max_tokens,
                 role_alternation: self.budget.alternation,
             },
@@ -396,8 +397,19 @@ impl fmt::Display for TooLarge {
         write!(
             f,
             ", less {reserve} reserved for the reply and about {overhead} for the system prompt \
-             and tool definition. The turn stays in runtime.history, and later calls leave it \
-             out. "
+             and tool definition"
+        )?;
+        if self.budget.scale != Scale::RULE {
+            let ratio = self.budget.scale.ratio();
+            write!(
+                f,
+                ", with the window and the reserve counted down {ratio:.2}x, since {model}'s \
+                 provider has reported requests larger than OutRig estimated them"
+            )?;
+        }
+        write!(
+            f,
+            ". The turn stays in runtime.history, and later calls leave it out. "
         )?;
         if *window_assumed {
             write!(
@@ -655,7 +667,9 @@ impl Store {
     /// See [`History::open_round`].
     fn open_round(&mut self, budget: &Budget, line: impl Fn(usize) -> String) -> Message {
         let allowance = budget::tokens([&Message::user(line(self.turns.len()))]);
-        let omitted = self.omitted(budget, allowance);
+        // As its first call will be: see `Store::assemble`.
+        let budget = budget.making_room_for(allowance);
+        let omitted = self.omitted(&budget, allowance);
         let opening = Message::user(line(omitted));
         self.begin(opening.clone(), allowance);
         opening
@@ -745,8 +759,19 @@ impl Store {
         }
     }
 
+    /// The estimated tokens of `prompt`.
+    fn prompt_tokens(&self, prompt: Prompt) -> u64 {
+        match prompt {
+            Prompt::Opening { tokens } => tokens,
+            Prompt::Turn(id) => self.turns[id].tokens,
+        }
+    }
+
     fn assemble(&mut self, budget: &Budget) -> Result<(Vec<Message>, Manifest), TooLarge> {
         let (round, prompt) = self.prompt();
+        // The call is held to its allowance, but not to a scale that would
+        // refuse a prompt the rule admits.
+        let budget = &budget.making_room_for(self.prompt_tokens(prompt));
         let Selection {
             carried,
             evicted,
@@ -963,10 +988,7 @@ impl Store {
     /// are still tried, so one large turn costs only itself.
     fn select(&self, start: usize, prompt: Prompt, room: u64) -> Result<Selection, u64> {
         let latest = prompt.turn();
-        let prompt_tokens = match prompt {
-            Prompt::Opening { tokens } => tokens,
-            Prompt::Turn(id) => self.turns[id].tokens,
-        };
+        let prompt_tokens = self.prompt_tokens(prompt);
         if prompt_tokens > room {
             return Err(prompt_tokens);
         }

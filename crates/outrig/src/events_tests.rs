@@ -177,6 +177,7 @@ fn each_event_has_exactly_its_data_fields() {
                     window_assumed: true,
                     reserve: 32_000,
                     overhead: 900,
+                    estimate_scale: 1.0,
                     max_tokens: Some(4096),
                     role_alternation: RoleAlternation::Relaxed,
                 },
@@ -852,6 +853,7 @@ fn each_event_has_exactly_its_data_fields() {
     assert_eq!(
         nested(call, "budget"),
         [
+            "estimate_scale",
             "max_tokens",
             "model",
             "overhead",

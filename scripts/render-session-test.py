@@ -282,6 +282,7 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
             "window_assumed": True,
             "reserve": 4096,
             "overhead": 1662,
+            "estimate_scale": 1.0,
             "max_tokens": 4096,
             "role_alternation": "relaxed",
         },
@@ -1011,6 +1012,19 @@ class RenderSession(unittest.TestCase):
         self.assertIn("withheld so the roles alternate: 3 (recent), 5 (promoted)", self.page(events))
         self.assertNotIn("withheld so the roles alternate", self.page(ordinary()))
         self.assertIn("role alternation: relaxed", self.page(ordinary()))
+
+    def test_a_call_names_the_scale_its_estimate_was_held_to_only_above_the_rule(self) -> None:
+        def scaled(scale: float) -> str:
+            budget = model_call(0, 1)["budget"] | {"estimate_scale": scale}
+            return self.page(
+                [
+                    (kind, data | {"budget": budget}) if kind == "model.call" else (kind, data)
+                    for kind, data in ordinary()
+                ]
+            )
+
+        self.assertIn("estimate scale: 1.126x", scaled(1.126))
+        self.assertNotIn("estimate scale", scaled(1.0))
 
     def test_an_unknown_type_is_shown_as_it_is(self) -> None:
         html = self.page(ordinary() + [("something.new", {"what": "it says"})])

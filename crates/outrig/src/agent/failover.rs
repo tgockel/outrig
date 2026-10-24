@@ -43,6 +43,9 @@
 //!   smaller window, and what fit one may not fit another. A candidate whose
 //!   window cannot hold the call's latest turn is passed over for the next,
 //!   and only when none can does the call end ([`unfit`]).
+//! * **Each candidate has its own count.** The chain holds a [`Calibration`]
+//!   for each candidate, learned from the usage that candidate reported for the
+//!   view it was sent, and scales that candidate's next view by it.
 //! * **Each candidate reads what the others wrote.** One model's reply joins
 //!   the conversation every model is sent, so each candidate's view is
 //!   assembled for its provider's protocol as well as its window: reasoning
@@ -63,6 +66,7 @@
 //! [`ChainDeadline`]: super::retry::ChainDeadline
 //! [`retry`]: super::retry
 //! [`Wire`]: super::budget::Wire
+//! [`Calibration`]: super::budget::Calibration
 
 use std::fmt;
 use std::sync::Arc;
@@ -74,7 +78,7 @@ use rig::completion::{
 use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 
-use super::budget::Budget;
+use super::budget::{Budget, Calibration};
 use super::history::{Adjacent, History, TooLarge};
 use super::ledger::CallSlot;
 use super::retry::{BudgetSpent, RetryPolicy, candidate_failure_label};
@@ -199,26 +203,37 @@ where
 /// [`History`] is the one there is. The trait is what lets the chain's own
 /// tests stand in for the store.
 pub(crate) trait View: Send + Sync {
-    /// The messages call `call` to a candidate held to `budget` is sent,
-    /// oldest first, ending with the call's prompt, and the first place they
-    /// put one role after itself, if any -- or why the prompt does not fit.
-    fn view(
-        &self,
-        budget: &Budget,
-        call: CallId,
-    ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge>;
+    /// What call `call` to a candidate held to `budget` is sent, or why the
+    /// prompt does not fit.
+    fn view(&self, budget: &Budget, call: CallId) -> Result<Viewed, TooLarge>;
+}
+
+/// What a call to one candidate is sent of the conversation.
+pub(crate) struct Viewed {
+    /// The messages, oldest first, ending with the call's prompt.
+    messages: Vec<Message>,
+    /// The first place they put one role after itself, if any.
+    adjacent: Option<Adjacent>,
+    /// What the rule estimates the whole request at, before the candidate's
+    /// scale: the number its provider's report of the request is compared with.
+    estimate: u64,
+    /// The reply ceiling the call carries: the candidate's, unless the scale
+    /// would have refused the call's prompt and the view lowered it to carry
+    /// it ([`Budget::making_room_for`]).
+    max_tokens: Option<u32>,
 }
 
 /// Recorded as a `model.call` manifest naming the candidate's budget, one for
 /// each candidate the call's view is assembled for.
 impl View for History {
-    fn view(
-        &self,
-        budget: &Budget,
-        call: CallId,
-    ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge> {
+    fn view(&self, budget: &Budget, call: CallId) -> Result<Viewed, TooLarge> {
         self.assemble(budget, call)
-            .map(|(sent, manifest)| (sent, manifest.adjacent.first().copied()))
+            .map(|(messages, manifest)| Viewed {
+                messages,
+                adjacent: manifest.adjacent.first().copied(),
+                estimate: manifest.estimate,
+                max_tokens: manifest.budget.max_tokens,
+            })
     }
 }
 
@@ -267,6 +282,9 @@ struct Abandoned {
 #[derive(Clone)]
 pub(crate) struct FailoverModel {
     candidates: Arc<Vec<Box<dyn Candidate>>>,
+    /// What each candidate's provider has been seen to count, in the
+    /// candidates' order.
+    calibrations: Arc<[Calibration]>,
     policy: RetryPolicy,
     /// ANDed across the chain, computed once at build time -- see
     /// [`composes_native_output_with_tools`].
@@ -306,6 +324,7 @@ impl FailoverModel {
             .iter()
             .all(|candidate| candidate.composes_native_output_with_tools());
         Self {
+            calibrations: candidates.iter().map(|_| Calibration::default()).collect(),
             candidates: Arc::new(candidates),
             policy,
             composes,
@@ -323,6 +342,26 @@ impl FailoverModel {
     /// head's first.
     pub(crate) fn budgets(&self) -> impl Iterator<Item = &Budget> {
         self.candidates.iter().map(|candidate| candidate.budget())
+    }
+
+    /// What a call to the candidate at `index` is held to now: its budget at
+    /// the scale its provider's reports have set.
+    fn held_to(&self, index: usize) -> Budget {
+        self.candidates[index]
+            .budget()
+            .scaled(self.calibrations[index].get())
+    }
+
+    /// The `[models.<name>]` row every call is tried against first.
+    pub(crate) fn head_name(&self) -> &str {
+        self.candidates[0].model_name()
+    }
+
+    /// What a call to the head is held to now. A round opens against it, so the
+    /// count of turns the opening says its first call leaves out is the count
+    /// that call leaves out.
+    pub(crate) fn head_budget(&self) -> Budget {
+        self.held_to(0)
     }
 
     /// Hold calls to the head to a `window` of tokens in place of the one it
@@ -567,23 +606,26 @@ impl CompletionModel for FailoverModel {
                 request.clone()
             }
             .expect("taken only for the last candidate");
+            let budget = self.held_to(index);
+            // Every candidate is sent a view assembled for its own window, the
+            // head's too, which may leave out more -- or cannot hold the
+            // call's latest turn at all -- and for its own count of tokens.
+            // What rig put after the system prompt is the prompt alone, the
+            // round's hook having patched the rest out, and the view replaces
+            // it.
+            let viewed = self.view.view(&budget, call);
+            let max_tokens = viewed
+                .as_ref()
+                .map_or(budget.max_tokens, |viewed| viewed.max_tokens);
             self.slot.candidate(
                 candidate.model_name(),
                 candidate.model_identifier(),
-                candidate.budget().max_tokens,
+                max_tokens,
             );
-            // Every candidate is sent a view assembled for its own window, the
-            // head's too, which may leave out more -- or cannot hold the
-            // call's latest turn at all. What rig put after the system prompt
-            // is the prompt alone, the round's hook having patched the rest
-            // out, and the view replaces it.
-            let viewed = self
-                .view
-                .view(candidate.budget(), call)
-                .map(|(view, adjacent)| {
-                    attempt.chat_history = after_system(&attempt.chat_history, view);
-                    adjacent
-                });
+            let viewed = viewed.map(|viewed| {
+                attempt.chat_history = after_system(&attempt.chat_history, viewed.messages);
+                (viewed.adjacent, viewed.estimate)
+            });
             // Both rewrites are per candidate. `max_tokens` is the load-bearing
             // one: the agent carries none of its own, so without this no
             // ceiling would be sent. `model` arrives `None` on the agent path
@@ -591,7 +633,7 @@ impl CompletionModel for FailoverModel {
             // identifier, so setting it is belt-and-braces against a future
             // rig that populates the field -- correct, and free.
             attempt.model = Some(candidate.model_identifier().to_string());
-            attempt.max_tokens = candidate.budget().max_tokens.map(u64::from);
+            attempt.max_tokens = max_tokens.map(u64::from);
 
             let error = match viewed {
                 // Not made: the call cannot fit this candidate. Sending it
@@ -599,8 +641,12 @@ impl CompletionModel for FailoverModel {
                 // to `is_recoverable`; the next round's view leaves the turn
                 // out, which `candidate_may_clear` counts.
                 Err(too_large) => CompletionError::RequestError(Box::new(too_large)),
-                Ok(adjacent) => match candidate.completion(attempt).await {
+                Ok((adjacent, estimate)) => match candidate.completion(attempt).await {
                     Ok(response) => {
+                        // Against the estimate before its scale, or each call
+                        // would be measured against a correction of the last.
+                        self.calibrations[index]
+                            .learn(budget.wire.reported_input(&response.usage), estimate);
                         return Ok(CompletionResponse {
                             choice: response.choice,
                             usage: response.usage,
@@ -619,7 +665,7 @@ impl CompletionModel for FailoverModel {
                         if let Some(adjacent) = adjacent
                             && refused(&error)
                         {
-                            self.slot.refused(candidate.budget(), adjacent);
+                            self.slot.refused(&budget, adjacent);
                         }
                         error
                     }
@@ -675,6 +721,7 @@ mod tests {
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
+    use crate::agent::budget::Scale;
     use crate::agent::history::Role;
     use crate::agent::ledger::{Ledger, Refusal};
     use crate::agent::mock_http::transport_failure;
@@ -701,6 +748,8 @@ mod tests {
         /// lets it inspect a candidate it no longer owns.
         seen: Arc<Mutex<Vec<CompletionRequest>>>,
         composes: bool,
+        /// The input tokens each answer reports having cost.
+        input_tokens: u64,
     }
 
     impl Scripted {
@@ -719,7 +768,14 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 seen: Arc::default(),
                 composes: true,
+                input_tokens: 0,
             }
+        }
+
+        /// This candidate's answers report `input_tokens` as the request's cost.
+        fn reporting(mut self, input_tokens: u64) -> Self {
+            self.input_tokens = input_tokens;
+            self
         }
 
         fn with_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -763,10 +819,14 @@ mod tests {
                 Some(Err(e)) => Err(clone_error(e)),
                 None => Err(CompletionError::ProviderError("script empty".into())),
             };
+            let input_tokens = self.input_tokens;
             Box::pin(async move {
                 outcome.map(|text| CompletionResponse {
                     choice: OneOrMany::one(AssistantContent::text(text)),
-                    usage: Usage::new(),
+                    usage: Usage {
+                        input_tokens,
+                        ..Usage::new()
+                    },
                     raw_response: (),
                     message_id: None,
                 })
@@ -827,18 +887,29 @@ mod tests {
         }
     }
 
+    /// What every view a store stand-in assembles is estimated at.
+    const ESTIMATE: u64 = 1_000;
+
     /// A store stand-in: the view for a budget names its model, and the
-    /// budgets it was asked for are kept. `too_large_for` names the candidates
-    /// whose window the call's latest turn does not fit, and `adjacent_for`
-    /// one whose view puts the model's reply after its own.
+    /// models it was asked for are kept, with the scale each was held to.
+    /// `too_large_for` names the candidates whose window the call's latest turn
+    /// does not fit, and `adjacent_for` one whose view puts the model's reply
+    /// after its own.
     #[derive(Default)]
     struct Views {
-        asked: Mutex<Vec<String>>,
+        asked: Mutex<Vec<(String, Scale)>>,
+        /// The ceiling every view lowers the call to, if it does.
+        lowered_to: Option<u32>,
         too_large_for: Vec<&'static str>,
         adjacent_for: Vec<&'static str>,
     }
 
     impl Views {
+        /// The model and scale of each view asked for, in the order asked.
+        fn asked(&self) -> Vec<(String, Scale)> {
+            self.asked.lock().expect("asked").clone()
+        }
+
         fn too_large_for(names: impl IntoIterator<Item = &'static str>) -> Self {
             Self {
                 too_large_for: names.into_iter().collect(),
@@ -855,12 +926,11 @@ mod tests {
     }
 
     impl View for Views {
-        fn view(
-            &self,
-            budget: &Budget,
-            _call: CallId,
-        ) -> Result<(Vec<Message>, Option<Adjacent>), TooLarge> {
-            self.asked.lock().expect("asked").push(budget.model.clone());
+        fn view(&self, budget: &Budget, _call: CallId) -> Result<Viewed, TooLarge> {
+            self.asked
+                .lock()
+                .expect("asked")
+                .push((budget.model.clone(), budget.scale));
             let named = |names: &[&str]| names.contains(&budget.model.as_str());
             if named(&self.too_large_for) {
                 return Err(TooLarge {
@@ -874,10 +944,12 @@ mod tests {
                 turn: Some(2),
                 role: Role::Assistant,
             });
-            Ok((
-                vec![Message::user(format!("the view for {}", budget.model))],
+            Ok(Viewed {
+                messages: vec![Message::user(format!("the view for {}", budget.model))],
                 adjacent,
-            ))
+                estimate: ESTIMATE,
+                max_tokens: self.lowered_to.or(budget.max_tokens),
+            })
         }
     }
 
@@ -1311,10 +1383,8 @@ mod tests {
                 Message::user("the view for anthropic")
             ]
         );
-        assert_eq!(
-            *views.asked.lock().expect("asked"),
-            ["bedrock", "anthropic"]
-        );
+        let models: Vec<_> = views.asked().into_iter().map(|(model, _)| model).collect();
+        assert_eq!(models, ["bedrock", "anthropic"]);
     }
 
     /// A candidate whose window the call's latest turn does not fit is passed
@@ -1521,6 +1591,117 @@ mod tests {
             (moved.raw_response.model, head.raw_response.model),
             ("anthropic".to_string(), "bedrock".to_string())
         );
+    }
+
+    /// A chain of one candidate whose answers report `reported` input tokens,
+    /// called twice: the chain, and the scale each call was held to.
+    async fn answered_twice(reported: u64) -> (FailoverModel, Vec<Scale>) {
+        let views = Arc::new(Views::default());
+        let model = chain_over(
+            vec![Box::new(Scripted::ok("opus").reporting(reported))],
+            Arc::clone(&views) as Arc<dyn View>,
+            CallSlot::default(),
+        );
+        model.completion(request()).await.expect("answers");
+        model.completion(request()).await.expect("answers");
+        let scales = views.asked().into_iter().map(|(_, scale)| scale).collect();
+        (model, scales)
+    }
+
+    /// An answer whose request its provider reported over the estimate scales
+    /// the next call to that candidate by the ratio, which a round opens
+    /// against as well.
+    #[tokio::test]
+    async fn an_answer_over_its_estimate_scales_the_next_call() {
+        let (model, scales) = answered_twice(ESTIMATE * 6 / 5).await;
+
+        let reported = Scale::observed(6, 5);
+        assert_eq!(
+            scales,
+            [Scale::RULE, reported],
+            "the first call is held to the rule, and the second to what was reported"
+        );
+        assert_eq!(model.head_budget().scale, reported);
+    }
+
+    /// A provider that reported less than the estimate, or nothing, moves the
+    /// scale below nothing: it is never under the rule.
+    #[tokio::test]
+    async fn an_answer_under_its_estimate_or_with_no_usage_leaves_the_rule() {
+        for reported in [ESTIMATE / 2, 0] {
+            let (_, scales) = answered_twice(reported).await;
+            assert_eq!(
+                scales,
+                [Scale::RULE, Scale::RULE],
+                "reported {reported} of an estimate of {ESTIMATE}"
+            );
+        }
+    }
+
+    /// A view that had to lower the reply's ceiling to carry the call's prompt
+    /// -- the scale would have refused it -- sets the ceiling the call is sent,
+    /// not the candidate's.
+    #[tokio::test]
+    async fn a_ceiling_the_view_lowered_is_the_one_sent() {
+        let head = Scripted::ok("opus").with_max_tokens(64_000);
+        let seen = Arc::clone(&head.seen);
+        let views = Views {
+            lowered_to: Some(1_500),
+            ..Views::default()
+        };
+        let model = chain_over(vec![Box::new(head)], Arc::new(views), CallSlot::default());
+
+        model.completion(request()).await.expect("answers");
+
+        let ceilings: Vec<_> = seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .map(|request| request.max_tokens)
+            .collect();
+        assert_eq!(ceilings, [Some(1_500)]);
+    }
+
+    /// What one candidate reported says nothing of another: a call that moves
+    /// from a head with a ratio to its fallback starts the fallback from the
+    /// rule, and the fallback's answer scales only the fallback.
+    #[tokio::test]
+    async fn a_failover_starts_from_the_rule() {
+        // Answers once, reporting 1.2x, then fails.
+        let head = Scripted::new("bedrock", vec![Ok("hi"), Err(http_status(503))])
+            .reporting(ESTIMATE * 6 / 5);
+        let fallback = Scripted::ok("anthropic").reporting(ESTIMATE * 3 / 2);
+        let views = Arc::new(Views::default());
+        let model = chain_over(
+            vec![Box::new(head), Box::new(fallback)],
+            Arc::clone(&views) as Arc<dyn View>,
+            CallSlot::default(),
+        );
+
+        model.completion(request()).await.expect("the head answers");
+        model
+            .completion(request())
+            .await
+            .expect("the fallback answers");
+        // The fallback's own ratio is its own: the head is still at 1.2.
+        model
+            .completion(request())
+            .await
+            .expect("the head fails again");
+
+        let (head, fallback) = (Scale::observed(6, 5), Scale::observed(3, 2));
+        let asked = |model: &str, scale| (model.to_string(), scale);
+        assert_eq!(
+            views.asked(),
+            [
+                asked("bedrock", Scale::RULE),
+                asked("bedrock", head),
+                asked("anthropic", Scale::RULE),
+                asked("bedrock", head),
+                asked("anthropic", fallback),
+            ]
+        );
+        assert_eq!(model.head_budget().scale, head);
     }
 
     /// Streaming reaches no candidate at all: the agent loop never streams, and

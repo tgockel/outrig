@@ -142,9 +142,17 @@ category says what it may hold.
     event: a call that goes to more than one model is assembled for each under the same `call_id`.
   - `round`: its round.
   - `budget`: what it was held to: `model`; in tokens, `window`, `window_assumed`, `reserve`,
-    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`; and
-    `role_alternation`, `relaxed` or `strict`, as the model's provider row says.
-  - `estimate`: the whole request's estimated tokens.
+    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`; `estimate_scale`,
+    what `estimate` was multiplied by to be held to the window; and `role_alternation`,
+    `relaxed` or `strict`, as the model's provider row says.
+  - `estimate`: the whole request's estimated tokens, before `estimate_scale`. The scale is `1.0`
+    until the model's provider has reported what a request cost. From then on it is the ratio of
+    the input tokens that model's latest answered call reported -- `usage.input_tokens` on its
+    `model.attempt`, with the cache's added for an Anthropic model -- to that call's `estimate`,
+    and never less than `1.0` or more than `3.0`. Each model of an alias has its own. A call
+    whose prompt the scale would refuse, though the estimate alone admits it, is held to a lower
+    `reserve` -- and `max_tokens` with it, never below 1,024 -- and, if that is not enough, to a
+    smaller `estimate_scale`, so the call is made and its answer corrects the scale.
   - `carried`: the turns it sent, oldest first, each as `{turn, why}`; `why` is `latest`,
     `round`, `promoted`, `first`, or `recent`.
   - `evicted`: the turns chosen but left out for size, the same way.

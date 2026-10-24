@@ -13,7 +13,7 @@ use rig::tool::{ToolDyn, ToolError};
 use serde_json::json;
 
 use super::AgentError;
-use super::budget::{ASSUMED_CONTEXT_WINDOW, Budget, DEFAULT_REPLY_RESERVE};
+use super::budget::{ASSUMED_CONTEXT_WINDOW, DEFAULT_REPLY_RESERVE};
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
 use super::history::{LeftOut, Manifest, Why, Window, as_sent};
@@ -2174,9 +2174,8 @@ async fn every_cut_driven(
     agent.primary().history.set_window(NARROW);
     // Room for either of round 5's large turns and what else there is, not
     // both: the model's own budget, its window shrunk to leave that room.
-    let real = (*agent.primary().budget).clone();
+    let real = agent.primary().agent.model.head_budget();
     let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
-    agent.primary_mut().budget = Arc::new(Budget { window, ..real });
     Arc::get_mut(&mut agent.primary_mut().agent.model)
         .expect("no call is in flight")
         .narrow_head(window);
@@ -2267,7 +2266,7 @@ async fn each_calls_manifest_reconstructs_what_the_provider_received() {
         let (agent, recorded, manifests) = every_cut(style, &var).await;
         for (n, manifest) in manifests.iter().enumerate() {
             assert_eq!(manifest.call, n as u64);
-            assert_eq!(manifest.budget, *agent.primary().budget);
+            assert_eq!(manifest.budget, agent.primary().agent.model.head_budget());
         }
         each_call_reconstructs(style, &agent, &recorded, &manifests);
     }
@@ -2429,7 +2428,7 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
             vec![text_reply("ok")],
         )
         .await;
-        let budget = &agent.primary().budget;
+        let budget = agent.primary().agent.model.head_budget();
         assert_eq!(
             (
                 budget.model.as_str(),
@@ -2444,8 +2443,61 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
         let manifest = seen.lock().expect("manifests")[0].clone();
         assert_eq!(
             manifest.budget,
-            *agent.primary().budget,
+            agent.primary().agent.model.head_budget(),
             "the call was held to it"
+        );
+    }
+}
+
+/// A provider that reports a request larger than the rule estimated scales the
+/// next call's allowance, through both protocols and however each counts what it
+/// cached: Anthropic's `input_tokens` leaves the cache out, and OpenAI's
+/// `prompt_tokens` has it in. The latest answered call decides, so one that
+/// reports a request under its estimate puts the next back at the rule.
+#[tokio::test]
+async fn a_request_reported_over_its_estimate_scales_the_next_calls_allowance() {
+    for style in Style::ALL {
+        // About 60,000 tokens against an estimate of a few thousand, which is
+        // past anything the scale is allowed to believe.
+        let large = match style {
+            Style::Anthropic => json!({
+                "input_tokens": 10,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 60_000,
+            }),
+            Style::OpenAi => json!({
+                "prompt_tokens": 60_000,
+                "completion_tokens": 7,
+                "total_tokens": 60_007,
+                "prompt_tokens_details": { "cached_tokens": 59_000 },
+            }),
+        };
+        let (mut agent, _requests) = agent_in(
+            style,
+            "OUTRIG_TEST_AGENT_SCALED_ESTIMATE",
+            MODEL,
+            "context-window = 200000",
+            "max-tokens = 4096",
+            vec![
+                style.text("one").usage(large),
+                style.text("two"),
+                style.text("three"),
+            ],
+        )
+        .await;
+        let seen = manifests(&agent);
+        for message in ["go", "again", "once more"] {
+            round(&mut agent, message).await;
+        }
+
+        let seen = seen.lock().expect("manifests");
+        let ratios: Vec<f64> = seen.iter().map(|m| m.budget.scale.ratio()).collect();
+        assert_eq!(
+            ratios,
+            [1.0, 3.0, 1.0],
+            "{style:?}: the first call is held to the rule, the second to what the first was \
+             reported at, at most three times it, and the third, after a call that reported \
+             less than it was estimated at, to the rule again"
         );
     }
 }
@@ -2472,7 +2524,7 @@ async fn no_context_window_assumes_one_whatever_the_identifier() {
             vec![style.text("ok")],
         )
         .await;
-        let budget = &agent.primary().budget;
+        let budget = agent.primary().agent.model.head_budget();
         assert_eq!(
             (budget.window, budget.window_assumed, budget.reserve),
             (ASSUMED_CONTEXT_WINDOW, true, reserve),
@@ -4922,6 +4974,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
             "window_assumed": false,
             "reserve": 1024,
             "overhead": moved_call["budget"]["overhead"],
+            "estimate_scale": 1.0,
             "max_tokens": 1024,
             "role_alternation": "relaxed",
         })

@@ -85,7 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Each model call is held to the model's context window, from `Model::context_window` or an
   assumed 128,000 tokens with a warning, less the reply's ceiling and the system prompt, by an
-  estimate made before the call. What does not fit is left out in a fixed order -- the window's
+  estimate made before the call. The estimate is a token per three ASCII bytes and is scaled by
+  what the model's provider has reported: the ratio of the input tokens its latest answered call
+  was reported at to that call's estimate, never below the estimate itself, so a tokenizer that
+  counts more than it, as Claude Opus 5's does by about a tenth, does not leave a call over the
+  window. Each model of an alias has its own, and `model.call`'s `budget.estimate_scale` records
+  it. A prompt the scale would refuse but the estimate alone admits is carried with the reply's
+  ceiling lowered instead, as `budget.reserve` and `budget.max_tokens` record. What does not fit
+  is left out in a fixed order -- the window's
   recent rounds, then its first, then promotions, then the round's earlier turns -- and the turn
   a call answers never is. When that turn alone does not fit, the call is not made: the round
   ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's

@@ -809,6 +809,10 @@ pub struct CallBudget {
     pub window_assumed: bool,
     pub reserve: u32,
     pub overhead: u64,
+    /// What the call's `estimate` was multiplied by to be held to the window: 1.0
+    /// is the estimate as it stands, and above it the model's provider has
+    /// reported more input tokens for a request than the estimate said.
+    pub estimate_scale: f64,
     pub max_tokens: Option<u32>,
     pub role_alternation: RoleAlternation,
 }

@@ -54,7 +54,6 @@ use crate::python::host::{Interpreter, InterpreterError, Tasks};
 
 pub use self::channel::UserChannel;
 
-use self::budget::Budget;
 use self::build::RigAgent;
 use self::channel::Announcer;
 #[cfg(test)]
@@ -91,11 +90,6 @@ pub(crate) struct Agent {
     pub(crate) agent: RigAgent,
     /// The whole conversation, which rounds commit to as they go.
     pub(crate) history: History,
-    /// The head's allowance, whose `model` is the row every call is tried
-    /// against first, and which the line that opens a round is costed
-    /// against. Each call is held to the allowance of the model it goes to,
-    /// which the chain holds.
-    pub(crate) budget: Arc<Budget>,
     tool_call_max: usize,
     /// Shared with the tool and each round's hook; what
     /// [`Agent::interrupter`] presses.
@@ -120,7 +114,7 @@ impl Agent {
 
     /// The `[models.<name>]` row every model call is tried against first.
     pub(crate) fn model(&self) -> &str {
-        &self.budget.model
+        self.agent.model.head_name()
     }
 
     /// What stops the Python the current round waits on: see
@@ -155,7 +149,9 @@ impl Agent {
         &self,
         opening: impl Fn(usize) -> String,
     ) -> Result<Finished, AgentError> {
-        let opening = self.history.open_round(&self.budget, opening);
+        let opening = self
+            .history
+            .open_round(&self.agent.model.head_budget(), opening);
         self.history.events().emit(Payload::RoundStarted {
             round: self.history.round(),
         });
@@ -183,9 +179,11 @@ impl Agent {
             .lifecycle
             .open_round()
             .map_err(|by| AgentError::Closed(by.into()))?;
-        let opening = self.history.open_round(&self.budget, |omitted| {
-            orientation::opening(&announcement, omitted)
-        });
+        let opening = self
+            .history
+            .open_round(&self.agent.model.head_budget(), |omitted| {
+                orientation::opening(&announcement, omitted)
+            });
         self.history.events().emit(Payload::RoundStarted {
             round: self.history.round(),
         });
@@ -344,7 +342,6 @@ impl Agent {
         Ok(Self {
             agent,
             history,
-            budget: Arc::new(budget),
             tool_call_max: resolved.tool_call_max,
             interrupts,
             user,

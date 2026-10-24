@@ -772,6 +772,13 @@ together -- as the provider publishes it, such as `200000` for current Claude mo
 configures nothing on the provider's side; it tells `outrig run-new` how much one model call can
 carry. Each call sets aside the reply's ceiling (`max-tokens`, or the lower one the provider
 holds it to) and carries the system prompt and as much of the conversation as fits in the rest.
+What fits is estimated before the call, and the estimate is scaled by what the model's provider
+has reported for the requests it has answered, so one that counts more tokens than the estimate
+does is held to less. The first call to a model is held to the estimate alone. If the scale would
+refuse a call's prompt that the estimate alone admits -- a very large system prompt in a window
+that held it by a small margin -- the reply gives way: the ceiling the call sends is lowered to
+what the request leaves, never below 1,024 tokens, so the call is made and its answer corrects
+the scale.
 Unset, `run-new` assumes a 128,000-token window, sets aside at most a quarter of it for the
 reply, and warns once at startup; it never infers a window from `identifier`. A model with a
 larger window is sent less than it could take until its row says so, and one with a smaller

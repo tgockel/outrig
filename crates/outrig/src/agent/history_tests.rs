@@ -4,7 +4,7 @@ use rig::completion::message::{AssistantContent, ToolResultContent, UserContent}
 use serde_json::json;
 
 use super::{Adjacent, History, Prompt, Role, Store, TooLarge, Why, Window, split_turns};
-use crate::agent::budget::{Budget, candidate};
+use crate::agent::budget::{Budget, MIN_REPLY, Scale, candidate};
 use crate::agent::tool;
 use crate::harness::event::CallId;
 use crate::python::host::ContextChange;
@@ -518,6 +518,7 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         window_assumed: true,
         reserve: 250,
         overhead: 300,
+        scale: Scale::RULE,
         max_tokens: None,
         provider: "p".into(),
         wire: crate::agent::budget::Wire::OpenAi,
@@ -550,6 +551,132 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
     assert_eq!(manifest.carried, [(10, Why::Latest)]);
     assert_eq!(manifest.estimate, 450 + 300);
     assert_eq!(sent, store.turns[10].messages, "the latest turn alone");
+}
+
+/// A candidate whose provider counts more tokens than the rule estimates is
+/// held to less of the same store, in the same order, and the call's manifest
+/// records the scale it was held to beside the estimate, which stays the rule's.
+#[test]
+fn a_scaled_allowance_carries_less_of_the_same_store() {
+    let mut store = five_rounds();
+    let rule = Budget::with_room("m", 80);
+    let scaled = Budget {
+        scale: Scale::observed(5, 4),
+        ..rule.clone()
+    };
+
+    let (_, at_rule) = store.assemble(&rule).expect("room for all 80");
+    assert_eq!(at_rule.evicted, []);
+    assert_eq!(at_rule.estimate, 80);
+
+    // 80 of the provider's tokens are 64 of the rule's: the latest turn, the
+    // round's own, the promotion and the first rounds, and not the recent one.
+    let (_, at_scale) = store.assemble(&scaled).expect("room for most");
+    let ids = |chosen: &[(usize, Why)]| chosen.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+    assert_eq!(ids(&at_scale.carried), [0, 1, 2, 8, 9, 10]);
+    assert_eq!(ids(&at_scale.evicted), [6, 7]);
+    assert_eq!(at_scale.estimate, 60, "the estimate is the rule's count");
+
+    let event = |manifest: &super::Manifest| manifest.event(CallId::new(1)).budget.estimate_scale;
+    assert!((event(&at_rule) - 1.0).abs() < 1e-9);
+    assert!((event(&at_scale) - 1.25).abs() < 1e-9);
+}
+
+/// A turn too large for the room says why the room is less than the window
+/// leaves, when the provider's count has scaled it down.
+#[test]
+fn a_turn_too_large_for_the_scaled_room_says_so() {
+    let mut store = five_rounds();
+    store.turns[10].tokens = 500;
+    let rule = Budget {
+        window: 1_000,
+        reserve: 250,
+        overhead: 300,
+        ..Budget::with_room("small", 0)
+    };
+    let scaled = Budget {
+        scale: Scale::observed(5, 4),
+        ..rule.clone()
+    };
+    let err = store
+        .assemble(&scaled)
+        .expect_err("300 of room, and 450 at the rule");
+    assert_eq!((err.turn, err.estimate), (Some(10), 500), "{err}");
+    let text = err.to_string();
+    for needle in [
+        "room for about 300",
+        "250 reserved for the reply",
+        "counted down 1.25x",
+        "small's provider has reported requests larger than OutRig estimated them",
+    ] {
+        assert!(text.contains(needle), "{needle:?} in {text}");
+    }
+    let at_rule = TooLarge {
+        budget: rule,
+        ..err
+    };
+    assert!(!at_rule.to_string().contains("counted down"), "{at_rule}");
+}
+
+/// A prompt the rule admits is carried however the provider's count scales the
+/// request: the reply gives up the room, where held to the scale with the
+/// reserve as it was the call could carry nothing. So is a prompt the scale
+/// leaves no room for beside the least reply, with the scale cut back.
+#[test]
+fn a_scale_that_would_refuse_the_prompt_lowers_the_reply_instead() {
+    let rule =
+        Budget::new(&candidate("m", Some(200_000)), Some(64_000), 100_000).expect("36000 of room");
+    let scaled = rule.scaled(Scale::observed(3, 2));
+    assert_eq!(scaled.room(), 0);
+
+    let mut store = priced(five_rounds(), 100);
+    let (_, manifest) = store
+        .assemble(&scaled)
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(manifest.carried, [(10, Why::Latest)]);
+    let held = &manifest.budget;
+    assert!(
+        MIN_REPLY <= held.reserve && held.reserve < rule.reserve,
+        "{held:?}"
+    );
+    assert_eq!(held.max_tokens, Some(held.reserve));
+    assert_eq!(held.scale, scaled.scale);
+
+    // A prompt that leaves the window less than the least reply beside it.
+    store.turns[10].tokens = 35_000;
+    let (_, manifest) = store
+        .assemble(&scaled)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let held = &manifest.budget;
+    assert!(held.reserve >= MIN_REPLY, "{held:?}");
+    assert!(
+        Scale::RULE < held.scale && held.scale < scaled.scale,
+        "{held:?}"
+    );
+
+    // Beyond what the rule admits is refused all the same.
+    store.turns[10].tokens = 40_000;
+    store.assemble(&scaled).expect_err("36000 at the rule");
+}
+
+/// A round's opening is a prompt like any other, and the count it states of the
+/// turns its first call leaves out is that call's, with the reply lowered.
+#[test]
+fn an_opening_the_scale_would_refuse_is_carried_and_counted_exactly() {
+    let rule =
+        Budget::new(&candidate("m", Some(200_000)), Some(64_000), 100_000).expect("36000 of room");
+    let scaled = rule.scaled(Scale::observed(3, 2));
+
+    let mut store = priced(five_rounds(), 100);
+    // An announcement of about 4,000 tokens, which the rule's room holds.
+    let line = |n: usize| format!("{n} {}", "y".repeat(12_000));
+    let opening = store.open_round(&scaled, line);
+    assert_eq!(stated(&opening), first_call_leaves_out(&mut store, &scaled));
+    let (_, manifest) = store
+        .assemble(&scaled)
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(manifest.opening, Some(opening));
+    assert!(manifest.budget.reserve < rule.reserve);
 }
 
 /// Each candidate has its own allowance, and the same conversation assembled
@@ -693,7 +820,8 @@ async fn the_opening_count_includes_what_the_budget_leaves_out() {
 /// line's length moves what fits. Here the line grows with the count, and one
 /// large turn sits among small ones, so a longer line can leave out the large
 /// one and fit the small: costed at its own size, an opening would state a
-/// count its call does not keep.
+/// count its call does not keep. So it is under a scale, which moves what fits
+/// as well.
 #[test]
 fn the_opening_counts_exactly_what_its_first_call_leaves_out() {
     let mut store = rounds_of(
@@ -708,14 +836,19 @@ fn the_opening_counts_exactly_what_its_first_call_leaves_out() {
         turn.tokens = tokens;
     }
     let line = |n: usize| format!("{n} {}", "y".repeat(30 * n));
-    for room in (0..2_600).step_by(7) {
-        let budget = Budget::with_room("m", room);
-        let opening = store.open_round(&budget, line);
-        assert_eq!(
-            stated(&opening),
-            first_call_leaves_out(&mut store, &budget),
-            "room {room}"
-        );
+    for scale in [Scale::RULE, Scale::observed(3, 2)] {
+        for room in (0..4_000).step_by(7) {
+            let budget = Budget {
+                scale,
+                ..Budget::with_room("m", room)
+            };
+            let opening = store.open_round(&budget, line);
+            assert_eq!(
+                stated(&opening),
+                first_call_leaves_out(&mut store, &budget),
+                "room {room} at {scale:?}"
+            );
+        }
     }
 }
 

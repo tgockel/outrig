@@ -661,6 +661,11 @@ class Builder:
                 else []
             ),
             f"overhead: {tokens(budget.get('overhead'))} tokens",
+            *(
+                [f"estimate scale: {scale:g}x"]
+                if (scale := num(budget.get("estimate_scale"))) is not None and scale > 1
+                else []
+            ),
             f"role alternation: {text(budget.get('role_alternation'))}",
         ] + [
             f"left out of turn {text(part.get('turn'))}: part {text(part.get('part'))} of message "

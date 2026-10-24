@@ -1473,6 +1473,7 @@ pub outrig::harness::event::Background::dropped: u64
 pub outrig::harness::event::Background::id: outrig::harness::event::ExecId
 pub outrig::harness::event::Background::output: alloc::string::String
 #[non_exhaustive] pub struct outrig::harness::event::CallBudget
+pub outrig::harness::event::CallBudget::estimate_scale: f64
 pub outrig::harness::event::CallBudget::max_tokens: core::option::Option<u32>
 pub outrig::harness::event::CallBudget::model: alloc::string::String
 pub outrig::harness::event::CallBudget::overhead: u64

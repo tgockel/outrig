@@ -318,6 +318,9 @@ new protocol message, and the query vocabulary becomes a surface to design and m
   it, not exercised with a shorter list than rig supplied. `0003-11` sent one on every model
   call, and `0003-12` asserts the result on the wire through both adapters, against mocks. A live
   endpoint is still unexercised.
-- The token estimate. It over-counts code and prose by design; text that tokenizes densely can
-  cost more than it is estimated at, and no provider's reported usage has been compared with it
-  yet (`plan/next/calibrate-the-token-estimate.md`).
+- The token estimate. It was first an uncalibrated rule that over-counts code and prose; a
+  session on Claude Opus 5 then reported 8-13% more input tokens than it estimated, so a call
+  could exceed a real `context-window` (#668). Each candidate's estimate is now scaled by the
+  ratio of the input tokens its latest answered call was reported at to what the rule estimated,
+  never below the rule and at most 3x. A provider's refusal of a request as too long is still not
+  parsed.
