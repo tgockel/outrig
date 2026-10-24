@@ -38,3 +38,5 @@ Each entry has the same sections: `## Shipped`, `## Alternative`, `## Evaluation
 - `custom-hosted-object-protocol.md` -- a hosted-object protocol of OutRig's own, with one
   multiplexed connection and no RPyC, keeping the library's synchronous calling convention,
   against RPyC's proxies over the pool.
+- `cost-aware-commentary-preamble.md` -- a preamble that tells the model its commentary is
+  re-sent on every later call in the window, against the audience-only sentence that ships.
