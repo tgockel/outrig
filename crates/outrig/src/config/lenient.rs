@@ -202,6 +202,139 @@ pub(super) fn parse(text: &str, file: Option<&Path>, skip_bad_values: bool) -> R
     }
 }
 
+/// The non-empty string value of a top-level `key` in `text`, for a caller
+/// that needs that one key out of a file [`parse`] refused.
+///
+/// `Ok(None)` is "this file declares nothing this key can be read from", and
+/// the caller's default stands. `Err` is "this file cannot be asked": what the
+/// parse error cost could have been the key itself, so the error comes back
+/// rather than an answer that might be wrong.
+///
+/// Recovery first, because a file is usually broken somewhere other than the
+/// key being asked about -- a half-written `[models.<name>]` block below a
+/// good `session-root` -- and the recovered document still carries it.
+///
+/// What is taken from that document is only a declaration recovery did not
+/// have to repair: a plain non-empty string, under a key no error points at,
+/// in a region no error reaches. Recovery is a best effort at *a* reading of a
+/// damaged file, not a reading of what its writer meant, and the two come
+/// apart in ways that would otherwise be invisible here:
+///
+/// - A value with a broken escape is repaired rather than refused: `"/a\uZZ"`
+///   recovers as `/a<U+FFFD>ZZ`, a path nobody has.
+/// - A string left unterminated swallows the lines below it, so the value
+///   carries the rest of the file.
+/// - A key declared twice keeps the *first* value, while a file that parsed
+///   would have been refused outright -- the question of which one the writer
+///   meant is exactly what is unanswerable.
+///
+/// Each of those leaves an error whose span either reaches the declaration's
+/// own text or points at a second spelling of the key ([`concerns`]), so each
+/// is refused. A table or an empty string under the key is refused the same
+/// way, being no path either.
+///
+/// Having no answer from the document, what is left is whether the file could
+/// be declaring the key somewhere the recovery lost. A document that parsed
+/// has no such somewhere, so its silence is the file's own and the default
+/// stands. A document that did not is refused unless [`might_declare`] can
+/// rule the key out of it, because a command acting on the wrong answer --
+/// `outrig clean`, pointed at a session root that holds no records, reads
+/// every labeled container as a stray -- would do damage no warning undoes.
+///
+/// A file that parses cleanly therefore answers `None` whatever it holds under
+/// `key`: a wrong *type* in a readable file is the ordinary lenient load's
+/// business ([`ConfigWarningKind::InvalidValue`]), not this one's.
+pub(super) fn salvage_top_level_string(text: &str, key: &str) -> Result<Option<String>> {
+    let (doc, errors) = DeTable::parse_recoverable(text);
+    let declared = doc.get_ref().get_key_value(key);
+    if let Some((name, value)) = declared
+        && let DeValue::String(found) = value.get_ref()
+        && !found.is_empty()
+        && !errors
+            .iter()
+            .any(|error| concerns(error, text, name.span(), value.span(), key))
+    {
+        return Ok(Some(found.as_ref().to_string()));
+    }
+    let Some(mut err) = errors.into_iter().next() else {
+        return Ok(None);
+    };
+    if declared.is_none() && !might_declare(text, key) {
+        return Ok(None);
+    }
+    err.set_input(Some(text));
+    Err(err.into())
+}
+
+/// Whether `error` has anything to say about the `key` declared at
+/// `key_span = value_span`, which is the question of whether the value
+/// recovered there can be trusted.
+///
+/// Two ways it can. The error's span reaches the declaration -- the whole of
+/// it, key and value together, endpoints included, since the errors that
+/// matter most here sit exactly at the end of what they damaged (an
+/// unterminated string reports at the end of the text it swallowed). Or the
+/// error points at another spelling of the same key, which is how a duplicate
+/// declaration is reported, span on the *second* one: the value recovered is
+/// then the first of two the file gives, and no reading of a file that does
+/// not parse can say which of them the writer meant to be left with.
+///
+/// The second test cannot tell a top-level duplicate from one inside a table,
+/// so a `session-root` repeated under `[some-table]` costs the top-level one
+/// its answer too. That is the safe direction, and a file with two of anything
+/// is being edited anyway.
+///
+/// An error with no span at all could be about anything, this declaration
+/// included.
+fn concerns(
+    error: &toml::de::Error,
+    text: &str,
+    key_span: Range<usize>,
+    value_span: Range<usize>,
+    key: &str,
+) -> bool {
+    let Some(span) = error.span() else {
+        return true;
+    };
+    // A broken `[header` above a top-level key can leave the two spans
+    // inverted, so the declaration's extent is their union, not key-then-value.
+    let start = key_span.start.min(value_span.start);
+    let end = key_span.end.max(value_span.end);
+    (span.start <= end && start <= span.end)
+        || text
+            .get(span.start..span.end)
+            .is_some_and(|at| names_key(at, key))
+}
+
+/// Whether `at`, the text an error points at, is a spelling of `key` -- which
+/// a quoted key need not look like (`"session-\u0072oot"`), so the decoder
+/// decides rather than a comparison of the bytes. Parsed as the start of a
+/// declaration, because that is what it is in the document it came from.
+fn names_key(at: &str, key: &str) -> bool {
+    let at = at.trim();
+    if at.is_empty() || at.contains('\n') {
+        return false;
+    }
+    let declaration = format!("{at} = 0");
+    let (doc, _) = DeTable::parse_recoverable(&declaration);
+    doc.get_ref().contains_key(key)
+}
+
+/// Whether a document that did not parse could still be declaring `key`
+/// somewhere its recovery did not put under that name -- a declaration
+/// swallowed by an unterminated string above it, say.
+///
+/// Conservative on purpose, since the caller's alternative to "it might" is a
+/// default that may be the wrong directory. Written out, the file cannot be
+/// declaring the key unless its text holds the key, or an escape, which in a
+/// file that did not parse is a spelling this cannot resolve -- a quoted
+/// `"session-\u0072oot"` is the key and holds none of its bytes. A backslash
+/// in a broken file therefore counts as a mention, even though it usually is
+/// not one.
+fn might_declare(text: &str, key: &str) -> bool {
+    text.contains(key) || text.contains('\\')
+}
+
 /// `node` without the entries that start at a `dropped` offset.
 fn prune<'i>(node: &DeValue<'i>, dropped: &HashSet<usize>) -> DeValue<'i> {
     let keep = |v: &Spanned<DeValue<'i>>| Spanned::new(v.span(), prune(v.get_ref(), dropped));

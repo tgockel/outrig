@@ -267,3 +267,136 @@ async fn a_missing_global_config_is_refused_only_where_it_is_read() {
         "the record is discarded"
     );
 }
+
+/// #384: these four commands need one key out of a file every outrig on the
+/// machine shares, so a global config broken anywhere else -- a half-written
+/// `[models.<name>]` block, a `[network]` value mid-edit -- no longer stops
+/// them. The root the damaged file still names is the one they use, and the
+/// warning says what was skipped and that the error is still there.
+#[tokio::test]
+async fn the_session_commands_salvage_the_root_from_an_unloadable_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("sessions");
+    let sid = record(&root, "20261003T100000-aaaa");
+    // Where the default root would be, were the key not salvaged.
+    let data = tmp.path().join("data");
+    let env = [("XDG_DATA_HOME", data.as_path())];
+
+    for body in [
+        format!("session-root = {:?}\n[models.half-written\n", utf8(&root)),
+        format!(
+            "session-root = {:?}\n[network]\nmode = \"nonsense\"\n",
+            utf8(&root)
+        ),
+    ] {
+        let global = global_config(tmp.path(), &body);
+        let out =
+            run_outrig_output(tmp.path(), &["--global-config", utf8(&global), "ls"], &env).await;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "ls must not fail on {body:?}:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(sid.as_str()),
+            "ls must list the salvaged root for {body:?}:\n{stdout}",
+        );
+        assert!(
+            stderr.contains("could not be read in full")
+                && stderr.contains(utf8(&root))
+                && stderr.contains("`outrig run` still refuses it"),
+            "the warning must name what was taken and that the fault remains:\n{stderr}",
+        );
+    }
+
+    // The same file still stops the commands that read the whole of it.
+    let global = global_config(
+        tmp.path(),
+        &format!("session-root = {:?}\n[models.half-written\n", utf8(&root)),
+    );
+    let (ok, stderr) = run_outrig_with_env(
+        tmp.path(),
+        &[
+            "--global-config",
+            utf8(&global),
+            "run",
+            "--image",
+            ABSENT_IMAGE,
+        ],
+        &env,
+    )
+    .await;
+    assert!(!ok, "run must still refuse the broken file:\n{stderr}");
+    assert!(stderr.contains("unclosed table"), "{stderr}");
+}
+
+/// The degradation stops where guessing would start. A broken file that never
+/// mentions `session-root` cannot be declaring one, so the default stands and
+/// the command runs; one that mentions it without yielding a path the file
+/// really names might be declaring the root the parse error swallowed, so the
+/// command stops instead of acting on a root the operator did not choose --
+/// which for `clean` means sweeping a directory with no records in it, where
+/// every labeled container reads as a stray.
+///
+/// The four bodies are the shapes where recovery's reading and the operator's
+/// intent come apart: the value is where the file broke, the key is spelled
+/// with an escape so its raw bytes do not give it away, a damaged escape
+/// inside the value is repaired into a path nobody has, and the root is
+/// declared twice, where even an undamaged file would be refused.
+#[tokio::test]
+async fn a_root_that_cannot_be_read_is_refused_rather_than_guessed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let env = [("XDG_DATA_HOME", data.as_path())];
+
+    let sid = record(&data.join("outrig/sessions"), "20261003T100000-aaaa");
+    let absent = global_config(tmp.path(), "default-model = [\n");
+    let out = run_outrig_output(tmp.path(), &["--global-config", utf8(&absent), "ls"], &env).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no session-root could be read from it"),
+        "the warning must say the default is in use:\n{stderr}",
+    );
+    assert!(
+        stdout.contains(sid.as_str()),
+        "ls listed the XDG default root:\n{stdout}",
+    );
+
+    // The root the operator chose, holding the record `clean` would be
+    // sweeping away from were it to fall back to the default.
+    let chosen = tmp.path().join("chosen");
+    let kept = record(&chosen, "20261003T100001-bbbb");
+    let kept_json = chosen.join(kept.as_str()).join("session.json");
+
+    for body in [
+        "session-root = [\n".to_string(),
+        "\"session-\\u0072oot\" = [\n".to_string(),
+        "session-root = \"/srv/\\uZZZZsessions\"\n[broken\n".to_string(),
+        format!(
+            "session-root = {0:?}\nsession-root = {0:?}\n",
+            utf8(&chosen)
+        ),
+    ] {
+        let swallowed = global_config(tmp.path(), &body);
+        for cmd in [&["ls"][..], &["clean", "-y", "--older-than", "1s"]] {
+            let args = [&["--global-config", utf8(&swallowed)][..], cmd].concat();
+            let out = run_outrig_output(tmp.path(), &args, &env).await;
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "{cmd:?} on {body:?} must fail:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("TOML parse error"),
+                "{cmd:?} on {body:?} must report the parse error:\n{stderr}",
+            );
+        }
+    }
+    assert!(
+        kept_json.is_file(),
+        "no sweep ran in the root the file names",
+    );
+}

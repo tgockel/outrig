@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ls`, `logs`, `discard`, and `clean` survive a global config that does not load.** These
+  four need exactly one key from it, `session-root`, and read no repo config at all -- but a
+  TOML syntax error anywhere in that one machine-wide file, or a value the loader refuses rather
+  than sets aside, failed the command over something sessions do not depend on, so a global
+  config mid-edit cost the user every session command. They now fall back to reading that key
+  alone, warn on stderr that only it was taken and that `outrig run` still refuses the file, and
+  carry on. The fallback never invents a root: it takes only a `session-root` the damaged file
+  states outright -- one plain string, declared once, with nothing the parser had to repair --
+  and a file whose text cannot be declaring the key falls back to the default. Anything in
+  between fails the command as before, because a root that is not the operator's would have
+  `clean` sweep a directory holding no records, where every container outrig labeled reads as a
+  stray. `run`, `mcp`, and `build` are unchanged and still refuse the file. (#384)
 - **A subagent's model-layer stderr lines carry its label.** Everything a subagent's round
   printed *above* the model was labeled already, but the lines from beneath it were not: a
   retry, a move to the next candidate of an alias chain, and the report for a turn that

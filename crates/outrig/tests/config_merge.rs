@@ -3920,6 +3920,153 @@ model-cache-root = "/var/cache/outrig/models"
         );
     }
 
+    /// #384: the session commands need one key out of the global config, and a
+    /// file broken anywhere used to cost them all of it. The salvage reads
+    /// `session-root` out of a document that does not parse, resolved beside
+    /// the file exactly as `load_global` resolves it.
+    ///
+    /// All three breaks are below the key, which is where a break can be: TOML
+    /// puts every top-level key above the first table header, so the half-
+    /// written `[models.<name>]` block or bad `[network]` value an operator is
+    /// in the middle of is always *after* the `session-root` line.
+    #[test]
+    fn a_session_root_is_salvaged_from_a_file_that_does_not_parse() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // A table header that was never closed.
+            "session-root = \"sessions\"\n[models.half-written\n",
+            // A value left mid-edit.
+            "session-root = \"sessions\"\ndefault-model = [\n",
+            // Not a syntax error at all: a value `load_global` refuses rather
+            // than sets aside, because `[network]` is one of the strict tables
+            // where leaving a key out would loosen the sandbox.
+            "session-root = \"sessions\"\n[network]\nmode = \"nonsense\"\n",
+            // A key spelled with an escape is the same key, and this one is
+            // whole: the damage is a table below it.
+            "\"session-\\u0072oot\" = \"sessions\"\n[models.half-written\n",
+            // A duplicate that is not of this key decides nothing about it.
+            "session-root = \"sessions\"\n[a]\nx = 1\n[a]\ny = 2\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::load_global(&path).expect_err(body);
+            assert_eq!(
+                Config::salvage_global_session_root(&path).expect(body),
+                Some(dir.path().join("sessions")),
+                "{body}",
+            );
+        }
+    }
+
+    /// The refusal that keeps the salvage honest. A parse error can take the
+    /// declaration with it, and answering "no root" would send `clean` at the
+    /// default -- where it finds no records and reads every labeled container
+    /// as a stray. So a file that mentions the key without yielding a path is
+    /// an error, not a default.
+    #[test]
+    fn a_broken_file_that_might_declare_the_root_is_refused() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // The value is itself where the parse failed.
+            "session-root = [\n",
+            // The same, under a key spelled with an escape: the recovered
+            // document holds the canonical key, which is what decides, not
+            // whether the raw bytes spell it out.
+            "\"session-\\u0072oot\" = [\n",
+            // Declared with nothing after the `=`.
+            "session-root =\n[broken\n",
+            // Under a table header that was never closed, so what recovery
+            // hands back under the key is a table rather than a path -- and a
+            // key under a header is not the top-level one in any case.
+            "[a.b\nsession-root = \"sessions\"\n",
+            // An unclosed array above the key swallows the declaration into
+            // itself, so the document has no top-level `session-root` at all
+            // -- but the text does, and it may be exactly what was lost.
+            "default-model = [\nsession-root = \"sessions\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::salvage_global_session_root(&path).expect_err(body);
+        }
+    }
+
+    /// A value recovery had to *repair* is not a declaration. The parser
+    /// resolves a damaged string as best it can -- an invalid escape becomes a
+    /// replacement character, an unterminated one swallows the lines below it
+    /// -- and the path that comes out is one the file does not name and nobody
+    /// has. Each is refused rather than used, and none of them silently
+    /// becomes the default.
+    #[test]
+    fn a_repaired_root_value_is_refused_rather_than_used() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // `\uZZZZ` is not an escape; recovery keeps a replacement
+            // character where the escape was.
+            "session-root = \"/srv/\\uZZZZsessions\"\n[broken\n",
+            // Not an escape at all.
+            "session-root = \"/srv/\\q sessions\"\n[broken\n",
+            // An unterminated multi-line string takes the rest of the file
+            // into the value.
+            "session-root = \"\"\"/srv/sessions\ndefault-model = \"m\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            let err = Config::salvage_global_session_root(&path)
+                .expect_err(body)
+                .to_string();
+            assert!(err.contains("TOML parse error"), "{body}: {err}");
+        }
+    }
+
+    /// Two declarations of the key in a file that does not parse are refused,
+    /// not silently read as the first. A file that *does* parse is refused for
+    /// a duplicate key outright, and a damaged one gives no better ground to
+    /// pick between them: recovery keeps whichever came first, which is a
+    /// property of the parser, not a statement about what the operator meant.
+    #[test]
+    fn a_duplicated_root_declaration_is_refused() {
+        let dir = tempdir().unwrap();
+        for body in [
+            // Plainly twice -- and the second line is the only thing wrong
+            // with the file.
+            "session-root = \"/srv/one\"\nsession-root = \"/srv/two\"\n",
+            // The second spelled with an escape, so the raw bytes of the two
+            // declarations have nothing in common.
+            "session-root = \"/srv/one\"\n\"session-\\u0072oot\" = \"/srv/two\"\n",
+            // A dotted key cannot extend a string, and the file is again
+            // declaring the root twice over.
+            "session-root = \"/srv/one\"\nsession-root.sub = \"/srv/two\"\n",
+        ] {
+            let path = write_global_cfg(dir.path(), body);
+            Config::load_global(&path).expect_err(body);
+            Config::salvage_global_session_root(&path).expect_err(body);
+        }
+    }
+
+    /// A file that cannot be declaring the key -- its bytes do not contain it
+    /// -- is `None`, which is the default. This is the common broken file: the
+    /// operator was editing a provider or a model, and where sessions live was
+    /// never in question.
+    #[test]
+    fn a_broken_file_that_cannot_declare_the_root_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = write_global_cfg(dir.path(), "default-model = [\n");
+        Config::load_global(&path).expect_err("the file does not parse");
+        assert_eq!(
+            Config::salvage_global_session_root(&path).expect("no root to find"),
+            None,
+        );
+    }
+
+    /// A missing file is `None` rather than an error, as it is for
+    /// `load_global`: there is nothing to salvage and nothing wrong.
+    #[test]
+    fn salvaging_from_a_missing_file_is_the_default() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            Config::salvage_global_session_root(&dir.path().join("absent.toml"))
+                .expect("a missing file has no root"),
+            None,
+        );
+    }
+
     /// Missing is empty, as it is for `load`; anything else unreadable is an
     /// error naming the path.
     #[test]
@@ -5560,6 +5707,22 @@ model-cache-root = "~"
                 assert_eq!(cfg.session_root, Some(home.join("outrig-sessions")));
                 assert_eq!(cfg.model_cache_root.as_deref(), Some(home));
             }
+        });
+    }
+
+    /// The salvage expands `~` as `load_global` expands it, so the degraded
+    /// read of a damaged file keeps the promise that the root it hands back is
+    /// absolute, rather than leaving its callers a second rule to learn.
+    #[test]
+    fn a_salvaged_tilde_root_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let (_repo, _global, global_cfg) =
+                repo_and_global("session-root = \"~/outrig-sessions\"\n[models.broken\n");
+            Config::load_global(&global_cfg).expect_err("the file does not parse");
+            assert_eq!(
+                Config::salvage_global_session_root(&global_cfg).expect("the root is salvaged"),
+                Some(home.join("outrig-sessions")),
+            );
         });
     }
 

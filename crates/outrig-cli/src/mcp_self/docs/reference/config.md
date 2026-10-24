@@ -108,6 +108,15 @@ Since only the global config can set it, `outrig run` and the session commands (
 (on `outrig run`/`logs`/`discard`) instead points at one specific session directory. See
 [Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
 
+Because those four commands need `session-root` and nothing else in the file, a global config
+that fails to load does not stop them: outrig re-reads it for that one key, warns that nothing
+else it sets is in effect, and carries on. `run`, `mcp`, and `build` read the whole file and
+still refuse it. That degraded read takes only a root the damaged file states outright -- one
+plain string, declared once, nothing the parser had to repair. If the file might be declaring one
+and no such value can be read, the session commands stop too, rather than fall back to a root the
+operator did not choose. See the
+[CLI reference](https://tgockel.github.io/outrig/reference/cli.html).
+
 `model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
 `~/.cache/outrig/models/`), and a configured value resolves the way `session-root`'s does. It
 only matters for `style = "mistralrs"` models configured with `model-id` -- that's where the
