@@ -19,6 +19,7 @@
 //!   recognizes and one it does not, including the difference between
 //!   `completion_model` (what `build_agent` uses) and
 //!   `CompletionModel::with_model` (which would silently cap replies at 2048);
+//! * every request asks for prompt caching, which rig leaves off unless asked;
 //! * the shared retry client covers this provider too -- including that a
 //!   `Retry-After` sets the wait, that a spent budget ends the turn without
 //!   taking the session with it, and that a redirect loop, which no wait can
@@ -342,7 +343,11 @@ async fn native_tool_use_round_trip() {
     assert_eq!(body["max_tokens"], 4096);
     assert_eq!(
         body["system"],
-        json!([{ "type": "text", "text": PREAMBLE }]),
+        json!([{
+            "type": "text",
+            "text": PREAMBLE,
+            "cache_control": { "type": "ephemeral" },
+        }]),
         "the preamble travels in Anthropic's top-level `system`, not as a \
          message with role=system",
     );
@@ -404,6 +409,58 @@ async fn native_tool_use_round_trip() {
         result_block.to_string().contains("pong:ping"),
         "the tool's output should reach the model: {result_block:#?}",
     );
+}
+
+/// Every request asks Anthropic to cache, or no call is ever read back (#669).
+///
+/// Three markers, of the four a request may carry: the top level's, which
+/// Anthropic moves to the end of the request, and one each on the last tool and
+/// the last system block. Both requests of a tool round trip are held to it,
+/// since the second is the one that has something to read back.
+#[tokio::test]
+async fn every_request_asks_for_prompt_caching() {
+    let (addr, mut requests) = start_mock_http(vec![echo_tool_use(), text_reply("done")]).await;
+
+    run_one_turn(
+        addr,
+        "OUTRIG_TEST_ANTHROPIC_PROMPT_CACHING",
+        MODEL,
+        Some(4096),
+        vec![EchoTool::default()],
+    )
+    .await
+    .expect("turn completes");
+
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 2, "one call per model turn: {recorded:#?}");
+
+    let ephemeral = json!({ "type": "ephemeral" });
+    for (n, request) in recorded.iter().enumerate() {
+        let body = &request.body;
+        assert_eq!(
+            body["cache_control"], ephemeral,
+            "request {n} carries the marker Anthropic moves to its end: {body:#?}",
+        );
+        let system = body["system"].as_array().expect("system blocks");
+        assert_eq!(
+            system.last().expect("a system block")["cache_control"],
+            ephemeral,
+            "request {n}: the system prompt ends a cached prefix: {system:#?}",
+        );
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.last().expect("a tool")["cache_control"],
+            ephemeral,
+            "request {n}: the tool definition ends a cached prefix: {tools:#?}",
+        );
+        // Those three are all of them: rig leaves the messages to the top-level
+        // marker, and none names a TTL, so the default five minutes applies.
+        assert_eq!(
+            body.to_string().matches("\"cache_control\"").count(),
+            3,
+            "request {n}: no marker beyond those three: {body:#?}",
+        );
+    }
 }
 
 /// A tool result goes back as the tool returned it, even when it is JSON that

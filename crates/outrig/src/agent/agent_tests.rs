@@ -3120,6 +3120,30 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
     }
 }
 
+// ---------------------------------------------------------------------------- caching
+
+/// A call asks Anthropic for no caching yet (#669). Once a round's view is full
+/// its front changes on every call, so a marker at the end of the request would
+/// pay the 1.25x write each time and never read it back. This pins the deferral
+/// `anthropic_model` records; when the view only grows between cuts (#666), it
+/// becomes the assertion that the markers are there.
+#[tokio::test]
+async fn an_anthropic_call_does_not_ask_for_prompt_caching_yet() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_NO_PROMPT_CACHING",
+        MODEL,
+        "",
+        vec![text_reply("done")],
+    )
+    .await;
+    round(&mut agent, "hi").await;
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 1, "one call: {recorded:#?}");
+    let body = &recorded[0].body;
+    assert!(!body.to_string().contains("cache_control"), "{body:#}");
+}
+
 // ---------------------------------------------------------------------------- resolution
 
 /// Two providers, each keyed by `{vars}_FIRST` and `{vars}_SECOND`, and an

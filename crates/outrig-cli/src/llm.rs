@@ -1043,7 +1043,17 @@ fn anthropic_model(
     // off. `with_model` would have already capped every reply at 2048 tokens,
     // silently and without outrig ever seeing that it happened.
     // `tests/anthropic_mock.rs` pins the difference.
-    let mut model = client.completion_model(&candidate.model_identifier);
+    //
+    // Rig sends no `cache_control` unless asked, so without these two calls every
+    // request pays full price for the whole history. Automatic caching marks the
+    // end of the request, where Anthropic moves the breakpoint as the history
+    // grows; prompt caching marks the last tool and the last system block, the
+    // part every call shares. Three of the four breakpoints a request may carry,
+    // at the default five-minute TTL. `tests/anthropic_mock.rs` pins them.
+    let mut model = client
+        .completion_model(&candidate.model_identifier)
+        .with_automatic_caching()
+        .with_prompt_caching();
     // Precedence, highest first: the agent's or model's `max-tokens` (already
     // merged into the candidate by `resolve_candidate`), then rig's published
     // ceiling for an identifier it recognizes, then ours. Anthropic rejects a

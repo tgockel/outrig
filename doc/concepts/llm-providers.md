@@ -404,6 +404,22 @@ know your model. It errs high deliberately, because a model whose real limit is 
 rejects the request and names that limit, whereas a ceiling set too low truncates replies
 mid-sentence with nothing logged.
 
+`outrig run` asks Anthropic to cache the prompt on every request. One marker at the top level of
+the request moves to its end, so a call reads back what the call before it wrote and pays full
+price for only its newest turn. Two more, on the last tool definition and the last block of the
+system prompt, keep the part every call shares cached whatever happens to the conversation after
+it. The cache lasts five minutes from its last use, so a pause longer than that starts the next
+call cold. A write costs 1.25 times plain input, and a read a tenth of it or less. A prompt
+shorter than the model's minimum, between 512 and 4,096 tokens depending on the model, is sent
+uncached, and Anthropic reports no error. `model.attempt` records what a request read and wrote as
+`cached_input_tokens` and `cache_creation_input_tokens`; see
+[Integration audit](../reference/events.md#integration-audit). No setting turns it off, so an
+endpoint at `base-url` that refuses a top-level `cache_control` answers `400` to every call.
+
+`run-new` and the library loop do not ask yet. Once a round's history is full, they choose it
+again on every call and its front keeps changing, so a marker at the end of the request would
+pay the write each time and never read it back.
+
 Everything else is shared with the other remote styles: `request-timeout-secs`,
 `retry-budget-secs`, `role-alternation`, tool-call limits, tool-result truncation, conversation
 history, and subagents all behave identically. Turns are non-streaming, as for `openai`.
@@ -492,7 +508,8 @@ stay up.
 
 > **TODO: Incomplete** -- v0 wires `"openai"` and `"anthropic"`. The other styles Rig ships
 > adapters for (Cohere, Gemini, and friends) are not exposed yet, and neither are the
-> Anthropic-specific extras -- prompt caching, citations, and configurable API versions.
+> Anthropic-specific extras -- citations, configurable API versions, and prompt caching in
+> `run-new` and the library loop.
 
 ## Tool calling
 

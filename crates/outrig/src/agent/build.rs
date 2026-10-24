@@ -274,6 +274,13 @@ pub(crate) fn anthropic_model(
     // leaves the default unset, which is the signal the fallback below keys
     // off. `with_model` would have already capped every reply at 2048 tokens,
     // silently.
+    //
+    // No prompt caching yet (#669), unlike `outrig run`'s. Once a round's view
+    // is full it is chosen again on every call and its front keeps changing, so
+    // a cache marker at the end of the request would pay the 1.25x write on each
+    // call and never read it back. It waits for a view that only grows between
+    // cuts (#666). Rig's `with_prompt_caching` also marks the last message, so
+    // marking only the system prompt and tools is not a flag it offers.
     let mut model = client.completion_model(&candidate.model_identifier);
     let max_tokens = match (candidate.max_tokens, model.default_max_tokens) {
         // The published ceiling is a cap as well as a default. A configured

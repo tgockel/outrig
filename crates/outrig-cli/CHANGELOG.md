@@ -165,6 +165,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside the record, which 0.2.2 kept. A session started before 0.2.2 in a directory that already
   held other files loses them with it.
 
+- **`outrig run` asks for prompt caching on a model with `style = "anthropic"`.** Each request
+  carries a top-level `cache_control`, which Anthropic moves to the end of the request, and a
+  marker on the last tool definition and on the last system block, so a call reads back what the
+  one before it wrote instead of paying full price for the whole history. All three use the
+  default five-minute TTL. A prompt shorter than the model's minimum is sent uncached, and a read
+  shows as `cached_input_tokens` on `model.attempt`. No setting turns it off, so an endpoint
+  behind `base-url` that refuses a top-level `cache_control` answers `400` to every call.
+  `run-new` and the library loop do not ask yet: they wait for a history that only grows between
+  cuts. (#669)
+
 ### Removed
 
 - **The in-process LLM backend: the `local-llm` Cargo feature and `style = "mistralrs"`**,
