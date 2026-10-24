@@ -287,8 +287,9 @@ only the model's text. Subagent activity shows up two other ways:
   itself carry the label too -- a retry, a move to the next candidate of an alias chain, a turn
   that produced no text -- so a fan-out's waits and failures are attributable to the round that
   is having them. The primary agent's own lines are unlabeled.
-- In a transcript holding that subagent's prompts, replies, and published outcomes. A subagent the
-  primary launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
+- In a transcript holding that subagent's prompts, any steer delivered mid-round, replies,
+  and published outcomes. A subagent the primary launched writes
+  `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
   logs. One launched by a subagent writes into a directory named for its parent, beside the
   parent's own transcript: `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`,
   and `scan`'s own go in `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under

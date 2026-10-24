@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between fails the command as before, because a root that is not the operator's would have
   `clean` sweep a directory holding no records, where every container outrig labeled reads as a
   stray. `run`, `mcp`, and `build` are unchanged and still refuse the file. (#384)
+- **A mid-round steer now reaches the subagent transcript.** `outrig__subagent_send` to a
+  running subagent rides to the model on its next tool result, and the round's history keeps
+  it there -- but nothing wrote it to `subagent-<name>.log` on its own, so reading the
+  transcript afterwards showed the round act on a message no line named: it would answer, call
+  a different tool, or abandon its task mid-stream with no visible cause. Each steer the round
+  actually delivered is now recorded as its own `--- steer ---` block, in delivery order,
+  right before the round's reply -- one a failed turn took the delivery back on is not recorded
+  as read, the same way it is not delivered. (#386)
 - **A subagent's model-layer stderr lines carry its label.** Everything a subagent's round
   printed *above* the model was labeled already, but the lines from beneath it were not: a
   retry, a move to the next candidate of an alias chain, and the report for a turn that

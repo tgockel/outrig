@@ -1038,6 +1038,16 @@ async fn run_rounds(
             Err(e) => (String::new(), Some(e.to_string())),
         };
 
+        // Read before `close_injections` drains it (#386): a steer counts
+        // as delivered only once a turn's history keeps the result it rode
+        // on, so this is what the model actually saw this round, in the
+        // order it saw it -- `undeliver_injections` already took back any a
+        // failed turn lost. Recorded ahead of the reply, which is what the
+        // model said *after* reading them.
+        for steer in shared.delivered_injections() {
+            log.record_steer(&steer);
+        }
+
         // Closed before anything below awaits, so a prompt sent from here on
         // queues as a round of its own instead of joining one that is over.
         // A failed round starts nothing on its own: the parent reads the
@@ -2799,6 +2809,62 @@ mod tests {
         call.assert_tool_calls_answered();
         assert_eq!(call.mentions(STEER), 1, "the steer is in history once");
         call.reply("summary");
+    }
+
+    /// #386: a steer delivered mid-round is in the transcript, not just in
+    /// what the model was sent -- the bug was that `run_rounds` folded a
+    /// steer into history or into the failure note but never wrote it to the
+    /// log on its own, so reading `subagent-probe.log` afterwards showed the
+    /// round answer a message no line named.
+    #[tokio::test]
+    async fn a_delivered_steer_reaches_the_transcript() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.call_tools(&[("counted", "{}")]);
+        provider.next_call().await.reply("ok");
+
+        probe_went_idle(&registry).await;
+        let transcript = probe_transcript(&log_dir).await;
+        assert!(
+            transcript.contains(&format!("\n--- steer ---\n{STEER}\n")),
+            "the steer is recorded: {transcript}"
+        );
+    }
+
+    /// Two steers accepted before the same tool-call batch's last result go
+    /// out together and both land in the transcript, in the order they were
+    /// sent -- one `--- steer ---` block each, not one block holding both.
+    #[tokio::test]
+    async fn multiple_delivered_steers_each_get_their_own_transcript_block() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let call = provider.next_call().await;
+        steer(&registry);
+        assert_eq!(
+            registry.send("probe", FOLLOW_UP.to_string()),
+            Ok("injected into the round in flight")
+        );
+        call.call_tools(&[("counted", "{}")]);
+        provider.next_call().await.reply("ok");
+
+        probe_went_idle(&registry).await;
+        let transcript = probe_transcript(&log_dir).await;
+        let steer_at = transcript
+            .find(&format!("\n--- steer ---\n{STEER}\n"))
+            .expect("the first steer is recorded");
+        let follow_up_at = transcript
+            .find(&format!("\n--- steer ---\n{FOLLOW_UP}\n"))
+            .expect("the second steer is recorded");
+        assert!(
+            steer_at < follow_up_at,
+            "the steers are recorded in delivery order: {transcript}"
+        );
     }
 
     /// The tool-call cap ends a round at its next model call without making

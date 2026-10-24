@@ -451,6 +451,18 @@ impl SubagentShared {
         (prompts.steers[span.clone()].to_vec(), span)
     }
 
+    /// The steers this round has delivered and kept, in the order they were
+    /// accepted. Unlike [`Self::close_injections`], this does not drain: a
+    /// caller reads it first, while delivered and undelivered are still
+    /// told apart, for #386's transcript record of what actually reached
+    /// the model. A batch the turn did not keep reverts its delivery
+    /// through [`Self::undeliver_injections`], so this omits it -- what is
+    /// left is only what survived to the round's end.
+    pub fn delivered_injections(&self) -> Vec<String> {
+        let prompts = self.lock_prompts();
+        prompts.steers[..prompts.delivered].to_vec()
+    }
+
     /// Count the steers in `span` as never sent: the history lost the tool
     /// result that carried them.
     ///

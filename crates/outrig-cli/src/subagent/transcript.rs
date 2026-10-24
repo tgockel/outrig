@@ -113,6 +113,17 @@ impl Transcript {
         self.write(&format!("\n--- reply ---\n{reply}\n"));
     }
 
+    /// A steer the parent's `outrig__subagent_send` put in front of the model
+    /// mid-round (#386). One line per steer that actually reached it --
+    /// `run_rounds` reads [`super::state::SubagentShared::delivered_injections`]
+    /// for the list, so a steer a failed turn took the delivery back on is not
+    /// recorded here as read, even though the round folds it into history
+    /// afterwards (`record_outcome` and the next round's prompt cover that
+    /// case, same as any other message in the history).
+    pub fn record_steer(&mut self, text: &str) {
+        self.write(&format!("\n--- steer ---\n{text}\n"));
+    }
+
     pub fn record_outcome(&mut self, kind: &str, body: &str) {
         self.write(&format!("\n--- {kind} ---\n{body}\n"));
     }
