@@ -22,7 +22,7 @@ use crate::builtin_tool::{fail, name_of, parse_args};
 use crate::mcp_self::args::{
     GET_CONFIG_SCHEMA, GET_DOC, GetDocArgs, LIST_BASE_IMAGES, LIST_DOCS,
     LIST_MCP_SERVER_SUGGESTIONS, VALIDATE_CONFIG, VALIDATE_DOCKERFILE, VALIDATE_IMAGE_TOML,
-    ValidateConfigArgs, ValidateDockerfileArgs,
+    ValidateConfigArgs, ValidateDockerfileArgs, ValidateImageTomlArgs,
 };
 use crate::mcp_self::{docs, schema, suggestions, validate};
 use crate::session_tool::SessionTool;
@@ -110,8 +110,11 @@ impl Kind {
             Self::ValidateConfig => {
                 "Parse and validate a config.toml fragment containing \
                  [images.<name>] entries, returning parse and validation errors, \
-                 and a warning for each key outrig would ignore. Run it on any \
-                 config you write before telling the user it is ready."
+                 and a warning for each key outrig would ignore. Checked as a \
+                 repo config (.agents/outrig/config.toml), which may not carry \
+                 the machine-level keys; pass scope = \"global\" for a fragment \
+                 bound for ~/.outrig/config.toml. Run it on any config you write \
+                 before telling the user it is ready."
             }
             Self::ValidateImageToml => {
                 "Parse and validate the complete contents of a standalone \
@@ -145,7 +148,28 @@ impl Kind {
                 "required": ["dockerfile"],
                 "additionalProperties": false
             }),
-            Self::ValidateConfig | Self::ValidateImageToml => json!({
+            Self::ValidateConfig => json!({
+                "type": "object",
+                "properties": {
+                    "toml": {
+                        "type": "string",
+                        "description": "Full text of the TOML to parse and validate."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["repo", "global"],
+                        "description": "Which config file the fragment is for. \
+                                        Defaults to \"repo\" \
+                                        (.agents/outrig/config.toml), which may not set \
+                                        session-root, model-cache-root, the [network] \
+                                        policy keys, [repo].env-allow, or a provider \
+                                        carrying an api-key."
+                    }
+                },
+                "required": ["toml"],
+                "additionalProperties": false
+            }),
+            Self::ValidateImageToml => json!({
                 "type": "object",
                 "properties": {
                     "toml": {
@@ -210,10 +234,10 @@ impl ToolDyn for SelfTool {
                 }
                 Kind::ValidateConfig => {
                     let args: ValidateConfigArgs = parse_args(&args)?;
-                    encode(&validate::validate_config(&args.toml))
+                    encode(&validate::validate_config(&args.toml, args.scope))
                 }
                 Kind::ValidateImageToml => {
-                    let args: ValidateConfigArgs = parse_args(&args)?;
+                    let args: ValidateImageTomlArgs = parse_args(&args)?;
                     encode(&validate::validate_image_toml(&args.toml))
                 }
             }
@@ -350,6 +374,99 @@ mod tests {
             "{out}"
         );
         assert_eq!(parsed["warnings"][0]["line"], json!(3), "{out}");
+    }
+
+    /// The default scope is the repo config, so a fragment carrying a key
+    /// only the operator's own file may set is refused here rather than at
+    /// `outrig run`, after the user installed what this tool approved.
+    #[tokio::test]
+    async fn validate_config_defaults_to_the_repo_rules() {
+        let toml = "[network]\nmode = \"filter\"\nallow = [\"github.com:443\"]\n";
+        let out = tool(Kind::ValidateConfig)
+            .call(json!({ "toml": toml }).to_string())
+            .await
+            .expect("validation runs");
+        let parsed: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(parsed["valid"], json!(false), "{out}");
+        assert_eq!(
+            parsed["errors"][0]["code"],
+            json!("repo_config_invalid"),
+            "{out}"
+        );
+
+        let out = tool(Kind::ValidateConfig)
+            .call(json!({ "toml": toml, "scope": "global" }).to_string())
+            .await
+            .expect("validation runs");
+        let parsed: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(parsed["valid"], json!(true), "{out}");
+    }
+
+    /// `validate_image_toml` has no scope to pick, and advertising one would
+    /// invite an agent to send an argument its decoder refuses.
+    #[tokio::test]
+    async fn validate_image_toml_takes_no_scope() {
+        let toml = "[image]\nref = \"x\"\n\n[mcp]\nfs = [\"mcp-server-filesystem\"]\n";
+        tool(Kind::ValidateImageToml)
+            .call(json!({ "toml": toml }).to_string())
+            .await
+            .expect("validation runs");
+        assert!(
+            tool(Kind::ValidateImageToml)
+                .call(json!({ "toml": toml, "scope": "repo" }).to_string())
+                .await
+                .is_err(),
+            "a scope it would ignore must not decode"
+        );
+        assert!(
+            tool(Kind::ValidateImageToml).parameters()["properties"]
+                .get("scope")
+                .is_none(),
+            "nor be advertised"
+        );
+    }
+
+    /// These schemas are hand-written where `outrig mcp self` derives its own
+    /// from the same arg structs, so the two front-ends can drift in what
+    /// they advertise even while sharing a decoder -- which is exactly what a
+    /// model reads to decide how to call a tool. Argument names and which are
+    /// required are the part that has to agree; the prose does not.
+    #[test]
+    fn advertised_arguments_match_what_outrig_mcp_self_derives() {
+        let derived = crate::mcp_self::server::SelfServer::tools();
+        for kind in Kind::ALL {
+            let served = derived
+                .iter()
+                .find(|t| t.name == kind.tool())
+                .unwrap_or_else(|| panic!("{} is served", kind.tool()));
+            let served = Value::Object((*served.input_schema).clone());
+            let builtin = kind.parameters();
+
+            let names = |schema: &Value| {
+                let mut keys: Vec<String> = schema["properties"]
+                    .as_object()
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                keys.sort_unstable();
+                keys
+            };
+            let required = |schema: &Value| {
+                let mut keys: Vec<String> = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                keys.sort_unstable();
+                keys
+            };
+            assert_eq!(names(&builtin), names(&served), "{}", kind.tool());
+            assert_eq!(required(&builtin), required(&served), "{}", kind.tool());
+        }
     }
 
     #[tokio::test]

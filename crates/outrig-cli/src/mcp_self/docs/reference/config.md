@@ -1633,9 +1633,10 @@ refused, after the warning that says why. Some things are never set aside:
 - a table header with an unquoted `.` in a name, such as `[models.opus-4.7]`, which is refused
   with a hint to quote it: `[models."opus-4.7"]`.
 
-`outrig mcp self`'s `validate_config` tool returns the same warnings beside its errors. An
-`org.outrig.mcp` image label and an `image.toml`, which no config load reads, still refuse an
-unknown key.
+`outrig mcp self`'s `validate_config` tool returns the same warnings beside its errors. It
+checks a fragment as a repo config unless it is passed `scope = "global"`, so the global-only
+keys below are refused in the file that may not set them. An `org.outrig.mcp` image label and an
+`image.toml`, which no config load reads, still refuse an unknown key.
 
 ## Validation rules
 

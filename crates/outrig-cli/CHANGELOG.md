@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`validate_config` holds a fragment to the rules of the file it is for.** The tool ran only
+  the checks a *merged* config is held to, which is the half that cannot tell which file
+  declared what -- so a repo fragment setting `session-root`, `model-cache-root`, a `[network]`
+  policy key, `[repo].env-allow`, or a provider carrying an `api-key` came back `valid: true`
+  even though `outrig run` refuses that file at load. An AI authoring a config over `outrig mcp
+  self` got the error only after the user had installed what the tool approved, and in the place
+  least able to explain it. The fragment is now checked as a repo config by default -- the file
+  this surface exists to help write, and where an `[images.<name>]` block goes -- and a
+  global-only key is refused with `code: "repo_config_invalid"`, the loader's own message naming
+  the key, and a note that `scope = "global"` is how to check it as the global config instead.
+  `scope` skips exactly those repo-only rules and nothing else, so an image block, which is
+  valid in either file, validates the same whichever way it is sent. `validate_image_toml`,
+  which takes a whole `image.toml` and has no scope to pick, no longer shares the argument type
+  and refuses a `scope` it would have ignored.
 - **A connection that fails while reading a `200` body no longer ends a turn as unrecovered.**
   `RetryingHttpClient` only retried a failure `send()` itself raised -- a reset mid-body or a
   request timeout while the body was still arriving surfaced instead from the lazy body rig

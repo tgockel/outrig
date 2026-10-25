@@ -87,6 +87,14 @@ The server exposes these tools:
 | `validate_config`             | Errors and unknown-key warnings for config image blocks.   |
 | `validate_image_toml`         | TOML validation for standalone image projects.             |
 
+`validate_config` checks a fragment as the repo config, `.agents/outrig/config.toml`, which is
+where an `[images.<name>]` block goes and what this surface is here to help write. That file may
+not carry the keys describing the operator's own machine -- `session-root`, `model-cache-root`,
+the `[network]` policy keys, `[repo].env-allow`, or a provider with an `api-key` -- so a fragment
+holding one is refused with an error naming it. Pass `scope = "global"` for a fragment bound for
+`~/.outrig/config.toml`, where those keys belong; everything else is checked the same either way.
+See [Config Reference](../reference/config.md) for which key lives where.
+
 The suggestion tools are not a registry. The AI can pick any base image, package set, or MCP
 server command that fits the job. In particular, OutRig supports shell MCP servers even when the
 suggestion list does not name a single maintained package recipe. The Dockerfile validator is

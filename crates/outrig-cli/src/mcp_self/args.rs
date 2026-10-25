@@ -37,4 +37,41 @@ pub(crate) struct ValidateDockerfileArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ValidateConfigArgs {
     pub(crate) toml: String,
+    /// Which config file this fragment is written for. Defaults to `repo`.
+    #[serde(default)]
+    pub(crate) scope: ConfigScope,
+}
+
+/// Which of outrig's two config files a fragment is written for.
+///
+/// The files share a schema but not their rules: the keys that describe the
+/// operator's own machine -- `session-root`, `model-cache-root`, the
+/// `[network]` policy keys, `[repo].env-allow`, and a provider carrying an
+/// `api-key` -- belong to the global config, and a repo config that sets one
+/// is refused at load.
+// Defaulting to `Repo` is the point of the argument. That is the file this
+// surface exists to help write -- `.agents/outrig/config.toml`, the one path
+// `get_config_schema` names -- and the two ways to be wrong are not
+// symmetric. A global fragment checked as a repo one is refused by an error
+// that names the key and this argument, which an agent can act on; a repo
+// fragment checked as a global one would be called valid and then refused by
+// `outrig run`, after the user installed it.
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ConfigScope {
+    /// The repo config, `.agents/outrig/config.toml`.
+    #[default]
+    Repo,
+    /// The global config, `~/.outrig/config.toml`.
+    Global,
+}
+
+/// `validate_image_toml` takes a whole `image.toml`, which is neither config
+/// file and has no scope to pick. It shared [`ValidateConfigArgs`] while the
+/// two shapes were identical; a `scope` it would have to ignore is what
+/// separates them.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ValidateImageTomlArgs {
+    pub(crate) toml: String,
 }

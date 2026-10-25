@@ -21,7 +21,7 @@ use crate::error::{OutrigError, Result};
 use crate::mcp_self::args::{
     EmptyArgs, GET_CONFIG_SCHEMA, GET_DOC, GetDocArgs, LIST_BASE_IMAGES, LIST_DOCS,
     LIST_MCP_SERVER_SUGGESTIONS, VALIDATE_CONFIG, VALIDATE_DOCKERFILE, VALIDATE_IMAGE_TOML,
-    ValidateConfigArgs, ValidateDockerfileArgs,
+    ValidateConfigArgs, ValidateDockerfileArgs, ValidateImageTomlArgs,
 };
 use crate::mcp_self::{docs, schema, suggestions, validate};
 
@@ -99,9 +99,10 @@ impl SelfServer {
                 VALIDATE_CONFIG,
                 "Validate Config",
                 "Parse and validate a TOML fragment containing [images.<name>] entries; \
-                 a key outrig would ignore comes back as a warning.",
+                 a key outrig would ignore comes back as a warning. Checked as a repo \
+                 config (.agents/outrig/config.toml) unless scope says global.",
             ),
-            tool::<ValidateConfigArgs>(
+            tool::<ValidateImageTomlArgs>(
                 VALIDATE_IMAGE_TOML,
                 "Validate Image TOML",
                 "Parse and validate complete standalone image.toml content.",
@@ -143,10 +144,10 @@ impl SelfServer {
                     Ok(args) => args,
                     Err(result) => return Ok(result),
                 };
-                json_result(validate::validate_config(&args.toml))
+                json_result(validate::validate_config(&args.toml, args.scope))
             }
             VALIDATE_IMAGE_TOML => {
-                let args: ValidateConfigArgs = match parse_args(request.arguments) {
+                let args: ValidateImageTomlArgs = match parse_args(request.arguments) {
                     Ok(args) => args,
                     Err(result) => return Ok(result),
                 };

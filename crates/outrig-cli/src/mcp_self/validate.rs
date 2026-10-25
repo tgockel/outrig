@@ -3,6 +3,8 @@ use serde::Serialize;
 use outrig::config::Config;
 use outrig::container::embedded::parse_standalone_image_toml;
 
+use crate::mcp_self::args::ConfigScope;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ValidationMessage {
     pub code: &'static str,
@@ -68,7 +70,21 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
     DockerfileValidation { warnings }
 }
 
-pub fn validate_config(toml: &str) -> ConfigValidation {
+/// Validate a config fragment as the file `scope` names.
+///
+/// Two checks, because a config load is two checks. `Config::validate` is the
+/// one that runs on the *merged* config and so cannot tell which file declared
+/// what; `Config::validate_as_repo` is the one `Config::load` applies to the
+/// repo file alone, and it refuses the keys that describe the operator's own
+/// machine -- `session-root`, `model-cache-root`, `[network]`'s policy keys,
+/// `[repo].env-allow`, and a provider carrying an `api-key`. Running only the
+/// first reported a repo fragment with `[network] allow = [...]` as valid and
+/// left `outrig run` to refuse it, which is the worst place to learn it: after
+/// the user has installed the file an agent said was good.
+///
+/// Repo-side first, as `Config::load` orders them, so a fragment that breaks
+/// both rules reports the error that would stop it first.
+pub fn validate_config(toml: &str, scope: ConfigScope) -> ConfigValidation {
     let (warnings, result) = match Config::load_from_str(toml) {
         // `load_from_str` sets aside nothing but unknown keys.
         Ok(cfg) => (
@@ -80,9 +96,22 @@ pub fn validate_config(toml: &str) -> ConfigValidation {
                     line: Some(w.line()),
                 })
                 .collect(),
-            cfg.validate(None),
+            repo_scope_result(&cfg, scope).and_then(|()| {
+                cfg.validate(None).map_err(|err| ValidationMessage {
+                    code: "config_invalid",
+                    message: err.to_string(),
+                    line: None,
+                })
+            }),
         ),
-        Err(err) => (Vec::new(), Err(err)),
+        Err(err) => (
+            Vec::new(),
+            Err(ValidationMessage {
+                code: "config_invalid",
+                message: err.to_string(),
+                line: None,
+            }),
+        ),
     };
     match result {
         Ok(()) => ConfigValidation {
@@ -90,16 +119,33 @@ pub fn validate_config(toml: &str) -> ConfigValidation {
             errors: Vec::new(),
             warnings,
         },
-        Err(err) => ConfigValidation {
+        Err(error) => ConfigValidation {
             valid: false,
-            errors: vec![ValidationMessage {
-                code: "config_invalid",
-                message: err.to_string(),
-                line: None,
-            }],
+            errors: vec![error],
             warnings,
         },
     }
+}
+
+/// The repo-only rules, skipped for a fragment written for the global config
+/// -- which is where every key they refuse belongs, so holding a global
+/// fragment to them would refuse exactly the file that is allowed to say it.
+///
+/// The error carries its own code, so a caller that asked for the default
+/// scope can tell "this is not a valid config" from "this is not valid *in a
+/// repo config*", and the message says which argument moves it.
+fn repo_scope_result(cfg: &Config, scope: ConfigScope) -> Result<(), ValidationMessage> {
+    if scope == ConfigScope::Global {
+        return Ok(());
+    }
+    cfg.validate_as_repo().map_err(|err| ValidationMessage {
+        code: "repo_config_invalid",
+        message: format!(
+            "{err}; pass scope = \"global\" to check this fragment against the \
+             global config's rules instead"
+        ),
+        line: None,
+    })
 }
 
 pub fn validate_image_toml(toml: &str) -> ConfigValidation {
@@ -222,6 +268,7 @@ context = "."
 [images.c.mcp]
 "bad.name" = ["mcp"]
 "#,
+            ConfigScope::Repo,
         );
         assert!(!out.valid);
         assert!(out.errors[0].message.contains("invalid mcp server name"));
@@ -237,6 +284,7 @@ context = "."
 image-name = "docker.io/library/debian:stable"
 contex     = "."
 "#,
+            ConfigScope::Repo,
         );
         assert!(out.valid, "an unknown key alone is not invalid: {out:?}");
         assert_eq!(
@@ -259,12 +307,97 @@ contex     = "."
 host-pth       = "/a"
 container-path = "/a"
 "#,
+            ConfigScope::Repo,
         );
         assert!(!out.valid, "{out:?}");
         assert!(
             out.errors[0].message.contains("unknown field `host-pth`"),
             "{out:?}"
         );
+    }
+
+    /// The regression: a repo fragment carrying the operator's own keys was
+    /// reported valid, because only the merged-config rules were run. `outrig
+    /// run` then refused the file the agent had just told the user to install.
+    #[test]
+    fn config_validator_refuses_a_repo_fragment_that_sets_network_policy() {
+        let out = validate_config(
+            r#"
+[network]
+mode  = "filter"
+allow = ["github.com:443"]
+"#,
+            ConfigScope::Repo,
+        );
+        assert!(!out.valid, "{out:?}");
+        assert_eq!(out.errors[0].code, "repo_config_invalid", "{out:?}");
+        assert!(
+            out.errors[0].message.contains("[network].allow"),
+            "the error should name the key: {out:?}"
+        );
+        assert!(
+            out.errors[0].message.contains("scope"),
+            "and say which argument moves the fragment: {out:?}"
+        );
+    }
+
+    /// Each of the repo-only rules, so a fifth one added to
+    /// `validate_as_repo` is reachable here by construction rather than by
+    /// having been remembered.
+    #[test]
+    fn config_validator_refuses_every_repo_only_key() {
+        for fragment in [
+            "session-root = \"/srv/outrig\"\n",
+            "model-cache-root = \"/srv/models\"\n",
+            "[network]\ndefault = \"deny\"\n",
+            "[repo]\nenv-allow = []\n",
+            "[providers.p]\nstyle = \"openai\"\n\
+             base-url = \"https://api.openai.com/v1\"\n\
+             api-key = \"${OPENAI_API_KEY}\"\n",
+        ] {
+            let out = validate_config(fragment, ConfigScope::Repo);
+            assert!(!out.valid, "{fragment:?} should be repo-invalid: {out:?}");
+            assert_eq!(out.errors[0].code, "repo_config_invalid", "{out:?}");
+
+            let global = validate_config(fragment, ConfigScope::Global);
+            assert!(
+                global.valid,
+                "{fragment:?} is exactly what the global config is for: {global:?}"
+            );
+        }
+    }
+
+    /// `scope = "global"` skips the repo-only rules and nothing else: the
+    /// cross-reference rules every config is held to still run.
+    #[test]
+    fn global_scope_still_runs_the_shared_rules() {
+        let out = validate_config(
+            r#"
+[models.m]
+provider   = "nope"
+identifier = "gpt-4o"
+"#,
+            ConfigScope::Global,
+        );
+        assert!(!out.valid, "{out:?}");
+        assert_eq!(out.errors[0].code, "config_invalid", "{out:?}");
+    }
+
+    /// An image block -- what this tool is mostly handed -- is valid in
+    /// either file, so the scope argument costs the common case nothing.
+    #[test]
+    fn an_image_block_is_valid_in_both_scopes() {
+        let fragment = r#"
+[images.c]
+image-name = "docker.io/library/debian:stable"
+
+[images.c.mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#;
+        for scope in [ConfigScope::Repo, ConfigScope::Global] {
+            let out = validate_config(fragment, scope);
+            assert!(out.valid, "{scope:?}: {out:?}");
+        }
     }
 
     #[test]
