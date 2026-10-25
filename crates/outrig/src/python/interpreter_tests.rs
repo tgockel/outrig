@@ -4863,6 +4863,55 @@ fn a_child_kernel_holds_its_inputs_and_no_user_channel() {
     );
 }
 
+/// Each kind of agent's `help(runtime)` is whole, and names the channels that agent has: the
+/// primary's user channel, a work child's `complete` and `progress`, a request child's channels.
+/// None sends the reader to a class name no kernel binds.
+#[test]
+fn help_on_a_runtime_names_the_channels_that_agent_has() {
+    let mut k = Interpreter::start();
+    k.spawn_as(1, "w = await runtime.spawn('w', prompt='p')", "c1");
+    k.spawn_as(
+        2,
+        "r = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c2",
+    );
+
+    let primary = k.output(3, "help(runtime)");
+    let work = k.output_in("c1", 4, "help(runtime)");
+    let request = k.output_in("c2", 5, "help(runtime)");
+    for (who, said) in [
+        ("primary", &primary),
+        ("work", &work),
+        ("request", &request),
+    ] {
+        // Whole: cut at nothing, and carrying the part every agent is told.
+        assert!(
+            !said.contains("[help cut at") && said.contains("runtime.context.promote(turn)"),
+            "{who}: {said}"
+        );
+        // Nothing sends the reader to a class, which no kernel binds under any name.
+        assert!(!said.contains("help(Runtime)"), "{who}: {said}");
+    }
+    assert!(
+        primary.contains("is how")
+            && primary.contains("the user reaches you and you reach them")
+            && !primary.contains("await runtime.complete(value)"),
+        "{primary}"
+    );
+    assert!(
+        work.contains("await runtime.complete(value)")
+            && work.contains("runtime.channels[\"progress\"]")
+            && !work.contains("the user reaches you and you reach them"),
+        "{work}"
+    );
+    assert!(
+        request.contains("await d.reply(value)")
+            && request.contains("no `runtime.complete`")
+            && !request.contains("runtime.channels[\"progress\"]"),
+        "{request}"
+    );
+}
+
 /// A request crosses to the child as a copy of its body; a reply that fails its check raises in
 /// the child with its path and counts an attempt; one that passes settles the handle with a copy;
 /// and a reply after that is refused, as the host is told at each step.

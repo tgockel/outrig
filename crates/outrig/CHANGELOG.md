@@ -726,6 +726,17 @@ each described below.
 
 ### Fixed
 
+- **`help(runtime)` in a child names only what that child has.** A work child's runtime carried a
+  two-line docstring deferring to `help(Runtime)`, and `Runtime` is bound in no kernel, so
+  following it raised `NameError`; the text deferred to described `runtime.channels["user"]`,
+  which no child has. Each kind of agent now has a runtime class with a docstring of its own, the
+  shared text around one paragraph that names that agent's channels: the primary's user channel,
+  a work child's `complete` and `progress`, and a request child's own channels, which says it has
+  no `complete`. Request children get `RequestRuntime`, where they used to share the primary's
+  `Runtime`. A runtime also takes `__slots__`, which keeps `__dict__` and `__weakref__` -- a
+  tenth of the 8 KiB `help` bound, and of no use to the agent -- off the page, so all three fit
+  whole as `0003-10` decided `help(runtime)` should. (#686)
+
 - **An image's `org.outrig.mcp` label may reference only the host variables the global config
   allows.** A `${VAR}` in the `env` of a server a label declares resolved any variable in the
   operator's environment, past the `[repo] env-allow` list that holds a repo config file to it.

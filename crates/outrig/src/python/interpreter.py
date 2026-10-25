@@ -3732,36 +3732,63 @@ class Endpoint:
 # What `return_when` may be: asyncio's own constants, which in CPython are strings.
 _RETURN_WHEN = (asyncio.FIRST_COMPLETED, asyncio.FIRST_EXCEPTION, asyncio.ALL_COMPLETED)
 
+# What a runtime says of the channels its agent has, and of how its work is answered: the one
+# part of the text that differs between agents, so each runtime class states its own.
+_USER_CHANNELS = """`runtime.channels` maps a name to the endpoint of a channel.
+`runtime.channels["user"]` is how the user reaches you and you reach them: see
+`help(type(runtime.channels["user"]))`."""
+_WORK_CHANNELS = """`await runtime.complete(value)` answers the submission your parent gave you,
+and is the only way to answer it: see `help(runtime.complete)`.
+
+`runtime.channels` maps a name to the endpoint of a channel, and yours is
+`runtime.channels["progress"]`, which says how far you have got. No user reaches you."""
+_REQUEST_CHANNELS = """`runtime.channels` maps a name to the endpoint of a channel, and yours are
+the request channels your parent declared: `d = await runtime.channels[name].receive()` takes
+the next request, which you answer with `await d.reply(value)`, or end with
+`await d.fail(message)`. You have no `runtime.complete`, and no user reaches you."""
+
+
+def _runtime_doc(channels):
+    """A runtime's docstring, `channels` being what that agent is told of its own channels.
+
+    Every runtime's docstring is whole. A kernel binds `runtime` and none of the classes behind
+    it, so one that deferred to another class would send the agent reading it to a name it cannot
+    reach -- and the text deferred to would describe channels the agent may not have.
+    """
+    return f"""What this agent reaches beyond its own names.
+
+{channels}
+
+`await runtime.wait(fs)` waits as `asyncio.wait` does and watches every channel while it
+waits: see `help(runtime.wait)`.
+
+`runtime.names()` lists what you have bound, with the type of each value.
+
+`runtime.history.turns` is your whole conversation, to read with ordinary Python at no cost in
+context: see `help(runtime.history)`. Not all of it is sent to the model on each call:
+`runtime.context.promote(turn)` sends a turn again until `runtime.context.demote(turn)`, and
+every call is held to the model's context window: see `help(runtime.context)`.
+
+`runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
+packages, and nothing compiled loads -- and where code that needs more can run.
+
+`runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
+each is; asking makes no request to any of them.
+
+`await runtime.spawn(name, prompt=...)` launches a child agent to give work to, and
+`await runtime.release([child])` ends it: see `help(runtime.spawn)`.
+
+Code in a module reaches the same runtime after `import outrig`, as `outrig.runtime`, and
+each binding as `outrig.bindings[name]`; `outrig.schema` declares types, decodes JSON into
+them strictly, and renders their JSON Schema."""
+
 
 class Runtime:
-    """What this agent reaches beyond its own names.
+    __doc__ = _runtime_doc(_USER_CHANNELS)
 
-    `runtime.channels` maps a name to the endpoint of a channel. `runtime.channels["user"]` is how
-    the user reaches you and you reach them: see `help(type(runtime.channels["user"]))`.
-
-    `await runtime.wait(fs)` waits as `asyncio.wait` does and watches every channel while it
-    waits: see `help(runtime.wait)`.
-
-    `runtime.names()` lists what you have bound, with the type of each value.
-
-    `runtime.history.turns` is your whole conversation, to read with ordinary Python at no cost in
-    context: see `help(runtime.history)`. Not all of it is sent to the model on each call:
-    `runtime.context.promote(turn)` sends a turn again until `runtime.context.demote(turn)`, and
-    every call is held to the model's context window: see `help(runtime.context)`.
-
-    `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
-    packages, and nothing compiled loads -- and where code that needs more can run.
-
-    `runtime.bindings` lists the objects the session hosts for you on the host, by name, with what
-    each is; asking makes no request to any of them.
-
-    `await runtime.spawn(name, prompt=...)` launches a child agent to give work to, and
-    `await runtime.release([child])` ends it: see `help(runtime.spawn)`.
-
-    Code in a module reaches the same runtime after `import outrig`, as `outrig.runtime`, and
-    each binding as `outrig.bindings[name]`; `outrig.schema` declares types, decodes JSON into
-    them strictly, and renders their JSON Schema.
-    """
+    # These and nothing else. The agent reads a runtime and never adds to one, and without this
+    # `help(runtime)` spends a tenth of its bound on `__dict__` and `__weakref__`.
+    __slots__ = ("_channels", "_held", "_history", "_context", "_kernel")
 
     MessageAvailable = MessageAvailable
 
@@ -4042,8 +4069,9 @@ class Runtime:
 
 
 class WorkRuntime(Runtime):
-    """A work child's runtime: `runtime`'s, and `complete`, how it answers the submission its
-    parent gave it. See `help(Runtime)` for the rest."""
+    __doc__ = _runtime_doc(_WORK_CHANNELS)
+
+    __slots__ = ()
 
     async def complete(self, value):
         """Complete the submission you were given with `value`, an instance of its result type --
@@ -4052,14 +4080,19 @@ class WorkRuntime(Runtime):
         It returns once the value is accepted, and the submission is then done. One that does not
         check raises what is wrong, each problem with its path, and counts one of the
         submission's attempts: correct it and complete again. Past the last attempt the
-        submission ends rejected. A submission that has ended -- completed already, cancelled --
-        takes no answer, and this raises.
+        submission ends rejected; one that has ended takes no answer, so this raises.
         """
         work = self._kernel.child.last
         if work is None:
             raise RuntimeError("no submission has been given to you yet, so there is nothing to "
                                "complete")
         await work.answer(value)
+
+
+class RequestRuntime(Runtime):
+    __doc__ = _runtime_doc(_REQUEST_CHANNELS)
+
+    __slots__ = ()
 
 
 # ---------------------------------------------------------------------------- child agents
@@ -4946,20 +4979,25 @@ class Kernel:
         self.globals = self.module.__dict__
         self.globals["__builtins__"] = builtins
         self.globals["asyncio"] = asyncio
+        # The channels this agent has, and the runtime class that describes them: each kind of
+        # agent is told of its own, so the three are told apart here and nowhere else.
         if child is None:
             # The user's channel carries text both ways, and the host is at the other end of it.
             # A child has none: what it is given comes from its parent.
             self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
+            runtime = Runtime
         elif child.kind == "request":
             self.channels = {
-                name: RequestEndpoint(agent, name, channel) for name, channel in child.channels.items()
+                name: RequestEndpoint(agent, name, channel)
+                for name, channel in child.channels.items()
             }
+            runtime = RequestRuntime
         else:
             self.channels = {"progress": _ProgressOut(agent, child)}
+            runtime = WorkRuntime
         self.history = History()
         # Also `outrig.runtime`, from any code an execution of this kernel runs, whatever the
         # global comes to hold.
-        runtime = WorkRuntime if child is not None and child.kind == "work" else Runtime
         self.runtime = self.globals["runtime"] = runtime(
             self.channels, self.held, self.history, Context(agent, self.history), self
         )
