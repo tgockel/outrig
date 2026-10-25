@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A connection that fails while reading a `200` body no longer ends a turn as unrecovered.**
+  `RetryingHttpClient` only retried a failure `send()` itself raised -- a reset mid-body or a
+  request timeout while the body was still arriving surfaced instead from the lazy body rig
+  polls afterwards, outside the retry loop entirely, as a single unretried `HttpError`. Because
+  that class is exactly the one the retry loop is supposed to exhaust before giving up, the
+  REPL reported "LLM endpoint failed and did not recover" for a failure that had, in fact,
+  never been retried at all. The loop now reads the body itself before handing it to rig, so a
+  failure partway through it is retried the same as any other transient one, on the same budget
+  and backoff. (#379)
 - **`ls`, `logs`, `discard`, and `clean` survive a global config that does not load.** These
   four need exactly one key from it, `session-root`, and read no repo config at all -- but a
   TOML syntax error anywhere in that one machine-wide file, or a value the loader refuses rather

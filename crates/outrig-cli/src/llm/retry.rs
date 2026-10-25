@@ -14,7 +14,9 @@
 //!
 //! [`RetryingHttpClient`] is a [`rig::http_client::HttpClientExt`] backed by a
 //! `reqwest::Client`. Every request it sends retries transient failures --
-//! request timeouts, connection errors, and the retry-friendly HTTP statuses
+//! request timeouts, connection errors, a `200` whose body fails partway
+//! through (a reset or a timeout mid-read, same as if it had hit the
+//! connection instead of the body), and the retry-friendly HTTP statuses
 //! (408/425/429/5xx) -- honoring a `Retry-After` header when the server sends
 //! one and falling back to jittered exponential backoff when it does not. The
 //! whole loop is bounded by a wall-clock budget rather than an attempt count,
@@ -608,7 +610,27 @@ where
             .await;
 
         let (err, retry_after) = match sent {
-            Ok(response) if response.status().is_success() => return into_lazy_response(response),
+            Ok(response) if response.status().is_success() => {
+                // The status line is back, so the endpoint has answered even
+                // if the body that follows never finishes (#379): a reset or a
+                // request timeout mid-read is exactly as transient as the same
+                // failure hitting `send()` instead, and the full budget is
+                // already the one in force once a response exists.
+                answered = true;
+                let status = response.status();
+                let headers = response.headers().clone();
+                // Read here, inside the loop, rather than handed back lazy:
+                // rig has not been given anything from this response yet, so a
+                // failure reading the body is still a failure this attempt can
+                // retry in full, not a one-shot a lazy future would only be
+                // able to report once, outside this loop's budget and
+                // backoff. The eventual `LazyBody` below is immediately ready
+                // -- these bytes are already in hand.
+                match response.bytes().await {
+                    Ok(bytes) => return ready_lazy_response(status, headers, bytes),
+                    Err(error) => (HttpError::Instance(Box::new(error)), None),
+                }
+            }
             Ok(response) => {
                 answered = true;
                 let status = response.status();
@@ -684,28 +706,28 @@ where
     }
 }
 
-/// Repackage a successful `reqwest::Response` as the `http::Response` rig
-/// expects, with the body left lazy. Mirrors rig's `HttpClientExt for
-/// reqwest::Client` -- keep in sync with rig-core 0.40
-/// `src/http_client/mod.rs:155-215`. rig exposes no public converter for this,
-/// so it is a copy by necessity rather than by choice.
-fn into_lazy_response<U>(
-    response: reqwest::Response,
+/// Repackage an already-read success body as the `http::Response` rig
+/// expects. The shape -- status, headers, a boxed future for the body -- is
+/// rig's own (`HttpClientExt for reqwest::Client`, keep in sync with rig-core
+/// 0.40 `src/http_client/mod.rs:155-215`); what differs is that there is
+/// nothing left to await. The body was read inside the retry loop so a
+/// failure partway through it could still be retried there (#379), so by the
+/// time this runs it is already bytes in hand -- the `LazyBody` future the
+/// trait signature still requires is `async` only in name, and resolves on
+/// its first poll.
+fn ready_lazy_response<U>(
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
 ) -> rig::http_client::Result<Response<LazyBody<U>>>
 where
     U: From<Bytes> + WasmCompatSend + 'static,
 {
-    let mut res = Response::builder().status(response.status());
+    let mut res = Response::builder().status(status);
     if let Some(hs) = res.headers_mut() {
-        *hs = response.headers().clone();
+        *hs = headers;
     }
-    let body: LazyBody<U> = Box::pin(async {
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| HttpError::Instance(e.into()))?;
-        Ok(U::from(bytes))
-    });
+    let body: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
     res.body(body).map_err(HttpError::Protocol)
 }
 
@@ -884,6 +906,14 @@ fn is_transient(err: &HttpError) -> bool {
 /// [`send_with_retry`], or a second layer that retried this class, would make
 /// this claim more than it knows. Note it stays true when the budget is `0`:
 /// nothing was retried, and there was nothing to retry with.
+///
+/// This used to be false for one case (#379): a `200` whose body failed
+/// partway through surfaced from the lazy body rig polls, outside
+/// [`send_with_retry`]'s loop entirely, as an `HttpError::Instance` that
+/// `is_transient` accepted on the strength of a single, unretried attempt.
+/// [`send_with_retry`] now reads that body itself and retries a failure in it
+/// the same as any other transient one, so every `HttpError` this predicate
+/// sees, body-read failures included, really did exhaust the budget.
 ///
 /// A failover chain is a third layer and does not disturb that, but the reason
 /// is a property of [`FailoverModel`] rather than of this predicate: a
@@ -1738,6 +1768,60 @@ mod tests {
             elapsed >= policy.budget - policy.max_delay,
             "the full budget must be spent, not {elapsed:?} of it",
         );
+    }
+
+    /// The bug this task fixes (#379): a `200` whose body never finishes
+    /// retries from inside the loop rather than surfacing to the REPL as an
+    /// unretried failure. The first connection answers success and then dies
+    /// mid-body; the second serves the whole thing.
+    #[tokio::test(start_paused = true)]
+    async fn a_200_whose_body_fails_partway_is_retried_from_inside_the_loop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a two-shot server");
+        let port = listener.local_addr().expect("loopback address").port();
+        tokio::spawn(async move {
+            // First connection: a `200` that promises ten bytes and delivers
+            // three before the socket closes -- a reset or a timeout mid-read
+            // looks the same to the client as this.
+            let (mut socket, _) = listener.accept().await.expect("first connection arrives");
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc")
+                .await
+                .expect("the truncated body is written");
+            socket.shutdown().await.expect("close before the body completes");
+            drop(socket);
+
+            // Second connection: the retry, served in full.
+            let (mut socket, _) = listener.accept().await.expect("second connection arrives");
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                .await
+                .expect("the whole body is written");
+            let _ = socket.shutdown().await;
+            drop(listener);
+        });
+
+        let result = send_with_retry::<Bytes>(
+            test_client(),
+            loop_policy(),
+            Method::POST,
+            format!("http://127.0.0.1:{port}/v1/chat/completions")
+                .parse()
+                .expect("a loopback URI parses"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+        .expect("the retried attempt serves a whole body");
+
+        let bytes = result.into_body().await.expect("the body is already in hand");
+        assert_eq!(&bytes[..], b"hello", "the retried attempt's body, not the truncated one");
     }
 
     /// A URL reqwest refuses to send fails the same way on every replay, so the
