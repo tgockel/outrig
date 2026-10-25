@@ -463,10 +463,7 @@ async fn serve_unix_http_transport(
     signals: &mut Signals,
 ) -> Result<i32> {
     prepare_unix_socket(path)?;
-    let listener = tokio::net::UnixListener::bind(path)?;
-    let _cleanup = UnixSocketCleanup {
-        path: path.to_path_buf(),
-    };
+    let (listener, _cleanup) = bind_unix_listener(path)?;
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
@@ -705,6 +702,22 @@ fn listen_exposure_warning(listen: &ListenAddr) -> Option<String> {
     }
 }
 
+/// Mode the listening socket is published with: owner-only, because the
+/// socket's filesystem permissions are the whole access boundary for a
+/// `unix:` listener -- everything that connects reaches the container's tool
+/// surface, and v1 has no authentication behind it.
+#[cfg(unix)]
+const UNIX_SOCKET_MODE: u32 = 0o600;
+
+/// Clear the listen path, refusing rather than displacing a listener that is
+/// still serving it.
+///
+/// `bind(2)` fails on an existing path, so a socket left by a process that
+/// died has to be removed before a new one can take the name. A socket a live
+/// process is still accepting on looks exactly the same on disk, and removing
+/// that one does not stop it: it keeps running, holding its container, reached
+/// by nothing, while this process answers under the name its clients hold.
+/// Only a connection tells the two apart.
 #[cfg(unix)]
 fn prepare_unix_socket(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
@@ -718,11 +731,8 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
         .into());
     }
 
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            std::fs::remove_file(path).path_ctx("remove", path)?;
-            Ok(())
-        }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => clear_stale_unix_socket(path),
         Ok(_) => Err(OutrigError::Configuration(format!(
             "unix listen path exists and is not a socket: {}",
             path.display()
@@ -731,6 +741,208 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).path_ctx("stat", path).map_err(Into::into),
     }
+}
+
+/// Remove a socket file nothing is listening on, and refuse every other
+/// answer.
+///
+/// The probe is a connection, which is what a client would have done anyway,
+/// and only one of its outcomes clears the path: `ECONNREFUSED`, the kernel's
+/// answer for a socket whose listener is gone. A connect that succeeds proves
+/// someone is accepting -- the peer sees a connection that opens and closes
+/// with no request on it, which its HTTP server drops.
+///
+/// Every other outcome leaves the question open and is refused, because the
+/// cost of guessing wrong is a running instance silently cut off from its
+/// clients, where the cost of refusing is a message. `EAGAIN` is the sharp
+/// one: a live listener whose backlog is full answers with it, so it means
+/// *more* likely to be serving, not less. The path going missing between the
+/// stat and the probe is the one benign case -- there is nothing left to
+/// remove.
+///
+/// The socket is deliberately nonblocking. A blocking `connect(2)` to a
+/// listener that has stopped accepting with a full backlog waits forever, and
+/// it would wait here on the runtime thread, after the container and backing
+/// MCPs are already up and before anything is watching for a signal -- so
+/// SIGINT could not advance teardown, the installed handlers restarting the
+/// syscall rather than interrupting it. A timeout around a blocking connect
+/// would not help: the thread stays in the syscall regardless. For a Unix
+/// socket a nonblocking `connect(2)` resolves in the same call, so this
+/// returns an answer without ever waiting.
+///
+/// This is a check, not a lock. Two `outrig mcp` processes racing for the same
+/// path can both find it free, and one then binds a name the other is about to
+/// remove. It closes the case the report describes -- a second instance
+/// launched against a path an established one is already serving.
+#[cfg(unix)]
+fn clear_stale_unix_socket(path: &Path) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+
+    let addr = errno_ctx(UnixAddr::new(path), "address", path)?;
+    let probe = errno_ctx(
+        socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        ),
+        "socket",
+        path,
+    )?;
+
+    match connect(std::os::fd::AsRawFd::as_raw_fd(&probe), &addr) {
+        Ok(()) => Err(OutrigError::Configuration(format!(
+            "unix listen socket is already served by a running process: {}\n  \
+             stop it, or pass --listen with another path",
+            path.display()
+        ))
+        .into()),
+        Err(Errno::ECONNREFUSED) => {
+            std::fs::remove_file(path).path_ctx("remove", path)?;
+            Ok(())
+        }
+        Err(Errno::ENOENT) => Ok(()),
+        // `EAGAIN`/`EINPROGRESS` mean a listener is there and not taking this
+        // connection now; everything else (`EACCES`, `EPERM`, ...) means the
+        // probe never got an answer at all.
+        Err(e) => Err(OutrigError::Configuration(format!(
+            "unix listen path {} holds a socket that could not be reached ({}), so whether a \
+             process is still serving it is unknown; outrig will not replace it",
+            path.display(),
+            std::io::Error::from(e)
+        ))
+        .into()),
+    }
+}
+
+/// Bind and listen on `path` with a socket only this user can connect to.
+///
+/// The mode is set on the socket before it is given a name, so the name never
+/// exists under a wider one: `bind(2)` publishes the socket's own mode minus
+/// the process umask, where `tokio::net::UnixListener::bind` -- which creates
+/// the socket itself, mode `0777` -- publishes whatever the umask happens to
+/// leave, `0775` under the common `002`.
+///
+/// Under any ordinary umask that lands exactly on [`UNIX_SOCKET_MODE`] and
+/// nothing further is done. A umask masking an owner bit (`0200`, `0400`)
+/// leaves a socket this user cannot connect to, and only that case is
+/// repaired, by [`restore_socket_mode`].
+#[cfg(unix)]
+fn bind_unix_listener(path: &Path) -> Result<(tokio::net::UnixListener, UnixSocketCleanup)> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    use nix::sys::socket::{
+        AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+    };
+    use nix::sys::stat::{Mode, fchmod};
+
+    let addr = errno_ctx(UnixAddr::new(path), "address", path)?;
+    // `SOCK_NONBLOCK` is what `UnixListener::from_std` requires of the socket
+    // it adopts; `SOCK_CLOEXEC` keeps the listener out of the `podman exec`
+    // children the backing MCP servers run as.
+    let sock = errno_ctx(
+        socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+            None,
+        ),
+        "socket",
+        path,
+    )?;
+    errno_ctx(
+        fchmod(sock.as_fd(), Mode::from_bits_truncate(UNIX_SOCKET_MODE)),
+        "chmod",
+        path,
+    )?;
+
+    errno_ctx(bind(sock.as_raw_fd(), &addr), "bind", path)?;
+    // The name exists from here on, so own its removal before anything else
+    // can fail.
+    let cleanup = UnixSocketCleanup {
+        path: path.to_path_buf(),
+    };
+    errno_ctx(listen(&sock, Backlog::MAXCONN), "listen", path)?;
+    restore_socket_mode(path)?;
+
+    let listener = tokio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(sock))
+        .path_ctx("listen", path)?;
+    Ok((listener, cleanup))
+}
+
+/// Put back owner bits the umask took off the socket just bound at `path`,
+/// touching nothing that is not still that socket.
+///
+/// The entry cannot be chmod'd by name. `chmod(2)` follows symlinks and
+/// re-resolves the path, so in a directory another user can write -- `/tmp`
+/// without its sticky bit, a shared runtime directory -- they can swap the
+/// entry between `bind(2)` and this call and have outrig apply `0600` to a
+/// file of their choosing, stripping the execute and search bits off a
+/// binary or a directory for good. The socket's own mode does not prevent
+/// that: what is replaced is the directory entry, not the inode.
+///
+/// So the inode is pinned first, with `O_PATH | O_NOFOLLOW`, which resolves
+/// the entry once and refuses to walk a symlink, and the mode is applied
+/// through that handle via `/proc/self/fd`. A swap is then visible rather
+/// than exploitable -- the pinned inode is a symlink or a regular file
+/// instead of a socket -- and is refused. (`fchmod` on the listening
+/// descriptor is not the same operation: a Unix socket's fd and its directory
+/// entry are different inodes, so it would change the mode nothing consults.)
+///
+/// The common case does no work at all: under any umask leaving the owner
+/// bits alone the socket is already [`UNIX_SOCKET_MODE`] and this returns
+/// after the stat. Nothing here ever widens a mode.
+#[cfg(unix)]
+fn restore_socket_mode(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::{Mode, fstat};
+
+    let pinned = errno_ctx(
+        open(
+            path,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        "open",
+        path,
+    )?;
+    let stat = errno_ctx(fstat(&pinned), "stat", path)?;
+
+    if !matches!(
+        nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode) & nix::sys::stat::SFlag::S_IFMT,
+        nix::sys::stat::SFlag::S_IFSOCK
+    ) {
+        return Err(OutrigError::Configuration(format!(
+            "unix listen path {} stopped being the socket outrig just bound there; \
+             something else is writing that directory, so outrig will not touch it",
+            path.display()
+        ))
+        .into());
+    }
+
+    if stat.st_mode & 0o777 == UNIX_SOCKET_MODE {
+        return Ok(());
+    }
+
+    // The pinned inode, not the name: a second swap cannot redirect this.
+    let by_fd = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+    std::fs::set_permissions(&by_fd, std::fs::Permissions::from_mode(UNIX_SOCKET_MODE))
+        .path_ctx("chmod", path)
+        .map_err(Into::into)
+}
+
+/// A raw `errno` rendered the way every other filesystem failure here is: the
+/// operation and the path it was operating on.
+#[cfg(unix)]
+fn errno_ctx<T>(result: nix::Result<T>, op: &'static str, path: &Path) -> Result<T> {
+    result
+        .map_err(std::io::Error::from)
+        .path_ctx(op, path)
+        .map_err(Into::into)
 }
 
 #[cfg(unix)]
@@ -1363,5 +1575,222 @@ named  = { sidecar = "serve" }
 
         let unix = ListenAddr::Unix(PathBuf::from("/tmp/outrig.sock"));
         assert!(listen_exposure_warning(&unix).is_none());
+    }
+
+    /// A path whose socket nothing answers on is the ordinary case -- a prior
+    /// `outrig mcp` that was killed -- and the new listener takes the name.
+    #[tokio::test]
+    async fn a_socket_nothing_listens_on_is_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // Bound, never listened on, and the listener dropped: the file stays,
+        // and connecting to it is refused exactly as it is for a socket whose
+        // process is gone.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the socket file outlives its listener");
+
+        prepare_unix_socket(&path).expect("a socket with no listener is cleared");
+        assert!(!path.exists(), "the stale socket should have been removed");
+    }
+
+    /// A listener that has stopped accepting and filled its backlog answers a
+    /// connect with `EAGAIN` rather than refusing it. A blocking probe waits
+    /// for that one forever, on the runtime thread, with the container and
+    /// backing MCPs already up and no signal handler yet able to advance
+    /// teardown -- so the probe is nonblocking, and `EAGAIN` is read as the
+    /// evidence of a live server that it is.
+    #[tokio::test]
+    async fn a_listener_with_a_full_backlog_is_refused_rather_than_waited_on() {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+        };
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // The smallest backlog the kernel will take, and nothing ever accepts.
+        let addr = UnixAddr::new(&path).expect("addr");
+        let server = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("socket");
+        bind(server.as_raw_fd(), &addr).expect("bind");
+        listen(&server, Backlog::new(0).expect("backlog")).expect("listen");
+
+        // Fill it: one queued connection is enough to make the next `EAGAIN`.
+        // These are nonblocking for the same reason the probe is -- a blocking
+        // connect here would hang this test on the very syscall it is about.
+        let _queued: Vec<_> = (0..2)
+            .map(|_| {
+                let client = socket(
+                    AddressFamily::Unix,
+                    SockType::Stream,
+                    SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                    None,
+                )
+                .expect("client socket");
+                let _ = nix::sys::socket::connect(client.as_raw_fd(), &addr);
+                client
+            })
+            .collect();
+
+        // The assertion is as much that this returns at all as what it says.
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || prepare_unix_socket(&path)
+            }),
+        )
+        .await
+        .expect("the probe must not block on a listener that never accepts")
+        .expect("probe task");
+
+        let err = probe.expect_err("a listener that is not accepting still holds the path");
+        assert!(
+            err.to_string().contains("outrig will not replace it"),
+            "an unanswered probe must refuse rather than clear: {err}"
+        );
+        assert!(path.exists(), "the live listener's socket must still be there");
+    }
+
+    /// The fault from #374: a second `outrig mcp --listen unix:<same path>`
+    /// used to unlink the first one's socket and bind its own. The first kept
+    /// running -- container and backing MCPs alive -- reachable by nothing,
+    /// and its clients were silently rehomed onto the second.
+    #[tokio::test]
+    async fn a_socket_a_live_process_serves_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+
+        let err = prepare_unix_socket(&path).expect_err("a served socket must not be displaced");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("already served by a running process"),
+            "error should name the cause: {rendered}"
+        );
+        assert!(
+            rendered.contains("--listen"),
+            "error should say what to do instead: {rendered}"
+        );
+        assert!(
+            path.exists(),
+            "the live listener's socket must still be there"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_listen_path_that_is_not_a_socket_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("regular-file");
+        std::fs::write(&path, b"not a socket").expect("write");
+
+        let err = prepare_unix_socket(&path).expect_err("a regular file must be refused");
+        assert!(
+            err.to_string().contains("is not a socket"),
+            "{}",
+            err.to_string()
+        );
+        assert!(path.exists(), "the file must be left alone");
+    }
+
+    #[tokio::test]
+    async fn a_free_listen_path_needs_no_clearing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        prepare_unix_socket(&dir.path().join("outrig.sock")).expect("an unused path is ready");
+
+        let missing = dir.path().join("nope").join("outrig.sock");
+        let err = prepare_unix_socket(&missing).expect_err("a missing parent must be refused");
+        assert!(
+            err.to_string().contains("parent directory does not exist"),
+            "{}",
+            err.to_string()
+        );
+    }
+
+    /// The socket's permissions are the only thing standing between a
+    /// `unix:` listener and the container's tool surface, so they do not get
+    /// to follow the umask. `UnixListener::bind` creates the socket `0777`
+    /// and publishes `0777 & !umask` -- `0775` under the common `002`, which
+    /// hands every group member the tools (#374).
+    #[tokio::test]
+    async fn the_listen_socket_is_owner_only_whatever_the_umask_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use nix::sys::stat::{Mode, umask};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // Process-global, so it is restored before anything is asserted.
+        let previous = umask(Mode::empty());
+        let bound = bind_unix_listener(&path);
+        umask(previous);
+        let (listener, _cleanup) = bound.expect("bind");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, UNIX_SOCKET_MODE, "socket mode is {mode:o}, want 0600");
+
+        // Owner-only is not the same as unusable: this user still connects.
+        let client = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        listener.accept().await.expect("accept");
+        drop(client);
+    }
+
+    /// `chmod(2)` by name re-resolves the path and follows symlinks. In a
+    /// directory another user can write -- `/tmp` without its sticky bit --
+    /// they can swap the entry between `bind(2)` and the chmod and have
+    /// outrig apply `0600` to a file of their choosing, stripping the search
+    /// bits off a directory or the execute bit off a binary for good. The
+    /// mode goes through a handle pinned with `O_NOFOLLOW` instead, so a swap
+    /// is refused rather than followed.
+    #[tokio::test]
+    async fn a_swapped_listen_entry_is_refused_rather_than_chmodded() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        // The file an attacker would be aiming at: a directory nothing should
+        // take the search bits off.
+        let victim = dir.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim dir");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Stand where `bind` leaves the path, then swap the entry for a link
+        // at the victim -- what a writable parent directory allows.
+        std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        std::fs::remove_file(&path).expect("unlink");
+        std::os::unix::fs::symlink(&victim, &path).expect("symlink");
+
+        let err = restore_socket_mode(&path).expect_err("a swapped entry must be refused");
+        assert!(
+            err.to_string().contains("stopped being the socket"),
+            "error should name what happened: {err}"
+        );
+
+        let mode = std::fs::metadata(&victim).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the victim's mode must be untouched, is {mode:o}");
+    }
+
+    /// The listener owns the name it bound: dropping it takes the socket file
+    /// with it, so the next run finds a free path rather than a stale one.
+    #[tokio::test]
+    async fn dropping_the_listener_removes_its_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outrig.sock");
+
+        let (listener, cleanup) = bind_unix_listener(&path).expect("bind");
+        assert!(path.exists());
+        drop(listener);
+        drop(cleanup);
+        assert!(!path.exists(), "the socket file should be gone");
     }
 }

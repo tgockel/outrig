@@ -399,7 +399,9 @@ declared servers without serving MCP. All non-protocol output stays off stdout.
 
 When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.
 TCP addresses are socket addresses such as `127.0.0.1:7331` or `0.0.0.0:7331`;
-Unix sockets use `unix:/tmp/outrig.sock`. The HTTP MCP endpoint is always `/mcp`.
+Unix sockets use `unix:/tmp/outrig.sock`, created `0600` regardless of umask, and a
+path another `outrig mcp` is still serving is refused rather than taken over. The HTTP
+MCP endpoint is always `/mcp`.
 Loopback TCP is local-only by default. Non-loopback TCP binds are allowed but print a
 warning because this v1 surface has no built-in auth; use an authenticated reverse proxy
 before exposing it broadly. Each HTTP MCP client gets its own rmcp session backed by the

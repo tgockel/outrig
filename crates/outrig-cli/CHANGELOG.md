@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never been retried at all. The loop now reads the body itself before handing it to rig, so a
   failure partway through it is retried the same as any other transient one, on the same budget
   and backoff. (#379)
+- **`outrig mcp --listen unix:<path>` refuses a socket another instance is serving, and creates
+  its own `0600`.** The path was cleared unconditionally: a second `outrig mcp` on the same
+  socket unlinked the first one's name and bound its own, leaving that instance running and
+  holding its container with nothing able to reach it, while its clients were silently rehomed
+  onto the second. outrig now connects to an existing socket first -- a refused connection is a
+  socket whose process is gone, and that one is still cleared; a connection that succeeds is a
+  live server, and the command fails naming the path. A socket this user cannot probe at all is
+  refused too, because the alternative is cutting off a server that may well be running. The
+  socket is also published `0600` rather than `0777 & ~umask`, which under the common umask of
+  `002` handed every member of the user's group a route to the container's tools, where the
+  docs call filesystem permissions the access boundary. The mode is set on the socket before
+  `bind` gives it a name, so the name never exists under a wider one. The probe is nonblocking:
+  a listener that has stopped accepting with a full backlog answers a blocking connect with
+  neither success nor refusal, which would have wedged startup on the runtime thread with the
+  container already up and signals unable to advance teardown. The mode is applied through an
+  inode pinned with `O_NOFOLLOW`, never by name, so a socket entry replaced in a directory
+  another user can write is refused rather than followed into a `chmod` of an unrelated
+  file. (#374)
 - **`ls`, `logs`, `discard`, and `clean` survive a global config that does not load.** These
   four need exactly one key from it, `session-root`, and read no repo config at all -- but a
   TOML syntax error anywhere in that one machine-wide file, or a value the loader refuses rather

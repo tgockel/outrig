@@ -296,8 +296,23 @@ For local multi-process access without a TCP port, use a Unix socket:
 outrig mcp --listen unix:/tmp/outrig.sock --image coding
 ```
 
-Socket filesystem permissions are the access boundary. HTTP clients still use the
-Streamable HTTP protocol and the `/mcp` path over that socket.
+Socket filesystem permissions are the access boundary, so the socket is created
+`0600` -- only the user running `outrig mcp` can connect, whatever the process
+umask is. HTTP clients still use the Streamable HTTP protocol and the `/mcp` path
+over that socket.
+
+A socket file left behind by a process that is gone is removed and the path
+reused. A path another `outrig mcp` is still serving is refused instead, naming
+it: taking it over would leave that instance running and holding its container
+with nothing able to reach it. Stop it, or pick another path. A socket that
+answers neither way -- one whose server has stopped accepting, or that this user
+cannot connect to -- is also refused, since the risk of cutting off a running
+instance outweighs an error message.
+
+Point `--listen` at a directory only you can write. In a shared one without the
+sticky bit, another user can replace the socket's directory entry; outrig refuses
+the path instead of following the replacement, but it cannot stop the entry from
+being taken.
 
 #### Browser defenses
 

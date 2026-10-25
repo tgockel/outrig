@@ -61,8 +61,10 @@ hf-hub             = { workspace = true, optional = true, features = ["ureq"] }
 indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
 mistralrs-core     = { workspace = true, optional = true }
-# `fs` carries `fcntl`, which `session.rs` takes the owner-liveness lock with.
-nix                = { workspace = true, features = ["fs", "resource", "term", "user"] }
+# `fs` carries `fcntl`, which `session.rs` takes the owner-liveness lock with,
+# plus the `fchmod`/`open(O_PATH)` that `cli/mcp.rs` publishes a listening Unix
+# socket with. `socket` carries the nonblocking bind and liveness probe there.
+nix                = { workspace = true, features = ["fs", "resource", "socket", "term", "user"] }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }
