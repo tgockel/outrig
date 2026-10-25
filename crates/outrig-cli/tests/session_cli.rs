@@ -791,6 +791,133 @@ async fn logs_follow_handles_truncation() {
     assert!(s.contains("rotated-content"), "missing rotated: {s}");
 }
 
+/// Once the session's record is finalized, `--follow` returns on its own
+/// instead of sitting forever (#383): the doc promises exactly that, and
+/// before this the loop only ever ended on `ctrl_c`.
+#[tokio::test]
+async fn logs_follow_returns_once_the_session_is_finalized() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+    write_log(
+        &dir,
+        "fs.stderr",
+        b"first
+",
+    );
+    let logs_dir = dir.join("logs");
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+
+    let finalizer = {
+        let store = store.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            store
+                .finalize(&sid, SystemTime::now(), 0)
+                .expect("finalize");
+        })
+    };
+
+    let follow = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            logs::execute_with(&mut sw, &mut ew, &logs_dir, Some("fs"), true),
+        )
+        .await
+    });
+
+    let drain_task = tokio::spawn(async move { drain(stdout_r).await });
+
+    finalizer.await.expect("finalizer joined");
+    let result = follow
+        .await
+        .expect("follow task joined")
+        .expect("follow did not time out");
+    result.expect("execute_with returned an error");
+    let out = drain_task.await.expect("drain joined");
+    assert!(out.contains("first"), "missing initial dump: {out}");
+}
+
+/// The race the finalization check can lose if it samples after this
+/// tick's read instead of before: a writer's last bytes land, then the
+/// session is finalized, both nearly back-to-back as `session_setup::
+/// teardown` does it (drain, then finalize) -- so `--follow` has to catch
+/// those bytes on the very tick it notices the record is done, not return
+/// having skipped them because the record looked finished first.
+#[tokio::test]
+async fn logs_follow_catches_the_final_write_before_returning() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create")
+        .0;
+    let path = write_log(&dir, "fs.stderr", b"first\n");
+    let logs_dir = dir.join("logs");
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+
+    let finalizer = {
+        let store = store.clone();
+        let sid = sid.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            // Give `execute_with` time to finish its initial `cat_file` dump
+            // and start polling.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            // The last bytes a writer ever produces, immediately followed by
+            // the finalize that marks the session over -- same order
+            // `session_setup::teardown` uses (drain the writer, then
+            // finalize), and with no poll tick deliberately interposed
+            // between them.
+            {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .expect("open append")
+                    .write_all(b"final\n")
+                    .expect("final write");
+            }
+            store
+                .finalize(&sid, SystemTime::now(), 0)
+                .expect("finalize");
+        })
+    };
+
+    let follow = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            logs::execute_with(&mut sw, &mut ew, &logs_dir, Some("fs"), true),
+        )
+        .await
+    });
+
+    let drain_task = tokio::spawn(async move { drain(stdout_r).await });
+
+    finalizer.await.expect("finalizer joined");
+    let result = follow
+        .await
+        .expect("follow task joined")
+        .expect("follow did not time out");
+    result.expect("execute_with returned an error");
+    let out = drain_task.await.expect("drain joined");
+    assert!(out.contains("first"), "missing initial dump: {out}");
+    assert!(
+        out.contains("final"),
+        "lost the write that landed right before finalize: {out}"
+    );
+}
+
 // -------- discard --------
 
 fn args_for_id(id: &str, yes: bool) -> discard::DiscardArgs {

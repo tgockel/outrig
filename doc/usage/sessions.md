@@ -185,7 +185,8 @@ warning: unused import: `std::collections::HashMap`
 ```
 
 `--follow` (`-f`) tails the file with `tail -F`-style behavior: continues when the file rotates,
-returns when EOF is reached and no further writes are expected.
+and returns on its own once the session's record shows it has ended -- there is nothing left to
+write. Ctrl-C ends it earlier, same as any other command.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
 `conn.log`-style JSON object per outbound TCP connection and one per name lookup. It is not

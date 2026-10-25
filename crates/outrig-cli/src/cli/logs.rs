@@ -82,9 +82,9 @@ where
         }
         Some(s) => {
             let path = logs_dir.join(format!("{s}{LOG_SUFFIX}"));
-            cat_file(stdout, &path).await?;
+            let pos = cat_file(stdout, &path).await?;
             if follow {
-                follow_file(stdout, &path).await?;
+                follow_file(stdout, &path, pos, logs_dir.parent()).await?;
             }
             Ok(0)
         }
@@ -207,20 +207,49 @@ async fn cat_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Result<
     Ok(n)
 }
 
-/// Polling tail. Caller has already cat'd the file once via [`cat_file`].
-/// Loop: stat, if size grew read+write delta, if size shrank reopen from
-/// byte 0 (file was truncated/rotated). Terminates on `ctrl_c`.
-async fn follow_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Result<()> {
-    let mut pos: u64 = tokio::fs::metadata(path)
-        .await
-        .path_ctx("stat", path)?
-        .len();
+/// Polling tail. Caller has already cat'd the file once via [`cat_file`],
+/// whose return value seeds `pos`: re-stating the file here instead, as this
+/// used to, reads whatever landed between that dump finishing and this call
+/// starting into `pos` itself, so the delta is never read as "new" and is
+/// lost rather than caught up on (#383).
+///
+/// Loop: wait out the poll tick (or `ctrl_c`, which ends it), sample whether
+/// `session_dir`'s record already shows the session finished, then stat --
+/// if size grew read+write the delta, if size shrank reopen from byte 0
+/// (file was truncated/rotated) -- and only *after* that read, return if the
+/// sample said so. Sampling before the read rather than after matters:
+/// teardown stops the MCP server and lets its log settle before it
+/// finalizes the record (see `session_setup::teardown`), so a sample taken
+/// before this tick's read is guaranteed to have every byte the writer will
+/// ever produce already on disk for that same read to catch up on; sampling
+/// after the read instead would let a write landing between the read and
+/// the sample go unread forever, mistaking "stopped, as of a moment ago" for
+/// "stopped, and this tick already read everything there is." When
+/// `session_dir` is `None` or its record is unreadable or not yet finalized
+/// -- a bare log directory with no `session.json`, as the tests here use,
+/// included -- the loop only ends on `ctrl_c`, as it always did.
+async fn follow_file<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    path: &Path,
+    mut pos: u64,
+    session_dir: Option<&Path>,
+) -> Result<()> {
     let mut buf = [0u8; 8192];
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = tokio::time::sleep(FOLLOW_POLL) => {}
         }
+        // Sampled before this tick's stat+read, not after: teardown stops the
+        // MCP server and settles its log *before* it finalizes the record, so
+        // a `true` seen here means every byte the writer will ever produce is
+        // already on disk, and the read below is guaranteed to catch up to
+        // all of it. Sampling the other way -- after the read -- leaves a
+        // window where a write lands between that read and this check, and
+        // the check would then see `true` and return having never read it;
+        // the record stays finalized once set, so a stale `false` here costs
+        // at most one more poll tick before the next iteration notices.
+        let ended = session_dir.is_some_and(session_ended);
         let len = match tokio::fs::metadata(path).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -243,12 +272,26 @@ async fn follow_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Resu
             }
             stdout.flush().await?;
         }
+        if ended {
+            return Ok(());
+        }
     }
+}
+
+/// Whether `dir`'s `session.json` records the session as over. `false` for
+/// anything that isn't a readable, finalized record -- a directory with no
+/// record at all, one mid-write, or one whose session is still running --
+/// so a follow never stops on a record it cannot confirm is done.
+fn session_ended(dir: &Path) -> bool {
+    session::SessionStore::new(PathBuf::new())
+        .get_by_path(dir)
+        .is_ok_and(|s| s.ended_at.is_some())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::format_size;
+    use super::{cat_file, format_size};
+    use std::io::Write as _;
 
     #[test]
     fn size_formatting() {
@@ -256,5 +299,40 @@ mod tests {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(1228), "1.2 KiB");
         assert_eq!(format_size(3 * 1024 * 1024 + 400 * 1024), "3.4 MiB");
+    }
+
+    /// `cat_file`'s return value is the byte count it actually wrote out, so
+    /// a caller that seeds `follow_file`'s `pos` from it (rather than
+    /// re-`stat`ing afterward) never misses whatever a writer appends between
+    /// the dump finishing and the first poll -- the seam `follow_file` used
+    /// to lose (#383): a re-`stat` taken after such a write landed would seed
+    /// `pos` past it.
+    #[tokio::test]
+    async fn cat_file_returns_the_byte_count_it_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fs.stderr");
+        std::fs::write(&path, b"first\n").expect("write");
+
+        let mut out = Vec::new();
+        let n = cat_file(&mut out, &path).await.expect("cat_file");
+        assert_eq!(n, 6, "byte count should match the file's contents");
+        assert_eq!(out, b"first\n");
+
+        // A write landing right after `cat_file` returns, before anything
+        // re-`stat`s the file -- exactly the window `follow_file` used to
+        // lose. Seeding `pos` from `n` above (not a fresh `stat`) is what a
+        // caller needs to do to catch this on the next poll.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append");
+        f.write_all(b"seam\n").expect("seam write");
+        drop(f);
+
+        let len = std::fs::metadata(&path).expect("stat").len();
+        assert!(
+            len > n,
+            "the seam write must land after cat_file's count, or this test proves nothing"
+        );
     }
 }
