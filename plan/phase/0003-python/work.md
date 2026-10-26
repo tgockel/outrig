@@ -225,8 +225,9 @@ message says the child ended without completing. What happens to the child follo
 a decorated call's child is released, as it is whenever its one call settles; an explicit work child
 stays, idle, and a submission queued behind the failed one opens its own round next, since a new
 submission is a change in the summary. The skill parser (`skills.md`) is a decorated call and
-inherits the release. For now a model that will not complete raises on the caller's side; prompting
-it more than once is `potential/one-shot-nudging.md`'s evaluation.
+inherits the release. `0003-37`, decided on 2026-10-26, changes this ending and the idle one for a
+request child above: after a warning round, a child that still changes nothing has every request
+it holds cancelled, and each sender is told.
 
 Only an invalid answer -- a completion or reply that failed a check -- counts toward the
 per-request attempt limit, 3 by default; past it the request settles with `CompletionRejected`,

@@ -306,8 +306,8 @@ id. If that round ends without a completion that passed too, nothing has changed
 and where a request child would go idle the call settles with `CompletionRejected` whose message
 says the child ended without completing, and its child is released. Decided on 2026-10-05, after
 the follow-up review, replacing a call left open with its child resident until the caller ended
-it. For now a model that will not complete raises on the caller's side; prompting it more than
-once is `potential/one-shot-nudging.md`'s evaluation. Only a completion that failed a check counts
+it. `0003-37`, decided on 2026-10-26, changes this ending: after a warning round, a child that
+still changes nothing is cancelled, not rejected. Only a completion that failed a check counts
 toward the per-request attempt limit, 3 by default (`work.md`); past it the call settles with
 `CompletionRejected` carrying the last value submitted and its problems. The two ends are one
 exception with different contents, and neither re-runs anything. The prompted round counts no

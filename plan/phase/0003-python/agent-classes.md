@@ -301,6 +301,12 @@ host knows because it delivers and settles each one, and compares ids where `Tol
 counts (`execution-and-rounds.md`, "A round", for what else changes). Such a round counts no
 attempt against any request (below).
 
+`0003-37`, decided on 2026-10-26, changes what an unchanged summary does. Where this rule leaves a
+child idle with requests open, or ends a work child's submission `CompletionRejected`, `0003-37`
+asks the child once more with a warning, and when that round changes nothing either, cancels every
+request the summary holds and tells each sender, so that no child is idle holding a request it has
+not answered.
+
 Five consequences, which `0003-30` tests:
 
 - **A child that answered anything in a round gets the next round, whatever arrived meanwhile.**

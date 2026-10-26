@@ -1,4 +1,4 @@
-# 0003-37 -- The docs describe the system that now exists
+# 0003-38 -- The docs describe the system that now exists
 
 ## Context
 
@@ -12,6 +12,8 @@ task, `0003-21`, before the relay task, `0003-22`, and shifted the tasks then nu
 through `0003-30` by one, which made this task `0003-31`. A fourth, in the planning round of
 2026-10-15 that folded in the host-program requirements, inserted six tasks between `0003-22`
 and this one and moved `0003-23` through `0003-31` again, which made this task `0003-37`.
+A fifth, in the planning round of 2026-10-26 that promoted `potential/one-shot-nudging.md` to
+`0003-37`, inserted that task before this one, which made this task `0003-38`.
 
 `doc/` is design-first: `.claude/CLAUDE.md` says subsystem pages carry `TODO: Incomplete` until
 their implementation exists. Individual tasks drop their own markers as behavior becomes real,
@@ -80,9 +82,10 @@ MCP now sits, and what a binding lets an agent do on the host.
   host-declared class's model, image or instructions.
 - **`doc/reference/events.md` extended with every event type the phase added after `0003-13`**: the
   session states and the in-memory stream's gap reporting (`0003-19`), a hosted request's receipt,
-  dispatch and outcome (`0003-22`), `agent.request.*` (`0003-30`), `agent.call.*` (`0003-31`),
-  `agent.instance.*` (`0003-34`), `skill.directive.received` and `skill.invocation.*` (`0003-33`),
-  and `binding.injected` (`0003-36`), each with its category.
+  dispatch and outcome (`0003-22`), `agent.request.*` (`0003-30`, and the host's cancel, which
+  `0003-37` records with its cause), `agent.call.*` (`0003-31`), `agent.instance.*` (`0003-34`),
+  `skill.directive.received` and `skill.invocation.*` (`0003-33`), and `binding.injected`
+  (`0003-36`), each with its category.
 - **`doc/reference/cli.md` lists `/name text`** among `run-new`'s commands, with what it does, and
   that built-in commands win over a skill's name. The REPL parses nothing; the line is delivered to
   the agent, whose `outrig.skills.invoke(name, text)` has a typed agent call parse the text into the
@@ -100,7 +103,8 @@ MCP now sits, and what a binding lets an agent do on the host.
   shadowing rule, `/name`, `outrig.skills` -- `invoke(name, text)` deriving `<Skill>Params` from
   the entry's signature and having a typed agent call parse the text into it, and
   `invoke(name, params=...)` making no model call -- `runtime.spawn`, `@outrig.agent` and
-  `outrig.Agent`, request channels and replies, completion and repair, releasing a child, how a
+  `outrig.Agent`, request channels and replies, completion and repair, the two nudges and the
+  cancel that ends a request its child does not answer (`0003-37`), releasing a child, how a
   child's spend is added to its call, the skill invocation and the round, and that a child has no
   user channel.
 - **The embedding API documented**: `crates/outrig/README.md` shows a session built, driven and
@@ -157,6 +161,8 @@ MCP now sits, and what a binding lets an agent do on the host.
   and the events reference gains the `agent.instance.*` family.
 - **Hard: `0003-35`, `0003-36`.** The host-program usage page describes driving a class and
   injecting a live object, and the config reference the `[host]` grace key `0003-29` adds.
+- **Hard: `0003-37`.** The concepts page and the events reference describe the two nudges, the
+  cancel a child's unanswered request ends in, and the event that records it.
 - **Soft: every earlier task**, each of which drops its own markers. This one is done last.
 
 ## See also

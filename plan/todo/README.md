@@ -91,7 +91,7 @@ tasks is an invariant this file holds.
 
 ### Phase 0003 -- python
 
-`0003-01` through `0003-37` cover the phase's user-visible deliverables. The ordering is
+`0003-01` through `0003-38` cover the phase's user-visible deliverables. The ordering is
 chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
 an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
 was built from the phase's exit criteria instead and silently omitted discovery, history, and
@@ -104,6 +104,7 @@ phase.
 | --------- | ------------------------------------------------------------------ |
 | `0003-34` | An agent class answers requests                                    |
 | `0003-35` | A host program drives an agent class                               |
+| `0003-37` | A request is worked on or cancelled, and its sender is told        |
 
 **Live objects**
 
@@ -115,7 +116,7 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-37` | The docs describe the system that now exists                       |
+| `0003-38` | The docs describe the system that now exists                       |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -153,6 +154,11 @@ Cross-cutting notes the individual tasks carry rather than this file:
   list, not forgotten. `0003-24`'s `[policy]` was reverted before release and `0003-25`'s
   evaluator went back to `plan/next/`: in 0.3 the binding is the grant, and finer permissions are
   `plan/next/binding-permissions.md`.
+- The planning round of 2026-10-26 promoted `potential/one-shot-nudging.md` to `0003-37`: a request
+  is either worked on or cancelled, and its sender is told which, for request children as well as
+  work children. It sits after `0003-34` through `0003-36` and before the documentation, which
+  became `0003-38`. `0003-34` lands first and its tests assert the ending `0003-37` replaces, an
+  idle child with a request open, so `0003-37` rewrites them.
 - `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
   box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
 

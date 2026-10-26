@@ -109,7 +109,8 @@ its context kept; releasing the instance ends the child.
   round that opens with it counted (`agent-classes.md`, "The child's rounds"); a
   request the child leaves open stays open until
   `h.cancel()`, a later round answers it, or release, a `runtime.wait` timeout in the caller
-  ending that caller's wait only; only an invalid reply counts an attempt, 3 by default, and past
+  ending that caller's wait only (`0003-37` replaces this ending with a warning round and then a
+  cancel); only an invalid reply counts an attempt, 3 by default, and past
   the limit the request settles `CompletionRejected` while the child goes on serving the others;
   `fail` settles `AgentRequestFailed`; `h.cancel()` removes a request before receipt and makes
   `reply` raise `RequestCancelled` after it.
@@ -166,7 +167,8 @@ its context kept; releasing the instance ends the child.
   twice for one request -- the round that received it and the one that named it -- after which
   the mock receives no further call, the child reads idle, and the handle stays open with no
   `agent.request.invalid` recorded; `h.cancel()` settles it cancelled, and a new request sent
-  before that starts a round whose opening names both. Three requests sent together to a mock
+  before that starts a round whose opening names both. (`0003-37` replaces this ending: a third
+  round warns, and the request is then cancelled.) Three requests sent together to a mock
   that answers one per round all settle, with a round opened by the host after each of the first
   two replies and no arrival after the three. A request on which the mock replies with a wrong
   shape three times settles `CompletionRejected` and the mock receives no further call for it;

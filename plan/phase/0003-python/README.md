@@ -189,6 +189,8 @@ written against.
   work that produced it.
 - One child answers several requests without losing its context: an agent class's instance
   takes a second request whose round reads what the first one bound (`0003-34`).
+- A request sent to a child is either worked on or cancelled, and its sender is told which: no
+  child is idle while it holds a request it has not answered (`0003-37`).
 - `/name text` runs a skill's entry through the main agent, its parameters mapped from the text
   by a typed agent call, visible in its history.
 - A skill that uses a binding and runs typed children in parallel with one repaired works end to
@@ -210,17 +212,19 @@ written against.
 `doc/concepts/subagents.md`, `doc/reference/config.md`, `doc/reference/cli.md`, and
 `SECURITY.md` -- the MCP pages most of all, since this phase demotes MCP from the way an agent
 acts to one integration surface among others. Hosted objects, skills and the session API
-and the host-program mode have no `doc/` page yet; `0003-37` writes them, and `doc/usage/run.md`
+and the host-program mode have no `doc/` page yet; `0003-38` writes them, and `doc/usage/run.md`
 and `doc/reference/cli.md` gain the script form.
 
 ## Tasks
 
-`0003-01` through `0003-37`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
+`0003-01` through `0003-38`, in `plan/done/` and `plan/todo/`; `plan/todo/README.md` carries
 the per-step index. They cover the deliverables above; the subjects listed as out of scope below
 have design pages or `plan/next/` entries and no tasks. The planning round of 2026-10-15 folded in
 the host-program requirements (R1-R9): six tasks placed by dependency, and `0003-23` through
 `0003-31` moved to make room. `0003-24` was reverted before release, its file kept in
-`plan/done/` as the record, and `0003-25` went back to `plan/next/` as `policy-evaluator.md`.
+`plan/done/` as the record, and `0003-25` went back to `plan/next/` as `policy-evaluator.md`. The
+planning round of 2026-10-26 promoted `potential/one-shot-nudging.md` to `0003-37`, ahead of the
+documentation.
 
 The ordering puts a usable command early. `0003-01` through `0003-05` are the shortest path to an
 interactive `run-new`, and everything after is additive. One consequence is worth knowing before
@@ -231,7 +235,7 @@ channel that replaces it is `0003-08`.
 processes before the tasks that build on it, and a spike that fails its acceptance stops and
 reports to the maintainer rather than changing the design on its own. Close behavior is built with
 each resource: the task that adds a resource adds its row to `lifecycle.md`'s close table.
-`0003-37`, the documentation, comes last.
+`0003-38`, the documentation, comes last.
 
 ## Out of scope
 

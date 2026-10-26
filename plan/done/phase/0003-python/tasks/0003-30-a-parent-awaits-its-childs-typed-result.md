@@ -185,8 +185,8 @@ including when the session closes.
   and a submission queued behind the failed one opens its own round next, a new submission being
   a change in the summary. The invalid-answer attempt limit above is separate. Decided on
   2026-10-05 after the follow-up review;
-  `plan/phase/0003-python/potential/one-shot-nudging.md` records prompting more than once as an
-  evaluation.
+  `plan/phase/0003-python/potential/one-shot-nudging.md` (promoted to `0003-37`) records prompting
+  more than once as an evaluation.
 - **A request child's rounds.** A request arriving while the child is idle starts a round, as a
   user message starts the main agent's (`execution-and-rounds.md`). One arriving during a round
   is announced on the next result by the announcer `crates/outrig/src/agent/channel.rs` already
@@ -593,8 +593,8 @@ including when the session closes.
 - `crates/outrig/src/agent/channel.rs` -- the `Announcer`, whose comparison of deliveries made
   against the count kept at the last round that ended well is what the end-of-round summary
   generalizes.
-- `plan/phase/0003-python/potential/one-shot-nudging.md` -- prompting a work child more than
-  once before its submission fails, as an evaluation.
+- `plan/phase/0003-python/potential/one-shot-nudging.md` (promoted to `0003-37`) -- prompting a
+  work child more than once before its submission fails, as an evaluation.
 - `plan/next/wait-for-request-capacity.md` -- a sender awaiting room under `requests-max`.
 - `plan/phase/0003-python/potential/resource-scheduling.md` -- the scheduler for children working
   at once that this task does not build.
