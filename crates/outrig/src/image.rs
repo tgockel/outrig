@@ -1001,7 +1001,12 @@ fn temp_tag_guard(temp_tag: &ImageTag) -> CleanupGuard {
     // The tag carries this build's pid and nonce, so it names nothing another
     // build could create -- a retry is safe.
     CleanupGuard::arm(
-        Cmd::new("buildah").arg("rmi").arg(temp_tag.as_str()),
+        Cmd::new("buildah")
+            .arg("rmi")
+            .arg(temp_tag.as_str())
+            // A build cancelled before it creates the tag removes nothing,
+            // and that is not a cleanup that failed.
+            .absent_is_done("image not known"),
         Reissue::Safe,
     )
 }
@@ -1122,8 +1127,15 @@ async fn commit_image_with_labels(
 ) -> Result<()> {
     let builder = temporary_builder_name();
     // `outrig-label-<pid>-<nonce>`, so likewise this build's alone.
-    let builder_owned =
-        CleanupGuard::arm(Cmd::new("buildah").arg("rm").arg(&builder), Reissue::Safe);
+    // A build cancelled before `buildah from` made the builder removes
+    // nothing, which is not a cleanup that failed.
+    let builder_owned = CleanupGuard::arm(
+        Cmd::new("buildah")
+            .arg("rm")
+            .arg(&builder)
+            .absent_is_done("container not known"),
+        Reissue::Safe,
+    );
     let result = async {
         run_buildah_capture(
             Cmd::new("buildah")

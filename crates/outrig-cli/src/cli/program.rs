@@ -6,10 +6,16 @@
 //! directory under the session root. Its streams, working directory, environment and exit status
 //! are its own, and nothing here reads what it prints.
 //!
-//! `SIGINT` and `SIGTERM` this process receives are forwarded to the program's process group. The
-//! first starts the program's grace (`--grace`, `[host] grace-secs`); past it, or at a second
-//! signal, the program's group is stopped, and a further signal sends `SIGKILL` at once. Whatever
-//! the program left open, the engine stops, and each such session is told of here, on stderr.
+//! `SIGINT` and `SIGTERM` this process receives are forwarded to the program's process group,
+//! and so is a `SIGHUP`, as the `SIGTERM` a closed terminal asks for. The first starts the
+//! program's grace (`--grace`, `[host] grace-secs`); past it, or at a second signal, the
+//! program's group is stopped, and a further signal sends `SIGKILL` at once. Whatever the program
+//! left open, the engine stops, and each such session is told of here, on stderr.
+//!
+//! None of the three is left at its default disposition once the program exists: a `SIGHUP` that
+//! was would end this process where it stands, and with it the engine that stops the sessions the
+//! program left open -- the containers would run on under conmon, and their records would stay
+//! live (#644).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -108,11 +114,17 @@ pub async fn execute(
     // with nothing left to clean up.
     let mut interrupts = signal(SignalKind::interrupt()).map_err(OutrigError::Io)?;
     let mut terminations = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
+    // A closed terminal asks for the program to stop, which is what a SIGTERM asks for, so it is
+    // forwarded as one: the program has one way to be asked to end, and the grace and the stop
+    // that follow are the same. Left at its default, it would kill this process with the
+    // program's sessions still running.
+    let mut hangups = signal(SignalKind::hangup()).map_err(OutrigError::Io)?;
     let exit = loop {
         tokio::select! {
             exit = running.wait() => break exit?,
             Some(()) = interrupts.recv() => running.interrupt(),
             Some(()) = terminations.recv() => running.terminate(),
+            Some(()) = hangups.recv() => running.terminate(),
         }
     };
     for left in exit.left_open() {

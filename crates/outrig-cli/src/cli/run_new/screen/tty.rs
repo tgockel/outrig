@@ -7,9 +7,16 @@
 //! decoding reads, so it must not be bypassed there. The others cannot take
 //! that way:
 //!
-//! - **SIGTERM and SIGHUP** end the process by their default action, as they
-//!   do without the screen; a handler installed while the screen is up first
-//!   puts the terminal back, then lets the signal do what it would have done.
+//! - **SIGTERM and SIGHUP** go on to do what they would have done without the
+//!   screen; a handler installed while the screen is up first puts the
+//!   terminal back, then delivers the signal to whatever was there before --
+//!   the session's own listener, which ends the session through its teardown,
+//!   or the default action, which ends the process. Either way the terminal is
+//!   the shell's again before anything else happens, and the screen is marked
+//!   dead, so a session that goes on to stop does not draw over the terminal
+//!   it has just given back. The screen's thread may be in the middle of a
+//!   frame when that lands, so it repairs the terminal once more itself, after
+//!   its last write ([`repair`]).
 //! - **A panic** anywhere, through a hook chained ahead of the process's own,
 //!   which also marks the screen dead so its thread stops drawing.
 //! - **A screen that cannot be waited for**, stuck writing to a terminal that
@@ -36,8 +43,11 @@ use ratatui::crossterm::{queue, terminal};
 
 /// Set while the terminal is raw and [`restore`] has something to do.
 static ARMED: AtomicBool = AtomicBool::new(false);
-/// Set once a panic restored the terminal: the screen must not draw again.
+/// Set once the terminal was taken back from the screen -- by a panic, by a
+/// signal, or from outside: the screen must not draw again.
 static DEAD: AtomicBool = AtomicBool::new(false);
+/// Set once a signal took the terminal back, which is not a screen failure.
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
 /// Set while the detail view holds the terminal's alternate screen.
 static DETAIL: AtomicBool = AtomicBool::new(false);
 /// The viewport's top row, or `u16::MAX` before there is one.
@@ -48,9 +58,14 @@ static RESTORE_FD: AtomicI32 = AtomicI32::new(-1);
 static SAVED: Saved<libc::termios> = Saved::new();
 
 /// The signals that end the process with the terminal in whatever state it
-/// is in, and what each was set to do before the screen's handler.
+/// is in, and what each was set to do before the screen's handler. A
+/// predecessor stays where it is once the handler is taken out: a signal that
+/// is already inside the handler, on another thread, still has to be handed
+/// to it, and would otherwise find it gone.
 const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
 static PREVIOUS: [Saved<libc::sigaction>; 2] = [Saved::new(), Saved::new()];
+/// Whether the screen's handler is the one installed for each.
+static INSTALLED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
 
 /// The terminal in raw mode, until [`Raw::leave`] or drop.
 pub(super) struct Raw {
@@ -76,10 +91,19 @@ impl Raw {
             RESTORE_FD.store(tty.into_raw_fd(), Ordering::SeqCst);
         }
         hook_panics();
+        if dead() {
+            return Err(given_up());
+        }
         terminal::enable_raw_mode()?;
         // From here an error drops `raw`, which puts the terminal back.
         let raw = Raw { active: true };
         ARMED.store(true, Ordering::SeqCst);
+        // Checked once armed too: either `abandon`'s `restore` saw it armed, or
+        // this sees the screen dead, and backs out before any write that could
+        // wait on a terminal that has stopped reading.
+        if dead() {
+            return Err(given_up());
+        }
         install_handlers();
         queue!(out, EnableBracketedPaste)?;
         out.flush()?;
@@ -122,9 +146,46 @@ impl Drop for Raw {
     }
 }
 
-/// Whether a panic took the terminal back from the screen.
+/// The terminal's file, as the screen writes it: nothing reaches the terminal
+/// once it was taken back. A start given up on is still inside
+/// [`Viewport::open`](super::viewport::Viewport::open) -- waiting for the
+/// cursor's position, say -- and the moves and clears it goes on to would land
+/// on whatever the session has written below the conversation by then, which
+/// [`repair`] cannot give back.
+pub(super) struct Held(File);
+
+impl Held {
+    pub(super) fn new(tty: File) -> Self {
+        Self(tty)
+    }
+}
+
+impl Write for Held {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if dead() {
+            return Err(given_up());
+        }
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn given_up() -> io::Error {
+    io::Error::other("the screen was given up on before it had the terminal")
+}
+
+/// Whether the terminal was taken back from the screen, so it must not draw.
 pub(super) fn dead() -> bool {
     DEAD.load(Ordering::SeqCst)
+}
+
+/// Whether it was a signal that took it back. Then the screen stopped because
+/// the session is ending, which is not a failure to report.
+pub(super) fn signalled() -> bool {
+    SIGNALLED.load(Ordering::SeqCst)
 }
 
 /// The viewport moved to `top`: where [`restore`] clears from.
@@ -139,8 +200,23 @@ pub(super) fn detail_open(open: bool) {
 
 /// Take the terminal back from a screen that cannot be waited for.
 pub(super) fn abandon() {
-    restore();
+    // Published first: a thread still taking the terminal sees it, and backs
+    // out, or arms restoration in time for the `restore` below to find it.
     DEAD.store(true, Ordering::SeqCst);
+    restore();
+}
+
+/// Put the terminal back once more after something took it from the screen --
+/// a signal, or a start given up on -- from the screen's own thread once it has
+/// written for the last time. That restoration runs wherever the thread was: a
+/// frame it was in the middle of, or the escapes of a start, land after, and
+/// can leave the viewport drawn over what the session says as it closes, the
+/// cursor hidden, or bracketed paste on. Nothing for a screen that ended on its
+/// own, which the thread leaves as it should be.
+pub(super) fn repair() {
+    if dead() {
+        put_back();
+    }
 }
 
 /// Put the terminal back: out of the alternate screen, with no scroll region,
@@ -150,6 +226,11 @@ fn restore() {
     if !ARMED.swap(false, Ordering::SeqCst) {
         return;
     }
+    put_back();
+}
+
+/// What [`restore`] does, as many times as it is asked to.
+fn put_back() {
     let fd = RESTORE_FD.load(Ordering::SeqCst);
     if fd < 0 {
         return;
@@ -221,7 +302,7 @@ fn hook_panics() {
 }
 
 fn install_handlers() {
-    for (signal, previous) in SIGNALS.iter().zip(&PREVIOUS) {
+    for ((signal, previous), installed) in SIGNALS.iter().zip(&PREVIOUS).zip(&INSTALLED) {
         // SAFETY: `sigaction` reads and writes only the structs passed, which
         // are valid; the handler it installs is async-signal-safe.
         unsafe {
@@ -236,14 +317,19 @@ fn install_handlers() {
             ours.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
             libc::sigemptyset(&mut ours.sa_mask);
             ours.sa_flags = libc::SA_RESTART;
-            libc::sigaction(*signal, &ours, std::ptr::null_mut());
+            if libc::sigaction(*signal, &ours, std::ptr::null_mut()) == 0 {
+                installed.store(true, Ordering::SeqCst);
+            }
         }
     }
 }
 
 fn uninstall_handlers() {
-    for (signal, previous) in SIGNALS.iter().zip(&PREVIOUS) {
-        if let Some(previous) = previous.take() {
+    for ((signal, previous), installed) in SIGNALS.iter().zip(&PREVIOUS).zip(&INSTALLED) {
+        if !installed.swap(false, Ordering::SeqCst) {
+            continue;
+        }
+        if let Some(previous) = previous.get() {
             // SAFETY: as in `install_handlers`.
             unsafe { libc::sigaction(*signal, &previous, std::ptr::null_mut()) };
         }
@@ -251,11 +337,21 @@ fn uninstall_handlers() {
 }
 
 extern "C" fn on_signal(signal: libc::c_int) {
-    restore();
+    // Read before anything is published: the screen's thread stops at `DEAD`
+    // and drops `Raw`, which takes this handler out, and a signal that went
+    // on to look for its predecessor after that -- preempted between the two
+    // -- would find none and end the process by the default action, with the
+    // session's container left running.
     let previous = SIGNALS
         .iter()
         .position(|&ours| ours == signal)
         .and_then(|index| PREVIOUS[index].get());
+    restore();
+    // The terminal is the shell's again, and the session may go on stopping
+    // for a few seconds: nothing draws over it from here. `SIGNALLED` first,
+    // so a thread that sees the screen dead can tell why.
+    SIGNALLED.store(true, Ordering::SeqCst);
+    DEAD.store(true, Ordering::SeqCst);
     // SAFETY: as in `install_handlers`; `raise` is async-signal-safe, and the
     // signal is delivered again once this handler returns, to whatever was
     // there before.
@@ -309,17 +405,44 @@ impl<T: Copy> Saved<T> {
             .load(Ordering::SeqCst)
             .then(|| unsafe { (*self.value.get()).assume_init() })
     }
-
-    fn take(&self) -> Option<T> {
-        let value = self.get();
-        self.set.store(false, Ordering::SeqCst);
-        value
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, PoisonError};
+
     use super::*;
+
+    /// A signal already inside the screen's handler when the screen's thread
+    /// takes it out -- `Raw` dropped as the screen ends -- still looks up what
+    /// to hand the signal to. Taking the handler out must leave that where it
+    /// is, or the signal finds none and ends the process by its default
+    /// action, with the session's container left running (#644).
+    #[test]
+    fn taking_the_handler_out_leaves_its_predecessor_for_a_signal_already_in_it() {
+        // The dispositions are the whole process's.
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _only = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+
+        install_handlers();
+        if !INSTALLED[0].load(Ordering::SeqCst) {
+            // Whoever started the tests ignores SIGTERM: nothing is installed
+            // to take out.
+            return;
+        }
+        let recorded = PREVIOUS[0].get().expect("the predecessor is recorded");
+
+        uninstall_handlers();
+        assert!(!INSTALLED[0].load(Ordering::SeqCst), "the handler is out");
+        let kept = PREVIOUS[0]
+            .get()
+            .expect("the predecessor is still there for a signal already in the handler");
+        assert_eq!(kept.sa_sigaction, recorded.sa_sigaction);
+
+        // Taken out once, it is not taken out again: that would put back a
+        // predecessor that something else has since replaced.
+        uninstall_handlers();
+    }
 
     #[test]
     fn the_row_sequence_counts_from_one() {

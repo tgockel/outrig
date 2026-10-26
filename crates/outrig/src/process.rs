@@ -152,6 +152,9 @@ pub(crate) struct Cmd {
     /// Whether the child leads a process group of its own rather than
     /// joining outrig's. See [`Cmd::in_own_process_group`].
     own_process_group: bool,
+    /// What a failed run's stderr says when its target was already gone.
+    /// See [`Cmd::absent_is_done`].
+    absent: Option<&'static str>,
 }
 
 impl Cmd {
@@ -162,6 +165,7 @@ impl Cmd {
             shown: Vec::new(),
             env: Vec::new(),
             own_process_group: false,
+            absent: None,
         }
     }
 
@@ -215,6 +219,20 @@ impl Cmd {
     pub(crate) fn in_own_process_group(mut self) -> Self {
         self.own_process_group = true;
         self
+    }
+
+    /// Say that a run which fails with `sentinel` in its stderr found nothing
+    /// to remove, which for a removal is the same as having removed it. A
+    /// detached cleanup, whose output is otherwise discarded, reads that
+    /// stderr to tell the two apart; see [`Cmd::absent`].
+    pub(crate) fn absent_is_done(mut self, sentinel: &'static str) -> Self {
+        self.absent = Some(sentinel);
+        self
+    }
+
+    /// The sentinel [`Cmd::absent_is_done`] set.
+    pub(crate) fn absent(&self) -> Option<&'static str> {
+        self.absent
     }
 
     /// The argv as executed. For deciding what runs, never for display.

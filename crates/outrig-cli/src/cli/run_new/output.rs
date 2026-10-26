@@ -74,6 +74,9 @@ enum ToStderr {
     Text(Vec<u8>),
     /// Written as it is, and a failure to is not reported.
     BestEffort(Vec<u8>),
+    /// Written as it is, and a failure to is neither reported nor the end of
+    /// the thread: the first of the conversation's own writes to fail says so.
+    Ignored(Vec<u8>),
     /// Answered once everything queued before it has been written. Nothing
     /// queued after it is, since the thread ends.
     Finish(oneshot::Sender<()>),
@@ -153,6 +156,18 @@ impl Output {
         let _ = self.stderr.send(ToStderr::Text(text.into()));
     }
 
+    /// A way to put lines on stderr's queue from where `self` is not at hand,
+    /// as the start's progress is, which must not write to stderr itself: a
+    /// write there waits on a reader that may have stopped, and the task
+    /// writing is the one that hears a signal. Best effort, as
+    /// [`Output::text_best_effort`] is.
+    pub(super) fn say(&self) -> crate::cli::session_setup::Say {
+        let stderr = self.stderr.clone();
+        std::sync::Arc::new(move |line| {
+            let _ = stderr.send(ToStderr::Ignored(lined(line)));
+        })
+    }
+
     /// `text` on stderr, as it is, for what the session says as it closes. A
     /// write of it that fails says nothing of the conversation, so it is not
     /// reported through [`Failures`].
@@ -200,6 +215,12 @@ impl Output {
         if self.stderr.send(asked).is_ok() {
             let _ = written.await;
         }
+    }
+
+    /// Wait for what is queued for stderr to be written, or for its thread to
+    /// stop: what the session said before it took the terminal for itself.
+    pub(super) async fn drained(&self) {
+        self.drain_stderr(false).await;
     }
 
     /// Wait for what is queued to be written: stderr's, and stdout's too
@@ -288,6 +309,10 @@ fn serve_stderr(
         }
         let written = match item {
             ToStderr::Text(text) => write_whole(&mut out, &text, serial),
+            ToStderr::Ignored(text) => {
+                let _ = write_whole(&mut out, &text, serial);
+                Ok(())
+            }
             ToStderr::BestEffort(text) => {
                 if write_whole(&mut out, &text, serial).is_err() {
                     return;
@@ -577,6 +602,42 @@ mod tests {
         .expect("threads");
         out.text("note\n");
         let failed = failures.recv().await.expect("the write failed");
+        assert_eq!(failed.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// What the start says goes on stderr's queue and is not written by the
+    /// task that says it, so a stderr that has stopped does not keep that task
+    /// from hearing a signal (#644).
+    #[tokio::test]
+    async fn saying_does_not_wait_on_a_stuck_stderr() {
+        let log = Log::default();
+        let stderr = Gate::shut("E", &log);
+        let (out, _failures) = start(&Gate::open("O", &log), &stderr);
+
+        let say = out.say();
+        say("first");
+        stderr.reached(1);
+        say("second");
+        stderr.let_through();
+        out.finish(pending::<()>()).await;
+        assert_eq!(written(&log), ["E:first\n", "E:second\n"]);
+    }
+
+    /// What the start says is not the conversation's: a write of it that
+    /// fails is ignored, and the thread goes on, so the first write of the
+    /// conversation's own to fail is the one that says so (#644).
+    #[tokio::test]
+    async fn a_failed_startup_write_leaves_the_thread_to_report_the_next() {
+        let (out, mut failures) = Output::spawn(
+            Gate::open("O", &Log::default()),
+            Broken(io::ErrorKind::BrokenPipe),
+            false,
+        )
+        .expect("threads");
+
+        out.say()("banner");
+        out.text("note\n");
+        let failed = failures.recv().await.expect("the conversation's write failed");
         assert_eq!(failed.kind(), io::ErrorKind::BrokenPipe);
     }
 

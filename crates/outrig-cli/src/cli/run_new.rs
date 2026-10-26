@@ -32,6 +32,7 @@
 //! sent each other. Anywhere else it is plain lines, as `converse` describes.
 
 use std::fs::File;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -47,9 +48,10 @@ use outrig::image::{self, BuildOutput, ImageTag};
 use outrig::LaunchSpec;
 
 use crate::builtin_image;
-use crate::cli::eprint_best_effort;
 use crate::cli::report::{Summary, render_report, summarize};
-use crate::cli::session_setup::ProgressSpan;
+use crate::cli::log_divert::LogWriter;
+use crate::cli::session_setup::{ProgressSpan, Say};
+use crate::cli::signals::{EndSignal, Signals, session_ending_line};
 use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{
     RepoConfig, default_session_root, refuse_home_workspace, refuse_repo_declared_mounts,
@@ -57,7 +59,7 @@ use crate::paths::{
 };
 use crate::session::{self, Session, SessionId, SessionStore, resolve_session_root};
 
-use self::converse::{Frontend, Interrupts};
+use self::converse::{Conversed, Frontend, Interrupts};
 use self::output::{Failures, Output};
 use self::screen::{Screen, Started};
 
@@ -65,6 +67,12 @@ mod approve;
 mod converse;
 mod output;
 mod screen;
+
+/// How long what the start said is waited for before the screen takes the
+/// terminal. The screen draws on `/dev/tty` apart from `Output`'s writers, so
+/// a banner still being written would land on its first frame; past this, the
+/// session is in plain lines instead.
+const HANDOFF_GRACE: Duration = Duration::from_secs(2);
 
 /// How long, once the session is stopped and its record finished, the report
 /// is waited for. A destination that has stopped -- a pager paused, a pipe
@@ -136,11 +144,19 @@ pub async fn execute(
     // terminal sees each submission through a subscription of its own, and
     // the event log is a second one when the user asked for it.
     let agent_name = args.agent.clone().or_else(|| cfg.default_agent.clone());
+    // Made before the container starts, so a process that cannot start its
+    // threads fails with nothing left to stop. The conversation writes through
+    // it, and so do the start's own progress, the banner, the closing line and
+    // the report, in turn with what the agent sends: the task that starts the
+    // session is the one that hears a signal, and a write of its own to a
+    // stderr whose reader has stopped would hold it up for good.
+    let (out, mut failures) = Output::stdio()?;
+    let say = out.say();
     let mut builder = SessionBuilder::new(cfg.clone(), agent_name.as_deref(), args.model.as_deref())
         .secrets(EnvSecrets)
         .repo_root(&repo_root)
         .approver(approve::TerminalApprover)
-        .progress(progress_lines())
+        .progress(progress_lines(say.clone()))
         .skill_source("project", DirectorySource::within(&repo_root, SKILLS_DIR));
     let home = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     if let Some(home) = user_skills_home(&repo_root, home) {
@@ -168,6 +184,16 @@ pub async fn execute(
         &cfg,
         &default_session_root(),
     ));
+    // Installed before anything a signal could orphan exists, as `run`'s
+    // setup installs them: from here SIGINT, SIGTERM and SIGHUP are never at
+    // their default disposition, so none of them can kill outrig with a
+    // container started and a record unfinished. SIGINT is the conversation's
+    // own once it begins -- a Ctrl-C there stops the round, not the session --
+    // and a listener that nobody polls keeps the signal for the next wait that
+    // does, never the default action.
+    let mut signals = Signals::install()?;
+    // Asked now, while a terminal cannot yet have hung up; see [`Terminals`].
+    let terminals = Terminals::now();
     let sid = SessionId::new();
     // Held until this returns: the directory is this invocation's from here.
     let (_reserved, log_dir) = reserve_session_dir(&store, &sid, args.session_dir.as_deref())?;
@@ -186,48 +212,70 @@ pub async fn execute(
         exit_code: None,
         link_target: None,
     };
-    // Made before the container starts, so a process that cannot start its
-    // threads fails with nothing left to stop. The conversation writes through
-    // it, and so do the closing line and the report, in turn with what the
-    // agent sends. The banner and the report of a failed start are written
-    // directly: nothing is queued on it yet, so nothing is being written to
-    // compete with them.
-    let (out, mut failures) = Output::stdio()?;
-    let started = start(Start {
-        builder,
-        cfg: &cfg,
-        image_cfg_name: &image_cfg_name,
-        image_cfg,
-        repo_root: &repo_root,
-        log_dir,
-        record: &mut session,
-    })
-    .await;
+    // Log records go the same way while the start runs, until the screen
+    // diverts them to itself.
+    // Held to the end of the session, and what the screen diverts after goes
+    // back to it, never to a write to stderr that waits on its reader.
+    let _logs = LogWriter::global().divert({
+        let say = say.clone();
+        move |record| say(&record.text)
+    });
+    // Raced, as `run`'s setup races its own: a signal here drops the start,
+    // and what it had made -- a build's working containers, a container
+    // already up -- is removed on the way out rather than left behind. What
+    // the signal says is queued on `out` and not written here: a build's own
+    // output can be stuck writing to a stderr nobody reads, holding the stream
+    // a write from here would wait for, and this is where the start is
+    // dropped from.
+    let started = signals
+        .race_settled_saying(
+            start(Start {
+                builder,
+                cfg: &cfg,
+                image_cfg_name: &image_cfg_name,
+                image_cfg,
+                repo_root: &repo_root,
+                log_dir,
+                record: &mut session,
+                say: &say,
+            }),
+            |line| out.text_best_effort(format!("{line}\n")),
+        )
+        .await;
 
     // Written only now, once the container runs under the name recorded. A
     // session that failed to start is recorded too, and at once finalized, so
     // it is never a live record without a container.
     if let Err(e) = store.create_prepared(&sid, args.session_dir.as_deref(), &mut session) {
         let Ok(running) = started else {
+            out.finish(tokio::time::sleep(REPORT_GRACE)).await;
             return Err(e);
         };
         let summary = summarize(&running.shutdown(DEFAULT_DRAIN).await);
         if summary.verdict != Verdict::Clean {
-            eprint_best_effort(&render_report(&summary));
+            say(&render_report(&summary));
         }
-        return outcome_of(Err(e), &summary);
+        // After the record is as it will be, as for any other end.
+        out.finish(tokio::time::sleep(REPORT_GRACE)).await;
+        // No conversation ran, so no signal ended one.
+        return outcome_of(Err(e), &summary, None);
     }
     let mut running = match started {
         Ok(running) => running,
         Err(e) => {
-            let _ = store.finalize(&sid, SystemTime::now(), 1);
+            // The signal's status for a start a signal ended, so the record
+            // says what the process exits with, as a finished session's does.
+            let _ = store.finalize(&sid, SystemTime::now(), e.exit_code());
+            // After the record, so a destination that has stopped delays
+            // what the signal said and not the exit.
+            out.finish(tokio::time::sleep(REPORT_GRACE)).await;
             return Err(e);
         }
     };
 
     // What is said from here on is best effort: a stderr whose reader has gone
     // must not skip the stop and the record that follow.
-    eprint_best_effort(&render_banner(&Banner {
+    say(&render_banner(&Banner {
         image_config_row: builtin_image::banner_image_config_row(&image_cfg_name, builtin_default),
         image_tag: &session.image_tag,
         model: running.model().unwrap_or_default(),
@@ -236,20 +284,41 @@ pub async fn execute(
         session_id: sid.as_str(),
     }));
 
-    let conversed = conversation(&mut running, &mut shown, &out, &mut failures, verbose > 0).await;
+    let conversed = conversation(
+        &mut running,
+        &mut shown,
+        &out,
+        &mut failures,
+        &mut signals,
+        verbose > 0,
+    )
+    .await;
+    // A hangup that surfaced as a failed read or write, or as input ending,
+    // is the signal's, wherever in the conversation it did.
+    let conversed = conversed.reconciled(&mut failures);
+    // The signal that ended the conversation, if one did: the session stops
+    // as it does for `/quit`, and the status it exits with is the signal's,
+    // whatever else went wrong on the way.
+    let signalled = hangup_behind(conversed.signal, terminals);
 
-    // Said first, since stopping can take a few seconds and a Ctrl-C there
+    // Said after the screen has given the terminal back, which it drew over
+    // and cleared, so a signal's notice is not lost with the screen; said
+    // first here, since stopping can take a few seconds and a Ctrl-C there
     // does nothing. Queued, not written here: with stdout and stderr one pipe,
     // a write waits for the message being written to it, and for as long as
     // nobody reads the pipe, which the stop must not wait for.
+    if let Some(sig) = signalled {
+        out.text_best_effort(session_ending_line(sig));
+    }
     out.text_best_effort("[outrig] closing the session\n");
     let report = running.shutdown(DEFAULT_DRAIN).await;
     let summary = summarize(&report);
     out.text_best_effort(render_report(&summary));
     // `/quit` did not wait for what the conversation had queued, so a write of
     // it that has failed since, as the stop ran, fails the session here.
-    let conversed = converse::reconcile(conversed, &mut failures);
-    let outcome = outcome_of(conversed, &summary);
+    let conversed = conversed.reconciled(&mut failures);
+    let signalled = hangup_behind(signalled, terminals);
+    let outcome = outcome_of(conversed.result, &summary, signalled);
     // The status the process exits with, so the record never says otherwise.
     let exit = outcome
         .as_ref()
@@ -262,6 +331,57 @@ pub async fn execute(
     // written, and the `error:` line printed once this returns follows it.
     out.finish(tokio::time::sleep(REPORT_GRACE)).await;
     outcome
+}
+
+/// A standard stream, as [`Terminals`] asks about it.
+trait Stream: IsTerminal + std::os::fd::AsRawFd {}
+impl<T: IsTerminal + std::os::fd::AsRawFd> Stream for T {}
+
+/// Which of stdin, stdout and stderr were this process's controlling terminal
+/// when the session began.
+///
+/// A terminal that closes is hung up before anything blocked on it is woken:
+/// every descriptor open on it fails its reads, writes and ioctls from then on,
+/// and `isatty` says it is no terminal. So a descriptor that was the
+/// controlling terminal and is not has certainly hung up, whether or not its
+/// SIGHUP has been heard yet -- a read or write can fail with `EIO`, or a read
+/// end as input ending, before it -- and the session ends as that signal ends
+/// it. Nothing is waited for.
+///
+/// Only the controlling terminal: its hangup is what sends this process
+/// SIGHUP. Another terminal a stream was redirected to hangs up on its own
+/// session, and a pipe that closes, or input ending on a terminal that has not,
+/// is not a hangup at all.
+#[derive(Clone, Copy)]
+struct Terminals([bool; 3]);
+
+impl Terminals {
+    fn now() -> Self {
+        Self::of(
+            [&std::io::stdin() as &dyn Stream, &std::io::stdout(), &std::io::stderr()],
+            |stream| crate::repl::is_controlling_tty(&stream.as_raw_fd()),
+        )
+    }
+
+    fn of(streams: [&dyn Stream; 3], controlling: impl Fn(&dyn Stream) -> bool) -> Self {
+        Self(streams.map(|stream| stream.is_terminal() && controlling(stream)))
+    }
+
+    /// Whether a stream that was the controlling terminal has hung up. The
+    /// streams are the same three, asked again.
+    fn hung_up(&self, streams: [&dyn Stream; 3]) -> bool {
+        self.0
+            .iter()
+            .zip(streams)
+            .any(|(was, now)| *was && !now.is_terminal())
+    }
+}
+
+/// The signal that ended the conversation: the one it returned or, failing
+/// that, the SIGHUP a controlling terminal that has hung up sends.
+fn hangup_behind(signal: Option<EndSignal>, started: Terminals) -> Option<EndSignal> {
+    let streams: [&dyn Stream; 3] = [&std::io::stdin(), &std::io::stdout(), &std::io::stderr()];
+    signal.or_else(|| started.hung_up(streams).then_some(EndSignal::Hangup))
 }
 
 /// Where skills live, beneath a repository and beneath a home directory.
@@ -289,13 +409,40 @@ async fn conversation(
     shown: &mut harness::event::Subscription,
     out: &Output,
     failures: &mut Failures,
+    signals: &mut Signals,
     verbose: bool,
-) -> Result<()> {
+) -> Conversed {
     // Before the screen takes the terminal, which turns Ctrl-C into a key.
-    let mut interrupts = Interrupts::new()?;
-    let started = if screen::wanted() {
-        Screen::start(verbose)
-            .await
+    let mut interrupts = match Interrupts::new() {
+        Ok(interrupts) => interrupts,
+        Err(e) => return Conversed::failed(e.into()),
+    };
+    let handed = if screen::wanted() {
+        match handed_off(out, signals).await {
+            Ok(handed) => handed,
+            Err(sig) => {
+                return Conversed {
+                    signal: Some(sig),
+                    result: Ok(()),
+                };
+            }
+        }
+    } else {
+        false
+    };
+    let started = if handed {
+        // Raced: the screen's first write can wait on a terminal that has
+        // stopped reading, and a signal must still reach the stop.
+        let start = Screen::start(verbose);
+        tokio::pin!(start);
+        let start = tokio::select! {
+            start = &mut start => start,
+            sig = signals.termination() => {
+                screen::give_up(start).await;
+                return Conversed { signal: Some(sig), result: Ok(()) };
+            }
+        };
+        start
             .inspect_err(|e| {
                 tracing::debug!(target: "outrig::cli::run_new", "no screen, reading plain lines: {e}");
             })
@@ -310,7 +457,10 @@ async fn conversation(
         failures: mut drawn,
     }) = started
     else {
-        let typed = converse::read_lines()?;
+        let typed = match converse::read_lines() {
+            Ok(typed) => typed,
+            Err(e) => return Conversed::failed(e.into()),
+        };
         return converse::converse(
             running,
             shown,
@@ -318,6 +468,7 @@ async fn conversation(
             typed,
             &mut interrupts,
             failures,
+            signals,
         )
         .await;
     };
@@ -329,10 +480,23 @@ async fn conversation(
         typed,
         &mut interrupts,
         &mut drawn,
+        signals,
     )
     .await;
+    // The terminal is the shell's again from here, so what the session says
+    // as it closes -- the signal's notice, the report -- is written below the
+    // conversation rather than drawn over by the screen.
     screen.finish().await;
-    converse::reconcile(conversed, &mut drawn)
+    conversed.reconciled(&mut drawn)
+}
+
+/// Whether what the start said has been written, so the screen may take the
+/// terminal; or the signal that ended the wait.
+async fn handed_off(out: &Output, signals: &mut Signals) -> std::result::Result<bool, EndSignal> {
+    tokio::select! {
+        drained = tokio::time::timeout(HANDOFF_GRACE, out.drained()) => Ok(drained.is_ok()),
+        sig = signals.termination() => Err(sig),
+    }
 }
 
 /// What [`execute`] returns once the session is stopped: the status its report
@@ -341,10 +505,22 @@ async fn conversation(
 /// except that a stop not proven outranks it, as it does everything in
 /// [`exit_status`] -- a script reading the status must still be told that
 /// something may be running.
-fn outcome_of(ended: Result<()>, summary: &Summary) -> Result<i32> {
+///
+/// A session a signal ended exits with the signal's own 128 plus its number,
+/// as it would had the signal killed outrig outright, and as `run` and `mcp`
+/// do; a stop not proven still outranks it. The signal is not an error: the
+/// session was asked to end and did, so nothing is printed for it beyond the
+/// notice already given. Nor does an error take its status: a write that
+/// failed as the session closed is still printed, and the session exits as
+/// it was asked to, since the stop it proved is the same.
+fn outcome_of(ended: Result<()>, summary: &Summary, signalled: Option<EndSignal>) -> Result<i32> {
     let status = exit_status(summary);
+    let status = match signalled {
+        Some(sig) if status != 3 => sig.exit_code(),
+        _ => status,
+    };
     match ended {
-        Err(e) if status == 3 => Err(e.with_status(status)),
+        Err(e) if status == 3 || signalled.is_some() => Err(e.with_status(status)),
         other => other.map(|()| status),
     }
 }
@@ -366,11 +542,11 @@ fn exit_status(summary: &Summary) -> i32 {
 
 /// The two lines the start prints for each of its steps, as each begins and
 /// ends.
-fn progress_lines() -> impl FnMut(Progress) + Send + 'static {
+fn progress_lines(say: Say) -> impl FnMut(Progress) + Send + 'static {
     let mut span = None;
     move |progress| match progress {
         Progress::Started(step) => {
-            span = Some(ProgressSpan::start(match step {
+            span = Some(ProgressSpan::start_saying(&say, match step {
                 Step::Packages => "installing binding packages",
                 Step::Bindings => "starting bindings",
                 Step::Container => "starting container",
@@ -492,6 +668,8 @@ struct Start<'a> {
     log_dir: PathBuf,
     /// Filled in with the image tag and the container name as each is learned.
     record: &'a mut Session,
+    /// Where the start's progress is said.
+    say: &'a Say,
 }
 
 /// Ensure the image, then start the session in it. On failure nothing is left
@@ -505,6 +683,7 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
         repo_root,
         log_dir,
         record,
+        say,
     } = args;
 
     // Ensured here, under the image-config's name as `run` and `build` do,
@@ -512,7 +691,7 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
     // would build a Dockerfile under a nameless tag of its own. A cache miss
     // shows its build as it runs, as `run`'s does, so minutes of building do
     // not read as a hang.
-    let span = ProgressSpan::start(format!("ensuring image for {image_cfg_name}"));
+    let span = ProgressSpan::start_saying(say, format!("ensuring image for {image_cfg_name}"));
     let tag = image::compute_tag_for(image_cfg_name, image_cfg, repo_root).await?;
     let image = image::ensure_tagged_image_for_with_output(
         image_cfg_name,
@@ -534,10 +713,10 @@ async fn start(args: Start<'_>) -> Result<harness::Session> {
     let (spec, skipped) =
         launch_spec(cfg, image_cfg_name, &image.tag, repo_root, log_dir, &record.id).await?;
     if !skipped.is_empty() {
-        eprintln!(
+        say(&format!(
             "[outrig] run-new starts no MCP servers; not started: {}",
             skipped.join(", ")
-        );
+        ));
     }
 
     let session = builder.container(spec).start().await?;
@@ -598,6 +777,35 @@ fn render_banner(banner: &Banner<'_>) -> String {
 mod tests {
     use super::*;
     use outrig::EmbeddedMcpPolicy;
+
+    /// A controlling terminal whose other end closed is no longer one, and
+    /// that is the whole of what says it hung up: not a pipe that closes, not
+    /// a terminal that is merely quiet, and not another terminal a stream was
+    /// redirected to, whose hangup is its own session's (#644).
+    #[test]
+    fn only_a_controlling_terminal_that_closed_has_hung_up() {
+        let pty = nix::pty::openpty(None, None).expect("a pty");
+        let slave = File::from(pty.slave);
+        let all = || [&slave as &dyn Stream, &slave, &slave];
+        let controlling = Terminals::of(all(), |_| true);
+        let unrelated = Terminals::of(all(), |stream| {
+            crate::repl::is_controlling_tty(&stream.as_raw_fd())
+        });
+        assert!(!controlling.hung_up(all()), "a quiet terminal");
+
+        let (read, write) = std::io::pipe().expect("a pipe");
+        let write = File::from(std::os::fd::OwnedFd::from(write));
+        let on_a_pipe = Terminals::of([&write, &write, &write], |_| true);
+        drop(read);
+        assert!(!on_a_pipe.hung_up([&write, &write, &write]), "a pipe");
+
+        drop(pty.master);
+        assert!(controlling.hung_up(all()), "a hung-up controlling terminal");
+        assert!(
+            !unrelated.hung_up(all()),
+            "a terminal that is not this process's own"
+        );
+    }
 
     /// The user's skills are served after the project's, from the home directory, unless the
     /// repository is the home directory -- reached through a link or not -- whose
@@ -729,7 +937,7 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
     fn an_error_exits_3_only_when_the_stop_is_not_proven() {
         let text = failed().expect_err("it failed").to_string();
 
-        let stuck = outcome_of(failed(), &summary(Verdict::NotProvenStopped))
+        let stuck = outcome_of(failed(), &summary(Verdict::NotProvenStopped), None)
             .expect_err("the conversation's error is returned");
         assert_eq!(stuck.exit_code(), 3);
         assert_eq!(stuck.to_string(), text, "the error is printed as it was");
@@ -739,10 +947,67 @@ fs    = { command = ["mcp-fs"], sidecar = "tools" }
             summary(Verdict::StoppedWithUnknown),
             died(Verdict::Clean),
         ] {
-            let err = outcome_of(failed(), &other).expect_err("the error is returned");
+            let err = outcome_of(failed(), &other, None).expect_err("the error is returned");
             assert_eq!(err.exit_code(), 1, "{other:?}");
             assert_eq!(err.to_string(), text);
         }
+    }
+
+    /// A signal that ended the session decides the status, as it does for
+    /// `run` and `mcp`: 128 plus its number, and the record keeps the same.
+    /// It is not an error, so nothing is printed for it.
+    #[test]
+    fn a_signal_exits_128_plus_its_number() {
+        for (sig, code) in [
+            (EndSignal::Hangup, 129),
+            (EndSignal::Interrupt, 130),
+            (EndSignal::Terminate, 143),
+        ] {
+            let status = outcome_of(Ok(()), &summary(Verdict::Clean), Some(sig))
+                .expect("a signal is not an error");
+            assert_eq!(status, code, "{sig}");
+        }
+        // The session did stop cleanly, so what the report found is the
+        // signal's status and not the report's 0.
+        assert_eq!(exit_status(&summary(Verdict::Clean)), 0);
+    }
+
+    /// A write that failed as the signalled session closed is still its
+    /// error, printed as it was, but the session leaves as it was asked to:
+    /// the stop it proved is the same, so the process and the record keep the
+    /// signal's status and not the error's 1.
+    #[test]
+    fn a_signal_keeps_its_status_when_a_write_failed() {
+        let text = failed().expect_err("it failed").to_string();
+        for (sig, code) in [(EndSignal::Hangup, 129), (EndSignal::Terminate, 143)] {
+            for proven in [summary(Verdict::Clean), summary(Verdict::StoppedWithUnknown)] {
+                let err = outcome_of(failed(), &proven, Some(sig))
+                    .expect_err("the write's error is still returned");
+                assert_eq!(err.exit_code(), code, "{sig}: {proven:?}");
+                assert_eq!(err.to_string(), text, "the error is printed as it was");
+            }
+        }
+    }
+
+    /// A stop not proven outranks the signal: a script reading the status
+    /// must still be told that something may be running.
+    #[test]
+    fn a_stop_not_proven_outranks_a_signal() {
+        let status = outcome_of(
+            Ok(()),
+            &summary(Verdict::NotProvenStopped),
+            Some(EndSignal::Terminate),
+        )
+        .expect("no error cut it short");
+        assert_eq!(status, 3);
+
+        let stuck = outcome_of(
+            failed(),
+            &summary(Verdict::NotProvenStopped),
+            Some(EndSignal::Terminate),
+        )
+        .expect_err("the error is still returned");
+        assert_eq!(stuck.exit_code(), 3);
     }
 
     /// What a person needs before typing: the model, and that Python is ready

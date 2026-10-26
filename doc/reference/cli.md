@@ -319,11 +319,14 @@ outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--ver
   spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
 - The configuration is loaded and validated once, from the invocation's directory as for every
   command, before the program starts. The program reads it as `outrig.config()`.
-- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group. The
-  first starts the program's grace, `--grace` seconds -- else `[host] grace-secs`, else 5, at
-  most 3600 -- not counting time spent shutting down a session the program asked to shut down.
-  Past it, or at a second signal, the program's group gets `SIGTERM`, then `SIGKILL` five seconds
-  later; a further signal sends `SIGKILL` at once. `--grace` is refused without a script.
+- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group, and
+  so is a `SIGHUP` -- a closed terminal, a CI timeout -- which reaches the program as the
+  `SIGTERM` it asks for. The first starts the program's grace, `--grace` seconds -- else
+  `[host] grace-secs`, else 5, at most 3600 -- not counting time spent shutting down a session the
+  program asked to shut down. Past it, or at a second signal, the program's group gets `SIGTERM`,
+  then `SIGKILL` five seconds later; a further signal sends `SIGKILL` at once. None of the three
+  ends `outrig` where it stands, which would leave the sessions the program opened running.
+  `--grace` is refused without a script.
 - Each session the program leaves open -- it exits, raises, is killed or is stopped -- is shut
   down, its report printed on stderr under a line naming it; one it was still entering has its
   start stopped, with one line saying so. `outrig` exits once each is stopped.
@@ -528,7 +531,8 @@ work, and Up and Down recall what you sent, kept in memory and never written to 
 clears the box when something is typed in it, and is otherwise the Ctrl-C described below.
 Ctrl-D at an empty box ends input, and Ctrl-Z suspends `run-new` as it would any program. A byte
 that is not UTF-8 is dropped as it is typed, and becomes U+FFFD in a paste. SIGTERM and SIGHUP
-end `run-new` as they do without the screen, and the terminal is put back first.
+end the session as they do without the screen, and the terminal is put back first, so what the
+session says as it stops is written below the conversation rather than drawn over.
 
 With stdin or stdout piped or redirected, on a terminal other than the one it was started from,
 or with `TERM` set to `dumb`, `cons25`, or `emacs`, `run-new` reads and writes plain lines, as
@@ -570,10 +574,11 @@ Besides `/help`, `/quit`, and a directive naming one of the session's skills, a 
 session carries on; the messages it had not read are still waiting, so a line typed next is
 announced with them.
 
-**Leaving.** `/quit`, the end of input, and a second Ctrl-C at the prompt each close the session
-to new work, then stop it: Python still running, and calls into bindings, are given five seconds
-to finish; Python is then interrupted, the bindings process is stopped with everything it started,
-and the container is stopped, which ends whatever an interrupt could not. A round running at
+**Leaving.** `/quit`, the end of input, a second Ctrl-C at the prompt, and a `SIGTERM` or
+`SIGHUP` from anywhere each close the session to new work, then stop it: Python still running,
+and calls into bindings, are given five seconds to finish; Python is then interrupted, the
+bindings process is stopped with everything it started, and the container is stopped, which ends
+whatever an interrupt could not. A round running at
 `/quit` is dropped; one still running when input ends is let finish first. `run-new` then prints
 what the stop found -- whether everything stopped, how each execution that was running ended,
 `ok`, `error`, or `unknown` for one cut off, and how each call into a binding that ended after
@@ -585,10 +590,23 @@ the close ended -- and exits with the status it decides:
 | 2      | Everything stopped, and some Python or binding call was cut off: it may have acted. |
 | 3      | Something could not be confirmed stopped, and may still be running.                 |
 
+A `SIGTERM` or `SIGHUP` -- a `kill`, a CI timeout, a closed terminal -- ends the session this
+way wherever it lands, startup included: the session is stopped and reported as for `/quit`, its
+record is finalized, and the status is the signal's own `143` or `129`, as for `run` and `mcp`,
+except that a stop not proven outranks it with `3`. A signal during startup stops what had been
+started and exits the same way, including at the question about a binding a repository declared,
+which nobody has to answer, but with `3` if removing what it had started is not proven. Stderr
+says which signal it was.
+
+Nothing is waited for once a signal has asked for the session to end: not the agent's messages
+that were queued for a stdout or stderr that has stopped, and not the end of input's own wait for
+them, which a signal ends as a Ctrl-C does. A write that fails as the session closes is still
+printed after the report, but the status stays the signal's.
+
 Neither the closing line, `[outrig] closing the session`, nor the report is waited for before the
 stop starts, and neither makes the session fail if it cannot be written. If nothing is reading a
-pipe that carries stdout and stderr, the session is still stopped and its record finished, and
-`run-new` then waits five seconds for the report before it exits.
+pipe that carries stdout and stderr, or stderr alone, the session is still stopped and its record
+finished, and `run-new` then waits five seconds for the report before it exits.
 
 If the interpreter exits -- Python that calls `os._exit`, say -- nothing typed could reach the
 agent any more, and the session ends, through the same report, with exit status 1, or 3 if the
@@ -905,7 +923,10 @@ only thing keeping it away from a build in flight.
 
 Once `outrig run` or `outrig mcp` has written its session record, it catches all three signals:
 it stops the session's containers and finalizes the record, which keeps the same code, before it
-exits. `outrig mcp` exits `0` on a signal once its startup has finished; see
+exits. `outrig run-new` does the same from before it starts anything, taking SIGINT only until
+its conversation begins, where Ctrl-C is the conversation's own. A host program's `outrig run`
+forwards all three to the program rather than exiting on one, and the status is the program's.
+`outrig mcp` exits `0` on a signal once its startup has finished; see
 [`outrig mcp`](#outrig-mcp). `outrig image build` catches them once it starts its validation
 container, and stops that container before it exits.
 

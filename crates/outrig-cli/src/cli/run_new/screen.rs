@@ -65,7 +65,7 @@ use self::facts::Fact;
 use self::render::Theme;
 use self::status::Status;
 use self::transcript::{Entry, Kind, Transcript};
-use self::tty::Raw;
+use self::tty::{Held, Raw};
 use self::viewport::{Panel, Viewport};
 use super::output::{Failures, OUTBOX, same_destination};
 use crate::cli::log_divert::{Diverted, LogWriter};
@@ -81,6 +81,29 @@ const FINISH_GRACE: Duration = Duration::from_secs(2);
 
 /// Lines typed, as they reach the conversation's loop.
 pub(super) type Typed = mpsc::UnboundedReceiver<io::Result<String>>;
+
+/// How long a start given up on is waited for, once the terminal is put back,
+/// to be done with it: past that, it is stuck on a terminal that stopped
+/// reading, and the session goes on without it.
+const GIVE_UP_GRACE: Duration = Duration::from_millis(500);
+
+/// The start was given up on, as a signal ended the wait for it: put the
+/// terminal back, and have the thread stop at its next look. Then wait up to
+/// [`GIVE_UP_GRACE`] for `start`, which the thread answers once its last write
+/// is made, so that what the session says next is not met by one.
+pub(super) async fn give_up(start: impl Future<Output = io::Result<Started>>) {
+    tty::abandon();
+    // The thread's answer: failed, with the terminal repaired, or opened before
+    // it saw the terminal taken, and then asked to finish.
+    if let Ok(Ok(mut started)) = tokio::time::timeout(GIVE_UP_GRACE, start).await {
+        started.screen.finish().await;
+    }
+}
+
+/// Whether a signal took the terminal back from the screen.
+pub(super) fn signalled() -> bool {
+    tty::signalled()
+}
 
 /// Whether `run-new` takes the terminal: stdin is the controlling terminal and
 /// one rustyline would drive, and stdout is the same terminal. stdout must be,
@@ -290,6 +313,12 @@ impl Screen {
     /// Show what is left and give the terminal back, waiting for the thread
     /// no longer than [`FINISH_GRACE`]; past that, the terminal is put back
     /// from here. Log records go to stderr again after.
+    ///
+    /// A signal that has put the terminal back is waited out as well: that
+    /// the terminal is the shell's says nothing of whether the thread has
+    /// drawn its last frame, and what the session writes next, as it closes,
+    /// must not meet one. It stops at its next look, a tick away, and repairs
+    /// what it drew in the meantime.
     pub(super) async fn finish(&mut self) {
         if std::mem::replace(&mut self.finished, true) {
             return;
@@ -337,16 +366,35 @@ fn serve(
     let mut terminal = match Terminal::open(tty, links, typed, verbose) {
         Ok(terminal) => terminal,
         Err(e) => {
+            // A start given up on may have written after what put the
+            // terminal back.
+            tty::repair();
             let _ = ready.send(Err(e));
             return;
         }
     };
     let _ = ready.send(Ok(()));
     let ran = panic::catch_unwind(AssertUnwindSafe(|| terminal.run()));
+    let ran = unless_taken_back(ran, tty::dead());
     if let Some(e) = failure(ran) {
         let _ = terminal.links.failed.send(e);
     }
     terminal.close();
+}
+
+/// `ran`, but for an error: a write that failed because the terminal was taken
+/// back -- by a signal, after the frame's last look -- is the screen being
+/// stopped, not failing, and reported would outrank the signal's exit status.
+/// A panic is not this: it is the `Err` of `ran`, and is reported whatever took
+/// the terminal.
+fn unless_taken_back(
+    ran: thread::Result<io::Result<()>>,
+    taken_back: bool,
+) -> thread::Result<io::Result<()>> {
+    match ran {
+        Ok(Err(_)) if taken_back => Ok(Ok(())),
+        ran => ran,
+    }
 }
 
 /// What a thread of the screen's ended on, if not on being done.
@@ -428,6 +476,8 @@ struct Keyboard {
 impl Keyboard {
     /// Read keys until told to stop, or until the terminal was taken back.
     fn run(&mut self) -> io::Result<()> {
+        // `tty::dead` ends this too: a signal that put the terminal back left
+        // it un-raw, where a key read means nothing.
         while !self.stop.load(Ordering::SeqCst) && !tty::dead() {
             if !event::poll(TICK)? {
                 continue;
@@ -589,7 +639,7 @@ struct Detail {
 }
 
 struct Terminal {
-    out: CrosstermBackend<BufWriter<File>>,
+    out: CrosstermBackend<BufWriter<Held>>,
     raw: Raw,
     viewport: Viewport,
     detail: Option<Detail>,
@@ -617,7 +667,7 @@ impl Terminal {
         typed: mpsc::UnboundedSender<io::Result<String>>,
         verbose: bool,
     ) -> io::Result<Self> {
-        let mut out = CrosstermBackend::new(BufWriter::new(tty));
+        let mut out = CrosstermBackend::new(BufWriter::new(Held::new(tty)));
         let raw = Raw::enter(&mut out)?;
         let editor = Editor::default();
         let layout = render::layout(&editor, out.size()?.width);
@@ -653,6 +703,13 @@ impl Terminal {
     fn run(&mut self) -> io::Result<()> {
         loop {
             if tty::dead() {
+                // A signal put the terminal back and the session is ending:
+                // the screen is done, not failed. Reported as a failure it
+                // would become the session's error and outrank the signal's
+                // own exit status.
+                if tty::signalled() {
+                    return Ok(());
+                }
                 return Err(io::Error::other("the screen stopped after a panic"));
             }
             self.heed()?;
@@ -778,6 +835,11 @@ impl Terminal {
 
     /// Draw a frame, if anything changed.
     fn show(&mut self) -> io::Result<()> {
+        // A signal may have put the terminal back since the loop last looked,
+        // while this thread waited for a key: nothing is drawn over it.
+        if tty::dead() {
+            return Ok(());
+        }
         if std::mem::take(&mut self.resized) {
             match &mut self.detail {
                 Some(detail) => {
@@ -932,6 +994,12 @@ impl Terminal {
                 Ok(())
             })();
         }
+        // Queued escapes the dead-state checks kept from being flushed would
+        // otherwise be written as `out` drops, after the repair.
+        let _ = self.out.flush();
+        // After the last write there will be: whatever a signal's restore
+        // met this thread in the middle of is put right.
+        tty::repair();
         if let Some(done) = self.finish.take() {
             let _ = done.send(());
         }
@@ -971,6 +1039,18 @@ fn rows_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write refused because a signal took the terminal back is the screen
+    /// stopping, so the session keeps the signal's exit status (#644); a write
+    /// that failed on its own, or a panic, is still a failure.
+    #[test]
+    fn a_write_refused_after_the_terminal_was_taken_back_is_not_a_failure() {
+        let refused = || Ok(Err(io::Error::other("refused")));
+        assert!(failure(unless_taken_back(refused(), true)).is_none());
+        assert!(failure(unless_taken_back(refused(), false)).is_some());
+        let panicked = Err(Box::new("boom") as Box<dyn std::any::Any + Send>);
+        assert!(failure(unless_taken_back(panicked, true)).is_some());
+    }
 
     #[test]
     fn the_screen_wants_stdin_and_stdout_on_the_controlling_terminal() {

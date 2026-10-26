@@ -2025,7 +2025,7 @@ impl outrig::config::SidecarWorkspaceAccess
 pub fn outrig::config::SidecarWorkspaceAccess::mount_access(self) -> core::option::Option<outrig::config::MountAccess>
 pub struct outrig::Abandonable<F>(_)
 impl<F> outrig::Abandonable<F>
-pub async fn outrig::Abandonable<F>::abandon(self)
+pub async fn outrig::Abandonable<F>::abandon(self) -> core::result::Result<(), alloc::vec::Vec<alloc::string::String>>
 pub fn outrig::Abandonable<F>::new(F) -> Self
 impl<F: core::future::future::Future> core::future::future::Future for outrig::Abandonable<F>
 pub type outrig::Abandonable<F>::Output = <F as core::future::future::Future>::Output

@@ -463,7 +463,13 @@ fn spawn_cleanup(cmd: &Cmd) -> std::io::Result<Child> {
     cmd.std_command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Read back only to tell a target that was never there from a
+        // refusal, so a command that does not ask keeps discarding it.
+        .stderr(if cmd.absent().is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .inspect_err(|e| {
             tracing::debug!(
@@ -724,6 +730,9 @@ impl Wait {
                 true
             }
             Ok(Some(status)) if status.success() => self.advance(),
+            // The target was never there, or is already gone: what the
+            // removal is for is done.
+            Ok(Some(_)) if self.found_target_absent() => self.advance(),
             // Killed by this module for wedging, and so terminal whatever the
             // budget says: the next attempt would be the same command against
             // the same engine that just held it for `WEDGED_CLEANUP`, and the
@@ -790,6 +799,24 @@ impl Wait {
                 false
             }
         }
+    }
+
+    /// Whether the attempt that just exited said its target was not there,
+    /// for a command that [says what that sounds like](Cmd::absent_is_done).
+    fn found_target_absent(&mut self) -> bool {
+        use std::io::Read as _;
+
+        let (Some(sentinel), Some(child)) = (self.cmd.absent(), self.child.as_mut()) else {
+            return false;
+        };
+        let Some(stderr) = child.stderr.take() else {
+            return false;
+        };
+        // The child has exited, so this ends at once; the bound is for a
+        // grandchild that kept the pipe.
+        let mut said = Vec::new();
+        let _ = stderr.take(64 * 1024).read_to_end(&mut said);
+        String::from_utf8_lossy(&said).contains(sentinel)
     }
 
     /// Start the next attempt once its backoff has elapsed. Returns whether
@@ -1110,14 +1137,20 @@ impl<F> Abandonable<F> {
     /// until buildah has exited, a removal until it has run. Bounded by a
     /// little more than a stopped build's grace, so a wedged removal is left
     /// to run on its own rather than waited for.
-    pub async fn abandon(self) {
-        if let Err(why) = self.0.owed().settled(ABANDON_WAIT).await {
+    ///
+    /// `Ok` once all of it is proven done; otherwise why not, one reason per
+    /// piece that failed or was still running when the wait ended, for a caller
+    /// that must not say the work stopped when it is not known to have.
+    pub async fn abandon(self) -> Result<(), Vec<String>> {
+        let settled = self.0.owed().settled(ABANDON_WAIT).await;
+        if let Err(why) = &settled {
             tracing::debug!(
                 target: "outrig::supervise",
                 why = why.join("; "),
                 "abandoned work did not prove it finished"
             );
         }
+        settled
     }
 }
 
@@ -1151,6 +1184,68 @@ pub(crate) async fn blocking<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `abandon` returns is whether the cleanup its drop set going is
+    /// proven done, so a caller can tell a stopped start from one that is not
+    /// known to be.
+    #[tokio::test]
+    async fn abandon_says_whether_the_cleanup_was_proven() {
+        struct Fails;
+        impl Drop for Fails {
+            fn drop(&mut self) {
+                Debt::new().fail("the removal failed".to_string());
+            }
+        }
+
+        let mut clean = Abandonable::new(std::future::pending::<()>());
+        let _ = tokio::time::timeout(Duration::from_millis(10), &mut clean).await;
+        assert_eq!(clean.abandon().await, Ok(()));
+
+        let mut failing = Abandonable::new(async {
+            let _held = Fails;
+            std::future::pending::<()>().await
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(10), &mut failing).await;
+        assert_eq!(
+            failing.abandon().await,
+            Err(vec!["the removal failed".to_string()])
+        );
+    }
+
+    /// A removal that finds its target was never there is done, not failed
+    /// (#644): a build cancelled before it creates its tag owes `rmi` of a
+    /// tag nothing made. Without the sentinel the same exit is a failure.
+    #[tokio::test]
+    async fn a_removal_that_finds_nothing_to_remove_is_proven_done() {
+        async fn cancelled(cmd: Cmd) -> Result<(), Vec<String>> {
+            let mut start = Abandonable::new(async {
+                let _owed = CleanupGuard::arm(cmd, Reissue::Once);
+                std::future::pending::<()>().await
+            });
+            let _ = tokio::time::timeout(Duration::from_millis(10), &mut start).await;
+            start.abandon().await
+        }
+        let gone = || {
+            Cmd::new("sh")
+                .arg("-c")
+                .arg("echo 'image not known' >&2; exit 125")
+        };
+        assert_eq!(
+            cancelled(gone().absent_is_done("image not known")).await,
+            Ok(())
+        );
+        assert!(cancelled(gone()).await.is_err());
+        assert!(
+            cancelled(
+                Cmd::new("sh")
+                    .arg("-c")
+                    .arg("echo busy >&2; exit 125")
+                    .absent_is_done("image not known")
+            )
+            .await
+            .is_err()
+        );
+    }
 
     /// Wait for `path` to exist, or fail. The cleanups here are real
     /// processes, so what a test waits on is a side effect on disk.

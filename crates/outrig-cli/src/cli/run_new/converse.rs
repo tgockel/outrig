@@ -66,6 +66,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use super::output::{self, Failures, Output, PROMPT};
 use super::screen::{self, Screen, Typed};
+use crate::cli::signals::{EndSignal, Signals};
 use crate::error::Result;
 use crate::repl::{HelpEntry, INTERRUPT_NOTICE, compose_help};
 
@@ -123,6 +124,13 @@ type Shared<'a> = Mutex<&'a mut Session>;
 /// `shown` is the terminal's subscription to the session's events, which is
 /// where the Python each round runs is shown from. `typed` is what the user
 /// types, and `failures` the writes `view` could not make.
+///
+/// `signals` is how the session is ended from outside: a SIGTERM or a SIGHUP
+/// leaves as `/quit` does, and is returned so the caller can say so, finalize
+/// the record with the signal's status, and exit with it. SIGINT is not one of
+/// them -- at this terminal Ctrl-C is the conversation's own, and `interrupts`
+/// carries it. A signal that lands while what the session showed is still being
+/// written ends that wait as a Ctrl-C does, and is returned all the same.
 pub(super) async fn converse(
     session: &mut Session,
     shown: &mut Subscription,
@@ -130,18 +138,93 @@ pub(super) async fn converse(
     typed: Typed,
     interrupts: &mut Interrupts,
     failures: &mut Failures,
-) -> Result<()> {
+    signals: &mut Signals,
+) -> Conversed {
     let mut term = Terminal {
         view,
         reading: true,
     };
-    let left = drive(session, shown, &mut term, typed, interrupts, failures).await;
-    if left.is_err() {
-        // A failure does not wait on a stdout that may have stopped either.
+    let left = drive(
+        session, shown, &mut term, typed, interrupts, failures, signals,
+    )
+    .await;
+    let (mut signal, result) = match left {
+        Ok(signal) => (signal, Ok(())),
+        Err(e) => (None, Err(e)),
+    };
+    if signal.is_some() || result.is_err() {
+        // A failure does not wait on a stdout that may have stopped either,
+        // and neither does a signal: it asked for the session to end now. So
+        // nothing is settled: with stdout and stderr two pipes, what stderr
+        // had queued is waited for by `settle` even once stdout is abandoned,
+        // and a reader that has stopped never lets it be.
         term.abandon();
     }
-    term.settle(interrupts.recv()).await;
-    reconcile(left, failures)
+    if signal.is_none() {
+        signal = settle(&term, interrupts, signals).await;
+    }
+    if signal.is_none() && screen::signalled() {
+        // A signal stopped the screen, and its typed lines ended with it: the
+        // loop can have read that as input ending, or the settle as done,
+        // before it heard the signal. It is on its way -- the screen's handler
+        // passes it on -- so it is waited for, and for as long as the wait is
+        // bounded when it is not one of these.
+        signal = tokio::time::timeout(SIGNAL_GRACE, signals.termination())
+            .await
+            .ok();
+    }
+    Conversed { signal, result }.reconciled(failures)
+}
+
+/// How long a signal that stopped the screen is waited for, to reach the
+/// listener the conversation holds.
+const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How the conversation ended. The signal that ended it is kept apart from
+/// whether it went well: a write that failed as the session closed is the
+/// session's error, and not a reason for it to leave with any status but the
+/// signal's.
+pub(super) struct Conversed {
+    /// The SIGTERM or SIGHUP the session was ended by, if one did.
+    pub(super) signal: Option<EndSignal>,
+    pub(super) result: Result<()>,
+}
+
+impl Conversed {
+    /// A conversation that failed before it began.
+    pub(super) fn failed(error: crate::error::CliError) -> Self {
+        Self {
+            signal: None,
+            result: Err(error),
+        }
+    }
+
+    /// `self`, with its result failed if a write has, as [`reconcile`] says.
+    pub(super) fn reconciled(self, failures: &mut Failures) -> Self {
+        Self {
+            result: reconcile(self.result, failures),
+            ..self
+        }
+    }
+}
+
+/// [`Terminal::settle`], ended by a Ctrl-C, or by a SIGTERM or SIGHUP, which
+/// is returned: the wait is for output that has nobody to be shown to once
+/// the session is asked to end, and it is not one to hold that up.
+async fn settle(
+    term: &Terminal<'_>,
+    interrupts: &mut Interrupts,
+    signals: &mut Signals,
+) -> Option<EndSignal> {
+    let mut signalled = None;
+    term.settle(async {
+        tokio::select! {
+            _ = interrupts.recv() => {}
+            sig = signals.termination() => signalled = Some(sig),
+        }
+    })
+    .await;
+    signalled
 }
 
 /// Where the conversation is shown: plain lines on stdout and stderr, or the
@@ -214,7 +297,8 @@ pub(super) fn reconcile(left: Result<()>, failures: &mut Failures) -> Result<()>
 
 /// The loop [`converse`] runs. It returns with everything it showed queued,
 /// and stdout abandoned if the user asked to go; writing the rest is
-/// [`converse`]'s to wait for.
+/// [`converse`]'s to wait for. A SIGTERM or SIGHUP is returned as the signal
+/// it was.
 async fn drive(
     session: &mut Session,
     shown: &mut Subscription,
@@ -222,7 +306,8 @@ async fn drive(
     mut lines: Typed,
     interrupts: &mut Interrupts,
     failures: &mut Failures,
-) -> Result<()> {
+    signals: &mut Signals,
+) -> Result<Option<EndSignal>> {
     // `run-new` always starts its session with a primary agent.
     let (Some(user), Some(interrupt)) = (session.user_channel(), session.interrupter()) else {
         return Err(SessionError::NoPrimary.into());
@@ -256,9 +341,11 @@ async fn drive(
         if round.is_none() {
             if gone {
                 // What the interpreter sent is shown before this.
-                term.settle(interrupts.recv()).await;
+                if let Some(sig) = settle(term, interrupts, signals).await {
+                    return Ok(Some(sig));
+                }
                 term.note("[outrig] the Python interpreter exited; the session is over");
-                return Ok(());
+                return Ok(None);
             }
             if !term.reading {
                 // Input ending is how piped input finishes, so what became of
@@ -271,22 +358,35 @@ async fn drive(
                 {
                     term.answered(queued, mid_round);
                 }
-                tokio::select! {
-                    () = show(view, user.receive_waiting()) => {}
+                let signalled = tokio::select! {
+                    () = show(view, user.receive_waiting()) => None,
                     _ = interrupts.recv() => {
-                        closer.close_admission();
                         term.abandon();
-                        return Ok(());
+                        None
                     }
-                }
+                    sig = signals.termination() => {
+                        term.abandon();
+                        Some(sig)
+                    }
+                };
                 closer.close_admission();
-                return Ok(());
+                return Ok(signalled);
             }
         }
         // Not `biased`: whichever branches are ready, one is picked at random,
         // so a steady stream of the agent's messages cannot starve the round,
         // what the user types, or anything else.
         tokio::select! {
+            // A signal from outside ends the session, as `/quit` does: the
+            // round in flight is dropped, nothing more is admitted, and the
+            // stop and the report follow. What it was going to show is not
+            // waited for -- whoever signalled is not waiting to read it.
+            sig = signals.termination() => {
+                closer.close_admission();
+                term.abandon();
+                drop(round.take());
+                return Ok(Some(sig));
+            }
             Some(()) = interrupts.recv() => {
                 if round.is_some() {
                     if let Some(said) = interrupt() {
@@ -299,7 +399,7 @@ async fn drive(
                     term.newline();
                     closer.close_admission();
                     term.abandon();
-                    return Ok(());
+                    return Ok(None);
                 } else if let Some(said) = session.lock().await.stop_held() {
                     // No round holds the lock.
                     term.note(&format!("\n[outrig] {said} (Ctrl-C again exits)"));
@@ -388,7 +488,7 @@ async fn drive(
                             closer.close_admission();
                             term.abandon();
                             drop(round.take());
-                            return Ok(());
+                            return Ok(None);
                         }
                         ["help"] => term.note(&help),
                         // The name follows the slash, and whitespace ends it: the

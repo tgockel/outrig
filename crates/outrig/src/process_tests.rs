@@ -1091,7 +1091,7 @@ async fn an_abandoned_graceful_child_is_waited_out_until_it_is_reaped() {
         let _child = child;
         std::future::pending::<()>().await
     });
-    held.abandon().await;
+    held.abandon().await.expect("the child's stop is proven");
 
     assert!(
         !occupies_a_process_slot(pid),

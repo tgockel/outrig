@@ -543,6 +543,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Abandonable::abandon` returns whether the cleanup it waited for is proven done.** It returns
+  `Result<(), Vec<String>>`, the reasons being one per piece that failed or was still running when
+  the wait ended, so a caller can tell a stopped start from one not known to be stopped.
 - **`[[workspace.mounts]].container-path` is optional, and defaults to the resolved
   `host-path`.** `MountConfig::container_path` is replaced by `declared_container_path`, which
   is `None` when the config left it unset, and `resolved_container_path(repo_root)`. A session

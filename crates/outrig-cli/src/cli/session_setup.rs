@@ -60,25 +60,48 @@ use outrig::{McpClient, Transcript};
 
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// Where a command that has a writer of its own wants its progress lines: each
+/// is handed over, without its line ending.
+pub(crate) type Say = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub(crate) struct ProgressSpan {
     started: Instant,
+    say: Option<Say>,
 }
 
 impl ProgressSpan {
     pub(crate) fn start(label: impl Into<String>) -> Self {
-        let label = label.into();
-        progress_line(format_args!("[outrig] {label}"));
-        Self {
+        Self::begin(None, label.into())
+    }
+
+    /// [`ProgressSpan::start`], with the lines handed to `say` and not written
+    /// to stderr here, for a caller whose task must not wait on stderr.
+    pub(crate) fn start_saying(say: &Say, label: impl Into<String>) -> Self {
+        Self::begin(Some(say.clone()), label.into())
+    }
+
+    fn begin(say: Option<Say>, label: String) -> Self {
+        let span = Self {
             started: Instant::now(),
-        }
+            say,
+        };
+        span.line(format_args!("[outrig] {label}"));
+        span
     }
 
     pub(crate) fn done(self, message: impl AsRef<str>) {
-        progress_line(format_args!(
+        self.line(format_args!(
             "[outrig] {} ({})",
             message.as_ref(),
             format_elapsed(self.started.elapsed())
         ));
+    }
+
+    fn line(&self, line: std::fmt::Arguments<'_>) {
+        match &self.say {
+            Some(say) => say(&line.to_string()),
+            None => progress_line(line),
+        }
     }
 }
 

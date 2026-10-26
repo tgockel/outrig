@@ -230,6 +230,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocking write to it. With output paused by `Ctrl-S`, and stdout and stderr sent elsewhere, that
   write held SIGINT's handler and the session's teardown until the terminal read again. The write is
   now non-blocking, best effort, and comes after the handler is back.
+- **A SIGTERM or SIGHUP ends `outrig run-new` through its teardown, as it does `outrig run`.**
+  Both were at their default disposition for the whole of `run-new`, so a `kill`, a CI timeout or
+  a closed terminal killed outrig where it stood: the container ran on under conmon, and the
+  record kept no `ended_at`, which made `outrig discard` refuse it as running and `outrig clean`
+  skip it. Either signal now ends the session as `/quit` does, wherever it lands -- during
+  startup, during a round, at the prompt -- stopping the session, printing the report, finalizing
+  the record with `143` or `129`, and exiting with the same; a stop not proven still outranks it
+  with `3`. On a terminal the screen puts the terminal back first, so the closing report is
+  written below the conversation rather than drawn over. SIGINT is unchanged: it is the
+  conversation's own once the conversation begins. A signal does not wait for output a stopped
+  terminal or pipe has not taken, nor for the answer to the question about a binding a repository
+  declared, and a write that fails as the session closes does not change the status it exits with.
+  A signal that cancels a start whose cleanup is not proven exits `3`, not its own status. A build cancelled
+  before it created its temporary image owes the removal of nothing, and does not count as one
+  that failed.
+- **A SIGHUP reaches a host program as the SIGTERM it asks for.** `outrig run <script.py>`
+  forwarded SIGINT and SIGTERM to the program's process group but left SIGHUP at its default, so a
+  closed terminal ended outrig along with the engine that stops the sessions the program left
+  open. It is now forwarded as a SIGTERM, starting the same grace.
 
 ## [0.2.2](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.2) - 2026-10-20
 

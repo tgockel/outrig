@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -224,6 +224,9 @@ struct Session {
     streams: Vec<JoinHandle<()>>,
     /// The read end of a [`Reader::Stalled`] stdout, kept open and unread.
     stalled: Option<ChildStdout>,
+    /// The read end of a stderr that is kept open and unread, which
+    /// [`Session::with_stalled_stderr`] leaves.
+    stalled_stderr: Option<ChildStderr>,
 }
 
 impl Session {
@@ -232,13 +235,28 @@ impl Session {
     }
 
     fn spawn(repo: &Path, sessions: &Path, reader: Reader) -> Self {
-        Self::launch(repo, sessions, &global_config(repo), &[], reader)
+        Self::launch(repo, sessions, &global_config(repo), &[], reader, false)
+    }
+
+    /// [`Session::start`], with stderr's read end held open and never read: a
+    /// stderr that has stopped, as a pipe of its own, apart from stdout's,
+    /// leaves it. What is written there waits in the pipe until it is full, so
+    /// the `stderr` sink stays empty.
+    fn with_stalled_stderr(repo: &Path, sessions: &Path) -> Self {
+        Self::launch(
+            repo,
+            sessions,
+            &global_config(repo),
+            &[],
+            Reader::Live,
+            true,
+        )
     }
 
     /// [`Session::start`], with `global` as the global config and `env` added
     /// to the binary's environment.
     fn with_global(repo: &Path, sessions: &Path, global: &Path, env: &[(&str, String)]) -> Self {
-        Self::launch(repo, sessions, global, env, Reader::Live)
+        Self::launch(repo, sessions, global, env, Reader::Live, false)
     }
 
     fn launch(
@@ -247,6 +265,7 @@ impl Session {
         global: &Path,
         env: &[(&str, String)],
         reader: Reader,
+        stderr_stalled: bool,
     ) -> Self {
         let mut child = run_new_command(repo, sessions, global, env)
             .stdout(Stdio::piped())
@@ -273,11 +292,17 @@ impl Session {
             ))),
             Reader::Stalled => stalled = Some(child_stdout),
         }
-        streams.push(tokio::spawn(stream_lines(
-            child.stderr.take().expect("stderr"),
-            Arc::clone(&stderr),
-            "stderr",
-        )));
+        let child_stderr = child.stderr.take().expect("stderr");
+        let mut stalled_stderr = None;
+        if stderr_stalled {
+            stalled_stderr = Some(child_stderr);
+        } else {
+            streams.push(tokio::spawn(stream_lines(
+                child_stderr,
+                Arc::clone(&stderr),
+                "stderr",
+            )));
+        }
         Self {
             child,
             pid,
@@ -286,7 +311,21 @@ impl Session {
             stderr,
             streams,
             stalled,
+            stalled_stderr,
         }
+    }
+
+    /// How many bytes of a stalled stderr's pipe wait to be read. What a pipe holds is not a
+    /// measure of whether it is full: the kernel lowers a new pipe to two pages once the user has
+    /// too many, and a pipe is full when its pages are, not its bytes.
+    fn unread_stderr(&self) -> usize {
+        use std::os::fd::AsRawFd as _;
+
+        let pipe = self.stalled_stderr.as_ref().expect("stderr is stalled");
+        let mut waiting: nix::libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `c_int`, through a pointer to one.
+        unsafe { nix::libc::ioctl(pipe.as_raw_fd(), nix::libc::FIONREAD, &mut waiting) };
+        waiting.max(0) as usize
     }
 
     /// Stop reading what outrig writes and close the read ends: the reader of
@@ -315,6 +354,7 @@ impl Session {
             stderr,
             streams,
             stalled,
+            stalled_stderr,
             ..
         } = self;
         let open = (!close_input).then_some(stdin);
@@ -323,6 +363,17 @@ impl Session {
             .expect("exits")
             .expect("wait");
         drop((open, stalled));
+        if let Some(mut pipe) = stalled_stderr {
+            // What was written while nothing read it, now that nothing will
+            // write more: bounded, in case something outrig started holds the
+            // write end.
+            let mut written = Vec::new();
+            let _ = timeout(Duration::from_secs(2), pipe.read_to_end(&mut written)).await;
+            stderr
+                .lock()
+                .expect("unpoisoned")
+                .push_str(&String::from_utf8_lossy(&written));
+        }
         for stream in streams {
             stream.await.expect("drained");
         }
@@ -382,6 +433,16 @@ fn ctrl_c(leader: &str) {
         .args(["-INT", "--", &format!("-{leader}")])
         .status()
         .expect("kill -INT");
+    assert!(kill.success());
+}
+
+/// Send `signal` to `pid` alone, as `kill` from another terminal does -- not
+/// to the group, so it reaches outrig and nothing it started.
+fn signal(pid: &str, signal: &str) {
+    let kill = std::process::Command::new("kill")
+        .args([&format!("-{signal}"), "--", pid])
+        .status()
+        .expect("kill");
     assert!(kill.success());
 }
 
@@ -1448,6 +1509,153 @@ async fn a_ctrl_c_at_the_prompt_stops_python_an_earlier_one_left_running() {
     let next = tool_result(&recorded[3], "toolu_next");
     assert!(next.contains("CancelledError"), "{next}");
     assert!(next.contains("[this call]\nagain\n"), "{next}");
+}
+
+/// A signal from outside ends the session the way `/quit` does, and not the
+/// way a kill does (#644): before this, SIGTERM and SIGHUP were at their
+/// default disposition for the whole of `run-new`, so they killed outrig where
+/// it stood -- the container was left running under conmon, and the record
+/// stayed live, which made `outrig discard` refuse it and `outrig clean` skip
+/// it. Now the session is closed, stopped and reported, the record is
+/// finalized with the signal's own status, and the process exits with it: 143
+/// for SIGTERM, 129 for SIGHUP, as `outrig run` and `outrig mcp` do.
+///
+/// The signal is sent to outrig alone, as `kill` from another terminal sends
+/// it, rather than to the group as a terminal's Ctrl-C goes.
+async fn a_signal_stops_the_session_and_finalizes_the_record(sent: &str, expected: i32) {
+    let (addr, _requests) =
+        start_mock_http(vec![submit("toolu_1", "x = 1"), text_reply("set")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    // A round has run, so the container is up and the record is written.
+    session.type_line("set x").await;
+    wait_for(&session.stderr, "set", TEST_TIMEOUT).await;
+
+    signal(&session.pid, sent);
+    let (status, _, stderr) = session.exit(false).await;
+
+    assert_eq!(status.code(), Some(expected), "{status}: {stderr}");
+    assert!(
+        stderr.contains(&format!("[outrig] SIG{sent} received; ending the session")),
+        "the signal says what it is doing: {stderr}"
+    );
+    // The stop ran, so the session's report was reached at all.
+    assert!(
+        stderr.contains("[outrig] session closed: stopped, every outcome known"),
+        "{stderr}"
+    );
+
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], expected, "{record:#}");
+    assert!(
+        !record["ended_at"].is_null(),
+        "a signalled session is finished, not left live: {record:#}"
+    );
+    // The container is gone, not left running under conmon.
+    let container = record["container_name"].as_str().expect("a name");
+    let _tidy = RemoveOnDrop(container.to_string());
+    assert!(
+        podman_names(&format!("name={container}")).is_empty(),
+        "the container outlived the session: {record:#}"
+    );
+}
+
+#[tokio::test]
+async fn sigterm_stops_the_session_and_exits_143() {
+    a_signal_stops_the_session_and_finalizes_the_record("TERM", 143).await;
+}
+
+#[tokio::test]
+async fn sighup_stops_the_session_and_exits_129() {
+    a_signal_stops_the_session_and_finalizes_the_record("HUP", 129).await;
+}
+
+/// That the session was stopped and finished, however the process left: the record carries
+/// `status` and an end, and the container is gone.
+fn assert_stopped_and_recorded(sessions: &Path, status: i32) {
+    let record = the_record(sessions);
+    assert_eq!(record["exit_code"], status, "{record:#}");
+    assert!(
+        !record["ended_at"].is_null(),
+        "a signalled session is finished, not left live: {record:#}"
+    );
+    let container = record["container_name"].as_str().expect("a name");
+    let _tidy = RemoveOnDrop(container.to_string());
+    assert!(
+        podman_names(&format!("name={container}")).is_empty(),
+        "the container outlived the session: {record:#}"
+    );
+}
+
+/// A SIGTERM ends a session whose stderr nobody reads (#644). With stdout and stderr two pipes,
+/// the wait for what is queued is for stderr's alone once stdout is abandoned, and a pipe that is
+/// full never lets it end -- but a signal asks for the session to end now, so nothing is waited
+/// for before the stop. The session is stopped and its record finished at once, and outrig leaves
+/// when the closing report, which cannot be written either, has had its grace.
+#[tokio::test]
+async fn sigterm_ends_a_session_whose_stderr_is_not_read() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit("toolu_sent", "await runtime.channels['user'].send('sent')"),
+        // Many times what a pipe holds, said on stderr as the round ends.
+        text_reply(&"x".repeat(500_000)),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_stalled_stderr(repo.path(), sessions.path());
+
+    // Before the round, so the reply cannot already have filled the pipe: it is many times what
+    // a pipe holds, and the thread writing it is stuck, or about to be, once more than the
+    // startup's own lines are in the pipe.
+    let before = session.unread_stderr();
+    session.type_line("go").await;
+    wait_for(&session.stdout, "sent", STEP_TIMEOUT).await;
+    wait_until(STEP_TIMEOUT, "the reply on stderr", || {
+        session.unread_stderr() >= before + 2048
+    })
+    .await;
+
+    signal(&session.pid, "TERM");
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(143), "{status}: {stderr}");
+    assert_stopped_and_recorded(sessions.path(), 143);
+}
+
+/// A SIGTERM ends the wait for output that is stuck once input has ended (#644): the end of input
+/// leaves the session waiting for what stdout has queued, and stdout's reader has stopped, with a
+/// message stuck midway through the pipe. A Ctrl-C ends that wait, and so does a SIGTERM, which
+/// leaves with 143 as it does everywhere else.
+#[tokio::test]
+async fn sigterm_ends_the_wait_for_a_stopped_stdout_once_input_has_ended() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_big",
+            "await runtime.channels['user'].send('A' * 200000)",
+        ),
+        text_reply("sent it"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::spawn(repo.path(), sessions.path(), Reader::Stalled);
+
+    session.type_line("go").await;
+    wait_for(&session.stderr, "sent it", STEP_TIMEOUT).await;
+    // Input ends as `exit` is called, and is waiting on stdout a second later.
+    let pid = session.pid.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        signal(&pid, "TERM");
+    });
+    let (status, _, stderr) = session.exit(true).await;
+    assert_eq!(status.code(), Some(143), "{status}: {stderr}");
+    assert!(
+        stderr.contains("[outrig] SIGTERM received; ending the session"),
+        "{stderr}"
+    );
+    assert_stopped_and_recorded(sessions.path(), 143);
 }
 
 /// The one session dir under `sessions`, and its record.
@@ -2598,6 +2806,16 @@ impl OnTerminal {
         });
     }
 
+    /// SIGTERM to outrig alone, as `kill` from another terminal sends it.
+    fn sigterm(&self) {
+        let pid = self.child.id().expect("a pid") as i32;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("SIGTERM");
+    }
+
     /// Keys, as the terminal sends them: a line ends with a carriage return.
     fn press(&mut self, keys: &str) {
         use std::io::Write as _;
@@ -2768,30 +2986,118 @@ async fn ctrl_c_ends_run_new_on_a_terminal_that_stopped_reading() {
     terminal.pause(false);
 }
 
-/// SIGTERM ends `run-new` on a terminal by its default action, as it does on pipes, and the
-/// screen gives the terminal back first, so the shell is left one it can type in.
+/// SIGTERM ends `run-new` on a terminal through its teardown, as it does on pipes (#644), and the
+/// screen gives the terminal back first, so the shell is left one it can type in, and what the
+/// session says as it closes is written below the conversation. It exits 143, its record says so,
+/// and its container is gone.
 #[tokio::test]
 async fn sigterm_on_a_terminal_gives_the_terminal_back() {
-    use std::os::unix::process::ExitStatusExt as _;
-
     let (addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
     let repo = repo(addr);
     let sessions = tempfile::tempdir().expect("a session root");
     let terminal = OnTerminal::start(repo.path(), sessions.path());
     terminal.shows("Ctrl-O detail").await;
-    // The default action leaves the container running.
     let id = banner_session_id(&terminal.screen());
+    // For an assertion that fails before the session has removed it.
     let _container = RemoveOnDrop(format!("outrig-{id}"));
-    let pid = terminal.child.id().expect("a pid") as i32;
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .expect("SIGTERM");
+    terminal.sigterm();
     let (status, screen) = terminal.exit().await;
-    assert_eq!(
-        status.signal(),
-        Some(nix::libc::SIGTERM),
-        "{status}:\n{screen}"
+    assert_eq!(status.code(), Some(143), "{status}:\n{screen}");
+    assert!(
+        screen.contains("[outrig] SIGTERM received; ending the session"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("[outrig] session closed: stopped, every outcome known"),
+        "{screen}"
+    );
+
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 143, "{record:#}");
+    assert!(
+        !record["ended_at"].is_null(),
+        "a signalled session is finished, not left live: {record:#}"
+    );
+    assert!(
+        podman_names(&format!("name=outrig-{id}")).is_empty(),
+        "the container outlived the session: {record:#}"
+    );
+}
+
+/// A SIGTERM while the screen is drawing leaves no frame behind (#644). The signal's handler gives
+/// the terminal back from wherever the screen's thread is, and a thread that was waiting for a key
+/// went on to draw the frame that was due, over what the session says as it closes, which was being
+/// written meanwhile: a spinner's glyph lands on the first line, and the lines that follow tear. A
+/// model call that is never answered keeps the status line's spinner turning, so a frame is due on
+/// about one tick in three, and about one session in three has one on the terminal if it is not
+/// kept off.
+#[tokio::test]
+async fn sigterm_while_the_screen_is_drawing_leaves_no_frame_behind() {
+    let (addr, _requests) = start_mock_http(vec![CannedResponse::held()]).await;
+    let repo = repo(addr);
+    for attempt in 1..=12 {
+        let sessions = tempfile::tempdir().expect("a session root");
+        let mut terminal = OnTerminal::start(repo.path(), sessions.path());
+        terminal.shows("Ctrl-O detail").await;
+        terminal.press("go\r");
+        terminal.shows("Ctrl-C stops").await;
+        // Off the tick the thread draws on, so the signal lands anywhere in it.
+        tokio::time::sleep(Duration::from_millis(37 * attempt)).await;
+        terminal.sigterm();
+        let (status, screen) = terminal.exit().await;
+        assert_eq!(status.code(), Some(143), "{status}:\n{screen}");
+        assert!(
+            !screen
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "attempt {attempt}: a frame was drawn after the terminal was given back:\n{screen}"
+        );
+        for line in [
+            "[outrig] SIGTERM received; ending the session",
+            "[outrig] closing the session",
+            "[outrig] session closed: stopped, every outcome known",
+        ] {
+            assert!(
+                screen.lines().any(|shown| shown == line),
+                "attempt {attempt}: {line:?} was not written whole:\n{screen}"
+            );
+        }
+        assert_stopped_and_recorded(sessions.path(), 143);
+    }
+}
+
+/// A SIGTERM at the question about a binding the repository declared ends `run-new` as it ends any
+/// start: record finalized with 143, nothing left running, and the exit. The question is read from
+/// stdin on a thread of tokio's blocking pool, which dropping the start leaves reading, and which
+/// the runtime would wait for at exit until Enter or the end of input -- so this exits only if
+/// outrig does not wait for it (#644). Nobody answers.
+#[tokio::test]
+async fn sigterm_at_the_question_about_a_binding_exits_without_an_answer() {
+    let (addr, _requests) = start_mock_http(vec![text_reply("unused")]).await;
+    let repo = repo_with(
+        addr,
+        "[bindings.rec]\ndescription = \"Records.\"\nfactory = \"recorder:make\"\n",
+    );
+    let sessions = tempfile::tempdir().expect("a session root");
+    let terminal = OnTerminal::start(repo.path(), sessions.path());
+    terminal.shows("[y/N]").await;
+    terminal.sigterm();
+    let (status, screen) = terminal.exit().await;
+    assert_eq!(status.code(), Some(143), "{status}:\n{screen}");
+    assert!(
+        screen.contains("[outrig] SIGTERM received; ending the session"),
+        "{screen}"
+    );
+
+    let record = the_record(sessions.path());
+    assert_eq!(record["exit_code"], 143, "{record:#}");
+    assert!(
+        !record["ended_at"].is_null(),
+        "a signalled start is finished, not left live: {record:#}"
+    );
+    let id = record["id"].as_str().expect("an id");
+    assert!(
+        podman_names(&format!("label=org.outrig.session={id}")).is_empty(),
+        "a container outlived the start: {record:#}"
     );
 }

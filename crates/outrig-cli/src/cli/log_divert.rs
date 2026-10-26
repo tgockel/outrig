@@ -37,8 +37,12 @@ impl LogWriter {
 
     /// Send every record to `sink` until the returned guard is dropped.
     pub(crate) fn divert(&self, sink: impl Fn(Record) + Send + Sync + 'static) -> Diverted {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(sink));
-        Diverted(self.clone())
+        let before = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(Arc::new(sink));
+        Diverted(self.clone(), before)
     }
 
     fn writer(&self, level: Level) -> EitherWriter<io::Stderr, Collector> {
@@ -72,12 +76,13 @@ impl<'a> MakeWriter<'a> for LogWriter {
     }
 }
 
-/// Records go back to stderr once this is dropped.
-pub(crate) struct Diverted(LogWriter);
+/// Records go back to where they went before the divert -- stderr, or an
+/// earlier divert's sink -- once this is dropped.
+pub(crate) struct Diverted(LogWriter, Option<Sink>);
 
 impl Drop for Diverted {
     fn drop(&mut self) {
-        *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = self.1.take();
     }
 }
 
@@ -188,6 +193,19 @@ mod tests {
         assert!(matches!(logs.writer(Level::WARN), EitherWriter::A(_)));
         tracing::subscriber::with_default(subscriber(&logs), || tracing::warn!("after"));
         assert!(seen.lock().expect("unpoisoned").is_empty());
+    }
+
+    /// A divert dropped under another goes back to that one's sink, not to
+    /// stderr, so records stay queued with whoever held the log first (#644).
+    #[test]
+    fn dropping_a_divert_restores_the_one_it_replaced() {
+        let logs = LogWriter::default();
+        let (_outer, outer_seen) = collect(&logs);
+        let (inner, inner_seen) = collect(&logs);
+        drop(inner);
+        tracing::subscriber::with_default(subscriber(&logs), || tracing::warn!("after"));
+        assert_eq!(outer_seen.lock().expect("unpoisoned").len(), 1);
+        assert!(inner_seen.lock().expect("unpoisoned").is_empty());
     }
 
     #[test]

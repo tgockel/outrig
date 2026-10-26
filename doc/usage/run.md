@@ -744,8 +744,11 @@ print(session.shutdown_report)
 ### Signals and the grace
 
 The program runs in a process group of its own. Ctrl-C, and `SIGINT` or `SIGTERM` sent to
-`outrig`, are forwarded to that group, so the program sees them as it would from a terminal. If
-`outrig` itself dies, the program and everything it started end with it.
+`outrig`, are forwarded to that group, so the program sees them as it would from a terminal. So is
+`SIGHUP` -- a closed terminal, a CI timeout -- which the program sees as the `SIGTERM` it asks
+for. None of the three ends `outrig` where it stands: were one to, the sessions the program opened
+would be left running, with no one to stop them. If `outrig` itself dies anyway -- `SIGKILL`, say
+-- the program and everything it started end with it, and its sessions' containers remain.
 
 The first signal also starts the program's grace: the time it has to end on its own, five seconds
 unless `--grace <SECS>` or `[host] grace-secs` says otherwise. Time OutRig spends shutting down a

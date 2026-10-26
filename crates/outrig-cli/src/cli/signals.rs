@@ -23,8 +23,13 @@
 //!
 //! Notices go through `writeln!` with the error dropped, never `eprintln!`:
 //! after SIGHUP the terminal may be gone, and `eprintln!` panics when the
-//! write fails.
+//! write fails. That write waits for a stderr nobody reads, and for as long as
+//! something else holds the stream -- a build's output, written from tokio's
+//! blocking pool, can be stuck in it -- so the task racing a step would wait
+//! with it and never reach the step's cleanup. A command with a writer of its
+//! own says its notices there instead, through the `_saying` forms.
 
+use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::io::Write as _;
@@ -143,12 +148,44 @@ impl Signals {
     where
         CliError: From<E>,
     {
+        self.race_settled_saying(fut, notice).await
+    }
+
+    /// [`Self::race_settled`], with each notice handed to `say` instead of
+    /// written to stderr here: the one as the signal lands, and the one for a
+    /// second signal that hurries the teardown. `say` must not wait on the
+    /// terminal, or the signal is not heard until it stops waiting. A signal
+    /// whose teardown is not proven to have removed what the step made, or
+    /// was hurried, ends it with status 3 rather than its own.
+    pub async fn race_settled_saying<T, E>(
+        &mut self,
+        fut: impl Future<Output = std::result::Result<T, E>>,
+        say: impl Fn(&str),
+    ) -> Result<T>
+    where
+        CliError: From<E>,
+    {
         let mut step = Abandonable::new(fut);
-        let result = self.race(&mut step).await;
-        if let Err(CliError::Interrupted(_)) = result {
-            unless_signaled(step.abandon()).await;
+        let result = self.race_saying("the session", &mut step, &say).await;
+        let Err(CliError::Interrupted(sig)) = result else {
+            return result;
+        };
+        // What the start had made is removed, or it is not known to be: the
+        // signal's status stands only for a stop that is proven, as it does
+        // for a session's report, and anything else is 3.
+        let proven = Cell::new(false);
+        let hurried = unless_signaled_saying(
+            async {
+                proven.set(step.abandon().await.is_ok());
+            },
+            &say,
+        )
+        .await;
+        if proven.get() && hurried.is_none() {
+            Err(CliError::Interrupted(sig))
+        } else {
+            Err(CliError::Interrupted(sig).with_status(3))
         }
-        result
     }
 
     /// [`Self::race`] for a command that is not a session, whose notice names
@@ -161,9 +198,21 @@ impl Signals {
     where
         CliError: From<E>,
     {
+        self.race_saying(ending, fut, &notice).await
+    }
+
+    async fn race_saying<T, E>(
+        &mut self,
+        ending: &str,
+        fut: impl Future<Output = std::result::Result<T, E>>,
+        say: &impl Fn(&str),
+    ) -> Result<T>
+    where
+        CliError: From<E>,
+    {
         tokio::select! {
             biased;
-            sig = self.any() => Err(interrupted(sig, ending)),
+            sig = self.any() => Err(interrupted(sig, ending, say)),
             result = fut => result.map_err(CliError::from),
         }
     }
@@ -172,9 +221,24 @@ impl Signals {
 /// The error a signal ends a wait with, announced as it happens: the teardown
 /// that follows can take seconds, and the user should not have to wonder what
 /// it is for.
-fn interrupted(sig: EndSignal, ending: &str) -> CliError {
-    notice(&format!("[outrig] {sig} received; ending {ending}"));
+fn interrupted(sig: EndSignal, ending: &str, say: &impl Fn(&str)) -> CliError {
+    say(&ending_notice(sig, ending));
     CliError::Interrupted(sig)
+}
+
+/// What a signal that ends `ending` is announced as.
+fn ending_notice(sig: EndSignal, ending: &str) -> String {
+    format!("[outrig] {sig} received; ending {ending}")
+}
+
+/// What a signal ending the session is announced as, for a caller that
+/// cannot let [`interrupted`] print it as the signal lands. `run-new` holds
+/// the terminal through its screen, which draws over whatever else is written
+/// there and clears it on the way out, and queues what it shows rather than
+/// writing it here; it says this once the terminal is the shell's again, in
+/// turn with the report that follows.
+pub fn session_ending_line(sig: EndSignal) -> String {
+    format!("{}\n", ending_notice(sig, "the session"))
 }
 
 /// [`interrupted`], for a signal that lands where the line is unfinished: at
@@ -182,7 +246,7 @@ fn interrupted(sig: EndSignal, ending: &str) -> CliError {
 /// on a line of its own, as the REPL's `[outrig] interrupted` does.
 pub fn interrupted_mid_line(sig: EndSignal) -> CliError {
     notice("");
-    interrupted(sig, "the session")
+    interrupted(sig, "the session", &notice)
 }
 
 /// Run a session's container cleanup to completion, unless SIGINT or SIGTERM
@@ -199,6 +263,15 @@ pub fn interrupted_mid_line(sig: EndSignal) -> CliError {
 /// twice in quick succession: once from the kernel and once from the shell
 /// passing it on.
 pub async fn unless_signaled(cleanup: impl Future<Output = ()>) -> Option<EndSignal> {
+    unless_signaled_saying(cleanup, &notice).await
+}
+
+/// [`unless_signaled`], with its notice handed to `say`; see
+/// [`Signals::race_settled_saying`].
+async fn unless_signaled_saying(
+    cleanup: impl Future<Output = ()>,
+    say: &impl Fn(&str),
+) -> Option<EndSignal> {
     let mut fresh = match Signals::install() {
         Ok(signals) => signals,
         Err(e) => {
@@ -221,7 +294,7 @@ pub async fn unless_signaled(cleanup: impl Future<Output = ()>) -> Option<EndSig
         biased;
         () = cleanup => None,
         sig = impatient => {
-            notice(&format!(
+            say(&format!(
                 "[outrig] {sig} received during teardown; removing the session's containers \
                  in the background"
             ));

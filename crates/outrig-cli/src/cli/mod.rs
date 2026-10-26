@@ -48,6 +48,31 @@ pub(crate) fn eprint_best_effort(text: &str) {
     let _ = std::io::stderr().write_all(text.as_bytes());
 }
 
+/// How long [`eprint_bounded`] waits for the write to `stderr`.
+const FINAL_ERROR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`eprint_best_effort`] for the last thing a process says, which must not
+/// keep it from exiting: a stderr whose reader has stopped, with its pipe
+/// full, holds a write for good. The write is made on a thread of its own and
+/// waited for only so long; the process ends with the write left in flight.
+pub(crate) fn eprint_bounded(text: &str) {
+    write_bounded(std::io::stderr(), text, FINAL_ERROR_GRACE);
+}
+
+fn write_bounded(mut out: impl Write + Send + 'static, text: &str, within: std::time::Duration) {
+    let text = text.to_string();
+    let (done, written) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("final-error".to_string())
+        .spawn(move || {
+            let _ = out.write_all(text.as_bytes());
+            let _ = done.send(());
+        });
+    if spawned.is_ok() {
+        let _ = written.recv_timeout(within);
+    }
+}
+
 /// Resolve the user's `<session>` argument (which may be a substring) to a
 /// concrete session. CLI policy, not store policy: substring matching is an
 /// ergonomic affordance for the user typing `outrig logs 1419 fs`, but the
@@ -146,3 +171,37 @@ pub fn unlink_dangling_report(store: &SessionStore, link: &DanglingLink) -> Resu
     })
 }
 
+
+#[cfg(test)]
+mod bounded_tests {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::write_bounded;
+
+    /// A writer whose write waits until it is let go, as a write to a full
+    /// pipe nobody reads does.
+    struct Stuck(mpsc::Receiver<()>);
+
+    impl Write for Stuck {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The last thing a process says does not keep it from exiting when the
+    /// write never finishes (#644).
+    #[test]
+    fn a_write_that_never_finishes_is_given_up_on() {
+        let (_hold, stuck) = mpsc::channel();
+        let started = Instant::now();
+        write_bounded(Stuck(stuck), "error: x\n", Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+}

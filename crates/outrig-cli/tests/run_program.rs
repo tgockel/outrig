@@ -374,6 +374,49 @@ async fn signals_sent_to_outrig_reach_the_program() {
     }
 }
 
+/// A `SIGHUP` -- a closed terminal, a CI timeout -- reaches the program as the `SIGTERM` it asks
+/// for, rather than ending `outrig` by the default action and leaving the engine that stops the
+/// program's sessions with it (#644). A program that handles `SIGTERM` says so and exits 0; one
+/// that does not is ended by it, and `outrig` exits with its 143.
+#[tokio::test]
+async fn a_sighup_to_outrig_reaches_the_program_as_a_sigterm() {
+    let case = Case::new();
+    case.write(
+        "handles.py",
+        "import signal, sys, time\n\
+         def handle(number, frame):\n    print('got', signal.Signals(number).name)\n    sys.exit(0)\n\
+         signal.signal(signal.SIGTERM, handle)\n\
+         open(sys.argv[1], 'w').close()\n\
+         time.sleep(60)\n",
+    );
+    case.write(
+        "ignores.py",
+        "import sys, time\nopen(sys.argv[1], 'w').close()\ntime.sleep(60)\n",
+    );
+    for (script, code, stdout) in [
+        ("handles.py", 0, "got SIGTERM\n".to_string()),
+        ("ignores.py", 128 + Signal::SIGTERM as i32, String::new()),
+    ] {
+        let ready = case.path().join(format!("{script}.hup-ready"));
+        let child = case
+            .outrig(&["run", script, ready.to_str().unwrap()])
+            .spawn()
+            .expect("outrig starts");
+        appears(&ready).await;
+        kill(Pid::from_raw(child.id().unwrap() as i32), Signal::SIGHUP).unwrap();
+        let ran = timeout(TEST_TIMEOUT, child.wait_with_output())
+            .await
+            .expect("outrig timed out")
+            .unwrap();
+        assert_eq!(
+            (ran.status.code(), text(&ran.stdout)),
+            (Some(code), stdout),
+            "{script}: {}",
+            text(&ran.stderr)
+        );
+    }
+}
+
 /// `kill -9` of `outrig` ends the program and what it started: its whole process group.
 #[tokio::test]
 async fn killing_outrig_ends_the_programs_group() {
