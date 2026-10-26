@@ -73,10 +73,14 @@ pub enum GaveUp {
 /// see, and it is *per round*: a subagent that published and then finished is
 /// idle but not failed. A publish counts only when no steer came after it,
 /// since it cannot answer one.
+///
+/// `Ended` is the one state nothing leaves: the task ended on its own, so no
+/// round will run again, and a prompt from the parent cannot start one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Running,
     Idle { published: bool },
+    Ended,
 }
 
 /// A point-in-time view of one subagent, cheap to clone out of the watch
@@ -96,14 +100,16 @@ pub struct Snapshot {
 impl Snapshot {
     /// Whether a parent at `watermark` has something to collect.
     ///
-    /// Two ways that happens: a newer version was published, or the subagent
+    /// Three ways that happens: a newer version was published, the subagent
     /// stopped without publishing during its last round -- or without
-    /// publishing again after a steer. The second is the error case, and it
-    /// stays true until the parent pokes the subagent back into `Running` -- it
-    /// is deliberately level-triggered, since nothing about a stalled subagent
-    /// changes just by being looked at.
+    /// publishing again after a steer -- or its task ended. The last two are
+    /// the error cases, and both are deliberately level-triggered, since
+    /// nothing about a stalled subagent changes just by being looked at. A stop
+    /// stays true until the parent pokes the subagent back into `Running`; an
+    /// end stays true for good.
     pub fn readable(&self, watermark: u64) -> bool {
         self.version > watermark
+            || self.state == RunState::Ended
             || (self.version == watermark && self.state == RunState::Idle { published: false })
     }
 
@@ -121,9 +127,17 @@ impl Snapshot {
             return None;
         }
         if self.version > watermark {
-            // A round may end without publishing while an older result is
-            // still uncollected; the unread result is the more useful answer.
+            // A round may end without publishing, or the task may end, while
+            // an older result is still uncollected; the unread result is the
+            // more useful answer.
             return self.outcome.clone();
+        }
+        if self.state == RunState::Ended {
+            return Some(Outcome::Error(
+                "subagent task ended unexpectedly, so it can no longer run. Release it with \
+                 outrig__subagent_release, then launch it again if the work is still needed."
+                    .to_string(),
+            ));
         }
         Some(Outcome::Error(match &self.silent_cause {
             Some(SilentCause::TruncatedReport) => TRUNCATED_REPORT.to_string(),
@@ -355,6 +369,18 @@ impl SubagentShared {
             self.tx
                 .send_modify(|snap| snap.state = RunState::Idle { published });
         }
+    }
+
+    /// Record that the subagent's task ended on its own, so a parent reading it
+    /// is told instead of waiting on a result that cannot come (#385).
+    ///
+    /// Not a [`Self::publish`]: that is edge-triggered, so a second read would
+    /// block again, and it would replace a report the parent has not collected
+    /// yet, which [`Snapshot::read`] hands over first. Takes no lock but the
+    /// channel's, which tokio does not let poisoning lock out: this runs right
+    /// after a panic, which may have poisoned any of the others.
+    pub fn end_task(&self) {
+        self.tx.send_modify(|snap| snap.state = RunState::Ended);
     }
 
     /// Whether the round in flight holds a report that answers every steer the
@@ -1083,5 +1109,94 @@ mod tests {
                 "subagent stopped without calling outrig__set_result".into()
             ))
         );
+    }
+
+    /// #385: nothing is coming from a task that ended, so a reader waiting on
+    /// the channel is woken, and the parent is told so each time it asks --
+    /// never made to wait -- along with the way out. It is not settled either,
+    /// or a wait naming only it would fail with "nothing to wait for".
+    #[test]
+    fn an_ended_task_wakes_a_waiting_reader_and_reads_as_an_error_every_time() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        let mut waiting = shared.subscribe();
+        assert!(
+            futures_util::FutureExt::now_or_never(waiting.changed()).is_none(),
+            "nothing has changed yet"
+        );
+
+        shared.end_task();
+        assert!(
+            futures_util::FutureExt::now_or_never(waiting.changed())
+                .is_some_and(|woken| woken.is_ok()),
+            "the reader is woken"
+        );
+
+        let message = silent_message(&shared);
+        for part in [
+            "ended unexpectedly",
+            "can no longer run",
+            "outrig__subagent_release",
+            "launch it again",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from: {message}");
+        }
+        assert_eq!(
+            silent_message(&shared),
+            message,
+            "asked again, it says so again"
+        );
+        assert!(!shared.snapshot().settled(0));
+    }
+
+    /// Ending publishes nothing, so a report the parent had not collected is
+    /// still read first, and the end reads after it (#310's lesson).
+    #[test]
+    fn an_ended_task_hands_over_its_report_first() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.publish(Outcome::Result("report".into()));
+        shared.end_task();
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.version, 1, "ending is not a publish");
+        assert_eq!(snapshot.read(0), Some(Outcome::Result("report".into())));
+        assert!(matches!(snapshot.read(1), Some(Outcome::Error(_))));
+    }
+
+    /// `send` checks that the task is running and then accepts, so a prompt
+    /// can land just after the task ended. It queues a round nothing will run,
+    /// and must not move the subagent back to `Running`: that would hand a
+    /// waiting parent the wait this state exists to end.
+    #[test]
+    fn a_prompt_sent_to_an_ended_task_does_not_revive_it() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        let _ = shared.close_injections(true);
+        shared.end_task();
+
+        assert_eq!(shared.accept("too late".into()), Accepted::Queued);
+        assert_eq!(shared.snapshot().state, RunState::Ended);
+        assert!(shared.snapshot().readable(0));
+    }
+
+    /// The panic that ended the task may have poisoned a lock it held, and a
+    /// panic in whatever wakes the parent would leave it waiting for good.
+    #[test]
+    fn ending_the_task_takes_no_lock_a_panic_may_have_poisoned() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = (
+                shared.lock_prompts(),
+                shared.lock_gave_up(),
+                shared.round_start_version.lock(),
+            );
+            panic!("a panic with the locks held");
+        }));
+        assert!(panicked.is_err());
+
+        shared.end_task();
+        assert_eq!(shared.snapshot().state, RunState::Ended);
     }
 }

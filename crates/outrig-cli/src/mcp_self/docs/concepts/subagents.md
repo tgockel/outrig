@@ -251,6 +251,11 @@ messages were sent, and a subagent with one waiting is not idle: reading its res
 round rather than returning how the last one stopped. Idle subagents live until released or until
 the session ends.
 
+The one subagent that cannot be reopened is one whose task ended unexpectedly, which is a bug in
+OutRig. Waiting on it or reading its result says so at once, and says so again every time rather
+than blocking; a report it made before that is read first. `outrig__subagent_send` refuses it.
+Release it and launch a new one.
+
 `outrig__subagent_release` takes the whole list or none of it. If any name in the call is unknown
 -- or named twice -- nothing is released and every subagent in that call stays live, with its
 history and its unread results intact. Releasing is unrecoverable, so a bad list is better retried
@@ -286,10 +291,11 @@ only the model's text. Subagent activity shows up two other ways:
   conversation, and what a subagent does next is its parent's call. Lines about the model call
   itself carry the label too -- a retry, a move to the next candidate of an alias chain, a turn
   that produced no text -- so a fan-out's waits and failures are attributable to the round that
-  is having them. The primary agent's own lines are unlabeled.
+  is having them. A subagent whose task ended unexpectedly says so on a line labeled the same
+  way. The primary agent's own lines are unlabeled.
 - In a transcript holding that subagent's prompts, any steer delivered mid-round, replies,
-  and published outcomes. A subagent the primary launched writes
-  `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
+  published outcomes, and the end of a task that stopped unexpectedly. A subagent the primary
+  launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
   logs. One launched by a subagent writes into a directory named for its parent, beside the
   parent's own transcript: `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`,
   and `scan`'s own go in `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under

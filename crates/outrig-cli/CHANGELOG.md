@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent whose task panics no longer leaves its parent waiting forever.** The round loop
+  never returns, so a panic inside it is the one way a subagent's task ends on its own, and tokio
+  contains a panic without telling anyone. The subagent stayed registered as running with its
+  channel still open: `outrig__get_result` and `outrig__wait_results` blocked until Ctrl-C, while
+  `outrig__subagent_send` already refused the same subagent as no longer running. The task now
+  catches the panic and moves the subagent into an ended state that wakes whoever is waiting and
+  reads as an error every time it is asked, naming the remedy: release it and launch a new one. A
+  report it made before the panic is still read first, and `outrig__subagent_send` refuses it at
+  once. The panic is traced on stderr under the subagent's label and recorded in its transcript.
+  A subagent that release or shutdown aborts is not reported as ended. (#385)
 - **Two launches that draw the same session id no longer share a directory.** A session's
   directory was made with `create_dir_all`, which succeeds on one that exists, so a launch whose
   id another launch already held wrote its `session.json` over that launch's -- one in 65,536

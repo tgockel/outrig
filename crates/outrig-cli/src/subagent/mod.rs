@@ -33,9 +33,11 @@ pub mod state;
 mod transcript;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt as _;
 use futures_util::future::select_all;
 use outrig::config::Config;
 use tokio::task::JoinHandle;
@@ -358,8 +360,9 @@ impl SubagentRegistry {
             .ok_or_else(|| unknown_name(name, &entries))?;
         // Release and shutdown take the name before they stop the task, so a
         // task found finished here ended on its own. It would take the prompt
-        // and never run it.
-        if entry.abort.is_finished() {
+        // and never run it. A task that ended says so itself, a little before
+        // the runtime reaps it.
+        if entry.abort.is_finished() || entry.shared.snapshot().state == state::RunState::Ended {
             return Err(format!("subagent {name:?} is no longer running"));
         }
         Ok(match entry.shared.accept(prompt) {
@@ -945,14 +948,8 @@ fn compose_preamble(parent: Option<&str>) -> String {
     out
 }
 
-/// One subagent's lifetime: a round per prompt the parent sends, with history
-/// carried across them. This is the headless-REPL loop -- `run_turn_captured`
-/// is the same call the REPL makes for a typed line.
-///
-/// Rounds run in the order their prompts were accepted, and a steer injected
-/// too late for any of its round's tool results to carry takes its place in
-/// that order as a round of its own -- see [`injection`]. The loop ends only
-/// when the task is aborted, which release and shutdown both do.
+/// One subagent's task: its [`drive_rounds`], and the note a task that ends on
+/// its own leaves behind (#385).
 async fn run_rounds(
     name: String,
     agent: crate::llm::RigAgent,
@@ -962,11 +959,45 @@ async fn run_rounds(
     label: Option<ModelLabel>,
     chain: Vec<ModelLabel>,
 ) {
-    let mut history = Vec::new();
     let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref());
     // What every trace below calls this subagent; `name` alone is ambiguous
     // between parents (#305).
     let path = subagent_path(&ancestry, &name);
+
+    // The loop never returns, so a panic is the only way the task ends on its
+    // own, and an abort drops this future before the code below. Caught here,
+    // once the unwind is over, rather than by a guard's `Drop` during it: a
+    // panic in a destructor mid-unwind aborts the process, and a guard would
+    // also run when release aborts the task, which is no failure. Unwind
+    // safety: what the code below observes is the shared state, which
+    // `end_task` overwrites, and a transcript that only appends.
+    let rounds = drive_rounds(&agent, &shared, &mut log, &path, &chain);
+    let _ = AssertUnwindSafe(rounds).catch_unwind().await;
+
+    // Before anything that could itself panic, since a parent may be waiting.
+    shared.end_task();
+    let note = "its task ended unexpectedly, so it can no longer run";
+    eprintln!("[outrig]   [{path}] {note}");
+    log.record_outcome("task ended", note);
+}
+
+/// A round per prompt the parent sends, with history carried across them. This
+/// is the headless-REPL loop -- `run_turn_captured` is the same call the REPL
+/// makes for a typed line.
+///
+/// Rounds run in the order their prompts were accepted, and a steer injected
+/// too late for any of its round's tool results to carry takes its place in
+/// that order as a round of its own -- see [`injection`]. The loop ends only
+/// when the task is aborted, which release and shutdown both do, or a panic
+/// unwinds out of it.
+async fn drive_rounds(
+    agent: &crate::llm::RigAgent,
+    shared: &Arc<SubagentShared>,
+    log: &mut transcript::Transcript,
+    path: &str,
+    chain: &[ModelLabel],
+) {
+    let mut history = Vec::new();
 
     loop {
         let prompt = shared.next_round().await;
@@ -992,7 +1023,7 @@ async fn run_rounds(
         };
 
         let outcome = agent
-            .run_turn_captured(&prompt, &mut history, &path, injections)
+            .run_turn_captured(&prompt, &mut history, path, injections)
             .await;
         // Asked whether the turn succeeded or not: the calls before a failing
         // one may already have been answered by a fallback.
@@ -1061,7 +1092,7 @@ async fn run_rounds(
         let steers = shared.close_injections(failure.is_none());
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
-        log.record_answered(&chain, &answered);
+        log.record_answered(chain, &answered);
         log.record_reply(&reply);
         if shared.gave_up() == Some(GaveUp::KeptReport) {
             // The give-up goes beside the report rather than over it (#350), as
@@ -1083,7 +1114,7 @@ async fn run_rounds(
                 eprintln!("[outrig]   [{path}] round failed after reporting: {reason}");
                 log.record_outcome("round failed after reporting", reason);
             } else {
-                publish_round_failure(&shared, &path, reason);
+                publish_round_failure(shared, path, reason);
             }
         }
         shared.end_round();
@@ -1522,6 +1553,33 @@ mod tests {
                 entered.ready.notify_one();
                 std::future::pending().await
             })
+        }
+    }
+
+    /// A session tool whose call panics, which unwinds out of the round that
+    /// made it: the one way a subagent's task ends on its own (#385). Rig runs a
+    /// tool inline in the agent loop, so this is the path a panic in a real
+    /// tool, or in the loop itself, takes.
+    struct PanickingTool;
+
+    impl rig::tool::ToolDyn for PanickingTool {
+        fn name(&self) -> String {
+            "panics".to_string()
+        }
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn call<'a>(
+            &'a self,
+            _args: String,
+        ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>> {
+            Box::pin(async move { panic!("injected tool panic") })
         }
     }
 
@@ -2728,6 +2786,136 @@ mod tests {
             futures_util::FutureExt::now_or_never(shared.next_round()).is_none(),
             "and the prompt must not be queued"
         );
+    }
+
+    /// The task says it ended before the runtime has reaped it, so a `send` in
+    /// between cannot go by `is_finished`. Its prompt would be queued for a
+    /// round nothing will run.
+    #[tokio::test]
+    async fn send_refuses_a_subagent_that_reports_its_task_ended() {
+        let (registry, _log_dir) = test_registry();
+        // The stand-in task never finishes, so `is_finished` is not what refuses.
+        let shared = hand_built_entry(&registry, "gone");
+        shared.end_task();
+
+        let err = registry
+            .send("gone", "hello".to_string())
+            .expect_err("an ended task cannot run the prompt");
+        assert!(err.contains("no longer running"), "got: {err}");
+        assert!(
+            futures_util::FutureExt::now_or_never(shared.next_round()).is_none(),
+            "and the prompt must not be queued"
+        );
+    }
+
+    /// #385: a panic is the one way a subagent's task ends on its own, and
+    /// tokio contains it. Nothing then published and no sender dropped -- the
+    /// registry's entry holds it -- so a parent blocked reading or waiting on
+    /// the subagent waited until Ctrl-C, while `send` already called it dead.
+    /// Both now wake with the news, and every later one gets it at once, since
+    /// nothing is coming.
+    #[tokio::test]
+    async fn a_task_that_panics_ends_the_read_and_the_wait_on_it() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) =
+            launch_probe_with(&provider, 4, vec![SessionTool::new(PanickingTool)]).await;
+        let names = vec!["probe".to_string()];
+
+        // Both are polled before the script answers the round's model call with
+        // the call that panics, so both are blocked when it does.
+        let script = async {
+            provider.next_call().await.call_tools(&[("panics", "{}")]);
+        };
+        let (read, wait, ()) = tokio::join!(
+            tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe")),
+            tokio::time::timeout(WAIT_TIMEOUT, registry.wait_results(&names, 1)),
+            script
+        );
+        let message = match read.expect("a read blocked on the subagent is woken") {
+            Ok(Outcome::Error(message)) => message,
+            other => panic!("the end reads as an error, got: {other:?}"),
+        };
+        assert!(message.contains("ended unexpectedly"), "got: {message}");
+        assert_eq!(
+            wait.expect("a wait blocked on the subagent is woken"),
+            Ok(names.clone())
+        );
+
+        // Neither waits for something that cannot come, and the wait does not
+        // find "nothing to wait for".
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(registry.get_result("probe")),
+            Some(Ok(Outcome::Error(message)))
+        );
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(registry.wait_results(&names, 1)),
+            Some(Ok(names))
+        );
+        let err = registry
+            .send("probe", "hello".to_string())
+            .expect_err("it can run no prompt");
+        assert!(err.contains("no longer running"), "got: {err}");
+
+        // Written in the same poll that woke the reads, on this one-thread
+        // runtime.
+        let transcript = probe_transcript(&log_dir).await;
+        assert!(
+            transcript.contains("\n--- task ended ---\n"),
+            "the transcript records where the task stopped, got: {transcript}"
+        );
+    }
+
+    /// The end is not a publish, which would replace a report the parent has
+    /// not collected (#310): the report is read first, then the error, and the
+    /// error every time after.
+    #[tokio::test]
+    async fn a_task_that_panics_after_reporting_keeps_the_report() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) =
+            launch_probe_with(&provider, 4, vec![SessionTool::new(PanickingTool)]).await;
+
+        provider.next_call().await.set_result("findings");
+        provider.next_call().await.call_tools(&[("panics", "{}")]);
+
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            reads.push(
+                tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+                    .await
+                    .expect("every read ends")
+                    .expect("readable"),
+            );
+        }
+        assert_eq!(reads[0], Outcome::Result("findings".to_string()));
+        assert!(
+            matches!(&reads[1], Outcome::Error(message) if message.contains("ended unexpectedly")),
+            "got: {:?}",
+            reads[1]
+        );
+        assert_eq!(reads[2], reads[1], "and says so again");
+    }
+
+    /// Release and shutdown end a task by aborting it, which drops its future
+    /// at an await point rather than unwinding through it. That is the parent's
+    /// own doing, not a task ending on its own: no state for a reader to find
+    /// and no transcript record (#385).
+    #[tokio::test]
+    async fn a_released_subagent_is_not_reported_as_ended() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe(&provider, 4).await;
+        // The round is parked in its model call when it is released.
+        let _call = provider.next_call().await;
+        let shared = registry.lock().get("probe").expect("live").shared.clone();
+        let before = probe_transcript(&log_dir).await;
+
+        registry
+            .release(&["probe".to_string()])
+            .expect("probe is live");
+        // Reaping the task is what says the abort has landed.
+        registry.shutdown().await;
+
+        assert_eq!(shared.snapshot().state, state::RunState::Running);
+        assert_eq!(probe_transcript(&log_dir).await, before);
     }
 
     /// #181's wider window: a steer sent while the round's last model call is
