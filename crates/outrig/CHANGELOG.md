@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A network audit record names the resolved names that granted an `allow`, not only the
+  client's claim.** `outrig.host` holds the name a client claimed (`Host:` or SNI) when it made
+  one, and the first resolved name when it did not, with `outrig.host_source` saying which. Only a
+  resolved name can satisfy a hostname `allow` entry, so a connection granted by `allow[n]` whose
+  client claimed another name was recorded under a name that granted nothing, and the one that did
+  was written nowhere: the grant could not be read back from `network.jsonl`. The same held with no
+  claim and several resolved names, where `outrig.host` shows one of them. A record now also
+  carries `outrig.resolved`: the names this attachment's DNS listener had validated for the
+  destination address when the connection was decided, left out when there were none. Purely
+  additive: a new key, with `outrig.host` and `outrig.host_source` meaning what they did, so this
+  ships in a patch release. (#390)
 - **An allowed connection whose upstream connect fails now says why in its record.** The
   interceptor returned from a refused connect, one still unanswered after 20 seconds, or one with
   no route, and left the record as it stood: `outrig.action` `allow`, zero byte counts,

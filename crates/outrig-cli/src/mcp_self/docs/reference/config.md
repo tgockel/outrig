@@ -361,7 +361,11 @@ Consequences worth planning for:
 
 Client-asserted names are still recorded. An audit record carries the best known name in
 `outrig.host` and says where it came from in `outrig.host_source`, which is `resolved` for a
-name the interceptor validated and `asserted` for one the client claimed.
+name the interceptor validated and `asserted` for one the client claimed. Because only a
+resolved name can satisfy an `allow` entry, `outrig.resolved` lists every name the interceptor
+had validated for the destination address when the connection was decided. Where `outrig.host`
+shows the client's claim, the name that earned the grant is one of them. It is left out when
+there were none.
 
 > **Changed in 0.2.0.** Before this release a client-supplied `Host:` or SNI satisfied a
 > hostname `allow` entry on its own, so an allowlist permitted more than it appeared to. The

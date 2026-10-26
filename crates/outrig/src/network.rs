@@ -187,12 +187,16 @@ impl PolicyDecision {
 /// The names this attachment's own DNS listener validated for one destination
 /// address. Resolved identity is the only evidence that may grant a hostname
 /// rule.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct ResolvedNames(Vec<String>);
 
 impl ResolvedNames {
     fn iter(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(String::as_str)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     fn first(&self) -> Option<&str> {
@@ -2248,9 +2252,20 @@ struct AuditRecord {
     outrig_host: String,
     /// Where `outrig.host` came from: `resolved` for a name this attachment's
     /// DNS listener validated for the address, `asserted` for one the client
-    /// claimed. Only a resolved name can have granted an allow.
+    /// claimed. Only a resolved name can have granted an allow, which is why
+    /// `outrig.resolved` is written too: `outrig.host` shows one name, and
+    /// the one that granted may not be it.
     #[serde(rename = "outrig.host_source", skip_serializing_if = "Option::is_none")]
     outrig_host_source: Option<&'static str>,
+    /// Every name this attachment's DNS listener validated for the
+    /// destination address when the connection was decided: the evidence
+    /// the `allow` entries were matched against. Without it a grant cannot be
+    /// read back from the log whenever a client's claim takes `outrig.host`.
+    #[serde(
+        rename = "outrig.resolved",
+        skip_serializing_if = "ResolvedNames::is_empty"
+    )]
+    outrig_resolved: ResolvedNames,
     #[serde(rename = "outrig.action")]
     outrig_action: &'static str,
     #[serde(rename = "outrig.rule")]
@@ -2291,6 +2306,7 @@ impl AuditRecord {
             outrig_container: container.to_string(),
             outrig_host: host,
             outrig_host_source: host_source,
+            outrig_resolved: event.resolved,
             outrig_action: event.decision.action.as_str(),
             outrig_rule: event.decision.rule,
             outrig_error: event.error,
@@ -7196,6 +7212,70 @@ mod tests {
         assert_eq!(record["orig_bytes"], 0);
     }
 
+    /// #390 end to end: an address the container resolved `allowed.test` to
+    /// is reached announcing `other.test`. The allow is the resolved name's,
+    /// the record's host is the claim, and the name that granted has to be in
+    /// the record too -- it is the only place the grant can be read back.
+    #[tokio::test]
+    async fn a_grant_by_a_resolved_name_is_recorded_beside_the_name_claimed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, upstream) = upstream_once().await;
+        let bindings = empty_bindings();
+        bindings.lock().expect("bindings").bind(
+            dst.ip(),
+            "allowed.test",
+            Duration::from_secs(60),
+            Instant::now(),
+        );
+        let policy = Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host("allowed.test")
+                .build()
+                .expect("policy"),
+        ));
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(returning_ok(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            None,
+            audit_sink(dir.path()).await,
+            bindings,
+            policy,
+            cancel.clone(),
+        )));
+
+        let request = http_request("other.test");
+        client.write_all(&request).await.expect("write request");
+        // The request reaching the upstream is what says the connection was
+        // allowed, and so that the decision is the one recorded below.
+        let mut upstream = tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .expect("an allowed connection should reach the upstream")
+            .expect("upstream accepted");
+        let mut forwarded = vec![0u8; request.len()];
+        upstream
+            .read_exact(&mut forwarded)
+            .await
+            .expect("the bridge should carry the request");
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "allow[0]");
+        assert_eq!(record["outrig.host"], "other.test");
+        assert_eq!(record["outrig.host_source"], "asserted");
+        assert_eq!(
+            record["outrig.resolved"],
+            serde_json::json!(["allowed.test"])
+        );
+    }
+
     /// Only the stand-in moves, and only to the alias's host.
     #[test]
     fn only_the_host_stand_in_is_dialed_elsewhere() {
@@ -9617,14 +9697,71 @@ options edns0
         );
         assert_eq!(claimed["outrig.host"], "evil.example");
         assert_eq!(claimed["outrig.host_source"], "asserted");
+        assert!(claimed.get("outrig.resolved").is_none());
 
         let looked_up = record(resolved(&["allowed.example"]), ClientAssertion::default());
         assert_eq!(looked_up["outrig.host"], "allowed.example");
         assert_eq!(looked_up["outrig.host_source"], "resolved");
+        assert_eq!(
+            looked_up["outrig.resolved"],
+            serde_json::json!(["allowed.example"])
+        );
 
         let unknown = record(ResolvedNames::default(), ClientAssertion::default());
         assert!(unknown.get("outrig.host").is_none());
         assert!(unknown.get("outrig.host_source").is_none());
+        assert!(unknown.get("outrig.resolved").is_none());
+    }
+
+    /// #390: a claim takes `outrig.host`, and only a resolved name can have
+    /// granted an allow, so the names that could have are written beside it.
+    /// With several of them, `outrig.host` is at most one, so they are all
+    /// written whichever of the two names the host came from.
+    #[test]
+    fn audit_record_keeps_the_resolved_names_a_claim_hides() {
+        fn record(resolved: ResolvedNames, assertion: ClientAssertion) -> serde_json::Value {
+            let record = AuditRecord::new(
+                "sid",
+                "outrig-test",
+                AuditEvent {
+                    proto: "tcp",
+                    opened: UNIX_EPOCH,
+                    duration: Duration::from_millis(1),
+                    orig: addr("10.0.2.100:50123"),
+                    dst: addr("203.0.113.66:443"),
+                    service: assertion.service(),
+                    resolved,
+                    assertion,
+                    bytes_tx: 0,
+                    bytes_rx: 0,
+                    decision: PolicyDecision::new(NetworkAction::Allow, "allow[0]"),
+                    error: None,
+                },
+            );
+            serde_json::to_value(record).expect("record json")
+        }
+
+        let both = record(
+            resolved(&["allowed.example"]),
+            ClientAssertion::tls("evil.example".to_string()),
+        );
+        assert_eq!(both["outrig.host"], "evil.example");
+        assert_eq!(both["outrig.host_source"], "asserted");
+        assert_eq!(
+            both["outrig.resolved"],
+            serde_json::json!(["allowed.example"])
+        );
+
+        let several = record(
+            resolved(&["a.example", "b.example"]),
+            ClientAssertion::default(),
+        );
+        assert_eq!(several["outrig.host"], "a.example");
+        assert_eq!(several["outrig.host_source"], "resolved");
+        assert_eq!(
+            several["outrig.resolved"],
+            serde_json::json!(["a.example", "b.example"])
+        );
     }
 
     /// A lookup is recorded as the UDP exchange with the DNS listener it is,
