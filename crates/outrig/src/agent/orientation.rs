@@ -32,13 +32,14 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::history::Window;
 use super::instructions::Instructions;
 use crate::harness::bindings::Brief;
 use crate::harness::event::InputBrief;
-use crate::harness::skills::SkillBrief;
+use crate::harness::skills::{Catalog, SkillBrief};
 
 /// What every agent is told first: how it acts.
 const ACT: &str = "You act on this project by writing Python. Your one tool, `submit_python`, runs \
@@ -46,10 +47,12 @@ const ACT: &str = "You act on this project by writing Python. Your one tool, `su
                    only way to read a file, run a command, or change anything.\n\n";
 
 /// What a session holds for its primary agent besides the interpreter: its
-/// bindings and its skills, each in the session's order.
+/// bindings and its skills, each in the session's order, and the catalog the
+/// skills are of, which a directive the user sends names one of.
 pub(crate) struct Holdings<'a> {
     pub(crate) bindings: &'a [Brief],
     pub(crate) skills: &'a [SkillBrief],
+    pub(crate) catalog: Option<&'a Arc<Catalog>>,
 }
 
 /// The orientation, then `configured` after a blank line when there is one,
@@ -298,7 +301,14 @@ fn skilled(skills: &[SkillBrief]) -> String {
         "\n\nThese skills come with the session, each instructions for a kind of work: \
          `outrig.skills.read(name)` returns them, to read when a skill's description fits what \
          you are doing. One that names a package also has Python, its entry module that \
-         package's `skill`, which you import as any module. `help(outrig.skills)` says more.\n",
+         package's `skill`, which you import as any module. `help(outrig.skills)` says more.\n\n\
+         A message from the user whose delivery names a skill, as `d.skill`, is the user typing \
+         `/name`: it asks you to run that skill. For a skill with a package, call `await \
+         outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [\"\"])[1])`, the text after \
+         the name and the whitespace that ends it. When that raises `outrig.skills.SkillNeedsClarification`, send its `question` to \
+         the user on `runtime.channels[\"user\"]`, and once they answer, call `invoke` again \
+         with `params=outrig.skills.params(d.skill)(...)`. For a skill without one, the message \
+         is its instructions followed by what the user typed: follow them.\n",
     );
     let mut listed = 0;
     let mut size = 0;

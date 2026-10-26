@@ -12,7 +12,7 @@ use super::lifecycle::Lifecycle;
 use super::report::{
     self, EventDelivery, ExecutionOutcome, ExecutionStatus, ShutdownReport, Stopped,
 };
-use super::skills::SkillBrief;
+use super::skills::Catalog;
 use super::{Closed, ClosedBy, Failure, SessionError, UserChannel};
 use crate::Outrig;
 use crate::agent::children::{self, Children};
@@ -146,14 +146,14 @@ impl Session {
 
     /// Open the primary agent's kernel, on the interpreter's main thread, and
     /// build the agent `resolved` names over it, in a container whose
-    /// workspace is `workspace`, told of the session's skills by `skills`: its
-    /// spend recorded in the session's ledger, and its rounds moving the
-    /// session's state.
+    /// workspace is `workspace`, told of the session's skills, `catalog`, and
+    /// sent directives naming them: its spend recorded in the session's
+    /// ledger, and its rounds moving the session's state.
     pub(crate) async fn build_primary(
         &mut self,
         resolved: &ResolvedAgent,
         workspace: Option<&Path>,
-        skills: &[SkillBrief],
+        catalog: &Arc<Catalog>,
     ) -> Result<(), AgentError> {
         self.interpreter.open(PRIMARY).await?;
         let agent = Agent::build(
@@ -163,7 +163,8 @@ impl Session {
             workspace,
             Holdings {
                 bindings: &self.bindings.briefs(),
-                skills,
+                skills: &catalog.briefs(),
+                catalog: Some(catalog),
             },
             self.ledger.clone(),
             Arc::clone(&self.lifecycle),

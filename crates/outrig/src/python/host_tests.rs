@@ -804,6 +804,41 @@ async fn a_post_the_channel_refuses_is_recorded_refused() {
     assert_eq!(refusal["reason"], "full");
 }
 
+/// A directive goes as a message naming its skill, and is recorded twice: the
+/// message, then the directive, under the message's id.
+#[tokio::test]
+async fn a_directive_names_its_skill_and_is_recorded_beside_its_message() {
+    let (dir, events) = recording().await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let answer = interpreter
+        .post_directive(USER, "/review-diff a.py", "review-diff", "project")
+        .expect("queued");
+    let request = fake.expect("msg").await;
+    assert_eq!(request["body"], "/review-diff a.py");
+    assert_eq!(request["skill"], "review-diff");
+    fake.send(json!({"t": "msg", "agent": PRIMARY, "id": request["id"], "pending": 1}))
+        .await;
+    assert_eq!(within(answer).await.expect("delivered"), 1);
+    let plain = interpreter.post(USER, "hi").expect("queued");
+    let request = fake.expect("msg").await;
+    assert!(request.get("skill").is_none(), "{request}");
+    fake.send(json!({"t": "msg", "agent": PRIMARY, "id": request["id"], "pending": 2}))
+        .await;
+    within(plain).await.expect("delivered");
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    assert_eq!(
+        kinds(&records),
+        ["message.sent", "skill.directive.received", "message.sent"]
+    );
+    let sent = of_kind(&records, "message.sent")[0];
+    let directive = of_kind(&records, "skill.directive.received")[0];
+    assert_eq!(directive["skill"], "review-diff");
+    assert_eq!(directive["source"], "project");
+    assert_eq!(directive["message"], sent["message"]);
+}
+
 /// What reaches the interpreter's stderr is recorded: its own diagnostics as
 /// such, and output no execution wrote -- which no result carries -- as
 /// unattributed, rather than vanishing.

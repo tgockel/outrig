@@ -345,3 +345,133 @@ model makes of a directive is not measured here.
   commands are matched and help is composed.
 - `plan/next/children-have-a-user-channel.md` -- a child-addressing REPL form must not collide with
   `/name`.
+
+## Decisions
+
+Forks 1, 2 and 3 were taken as recommended: the parser runs on the calling agent's model, with no
+`parse-model` key; `outrig.skills.params(name)` returns the class; and a reload while an
+invocation of the skill runs, in any kernel still open, is refused with `skill-busy`. What no doc
+settled is recorded here.
+
+- **`agent.call.settled` gains `value` (the maintainer's call).** The acceptance asks that the
+  parse call's settled event carry the `Clarification`, and also that `public-api.txt` gain only
+  the directive API, the invocation events and the invocation's id. The two disagree:
+  `AgentCallSettled` had no field for a result. It now has `value`, a preview of the result a
+  call was accepted with -- every typed call's, not the parser's alone -- `None` when it was not
+  accepted or the session's events are not observed. It is the one public addition outside the
+  list; the same JSON is also `agent.request.replied`'s `value`.
+- **`entry`, `bind` and `parameters` come from the host.** Discovery's reader of the `# ///
+  script` block already parsed `[tool.outrig.skill]`; it now keeps the three keys in the skill's
+  metadata, re-read whenever its digest moves, and the `skill.load` answer carries them to the
+  package's loader. The interpreter parses no TOML, so one parser decides what a block says.
+  `parameters` is a table of strings, as `bind` is, and anything else is `metadata-invalid`.
+- **`skill-changed` at `invoke`** is a new request, `skill.check {skill, digest}`, which lists the
+  skill again and refuses a digest that moved: a package imported earlier might fetch no file
+  during the invocation, so nothing else would notice.
+- **What can be found before anything runs raises from `invoke` itself**, as a typed call's
+  argument check raises from the call: the argument checks, `unknown-skill`, the import and its
+  failures, `skill-changed`, `skill-busy` under `reload=True`, the derivation's
+  `signature-unsupported` and `entry-not-found`, the `params` checks and `missing-binding`. No id
+  is spent and no event is published for them. What the run decides -- the parse's
+  `CompletionRejected` or `SkillNeedsClarification`, a limit, what the entry raises, a cancel --
+  comes from awaiting the handle. An instruction-only skill invoked is `entry-not-found`, saying
+  `outrig.skills.read` returns its instructions.
+- **The handle is narrower than `work.md`'s: `outrig.skills.Invocation`**, with `id`, `skill`,
+  `await`, `future`, `done()`, `result()` and `cancel()`, and no `status` or `progress`, which
+  describe a child's request. `runtime.wait` takes it as it takes a `Handle`. It owns a future of
+  the calling kernel's loop, settled once, by whichever comes first of the run's `finally` and a
+  done-callback for a task cancelled before its first step, whose `finally` never runs -- never
+  the task's own state, a cancelled task's being one a view cannot copy. `cancel()` is safe from
+  any thread and has `Task.cancel`'s meaning: a parse in progress is cancelled, which releases its
+  child; an `async def` entry gets `CancelledError` at its next `await`; a `def` entry runs on the
+  loop to its end, as any synchronous call does. A cancelled invocation raises
+  `outrig.RequestCancelled`, never `CancelledError`, which an awaiting execution would take for
+  its own cancellation. A `KeyboardInterrupt` or `SystemExit` landing in the entry settles the
+  handle with it and is raised on to the loop, as for any task. The run's `finally` awaits
+  nothing: a released child's loop gives its tasks a second.
+- **The parameter class.** Only the annotation of a parameter that becomes a field is resolved, one
+  at a time, as `typing.get_type_hints` resolves one, in the globals of the function the signature
+  comes from -- through what decorators wrap and what a `functools.partial` holds, as
+  `inspect.signature` follows them, so an entry made with `functools.wraps(partial(...))` derives --
+  and `{}` when that is no function: `from __future__ import annotations` works, and a return
+  annotation or a bound parameter's, which may name what the skill imports only under
+  `TYPE_CHECKING`, is never evaluated. Both were found in review: resolving every annotation refused
+  such a skill, and reading `__globals__` of what `inspect.unwrap` gave raised `AttributeError` for
+  a partial. A signature that cannot be read, such as a wrapper loop, is `signature-unsupported`. An
+  entry must be a function. Each field's type is checked with its markers stripped, before the class
+  is built and before any model is asked; a default must be of its field's type, as a typed call's
+  parameter's must, so `x: int = None` is `signature-unsupported` rather than an instance that fails
+  its own check; an unhashable default -- which a dataclass refuses as a field default -- is kept,
+  shared, through a factory returning it; `*args` defaults to a fresh list. Help from
+  `[tool.outrig.skill.parameters]` replaces a `doc()` the annotation already has, which the schema
+  would otherwise refuse as two. A field whose JSON key is `question`, an alias's included, is
+  refused, since the union could not tell the two results apart. A `parameters` key naming no field
+  is a `warnings.warn` in the execution that derived the class -- "reported", where the task says
+  other mistakes fail -- and the class is `<Camel>Params` in the entry's module. It is derived once
+  per import of the package, outside any lock, since deriving can import and a skill's import could
+  call `params()`; the first of two kernels deriving at once is the one kept.
+- **The parser is declared as `@outrig.agent` declares a function**, through `_agents._declare`,
+  and called through `_agents._call`, as the decorator's wrapper calls it, `invoke` having checked
+  the text is a `str`. The declaration takes the entry module as its `__module__` and
+  `parse_params` as its qualname, so a parse that asks or is refused -- which publishes no
+  invocation event -- still names the skill on its call's events, and its digest is the SHA-256 of
+  the entry module's source, the digest any declaration in that module carries. Its instructions
+  are `_PARSE` in `outrig/skills.py`, formatted with the skill's name and its class's and never
+  with the text, followed by the entry's cleaned docstring, or the skill's description when it has
+  none.
+- **Correlation.** A `ContextVar` holds the ids of the invocations the calling code runs inside,
+  innermost first, and `outrig.skills._current()` keeps those still in `_running`, the registry of
+  invocations not yet ended -- the same one `reload` reads for `skill-busy` -- so a task an entry
+  started and left running stops naming the invocation once it ends. A
+  spawn line carries the whole list, a typed call takes the innermost id when it is made, and an
+  RPyC request's label carries the innermost. `_Wait` takes it on the calling thread, as it takes
+  the execution, since the notice of a call never sent is written from the reader thread. As with
+  `execid`, only `hosted.received` names it; the request's other events share its id. Threads
+  started with `threading.Thread`, pool work items and `asyncio.to_thread` carry the context, as
+  they do the execution's; `_thread.start_new_thread` does not.
+- **Spend is read from the tree when the invocation ends**, not accumulated: each child's node
+  records the invocations its spawn was made inside, nodes stay in the registry after a release,
+  and each node's slot keeps every attempt, so `agent.invocation.ended` sums the attempts of the
+  nodes holding the id and of every agent below them, each once. The ledger and the rounds are
+  unchanged, so the main round counts each attempt once, as before. A child made inside an
+  invocation made inside another counts toward both. What a child spends after the entry ended
+  is in the rounds' totals and not on `skill.invocation.finished`.
+- **The protocol lines are `agent.invocation` and `agent.invocation.ended`**, routed to the
+  children's registry, which holds the slots; they are published as `skill.invocation.started` and
+  `skill.invocation.finished`. The second is sent only when the entry was called, so a parse that
+  ends the invocation publishes neither. `by` on the started event is `parser` exactly when it
+  names the parse call.
+- **`UserChannel::send_directive(skill, line)`.** For a skill with a `skill.py` the message is the
+  line, queued when the call returns, as `send`'s is. For one without, it is the skill's
+  instructions, read through its source within the session's places and bound, trimmed, a blank
+  line, then the line, queued once the future has read them. An unknown skill is an error and
+  nothing is sent. The `msg` line names the skill, which the interpreter checks is a string, and
+  `skill.directive.received` follows the message's `message.sent`, carrying its id. The catalog
+  reaches the channel through `Holdings`, keeping `Agent::build` at seven parameters.
+- **The REPL.** `drive` shows the events already queued before it reads a line, which is where
+  `skill.discovered` is as the session starts, so a `/name` typed at once finds its skill; a skill
+  named `help` or `quit` is left out of what a directive reaches, so `/help x` is still an unknown
+  command. A directive's name follows the slash directly, and any whitespace ends it, which is where
+  the preamble's `(d.body.split(maxsplit=1) + [""])[1]` splits too, so the parser of
+  `/review-diff<TAB>a.py b.py` is given `a.py b.py` (found in review: the `partition(" ")` the
+  design showed split only at a space). While a directive is being queued no other line is taken,
+  and its answer starts a round when none runs -- one that finds nothing new if the directive was
+  refused: a directive on piped input's last line still runs, and a line typed after an
+  instruction-only directive cannot reach the agent first. `/help` lists `/<skill> [text]` when the
+  session has skills, and a skill named `help` or `quit` is said once, as the catalog is read.
+- **`help(outrig.skills)` stays within the kernel's 8 KiB.** `__all__` is the functions and
+  `SkillError`; `Invocation`, `Clarification`, `SkillNeedsClarification`, `Origin` and `Skill` are
+  public and named in the module's docstring, each with `help()` of its own -- an exception class
+  alone renders past 2 KiB with what it inherits.
+- **Tests.** The session-level cases are `agent/invoke_tests.rs`, over `children_tests`'
+  session with a builder hook for skill sources and the binding's install places; the fixture
+  library installs into a directory kept between runs, as the test wheels are. `outrig-cli`'s
+  tests gained a mock that routes by the system prompt, as the crate-private one does.
+- **Of two implementations compared for complexity** (`/simplify`), the handle, the registry and
+  the REPL's catalog are the alternative's: one class where this one had a handle over a run
+  record, a flat registry by id where it had sets by skill, ids in the context where it had a chain
+  of records, and one read of the catalog before the loop. The derivation stayed this one's: the
+  alternative derived the class twice when two kernels invoked a skill at once, and stacked two
+  `doc()` markers on a parameter whose annotation had one.
+- **Follow-up.** Renaming `agent.call.settled` and `agent.request.settled`, whose names do not say
+  what happened, is #718, at the maintainer's request.

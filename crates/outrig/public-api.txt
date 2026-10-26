@@ -1143,6 +1143,10 @@ pub outrig::harness::event::HostedReason::Interception
 pub outrig::harness::event::HostedReason::Interrupted
 pub outrig::harness::event::HostedReason::Killed
 pub outrig::harness::event::HostedReason::QueueFull
+#[non_exhaustive] pub enum outrig::harness::event::InvocationEnd
+pub outrig::harness::event::InvocationEnd::Cancelled
+pub outrig::harness::event::InvocationEnd::Raised
+pub outrig::harness::event::InvocationEnd::Returned
 #[non_exhaustive] pub enum outrig::harness::event::Operation
 pub outrig::harness::event::Operation::Buffiter
 pub outrig::harness::event::Operation::Call
@@ -1165,13 +1169,19 @@ pub outrig::harness::event::Operation::Repr
 pub outrig::harness::event::Operation::Setattr
 pub outrig::harness::event::Operation::Str
 pub outrig::harness::event::Operation::Unknown
+#[non_exhaustive] pub enum outrig::harness::event::ParamsBy
+pub outrig::harness::event::ParamsBy::Caller
+pub outrig::harness::event::ParamsBy::Parser
 #[non_exhaustive] pub enum outrig::harness::event::Payload
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentCallSettled
+pub outrig::harness::event::Payload::AgentCallSettled::invocation: core::option::Option<outrig::harness::event::InvocationId>
 pub outrig::harness::event::Payload::AgentCallSettled::outcome: outrig::harness::event::RequestEnd
 pub outrig::harness::event::Payload::AgentCallSettled::request: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::AgentCallSettled::usage: core::option::Option<outrig::harness::event::Usage>
+pub outrig::harness::event::Payload::AgentCallSettled::value: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentCallStarted
 pub outrig::harness::event::Payload::AgentCallStarted::digest: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentCallStarted::invocation: core::option::Option<outrig::harness::event::InvocationId>
 pub outrig::harness::event::Payload::AgentCallStarted::module: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::parent: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::qualname: alloc::string::String
@@ -1292,6 +1302,7 @@ pub outrig::harness::event::Payload::HostedReceived::arguments: alloc::vec::Vec<
 pub outrig::harness::event::Payload::HostedReceived::binding: alloc::string::String
 pub outrig::harness::event::Payload::HostedReceived::by: outrig::harness::event::ReceivedBy
 pub outrig::harness::event::Payload::HostedReceived::execid: core::option::Option<outrig::harness::event::ExecId>
+pub outrig::harness::event::Payload::HostedReceived::invocation: core::option::Option<outrig::harness::event::InvocationId>
 pub outrig::harness::event::Payload::HostedReceived::keywords: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
 pub outrig::harness::event::Payload::HostedReceived::member: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::HostedReceived::operation: outrig::harness::event::Operation
@@ -1400,6 +1411,10 @@ pub outrig::harness::event::Payload::SessionReport::stopped: outrig::harness::St
 pub outrig::harness::event::Payload::SessionReport::verdict: outrig::harness::Verdict
 #[non_exhaustive] pub outrig::harness::event::Payload::SessionState
 pub outrig::harness::event::Payload::SessionState::state: outrig::harness::event::SessionState
+#[non_exhaustive] pub outrig::harness::event::Payload::SkillDirectiveReceived
+pub outrig::harness::event::Payload::SkillDirectiveReceived::message: outrig::harness::event::MessageId
+pub outrig::harness::event::Payload::SkillDirectiveReceived::skill: alloc::string::String
+pub outrig::harness::event::Payload::SkillDirectiveReceived::source: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::SkillDiscovered
 pub outrig::harness::event::Payload::SkillDiscovered::diagnostics: alloc::vec::Vec<outrig::harness::event::SkillDiagnostic>
 pub outrig::harness::event::Payload::SkillDiscovered::skills: alloc::vec::Vec<outrig::harness::event::DiscoveredSkill>
@@ -1411,6 +1426,22 @@ pub outrig::harness::event::Payload::SkillImported::reason: core::option::Option
 pub outrig::harness::event::Payload::SkillImported::reload: bool
 pub outrig::harness::event::Payload::SkillImported::skill: alloc::string::String
 pub outrig::harness::event::Payload::SkillImported::source: alloc::string::String
+#[non_exhaustive] pub outrig::harness::event::Payload::SkillInvocationFinished
+pub outrig::harness::event::Payload::SkillInvocationFinished::duration: core::time::Duration
+pub outrig::harness::event::Payload::SkillInvocationFinished::exception: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillInvocationFinished::invocation: outrig::harness::event::InvocationId
+pub outrig::harness::event::Payload::SkillInvocationFinished::outcome: outrig::harness::event::InvocationEnd
+pub outrig::harness::event::Payload::SkillInvocationFinished::result: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillInvocationFinished::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::SkillInvocationStarted
+pub outrig::harness::event::Payload::SkillInvocationStarted::bindings: alloc::vec::Vec<alloc::string::String>
+pub outrig::harness::event::Payload::SkillInvocationStarted::by: outrig::harness::event::ParamsBy
+pub outrig::harness::event::Payload::SkillInvocationStarted::call: core::option::Option<outrig::harness::event::AgentRequestId>
+pub outrig::harness::event::Payload::SkillInvocationStarted::digest: alloc::string::String
+pub outrig::harness::event::Payload::SkillInvocationStarted::invocation: outrig::harness::event::InvocationId
+pub outrig::harness::event::Payload::SkillInvocationStarted::params: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::SkillInvocationStarted::skill: alloc::string::String
+pub outrig::harness::event::Payload::SkillInvocationStarted::source: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::ToolResultTruncated
 pub outrig::harness::event::Payload::ToolResultTruncated::execid: outrig::harness::event::ExecId
 pub outrig::harness::event::Payload::ToolResultTruncated::kept: u64
@@ -1535,6 +1566,11 @@ pub outrig::harness::event::Held::type_name: alloc::string::String
 pub outrig::harness::event::InputBrief::name: alloc::string::String
 pub outrig::harness::event::InputBrief::preview: alloc::string::String
 pub outrig::harness::event::InputBrief::type_name: alloc::string::String
+pub struct outrig::harness::event::InvocationId(_)
+impl outrig::harness::event::InvocationId
+pub fn outrig::harness::event::InvocationId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::InvocationId
+pub fn outrig::harness::event::InvocationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::harness::event::LeftOut
 pub outrig::harness::event::LeftOut::message: u64
 pub outrig::harness::event::LeftOut::part: u64
@@ -1802,6 +1838,7 @@ impl outrig::harness::UserChannel
 pub async fn outrig::harness::UserChannel::receive(&self) -> core::option::Option<alloc::string::String>
 pub fn outrig::harness::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::harness::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
+pub fn outrig::harness::UserChannel::send_directive(&self, &str, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
 pub const outrig::harness::DEFAULT_DRAIN: core::time::Duration
 pub trait outrig::harness::Approver: core::marker::Send + core::marker::Sync
 pub fn outrig::harness::Approver::approve(&self, &outrig::harness::ApprovalRequest) -> outrig::harness::Approval

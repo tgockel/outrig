@@ -41,7 +41,7 @@ use super::supervisor::Process;
 use crate::events::Events;
 use crate::harness::HostedCall;
 use crate::harness::event::{
-    ExecId, HostedOutcome, HostedReason, Operation, Payload, ReceivedBy, RequestId,
+    ExecId, HostedOutcome, HostedReason, InvocationId, Operation, Payload, ReceivedBy, RequestId,
 };
 
 /// What the relay sends the interpreter: one protocol line, queued for its writer.
@@ -96,6 +96,7 @@ pub(crate) struct Rpc {
     member: Option<String>,
     target: Option<String>,
     exec: Option<u64>,
+    invocation: Option<u64>,
     size: Option<u64>,
 }
 
@@ -105,6 +106,7 @@ pub(crate) struct Rpc {
 pub(crate) struct Notice {
     binding: String,
     exec: Option<u64>,
+    invocation: Option<u64>,
     operation: String,
     member: Option<String>,
     target: Option<String>,
@@ -151,6 +153,8 @@ struct Call {
     agent: String,
     binding: String,
     exec: Option<ExecId>,
+    /// The skill invocation the interpreter said it was made inside.
+    invocation: Option<InvocationId>,
     op: Operation,
     member: Option<String>,
     target: Option<String>,
@@ -447,6 +451,7 @@ impl Relay {
                 agent: agent.to_string(),
                 binding: notice.binding,
                 exec: notice.exec.map(ExecId::new),
+                invocation: notice.invocation.map(InvocationId::new),
                 op: Operation::named(&notice.operation),
                 member: bounded(notice.member.as_deref()),
                 target: bounded(notice.target.as_deref()),
@@ -626,6 +631,7 @@ impl Relay {
                     agent: conn.0.clone(),
                     binding: conn.1.clone(),
                     exec: rpc.exec.map(ExecId::new),
+                    invocation: rpc.invocation.map(InvocationId::new),
                     op,
                     member: bounded(rpc.member.as_deref()),
                     target: bounded(rpc.target.as_deref()),
@@ -694,6 +700,7 @@ impl Relay {
             agent: call.agent.clone(),
             binding: call.binding.clone(),
             execid: call.exec,
+            invocation: call.invocation,
             operation: call.op,
             member: call.member.clone(),
             target: call.target.clone(),
@@ -801,6 +808,7 @@ impl Relay {
                             agent: r.agent.clone(),
                             binding: r.binding.clone(),
                             exec: None,
+                            invocation: None,
                             op,
                             member: r.member.clone(),
                             target: r.target.clone(),
@@ -820,6 +828,7 @@ impl Relay {
                         agent: r.agent,
                         binding: r.binding,
                         execid: call.exec,
+                        invocation: call.invocation,
                         operation: op,
                         member: r.member,
                         target: r.target,

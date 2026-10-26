@@ -162,6 +162,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never mounted. A skill in both is served from the repository, and the user's copy is
   reported as shadowed as the session starts, as each skill left out is, with why. The
   repository's `.agents/skills` may be a link inside the repository, never one out of it.
+- **`run-new` takes `/name` for a skill.** A line `/name text` naming one of the session's skills
+  reaches the agent as a directive naming the skill, which asks it to run the skill with
+  `outrig.skills.invoke` (see `outrig`'s changelog); no line typed after it reaches the agent
+  first. `/help` lists `/<skill> [text]` when the session has skills. `/help` and `/quit` stay
+  `run-new`'s own, and a skill named for one of them is said as the session starts; any other
+  `/word` is still an unknown command.
 
 ### Changed
 

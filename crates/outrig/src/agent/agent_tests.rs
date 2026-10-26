@@ -46,6 +46,7 @@ const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
 const NOTHING_HELD: Holdings<'static> = Holdings {
     bindings: &[],
     skills: &[],
+    catalog: None,
 };
 
 /// Run `f` with the api-key variable `var` set.
@@ -971,6 +972,7 @@ fn the_orientation_names_each_binding_and_says_a_call_blocks_the_loop() {
                 brief("tasks", "The task tracker.", false),
             ],
             skills: &[],
+            catalog: None,
         },
         Some("You write Python."),
         None,
@@ -1083,6 +1085,16 @@ async fn the_primary_is_told_the_skills_and_listing_them_ran_none() {
         system.contains("`outrig.skills.read(name)` returns them"),
         "{system}"
     );
+    // What a message naming a skill asks.
+    for said in [
+        "whose delivery names a skill, as `d.skill`",
+        "`await outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [\"\"])[1])`",
+        "`outrig.skills.SkillNeedsClarification`",
+        "`params=outrig.skills.params(d.skill)(...)`",
+        "the message is its instructions followed by what the user typed",
+    ] {
+        assert!(system.contains(said), "{said}: {system}");
+    }
     assert!(!sentinel.exists(), "listing a skill ran its code");
 }
 
@@ -1099,6 +1111,7 @@ fn the_orientation_lists_skills_within_its_bounds_and_counts_the_rest() {
             Holdings {
                 bindings: &[],
                 skills,
+                catalog: None,
             },
             None,
             None,

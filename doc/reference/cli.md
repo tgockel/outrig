@@ -427,6 +427,19 @@ why there is none; `help(runtime.spawn)` has the rest. `children-max`, `model-co
 code and model calls are in the event log, under the child's own subject, and are not printed
 here.
 
+**A `/name` asks the agent to run a skill.** The session's skills are the repository's
+`.agents/skills` and then `~/.agents/skills`, each a directory holding a `SKILL.md` and, optionally,
+a `skill.py`, and the agent is told each one's name and description. A line `/name text`, the name
+right after the slash, naming one of them goes onto the agent's channel as a directive, which its
+code sees naming the skill: the line as typed, or, for a skill with no `skill.py`, the skill's
+instructions followed by the line. For a skill with a `skill.py`, the agent runs it with
+`outrig.skills.invoke(name, text)`: a child agent reads `text` into the parameters of the skill's
+entry function, or asks a question instead, which the agent puts to you, and the entry is then
+called in the agent's Python, with each binding the skill names. Nothing of the skill runs until the
+agent's code calls it. No line typed after a directive reaches the agent before it does. `/help` and
+`/quit` are `run-new`'s own whatever the skills are named, and a skill named for one of them is said
+as the session starts.
+
 **The model is sent part of the conversation; the agent's Python holds all of it.** A round is
 the agent's work on the messages waiting when it starts. Each model call is chosen the session's
 first two rounds, the six before the current one, and the current one. Everything is in
@@ -552,9 +565,10 @@ starts the container and the interpreter, and prints the image, the model, and t
 version. The session is recorded like any other, so `outrig ls`, `discard`, and `clean` see it;
 its record is written once the interpreter is up, under the name of the container it runs in.
 
-The only slash commands are `/help` and `/quit`, and a blank line is ignored. A failed round is
-reported and the session carries on; the messages it had not read are still waiting, so a line
-typed next is announced with them.
+Besides `/help`, `/quit`, and a directive naming one of the session's skills, a line beginning
+`/` is an unknown command, and a blank line is ignored. A failed round is reported and the
+session carries on; the messages it had not read are still waiting, so a line typed next is
+announced with them.
 
 **Leaving.** `/quit`, the end of input, and a second Ctrl-C at the prompt each close the session
 to new work, then stop it: Python still running, and calls into bindings, are given five seconds

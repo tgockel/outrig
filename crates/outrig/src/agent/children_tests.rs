@@ -84,12 +84,25 @@ pub(super) async fn tree_held(
     routes: Vec<(&'static str, Responder)>,
     hold: Option<usize>,
 ) -> Tree {
+    tree_built(var, top, routes, hold, |builder| builder).await
+}
+
+/// [`tree_held`], its session built further by `build`: given skill sources,
+/// say, or the places its bindings install to.
+pub(super) async fn tree_built(
+    var: &str,
+    top: &str,
+    routes: Vec<(&'static str, Responder)>,
+    hold: Option<usize>,
+    build: impl FnOnce(SessionBuilder) -> SessionBuilder,
+) -> Tree {
     let (addr, requests, gauge) = mock_http::routed(routes, hold).await;
     let cfg = config(addr, var, top);
     let (events_out, mut subscription) = watched(None).await;
-    let session = SessionBuilder::new(cfg, Some("coding"), None)
+    let builder = SessionBuilder::new(cfg, Some("coding"), None)
         .events(events_out)
-        .secrets(keyed(var))
+        .secrets(keyed(var));
+    let session = build(builder)
         .start_on_host()
         .await
         .unwrap_or_else(|e| panic!("{e}"));

@@ -503,6 +503,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the repository. A source's operation runs on a thread of its own, so one that never
   returns holds up no runtime's shutdown, and a diagnostic escapes the control characters it
   quotes.
+- **Skill directives and `outrig.skills.invoke`: `UserChannel::send_directive`, and the events
+  `skill.directive.received`, `skill.invocation.started` and `skill.invocation.finished`.**
+  `send_directive(skill, line)` sends a `/name` the user typed: the agent's delivery of it names
+  the skill as `.skill`, which is `None` on every other message, and its body is the line, or, for
+  a skill with no `skill.py`, the skill's instructions followed by the line. The preamble tells the
+  primary agent that such a message asks it to run the skill. In agent code,
+  `outrig.skills.invoke(name, text)` returns an `Invocation` -- a handle with `id`, `await`,
+  `future`, `done()`, `result()` and `cancel()`, which `runtime.wait` takes -- and calls the
+  entry its `skill.py` names, `main` by default, with parameters a child agent reads from `text`:
+  a typed call on the calling agent's model, whose result is the skill's parameter class,
+  `outrig.skills.params(name)`, or an `outrig.skills.Clarification`, which `invoke` raises as
+  `SkillNeedsClarification` carrying a question for the user. `invoke(name, params=...)` takes the
+  class's instance instead and asks no model. The class is derived from the entry's signature, one
+  field per parameter but those `[tool.outrig.skill] bind` fills, each with the help
+  `[tool.outrig.skill.parameters]` gives it; a bound parameter gets the session's binding,
+  whatever the agent's own variable holds. What a skill cannot be invoked with is refused before
+  anything runs, as a `SkillError` whose `code` is `signature-unsupported`, `entry-not-found`,
+  `missing-binding`, `skill-changed` or `unknown-skill`, and `outrig.skills.reload` of a skill an
+  invocation is running is refused as `skill-busy`. The invocation's id is on
+  `agent.call.started`, `agent.call.settled` and `hosted.received` for the calls made inside it,
+  as `invocation`; `agent.call.settled` also carries `value`, a preview of the accepted result.
+  `skill.invocation.finished` carries the usage of every child made inside the invocation.
 - **`Payload::ModelText`, the text of a model's reply as its call returns.** Its event kind is
   `model.text`. A reply with no text, only tool calls or reasoning, records none, so a round whose
   model talks while it works records each thing it said, not only the closing reply.

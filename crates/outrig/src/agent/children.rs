@@ -35,7 +35,8 @@ use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{
-    AgentRequestId, ChannelBrief, ChildKind, InputBrief, Payload, RequestEnd, Subject,
+    AgentRequestId, ChannelBrief, ChildKind, InputBrief, InvocationEnd, InvocationId, ParamsBy,
+    Payload, RequestEnd, Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::{ClosedBy, RequestOutcome};
@@ -105,6 +106,9 @@ struct Node {
     /// The children it launched, in order.
     children: Vec<String>,
     child: Option<ChildNode>,
+    /// The skill invocations its launch was made inside, innermost first:
+    /// what it and every agent below it spend is each one's.
+    invocations: Vec<InvocationId>,
 }
 
 struct ChildNode {
@@ -249,6 +253,7 @@ impl Children {
                 slot,
                 children: Vec::new(),
                 child: None,
+                invocations: Vec::new(),
             },
         );
     }
@@ -334,6 +339,8 @@ impl Inner {
             "agent.request" => self.requested(agent, &line),
             "agent.call" => self.called(agent, &line),
             "agent.call.ended" => self.call_ended(&line),
+            "agent.invocation" => self.invoked(agent, &line),
+            "agent.invocation.ended" => self.invocation_ended(agent, &line),
             "agent.received" => self.received(&line),
             "agent.answered" => self.answered(&line),
             "agent.ended" => self.ended(&line),
@@ -380,6 +387,15 @@ impl Inner {
             _ => ChildKind::Work,
         };
         let name = line["name"].as_str().unwrap_or_default().to_string();
+        let invocations = line["invocations"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_u64)
+                    .map(InvocationId::new)
+                    .collect()
+            })
+            .unwrap_or_default();
         let (id, model, depth, lineage) = {
             let mut state = self.state();
             if let Some(by) = state.closed.clone().or_else(|| self.lifecycle.closed()) {
@@ -452,6 +468,7 @@ impl Inner {
                         delivered: BTreeMap::new(),
                         round: None,
                     }),
+                    invocations,
                 },
             );
             if let Some(node) = state.agents.get_mut(parent) {
@@ -683,11 +700,12 @@ impl Inner {
                 module: text(&line["module"]),
                 qualname: text(&line["qualname"]),
                 digest: line["digest"].as_str().map(str::to_string),
+                invocation: line["invocation"].as_u64().map(InvocationId::new),
             });
     }
 
-    /// The call settled and its child was released: how it ended, and what
-    /// every model request the child made used.
+    /// The call ended and its child was released: how it ended, what every
+    /// model request the child made used, and what it was accepted with.
     fn call_ended(&self, line: &Value) {
         let Some(id) = line["request"].as_u64() else {
             return;
@@ -703,7 +721,87 @@ impl Inner {
             request: AgentRequestId::new(id),
             outcome: outcome(line["outcome"].as_str().unwrap_or_default()),
             usage: self.ledger.total(&attempts),
+            invocation: line["invocation"].as_u64().map(InvocationId::new),
+            value: line["value"].as_str().map(str::to_string),
         });
+    }
+
+    /// `agent`'s code is calling a skill's entry through
+    /// `outrig.skills.invoke`.
+    fn invoked(&self, agent: &str, line: &Value) {
+        let Some(id) = line["invocation"].as_u64() else {
+            return;
+        };
+        let call = line["call"].as_u64().map(AgentRequestId::new);
+        let bindings = line["bindings"]
+            .as_array()
+            .map(|names| names.iter().map(text).collect())
+            .unwrap_or_default();
+        self.events_of(agent).emit(Payload::SkillInvocationStarted {
+            invocation: InvocationId::new(id),
+            skill: text(&line["skill"]),
+            source: text(&line["source"]),
+            digest: text(&line["digest"]),
+            params: line["params"].as_str().map(str::to_string),
+            by: if call.is_some() {
+                ParamsBy::Parser
+            } else {
+                ParamsBy::Caller
+            },
+            call,
+            bindings,
+        });
+    }
+
+    /// The entry an invocation of `agent`'s called has ended: how, and what
+    /// the children made inside the invocation spent.
+    fn invocation_ended(&self, agent: &str, line: &Value) {
+        let Some(id) = line["invocation"].as_u64() else {
+            return;
+        };
+        let invocation = InvocationId::new(id);
+        let outcome = match line["outcome"].as_str() {
+            Some("returned") => InvocationEnd::Returned,
+            Some("raised") => InvocationEnd::Raised,
+            _ => InvocationEnd::Cancelled,
+        };
+        let duration = line["duration"]
+            .as_f64()
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .unwrap_or_default();
+        self.events_of(agent)
+            .emit(Payload::SkillInvocationFinished {
+                invocation,
+                outcome,
+                duration,
+                result: line["result"].as_str().map(str::to_string),
+                exception: line["exception"].as_str().map(str::to_string),
+                usage: self.spent_inside(invocation),
+            });
+    }
+
+    /// What every child launched inside `invocation` has spent, and every
+    /// agent below them, each attempt once: a child keeps its node, and its
+    /// slot every attempt it made, once it is released.
+    fn spent_inside(&self, invocation: InvocationId) -> Option<Usage> {
+        let attempts = {
+            let state = self.state();
+            let mut attempts = Vec::new();
+            let mut todo: Vec<&str> = state
+                .agents
+                .iter()
+                .filter(|(_, node)| node.invocations.contains(&invocation))
+                .map(|(id, _)| id.as_str())
+                .collect();
+            while let Some(id) = todo.pop() {
+                if let Some(node) = state.agents.get(id) {
+                    attempts.extend(node.slot.attempts());
+                    todo.extend(node.children.iter().map(String::as_str));
+                }
+            }
+            attempts
+        };
+        self.ledger.total(&attempts)
     }
 
     fn received(&self, line: &Value) {

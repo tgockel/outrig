@@ -85,7 +85,8 @@ also numbers OutRig's own questions to the interpreter, so neither runs in seque
 them means nothing. Turns and calls are each counted from 0 on their own, and requests to
 bindings from 1. A request made of a child agent has a `request` id from the interpreter's own
 counter, which does not run in sequence either: the id its handle and the child's delivery of it
-carry in agent code.
+carry in agent code. A skill invocation's `invocation` id comes from the same counter, and is its
+`Invocation`'s `id` in agent code.
 
 ## Three categories
 
@@ -237,6 +238,31 @@ the same call, and records no new `model.call`.
   or `null` when the host gave none; `reload`, true when `outrig.skills.reload` imported it again;
   and `code` and `reason`, `null` unless the import failed, such as `unsatisfied-dependency` with
   each requirement it lacks. `reason` escapes control characters as a diagnostic's `message` does.
+- `skill.directive.received` -- a `/name` the user typed reached the subject on its user channel:
+  `skill`, the skill it names; `source`, the source serving it; and `message`, the id its
+  `message.sent` gives the message that carried it. Nothing of the skill has run: the agent's code
+  invokes it, or does not.
+- `skill.invocation.started` -- the subject's code called a skill's entry through
+  `outrig.skills.invoke`.
+  - `invocation`: its id, which the calls made inside it carry: `agent.call.started`,
+    `agent.call.settled`, and `hosted.received`.
+  - `skill`, `source`, and `digest`, of the skill's files when its package was imported.
+  - `params`: the parameters the entry is called with, as the JSON of its `<Skill>Params`, cut to
+    1,024 characters; `null` when the session's events are not observed.
+  - `by`: `parser` when a child read them from what the user typed, in the typed call `call`, or
+    `caller` when the code that invoked the skill gave them, `call` then `null`.
+  - `bindings`: the bindings the entry's parameters were filled from.
+
+  A parse that gives no parameters -- its answers refused, or a question for the user instead --
+  starts no invocation. Its typed call's `agent.call.settled` carries the invocation's id, with
+  the outcome `rejected`, or `accepted` and the question as its `value`.
+- `skill.invocation.finished` -- the entry ended: `invocation`; `outcome`, `returned`, `raised`, or
+  `cancelled`; `duration`, seconds from the call; `result`, the qualified name of the type of what
+  it returned, and `exception`, of what it raised, each `null` otherwise; and `usage`, what the
+  model requests of every child made inside the invocation used -- its parser, the typed calls
+  its code made, and every agent below them -- or `null` when none reported any. A child made
+  inside an invocation made inside another counts toward both. What a child spends after this is
+  in the rounds' totals and not here.
 - `agent.started` -- `model`, `python` (the interpreter's version), `container`, `tool_call_max`,
   and `tool_result_max`. A child's is recorded as it is launched.
 - `agent.stopped` -- no fields. The agent stopped: recorded as its session's shutdown stops the
@@ -379,13 +405,17 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   is the id the call's handle carries; `parent`, the subject of the agent whose code called;
   `module` and `qualname`, the declaration's `__module__` and `__qualname__`; and `digest`, a
   SHA-256 of the source that declared it -- its module's file, or the submission's source for a
-  function declared in one -- or `null` when none could be read. A call whose launch was refused,
+  function declared in one -- or `null` when none could be read; and `invocation`, the skill
+  invocation the call was made inside, or `null`. The parse `outrig.skills.invoke` makes is such a
+  call, declared in the skill's entry module as `parse_params`. A call whose launch was refused,
   by a limit say, has no child and records neither event; its handle raises the refusal.
 - `agent.call.settled` -- the call settled and its child, the subject, was released: `request`;
-  `outcome`, as `agent.request.settled` says it; and `usage`, the sum over every model request the
-  child made, or `null` when none reported any. It follows the `agent.released` that ended the
-  child, except at the session's close, which ends every call `closed` at once and tears its
-  children down afterward: a call settled `closed` precedes its child's release.
+  `outcome`, as `agent.request.settled` says it; `usage`, the sum over every model request the
+  child made, or `null` when none reported any; `invocation`, as on `agent.call.started`; and
+  `value`, a preview of the result it was accepted with, cut to 1,024 characters, or `null` when it
+  was not accepted or the session's events are not observed. It follows the `agent.released` that
+  ended the child, except at the session's close, which ends every call `closed` at once and tears
+  its children down afterward: a call settled `closed` precedes its child's release.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
   `from` and `to`, each `user` or `agent/primary`; and `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,
@@ -395,7 +425,9 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   which can be well after it arrived.
 - `hosted.received` -- a request agent code made of a binding's object, as it arrived, before
   anything is decided about it. `request`, an id OutRig gives it, which the request's other events
-  carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `operation`, what it
+  carry; `agent`; `binding`; `execid`, the execution that made it, or `null`; `invocation`, the
+  skill invocation it was made inside, or `null` -- each as the interpreter said, diagnostic
+  context the agent's own code can change; `operation`, what it
   asks of its target; `member`, the attribute it names, or `null`; `target`, the qualified name of
   its target's type on the host, or `null`; `arguments`, a preview of each positional argument,
   and `keywords`, one per keyword argument, by name; `parent`, the request a callback made it

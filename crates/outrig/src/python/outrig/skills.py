@@ -7,40 +7,58 @@ a package: `review-diff` is `outrig_skills.review_diff`, and its `skill.py` is
 the host as they are imported or opened, and none is on disk here, so a skill reads its data with
 `importlib.resources.files(__package__) / "data" / "ids.txt"`; its modules have no `__file__`.
 
+`invoke(name, text)` runs a skill's entry, its parameters read from `text` by a child agent, and
+`invoke(name, params=params(name)(...))` with parameters you give: see `help(outrig.skills.invoke)`.
+It returns an `Invocation`; the parser may ask instead, raising `SkillNeedsClarification`.
+
 Importing a skill's package checks the `requires-python` and `dependencies` its `skill.py`
 declares, and installs nothing: `pip install` what it lacks, then import it again. Each failure
 is a `SkillError` whose `code` says why; what the skill's own code raises is raised as it was.
-The package records where it came from as
-`__outrig_skill__`, an `Origin`; once the skill's files change, fetching another is refused with
-`skill-changed`, and `reload(name)` imports it afresh.
+The package records where it came from as `__outrig_skill__`, an `Origin`; once the skill's files
+change, fetching another is refused with `skill-changed`, and `reload(name)` imports it afresh.
 
 `sys.modules` is the interpreter's, so every agent here shares one module per skill, and its
 module-level state with it.
 """
 
+import asyncio
 import base64
+import contextvars
+import dataclasses
+import functools
+import hashlib
 import importlib
 import importlib.machinery
 import importlib.resources.abc
 import importlib.util
+import inspect
 import io
 import linecache
 import sys
+import threading
+import time
 import types
+import typing
+import warnings
 
-from . import _kernel
+from . import _agents, _kernel, schema
 
-__all__ = ["Origin", "Skill", "SkillError", "catalog", "read", "reload"]
+__all__ = ["SkillError", "catalog", "invoke", "params", "read", "reload"]
 
 
 class SkillError(ImportError):
-    """A skill could not be read, checked or imported. `skill` names it, and `code` says why:
+    """A skill could not be read, checked, imported or invoked. `skill` names it, and `code` says
+    why:
 
     - `unknown-skill` -- the session has no skill of that name;
     - `skill-changed` -- its files changed after its package was imported: `reload` it;
+    - `skill-busy` -- an invocation of it is running, so it is not reloaded;
     - `source-error` -- what serves it could not list or read it;
     - `metadata-invalid`, `duplicate-metadata-block` -- its metadata is not valid;
-    - `requires-python`, `unsatisfied-dependency` -- what it declares it needs is not here.
+    - `requires-python`, `unsatisfied-dependency` -- what it declares it needs is not here;
+    - `entry-not-found`, `signature-unsupported` -- it has no entry function, or one whose
+      parameters cannot be its parameter class;
+    - `missing-binding` -- it takes a binding the session does not have.
 
     What a skill's own code raises while it is imported is raised as it was, never as this.
     """
@@ -104,10 +122,16 @@ def read(name):
 def reload(name):
     """Import skill `name`'s package afresh, and return it: first remove it and each of its
     modules from `sys.modules` -- exactly those, never another skill whose name begins the same.
+    Refused with `skill-busy` while an invocation of it runs.
 
     Code that holds the old modules keeps the old code, and an object of an old class stays one:
     `isinstance` against the class reloaded is false of it."""
     package = _skill(name).package
+    # Any kernel's, while that kernel is open: a released one's never ends.
+    if any(i.skill == name and not i._kernel.ended for i in list(_running.values())):
+        raise SkillError(
+            "skill-busy", name, "an invocation of it is running; reload it once that has ended"
+        )
     imported = sys.modules.pop(package, None) is not None
     _drop_below(package)
     _loaded.pop(name, None)
@@ -117,6 +141,238 @@ def reload(name):
         return importlib.import_module(package)
     finally:
         _reloading.discard(name)
+
+
+def invoke(name, text=None, *, params=None, reload=False):
+    """Call skill `name`'s entry, and return its `Invocation` at once: `await` it for what the
+    entry returns, or raises.
+
+    With `text`, what the user typed after `/name`, a child agent reads it into the skill's
+    parameter class, `params(name)`, and the entry is called with what it read. The child may
+    find that the text does not say: then awaiting raises `SkillNeedsClarification`, whose
+    `question` is for the user, and nothing is called. With `params`, an instance of that class,
+    no child is asked. Each parameter `bind` names gets its binding, whatever your variables hold.
+
+    `reload=True` imports the skill afresh first; otherwise a skill whose files have changed
+    since it was imported raises `skill-changed`. What the skill cannot be called with raises a
+    `SkillError` here, before anything runs."""
+    if _ask is None:
+        raise RuntimeError(_OUTSIDE)
+    kernel = _kernel._calling()
+    if kernel is None:
+        raise RuntimeError(
+            "outrig.skills.invoke runs in an agent's code, and this runs outside every execution"
+        )
+    if (text is None) == (params is None):
+        raise TypeError("invoke takes the text the user typed, or params=, and not both")
+    if text is not None and type(text) is not str:
+        raise TypeError(f"invoke's text is a str, not {_type_name(type(text))}")
+    if params is not None and reload:
+        raise ValueError(
+            "params= is an instance of the class a reload replaces: reload with "
+            "outrig.skills.reload(name), then construct one of outrig.skills.params(name)"
+        )
+    _refuse_closing()
+    skill, loader, module = _entry_of(name, reload)
+    derived = _derived(skill, loader, module)
+    if params is not None:
+        derived.check(params)
+    bound = {}
+    for parameter, binding in derived.bind.items():
+        stub = kernel.stubs.get(binding)
+        if stub is None:
+            raise SkillError(
+                "missing-binding",
+                name,
+                f"[tool.outrig.skill] bind gives parameter {parameter!r} the binding {binding!r}, "
+                "which this session does not have; runtime.bindings lists the ones it does",
+            )
+        bound[parameter] = stub
+    invocation = Invocation(kernel, derived, bound)
+    context = contextvars.copy_context()
+    context.run(_within.set, (invocation.id, *_within.get()))
+    _running[invocation.id] = invocation
+    try:
+        kernel.loop.call_soon_threadsafe(invocation._start, context, text, params)
+    except RuntimeError:
+        # The kernel's loop has closed with it: nothing will run the invocation.
+        _running.pop(invocation.id, None)
+        raise
+    return invocation
+
+
+def params(name):
+    """Skill `name`'s parameter class, `<Name>Params` -- `ReviewDiffParams` for `review-diff`:
+    one field per parameter of its entry but those `bind` fills, each with its type, default and
+    help. `invoke(name, params=...)` takes an instance; `help()` on it lists the fields."""
+    skill, loader, module = _entry_of(name, False)
+    return _derived(skill, loader, module).cls
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Clarification:
+    """What a skill's parser completes with when the text does not say what to call the skill
+    with: the `question` to put to the user."""
+
+    question: typing.Annotated[str, schema.doc("The question for the user, in the user's terms.")]
+
+
+class SkillNeedsClarification(_agents.AgentError):
+    """`invoke`'s parser could not tell from the text what to call skill `skill` with, and asks
+    `question` instead. Nothing was called: put the question to the user, then invoke again with
+    `params=`, or with their new text."""
+
+    def __init__(self, skill, question):
+        super().__init__(f"skill {skill!r} asks: {question}")
+        self.skill = skill
+        self.question = question
+
+    def __reduce__(self):
+        return type(self), (self.skill, self.question)
+
+
+class Invocation:
+    """One call of a skill's entry, which `invoke` returns at once, the call under way.
+
+    `await` it for what the entry returns, or raises -- `outrig.RequestCancelled` once
+    cancelled -- and awaiting again gives the same. Cancelling the code awaiting it cancels the
+    wait, never the invocation; `cancel()` cancels the invocation: its parser released, or the
+    entry cancelled at its next `await`. `done()` and `result()` answer without waiting, and
+    `future` is a view `asyncio.wait` takes; `runtime.wait` and `asyncio.gather` take this
+    itself. `id` is what the session's events name it by, and `skill` the skill's name."""
+
+    __slots__ = ("id", "skill", "_kernel", "_derived", "_bound", "_future", "_view", "_task")
+
+    def __init__(self, kernel, derived, bound):
+        self.id = _next_id()
+        self.skill = derived.name
+        self._kernel, self._derived, self._bound = kernel, derived, bound
+        # Of the kernel's loop, and settled once, by `_end`, as the invocation ends.
+        self._future = kernel.loop.create_future()
+        self._view = None
+        self._task = None
+
+    def __await__(self):
+        return self._chained().__await__()
+
+    @property
+    def future(self):
+        if self._view is None or self._view.cancelled():
+            self._view = self._chained()
+        return self._view
+
+    def done(self):
+        return self._future.done()
+
+    def result(self):
+        return self._future.result()
+
+    def cancel(self):
+        """Cancel the invocation, from any thread; whether it had not ended."""
+        if self._future.done():
+            return False
+        try:
+            self._kernel.loop.call_soon_threadsafe(self._cancel)
+        except RuntimeError:
+            return False  # its kernel's loop has closed
+        return True
+
+    def __repr__(self):
+        state = "ended" if self.done() else "running"
+        return f"<invocation {self.id} of skill {self.skill!r}: {state}>"
+
+    def _cancel(self):
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+    def _chained(self):
+        """A future of the kernel's loop that settles as the invocation ends, and whose
+        cancelling cancels nothing else."""
+        view = self._kernel.loop.create_future()
+
+        def settle(future):
+            if view.done():
+                return
+            if future.exception() is None:
+                view.set_result(future.result())
+            else:
+                view.set_exception(future.exception())
+                view.exception()
+
+        if self._future.done():
+            settle(self._future)
+        else:
+            self._future.add_done_callback(settle)
+        return view
+
+    def _start(self, context, text, params):
+        """Run it on the kernel's loop, in `context`: the caller's, with this invocation set."""
+        self._task = asyncio.Task(
+            self._run(text, params), loop=self._kernel.loop, context=context,
+            name=f"invocation-{self.id}",
+        )
+        # A task cancelled before its first step never runs `_run`, whose `finally` ends it.
+        self._task.add_done_callback(lambda _: self._end("cancelled", None, None, None))
+
+    async def _run(self, text, params):
+        """Parse `text` into the skill's parameters, unless `params` is given, then call the
+        entry, telling the host as it is called and as it ends."""
+        derived, parse, entered, value, error = self._derived, None, None, None, None
+        outcome = "returned"
+        try:
+            if params is None:
+                parse = _agents._call(derived.declaration, {"text": text})
+                params = await parse
+                if type(params) is Clarification:
+                    raise SkillNeedsClarification(self.skill, params.question)
+            args, kwargs = derived.arguments(params, self._bound)
+            preview = None
+            if _observing():
+                preview = _agents.preview(derived.declaration.schema.encode(params))
+            source, digest = derived.origin
+            _notify({"t": "agent.invocation", "agent": self._kernel.agent, "invocation": self.id,
+                     "skill": self.skill, "source": source, "digest": digest,
+                     "params": preview, "call": None if parse is None else parse.id,
+                     "bindings": derived.bindings()})
+            entered = time.monotonic()
+            value = derived.entry(*args, **kwargs)
+            if asyncio.iscoroutine(value):
+                value = await value
+        except asyncio.CancelledError as e:
+            outcome, error = "cancelled", e
+        except BaseException as e:
+            outcome, error = "raised", e
+            if not isinstance(e, Exception):
+                # An interrupt or an exit, which the kernel's loop reports as for any task.
+                raise
+        finally:
+            if parse is not None and not parse.done():
+                parse.cancel()
+            self._end(outcome, value, error, entered)
+
+    def _end(self, outcome, value, error, entered):
+        """Record how the invocation ended, once: it holds its skill busy no longer and its id
+        names nothing from here on, the host is told when its entry was called, and its future
+        settles. On the kernel's loop, and waiting for nothing: a released kernel's loop gives
+        its tasks a second."""
+        if _running.pop(self.id, None) is None:
+            return
+        if entered is not None:
+            _notify({"t": "agent.invocation.ended", "agent": self._kernel.agent,
+                     "invocation": self.id, "outcome": outcome,
+                     "duration": time.monotonic() - entered,
+                     "result": _qualified(type(value)) if outcome == "returned" else None,
+                     "exception": _qualified(type(error)) if outcome == "raised" else None})
+        if outcome == "returned":
+            self._future.set_result(value)
+            return
+        if outcome == "cancelled":
+            error = _agents.RequestCancelled(
+                f"invocation {self.id} of skill {self.skill!r} was cancelled"
+            )
+        self._future.set_exception(error)
+        # Read here: a handle nobody awaits is not a mistake in the code that dropped it.
+        self._future.exception()
 
 
 # ---------------------------------------------------------------------------- machinery
@@ -130,11 +386,16 @@ _OUTSIDE = (
 )
 
 # The interpreter's, given by `_install`: send a request about a skill and return the host's
-# answer; tell the host something, never raising; and the module a failed import could not load
-# with the compiled file found where it looked, or `None`.
+# answer; tell the host something, never raising; the module a failed import could not load
+# with the compiled file found where it looked, or `None`; the next id of the interpreter's
+# counter; raise `outrig.SessionClosing` once the session is closing; and whether the host
+# records what agents give each other.
 _ask = None
 _notify = None
 _compiled = None
+_next_id = None
+_refuse_closing = None
+_observing = None
 
 # The session's skills, by name, from the host's `skills` line.
 _catalog = types.MappingProxyType({})
@@ -144,18 +405,29 @@ _modules = {}
 _loaded = {}
 # The skills being reloaded, whose next import says so.
 _reloading = set()
+# Each invocation not yet ended, in any kernel, by its id.
+_running = {}
+# The ids of the invocations the code reading it runs inside, innermost first: set in the context
+# each one runs in, which the tasks and `to_thread` workers it starts carry.
+_within = contextvars.ContextVar("outrig_invocations", default=())
+# Taken to keep the first of two parameter classes derived at once.
+_derive_lock = threading.Lock()
 
 _cause_of = BaseException.__dict__["__cause__"].__get__
 _context_of = BaseException.__dict__["__context__"].__get__
 _type_name = type.__dict__["__name__"].__get__
+_type_qualname = type.__dict__["__qualname__"].__get__
+_type_module = type.__dict__["__module__"].__get__
 
 
-def _install(ask, notify, compiled):
-    """Take the interpreter's ways to ask and tell the host, and its evidence of compiled code,
-    and serve `outrig_skills`: before `PathFinder`, so no directory on `sys.path` named so can
-    stand in for it. Called once, as the interpreter starts."""
-    global _ask, _notify, _compiled
+def _install(ask, notify, compiled, next_id, refuse_closing, observing):
+    """Take the interpreter's ways to ask and tell the host, its evidence of compiled code, its
+    ids, its refusal once the session closes, and whether the host records previews; and serve
+    `outrig_skills`: before `PathFinder`, so no directory on `sys.path` named so can stand in for
+    it. Called once, as the interpreter starts."""
+    global _ask, _notify, _compiled, _next_id, _refuse_closing, _observing
     _ask, _notify, _compiled = ask, notify, compiled
+    _next_id, _refuse_closing, _observing = next_id, refuse_closing, observing
     sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder), _Finder())
 
 
@@ -318,6 +590,243 @@ def _compiled_in_skill(e):
     return None
 
 
+# ---------------------------------------------------------------------------- invoking
+
+# What the child that reads the user's text into a skill's parameters is told first; the entry's
+# docstring follows. Formatted with the skill's name and its parameter class's, never with the
+# docstring or the text, which reach the child as they are.
+_PARSE = (
+    "`text` is what the user typed after `/{name}`: exact options, such as `--name value`, or "
+    "prose. Complete with the {params} it asks for when the text determines one: give an exact "
+    "option to its field, and make a plain reading that stays within what the words say "
+    "without asking -- a number written in words as that number, and a text that names nothing "
+    "for a field leaving that field's default. Complete with a Clarification instead, its "
+    "`question` in the user's own terms, when the text does not determine a required field, or "
+    "when the reading you would make covers more than the words name: a default that takes in "
+    "everything where the user named a part. Read `text` from the variable; it is not repeated "
+    "here.\n\nWhat `/{name}` does, as its entry's docstring says:"
+)
+
+
+def _current():
+    """The ids of the invocations the calling code runs inside and that have not ended, innermost
+    first: what the interpreter names on what that code asks of the host."""
+    return [id for id in _within.get() if id in _running]
+
+
+def _qualified(t):
+    """Class `t`'s module and qualified name, read without running any of its code."""
+    return f"{_type_module(t)}.{_type_qualname(t)}"
+
+
+def _entry_of(name, reload_first):
+    """Skill `name`, the loader its package was imported with, and its entry module, imported now
+    if it is not: reloaded first with `reload_first`, and otherwise, when imported before, checked
+    against the skill's files."""
+    skill = _skill(name)
+    if skill.entry is None:
+        raise SkillError(
+            "entry-not-found",
+            name,
+            "it has no skill.py, so nothing to call: its instructions are all of it, and "
+            "outrig.skills.read(name) returns them",
+        )
+    if reload_first:
+        reload(name)
+    elif name in _loaded:
+        _request(name, "skill.check", digest=_loaded[name].digest)
+    module = importlib.import_module(skill.entry)
+    return skill, module.__spec__.loader, module
+
+
+def _derived(skill, loader, module):
+    """What `invoke` calls `skill`'s entry with, worked out once per import of its package and
+    kept on `loader`: outside the lock, since working it out can import, and the first kept when
+    two kernels work it out at once."""
+    derived = loader.derived
+    if derived is None:
+        derived = _derive(skill, loader, module)
+        with _derive_lock:
+            if loader.derived is None:
+                loader.derived = derived
+            derived = loader.derived
+    return derived
+
+
+def _derive(skill, loader, module):
+    """`skill`'s parameter class and parser, from its entry's signature and what its package was
+    imported with, or the `SkillError` saying why its entry cannot have them."""
+    name = skill.name
+    entry_name = loader.entry or "main"
+    entry = getattr(module, entry_name, None)
+    if not inspect.isfunction(entry):
+        how = "[tool.outrig.skill] entry names" if loader.entry else "is the entry by default"
+        raise SkillError(
+            "entry-not-found", name, f"its skill.py defines no function {entry_name!r}, which {how}"
+        )
+    where = f"{module.__name__}.{entry_name}"
+
+    def unsupported(message):
+        return SkillError("signature-unsupported", name, f"{where}: {message}")
+
+    try:
+        parameters = list(inspect.signature(entry).parameters.values())
+        # Where a parameter's annotation is resolved, as `typing.get_type_hints` resolves one: the
+        # globals of the function the signature comes from, through what decorators wrap and a
+        # `functools.partial` holds -- a bounded walk, as a chain can loop.
+        target = inspect.unwrap(entry)
+        for _ in range(100):
+            if not isinstance(target, functools.partial):
+                break
+            target = inspect.unwrap(target.func)
+        namespace = getattr(target, "__globals__", {})
+    except Exception as e:
+        raise unsupported(
+            f"its signature cannot be read: {_type_name(type(e))}: {e}"
+        ) from None
+    for parameter in loader.bind:
+        if parameter not in {p.name for p in parameters}:
+            raise unsupported(f"[tool.outrig.skill] bind names {parameter!r}, no parameter of it")
+    helps = dict(loader.parameters)
+    fields = []
+    for p in parameters:
+        if p.kind is p.VAR_KEYWORD:
+            raise unsupported(f"it takes **{p.name}, which names no parameter to make a field of")
+        if p.name in loader.bind:
+            if p.kind is p.VAR_POSITIONAL:
+                raise unsupported(
+                    f"[tool.outrig.skill] bind names *{p.name}, which is no one value"
+                )
+            continue
+        # Only a field's annotation is resolved: the return's and a bound parameter's may name
+        # what the skill imports only under `TYPE_CHECKING`, and are no field's.
+        hint = str
+        if p.annotation is not p.empty:
+            probe = types.SimpleNamespace(__annotations__={p.name: p.annotation})
+            try:
+                hint = typing.get_type_hints(probe, namespace, include_extras=True)[p.name]
+            except Exception as e:
+                raise unsupported(
+                    f"the annotation of parameter {p.name!r} cannot be resolved: "
+                    f"{_type_name(type(e))}: {e}"
+                ) from None
+        if p.kind is p.VAR_POSITIONAL:
+            hint = list[hint]
+        base, _, aliases = schema._markers(hint)
+        help = helps.pop(p.name, None)
+        if help is not None:
+            hint = typing.Annotated[(base, *aliases, schema.doc(help))]
+        if (aliases[0].name if aliases else p.name) == "question":
+            raise unsupported(
+                f"parameter {p.name!r} would be the key `question`, which is a Clarification's, "
+                "so what its parser completes with could not be told apart"
+            )
+        try:
+            declared, _ = _agents.declared_with_classes(
+                base, f"{where}: parameter {p.name!r} cannot be"
+            )
+        except TypeError as e:
+            raise SkillError("signature-unsupported", name, str(e)) from None
+        if p.kind is p.VAR_POSITIONAL:
+            spec = dataclasses.field(default_factory=list)
+        elif p.default is p.empty:
+            spec = dataclasses.field()
+        else:
+            _, problems = declared._encoding(p.default)
+            if problems:
+                raise unsupported(
+                    f"the default of parameter {p.name!r} is not of its type:\n"
+                    f"{problems.listing()}"
+                )
+            default = p.default
+            if type(default).__hash__ is None:
+                # Shared between calls, as a mutable default is in any Python.
+                spec = dataclasses.field(default_factory=lambda default=default: default)
+            else:
+                spec = dataclasses.field(default=default)
+        fields.append((p.name, hint, spec))
+    for key in helps:
+        warnings.warn(
+            f"skill {name!r}: [tool.outrig.skill.parameters] has {key!r}, which is no field of its "
+            "parameter class, so its help is not used",
+            stacklevel=4,
+        )
+    camel = "".join(part[:1].upper() + part[1:] for part in name.split("-"))
+    cls = dataclasses.make_dataclass(
+        f"{camel}Params", fields, frozen=True, kw_only=True, module=module.__name__
+    )
+    cls.__doc__ = (
+        f"The parameters of skill {name!r}'s entry, {where}, but those `bind` fills: what "
+        f"outrig.skills.invoke({name!r}, params=...) takes."
+    )
+
+    # The parse, declared as `@outrig.agent` declares a function: in the entry's module, so its
+    # call's events name the skill, with the digest of that module's source.
+    async def parse_params(text: str) -> cls | Clarification:
+        ...
+
+    told = entry.__doc__
+    told = inspect.cleandoc(told) if told and told.strip() else skill.description
+    parse_params.__doc__ = _PARSE.format(name=name, params=cls.__name__) + "\n\n" + told
+    parse_params.__module__, parse_params.__qualname__ = module.__name__, "parse_params"
+    try:
+        declaration = _agents._declare(parse_params, None, None)
+    except TypeError as e:
+        raise SkillError("signature-unsupported", name, str(e)) from None
+    source = loader.sources.get(module.__name__)
+    digest = None if source is None else hashlib.sha256(source.encode()).hexdigest()
+    declaration = dataclasses.replace(declaration, digest=digest)
+    origin = (loader.source, loader.digest)
+    return _Derived(name, cls, declaration, entry, parameters, dict(loader.bind), origin)
+
+
+class _Derived:
+    """What `invoke` calls one import of a skill's entry with: its parameter class, the typed
+    call that parses into it -- whose schema, of the class or a `Clarification`, checks an
+    instance too -- the entry and its parameters, `bind`, and the source serving the skill with
+    the digest of its files then."""
+
+    __slots__ = ("name", "cls", "declaration", "entry", "parameters", "bind", "origin")
+
+    def __init__(self, name, cls, declaration, entry, parameters, bind, origin):
+        self.name, self.cls, self.declaration = name, cls, declaration
+        self.entry, self.parameters, self.bind, self.origin = entry, parameters, bind, origin
+
+    def check(self, params):
+        """Raise `TypeError` unless `params` is an instance of this class, of its field types."""
+        if type(params) is not self.cls:
+            raise TypeError(
+                f"params is a {_type_qualname(type(params))}, not a {self.cls.__name__}, skill "
+                f"{self.name!r}'s parameter class as now imported: "
+                f"outrig.skills.params({self.name!r}) returns it"
+            )
+        _, problems = self.declaration.schema._encoding(params)
+        if problems:
+            raise TypeError(
+                f"params holds what {self.cls.__name__}'s field types do not take:\n"
+                f"{problems.listing()}"
+            )
+
+    def arguments(self, params, bound):
+        """`(args, kwargs)` to call the entry with: its positional parameters in order, a bound
+        one from `bound`, `*args` unpacked, and its keyword-only parameters by name."""
+        args, kwargs = [], {}
+        for p in self.parameters:
+            value = bound[p.name] if p.name in bound else getattr(params, p.name)
+            if p.kind is p.VAR_POSITIONAL:
+                args.extend(value)
+            elif p.kind is p.KEYWORD_ONLY:
+                kwargs[p.name] = value
+            else:
+                args.append(value)
+        return args, kwargs
+
+    def bindings(self):
+        """The bindings the entry is given, in the order of its parameters."""
+        bound = (self.bind[p.name] for p in self.parameters if p.name in self.bind)
+        return list(dict.fromkeys(bound))
+
+
 class _Finder:
     """What serves `outrig_skills` and each skill of the catalog, and nothing else.
 
@@ -357,9 +866,16 @@ class _Loader:
 
     def __init__(self, name):
         self.name = name
+        self.source = None
         self.digest = None
         self.files = frozenset()
         self.sources = {}
+        # What `[tool.outrig.skill]` said when the package was imported -- `entry`, `bind` and
+        # `parameters` -- and what `invoke` derived from it, once it has.
+        self.entry = None
+        self.bind = {}
+        self.parameters = {}
+        self.derived = None
 
     def create_module(self, spec):
         return None
@@ -406,8 +922,11 @@ class _Loader:
         imports find its siblings."""
         answer = _request(self.name, "skill.load")
         self.digest, self.files = answer["digest"], frozenset(answer["files"])
+        self.source, self.entry = answer["source"], answer.get("entry")
+        self.bind = dict(answer.get("bind") or {})
+        self.parameters = dict(answer.get("parameters") or {})
         _check(self.name, answer.get("requires_python"), answer.get("dependencies") or [])
-        module.__outrig_skill__ = Origin(self.name, answer["source"], self.digest)
+        module.__outrig_skill__ = Origin(self.name, self.source, self.digest)
         _loaded[self.name] = self
 
     def _fetch(self, path):

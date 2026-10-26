@@ -641,29 +641,28 @@ fn help_documents_the_schema() {
 }
 
 /// `help(outrig.skills)` says what a skill is to the agent within what a kernel's `help()` shows,
-/// and on the host, where no session serves skills, each function says so.
+/// naming the classes it leaves to `help()` of their own, and on the host, where no session
+/// serves skills, each function says so.
 #[test]
 fn help_documents_skills_and_the_host_has_none() {
     let out = run(r#"
         import pydoc
         text = pydoc.render_doc(outrig.skills, renderer=pydoc.plaintext)
-        names = ('read(name)', 'reload(name)', 'catalog()', 'class SkillError', 'class Origin',
-                 'class Skill', 'importlib.resources.files', 'requires-python')
+        names = ('read(name)', 'reload(name)', 'catalog()', 'invoke(name, text=None',
+                 'params(name)', 'class SkillError', 'Invocation', 'SkillNeedsClarification',
+                 'Origin', 'importlib.resources.files', 'requires-python')
         print([name for name in names if name not in text], len(text) <= 8 * 1024)
-        for call in (lambda: outrig.skills.read("a"), outrig.skills.catalog):
+        calls = (lambda: outrig.skills.read("a"), outrig.skills.catalog,
+                 lambda: outrig.skills.invoke("a", "x"), lambda: outrig.skills.params("a"))
+        for call in calls:
             try:
                 call()
             except RuntimeError as e:
                 print(e)
         "#);
-    assert_eq!(
-        out,
-        "[] True\n\
-         outrig.skills reaches the session's skills, which only an agent's kernel has, and this \
-         Python is not one\n\
-         outrig.skills reaches the session's skills, which only an agent's kernel has, and this \
-         Python is not one\n"
-    );
+    let outside = "outrig.skills reaches the session's skills, which only an agent's kernel has, \
+                   and this Python is not one\n";
+    assert_eq!(out, format!("[] True\n{}", outside.repeat(4)));
 }
 
 /// `@outrig.agent` declares on the host as it does in a kernel -- the

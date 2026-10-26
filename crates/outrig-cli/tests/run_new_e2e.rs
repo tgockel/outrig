@@ -30,7 +30,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use common::{
-    CannedResponse, RecordedRequest, RepoDir, drain_recorded, start_mock_http, stream_lines,
+    CannedResponse, RecordedRequest, RepoDir, Responder, drain_recorded, start_mock_http,
+    start_routed_mock_http, stream_lines,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1591,6 +1592,413 @@ async fn a_repository_skill_is_listed_and_imports_and_a_bad_one_is_said() {
         "{system}"
     );
     assert_eq!(tool_result(&recorded[1], "toolu_1"), "hello from greet\n");
+}
+
+/// The review skill `skills.md` describes, trimmed: its entry asks the
+/// binding `repo` how many sections there are, and reviews each with a typed
+/// call, all at once; with `allow_partial`, it waits on the binding meanwhile.
+const REVIEW_DIFF: &str = r#"# /// script
+# [tool.outrig.skill]
+# bind = { repo = "repo" }
+#
+# [tool.outrig.skill.parameters]
+# base = "The ref to diff against."
+# paths = "Paths that limit the diff; leave empty only to review every changed file."
+# max_parallel = "How many sections are reviewed at once."
+# allow_partial = "Return a partial outcome instead of raising when a section fails."
+# ///
+import asyncio
+from dataclasses import dataclass
+
+import outrig
+
+
+@dataclass(frozen=True, kw_only=True)
+class Review:
+    verdict: str
+
+
+@outrig.agent
+async def analyze_code(section: str) -> Review:
+    """ROLE reviewer. Review one section of the diff."""
+    ...
+
+
+async def main(repo, base: str = "origin/main", *paths: str,
+               max_parallel: int = 4, allow_partial: bool = False):
+    """ROLE parser. Review the diff against `base`, one section at a time."""
+    sections = [f"{base}:{n}" for n in range(repo.method(1, y=2))]
+    if allow_partial:
+        waiting = asyncio.create_task(asyncio.to_thread(repo.wait_for_answer), name="waiting")
+    reviews = await asyncio.gather(*(analyze_code(s) for s in sections),
+                                   return_exceptions=True)
+    return [r.verdict if isinstance(r, Review) else type(r).__name__ for r in reviews]
+"#;
+
+/// Write the skill `name`'s files into `repo`'s `.agents/skills`, beside a
+/// `SKILL.md` saying `description`.
+fn write_skill(repo: &Path, name: &str, description: &str, files: &[(&str, &str)]) {
+    let dir = repo.join(".agents/skills").join(name);
+    std::fs::create_dir_all(&dir).expect("a skill's directory");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\nInstructions for {name}.\n"),
+    )
+    .expect("its SKILL.md");
+    for (path, text) in files {
+        std::fs::write(dir.join(path), text).expect("its file");
+    }
+}
+
+/// The text of the first message `request` carried: a child's opening, with
+/// the preview of what it was given.
+fn opening_of(request: &RecordedRequest) -> String {
+    request
+        .messages()
+        .first()
+        .map(|message| message["content"].to_string())
+        .unwrap_or_default()
+}
+
+/// How many tool results the conversation `request` carried holds.
+fn results_in(request: &RecordedRequest) -> usize {
+    request
+        .messages()
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "tool_result")
+        .count()
+}
+
+/// A responder answering `script` in order, repeating its last answer.
+fn in_order(script: Vec<CannedResponse>) -> Responder {
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(move |_| {
+        let n = next.fetch_add(1, Ordering::SeqCst);
+        script.get(n).or(script.last()).cloned().expect("a script")
+    })
+}
+
+/// A parser that prints the text it was given, then completes with `params`,
+/// given as Python.
+fn parsing(params: &'static str) -> Responder {
+    Arc::new(move |request: &RecordedRequest| match results_in(request) {
+        0 => submit("q0", "print(repr(text))"),
+        1 => submit("q1", &format!("await runtime.complete({params})")),
+        _ => text_reply("ended"),
+    })
+}
+
+/// The records of `kind` in `log`, each its data and its subject.
+fn records<'a>(log: &'a [Value], kind: &str) -> Vec<(&'a Value, &'a Value)> {
+    let kind = format!("org.outrig.{kind}");
+    log.iter()
+        .filter(|record| record["type"] == kind.as_str())
+        .map(|record| (&record["data"], &record["subject"]))
+        .collect()
+}
+
+/// What `usage` holds of `total_tokens`, `0` when it is `null`.
+fn tokens(usage: &Value) -> u64 {
+    usage["total_tokens"].as_u64().unwrap_or(0)
+}
+
+/// A repository holding the review skill, recording its events, beside a
+/// global config binding the fixture library as `repo` and installing it from
+/// `wheels` alone.
+fn reviewing(addr: std::net::SocketAddr, wheels: &Path) -> (RepoDir, std::path::PathBuf) {
+    let requirement = fixture_wheel(wheels);
+    let repo = repo_with(addr, "[events]\nmode = \"record\"");
+    write_skill(
+        repo.path(),
+        "review-diff",
+        "Reviews a diff in sections.",
+        &[("skill.py", REVIEW_DIFF)],
+    );
+    let global = global_config(repo.path());
+    append(
+        &global,
+        &format!(
+            "[bindings.repo]\ndescription = \"The fixture.\"\nrequires = [{requirement:?}]\n\
+             factory = \"outrig_fixture:make\"\n"
+        ),
+    );
+    (repo, global)
+}
+
+/// The parts compose through `run-new`: `/help` stays the terminal's own
+/// though a skill is named for it, which is said as the session starts, and a
+/// `/name` directive reaches the agent, whose code invokes the skill. A child
+/// parses the line into the skill's parameters; the entry uses its binding and
+/// makes three typed calls at once, one of whose children answers with the
+/// wrong shape once and is repaired. The event log ties every call, request
+/// and repair to the invocation, every hosted call to its execution, and each
+/// child's spend to its own events, its call, the invocation and the round,
+/// once each.
+#[tokio::test]
+async fn a_directive_runs_a_skill_whose_children_work_at_once() {
+    let reviewer: Responder = Arc::new(|request: &RecordedRequest| {
+        let repaired = opening_of(request).contains("origin/main:1");
+        match (repaired, results_in(request)) {
+            (true, 0) => submit(
+                "w1",
+                "try:\n    await runtime.complete({'verdict': 1})\nexcept ValueError:\n    \
+                 print('refused')",
+            ),
+            (true, 1) | (false, 0) => {
+                submit("w2", "await runtime.complete({'verdict': 'ok ' + section})")
+            }
+            _ => text_reply("ended"),
+        }
+    });
+    let primary = in_order(vec![
+        submit(
+            "toolu_1",
+            "import outrig\n\
+             d = await runtime.channels['user'].receive()\n\
+             print(d.skill, repr(d.body))\n\
+             print(await outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [''])[1]))",
+        ),
+        text_reply("reviewed"),
+    ]);
+    let (addr, mut requests) = start_routed_mock_http(vec![
+        ("ROLE reviewer", reviewer),
+        (
+            "ROLE parser",
+            parsing(
+                "{'base': 'origin/main', 'paths': ['a.py', 'b.py'], 'max_parallel': 2, \
+                 'allow_partial': False}",
+            ),
+        ),
+        ("", primary),
+    ])
+    .await;
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let (repo, global) = reviewing(addr, wheels.path());
+    write_skill(repo.path(), "help", "Says how to get help.", &[]);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session.type_line("/help").await;
+    wait_for(&session.stderr, "/<skill> [text]", TEST_TIMEOUT).await;
+    // A directive's name follows the slash directly.
+    session.type_line("/ review-diff a.py").await;
+    wait_for(
+        &session.stderr,
+        "[outrig] unknown command: / review-diff a.py",
+        TEST_TIMEOUT,
+    )
+    .await;
+    // Whitespace other than a space ends the name, as the agent splits it.
+    session
+        .type_line("/review-diff\ta.py b.py --max-parallel 2 --allow-partial")
+        .await;
+    wait_for(&session.stderr, "reviewed", TEST_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(
+            "[outrig] skill \"help\" is not run by /help, which is run-new's own command"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("/help"), "{stderr}");
+
+    let recorded = drain_recorded(&mut requests);
+    let after = recorded
+        .iter()
+        .find(|request| {
+            request
+                .body
+                .to_string()
+                .contains("\"tool_use_id\":\"toolu_1\"")
+        })
+        .expect("the request after the primary's call");
+    assert_eq!(
+        tool_result(after, "toolu_1"),
+        "review-diff '/review-diff\\ta.py b.py --max-parallel 2 --allow-partial'\n\
+         ['ok origin/main:0', 'ok origin/main:1', 'ok origin/main:2']\n"
+    );
+    // The text the parser was given: everything after the name.
+    let parsed = recorded
+        .iter()
+        .find(|request| {
+            common::system_text(&request.body).contains("ROLE parser") && results_in(request) == 1
+        })
+        .expect("the parser's call after it printed its text");
+    assert_eq!(
+        tool_result(parsed, "q0"),
+        "'a.py b.py --max-parallel 2 --allow-partial'\n"
+    );
+
+    let log = the_log(sessions.path());
+    let directive = records(&log, "skill.directive.received");
+    assert_eq!(directive.len(), 1);
+    assert_eq!(directive[0].0["skill"], "review-diff");
+    assert_eq!(directive[0].0["source"], "project");
+    let started = records(&log, "skill.invocation.started");
+    assert_eq!(started.len(), 1);
+    let (invoked, _) = started[0];
+    let id = invoked["invocation"].clone();
+    assert_eq!(invoked["by"], "parser");
+    assert_eq!(invoked["bindings"], json!(["repo"]));
+
+    // The parse call and the three typed calls, each under the invocation.
+    let calls = records(&log, "agent.call.started");
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    for (call, _) in &calls {
+        assert_eq!(call["invocation"], id, "{call}");
+    }
+    let parse = calls
+        .iter()
+        .find(|(call, _)| call["qualname"] == "parse_params")
+        .expect("the parse call");
+    assert_eq!(parse.0["module"], "outrig_skills.review_diff.skill");
+    assert_eq!(invoked["call"], parse.0["request"]);
+    let reviews: Vec<&Value> = calls
+        .iter()
+        .filter(|(call, _)| call["qualname"] == "analyze_code")
+        .map(|(call, _)| &call["request"])
+        .collect();
+    assert_eq!(reviews.len(), 3);
+    // The repair, under its call.
+    let invalid = records(&log, "agent.request.invalid");
+    assert_eq!(invalid.len(), 1, "{invalid:?}");
+    assert!(reviews.contains(&&invalid[0].0["request"]), "{invalid:?}");
+    // Each hosted call under the execution that made it, and the invocation.
+    let exec = records(&log, "exec.submitted")
+        .into_iter()
+        .find(|(_, subject)| subject.as_str() == Some("agent/primary"))
+        .expect("the primary's execution")
+        .0["execid"]
+        .clone();
+    let hosted = records(&log, "hosted.received");
+    assert!(!hosted.is_empty());
+    for (request, _) in &hosted {
+        assert_eq!(request["execid"], exec, "{request}");
+        assert_eq!(request["invocation"], id, "{request}");
+    }
+
+    // Each child's spend: in its own events, in its call's, in the
+    // invocation's and in the round's, each once.
+    let settled = records(&log, "agent.call.settled");
+    assert_eq!(settled.len(), 4);
+    let by_calls: u64 = settled.iter().map(|(call, _)| tokens(&call["usage"])).sum();
+    let by_attempts: u64 = records(&log, "model.attempt")
+        .iter()
+        .filter(|(_, subject)| subject.as_str() != Some("agent/primary"))
+        .map(|(attempt, _)| tokens(&attempt["usage"]))
+        .sum();
+    assert!(by_calls > 0);
+    assert_eq!(by_attempts, by_calls);
+    let finished = records(&log, "skill.invocation.finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].0["outcome"], "returned");
+    assert_eq!(tokens(&finished[0].0["usage"]), by_calls);
+    let round = records(&log, "model.round.completed")
+        .into_iter()
+        .find(|(_, subject)| subject.as_str() == Some("agent/primary"))
+        .expect("the primary's round")
+        .0;
+    assert_eq!(
+        tokens(&round["total"]),
+        tokens(&round["usage"]) + by_calls,
+        "{round}"
+    );
+}
+
+/// The same run, quit while its three typed calls wait on the model and its
+/// entry waits on a hosted call: each call ends `closed`, and the stop's
+/// report lists every child's request and the hosted call, in time.
+#[tokio::test]
+async fn quitting_while_a_skills_children_work_reports_each_of_them() {
+    let primary = in_order(vec![
+        submit(
+            "toolu_1",
+            "import outrig\n\
+             d = await runtime.channels['user'].receive()\n\
+             print(await outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [''])[1]))",
+        ),
+        text_reply("reviewed"),
+    ]);
+    let held: Responder = Arc::new(|_: &RecordedRequest| CannedResponse::held());
+    let (addr, mut requests) = start_routed_mock_http(vec![
+        ("ROLE reviewer", held),
+        ("ROLE parser", parsing("{'allow_partial': True}")),
+        ("", primary),
+    ])
+    .await;
+    let wheels = tempfile::tempdir().expect("a wheels directory");
+    let (repo, global) = reviewing(addr, wheels.path());
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::with_global(
+        repo.path(),
+        sessions.path(),
+        &global,
+        &wheels_only(wheels.path()),
+    );
+    session
+        .type_line("/review-diff everything, partial is fine")
+        .await;
+    // Each of the three reviewers has asked its model, which never answers.
+    let mut reviewers = 0;
+    timeout(TEST_TIMEOUT, async {
+        while reviewers < 3 {
+            let request = requests.recv().await.expect("the mock is serving");
+            if common::system_text(&request.body).contains("ROLE reviewer") {
+                reviewers += 1;
+            }
+        }
+    })
+    .await
+    .expect("three reviewers asked their model");
+    session.type_line("/quit").await;
+    let (status, _, stderr) = timeout(TEST_TIMEOUT, session.exit(false))
+        .await
+        .expect("the stop ends in time");
+    assert!(status.code().is_some(), "{stderr}");
+
+    let log = the_log(sessions.path());
+    let reviews: Vec<Value> = records(&log, "agent.call.started")
+        .iter()
+        .filter(|(call, _)| call["qualname"] == "analyze_code")
+        .map(|(call, _)| call["request"].clone())
+        .collect();
+    assert_eq!(reviews.len(), 3);
+    let closed: Vec<Value> = records(&log, "agent.call.settled")
+        .iter()
+        .filter(|(call, _)| call["outcome"] == "closed")
+        .map(|(call, _)| call["request"].clone())
+        .collect();
+    for review in &reviews {
+        assert!(closed.contains(review), "{review} ended closed: {closed:?}");
+    }
+    let report = records(&log, "session.report");
+    assert_eq!(report.len(), 1);
+    let report = report[0].0;
+    let listed: Vec<Value> = report["requests"]
+        .as_array()
+        .expect("the requests open at the close")
+        .iter()
+        .map(|request| request["request"].clone())
+        .collect();
+    for review in &reviews {
+        assert!(
+            listed.contains(review),
+            "{review} is in the report: {report}"
+        );
+    }
+    let hosted = report["hosted"].as_array().expect("the hosted calls");
+    assert!(
+        hosted.iter().any(|call| call["binding"] == "repo"),
+        "the entry's wait is in the report: {report}"
+    );
 }
 
 /// A round whose code leaves a task running says so as it closes, so a prompt

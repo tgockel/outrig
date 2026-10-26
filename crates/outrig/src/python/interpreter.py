@@ -2012,6 +2012,7 @@ class _Wait:
     __slots__ = (
         "pool",
         "execution",
+        "invocation",
         "interruptible",
         "waiting",
         "exc",
@@ -2024,6 +2025,9 @@ class _Wait:
     def __init__(self, pool, execution, interruptible):
         self.pool = pool
         self.execution = execution
+        # The skill invocation the calling code runs inside, read on its own thread: the waker
+        # that tells the host of a call never sent runs on another.
+        self.invocation = _invocation()
         self.interruptible = interruptible
         self.waiting = False
         self.exc = None
@@ -2045,6 +2049,7 @@ class _Wait:
             "agent": self.pool.kernel.agent,
             "binding": self.pool.binding,
             "exec": None if execution is None else execution.id,
+            "invocation": self.invocation,
             "operation": operation,
             "member": member,
             "target": target,
@@ -2432,7 +2437,10 @@ def _load_outrig(directory):
     outrig._kernel.install(_calling)
     outrig._agents._call = _call
     outrig._agents._submitted_source = _submitted_source
-    outrig.skills._install(_ask_host, _notify, _compiled_cause)
+    outrig.skills._install(
+        _ask_host, _notify, _compiled_cause, lambda: next(_ids), _refuse_closing,
+        lambda: _observing,
+    )
     _schema = outrig.schema
     _agents = outrig._agents
     _skills = outrig.skills
@@ -2442,6 +2450,15 @@ def _calling():
     """The kernel of the execution this code belongs to, or `None` outside every execution."""
     execution = _CURRENT.get()
     return None if execution is None else execution.kernel
+
+
+def _invocation():
+    """The id of the skill invocation the calling code runs inside, or `None`: diagnostic
+    context the host attaches to what that code asks of it, which the code can change."""
+    if _skills is None:
+        return None
+    ids = _skills._current()
+    return ids[0] if ids else None
 
 
 # The source of each submission, by the id of every code object compiled from it -- its own, and
@@ -2678,6 +2695,7 @@ def _connection_class(rpyc):
                     "member": member,
                     "target": target,
                     "exec": None if execution is None else execution.id,
+                    "invocation": _invocation(),
                 }
                 try:
                     self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)), label)
@@ -3483,13 +3501,16 @@ class Delivery:
 
     `id` names the message -- on a request channel, the request it carries, which its handle's
     `id` names too -- `body` is the message itself, `sender` who sent it -- `"user"` on the user
-    channel, an agent's id between agents -- and `received_at` when it arrived, in UTC.
+    channel, an agent's id between agents -- and `received_at` when it arrived, in UTC. `skill`
+    names the skill a `/name` the user typed resolved to, which asks you to run it, and is
+    `None` on every other message.
     """
 
     id: int
     body: object
     sender: str
     received_at: datetime.datetime
+    skill: object = dataclasses.field(default=None, kw_only=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3725,9 +3746,9 @@ class Endpoint:
                 self._unreceived -= 1
         _wake_all(wake, self._name)
 
-    def _deliver(self, body, sender, message):
-        """Queue `body` from `sender`, posted as `message`, and return how many messages then wait.
-        Reader thread only.
+    def _deliver(self, body, sender, message, skill=None):
+        """Queue `body` from `sender`, posted as `message` -- a directive naming `skill`, when
+        that is given -- and return how many messages then wait. Reader thread only.
 
         Raises `_Refused` for a body the contract does not take or a queue that is full, having
         queued nothing. The append is the last step that can fail, so a retry after running out
@@ -3744,7 +3765,9 @@ class Endpoint:
                 f"channel {self._name!r} receives {_describe_all(self._receives)}, not "
                 f"{_type_name(type(body))}"
             )
-        delivery = Delivery(message, copy, sender, datetime.datetime.now(datetime.timezone.utc))
+        delivery = Delivery(
+            message, copy, sender, datetime.datetime.now(datetime.timezone.utc), skill=skill
+        )
         with self._lock:
             if len(self._queue) >= QUEUE_MAX:
                 raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
@@ -3911,7 +3934,8 @@ class Runtime:
         spawn = next(_ids)
         line = {"t": "agent.spawn", "agent": kernel.agent, "id": spawn, "name": name,
                 "prompt": prompt, "model": model, "kind": kind, "manifest": manifest,
-                "channels": said}
+                "channels": said,
+                "invocations": [] if _skills is None else _skills._current()}
         _refuse_long(line, "spawn", "shorten the prompt, or give fewer inputs or channels")
         _spawning[spawn] = {"parent": kernel, "name": name, "kind": kind, "channels": channels,
                             "inputs": copies, "classes": bound}
@@ -4033,9 +4057,10 @@ class Runtime:
         # An iterator is not known to be empty until it is read. asyncio trips an assertion here.
         if not fs:
             raise ValueError("Set of Tasks/Futures is empty.")
-        # A handle is waited on through its view, and comes back as itself.
+        # A handle, or a skill's invocation, is waited on through its view, and comes back as
+        # itself.
         handles = {}
-        for f in [f for f in fs if type(f) is Handle]:
+        for f in [f for f in fs if type(f) is Handle or type(f) is _skills.Invocation]:
             handles[f.future] = f
             fs.discard(f)
             fs.add(f.future)
@@ -4843,6 +4868,7 @@ class _Call(_Work):
         super().__init__(None, sender, "submission", None, None, declaration.schema, 3)
         self.declaration = declaration
         self.arguments = arguments
+        self.invocation = _invocation()
         self.progress = _Progress(sender.agent, None, self.id)
         self.work = None  # the submission, once made
         self.task = None
@@ -4916,7 +4942,7 @@ class _Call(_Work):
             self.child = child._child
             _notify({"t": "agent.call", "agent": kernel.agent, "request": self.id,
                      "child": child.id, "module": d.module, "qualname": d.qualname,
-                     "digest": d.digest})
+                     "digest": d.digest, "invocation": self.invocation})
             if self.state not in _ENDED:
                 try:
                     _refuse_closing()
@@ -4936,8 +4962,13 @@ class _Call(_Work):
             if reason not in ("released", "closed") and _closing is None:
                 with contextlib.suppress(Exception):
                     await kernel.runtime.release([child])
+            said = None
+            if reason is None and _observing:
+                encoded, problems = d.schema._encoding(value)
+                said = None if problems else _agents.preview(encoded)
             _notify({"t": "agent.call.ended", "agent": kernel.agent, "request": self.id,
-                     "child": child.id, "outcome": reason or "accepted"})
+                     "child": child.id, "outcome": reason or "accepted",
+                     "invocation": self.invocation, "value": said})
             self.end(reason, value=value, error=error)
         finally:
             self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"))
@@ -5986,10 +6017,13 @@ def _msg(kernel, request_id, message):
     """
     channel = message.get("channel")
     endpoint = kernel.channels.get(channel) if isinstance(channel, str) else None
+    skill = message.get("skill")
     try:
         if endpoint is None:
             raise _Refused(f"agent {kernel.agent!r} has no channel {channel!r}")
-        pending = endpoint._deliver(message.get("body"), "user", request_id)
+        if skill is not None and type(skill) is not str:
+            raise _Refused(f"a directive names its skill with a str, not {_type_name(type(skill))}")
+        pending = endpoint._deliver(message.get("body"), "user", request_id, skill)
     except _Refused as e:
         _send({"t": "msg", "agent": kernel.agent, "id": request_id, "error": str(e)})
         return

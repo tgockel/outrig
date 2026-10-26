@@ -247,9 +247,10 @@ Four more tasks add events beside them that are execution diagnostics, not integ
   (`0003-31`). The child's model usage is attributed to the child's round and added to the skill
   invocation it ran under and to the main agent's round; a request's settled event names the
   rounds it spanned;
-- `0003-33`: each skill invocation, which the hosted calls made inside it carry as context, not as
-  authority. Invocation events are not an audit of what a skill did; only boundary events record
-  every crossing (`skills.md`);
+- `0003-33`, built: each directive the user sends, `skill.directive.received`, and each skill
+  invocation, `skill.invocation.started` and `skill.invocation.finished`, whose id the typed calls
+  and hosted calls made inside it carry as context, not as authority. Invocation events are not an
+  audit of what a skill did; only boundary events record every crossing (`skills.md`);
 - `0003-34`: each agent instance -- `agent.instance.started`, `ready`, `released` and
   `collected`, the last when the runtime releases an instance that was collected unreleased.
   Execution diagnostics like the rest, with any body they carry as a bounded preview.

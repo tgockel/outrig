@@ -28,7 +28,7 @@
 //! a [`DirectorySource`] serves nothing that is not inside a skill's own directory, and follows
 //! no link to get there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
@@ -399,12 +399,26 @@ impl Problem {
 }
 
 /// What a skill's files said when they were last read: their digest, and what its `skill.py`
-/// declares it needs, which the interpreter checks as the skill's package is imported.
+/// declares.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Meta {
     digest: String,
+    declared: Declared,
+}
+
+/// What a `skill.py`'s `# /// script` block declares: what the skill needs, which the
+/// interpreter checks as its package is imported, and what `outrig.skills.invoke` reads of
+/// `[tool.outrig.skill]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Declared {
     requires_python: Option<String>,
     dependencies: Vec<String>,
+    /// `entry`, the entry function's name, when the block names one.
+    entry: Option<String>,
+    /// `bind`: each entry parameter a binding fills, to the binding's name.
+    bind: BTreeMap<String, String>,
+    /// `[tool.outrig.skill.parameters]`: each entry parameter's help.
+    parameters: BTreeMap<String, String>,
 }
 
 /// What reading one skill's metadata found.
@@ -697,17 +711,13 @@ fn read_skill(
     }
     let executable = listed("skill.py");
     let mut warnings = Vec::new();
-    let (requires_python, dependencies) = if executable {
+    let declared = if executable {
         script(&text(source, skill, "skill.py")?, &mut warnings)?
     } else {
-        (None, Vec::new())
+        Declared::default()
     };
     Ok(Found {
-        meta: Meta {
-            digest,
-            requires_python,
-            dependencies,
-        },
+        meta: Meta { digest, declared },
         description,
         executable,
         warnings,
@@ -854,18 +864,14 @@ static BLOCK: LazyLock<Regex> = LazyLock::new(|| {
         .expect("PEP 723's expression compiles")
 });
 
-/// What `skill.py`'s `# /// script` block declares, `source` being its text -- its
-/// `requires-python` and its `dependencies` -- with a warning in `warnings` for each key OutRig
-/// does not know in `[tool.outrig]`.
+/// What `skill.py`'s `# /// script` block declares, `source` being its text, with a warning in
+/// `warnings` for each key OutRig does not know in `[tool.outrig]`.
 ///
 /// Only the file's leading lines are searched -- those before its first line that is neither
 /// blank nor a comment -- so a block after the first statement, or inside a docstring, is never
 /// read, and finding one parses no Python. A block opened and never closed is no block, and the
 /// skill takes the defaults.
-fn script(
-    source: &str,
-    warnings: &mut Vec<String>,
-) -> Result<(Option<String>, Vec<String>), Problem> {
+fn script(source: &str, warnings: &mut Vec<String>) -> Result<Declared, Problem> {
     let mut found = None;
     for block in BLOCK.captures_iter(leading(source)) {
         if &block["type"] != "script" {
@@ -888,7 +894,7 @@ fn script(
         found = Some(content);
     }
     let Some(content) = found else {
-        return Ok((None, Vec::new()));
+        return Ok(Declared::default());
     };
     let table: toml::Table = content.parse().map_err(|e| {
         Problem::invalid(format!(
@@ -912,11 +918,8 @@ fn leading(source: &str) -> &str {
 }
 
 /// What a `# /// script` block's table declares: `requires-python` and `dependencies`, its two
-/// keys from the specification, with each OutRig key of `[tool.outrig.skill]` checked.
-fn needs(
-    table: &toml::Table,
-    warnings: &mut Vec<String>,
-) -> Result<(Option<String>, Vec<String>), String> {
+/// keys from the specification, and the OutRig keys of `[tool.outrig.skill]`.
+fn needs(table: &toml::Table, warnings: &mut Vec<String>) -> Result<Declared, String> {
     let requires_python = match table.get("requires-python") {
         None => None,
         Some(value) => Some(
@@ -945,6 +948,11 @@ fn needs(
             .ok_or("its `tool` is not a table")?
             .get("outrig"),
     };
+    let mut declared = Declared {
+        requires_python,
+        dependencies,
+        ..Declared::default()
+    };
     if let Some(outrig) = outrig {
         for (key, value) in outrig
             .as_table()
@@ -954,7 +962,7 @@ fn needs(
                 let skill = value
                     .as_table()
                     .ok_or("its `[tool.outrig.skill]` is not a table")?;
-                outrig_skill(skill, warnings)?;
+                outrig_skill(skill, &mut declared, warnings)?;
             } else {
                 warnings.push(format!(
                     "`[tool.outrig]` has the key {key:?}, which OutRig does not know and ignores"
@@ -962,31 +970,48 @@ fn needs(
             }
         }
     }
-    Ok((requires_python, dependencies))
+    Ok(declared)
 }
 
-/// Check `[tool.outrig.skill]`: `entry`, the entry function's name, and `bind`, a table from an
-/// entry parameter to the binding it takes. Anything else is a warning.
-fn outrig_skill(skill: &toml::Table, warnings: &mut Vec<String>) -> Result<(), String> {
+/// Read `[tool.outrig.skill]` into `declared`: `entry`, the entry function's name; `bind`, a
+/// table from an entry parameter to the binding it takes; and `parameters`, a table from an entry
+/// parameter to its help. Anything else is a warning.
+fn outrig_skill(
+    skill: &toml::Table,
+    declared: &mut Declared,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
     for (key, value) in skill {
         match key.as_str() {
-            "entry" if !value.is_str() => {
-                return Err("its `[tool.outrig.skill]` entry is not a string".into());
+            "entry" => {
+                let entry = value
+                    .as_str()
+                    .ok_or("its `[tool.outrig.skill]` entry is not a string")?;
+                declared.entry = Some(entry.to_string());
             }
-            "bind"
-                if !value
-                    .as_table()
-                    .is_some_and(|bind| bind.values().all(toml::Value::is_str)) =>
-            {
-                return Err("its `[tool.outrig.skill]` bind is not a table of strings".into());
+            "bind" => {
+                declared.bind = strings(value)
+                    .ok_or("its `[tool.outrig.skill]` bind is not a table of strings")?;
             }
-            "entry" | "bind" => {}
+            "parameters" => {
+                declared.parameters = strings(value)
+                    .ok_or("its `[tool.outrig.skill.parameters]` is not a table of strings")?;
+            }
             key => warnings.push(format!(
                 "`[tool.outrig.skill]` has the key {key:?}, which OutRig does not know and ignores"
             )),
         }
     }
     Ok(())
+}
+
+/// `value` as a table of strings, or `None` when it is not one.
+fn strings(value: &toml::Value) -> Option<BTreeMap<String, String>> {
+    value
+        .as_table()?
+        .iter()
+        .map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------- serving
@@ -1029,9 +1054,12 @@ impl Catalog {
             let digest = digest.as_deref();
             match (kind.as_str(), path) {
                 ("skill.load", _) => catalog.load(&skill),
+                ("skill.check", _) => catalog.check(&skill, digest),
                 ("skill.read", Some(path)) => catalog.read(&skill, &path, digest),
                 ("skill.read", None) => Err(Problem::source("the request names no path")),
-                ("skill.instructions", _) => catalog.instructions(&skill, digest),
+                ("skill.instructions", _) => catalog
+                    .instructions(&skill, digest)
+                    .map(|body| json!({"body": body})),
                 (kind, _) => Err(Problem::source(format!(
                     "{kind:?} is not a request about skills"
                 ))),
@@ -1055,13 +1083,25 @@ impl Catalog {
             meta
         };
         let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        let declared = &meta.declared;
         Ok(json!({
             "source": served.source,
             "digest": meta.digest,
             "files": paths,
-            "requires_python": meta.requires_python,
-            "dependencies": meta.dependencies,
+            "requires_python": declared.requires_python,
+            "dependencies": declared.dependencies,
+            "entry": declared.entry,
+            "bind": declared.bind,
+            "parameters": declared.parameters,
         }))
+    }
+
+    /// Nothing, when `name`'s files are still at `digest`, the one its package was imported at;
+    /// `skill-changed` when they are not.
+    fn check(&self, name: &str, digest: Option<&str>) -> Result<Value, Problem> {
+        let digest = digest.ok_or_else(|| Problem::source("the request names no digest"))?;
+        self.current(name, Some(digest))?;
+        Ok(json!({}))
     }
 
     /// `name`, its files and their digest, refused as `skill-changed` when `digest`, the one its
@@ -1093,7 +1133,7 @@ impl Catalog {
     }
 
     /// `name`'s instructions: its `SKILL.md` past the frontmatter.
-    fn instructions(&self, name: &str, digest: Option<&str>) -> Result<Value, Problem> {
+    fn instructions(&self, name: &str, digest: Option<&str>) -> Result<String, Problem> {
         let (served, files, digest) = self.current(name, digest)?;
         if !files.iter().any(|file| file.path == "SKILL.md") {
             return Err(Problem::invalid(format!("skill {name:?} has no SKILL.md")));
@@ -1105,7 +1145,26 @@ impl Catalog {
                 "skill {name:?}'s SKILL.md no longer begins with frontmatter"
             ))
         })?;
-        Ok(json!({"body": body}))
+        Ok(body.to_string())
+    }
+
+    /// The skill a directive names: the name of the source serving it, and whether it has a
+    /// `skill.py`; `None` when the session serves no skill of that name.
+    pub(crate) fn directed(&self, name: &str) -> Option<(String, bool)> {
+        let served = self.served(name).ok()?;
+        Some((served.source.clone(), served.executable))
+    }
+
+    /// `name`'s instructions, read through its source now, within the session's places and its
+    /// bound: what a directive for a skill with no `skill.py` delivers. An error says why they
+    /// could not be read, its code first.
+    pub(crate) async fn read_instructions(self: &Arc<Self>, name: &str) -> Result<String, String> {
+        let (catalog, name) = (Arc::clone(self), name.to_string());
+        bounded(&self.gate, self.bound, move || {
+            catalog.instructions(&name, None)
+        })
+        .await
+        .map_err(|problem| format!("{}: {}", problem.code, problem.message))
     }
 
     /// Publish on `events` what the interpreter said of a skill's import.

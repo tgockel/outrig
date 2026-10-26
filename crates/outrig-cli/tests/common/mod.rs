@@ -341,33 +341,100 @@ async fn serve_mock_http(
         served += 1;
 
         if canned.held {
-            // Off the accept loop, so later requests are still served. Reading
-            // to EOF is what notices the client has dropped the request.
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let _ = sock.read_to_end(&mut Vec::new()).await;
-            });
+            // Off the accept loop, so later requests are still served.
+            tokio::spawn(answer(sock, canned));
             continue;
         }
-
-        let body = serde_json::to_string(&canned.body).expect("canned body serializes");
-        let extra: String = canned
-            .headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect();
-        let response = format!(
-            "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n{}\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-            canned.status,
-            extra,
-            body.len(),
-            body,
-        );
-        let _ = sock.write_all(response.as_bytes()).await;
-        let _ = sock.flush().await;
-        let _ = sock.shutdown().await;
+        answer(sock, canned).await;
     }
+}
+
+/// Answer the request read from `sock` with `canned`; one that is held is
+/// read until the client hangs up, which is what notices it dropped the
+/// request.
+async fn answer(mut sock: tokio::net::TcpStream, canned: CannedResponse) {
+    if canned.held {
+        use tokio::io::AsyncReadExt;
+        let _ = sock.read_to_end(&mut Vec::new()).await;
+        return;
+    }
+    let body = serde_json::to_string(&canned.body).expect("canned body serializes");
+    let extra: String = canned
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let response = format!(
+        "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n{}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        canned.status,
+        extra,
+        body.len(),
+        body,
+    );
+    let _ = sock.write_all(response.as_bytes()).await;
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
+}
+
+/// What the routed mock answers one request with.
+#[allow(dead_code)]
+pub type Responder = Arc<dyn Fn(&RecordedRequest) -> CannedResponse + Send + Sync>;
+
+/// The system prompt `body` carries, whether as one string or as blocks.
+#[allow(dead_code)]
+pub fn system_text(body: &serde_json::Value) -> String {
+    match &body["system"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// A mock several agents share: each request goes to the responder of the
+/// first route whose marker its system prompt holds -- `""` holds in any --
+/// and is answered on a task of its own, so the requests of agents working at
+/// once overlap. Every request arrives on the returned channel.
+#[allow(dead_code)]
+pub async fn start_routed_mock_http(
+    routes: Vec<(&'static str, Responder)>,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
+    let addr = listener.local_addr().expect("mock local_addr");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let routes = Arc::new(routes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (routes, tx) = (Arc::clone(&routes), tx.clone());
+            tokio::spawn(async move {
+                let Some(recorded) = read_http_request(&mut sock).await else {
+                    return;
+                };
+                let system = system_text(&recorded.body);
+                let canned = routes
+                    .iter()
+                    .find(|(marker, _)| system.contains(marker))
+                    .map(|(_, respond)| respond(&recorded))
+                    .expect("a route for every request: end the routes with \"\"");
+                if tx.send(recorded).is_err() {
+                    return;
+                }
+                answer(sock, canned).await;
+            });
+        }
+    });
+    (addr, rx)
 }
 
 /// Read one HTTP/1.1 request: the request line, its headers, and a

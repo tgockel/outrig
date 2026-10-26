@@ -225,6 +225,7 @@ impl Agent {
         let window = Window::DEFAULT;
         let instructions =
             instructions::load(&interpreter, workspace, resolved.repo_instructions).await;
+        let catalog = holdings.catalog.cloned();
         let preamble = orientation::preamble(
             workspace,
             holdings,
@@ -233,7 +234,7 @@ impl Agent {
             window,
         );
         let slot = CallSlot::new(ledger, interpreter.events().clone(), None);
-        let user = UserChannel::new(interpreter.clone());
+        let user = UserChannel::new(interpreter.clone(), catalog);
         Self::assemble(
             resolved,
             interpreter.clone(),
@@ -446,3 +447,7 @@ mod children_tests;
 #[cfg(test)]
 #[path = "typed_tests.rs"]
 mod typed_tests;
+
+#[cfg(test)]
+#[path = "invoke_tests.rs"]
+mod invoke_tests;

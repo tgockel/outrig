@@ -376,6 +376,33 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             a,
         ),
+        ("skill.directive.received", {"skill": "s", "source": "project", "message": 1}, a),
+        (
+            "skill.invocation.started",
+            {
+                "invocation": 7,
+                "skill": "s",
+                "source": "project",
+                "digest": "ab",
+                "params": '{"paths": ["a.py"]}',
+                "by": "parser",
+                "call": 8,
+                "bindings": ["repo"],
+            },
+            a,
+        ),
+        (
+            "skill.invocation.finished",
+            {
+                "invocation": 7,
+                "outcome": "returned",
+                "duration": 1.5,
+                "result": "builtins.dict",
+                "exception": None,
+                "usage": usage,
+            },
+            a,
+        ),
         (
             "agent.started",
             {
@@ -637,7 +664,14 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("agent.request.refused", {"request": 7, "ended": "failed"}, c),
         (
             "agent.call.started",
-            {"request": 8, "parent": a, "module": "review", "qualname": "analyze_code", "digest": "3b4c"},
+            {
+                "request": 8,
+                "parent": a,
+                "module": "review",
+                "qualname": "analyze_code",
+                "digest": "3b4c",
+                "invocation": 7,
+            },
             c,
         ),
         (
@@ -648,7 +682,17 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("agent.request.progress", {"request": 8, "body": "p"}, c),
         ("agent.request.cancelled", {"request": 8, "received": True}, c),
         ("agent.released", {"released": ["c1"], "ended": ["c1", "c2"], "requests": [8]}, a),
-        ("agent.call.settled", {"request": 8, "outcome": "cancelled", "usage": usage}, c),
+        (
+            "agent.call.settled",
+            {
+                "request": 8,
+                "outcome": "cancelled",
+                "usage": usage,
+                "invocation": 7,
+                "value": None,
+            },
+            c,
+        ),
         ("agent.wedged", {}, "agent/c2"),
         ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
         (
@@ -690,6 +734,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "agent": "primary",
                 "binding": "repo",
                 "execid": 2,
+                "invocation": 7,
                 "operation": "callattr",
                 "member": "push",
                 "target": "git.remote.Remote",

@@ -269,15 +269,23 @@ fn metadata_is_read_only_before_the_code() {
         let mut warnings = Vec::new();
         script(source, &mut warnings).map(|needs| (needs, warnings))
     };
-    let ((requires_python, dependencies), _) = read(
+    let (declared, _) = read(
         "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\n# /// script\n\
          # requires-python = \">=3.13\"\n# dependencies = [\"unidiff>=0.7\"]\n#\n\
-         # [tool.outrig.skill]\n# entry = \"run\"\n# bind = { repo = \"repo\" }\n# ///\n\
+         # [tool.outrig.skill]\n# entry = \"run\"\n# bind = { repo = \"repo\" }\n#\n\
+         # [tool.outrig.skill.parameters]\n# base = \"The ref to diff against.\"\n# ///\n\
          import os\n",
     )
     .expect("a block before the code");
-    assert_eq!(requires_python.as_deref(), Some(">=3.13"));
-    assert_eq!(dependencies, ["unidiff>=0.7"]);
+    assert_eq!(declared.requires_python.as_deref(), Some(">=3.13"));
+    assert_eq!(declared.dependencies, ["unidiff>=0.7"]);
+    assert_eq!(declared.entry.as_deref(), Some("run"));
+    let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+    assert_eq!(declared.bind, BTreeMap::from([pair("repo", "repo")]));
+    assert_eq!(
+        declared.parameters,
+        BTreeMap::from([pair("base", "The ref to diff against.")])
+    );
 
     for ignored in [
         // After the first statement.
@@ -289,8 +297,8 @@ fn metadata_is_read_only_before_the_code() {
         // Of a type the specification has not standardized.
         "# /// pyproject\n# requires-python = \">=3.99\"\n# ///\n",
     ] {
-        let (needs, warnings) = read(ignored).expect(ignored);
-        assert_eq!(needs, (None, Vec::new()), "{ignored}");
+        let (declared, warnings) = read(ignored).expect(ignored);
+        assert_eq!(declared, Declared::default(), "{ignored}");
         assert!(warnings.is_empty(), "{ignored}");
     }
 
@@ -307,14 +315,18 @@ fn metadata_is_read_only_before_the_code() {
 }
 
 #[test]
-fn the_block_takes_entry_and_bind_and_warns_of_any_other_key() {
+fn the_block_takes_entry_bind_and_parameters_and_warns_of_any_other_key() {
     let read = |table: &str| {
         let mut warnings = Vec::new();
         let source: String = table.lines().map(|line| format!("# {line}\n")).collect();
         script(&format!("# /// script\n{source}# ///\n"), &mut warnings).map(|_| warnings)
     };
     assert_eq!(
-        read("[tool.outrig.skill]\nentry = \"run\"\nbind = { repo = \"repo\" }").expect("valid"),
+        read(
+            "[tool.outrig.skill]\nentry = \"run\"\nbind = { repo = \"repo\" }\n\
+             [tool.outrig.skill.parameters]\nbase = \"The ref.\""
+        )
+        .expect("valid"),
         Vec::<String>::new()
     );
     let warnings = read("[tool.outrig.skill]\nentrypoint = \"run\"\n[tool.outrig.other]\nx = 1")
@@ -338,6 +350,8 @@ fn the_block_takes_entry_and_bind_and_warns_of_any_other_key() {
         "[tool.outrig.skill]\nentry = 1",
         "[tool.outrig.skill]\nbind = { repo = 1 }",
         "[tool.outrig.skill]\nbind = \"repo\"",
+        "[tool.outrig.skill.parameters]\nbase = 1",
+        "[tool.outrig.skill]\nparameters = \"base\"",
         "not toml at all",
     ] {
         let problem = read(refused).expect_err(refused);
@@ -990,7 +1004,9 @@ async fn the_host_answers_for_a_skills_listing_files_and_instructions() {
             ("SKILL.md", &instructions("review", "Reviews.")),
             (
                 "skill.py",
-                "# /// script\n# requires-python = \">=3.13\"\n# dependencies = [\"a>=1\"]\n# ///\n",
+                "# /// script\n# requires-python = \">=3.13\"\n# dependencies = [\"a>=1\"]\n\
+                 # [tool.outrig.skill]\n# entry = \"run\"\n# bind = { repo = \"git\" }\n\
+                 # [tool.outrig.skill.parameters]\n# base = \"The ref.\"\n# ///\n",
             ),
             ("data/ids.txt", "a\nb\n"),
         ],
@@ -1007,7 +1023,16 @@ async fn the_host_answers_for_a_skills_listing_files_and_instructions() {
     assert_eq!(ok["files"], json!(["SKILL.md", "data/ids.txt", "skill.py"]));
     assert_eq!(ok["requires_python"], ">=3.13");
     assert_eq!(ok["dependencies"], json!(["a>=1"]));
+    assert_eq!(ok["entry"], "run");
+    assert_eq!(ok["bind"], json!({"repo": "git"}));
+    assert_eq!(ok["parameters"], json!({"base": "The ref."}));
     let digest = ok["digest"].clone();
+    let current = asked(
+        &mut fake,
+        json!({"t": "skill.check", "id": 9, "skill": "review", "digest": digest}),
+    )
+    .await;
+    assert_eq!(current["ok"], json!({}), "{current}");
 
     let read = asked(
         &mut fake,
@@ -1052,6 +1077,12 @@ async fn the_host_answers_for_a_skills_listing_files_and_instructions() {
             .contains("reload(\"review\")"),
         "{changed}"
     );
+    let checked = asked(
+        &mut fake,
+        json!({"t": "skill.check", "id": 10, "skill": "review", "digest": digest}),
+    )
+    .await;
+    assert_eq!(checked["error"]["code"], "skill-changed", "{checked}");
 }
 
 #[tokio::test]

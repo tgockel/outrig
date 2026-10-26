@@ -110,7 +110,8 @@ spawned meanwhile would inherit the key. Edition 2024, which this workspace uses
   no text, which today reads as an empty reply (`plan/next/python-agent-textless-round.md`). Its
   exact shape is `0003-19`'s.
 - **User input**, through the session's end of the agent's `user` channel: what `UserChannel` does
-  today -- send a message, receive what the agent sent, take what is waiting at exit.
+  today -- send a message, receive what the agent sent, take what is waiting at exit -- and, since
+  `0003-33`, send a `/name` directive naming one of the session's skills (`skills.md`).
 - **An interrupter**, as `PythonAgent::interrupter` is today: it stops the Python a round waits on,
   and it is what a Ctrl-C reaches (`runtime-protection.md`).
 

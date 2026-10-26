@@ -9,7 +9,7 @@ use super::approval::Approver;
 use super::bindings::{self, BindingSpec, Bindings, Declared, Places, Setup};
 use super::event::{DEFAULT_CAPACITY, Subscription};
 use super::lifecycle::Lifecycle;
-use super::skills::{self, SkillBrief, SkillSource};
+use super::skills::{self, Catalog, SkillSource};
 use super::{Failure, Session, SessionError};
 use crate::agent::{self, AgentError, ResolvedAgent};
 use crate::config::{Config, ConfigValidationError, EnvSecrets, ImageConfig, Secrets, lexical};
@@ -453,13 +453,7 @@ impl SessionBuilder {
         );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
-        assemble(
-            session,
-            resolved.as_ref(),
-            workspace.as_deref(),
-            &catalog.briefs(),
-        )
-        .await
+        assemble(session, resolved.as_ref(), workspace.as_deref(), &catalog).await
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -631,13 +625,7 @@ impl SessionBuilder {
             setup,
         )
         .failing(self.fail_stop.take());
-        assemble(
-            session,
-            resolved.as_ref(),
-            workspace.as_deref(),
-            &catalog.briefs(),
-        )
-        .await
+        assemble(session, resolved.as_ref(), workspace.as_deref(), &catalog).await
     }
 }
 
@@ -686,16 +674,16 @@ async fn default_container(
 
 /// `session`, with the primary agent `resolved` names -- none, for a session
 /// with no primary agent -- in a container whose workspace is `workspace`,
-/// told of the session's skills by `skills`, and idle. A primary that cannot be
+/// holding the session's skills, `catalog`, and idle. A primary that cannot be
 /// built stops what the start launched.
 async fn assemble(
     mut session: Session,
     resolved: Option<&ResolvedAgent>,
     workspace: Option<&Path>,
-    skills: &[SkillBrief],
+    catalog: &Arc<Catalog>,
 ) -> Result<Session, SessionError> {
     if let Some(resolved) = resolved
-        && let Err(e) = session.build_primary(resolved, workspace, skills).await
+        && let Err(e) = session.build_primary(resolved, workspace, catalog).await
     {
         session.abandon().await;
         return Err(SessionError::Start(Failure(e)));

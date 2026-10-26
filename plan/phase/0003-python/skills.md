@@ -277,14 +277,20 @@ response is short:
 
 ```python
 d = await runtime.channels["user"].receive()        # d.skill == "review-diff"
-await outrig.skills.invoke(d.skill, d.body.partition(" ")[2])
+await outrig.skills.invoke(d.skill, (d.body.split(maxsplit=1) + [""])[1])
 ```
+
+The text is what follows the name and the whitespace that ends it, as the REPL tells a name from
+what follows: `/review-diff<TAB>a.py b.py` is `a.py b.py`, and `/review-diff` alone is `""`. A
+directive's name follows the slash directly, so `/ review-diff` is no directive (`0003-33`).
 
 `invoke` returns a handle, as a typed call does (`typed-agents.md`, "Calling"): the invocation
 starts when `invoke` is called, `await` gives the entry's return value or raises what it raised,
 and an agent with something to do meanwhile keeps the handle, which `h.cancel()` ends -- the
-parser child released, or the running entry interrupted. The field's name and `invoke`'s exact
-signature are `0003-33`'s.
+parser child released, or the running entry interrupted. **Decided in `0003-33`:** the field is
+`skill`, and `invoke(name, text=None, *, params=None, reload=False)` returns an
+`outrig.skills.Invocation`, a narrower handle than `work.md`'s -- `id`, `await`, `future`,
+`done()`, `result()` and `cancel()`, with no `status` or `progress` -- which `runtime.wait` takes.
 
 ### How `invoke` parses
 
@@ -330,8 +336,9 @@ async def parse_params(text: str) -> ReviewDiffParams | Clarification:
 
 The text is the call's input, bound into the child's namespace as `text` and never interpolated
 into the instructions. The instructions are the runtime's fixed text, whose wording is
-`0003-33`'s, followed by the entry's docstring; the field types and the parameter help reach the
-child as the result type's schema text, as they do for every typed call.
+`0003-33`'s (`_PARSE` in `outrig/skills.py`), followed by the entry's docstring; the field types
+and the parameter help reach the child as the result type's schema text, as they do for every
+typed call.
 
 The fixed text says which result is right. The child completes with a `<Skill>Params` when the
 text determines one: an exact option maps to its field, and a plain reading that stays within
@@ -369,7 +376,7 @@ and the main agent is the only agent with a user channel, so it asks there and w
 answer:
 
 ```python
-text = d.body.partition(" ")[2]
+text = (d.body.split(maxsplit=1) + [""])[1]
 try:
     await outrig.skills.invoke(d.skill, text)
 except outrig.skills.SkillNeedsClarification as e:
@@ -396,8 +403,8 @@ model: an agent that already understood the text, or that asked the user after a
 `SkillNeedsClarification` and now knows, constructs the instance and calls the entry through
 `invoke`, so bound parameters are still injected and the invocation's events are still emitted.
 `params` is checked against the field types as a typed call checks its inputs, and an instance of
-another skill's class is refused. The class is reachable through `outrig.skills` (the accessor's
-spelling is `0003-33`'s), and `help()` on it lists the fields with their types, defaults and help.
+another skill's class is refused. The class is reachable as `outrig.skills.params(name)`
+(decided in `0003-33`), and `help()` on it lists the fields with their types, defaults and help.
 
 Either way, **the instance is on the invocation's `skill.invocation.started` event**, with whether
 a child parsed it or the caller passed it ("Events"), so how the user's words became arguments is
@@ -506,8 +513,10 @@ They are not an audit of what the skill did locally. Its file writes, its subpro
 calls into its modules are not traced. Only its hosted calls are evented, per request, as every
 hosted call is: each request's events are published on the session's stream
 (`boundary-policy.md`), and the CLI writes them to `events.jsonl` only when `[events] mode =
-"record"`. A direct helper call produces boundary events and no invocation events. The names are
-candidates, and `0003-33` defines their schema in `observability.md`'s envelope.
+"record"`. A direct helper call produces boundary events and no invocation events. **Decided in
+`0003-33`:** the names are as above, and `doc/reference/events.md` gives their fields; the
+`invocation` id they share is also on `agent.call.started`, `agent.call.settled` and
+`hosted.received`.
 
 The states one invocation passes through, as explanation rather than enum names: directive
 received, delivered, loading, deriving, parsing, running, then returned, raised or cancelled -- or
@@ -598,13 +607,16 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
 - How an embedder's sources rank against the project's and the user's. **Decided in `0003-32`:**
   one ordered list, the first source holding a name serving it.
 - How an embedder's front end sends a directive. The skill is named on the message the host posts,
-  so the session's user channel needs a way to name one (`embedding.md`, `0003-33`).
+  so the session's user channel needs a way to name one (`embedding.md`). **Decided in `0003-33`:**
+  `UserChannel::send_directive(skill, line)`, which reads an instruction-only skill's body through
+  its source and publishes `skill.directive.received`.
 - How the preamble bounds a large catalog. **Decided in `0003-32`:** at most 50 skills and 12 KiB
   of them, then a count, the rest in `outrig.skills.catalog()`.
 - Whether a child's instructions list the catalog. **Decided in `0003-32`:** they do not; a child
   can still use every skill.
 - A reload while an invocation of the same skill runs in any kernel: refused with `skill-busy`, or
-  made to wait.
+  made to wait. **Decided in `0003-33`:** refused with `skill-busy`, since waiting would never end
+  when the reload is asked for from inside that invocation.
 - What the digest covers. **Decided in `0003-32`:** every file the source lists, by each file's
   version, so no file is read to tell a change.
 - What `__file__` is on a skill module. **Decided in `0003-32`:** unset; tracebacks and

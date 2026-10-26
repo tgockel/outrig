@@ -1076,27 +1076,64 @@ impl Interpreter {
         impl Future<Output = Result<usize, InterpreterError>> + Send + 'static,
         InterpreterError,
     > {
+        self.posting(channel, body, None)
+    }
+
+    /// [`Interpreter::post`] of a `/name` directive the user typed, naming
+    /// `skill`, which `source` serves: the agent's delivery of it names the
+    /// skill, and `skill.directive.received` follows its `message.sent`.
+    pub(crate) fn post_directive(
+        &self,
+        channel: &str,
+        body: &str,
+        skill: &str,
+        source: &str,
+    ) -> Result<
+        impl Future<Output = Result<usize, InterpreterError>> + Send + use<>,
+        InterpreterError,
+    > {
+        self.posting(channel, body, Some((skill, source)))
+    }
+
+    /// Queue `body` on `channel`, as a directive naming `(skill, source)` when
+    /// `directive` holds one.
+    fn posting(
+        &self,
+        channel: &str,
+        body: &str,
+        directive: Option<(&str, &str)>,
+    ) -> Result<
+        impl Future<Output = Result<usize, InterpreterError>> + Send + use<>,
+        InterpreterError,
+    > {
         if body.len() > MESSAGE_MAX {
             return Err(InterpreterError::Refused(format!(
                 "the message is {} bytes, past the {MESSAGE_MAX} a channel carries",
                 body.len()
             )));
         }
+        let mut line = json!({"t": "msg", "channel": channel, "body": body});
+        if let Some((skill, _)) = directive {
+            line["skill"] = json!(skill);
+        }
         // Recorded before it is sent, so the agent's taking it -- which can
         // reach the host ahead of the answer to this -- is recorded after.
-        let receiver = self.request(
-            json!({"t": "msg", "channel": channel, "body": body}),
-            Query::Post,
-            |_, id| {
-                self.events.emit_with(|| Payload::MessageSent {
+        let receiver = self.request(line, Query::Post, |_, id| {
+            self.events.emit_with(|| Payload::MessageSent {
+                message: id.message(),
+                channel: channel.to_string(),
+                from: USER_END.to_string(),
+                to: self.events.agent().to_string(),
+                body: body.to_string(),
+            });
+            if let Some((skill, source)) = directive {
+                self.events.emit_with(|| Payload::SkillDirectiveReceived {
+                    skill: skill.to_string(),
+                    source: source.to_string(),
                     message: id.message(),
-                    channel: channel.to_string(),
-                    from: USER_END.to_string(),
-                    to: self.events.agent().to_string(),
-                    body: body.to_string(),
                 });
-            },
-        )?;
+            }
+        })?;
         let table = Arc::clone(&self.table);
         Ok(async move {
             answer(&table, receiver)

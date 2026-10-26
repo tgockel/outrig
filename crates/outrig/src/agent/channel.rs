@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use super::AgentError;
+use crate::harness::skills::Catalog;
 use crate::python::host::{Channels, Interpreter, Sent, USER};
 
 /// How long the interpreter has to say what waits. It answers beside the
@@ -172,16 +173,20 @@ pub(crate) fn announcement(channels: &Channels, noun: Noun) -> Option<String> {
 pub struct UserChannel {
     interpreter: Interpreter,
     sent: Arc<Mutex<Sent>>,
+    /// The session's skills, which a directive names one of.
+    skills: Option<Arc<Catalog>>,
 }
 
 impl UserChannel {
-    /// The one end for `interpreter`'s agent. Built once: it takes over the
-    /// interpreter's only subscription.
-    pub(crate) fn new(interpreter: Interpreter) -> Self {
+    /// The one end for `interpreter`'s agent, whose directives name skills of
+    /// `skills`. Built once: it takes over the interpreter's only
+    /// subscription.
+    pub(crate) fn new(interpreter: Interpreter, skills: Option<Arc<Catalog>>) -> Self {
         let sent = interpreter.subscribe();
         Self {
             interpreter,
             sent: Arc::new(Mutex::new(sent)),
+            skills,
         }
     }
 
@@ -202,6 +207,59 @@ impl UserChannel {
     ) -> impl Future<Output = Result<usize, Box<dyn Error + Send + Sync>>> + Send + 'static {
         let queued = self.interpreter.post(USER, text);
         async move { Ok(queued?.await?) }
+    }
+
+    /// Send the agent `line`, a `/name` directive the user typed, naming the
+    /// session's skill `skill`.
+    ///
+    /// The agent's `runtime.channels["user"]` delivers it as a message whose
+    /// `.skill` is `skill`, which asks the agent to run the skill; nothing of
+    /// the skill runs here. For a skill with a `skill.py`, the message is
+    /// `line`, and it is on its way when this returns, as
+    /// [`UserChannel::send`]'s is. For one without, it is the skill's
+    /// instructions -- its `SKILL.md` past the frontmatter, read through its
+    /// source -- a blank line, then `line`, and it is on its way once the
+    /// future has read them. The future says what `send`'s does, or that the
+    /// session serves no skill named `skill`, or why its instructions could
+    /// not be read; nothing is sent then.
+    pub fn send_directive(
+        &self,
+        skill: &str,
+        line: &str,
+    ) -> impl Future<Output = Result<usize, Box<dyn Error + Send + Sync>>> + Send + 'static {
+        let catalog = self.skills.clone();
+        let found = catalog.as_ref().and_then(|catalog| catalog.directed(skill));
+        let queued = match &found {
+            Some((source, true)) => {
+                Some(self.interpreter.post_directive(USER, line, skill, source))
+            }
+            _ => None,
+        };
+        let (interpreter, skill, line) = (
+            self.interpreter.clone(),
+            skill.to_string(),
+            line.to_string(),
+        );
+        async move {
+            let (Some(catalog), Some((source, _))) = (catalog, found) else {
+                return Err(
+                    format!("unknown-skill: the session serves no skill named {skill:?}").into(),
+                );
+            };
+            if let Some(queued) = queued {
+                return Ok(queued?.await?);
+            }
+            let instructions = catalog.read_instructions(&skill).await?;
+            let instructions = instructions.trim_start_matches('\n').trim_end();
+            let body = if instructions.is_empty() {
+                line
+            } else {
+                format!("{instructions}\n\n{line}")
+            };
+            Ok(interpreter
+                .post_directive(USER, &body, &skill, &source)?
+                .await?)
+        }
     }
 
     /// The next message the agent sent, waiting until there is one: text it

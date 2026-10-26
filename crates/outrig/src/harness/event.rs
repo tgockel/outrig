@@ -142,6 +142,12 @@ id_type!(
     /// session's interpreter. Every event about the request carries it.
     AgentRequestId
 );
+id_type!(
+    /// One invocation of a skill through `outrig.skills.invoke`, for the life
+    /// of the session's interpreter: its events carry it, and so do the typed
+    /// calls and the hosted requests its code made while it ran.
+    InvocationId
+);
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -308,6 +314,49 @@ pub enum Payload {
         code: Option<String>,
         reason: Option<String>,
     },
+    /// A `/name` the user typed reached the event's subject on its user
+    /// channel as message `message`, naming `skill`, which `source` serves.
+    /// Nothing of the skill runs until the agent's code invokes it.
+    #[non_exhaustive]
+    SkillDirectiveReceived {
+        skill: String,
+        source: String,
+        message: MessageId,
+    },
+    /// The event's subject's code is calling `skill`'s entry through
+    /// `outrig.skills.invoke`, as `invocation`. `source` serves the skill,
+    /// whose files had `digest` when its package was imported. `params` is a
+    /// bounded preview of the `<Skill>Params` the entry is called with, or
+    /// `None` while the session's events are not observed; `by` says whether a
+    /// child parsed them from what the user typed, in the typed call `call`,
+    /// or the caller passed them; `bindings` names the bindings its parameters
+    /// were filled from.
+    #[non_exhaustive]
+    SkillInvocationStarted {
+        invocation: InvocationId,
+        skill: String,
+        source: String,
+        digest: String,
+        params: Option<String>,
+        by: ParamsBy,
+        call: Option<AgentRequestId>,
+        bindings: Vec<String>,
+    },
+    /// The entry of `invocation` ended, `duration` after it was called:
+    /// `result` names the type of what it returned and `exception` the type
+    /// of what it raised. `usage` is what the model requests of every child
+    /// made inside the invocation used, its parser's included, or `None` when
+    /// none reported anything.
+    #[non_exhaustive]
+    SkillInvocationFinished {
+        invocation: InvocationId,
+        outcome: InvocationEnd,
+        #[serde(serialize_with = "seconds")]
+        duration: Duration,
+        result: Option<String>,
+        exception: Option<String>,
+        usage: Option<Usage>,
+    },
     /// A child agent was launched, by `parent`; the event's subject is the
     /// child's.
     #[non_exhaustive]
@@ -402,8 +451,9 @@ pub enum Payload {
     /// A typed call -- `@outrig.agent`'s -- that `parent`'s code made, whose
     /// child is the event's subject: the declaration's `__module__` and
     /// `__qualname__`, and the SHA-256 digest of the source that declared it,
-    /// or `None` when none could be read. The submission's request events
-    /// follow under the same `request`.
+    /// or `None` when none could be read; and the skill invocation the call
+    /// was made inside, if any. The submission's request events follow under
+    /// the same `request`.
     #[non_exhaustive]
     AgentCallStarted {
         request: AgentRequestId,
@@ -411,15 +461,21 @@ pub enum Payload {
         module: String,
         qualname: String,
         digest: Option<String>,
+        invocation: Option<InvocationId>,
     },
-    /// The call settled, its child released: how its submission ended, and
+    /// The call ended and its child was released: how its submission ended,
     /// what every model request the child made used, or `None` when none
-    /// reported anything.
+    /// reported anything, and the skill invocation it was made inside, if any.
+    /// `value` is a bounded preview of the result it was accepted with, or
+    /// `None` when it was not accepted or the session's events are not
+    /// observed.
     #[non_exhaustive]
     AgentCallSettled {
         request: AgentRequestId,
         outcome: RequestEnd,
         usage: Option<Usage>,
+        invocation: Option<InvocationId>,
+        value: Option<String>,
     },
 
     // Integration audit: what crossed to a provider, or across a channel.
@@ -530,13 +586,16 @@ pub enum Payload {
     /// A request agent code made of a hosted object, as it arrived: published
     /// before anything is decided about it. `by` says who saw it -- the
     /// bindings process, which received it, or, for one it never received,
-    /// the owner's relay or the interpreter.
+    /// the owner's relay or the interpreter. `execid` and `invocation` are the
+    /// execution and the skill invocation it was made in, as the interpreter
+    /// said: diagnostic context, which the agent's own code can change.
     #[non_exhaustive]
     HostedReceived {
         request: RequestId,
         agent: String,
         binding: String,
         execid: Option<ExecId>,
+        invocation: Option<InvocationId>,
         operation: Operation,
         member: Option<String>,
         target: Option<String>,
@@ -620,6 +679,9 @@ impl Payload {
             Payload::BindingExited { .. } => "binding.exited",
             Payload::SkillDiscovered { .. } => "skill.discovered",
             Payload::SkillImported { .. } => "skill.imported",
+            Payload::SkillDirectiveReceived { .. } => "skill.directive.received",
+            Payload::SkillInvocationStarted { .. } => "skill.invocation.started",
+            Payload::SkillInvocationFinished { .. } => "skill.invocation.finished",
             Payload::AgentSpawned { .. } => "agent.spawned",
             Payload::AgentRequestSent { .. } => "agent.request.sent",
             Payload::AgentRequestReceived { .. } => "agent.request.received",
@@ -1138,6 +1200,30 @@ pub enum RequestEnd {
     Closed,
     /// The interpreter died before it was answered.
     Terminated,
+}
+
+/// Where the `<Skill>Params` a skill's entry was called with came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ParamsBy {
+    /// A child parsed them from the text the user typed after `/name`.
+    Parser,
+    /// The code that invoked the skill passed them, as `params=`.
+    Caller,
+}
+
+/// How a skill's entry ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum InvocationEnd {
+    /// It returned.
+    Returned,
+    /// It raised an exception.
+    Raised,
+    /// Its invocation was cancelled while it ran.
+    Cancelled,
 }
 
 /// Why a usage record changed nothing.

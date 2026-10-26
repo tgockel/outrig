@@ -2781,6 +2781,38 @@ fn a_message_waits_until_code_receives_it_once_and_in_order() {
     );
 }
 
+/// A directive's delivery names the skill the host resolved it to, and every
+/// other's names none; a skill named by anything but a string is refused,
+/// queuing nothing.
+#[test]
+fn a_directive_is_delivered_naming_its_skill() {
+    let mut k = Interpreter::start();
+    let directive = json!({"t": "msg", "agent": PRIMARY, "id": 1, "channel": "user",
+                           "body": "/review-diff a.py", "skill": "review-diff"});
+    assert_eq!(k.ask(directive)["pending"], 1);
+    assert_eq!(k.post(2, json!("plain"))["pending"], 2);
+    let refused = k.ask(
+        json!({"t": "msg", "agent": PRIMARY, "id": 3, "channel": "user",
+                               "body": "/x", "skill": 5}),
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not int")),
+        "{refused}"
+    );
+    let read = py(r#"
+        for _ in range(2):
+            d = await runtime.channels['user'].receive()
+            print(d.id, repr(d.skill), d.body)
+        print(runtime.channels['user'].pending())
+        "#);
+    assert_eq!(
+        k.output(4, &read),
+        "1 'review-diff' /review-diff a.py\n2 None plain\n0\n"
+    );
+}
+
 /// A receive with nothing queued waits for the next message rather than
 /// failing. One that is cancelled while it waits takes nothing with it: the
 /// message goes to the next receive.

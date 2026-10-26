@@ -289,7 +289,8 @@ optional field on the `Delivery`, `skill`, naming the skill the application reso
 other message it is `None`. The field comes from the application for the same reason `sender`
 does: a body that begins `/review-diff` is a body with some text in it, and only the application
 knows that it resolved a directive. The preamble tells the agent that such a message asks it to
-run the skill. The field's name is `0003-33`'s.
+run the skill. **Decided in `0003-33`:** the field is `skill`, as above, and an embedder sends a
+directive with `UserChannel::send_directive`.
 
 ## A worked relationship
 

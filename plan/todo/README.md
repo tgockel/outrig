@@ -105,12 +105,6 @@ phase.
 | `0003-34` | An agent class answers requests                                    |
 | `0003-35` | A host program drives an agent class                               |
 
-**Skills**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-33` | `/name` reaches the main agent as a call it makes                  |
-
 **Live objects**
 
 | Task      | What it settles                                                    |

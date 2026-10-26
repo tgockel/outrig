@@ -34,6 +34,12 @@
 //! buffer and is still read whole, though its echo is split around the
 //! message.
 //!
+//! A typed `/name` naming one of the session's skills is a directive: it goes
+//! onto the channel naming the skill, and asks the agent to run it. `/help` and
+//! `/quit` stay this terminal's own whatever the skills are called. No other
+//! line is taken until the directive is on the channel, and a round starts
+//! once it is, so a line typed after it cannot reach the agent first.
+//!
 //! Stdin is read on a thread of its own rather than through tokio. A read is
 //! always in flight, and tokio's blocking read would hold the runtime open at
 //! exit until the user pressed Enter; a thread does not hold up the process.
@@ -44,12 +50,14 @@
 //! Everything above about stdout and stderr is then the line mode's, which
 //! `run-new` keeps whenever the screen is not used.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::future::Future;
 use std::io::BufRead;
 use std::pin::Pin;
 
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use outrig::harness::event::{Payload, Received, Subscription};
 use outrig::harness::{RoundEnd, RoundOutcome, Session, SessionError, StillRunning, Tasks};
@@ -59,9 +67,15 @@ use tokio::sync::{Mutex, mpsc};
 use super::output::{self, Failures, Output, PROMPT};
 use super::screen::{self, Screen, Typed};
 use crate::error::Result;
-use crate::repl::{INTERRUPT_NOTICE, compose_help};
+use crate::repl::{HelpEntry, INTERRUPT_NOTICE, compose_help};
 
 type BoxError = Box<dyn Error + Send + Sync>;
+
+/// What `/help` says of a directive, when the session has skills.
+const DIRECTIVE_HELP: HelpEntry = HelpEntry {
+    syntax: "/<skill> [text]",
+    description: "ask the agent to run one of the session's skills",
+};
 
 /// How long, once input has ended, the answers to lines typed before it are
 /// waited for. The interpreter's reader thread gives them at once, and a line
@@ -216,11 +230,21 @@ async fn drive(
     let closer = session.closer();
     let view = term.view;
     let session = Mutex::new(session);
-    let help = compose_help(&[]);
+    // Read before any line is, so a `/name` typed at once finds its skill.
+    let skills = read_catalog(shown, term);
+    let help = compose_help(if skills.is_empty() {
+        &[]
+    } else {
+        &[DIRECTIVE_HELP]
+    });
 
     let mut round: Option<Round<'_>> = None;
     // Each posted line's answer, and whether it was typed while a round ran.
     let mut acks = FuturesOrdered::new();
+    // A directive's answer, and whether it was typed while a round ran: no
+    // line is taken until it comes.
+    let mut directing: Option<BoxFuture<'static, (std::result::Result<usize, BoxError>, bool)>> =
+        None;
     // Set once the interpreter has exited and everything it sent is taken.
     let mut gone = false;
     let mut last_was_interrupt = false;
@@ -328,7 +352,18 @@ async fn drive(
                 }
             }
             Some((queued, mid_round)) = acks.next() => term.answered(queued, mid_round),
-            line = lines.recv(), if term.reading => {
+            (queued, mid_round) = async {
+                directing.as_mut().expect("polled only while directing").await
+            }, if directing.is_some() => {
+                directing = None;
+                term.answered(queued, mid_round);
+                // On the channel by now, unless it was refused: a round tells
+                // the agent, or finds nothing new and shows the prompt.
+                if round.is_none() {
+                    round = Some(start(&session));
+                }
+            }
+            line = lines.recv(), if term.reading && directing.is_none() => {
                 let Some(line) = line else {
                     if round.is_none() {
                         term.newline();
@@ -356,6 +391,19 @@ async fn drive(
                             return Ok(());
                         }
                         ["help"] => term.note(&help),
+                        // The name follows the slash, and whitespace ends it: the
+                        // text the agent is told to take is what comes after.
+                        [name, ..] if !raw.starts_with(char::is_whitespace)
+                            && skills.contains(name) =>
+                        {
+                            let mid_round = round.is_some();
+                            directing = Some(
+                                user.send_directive(name, line)
+                                    .map(move |queued| (queued, mid_round))
+                                    .boxed(),
+                            );
+                            continue;
+                        }
                         // `raw`, as typed.
                         _ => term.note(&format!("[outrig] unknown command: /{raw}")),
                     }
@@ -374,6 +422,30 @@ async fn drive(
             }
         }
     }
+}
+
+/// The names of the skills a `/name` runs, from the `skill.discovered` event
+/// the session queued in `shown` as it started, showing each event taken as
+/// the loop would. A skill named for a built-in command is said, and left out.
+fn read_catalog(shown: &mut Subscription, term: &Terminal<'_>) -> HashSet<String> {
+    let mut skills = HashSet::new();
+    while let Ok(received) = shown.try_recv() {
+        if let Received::Event(event) = &received
+            && let Payload::SkillDiscovered { skills: found, .. } = &event.payload
+        {
+            skills.extend(found.iter().map(|skill| skill.name.clone()));
+        }
+        term.event(received);
+    }
+    for name in ["help", "quit"] {
+        if skills.remove(name) {
+            term.note(&format!(
+                "[outrig] skill {name:?} is not run by /{name}, which is run-new's own command; \
+                 the agent can still use it through outrig.skills"
+            ));
+        }
+    }
+    skills
 }
 
 /// Queue `messages` to be shown, each as room is made for it.
