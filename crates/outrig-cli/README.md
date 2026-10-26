@@ -26,13 +26,13 @@ talks to. Then you run `outrig run` and talk to the agent over a stdin/stdout RE
 ```sh
 $ outrig run
 [outrig] agent: coding (model: fast / provider: openai / gpt-4o-mini)
-[outrig] container outrig-20260502T103412-3f2a started
+[outrig] container outrig-20260502T103412-3f2a98ac started
 [outrig] mcp servers: fs, shell
 > what's in this repo?
 This repo is a Rust project named "outrig". The top level contains Cargo.toml,
 src/, and doc/. src/ has lib.rs and main.rs...
 > ^D
-[outrig] session 20260502T103412-3f2a ended
+[outrig] session 20260502T103412-3f2a98ac ended
 ```
 
 ## Commands

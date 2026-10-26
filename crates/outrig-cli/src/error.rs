@@ -53,6 +53,12 @@ pub enum CliError {
         source: serde_json::Error,
     },
 
+    /// A new session's `<root>/<sid>` already exists: another launch drew the
+    /// same id, or something else holds the name. Nothing was written, so the
+    /// launch can draw another id (#382).
+    #[error("session directory {} already exists", .0.display())]
+    SessionIdTaken(std::path::PathBuf),
+
     #[error("agent prompt failed: {0}")]
     Prompt(rig::completion::PromptError),
 

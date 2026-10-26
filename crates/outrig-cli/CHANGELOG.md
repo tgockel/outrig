@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two launches that draw the same session id no longer share a directory.** A session's
+  directory was made with `create_dir_all`, which succeeds on one that exists, so a launch whose
+  id another launch already held wrote its `session.json` over that launch's -- one in 65,536
+  for each pair started in the same second. Its `podman run --name outrig-<id>` then failed on
+  the name, and ending that launch stamped `exit_code: 1` and an `ended_at` onto the record of
+  the session that was still running. An id held by a `--session-dir` link did the same through
+  the link, which `create_dir_all` follows: the record replaced was the one in the user's own
+  directory. The directory is now created exclusively, which is the claim on the id, and a
+  launch that finds it taken draws another. Ids also carry eight random hex digits instead of
+  four, which is what separates two launches no directory can tell apart: under different
+  `--session-root`s, which share podman's container names, one same-second pair in four billion
+  now draws the same id rather than one in 65,536. Sessions already on disk keep their
+  four-digit ids and read as before. A `--session-dir` launch is not drawn for again: its record
+  is in its directory by the time the link under the root finds the id taken, so it still fails
+  there (#431), and eight digits make that as rare. (#382)
 - **`validate_config` holds a fragment to the rules of the file it is for.** The tool ran only
   the checks a *merged* config is held to, which is the half that cannot tell which file
   declared what -- so a repo fragment setting `session-root`, `model-cache-root`, a `[network]`

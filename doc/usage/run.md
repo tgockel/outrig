@@ -98,7 +98,7 @@ the exact command it is waiting on, which is the fastest way to reproduce the st
 
 ```sh
 $ RUST_LOG=debug outrig run
-[outrig] starting container outrig-20260726T170454-da0c
+[outrig] starting container outrig-20260726T170454-da0c6367
 DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
 ```
 
@@ -263,8 +263,8 @@ A typical startup looks like:
 [outrig] image tag computed: coding:8c2a4f7e91d6b5a3 (32ms)
 [outrig] ensuring image coding:8c2a4f7e91d6b5a3
 [outrig] image ready: coding:8c2a4f7e91d6b5a3 (cache hit) (18ms)
-[outrig] starting container outrig-20260502T103412-3f2a
-[outrig] container ready: outrig-20260502T103412-3f2a (620ms)
+[outrig] starting container outrig-20260502T103412-3f2a98ac
+[outrig] container ready: outrig-20260502T103412-3f2a98ac (620ms)
 [outrig] bootstrapping container user
 [outrig] container user ready (141ms)
 [outrig] reading and merging MCP configuration
@@ -281,11 +281,11 @@ A typical startup looks like:
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding
 [outrig] image:             coding:8c2a4f7e91d6b5a3
-[outrig] container started: outrig-20260502T103412-3f2a
+[outrig] container started: outrig-20260502T103412-3f2a98ac
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__read_file, fs__list_directory, fs__write_file, shell__exec
-[outrig] session id: 20260502T103412-3f2a   (Ctrl-D to exit, /help for slash commands)
+[outrig] session id: 20260502T103412-3f2a98ac   (Ctrl-D to exit, /help for slash commands)
 [outrig] entering REPL
 >
 ```
@@ -485,7 +485,7 @@ sidecars are errors, and there is no `/sidecar stop` in v0.
 [outrig] sidecars:
   tools   not started   servers: search
 > /sidecar add tools
-[outrig] sidecar tools started: outrig-20260504T141907-a83f-tools
+[outrig] sidecar tools started: outrig-20260504T141907-a83f6eda-tools
 [outrig] 1 MCP server connected (search); 2 tools available on the next turn
 > /sidecar add tools
 [outrig] sidecar "tools" is already running
@@ -618,7 +618,7 @@ The selected `[images.<name>]` block is incomplete. See
 $ outrig run
 [outrig] image-config: coding
 [outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container started: outrig-20260501T134412-3f2a
+[outrig] container started: outrig-20260501T134412-3f2ad11c
 [outrig] mcp fs: error: failed to spawn `mcp-server-filesystem` in container
 [outrig] caused by: exec: "mcp-server-filesystem": executable file not found in $PATH
 ```
@@ -642,11 +642,11 @@ place of `(from --image)`.
 $ outrig run
 [outrig] image-config: coding
 [outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container started: outrig-20260501T134412-3f2a
+[outrig] container started: outrig-20260501T134412-3f2ad11c
 [outrig] mcp fs: initialized
 [outrig] mcp shell: initialized
 [outrig] model: gpt-4o-mini
-[outrig] session id: 20260501T134412-3f2a
+[outrig] session id: 20260501T134412-3f2ad11c
 > hi
 error: LLM call failed: 401 Unauthorized
 caused by: provider returned: invalid_api_key

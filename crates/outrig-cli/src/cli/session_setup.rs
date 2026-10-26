@@ -573,7 +573,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         image_tag
     };
 
-    let sid = SessionId::new();
     let host_workspace = cfg.workspace.resolved_host_path(&repo_root);
     let container_workspace = cfg.workspace.container_path().to_path_buf();
     let mut launch =
@@ -583,26 +582,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     launch.devices = image_cfg.security.devices.clone();
     launch.no_new_privileges = image_cfg.security.no_new_privileges;
     launch.unmask = image_cfg.security.unmask.clone();
-    launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
-    let container_name = attach
-        .as_ref()
-        .map(|attach| attach.container_name.clone())
-        .unwrap_or_else(|| format!("outrig-{sid}"));
-    let mut session = Session {
-        id: sid.clone(),
-        started_at: SystemTime::now(),
-        ended_at: None,
-        container_name: container_name.clone(),
-        sidecar_container_names: Vec::new(),
-        image_tag: image_tag.to_string(),
-        image_config_name: Some(image_cfg_name.clone()),
-        agent_name: session_agent_name,
-        working_dir: repo_root.clone(),
-        session_dir: PathBuf::new(), // set by `create` below
-        exit_code: None,
-        link_target: None,
-    };
     // The record is the first thing a signal could orphan. From here on, none
     // ends the process without the session torn down: each slow step below
     // is raced against these, and a signal takes that step's bail-out.
@@ -611,8 +591,30 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // from here to `teardown`'s finalize. Without it `clean` and `discard`
     // decide liveness by the recorded container, which does not exist until
     // the image is built and started below -- minutes, for a cold build
-    // (#366).
-    let (session_dir, session_lock) = store.create(&sid, args.explicit_session_dir, &mut session)?;
+    // (#366). An id already taken under the root is drawn again, and the
+    // record rebuilt for the new one (#382).
+    let (mut session, session_dir, session_lock) =
+        store.create_fresh(SessionId::new, args.explicit_session_dir, |sid| Session {
+            id: sid.clone(),
+            started_at: SystemTime::now(),
+            ended_at: None,
+            container_name: attach
+                .as_ref()
+                .map(|attach| attach.container_name.clone())
+                .unwrap_or_else(|| format!("outrig-{sid}")),
+            sidecar_container_names: Vec::new(),
+            image_tag: image_tag.to_string(),
+            image_config_name: Some(image_cfg_name.clone()),
+            agent_name: session_agent_name.clone(),
+            working_dir: repo_root.clone(),
+            session_dir: PathBuf::new(), // set by `create`
+            exit_code: None,
+            link_target: None,
+        })?;
+    // Set after the claim, so the label carries the id the record has.
+    let sid = session.id.clone();
+    let container_name = session.container_name.clone();
+    launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
     // Every bail-out before there are containers to stop: end the record with
     // the exit code `e` carries, and pass `e` on. `session_lock` is still a
     // local here, so it outlives the finalize and is dropped as the `?`

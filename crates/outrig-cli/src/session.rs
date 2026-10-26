@@ -40,9 +40,21 @@ const SESSION_JSON: &str = "session.json";
 /// stderr, `network.jsonl`, transcripts -- goes under it.
 pub(crate) const LOGS_DIR: &str = "logs";
 
-/// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrr` (UTC, four
-/// hex digits of randomness). Lexicographic order matches chronological
-/// order modulo collisions, so listings can sort by string.
+/// How many ids [`SessionStore::create_fresh`] draws before it gives up. Two
+/// launches in one second draw the same id once in 2^32; a run of collisions
+/// is something holding the names, not chance (#382).
+pub const SESSION_ID_DRAWS: u32 = 8;
+
+/// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrrrrrr` (UTC, eight
+/// hex digits of randomness; before #382 it was four, and sessions from then
+/// keep those names). Lexicographic order matches chronological order modulo
+/// collisions, so listings can sort by string.
+///
+/// Two sessions under one root cannot share an id because
+/// [`SessionStore::create`] makes the directory of that name, which fails when
+/// it exists. The randomness is what keeps a draw from colliding in the cases
+/// that does not cover: two roots, which share podman's container names, and a
+/// `--session-dir` launch, which fails at its link instead of drawing again.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
@@ -54,9 +66,7 @@ impl SessionId {
         let ts = Zoned::now()
             .with_time_zone(jiff::tz::TimeZone::UTC)
             .strftime("%Y%m%dT%H%M%S");
-        let mut buf = [0u8; 2];
-        rand::rng().fill_bytes(&mut buf);
-        Self(format!("{ts}-{:02x}{:02x}", buf[0], buf[1]))
+        Self(format!("{ts}-{:08x}", rand::rng().next_u32()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -64,11 +74,12 @@ impl SessionId {
     }
 
     /// The start time `name` encodes, when it has the shape [`SessionId::new`]
-    /// gives: `None` for anything else, which is how a directory that is not
-    /// a session's is told from one whose record is lost.
+    /// gives, or gave before #382 with four hex digits: `None` for anything
+    /// else, which is how a directory that is not a session's is told from
+    /// one whose record is lost.
     pub fn started_at(name: &str) -> Option<SystemTime> {
         let (ts, rand) = name.split_once('-')?;
-        if rand.len() != 4 || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !matches!(rand.len(), 4 | 8) || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let civil = jiff::civil::DateTime::strptime("%Y%m%dT%H%M%S", ts).ok()?;
@@ -266,6 +277,10 @@ impl SessionStore {
     /// directory: of two launches given one at once, the second to write is
     /// refused.
     ///
+    /// Without one, creating `<root>/<sid>` is the claim: when anything at all
+    /// is already there under that name, the result is
+    /// [`CliError::SessionIdTaken`] and nothing is written (#382).
+    ///
     /// The [`SessionLock`] alongside the path is the caller's claim on the
     /// session as a *live* one, and it lasts exactly as long as the value is
     /// held: a caller that drops it at once has a record `clean` and
@@ -317,11 +332,19 @@ impl SessionStore {
                 canon
             }
             None => {
-                // Replacing, not claiming, until #382 makes the `create_dir`
-                // of a fresh id the claim.
+                // The claim: `create_dir` fails on anything already under the
+                // name -- a directory another launch drew the same id for, or a
+                // `--session-dir` link, dangling or not -- where `create_dir_all`
+                // would take the directory or follow the link, and the write
+                // below would replace the record there (#382).
                 let dir = self.root.join(&sid.0);
+                match fs::create_dir(&dir) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(CliError::SessionIdTaken(dir));
+                    }
+                    created => created.path_ctx("create directory", &dir)?,
+                }
                 session.session_dir = dir.clone();
-                fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
                 write_session_json_atomic(&dir, session)?;
                 dir
             }
@@ -334,6 +357,33 @@ impl SessionStore {
         // process does not own.
         let lock = claim_owner(&actual_dir);
         Ok((actual_dir, lock))
+    }
+
+    /// [`SessionStore::create`] under an id from `draw`, drawing again while the
+    /// id drawn is taken, up to [`SESSION_ID_DRAWS`] times (#382); the last
+    /// [`CliError::SessionIdTaken`] is the result when they all are. The record
+    /// comes from `session_for` once per id, so everything in it that names the
+    /// id names the one claimed.
+    ///
+    /// An explicit directory is never redrawn: its record is in the directory by
+    /// the time the link under the root finds the id taken, so it fails there
+    /// instead, and `create` reports no taken id for it (#431). A launch draws
+    /// with [`SessionId::new`]; a test can draw ids it has already taken.
+    pub fn create_fresh(
+        &self,
+        mut draw: impl FnMut() -> SessionId,
+        explicit_dir: Option<&Path>,
+        mut session_for: impl FnMut(&SessionId) -> Session,
+    ) -> Result<(Session, PathBuf, Option<SessionLock>)> {
+        let mut draws = 1;
+        loop {
+            let sid = draw();
+            let mut session = session_for(&sid);
+            match self.create(&sid, explicit_dir, &mut session) {
+                Err(CliError::SessionIdTaken(_)) if draws < SESSION_ID_DRAWS => draws += 1,
+                created => return created.map(|(dir, lock)| (session, dir, lock)),
+            }
+        }
     }
 
     /// Update `ended_at` + `exit_code` on a session that's already on disk.

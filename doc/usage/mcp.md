@@ -188,8 +188,8 @@ Use attach mode when a container is already running and you want an external MCP
 to share its workspace, installed tools, and environment:
 
 ```sh
-outrig mcp --attach 20260504T141907-a83f
-outrig mcp --attach outrig-20260504T141907-a83f --image coding
+outrig mcp --attach 20260504T141907-a83f6eda
+outrig mcp --attach outrig-20260504T141907-a83f6eda --image coding
 ```
 
 The first form resolves an existing outrig session id. The second form borrows a
@@ -404,7 +404,7 @@ answered `tools/list`, `outrig mcp` prints one banner to stderr:
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__list_directory, fs__read_file, fs__write_file, shell__exec
-[outrig] session id: 20260504T141907-a83f
+[outrig] session id: 20260504T141907-a83f6eda
 [outrig] transport: stdio
 [outrig] mcp server ready
 ```
@@ -569,10 +569,10 @@ On disk, new `outrig mcp` session JSON omits `agent_name`; older JSON with
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  IMAGE      EXIT
-20260504T141907-a83f   2026-05-04 14:19:07  0m44s     coding     0
+ID                         STARTED              DURATION  IMAGE      EXIT
+20260504T141907-a83f6eda   2026-05-04 14:19:07  0m44s     coding     0
 
-$ outrig logs 20260504T141907-a83f fs
+$ outrig logs 20260504T141907-a83f6eda fs
 [mcp-server-filesystem] starting; root=/workspace
 [mcp-server-filesystem] tools/list: 3 tools advertised
 ```

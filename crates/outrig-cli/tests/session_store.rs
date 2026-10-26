@@ -235,6 +235,282 @@ fn concurrent_creates_on_one_explicit_dir_claim_it_once() {
     }
 }
 
+/// #382: `create` made an auto-allocated directory with `create_dir_all`, which
+/// succeeds on one that exists, so a second launch given the same id wrote its
+/// record over the first's. Making the directory is the claim now: the second is
+/// refused and the first's record is as it was.
+#[test]
+fn a_second_create_for_one_auto_id_is_refused_and_the_first_record_kept() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101500-3f2a1c9e".into());
+    let mut first = sample_session(&sid);
+    first.image_tag = "first".into();
+    let (dir, _lock) = store.create(&sid, None, &mut first).expect("first create");
+
+    let mut second = sample_session(&sid);
+    second.image_tag = "second".into();
+    let err = store
+        .create(&sid, None, &mut second)
+        .expect_err("the id is taken");
+
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(taken) if *taken == dir),
+        "expected SessionIdTaken for {}, got: {err:?}",
+        dir.display()
+    );
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").image_tag,
+        "first",
+        "the first launch's record is not replaced"
+    );
+    assert!(
+        session::owner_is_live(&dir),
+        "the first launch still holds its claim"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("read dir").count(),
+        1,
+        "the refused launch leaves no temp file behind"
+    );
+}
+
+/// The same hole through a link: `create_dir_all` follows a `--session-dir` link
+/// to the directory behind it and calls that the directory it made, so the
+/// record went into the user's directory over the one already there.
+#[test]
+fn an_auto_id_held_by_an_explicit_link_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101501-3f2a1c9e".into());
+    let mut first = sample_session(&sid);
+    first.image_tag = "first".into();
+    let (dir, _lock) = store
+        .create(&sid, Some(explicit.path()), &mut first)
+        .expect("first create");
+
+    let mut second = sample_session(&sid);
+    second.image_tag = "second".into();
+    let err = store
+        .create(&sid, None, &mut second)
+        .expect_err("the link holds the id");
+
+    let link = root.path().join(sid.as_str());
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(taken) if *taken == link),
+        "expected SessionIdTaken for {}, got: {err:?}",
+        link.display()
+    );
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").image_tag,
+        "first",
+        "the record in the explicit directory is not replaced"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str()))
+            .expect("stat link")
+            .file_type()
+            .is_symlink(),
+        "the link is still a link"
+    );
+}
+
+/// Two launches drawing one id at the same moment, which is what #382 is about,
+/// and not one after the other: the directory is the claim, so exactly one wins
+/// and the rest are refused with its record intact.
+#[test]
+fn concurrent_creates_of_one_auto_id_claim_it_once() {
+    const LAUNCHES: usize = 4;
+    let sid = SessionId("20261026T101502-3f2a1c9e".into());
+    for _ in 0..10 {
+        let root = tempfile::tempdir().expect("tempdir root");
+        let store = SessionStore::new(root.path().to_path_buf());
+        let barrier = Barrier::new(LAUNCHES);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let launches: Vec<_> = (0..LAUNCHES)
+                .map(|n| {
+                    let (store, barrier, sid) = (&store, &barrier, &sid);
+                    scope.spawn(move || {
+                        let mut session = sample_session(sid);
+                        session.image_tag = format!("launch-{n}");
+                        barrier.wait();
+                        store
+                            .create(sid, None, &mut session)
+                            .map(|(_dir, lock)| (n, lock))
+                    })
+                })
+                .collect();
+            launches
+                .into_iter()
+                .map(|launch| launch.join().expect("create thread"))
+                .collect()
+        });
+
+        let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(won.len(), 1, "exactly one launch claims the id");
+        for loser in lost {
+            let err = loser.expect_err("partitioned as lost");
+            assert!(
+                matches!(err, CliError::SessionIdTaken(_)),
+                "a loser is refused for the id, got: {err:?}"
+            );
+        }
+        let (winner, _lock) = won.into_iter().next().expect("one winner").expect("won");
+        let (dir, record) = store.get_by_id(&sid).expect("the claimed session");
+        assert_eq!(
+            record.image_tag,
+            format!("launch-{winner}"),
+            "the record is the winner's"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read dir").count(),
+            1,
+            "the losers leave no temp file behind"
+        );
+    }
+}
+
+/// #382: a launch whose draw another launch holds draws again, and the record
+/// it keeps is the one built for the id that stuck, not for the draws before.
+#[test]
+fn create_fresh_draws_again_when_the_id_is_taken() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let taken = SessionId("20261026T101503-aaaaaaaa".into());
+    let fresh = SessionId("20261026T101503-bbbbbbbb".into());
+    let mut holder = sample_session(&taken);
+    holder.image_tag = "holder".into();
+    let (taken_dir, _holder_lock) = store.create(&taken, None, &mut holder).expect("holder");
+
+    let mut script = vec![taken.clone(), taken.clone(), fresh.clone()].into_iter();
+    let mut built = Vec::new();
+    let (session, dir, _lock) = store
+        .create_fresh(
+            || script.next().expect("drew past the script"),
+            None,
+            |sid| {
+                built.push(sid.clone());
+                sample_session(sid)
+            },
+        )
+        .expect("create_fresh");
+
+    assert_eq!(
+        built,
+        [taken.clone(), taken.clone(), fresh.clone()],
+        "a record is built for every draw"
+    );
+    assert_eq!(session.id, fresh);
+    assert_eq!(session.container_name, format!("outrig-{fresh}"));
+    assert_eq!(dir, root.path().join(fresh.as_str()));
+    assert_eq!(session.session_dir, dir);
+    assert_eq!(
+        store.get_by_path(&dir).expect("read").id,
+        fresh,
+        "the record on disk is the kept session's"
+    );
+    assert_eq!(
+        store.get_by_path(&taken_dir).expect("read").image_tag,
+        "holder",
+        "the id that was taken is still its holder's"
+    );
+}
+
+/// A root that answers every draw with "exists" is not bad luck, so the loop
+/// ends instead of drawing for ever, with the last refusal as its error.
+#[test]
+fn create_fresh_gives_up_when_every_draw_is_taken() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let taken = SessionId("20261026T101504-aaaaaaaa".into());
+    let (taken_dir, _holder_lock) = store
+        .create(&taken, None, &mut sample_session(&taken))
+        .expect("holder");
+
+    let mut draws = 0;
+    let err = store
+        .create_fresh(
+            || {
+                draws += 1;
+                taken.clone()
+            },
+            None,
+            sample_session,
+        )
+        .expect_err("every id is taken");
+
+    assert_eq!(draws, session::SESSION_ID_DRAWS);
+    assert!(
+        matches!(&err, CliError::SessionIdTaken(path) if *path == taken_dir),
+        "the last refusal is the error, got: {err:?}"
+    );
+}
+
+/// `setup` goes through `create_fresh` for `--session-dir` launches too, so it
+/// has to carry an explicit directory through to `create` unchanged.
+#[test]
+fn create_fresh_makes_an_explicit_directory_session_too() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261026T101505-cccccccc".into());
+    let canon = std::fs::canonicalize(explicit.path()).expect("canon");
+
+    let (session, dir, _lock) = store
+        .create_fresh(|| sid.clone(), Some(explicit.path()), sample_session)
+        .expect("create_fresh");
+
+    assert_eq!(dir, canon);
+    assert_eq!(session.session_dir, canon);
+    let (linked, record) = store.get_by_id(&sid).expect("the link resolves");
+    assert_eq!(linked, canon);
+    assert_eq!(record.id, sid);
+}
+
+/// What `new` draws: eight hex digits after the timestamp, and a name
+/// `started_at` reads back, which is how a `clean` that cannot parse the record
+/// still ages the directory.
+#[test]
+fn a_drawn_id_has_eight_random_digits() {
+    let sid = SessionId::new();
+    let (ts, rand) = sid.as_str().split_once('-').expect("a dash");
+
+    assert_eq!(ts.len(), "yyyymmddTHHMMSS".len());
+    assert_eq!(rand.len(), 8);
+    assert!(rand.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        SessionId::started_at(sid.as_str()).is_some(),
+        "{sid} reads back"
+    );
+}
+
+/// Four digits is what outrig 0.2.2 and earlier wrote, so those sessions are on
+/// disk and keep reading. Any other width is not an id.
+#[test]
+fn started_at_reads_both_widths_ids_have_had() {
+    let four = SessionId::started_at("20260501T134412-3f2a").expect("four digits");
+    let eight = SessionId::started_at("20260501T134412-3f2a1c9e").expect("eight digits");
+    assert_eq!(four, eight, "the timestamp reads the same either way");
+
+    for name in [
+        "20260501T134412-3f2",
+        "20260501T134412-3f2a1",
+        "20260501T134412-3f2a1c",
+        "20260501T134412-3f2a1c9",
+        "20260501T134412-3f2a1c9e0",
+        "20260501T134412-3f2g",
+        "20260501T134412-",
+        "20260501T134412",
+        "notes",
+    ] {
+        assert!(
+            SessionId::started_at(name).is_none(),
+            "{name} is not a session id"
+        );
+    }
+}
+
 #[test]
 fn list_includes_auto_and_symlinked_newest_first() {
     let root = tempfile::tempdir().expect("tempdir root");

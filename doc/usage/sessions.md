@@ -38,12 +38,12 @@ commands stop too -- better than quietly listing, or cleaning, some other direct
 
 ## Layout under the root
 
-Each session is a subdirectory of the root, named by session id (a UTC timestamp plus four
+Each session is a subdirectory of the root, named by session id (a UTC timestamp plus eight
 random hex digits -- sortable, unambiguous across concurrent runs):
 
 ```
 ~/.local/share/outrig/sessions/
-└── 20260501T134412-3f2a/
+└── 20260501T134412-3f2ad11c/
     ├── session.json              # id, timestamps, containers, image, exit status
     ├── outrig-enter              # launcher for view = "primary" sidecars, if any start
     └── logs/
@@ -55,6 +55,11 @@ random hex digits -- sortable, unambiguous across concurrent runs):
         └── subagent-audit/       # transcripts of the subagents "audit" launched
             └── subagent-scan.log
 ```
+
+outrig makes an auto-allocated session's directory itself and fails if the name is taken, so two
+launches never share one: a launch whose id the root already holds draws another. Sessions
+recorded by outrig 0.2.2 and earlier have four hex digits where these have eight, and read the
+same.
 
 `session.json` names every container the session owns: `container_name` for the primary,
 plus `sidecar_container_names` when the config declares
@@ -74,8 +79,8 @@ it:
 
 ```
 ~/.local/share/outrig/sessions/
-├── 20260501T134412-3f2a/        # auto-allocated, real directory
-└── 20260501T141907-9b1c -> /tmp/my-debug-run/    # explicit --session-dir, symlink
+├── 20260501T134412-3f2ad11c/        # auto-allocated, real directory
+└── 20260501T141907-9b1c42f3 -> /tmp/my-debug-run/    # explicit --session-dir, symlink
 ```
 
 This means you can launch with a known path and read `session.json`, `logs/`, etc. directly
@@ -100,10 +105,10 @@ List sessions newest-first:
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  IMAGE      EXIT
-20260501T141907-9b1c   2026-05-01 14:19:07  0m44s     coding     0   -> /tmp/my-debug-run
-20260501T134412-3f2a   2026-05-01 13:44:12  2m18s     coding     0
-20260430T091203-44d2   2026-04-30 09:12:03  6m02s     planning   1
+ID                         STARTED              DURATION  IMAGE      EXIT
+20260501T141907-9b1c42f3   2026-05-01 14:19:07  0m44s     coding     0   -> /tmp/my-debug-run
+20260501T134412-3f2ad11c   2026-05-01 13:44:12  2m18s     coding     0
+20260430T091203-44d2ca73   2026-04-30 09:12:03  6m02s     planning   1
 ```
 
 `EXIT` is the outrig process exit code, not the agent's "did it succeed" signal -- there's no
@@ -122,7 +127,7 @@ An entry that can't be read -- a truncated write, or a schema outrig no longer u
 -- costs only its own row. `outrig ls` reports it on stderr and lists everything else:
 
 ```
-[outrig] skipping 20260430T091203-44d2: session.json at ...: missing field `image_tag`
+[outrig] skipping 20260430T091203-44d2ca73: session.json at ...: missing field `image_tag`
 ```
 
 If nothing in the root parsed, the notice says `no readable sessions (N skipped)` rather
@@ -145,7 +150,7 @@ $ outrig ls --session-root /var/lib/outrig/sessions
 Print one server's captured stderr by session id:
 
 ```sh
-$ outrig logs 20260501T134412-3f2a fs
+$ outrig logs 20260501T134412-3f2ad11c fs
 [mcp-server-filesystem] starting; root=/workspace
 [mcp-server-filesystem] tools/list: 3 tools advertised
 [mcp-server-filesystem] tools/call: list_directory({"path": "/workspace"})
@@ -162,8 +167,8 @@ $ outrig logs --session-dir /tmp/my-debug-run fs
 Omit the server name to get a directory listing of available logs:
 
 ```sh
-$ outrig logs 20260501T134412-3f2a
-[outrig] logs for session 20260501T134412-3f2a:
+$ outrig logs 20260501T134412-3f2ad11c
+[outrig] logs for session 20260501T134412-3f2ad11c:
   fs       (1.2 KiB)
   shell    (3.4 KiB)
 ```
@@ -174,7 +179,7 @@ by its path under `logs/`.
 Follow a still-running session's log:
 
 ```sh
-$ outrig logs 20260501T141907-9b1c shell --follow
+$ outrig logs 20260501T141907-9b1c42f3 shell --follow
 [shell-mcp-command] starting
 [shell-mcp-command] exec: cargo check
 warning: unused import: `std::collections::HashMap`
@@ -266,17 +271,17 @@ Delete a session's on-disk record -- `session.json`, `logs/`, and `outrig-enter`
 directory that held it:
 
 ```sh
-$ outrig discard 20260430T091203-44d2 --yes
-[outrig] removed ~/.local/share/outrig/sessions/20260430T091203-44d2
+$ outrig discard 20260430T091203-44d2ca73 --yes
+[outrig] removed ~/.local/share/outrig/sessions/20260430T091203-44d2ca73
 ```
 
 For sessions whose root entry is a symlink, discard removes both the real directory at the
 symlink target and the symlink itself:
 
 ```sh
-$ outrig discard 20260501T141907-9b1c --yes
+$ outrig discard 20260501T141907-9b1c42f3 --yes
 [outrig] removed /tmp/my-debug-run
-[outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c (symlink)
+[outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c42f3 (symlink)
 ```
 
 You can also point at a session directory directly, or at its symlink under the root, which
@@ -293,10 +298,10 @@ the directory stays and discard says what it kept. Versions before 0.2.2 let a s
 a directory you keep other files in, and this is what discarding one of those looks like:
 
 ```sh
-$ outrig discard 20261003T120000-aaaa --yes
+$ outrig discard 20261003T120000-aaaafc6f --yes
 [outrig] removed the session record from /home/me/notes
 [outrig] kept /home/me/notes, which also holds KEEP_ME.txt, photos
-[outrig] removed ~/.local/share/outrig/sessions/20261003T120000-aaaa (symlink)
+[outrig] removed ~/.local/share/outrig/sessions/20261003T120000-aaaafc6f (symlink)
 ```
 
 If such a directory had a `logs/` of its own before the session, the session's logs went into
@@ -319,8 +324,8 @@ window, previews the sessions it will remove, then asks once before deleting:
 ```sh
 $ outrig clean
 [outrig] will remove 2 sessions older than 30d:
-  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
-  20260402T091203-44d2  ended 2026-04-02 09:18:54  /tmp/old-b
+  20260401T134412-3f2a1720  ended 2026-04-01 13:46:30  /tmp/old-a
+  20260402T091203-44d26334  ended 2026-04-02 09:18:54  /tmp/old-b
 Clean 2 sessions? [y/N]:
 ```
 
@@ -360,9 +365,9 @@ never removed, only reported:
 ```sh
 $ outrig clean --older-than 7d
 [outrig] will remove 1 session older than 7d:
-  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
+  20260401T134412-3f2a1720  ended 2026-04-01 13:46:30  /tmp/old-a
 [outrig] will remove 1 stray container older than 7d (no session record):
-  outrig-20260330T101500-88aa-tools  sidecar tools, session 20260330T101500-88aa
+  outrig-20260330T101500-88aa84ff-tools  sidecar tools, session 20260330T101500-88aa84ff
 Clean 1 session and 1 stray container? [y/N]:
 ```
 
