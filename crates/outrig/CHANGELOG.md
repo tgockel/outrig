@@ -50,6 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An allowed connection whose upstream connect fails now says why in its record.** The
+  interceptor returned from a refused connect, one still unanswered after 20 seconds, or one with
+  no route, and left the record as it stood: `outrig.action` `allow`, zero byte counts,
+  `conn_state` `S0`, and the cause only in a `warn` log line. That is the record of a connection
+  that opened and moved nothing, so a reader of `network.jsonl` working out why an agent could not
+  reach a host could not tell a destination that refused it from a connection that was never
+  used. The record now carries `outrig.error`, the reason in words, and omits it for a connection
+  whose upstream opened or was never dialed:
+  `upstream connect failed: Connection refused (os error 111)`, or
+  `upstream connect failed: timed out after 20s`. Where the dial went to another address than the
+  destination -- the host under pasta -- the message names it after `via`. `outrig.action` is still
+  the policy's decision, and `conn_state` is unchanged. (#389)
 - **A global config that does not load no longer stops the commands that need one key out of
   it.** `session-root` is global-only, so `outrig ls`, `logs`, `discard`, and `clean` read the
   global config and nothing else -- but they read all of it, through `Config::load_global`, so a

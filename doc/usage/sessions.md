@@ -223,6 +223,14 @@ loopback -- is closed on arrival and recorded with `outrig.action` `deny` and `o
 `not-redirected`. Its only destination is the listener itself, which the interceptor would
 otherwise dial from the host's network namespace.
 
+A connection the policy allowed whose upstream connect then failed -- refused, no route, or no
+answer within 20 seconds -- is closed and recorded with the decision as made, zero byte counts,
+and `outrig.error` saying why: `upstream connect failed: Connection refused (os error 111)`, or
+`upstream connect failed: timed out after 20s`. Where the dial went to a different address than
+`id.resp_h`, as it does for the host under pasta, the message names it after `via`. `conn_state`
+is `S0` as for any record with no response bytes, so `outrig.error` is what tells such a
+connection from one that opened and moved nothing, which has none.
+
 A name lookup is recorded as the UDP exchange with the interceptor's DNS listener that it is:
 `proto` is `udp`, `service` is `dns`, `id.resp_p` is 53, and `outrig.host` is the name the
 container asked for, with `outrig.host_source` `asserted`. `id.resp_h` is the address the query

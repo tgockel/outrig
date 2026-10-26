@@ -2255,6 +2255,12 @@ struct AuditRecord {
     outrig_action: &'static str,
     #[serde(rename = "outrig.rule")]
     outrig_rule: String,
+    /// Why an allowed connection's upstream connect failed, in words. Absent
+    /// when the upstream opened or was never dialed, which is what tells a
+    /// destination that could not be reached from a connection that opened and
+    /// moved nothing.
+    #[serde(rename = "outrig.error", skip_serializing_if = "Option::is_none")]
+    outrig_error: Option<String>,
 }
 
 impl AuditRecord {
@@ -2287,6 +2293,7 @@ impl AuditRecord {
             outrig_host_source: host_source,
             outrig_action: event.decision.action.as_str(),
             outrig_rule: event.decision.rule,
+            outrig_error: event.error,
         }
     }
 }
@@ -2308,6 +2315,9 @@ struct AuditEvent {
     bytes_tx: u64,
     bytes_rx: u64,
     decision: PolicyDecision,
+    /// Why the upstream connection never opened, when it did not. See
+    /// [`ConnOutcome::error`].
+    error: Option<String>,
 }
 
 fn zeek_timestamp(ts: SystemTime) -> f64 {
@@ -2659,6 +2669,7 @@ async fn record_refused(
                 action: NetworkAction::Deny,
                 rule: rule.to_string(),
             },
+            error: None,
         },
     );
     if let Err(e) = audit.queue_unless(&record, cancel).await {
@@ -2753,7 +2764,8 @@ async fn read_opening<S: AsyncRead + Unpin>(
 }
 
 /// What the audit record for one connection is built from. [`proxy`] updates
-/// it as bytes move and as a late client assertion changes the decision.
+/// it as bytes move, as a late client assertion changes the decision, and when
+/// the upstream connect fails.
 #[derive(Debug)]
 struct ConnOutcome {
     assertion: ClientAssertion,
@@ -2761,6 +2773,11 @@ struct ConnOutcome {
     decision: PolicyDecision,
     bytes_tx: u64,
     bytes_rx: u64,
+    /// Why the upstream connection never opened, when it did not. The decision
+    /// still says the connection was allowed and no bytes moved either way, so
+    /// nothing else in the record tells a connect that failed from one that
+    /// opened and stayed quiet.
+    error: Option<String>,
 }
 
 /// Bridges one accepted connection to `dst` and records it. `dst` is the
@@ -2792,6 +2809,7 @@ async fn handle_tcp(
         assertion: ClientAssertion::default(),
         bytes_tx: 0,
         bytes_rx: 0,
+        error: None,
     };
 
     // Cancellation cuts the connection wherever it is parked -- the sniff
@@ -2845,6 +2863,7 @@ async fn handle_tcp(
             bytes_tx: outcome.bytes_tx,
             bytes_rx: outcome.bytes_rx,
             decision: outcome.decision,
+            error: outcome.error,
         },
     )
     .await;
@@ -2946,14 +2965,13 @@ async fn proxy(
     } else {
         format!(" via {dial}")
     };
-    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dial)).await {
-        Ok(Ok(upstream)) => upstream,
-        Ok(Err(e)) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {e}");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} timed out: {e}");
+    let mut upstream = match connect_within_timeout(TcpStream::connect(dial)).await {
+        Ok(upstream) => upstream,
+        Err(why) => {
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {why}");
+            // The connection was allowed, so its record would otherwise read
+            // as one that opened and moved nothing.
+            outcome.error = Some(format!("upstream connect{via} failed: {why}"));
             return;
         }
     };
@@ -2983,6 +3001,20 @@ async fn proxy(
         policy,
     });
     bridge(client, &mut upstream, initial, recheck, outcome).await;
+}
+
+/// Awaits `connect`, giving up after [`CONNECT_TIMEOUT`]. The error is the
+/// reason in words, for the log and the audit record. Takes the connect rather
+/// than an address so a test can hand it one that never finishes.
+async fn connect_within_timeout<F>(connect: F) -> std::result::Result<TcpStream, String>
+where
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(upstream)) => Ok(upstream),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {CONNECT_TIMEOUT:?}")),
+    }
 }
 
 /// What a late client assertion is re-evaluated against.
@@ -3021,6 +3053,7 @@ async fn bridge(
         decision,
         bytes_tx,
         bytes_rx,
+        ..
     } = outcome;
     let bridged = {
         let downstream = async {
@@ -3321,6 +3354,7 @@ async fn resolve_dns(
             bytes_tx: raw.len() as u64,
             bytes_rx: 0,
             decision,
+            error: None,
         },
     )
     .await;
@@ -5403,6 +5437,7 @@ mod tests {
             bytes_tx: 0,
             bytes_rx: 0,
             decision: PolicyDecision::allow_default(),
+            error: None,
         }
     }
 
@@ -7024,6 +7059,99 @@ mod tests {
         assert_eq!(record["orig_bytes"], 0);
         assert_eq!(record["resp_bytes"], 0);
         assert_eq!(record["conn_state"], "S0");
+        // Nothing failed, so there is no reason to give: the record a refused
+        // connect used to share with this one now differs by exactly this.
+        assert!(record.get("outrig.error").is_none());
+    }
+
+    /// #389: an allowed connection whose upstream refuses the connect says so
+    /// in its record. It used to be the record above -- allowed, nothing
+    /// moved, `S0` -- with the cause only in a log line. Where the host alias
+    /// sent the dial somewhere other than the destination, the message names
+    /// where.
+    #[tokio::test]
+    async fn an_upstream_that_refuses_the_connect_is_recorded_with_its_reason() {
+        // A port nothing listens on: bound to be handed one, then released.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let alias = HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::LOCALHOST,
+        };
+        let stand_in = SocketAddr::from((PASTA_HOST_STAND_IN, closed.port()));
+
+        // Where the client asked to go, the alias that may send it elsewhere,
+        // and how the record says the dial was made.
+        for (dst, host_alias, via) in [
+            (closed, None, String::new()),
+            (stand_in, Some(alias), format!(" via {closed}")),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut client, intercepted, orig) = accepted_connection().await;
+            let connection = tokio::spawn(handle_tcp(
+                intercepted,
+                orig,
+                dst,
+                host_alias,
+                audit_sink(dir.path()).await,
+                empty_bindings(),
+                allow_all_policy(),
+                CancellationToken::new(),
+            ));
+
+            // Said at once, so the sniff does not wait out its window for it.
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: refused.example\r\n\r\n")
+                .await
+                .expect("write request");
+            tokio::time::timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("a connection whose connect failed ends")
+                .expect("connection task");
+
+            let record = only_audit_record(dir.path());
+            assert_eq!(record["outrig.action"], "allow");
+            assert_eq!(record["orig_bytes"], 0);
+            assert_eq!(record["resp_bytes"], 0);
+            assert_eq!(record["conn_state"], "S0");
+            let error = record["outrig.error"]
+                .as_str()
+                .expect("the record says why");
+            assert!(
+                error.starts_with(&format!("upstream connect{via} failed: ")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("os error {}", libc::ECONNREFUSED)),
+                "{error}"
+            );
+        }
+    }
+
+    /// The other ways a connect fails are said too: one nothing answers is
+    /// given up on after `CONNECT_TIMEOUT`, and one with no route carries the
+    /// OS's account of it. Neither can be had on loopback, so the connect is
+    /// handed in.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_nothing_answers_or_with_no_route_says_why() {
+        let silent = connect_within_timeout(std::future::pending::<io::Result<TcpStream>>()).await;
+        assert_eq!(
+            silent.expect_err("a connect nothing answers does not finish"),
+            format!("timed out after {CONNECT_TIMEOUT:?}")
+        );
+
+        let unroutable = connect_within_timeout(async {
+            Err::<TcpStream, _>(io::Error::from_raw_os_error(libc::ENETUNREACH))
+        })
+        .await;
+        let why = unroutable.expect_err("a connect with no route fails");
+        assert!(
+            why.contains(&format!("os error {}", libc::ENETUNREACH)),
+            "{why}"
+        );
     }
 
     /// #353's case end to end: under `default = "allow"`, a `ClientHello`
@@ -9429,6 +9557,7 @@ options edns0
                 bytes_tx: 517,
                 bytes_rx: 1298,
                 decision: PolicyDecision::allow_default(),
+                error: None,
             },
         );
         let json = serde_json::to_value(record).expect("record json");
@@ -9452,6 +9581,7 @@ options edns0
         assert_eq!(json["outrig.host"], "example.com");
         assert_eq!(json["outrig.action"], "allow");
         assert_eq!(json["outrig.rule"], "default");
+        assert!(json.get("outrig.error").is_none());
         assert!(json.get("host").is_none());
         assert!(json.get("bytes_tx").is_none());
         assert!(json.get("duration_ms").is_none());
@@ -9475,6 +9605,7 @@ options edns0
                     bytes_tx: 0,
                     bytes_rx: 0,
                     decision: PolicyDecision::allow_default(),
+                    error: None,
                 },
             );
             serde_json::to_value(record).expect("record json")
@@ -9516,6 +9647,7 @@ options edns0
                     bytes_tx: 29,
                     bytes_rx: 0,
                     decision: PolicyDecision::new(NetworkAction::Deny, "default"),
+                    error: None,
                 },
             );
             serde_json::to_value(record).expect("record json")
@@ -9594,6 +9726,7 @@ options edns0
                     action: NetworkAction::Deny,
                     rule: "deny[0]".to_string(),
                 },
+                error: None,
             },
         );
         let json = serde_json::to_value(record).expect("record json");
@@ -11091,6 +11224,7 @@ options edns0
             decision: PolicyDecision::allow_default(),
             bytes_tx: 0,
             bytes_rx: 0,
+            error: None,
         }
     }
 
@@ -11331,6 +11465,7 @@ options edns0
                 bytes_tx: 0,
                 bytes_rx: 0,
                 decision: PolicyDecision::allow_default(),
+                error: None,
             }
         }
 

@@ -230,7 +230,9 @@ choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Where both 
 entry wins over an allow entry, and a connection neither matches uses `default`. A denied
 connection is closed immediately and still writes a `network.jsonl` record with
 `outrig.action = "deny"` and zero byte counts, so the audit log is the place to diagnose
-network policy failures.
+network policy failures. An allowed connection whose upstream connect fails -- refused, no route,
+no answer -- is recorded as allowed, with zero byte counts and `outrig.error` saying why, which
+tells a host that could not be reached from one the policy stopped.
 
 Entries match TCP connections. Anything else the container sends -- UDP to any port but 53,
 which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no entry and takes
