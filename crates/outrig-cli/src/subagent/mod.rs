@@ -389,6 +389,18 @@ impl SubagentRegistry {
         if names.is_empty() {
             return Err("wait_results needs at least one name".to_string());
         }
+        // A duplicated name would subscribe twice and report twice, so one
+        // subagent could satisfy `min_count` alone and appear in the result
+        // once per occurrence. Reject it before subscribing, the way
+        // `release` does.
+        let mut seen = BTreeSet::new();
+        for name in names {
+            if !seen.insert(name) {
+                return Err(format!(
+                    "subagent {name:?} was named more than once in this wait request"
+                ));
+            }
+        }
         let mut receivers = Vec::with_capacity(names.len());
         {
             let entries = self.lock();
@@ -2220,6 +2232,30 @@ mod tests {
         for name in &ready {
             assert!(names.contains(name));
         }
+    }
+
+    /// #387: a duplicated name used to subscribe twice, so one ready
+    /// subagent satisfied `min_count` for both occurrences and was reported
+    /// twice. The request is rejected instead, the way a duplicate release
+    /// is, and the subagent is left live.
+    #[tokio::test(start_paused = true)]
+    async fn a_duplicate_wait_name_is_rejected_without_waiting() {
+        let (registry, _log_dir) = test_registry();
+        registry
+            .launch("audit", None, None, "work".to_string())
+            .await
+            .expect("launch succeeds");
+
+        let names = vec!["audit".to_string(), "audit".to_string()];
+        let err = registry
+            .wait_results(&names, 2)
+            .await
+            .expect_err("duplicate names must not be counted twice");
+        assert!(err.contains("more than once"), "got: {err}");
+        registry
+            .get_result("audit")
+            .await
+            .expect("the duplicate request must leave the subagent live");
     }
 
     /// wait_results reports readiness without collecting, so the result is
