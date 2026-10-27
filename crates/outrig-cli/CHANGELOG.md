@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A repo-declared mount is bound at the path the guard checked.** The guard that refuses a repo
+  config mounting the home directory or the global config canonicalized each host path to compare
+  it, then threw the result away; Podman re-resolved the original spelling after image
+  preparation, so a session that could write the repo could swap a symlink in that window. The
+  checked canonical path is now what is mounted, and it is looked at again just before the
+  container starts, which refuses a launch whose path was replaced meanwhile. A path that resolves to a name that is not
+  valid UTF-8 is refused, since the bind would render it as a different directory. (#604)
 - **A subagent whose task panics no longer leaves its parent waiting forever.** The round loop
   never returns, so a panic inside it is the one way a subagent's task ends on its own, and tokio
   contains a panic without telling anyone. The subagent stayed registered as running with its

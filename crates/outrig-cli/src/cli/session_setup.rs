@@ -40,7 +40,7 @@ use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{
     RepoConfig, default_session_root, refuse_home_workspace, refuse_mount_field_separators,
-    refuse_repo_declared_mounts, refuse_workspace_covering_global_config,
+    pin_repo_declared_mounts, recheck_pinned_mounts, refuse_workspace_covering_global_config,
     refuse_workspace_field_separator, repo_config_path,
 };
 use crate::session::{self, Session, SessionId, SessionLock, SessionStore};
@@ -364,6 +364,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // A workspace no config declared is outrig's pick, and outrig never picks
     // the home directory or one above it, nor one that contains the global
     // config. An attached session mounts nothing.
+    let mut pinned_mounts = Vec::new();
     if attach.is_none() {
         // Spelled without the default `.` it joins to the root.
         let workspace: PathBuf = cfg
@@ -384,7 +385,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         // directory with a `:` in its name can still be attached to (#365).
         refuse_workspace_field_separator(&workspace, &cfg.workspace, &repo_root)?;
         refuse_mount_field_separators(&cfg, &repo_root)?;
-        refuse_repo_declared_mounts(&cfg, &repo_root, args.global_cfg_path)?;
+        pinned_mounts = pin_repo_declared_mounts(&mut cfg, &repo_root, args.global_cfg_path)?;
         // No config of its own at the root, and no declared host path, means
         // the working directory by default, whether or not `--config`
         // supplied the settings.
@@ -694,6 +695,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             cache_status(raw_local_image, &image_outcome)
         ));
 
+        // The image work above can take minutes, and the repo is writable by
+        // a concurrent session: look again at what the guard validated (#604).
+        recheck_pinned_mounts(&pinned_mounts).map_err(|e| fail(e.into()))?;
         let span = ProgressSpan::start(format!("starting container {container_name}"));
         let start = Container::start_named(&image_tag, launch, container_name, transcript.clone());
         let container = signals.race(start).await.map_err(fail)?;

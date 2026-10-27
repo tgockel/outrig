@@ -481,7 +481,7 @@ impl GlobalConfigReach {
 /// outrig's own pick -- the repo root, or the current directory -- so the caller
 /// asks only when `[workspace] host-path` is declared nowhere: the global
 /// config's own is the operator's choice, and a repo's is judged by
-/// [`refuse_repo_declared_mounts`].
+/// [`pin_repo_declared_mounts`].
 pub(crate) fn refuse_workspace_covering_global_config(
     workspace: &Path,
     repo_root: &Path,
@@ -541,6 +541,15 @@ pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> R
     Ok(())
 }
 
+/// A repo-declared mount [`pin_repo_declared_mounts`] validated: the
+/// canonical host path the guard saw, which is what the launch now binds.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedMount {
+    what: String,
+    host: PathBuf,
+    source: PathBuf,
+}
+
 /// Refuse a repo-declared host path that reaches the operator's own files. The
 /// repo config sits in the read-write workspace, so an agent can edit it for
 /// the next session; a repo `[workspace] host-path`, `[[workspace.mounts]]` or
@@ -551,33 +560,39 @@ pub(crate) fn refuse_mount_field_separators(cfg: &Config, repo_root: &Path) -> R
 /// global-declared entry is the operator's own choice, and a hand-built one
 /// (`--volume`) carries no source. Neither does an undeclared workspace, which is
 /// outrig's own pick: [`refuse_workspace_covering_global_config`] asks about it.
-pub(crate) fn refuse_repo_declared_mounts(
-    cfg: &Config,
+///
+/// What passes is *pinned*: each checked entry's host path is replaced by the
+/// canonical path the check saw, so a symlink the agent swaps afterwards
+/// cannot redirect the bind (#604). A component that is replaced outright
+/// is what [`recheck_pinned_mounts`] catches, just before the container starts.
+pub(crate) fn pin_repo_declared_mounts(
+    cfg: &mut Config,
     repo_root: &Path,
     global_cfg: Option<&Path>,
-) -> Result<()> {
+) -> Result<Vec<PinnedMount>> {
     let home = BaseDirs::new().map(|d| d.home_dir().to_path_buf());
-    refuse_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg)
+    pin_repo_declared_mounts_with(cfg, repo_root, home.as_deref(), global_cfg)
 }
 
-/// [`refuse_repo_declared_mounts`] against an explicit `home` (`None` skips the
+/// [`pin_repo_declared_mounts`] against an explicit `home` (`None` skips the
 /// home rule). Paths are compared canonicalized, as in
 /// [`refuse_home_workspace_with`].
-fn refuse_repo_declared_mounts_with(
-    cfg: &Config,
+fn pin_repo_declared_mounts_with(
+    cfg: &mut Config,
     repo_root: &Path,
     home: Option<&Path>,
     global_cfg: Option<&Path>,
-) -> Result<()> {
+) -> Result<Vec<PinnedMount>> {
     let home = home.map(canonical_or_normalized);
     let global = global_cfg.map(GlobalConfigReach::of);
-    let check = |what: &str,
-                 source: Option<&ConfigSource>,
-                 host: PathBuf,
-                 access: MountAccess|
-     -> Result<()> {
+    let mut pinned = Vec::new();
+    let mut check = |what: &str,
+                     source: Option<&ConfigSource>,
+                     host: PathBuf,
+                     access: MountAccess|
+     -> Result<Option<PathBuf>> {
         let Some(source) = source.filter(|s| !matches!(s, ConfigSource::Global { .. })) else {
-            return Ok(());
+            return Ok(None);
         };
         let host = canonical_or_normalized(&host);
         let reason = if home.as_ref().is_some_and(|h| h.starts_with(&host)) {
@@ -586,8 +601,18 @@ fn refuse_repo_declared_mounts_with(
             && let Some(why) = global.as_ref().and_then(|g| g.rewritable_through(&host))
         {
             why
+        } else if host.to_str().is_none() {
+            // The bind is serialized through `display()`, which would name a
+            // different directory than the one checked.
+            "it resolves to a path that is not valid UTF-8, which cannot be bound faithfully"
+                .to_string()
         } else {
-            return Ok(());
+            pinned.push(PinnedMount {
+                what: what.to_string(),
+                host: host.clone(),
+                source: source.config_path(),
+            });
+            return Ok(Some(host));
         };
         Err(OutrigError::Configuration(format!(
             "refusing {what} {} declared in {}: {reason}, so an agent could edit files \
@@ -598,30 +623,58 @@ fn refuse_repo_declared_mounts_with(
             source.config_path().display()
         )))
     };
-    let workspace = &cfg.workspace;
-    check(
+    let workspace = &mut cfg.workspace;
+    if let Some(host) = check(
         "workspace host-path",
         workspace.config_source(),
         workspace.resolved_host_path(repo_root),
         MountAccess::ReadWrite,
-    )?;
-    for m in &workspace.mounts {
-        check(
+    )? {
+        workspace.set_host_path(host);
+    }
+    for m in &mut workspace.mounts {
+        if let Some(host) = check(
             "mount",
             m.config_source(),
             m.resolved_host_path(repo_root),
             m.access(),
-        )?;
+        )? {
+            m.set_host_path(host);
+        }
     }
-    for (name, sc) in &cfg.sidecars {
+    for (name, sc) in &mut cfg.sidecars {
         let what = format!("sidecar {name:?} mount");
-        for m in &sc.mounts {
-            check(
+        for m in &mut sc.mounts {
+            if let Some(host) = check(
                 &what,
                 m.config_source(),
                 m.resolved_host_path(repo_root),
                 m.access(),
-            )?;
+            )? {
+                m.set_host_path(host);
+            }
+        }
+    }
+    drop(check);
+    Ok(pinned)
+}
+
+/// Refuse a launch whose pinned mount no longer resolves to the path the guard
+/// validated. Run right before the container starts, after the image work that
+/// can take minutes: a symlink swap is already defeated by the pin, but an
+/// agent replacing a parent directory is seen here.
+pub(crate) fn recheck_pinned_mounts(pinned: &[PinnedMount]) -> Result<()> {
+    for p in pinned {
+        let now = canonical_or_normalized(&p.host);
+        if now != p.host {
+            return Err(OutrigError::Configuration(format!(
+                "refusing {} {} declared in {}: it now resolves to {}, so a component of it \
+                 was replaced after it was checked",
+                p.what,
+                p.host.display(),
+                p.source.display(),
+                now.display()
+            )));
         }
     }
     Ok(())
@@ -1045,7 +1098,7 @@ mod tests {
         assert!(!got.starts_with(root.join("cache")));
     }
 
-    /// `refuse_repo_declared_mounts_with` for a repo config, under `root`,
+    /// `pin_repo_declared_mounts_with` for a repo config, under `root`,
     /// declaring one mount of `host`, against a `global` config path and no
     /// home rule. The refusal's text, if there is one.
     fn refusal(root: &Path, host: &Path, access: &str, global: &Path) -> Option<String> {
@@ -1061,10 +1114,80 @@ mod tests {
             ),
         )
         .unwrap();
-        let cfg = Config::load_unvalidated(&repo, None).unwrap();
-        refuse_repo_declared_mounts_with(&cfg, &repo, None, Some(global))
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(global))
             .err()
             .map(|e| e.to_string())
+    }
+
+    /// A repo config declaring one read-write mount of `host`, loaded under
+    /// `root`, and the pin of it against a global config path.
+    fn pin(root: &Path, host: &Path, global: &Path) -> (Config, Vec<PinnedMount>) {
+        let repo = root.join("repo");
+        let file = repo_config_path(&repo);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            format!(
+                "[[workspace.mounts]]\nhost-path = \"{}\"\ncontainer-path = \"/g\"\n",
+                host.display()
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::load_unvalidated(&repo, None).unwrap();
+        let pinned = pin_repo_declared_mounts_with(&mut cfg, &repo, None, Some(global)).unwrap();
+        (cfg, pinned)
+    }
+
+    /// Pinning installs the canonical bytes, and the bind renders them through
+    /// `display()`: a target whose name is not UTF-8 would be mounted as its
+    /// U+FFFD spelling, which a repo can make a link to home. Refused.
+    #[test]
+    fn a_repo_mount_resolving_to_a_non_utf8_path_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let odd = root.join(OsStr::from_bytes(b"odd\xff"));
+        fs::create_dir_all(&odd).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&odd, &link).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+
+        let err = refusal(&root, &link, "read-only", &global).expect("non-UTF-8 target");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    /// The path the guard validated is the path that is mounted: a symlink
+    /// swapped after the check cannot redirect it, and a replaced component
+    /// is refused at start (#604).
+    #[test]
+    fn a_pinned_repo_mount_survives_a_symlink_swap_and_refuses_a_replaced_parent() {
+        let tmp = tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (safe, other) = (root.join("safe"), root.join("other"));
+        fs::create_dir_all(&safe).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        let global = root.join("conf/outrig/config.toml");
+
+        let (cfg, pinned) = pin(&root, &link, &global);
+        let repo = root.join("repo");
+        assert_eq!(cfg.workspace.mounts[0].resolved_host_path(&repo), safe);
+        recheck_pinned_mounts(&pinned).unwrap();
+
+        // The symlink now points elsewhere; the pin still names `safe`.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(cfg.workspace.mounts[0].resolved_host_path(&repo), safe);
+        recheck_pinned_mounts(&pinned).unwrap();
+
+        // The pinned directory itself is replaced by a link elsewhere.
+        fs::remove_dir(&safe).unwrap();
+        std::os::unix::fs::symlink(&other, &safe).unwrap();
+        let err = recheck_pinned_mounts(&pinned).unwrap_err().to_string();
+        assert!(err.contains(&other.display().to_string()), "{err}");
     }
 
     /// How a refusal names a directory the global config path is looked up
