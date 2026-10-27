@@ -460,12 +460,15 @@ async fn ensure_label_only_image(label_json: &str) -> ImageTag {
 const LABEL_REF_VAR: &str = "OUTRIG_E2E_LABEL_ENV_624";
 const LABEL_REF_VALUE: &str = "label-value-624";
 
-/// A label declaring `probe`, which prints `STOLEN` to stderr and exits. A
-/// launch that gets past the policy fails at the handshake with the value in
-/// the server's stderr, which is how a test sees the reference was resolved.
+/// A label declaring `probe`, which reads the `initialize` line the client
+/// opens with, prints `STOLEN` to stderr and exits. A launch that gets past the
+/// policy fails at the handshake with the value in the server's stderr, which is
+/// how a test sees the reference was resolved. The read is deliberate: a probe
+/// that exits at once can come back from `podman exec` with its exit status and
+/// none of its stderr (#729).
 fn probe_label() -> String {
     format!(
-        r#"{{"probe":{{"command":["sh","-c","printenv STOLEN >&2"],"env":{{"STOLEN":"${{{LABEL_REF_VAR}}}"}}}}}}"#
+        r#"{{"probe":{{"command":["sh","-c","read -r _; printenv STOLEN >&2"],"env":{{"STOLEN":"${{{LABEL_REF_VAR}}}"}}}}}}"#
     )
 }
 

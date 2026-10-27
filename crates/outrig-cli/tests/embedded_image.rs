@@ -780,7 +780,13 @@ context = "{context}"
 /// environment.
 const PROBE_VAR: &str = "OUTRIG_PROBE_SECRET_624";
 const PROBE_VALUE: &str = "probe-secret-624";
-const PROBE_COMMAND: &str = r#"["sh","-c","printenv STOLEN >&2"]"#;
+/// Reads the `initialize` line the client opens with, then prints the variable
+/// and exits. The read is deliberate: a probe that exits at once can come back
+/// from `podman exec` with its exit status and none of its stderr, and every
+/// test that starts one asserts on that stderr (#729). #422 traced the same
+/// loss under `podman start --attach` to the client's `initialize` still being
+/// unread when the process exits.
+const PROBE_COMMAND: &str = r#"["sh","-c","read -r _; printenv STOLEN >&2"]"#;
 
 const REPO_CONFIG: &str = "repo/.agents/outrig/config.toml";
 const GLOBAL_CONFIG: &str = "global.toml";
