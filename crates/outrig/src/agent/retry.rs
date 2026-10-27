@@ -547,7 +547,10 @@ impl<M: CompletionModel> RetryingModel<M> {
     /// One completion from the inner model, and the attempt it settled, once
     /// recorded: with the usage rig gave its completion, or -- when rig could
     /// make none -- the usage the body reported, and why not. An [`empty_turn`]
-    /// is the completion it comes back as, in place of rig's error.
+    /// is the completion it comes back as, in place of rig's error; any other
+    /// body rig rejected has the finish reason it names put first in that
+    /// error, since rig's own words say only what it could not find, and every
+    /// retry line, event and round error after this one is made from it.
     async fn attempt(
         &self,
         request: CompletionRequest,
@@ -557,10 +560,14 @@ impl<M: CompletionModel> RetryingModel<M> {
     ) {
         let settling = self.retries.slot.awaiting();
         let mut outcome = self.inner.completion(request).await;
-        if matches!(outcome, Err(CompletionError::ResponseError(_)))
-            && let Some(empty) = settling.body().and_then(|body| empty_turn(&body))
+        if let Err(CompletionError::ResponseError(message)) = &mut outcome
+            && let Some(body) = settling.body()
         {
-            outcome = Ok(empty);
+            if let Some(empty) = empty_turn(&body) {
+                outcome = Ok(empty);
+            } else if let Some(reason) = body_finish_reason(&body) {
+                *message = format!("finish reason {reason}: {message}");
+            }
         }
         let ids = settling.settle(&outcome);
         (outcome, ids)

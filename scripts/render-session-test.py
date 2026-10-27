@@ -557,6 +557,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "max_tokens": 1,
                 "error": "e",
                 "usage": None,
+                "finish_reason": "content_filter",
             },
             a,
         ),
@@ -587,6 +588,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 "max_tokens": None,
                 "error": None,
                 "usage": usage,
+                "finish_reason": "stop",
             },
             a,
         ),
@@ -1122,6 +1124,32 @@ class RenderSession(unittest.TestCase):
 
         self.assertIn("estimate scale: 1.126x", scaled(1.126))
         self.assertNotIn("estimate scale", scaled(1.0))
+
+    def test_an_attempt_says_it_failed_and_why_the_provider_stopped(self) -> None:
+        attempt = {
+            "call_id": 1,
+            "attempt_id": 2,
+            "model": "m",
+            "identifier": "i",
+            "max_tokens": 1,
+            "error": "unusable response (finish reason content_filter: empty)",
+            "usage": None,
+            "finish_reason": "content_filter",
+        }
+        html = self.page(ordinary() + [("model.attempt", attempt)])
+        self.assertIn(
+            "failed: request 2 of call 1: m (i), max tokens 1 -- finish reason content_filter",
+            html,
+        )
+        self.assertIn(
+            '<div class="label">error</div><pre>unusable response (finish reason content_filter',
+            html,
+        )
+
+    def test_a_field_its_handler_does_not_read_is_still_shown(self) -> None:
+        retry = {"model": "m", "attempt": 1, "delay": 1.0, "error": "e", "novel": "it says"}
+        html = self.page(ordinary() + [("model.retry", retry)])
+        self.assertIn("<summary>novel</summary><pre>it says</pre>", html)
 
     def test_an_unknown_type_is_shown_as_it_is(self) -> None:
         html = self.page(ordinary() + [("something.new", {"what": "it says"})])

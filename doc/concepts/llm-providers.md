@@ -492,7 +492,9 @@ not retried: the round ends with an empty reply and no error, keeps the Python i
 nothing to the conversation for the empty turn. A reply that is empty for any other reason, such
 as `length` or `content_filter`, or that names none, is still retried and then fails the round.
 So is one with anything in it the agent cannot use, such as a refusal, whatever its finish reason.
-The event log's `model.attempt` records the finish reason either way.
+The event log's `model.attempt` records the finish reason either way, and the error of a reply
+OutRig could not use leads with it -- `finish reason content_filter: ...` -- in each retry line,
+each move to the next model, and the round's failure.
 
 Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
 model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that

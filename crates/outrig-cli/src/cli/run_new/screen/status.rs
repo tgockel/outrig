@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::facts::{Fact, Phase, cut};
 
-/// How many characters of a retried call's error the line shows.
+/// How many characters of a retried or moved call's error the line shows.
 const ERROR_MAX: usize = 60;
 
 /// How many characters of what the model said the line shows.
@@ -23,9 +23,9 @@ pub(super) struct Status {
     model: Option<String>,
     /// The submission running, and since when.
     running: Option<(u64, Instant)>,
-    /// A call that failed and waits to be tried again: its model, when, and
-    /// why it failed.
-    retry: Option<(String, Instant, String)>,
+    /// A call that failed, until a request settles, another call starts, or
+    /// the round moves on.
+    failed: Option<Failed>,
     tokens: u64,
     /// The user's messages the agent has yet to take; `None` once a gap in
     /// the events may have hidden one being posted or taken.
@@ -37,6 +37,23 @@ pub(super) struct Status {
     said: Option<String>,
     /// Whether the agent has sent the user anything since the round started.
     sent: bool,
+}
+
+/// A failed call, as the line says it.
+#[derive(Debug)]
+enum Failed {
+    /// It waits to be tried again on `model` at `at`.
+    Retrying {
+        model: String,
+        at: Instant,
+        error: String,
+    },
+    /// Call `call` moved to another model from `from`.
+    Moved {
+        from: String,
+        error: String,
+        call: u64,
+    },
 }
 
 /// The status line's parts: what is shown, and whether the session is busy,
@@ -53,7 +70,7 @@ impl Default for Status {
             phase: Phase::Ready,
             model: None,
             running: None,
-            retry: None,
+            failed: None,
             tokens: 0,
             waiting: Some(0),
             still_running: None,
@@ -74,7 +91,7 @@ impl Status {
                     self.running = None;
                 }
                 if *phase != Phase::Model {
-                    self.retry = None;
+                    self.failed = None;
                 }
             }
             Fact::AgentStarted { model } => self.model = Some(model.clone()),
@@ -85,7 +102,7 @@ impl Status {
             }
             Fact::Submitted { exec, .. } => {
                 self.running = Some((*exec, now));
-                self.retry = None;
+                self.failed = None;
             }
             Fact::Completed { exec, .. } => {
                 if self.running.is_some_and(|(running, _)| running == *exec) {
@@ -97,17 +114,37 @@ impl Status {
                 delay,
                 error,
             } => {
-                let error = error.lines().next().unwrap_or_default();
-                self.retry = Some((model.clone(), now + *delay, cut(error, ERROR_MAX)));
+                self.failed = Some(Failed::Retrying {
+                    model: model.clone(),
+                    at: now + *delay,
+                    error: first_line(error),
+                });
             }
-            Fact::Failover { to: model } | Fact::Calling { model } => {
+            Fact::Failover {
+                from,
+                to,
+                error,
+                call,
+            } => {
+                self.model = Some(to.clone());
+                self.failed = Some(Failed::Moved {
+                    from: from.clone(),
+                    error: first_line(error),
+                    call: *call,
+                });
+            }
+            Fact::Calling { model, call } => {
                 self.model = Some(model.clone());
-                self.retry = None;
+                // The model a call moved to is sent that same call.
+                if !matches!(&self.failed, Some(Failed::Moved { call: moved, .. }) if moved == call)
+                {
+                    self.failed = None;
+                }
             }
-            Fact::Attempted => self.retry = None,
+            Fact::Attempted => self.failed = None,
             Fact::RoundEnded { tokens, .. } => {
                 self.tokens += tokens.unwrap_or(0);
-                self.retry = None;
+                self.failed = None;
                 self.said = None;
             }
             Fact::Spent(tokens) => {
@@ -168,17 +205,20 @@ impl Status {
                 )),
                 None => parts.push("Python running".to_string()),
             },
-            Phase::Model => match &self.retry {
-                Some((model, at, error)) if *at > now => parts.push(format!(
-                    "{model} failed ({error}); retrying in {}",
-                    elapsed(at.saturating_duration_since(now))
-                )),
-                _ => parts.push(match (&self.said, &self.model) {
-                    (Some(said), _) => cut(&said.split_whitespace().collect::<Vec<_>>().join(" "), SAID_MAX),
-                    (None, Some(model)) => format!("{model} is working"),
-                    (None, None) => "the model is working".to_string(),
-                }),
-            },
+            Phase::Model => {
+                match &self.failed {
+                    Some(Failed::Retrying { model, at, error }) if *at > now => {
+                        parts.push(format!(
+                            "{model} failed ({error}); retrying in {}",
+                            elapsed(at.saturating_duration_since(now))
+                        ));
+                    }
+                    _ => parts.push(self.working()),
+                }
+                if let Some(Failed::Moved { from, error, .. }) = &self.failed {
+                    parts.push(format!("moved from {from} ({error})"));
+                }
+            }
             Phase::Ready => {
                 parts.push("ready".to_string());
                 if let Some(running) = &self.still_running {
@@ -199,6 +239,24 @@ impl Status {
             busy: self.busy(),
         }
     }
+
+    /// What the model is doing while no retry waits: the latest thing it
+    /// said, or that it is working.
+    fn working(&self) -> String {
+        match (&self.said, &self.model) {
+            (Some(said), _) => {
+                let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+                cut(&said, SAID_MAX)
+            }
+            (None, Some(model)) => format!("{model} is working"),
+            (None, None) => "the model is working".to_string(),
+        }
+    }
+}
+
+/// The first line of a failed call's `error`, cut to what the line shows.
+fn first_line(error: &str) -> String {
+    cut(error.lines().next().unwrap_or_default(), ERROR_MAX)
 }
 
 /// `duration` as the screen shows it: `3.2s`, then `1m05s`.
@@ -340,6 +398,7 @@ mod tests {
         status.apply(
             &Fact::Calling {
                 model: "sonnet".into(),
+                call: 2,
             },
             now,
         );
@@ -348,22 +407,53 @@ mod tests {
         assert_eq!(status.shown(now).text, "sonnet is working");
     }
 
-    /// A failover names the model now called, and the next call, made to
-    /// the first model again, names that one.
+    /// A failover names the model now called, and the one it moved from and
+    /// why, while that model is sent the call and until it answers; the next
+    /// call, made to the first model again, names that one.
     #[test]
     fn the_line_names_the_model_each_call_is_made_to() {
         let now = Instant::now();
+        let failover = Fact::Failover {
+            from: "a".into(),
+            to: "b".into(),
+            error: "ResponseError: finish reason content_filter: Response contained no message\n..."
+                .into(),
+            call: 1,
+        };
+        let moved = "b is working · moved from a (ResponseError: finish reason content_filter: \
+                     Response contai...)";
         let mut status = after(
             &[
                 Fact::AgentStarted { model: "a".into() },
                 Fact::Phase(Phase::Model),
-                Fact::Calling { model: "a".into() },
-                Fact::Failover { to: "b".into() },
+                Fact::Calling {
+                    model: "a".into(),
+                    call: 1,
+                },
+                failover.clone(),
             ],
             now,
         );
+        assert_eq!(status.shown(now).text, moved);
+        // The chain sends the call it moved to the next model.
+        status.apply(
+            &Fact::Calling {
+                model: "b".into(),
+                call: 1,
+            },
+            now,
+        );
+        assert_eq!(status.shown(now).text, moved);
+        status.apply(&Fact::Attempted, now);
         assert_eq!(status.shown(now).text, "b is working");
-        status.apply(&Fact::Calling { model: "a".into() }, now);
+        status.apply(&failover, now);
+        status.apply(
+            &Fact::Calling {
+                model: "a".into(),
+                call: 2,
+            },
+            now,
+        );
         assert_eq!(status.shown(now).text, "a is working");
     }
 

@@ -178,6 +178,27 @@ def key(value: object) -> int | str:
     return n if n is not None else text(value)
 
 
+class Read(dict):
+    """An event's `data`, noting each field a handler reads through `get`, so the ones it never
+    read are still shown."""
+
+    def __init__(self, data: dict) -> None:
+        super().__init__(data)
+        self.read: set[str] = set()
+
+    def get(self, name: str, default: object = None) -> object:  # type: ignore[override]
+        self.read.add(name)
+        return super().get(name, default)
+
+    def leave(self, *names: str) -> None:
+        """Fields the handler leaves off its row on purpose, shown elsewhere."""
+        self.read.update(names)
+
+    def unread(self) -> list[Part]:
+        """A collapsed part for each field no handler read, named for it."""
+        return [Part(name, text(value)) for name, value in self.items() if name not in self.read]
+
+
 def first_line(value: str, width: int = 80) -> str:
     line = value.strip().split("\n", 1)[0]
     more = len(line) > width or "\n" in value.strip()
@@ -356,8 +377,8 @@ def turn_list(chosen: object) -> str:
 
 
 class Builder:
-    """The record, read in one pass. Each `on_<type>` handler is given the event's `data`; its
-    type, time, and agent are on `self` while it is handled."""
+    """The record, read in one pass. Each `on_<type>` handler is given the event's `data`, as a
+    `Read`; its type, time, and agent are on `self` while it is handled."""
 
     def __init__(self) -> None:
         self.blocks: list[Block] = []
@@ -375,6 +396,8 @@ class Builder:
         self.kind = ""
         self.time = ""
         self.subject = ""
+        # The row the event being handled last added, for the fields its handler did not read.
+        self.last: Item | None = None
 
     # -- blocks -------------------------------------------------------------
 
@@ -419,6 +442,7 @@ class Builder:
     def add(self, summary: str, **kw: object) -> Item:
         item = Item(self.time, self.kind, summary, subject=self.subject, **kw)  # type: ignore[arg-type]
         self.here().items.append(item)
+        self.last = item
         return item
 
     # -- correlation --------------------------------------------------------
@@ -442,6 +466,8 @@ class Builder:
                 text(d.get("from")),
                 text(d.get("to")),
             )
+        # Its sending names them, and a taking or a refusal repeats them.
+        d.leave("channel", "from", "to")
         return m
 
     def claim(self, source: str) -> Exec | None:
@@ -475,10 +501,20 @@ class Builder:
         data = obj(record.get("data"))
         if handler is None:
             self.add("", parts=[Part("data", text(data))])
-        else:
-            handler(data)
+            return
+        # What the handler did not read is shown on its row, so no field is left out unseen.
+        self.last = None
+        data = Read(data)
+        handler(data)
+        if unread := data.unread():
+            if self.last is None:
+                self.add("", parts=unread)
+            else:
+                self.last.parts = [*self.last.parts, *unread]
 
     def on_model_instructions(self, d: dict) -> None:
+        # agent.started or agent.spawned names the same model.
+        d.leave("model")
         tools = objs(d.get("tools"))
         max_tokens = text(d.get("max_tokens")) or "none sent"
         if self.subject in MAIN:
@@ -607,19 +643,23 @@ class Builder:
             f"{text(d.get('model'))}: attempt {text(d.get('attempt'))} again after "
             f"{seconds(d.get('delay'))}"
         )
-        self.add(summary, parts=[Part("error", text(d.get("error")))])
+        self.add(summary, parts=[Part("error", text(d.get("error")), True)])
 
     def on_model_attempt(self, d: dict) -> None:
+        failed = d.get("error") is not None
         summary = (
+            f"{'failed: ' if failed else ''}"
             f"request {text(d.get('attempt_id'))} of call {text(d.get('call_id'))}: "
             f"{text(d.get('model'))} ({text(d.get('identifier'))}), max tokens "
             f"{text(d.get('max_tokens')) or 'none sent'}"
         )
+        if d.get("finish_reason") is not None:
+            summary += f" -- finish reason {text(d.get('finish_reason'))}"
         if d.get("usage") is None:
             summary += " -- no usage reported"
         else:
             summary += f" -- {usage_summary(d.get('usage'))}"
-        parts = [Part("error", text(d.get("error")))] if d.get("error") is not None else []
+        parts = [Part("error", text(d.get("error")), True)] if failed else []
         self.add(summary, parts=parts)
 
     def on_model_usage_replaced(self, d: dict) -> None:
@@ -636,7 +676,7 @@ class Builder:
 
     def on_model_failover(self, d: dict) -> None:
         summary = f"{text(d.get('from'))} -> {text(d.get('to'))}"
-        self.add(summary, parts=[Part("error", text(d.get("error")))])
+        self.add(summary, parts=[Part("error", text(d.get("error")), True)])
 
     def on_model_call(self, d: dict) -> None:
         block = self.within(d.get("round"))
@@ -711,6 +751,8 @@ class Builder:
             self.add(f"exec {x.id}: the session was closed to new work", href=link(x.anchor))
             return
         holder = self.exec(d.get("holder"))
+        # The reason says only that an execution held the interpreter, which this names.
+        d.leave("reason")
         x.error = (
             f"Not run: exec {holder.id} held the interpreter. "
             "Its source is in the turn that submitted it."

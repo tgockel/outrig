@@ -65,14 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With stdin and stdout both the terminal, what you send and what the agent sends you print into
   the terminal's scrollback, and below them a status line says what the session is doing -- the
   model working -- the latest thing it said, once it has said anything -- Python running and
-  for how long, a retry, your messages the agent has yet to
+  for how long, a retry, the model a call moved from and why, your messages the agent has yet to
   read, the tokens spent -- above an input box with line editing, in-memory recall, Alt-Enter for
   a new line, and a paste sent as one message. The model's own text, each submission and what it
-  printed, retries, and log lines open in a view of their own on Ctrl-O, or print in the
-  conversation with `-v`. Ctrl-C clears what is typed before it interrupts anything; Ctrl-Z
-  suspends; SIGTERM and SIGHUP put the terminal back before they end the process, as they did
-  before. Piped or redirected stdin or stdout, another terminal, or `TERM=dumb` keep the plain
-  lines `run-new` has always written.
+  printed, retries, a child agent's failed round, and log lines open in a view of their own on
+  Ctrl-O, or print in the conversation with `-v`; an event of a kind it has no view of shows
+  what says why it failed, such as a traceback, whole. Ctrl-C clears what is typed before it
+  interrupts anything; Ctrl-Z suspends; SIGTERM and SIGHUP put the terminal back before they end
+  the process, as they did before. Piped or redirected stdin or stdout, another terminal, or
+  `TERM=dumb` keep the plain lines `run-new` has always written, which also carry what the screen
+  puts in the conversation, such as why a bindings process exited.
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
   ignores it, saying so in one line at startup.
@@ -97,7 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a session id as `outrig logs` does, or a session directory. Its `--host [[HOST]:[PORT]]`
   serves that page until Ctrl-C instead of writing it, printing the URL it bound -- the loopback
   on a port the kernel picks unless the argument says otherwise -- and building the page again
-  for each request, so a reload follows a session still being written.
+  for each request, so a reload follows a session still being written. Every field of an event
+  is on the page: one its row does not otherwise show is a collapsed part named for it. A failed
+  model request says so, with its error open and the finish reason the provider named.
 - **`run-new` hosts `[bindings.<name>]`.** Each declared binding's packages are installed, and one
   process on the host that holds every binding is started before the agent's interpreter
   (`installing binding packages`, `starting bindings`); the agent is told each name and description,

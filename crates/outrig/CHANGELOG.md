@@ -109,14 +109,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason `stop` or `end_turn`: that is a model with nothing to add, most often right after it sent
   the user a message, so the round ends with an empty reply, keeping what it ran, rather than
   failing. A reply that ended for any other reason, or none, or that holds anything the agent
-  cannot use, such as a refusal, is still retried. An alias naming several models resolves to each
-  this build can reach, in order, and a call that still fails moves to the next, starting again at
-  the first on every call. Each model a call goes to is sent a view assembled for its own window,
-  and carries its own reply ceiling, so a turn too large for the first model's window goes to the
-  next whose window holds it, and the round ends as above only when none does. A call to an
-  Anthropic model leaves out reasoning another provider wrote, which has no signature for Anthropic
-  to take it back with. When every model has failed, the round fails with each one's reason,
-  keeping what it ran, as any failed round does.
+  cannot use, such as a refusal, is still retried, and its error leads with the finish reason the
+  provider named, as in `finish reason content_filter: ...`, so each retry, each move to another
+  model and the round's failure say why it ended rather than only that it was empty. An alias naming
+  several models resolves to each this build can reach, in order, and a call that still fails moves
+  to the next, starting again at the first on every call. Each model a call goes to is sent a view
+  assembled for its own window, and carries its own reply ceiling, so a turn too large for the first
+  model's window goes to the next whose window holds it, and the round ends as above only when none
+  does. A call to an Anthropic model leaves out reasoning another provider wrote, which has no
+  signature for Anthropic to take it back with. When every model has failed, the round fails with
+  each one's reason, keeping what it ran, as any failed round does.
 
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,

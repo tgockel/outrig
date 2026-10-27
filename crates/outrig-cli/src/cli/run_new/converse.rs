@@ -734,26 +734,24 @@ impl Terminal<'_> {
     }
 
     /// What the terminal shows of one of the session's events. The line mode
-    /// shows each of the main agent's submissions as it starts, and a note
-    /// when some were not shown; a child's code runs under the child's own
-    /// subject, and is left to the event log. The screen reads them all.
+    /// shows each of the main agent's submissions as it starts, what the
+    /// screen would put in the conversation, and a note when some were not
+    /// shown; a child's code runs under the child's own subject, and is left
+    /// to the event log. The screen reads them all.
     fn event(&self, received: Received) {
         let out = match self.view {
             Frontend::Lines(out) => out,
             Frontend::Screen(screen) => return screen.event(&received),
         };
+        if let Some(line) = screen::conversation_line(&received) {
+            self.note(&line);
+        }
         match received {
             Received::Event(event) => {
                 if let Payload::ExecSubmitted { source, .. } = &event.payload
                     && event.subject.as_ref().map(|s| s.as_str()) == Some(MAIN_AGENT)
                 {
                     out.text(render_submission(source));
-                }
-                // What discovery left out or warned of, as the session starts.
-                if let Payload::SkillDiscovered { diagnostics, .. } = &event.payload {
-                    for diagnostic in diagnostics {
-                        self.note(&format!("[outrig] {}", diagnostic.message));
-                    }
                 }
             }
             Received::Missed(missed) => {

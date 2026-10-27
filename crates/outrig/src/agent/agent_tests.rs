@@ -4369,7 +4369,11 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     );
     shut_down(agent).await;
 
+    // Every text that says why names the provider's reason, not only rig's
+    // "empty".
+    let named = format!("finish reason {finish_reason}: ");
     assert!(ran, "{err}");
+    assert!(err.contains(&named), "{err}");
     assert_eq!(submissions(&mut submitted), ["print('ran')"]);
     assert_eq!(
         mock_http::drain(&mut requests).len(),
@@ -4377,7 +4381,8 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         "the call, the empty reply, and its two retries"
     );
     let records = events::recorded(dir.path());
-    assert_eq!(events::of_kind(&records, "model.retry").len(), 2);
+    let retries = events::of_kind(&records, "model.retry");
+    assert_eq!(retries.len(), 2);
     let attempts = events::of_kind(&records, "model.attempt");
     for attempt in &attempts[1..] {
         assert!(
@@ -4389,7 +4394,12 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
         assert_eq!(attempt["finish_reason"], finish_reason);
     }
     assert!(events::of_kind(&records, "model.round.completed").is_empty());
-    assert_eq!(events::of_kind(&records, "model.round.failed").len(), 1);
+    let failed = events::of_kind(&records, "model.round.failed");
+    assert_eq!(failed.len(), 1);
+    for event in retries.iter().chain(&attempts[1..]).chain(&failed) {
+        let error = event["error"].as_str().unwrap_or_default();
+        assert!(error.contains(&named), "{event}");
+    }
 }
 
 #[tokio::test]

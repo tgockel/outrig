@@ -9,18 +9,35 @@
 //! The screen is the main agent's. A child agent's own work -- its rounds, its
 //! code and its model calls -- is left to the event log, as the line mode
 //! leaves its code, and what it spent is in the main agent's rounds; its
-//! launch and the requests made of it are shown as unfamiliar kinds are.
+//! launch and the requests made of it are shown as unfamiliar kinds are, and
+//! a round of its that failed is shown with its error. Its retries and moves
+//! to another model are in the library's log lines, as the main agent's are.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use outrig::harness::event::{
     Abandoned, ExecStatus, Payload, ProbeVerdict, Received, Refusal, SessionState, Subject, Usage,
 };
 
+use serde_json::Value;
+
 use super::super::converse::MAIN_AGENT;
 
 /// How many characters of an unfamiliar event's JSON the detail view shows.
 const OTHER_MAX: usize = 400;
+
+/// The fields of an unfamiliar event that say what went wrong: shown whole,
+/// past [`OTHER_MAX`], since a traceback cut short is no use.
+const WHY: &[&str] = &[
+    "error",
+    "reason",
+    "detail",
+    "exception",
+    "traceback",
+    "message",
+    "problems",
+];
 
 /// The channel the agent and the user talk on, and the user's end of it, as
 /// the session's events name them.
@@ -44,10 +61,12 @@ pub(super) enum Fact {
     AgentStarted {
         model: String,
     },
-    /// A model call was made to `model`: the first of a round's, a retry's
-    /// failover, or one after it, back at the first.
+    /// Model call `call` was made to `model`: the first of a round's, a
+    /// retry's failover, which keeps the call's id, or one after it, back at
+    /// the first.
     Calling {
         model: String,
+        call: u64,
     },
     RoundStarted {
         round: u32,
@@ -79,9 +98,13 @@ pub(super) enum Fact {
         delay: Duration,
         error: String,
     },
-    /// A call moved to the model `to`; logged, as a retry is.
+    /// Call `call` failed on the model `from` for `error`, and moved to the
+    /// model `to`; logged, as a retry is.
     Failover {
+        from: String,
         to: String,
+        error: String,
+        call: u64,
     },
     /// A request to a provider ended.
     Attempted,
@@ -123,16 +146,30 @@ pub(super) enum Fact {
 pub(super) fn fact(received: &Received) -> Option<Fact> {
     match received {
         Received::Event(event) => match event.subject.as_ref().map(Subject::as_str) {
-            Some(child) if child != MAIN_AGENT => match from_payload(&event.payload)? {
-                Fact::Other { title, data } => Some(Fact::Other {
-                    title: format!("{title} · {child}"),
-                    data,
-                }),
-                _ => None,
-            },
+            Some(child) if child != MAIN_AGENT => of_child(child, from_payload(&event.payload)?),
             _ => from_payload(&event.payload),
         },
         Received::Missed(missed) => Some(Fact::Missed(*missed)),
+        _ => None,
+    }
+}
+
+/// What the screen shows of `fact`, which the child agent `child` is the
+/// subject of: an unfamiliar kind, and a round that failed, each naming it.
+fn of_child(child: &str, fact: Fact) -> Option<Fact> {
+    match fact {
+        Fact::Other { title, data } => Some(Fact::Other {
+            title: format!("{title} · {child}"),
+            data,
+        }),
+        Fact::RoundEnded {
+            round,
+            error: Some(error),
+            ..
+        } => Some(Fact::Note {
+            text: format!("{child}: round {round}'s model calls failed: {error}"),
+            inline: false,
+        }),
         _ => None,
     }
 }
@@ -252,9 +289,21 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
             delay: *delay,
             error: error.clone(),
         },
-        Payload::ModelFailover { to, .. } => Fact::Failover { to: to.clone() },
+        Payload::ModelFailover {
+            from,
+            to,
+            error,
+            call_id,
+            ..
+        } => Fact::Failover {
+            from: from.clone(),
+            to: to.clone(),
+            error: error.clone(),
+            call: call_id.get(),
+        },
         Payload::ModelCall(call) => Fact::Calling {
             model: call.budget.model.clone(),
+            call: call.call_id.get(),
         },
         Payload::ModelAttempt(_) => Fact::Attempted,
         Payload::ModelRoundCompleted {
@@ -356,15 +405,37 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
         Payload::ModelInstructions { .. }
         | Payload::TurnCommitted { .. }
         | Payload::ModelUsageReplaced { .. }
-        | Payload::ModelUsageRefused { .. }
         | Payload::InventoryObserved { .. }
         | Payload::SessionReport { .. } => return None,
         other => Fact::Other {
             title: other.kind().to_string(),
-            data: cut(&serde_json::to_string(other).unwrap_or_default(), OTHER_MAX),
+            data: other_data(serde_json::to_value(other).unwrap_or_default()),
         },
     };
     Some(fact)
+}
+
+/// An unfamiliar event's `data` as the detail view shows it: its JSON, cut to
+/// [`OTHER_MAX`], less the fields that say what went wrong, which follow it
+/// whole, one to a line.
+fn other_data(mut data: Value) -> String {
+    let mut why = String::new();
+    if let Some(fields) = data.as_object_mut() {
+        for name in WHY {
+            let text = match fields.get(*name) {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(items)) if items.iter().all(Value::is_string) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+            fields.remove(*name);
+            let _ = write!(why, "\n{name}: {text}");
+        }
+    }
+    cut(&data.to_string(), OTHER_MAX) + &why
 }
 
 /// What a usage record says was spent: its total, or the sum of its parts
@@ -386,6 +457,48 @@ pub(super) fn cut(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What says why an unfamiliar event failed is shown whole, however long,
+    /// and the rest is cut as before.
+    #[test]
+    fn an_unfamiliar_events_failure_is_shown_whole() {
+        let traceback = format!("Traceback (most recent call last):\n{}", "  x\n".repeat(200));
+        let shown = other_data(serde_json::json!({
+            "request": 7,
+            "outcome": "raised",
+            "body": "b".repeat(500),
+            "traceback": traceback,
+            "problems": ["too short", "not a list"],
+            "detail": null,
+        }));
+        assert!(shown.ends_with(&format!(
+            "\ntraceback: {traceback}\nproblems: too short\nnot a list"
+        )));
+        assert!(!shown.contains("\ndetail:"), "a field that says nothing stays in the JSON");
+        let (json, _) = shown.split_once('\n').expect("the fields after the JSON");
+        assert!(!json.contains("Traceback"));
+        assert!(json.ends_with("..."), "the rest is still cut: {json}");
+    }
+
+    /// A child's round that failed is shown with its error and the child's
+    /// name; the rest of its rounds are its own.
+    #[test]
+    fn a_childs_failed_round_is_shown() {
+        let ended = |error: Option<&str>| Fact::RoundEnded {
+            round: 2,
+            tokens: Some(10),
+            error: error.map(str::to_string),
+        };
+        assert_eq!(
+            of_child("helper", ended(Some("finish reason content_filter: empty"))),
+            Some(Fact::Note {
+                text: "helper: round 2's model calls failed: finish reason content_filter: empty"
+                    .into(),
+                inline: false,
+            })
+        );
+        assert_eq!(of_child("helper", ended(None)), None);
+    }
 
     #[test]
     fn text_is_cut_by_characters() {

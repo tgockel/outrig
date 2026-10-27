@@ -124,6 +124,15 @@ fn decide(stdin_tty: bool, controlling: bool, term: Option<&str>, stdout_too: bo
     tty_capable(stdin_tty, controlling, term) && stdout_too
 }
 
+/// The line the conversation shows of `received`, if it shows one: what the
+/// line mode prints of the session's events, so its notes are the screen's.
+pub(super) fn conversation_line(received: &Received) -> Option<String> {
+    match facts::fact(received)? {
+        Fact::Note { text, inline: true } => Some(text),
+        _ => None,
+    }
+}
+
 /// What the conversation's loop hands the screen, in the order it happened.
 enum ToScreen {
     /// An entry, and for a message the agent sent, its place in the outbox,
