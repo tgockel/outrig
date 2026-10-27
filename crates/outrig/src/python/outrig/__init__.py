@@ -14,7 +14,8 @@ the configuration it loaded, and `outrig.Session` enters a session the engine st
 Agent code launches a child agent with `runtime.spawn`, and the work it gives one ends with a
 value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(outrig.Request)`.
 `@outrig.agent` declares such work as a typed `async def`, each call of which runs in a child of
-its own: see `help(outrig.agent)`.
+its own: see `help(outrig.agent)`. A subclass of `outrig.Agent` declares a long-lived child
+instead, whose methods marked `@outrig.agent` are its request channels: see `help(outrig.Agent)`.
 
 `outrig.skills` reaches the session's skills, whose code imports as `outrig_skills.<name>`: see
 `help(outrig.skills)`.
@@ -22,6 +23,7 @@ its own: see `help(outrig.agent)`.
 
 from . import schema, skills
 from ._agents import (
+    Agent,
     AgentError,
     AgentLimitReached,
     AgentReleased,
@@ -39,6 +41,7 @@ from ._agents import (
 __all__ = [
     "schema",
     "skills",
+    "Agent",
     "AgentError",
     "AgentLimitReached",
     "AgentReleased",

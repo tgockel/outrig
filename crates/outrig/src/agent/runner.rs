@@ -26,6 +26,12 @@
 //! spent, or a round finds the child's model can never answer, no round opens:
 //! what the child holds open ends instead, and so does anything that arrives
 //! later.
+//!
+//! An agent class instance's child has one round before the rule applies: its
+//! orienting round, which opens as it launches, to get ready in. Requests that
+//! arrive meanwhile are announced as in any round, and its baseline is empty,
+//! so whatever is still open when it ends opens the next round. Its instance's
+//! `ready()` hears when it ended, or why it cannot be had.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +50,8 @@ const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Drive child `id`'s rounds until its registry, or the session, ends.
-/// `spent` says when the session's token budget is spent.
+/// `spent` says when the session's token budget is spent. `instance` is the
+/// agent class instance whose child it is, if it is one.
 pub(crate) async fn run(
     registry: Registry,
     id: String,
@@ -52,11 +59,14 @@ pub(crate) async fn run(
     agent: Agent,
     wake: Arc<Notify>,
     mut spent: watch::Receiver<bool>,
+    instance: Option<u64>,
 ) {
     let mut baseline = Summary::default();
     // Why the child's model can answer nothing, once a round has found so.
     let mut broken: Option<String> = None;
     let mut wait = RETRY_FIRST;
+    // The instance, until its child's orienting round has ended or cannot be had.
+    let mut orienting = instance;
     loop {
         let Some(children) = registry.upgrade() else {
             return;
@@ -76,6 +86,9 @@ pub(crate) async fn run(
             (None, None) => None,
         };
         if let Some((outcome, why)) = ended {
+            if let Some(instance) = orienting.take() {
+                children.oriented(&id, instance, Some((outcome, &why)));
+            }
             for request in children.open(&id) {
                 children.settle(&id, request, outcome, &why);
             }
@@ -85,7 +98,7 @@ pub(crate) async fn run(
             continue;
         }
         let live = children.summary(&id, kind);
-        if live == baseline || live.is_empty() {
+        if orienting.is_none() && (live == baseline || live.is_empty()) {
             if kind == ChildKind::Work
                 && let Some(&submission) = live.taken.first()
             {
@@ -114,6 +127,7 @@ pub(crate) async fn run(
         // Opened before a submission is given, so its taking names this round.
         children.round_opened(&id, agent.history.next_round());
         let (lead, detail) = match kind {
+            _ if orienting.is_some() => (orientation::ORIENTING.to_string(), String::new()),
             ChildKind::Request => (
                 orientation::requests(&children.unread_text(&id), &children.taken(&id)),
                 String::new(),
@@ -172,11 +186,20 @@ pub(crate) async fn run(
         children.round_ended(&id);
         match ended {
             Ok(_) => {
-                baseline = live;
+                // An orienting round's baseline stays empty, so what is open as
+                // it ends opens the next round.
+                match orienting.take() {
+                    Some(instance) => children.oriented(&id, instance, None),
+                    None => baseline = live,
+                }
                 wait = RETRY_FIRST;
             }
             Err(AgentError::Closed(_)) => return,
             Err(AgentError::PromptAfterWork(failed)) => {
+                // Its code ran, so an orienting round has ended all the same.
+                if let Some(instance) = orienting.take() {
+                    children.oriented(&id, instance, None);
+                }
                 drop(children);
                 tracing::warn!(
                     "child agent {id}'s round failed after its code ran; deciding again in \

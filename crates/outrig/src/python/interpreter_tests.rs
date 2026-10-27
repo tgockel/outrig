@@ -6066,6 +6066,701 @@ fn a_declaration_is_digested_from_the_source_that_declared_it() {
     );
 }
 
+// `outrig.Agent`, the interpreter's half: a class is checked as it is made, with no host at all,
+// and an instance holds what is asked of it until its child exists, with the test standing where
+// the host stands.
+
+/// What every agent class case begins with.
+const AGENT_CLASS_HEADER: &str = "import outrig\nfrom dataclasses import dataclass\n";
+
+/// A request method's base, which a case restates or replaces.
+const MARKED_BASE: &str = "class B(outrig.Agent):\n    'doc'\n    @outrig.agent\n    \
+                           async def f(self, x: int) -> int:\n        'd'\n";
+
+/// Each rule an agent class is checked by: the class, and what the `TypeError` its creation
+/// raises says, the member it names among it.
+const AGENT_CLASS_CASES: &[(&str, &str)] = &[
+    (
+        "class A(outrig.Agent):\n    @outrig.agent\n    async def f(self, x: int) -> int:\n        \
+         'd'\n",
+        "A has no docstring",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def f(self, x: int) -> int: \
+         ...\n",
+        "A.f has no docstring",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent(model='fast')\n    \
+         async def f(self, x: int) -> int:\n        'd'\n",
+        "A.f: a request method takes no model=; an instance's child runs on one model, which the \
+         constructor's model= names: A(model=...)",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent(validate=lambda result: [])\n    \
+         async def f(self, x: int) -> int:\n        'd'\n",
+        "A.f: a request method takes no validate=",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def f(self, x) -> int:\n        \
+         'd'\n",
+        "A.f: parameter 'x' has no type annotation",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def f(self, x: set) -> int:\n        \
+         'd'\n",
+        "A.f: parameter 'x' cannot be set",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def f(self, x: int):\n        \
+         'd'\n",
+        "A.f has no return annotation",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    \
+         async def f(self, *xs: int) -> int:\n        'd'\n",
+        "A.f takes *xs",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    \
+         async def f(self, **kw: int) -> int:\n        'd'\n",
+        "A.f takes **kw",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def user(self) -> int:\n        \
+         'd'\n",
+        "A.user: a request channel cannot be named 'user', which is the user channel's",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def release(self) -> int:\n        \
+         'd'\n",
+        "A.release: a request channel cannot be named 'release', which is a member of \
+         outrig.Agent",
+    ),
+    (
+        "{base}class A(B):\n    'doc'\n    @outrig.agent\n    async def f(self, x: str) -> int:\n        \
+         'd'\n",
+        "A.f restates a base class's request channel with another signature",
+    ),
+    (
+        "{base}class A(B):\n    'doc'\n    def f(self):\n        pass\n",
+        "A.f replaces request channel 'f' with an ordinary member",
+    ),
+    (
+        "class B(outrig.Agent):\n    'doc'\n    def f(self):\n        pass\n\
+         class A(B):\n    'doc'\n    @outrig.agent\n    async def f(self, x: int) -> int:\n        \
+         'd'\n",
+        "A.f would make a base class's ordinary member a request channel",
+    ),
+    (
+        "@dataclass\nclass Thing:\n    n: int\n\
+         def other():\n    @dataclass\n    class Thing:\n        m: int\n    return Thing\n\
+         class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def f(self) -> Thing:\n        \
+         'd'\n    @outrig.agent\n    async def g(self) -> other():\n        'd'\n",
+        "A.g use two classes named 'Thing', Thing and other.<locals>.Thing",
+    ),
+    (
+        "class A:\n    'doc'\n    @outrig.agent\n    async def f(self, x: int) -> int:\n        'd'\n",
+        "A.f: @outrig.agent on a method marks a request channel of an outrig.Agent subclass, \
+         and A is not one",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    AFMessage = 1\n    @outrig.agent\n    \
+         async def f(self, x: int, y: int) -> int:\n        'd'\n",
+        "A.f: its request is the dataclass AFMessage, a name A already gives a member of its own",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @outrig.agent\n    async def g(self, x: int) -> int:\n        \
+         'd'\n    @staticmethod\n    @outrig.agent\n    async def f(self, x: int) -> int:\n        \
+         'd'\n",
+        "A.f: a request channel is a method of the instance, which @staticmethod would make it \
+         not; remove @staticmethod",
+    ),
+    (
+        "class A(outrig.Agent):\n    'doc'\n    @classmethod\n    @outrig.agent\n    \
+         async def f(self, x: int) -> int:\n        'd'\n    @outrig.agent\n    \
+         async def g(self, x: int) -> int:\n        'd'\n",
+        "A.f: a request channel is a method of the instance, which @classmethod would make it \
+         not; remove @classmethod",
+    ),
+];
+
+/// An agent class is checked as it is made, by its marks and signatures alone: each rule's
+/// violation raises `TypeError` naming the class and the member, alike for a class declared in a
+/// submission and in a module; and what is not marked, whatever its body, is left alone.
+#[test]
+fn an_agent_class_is_checked_as_it_is_made() {
+    let mut k = Interpreter::start();
+    let source = |case: &str| {
+        format!(
+            "{AGENT_CLASS_HEADER}{}",
+            case.replace("{base}", MARKED_BASE)
+        )
+    };
+    for (n, (case, said)) in AGENT_CLASS_CASES.iter().enumerate() {
+        let result = k.exec(n as u64 + 1, &source(case));
+        let error = text(&result["error"]);
+        assert!(
+            error.contains(&format!("TypeError: {PRIMARY_MODULE}.")) && error.contains(said),
+            "case {n}, in a submission: {error}"
+        );
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (n, (case, _)) in AGENT_CLASS_CASES.iter().enumerate() {
+        std::fs::write(dir.path().join(format!("case_{n}.py")), source(case)).expect("write");
+    }
+    let imported = k.output(
+        100,
+        &py(&format!(
+            r#"
+            import importlib, sys
+            sys.path.insert(0, {dir:?})
+            for n in range({count}):
+                try:
+                    importlib.import_module(f'case_{{n}}')
+                    print(n, 'accepted')
+                except TypeError as e:
+                    print(n, e)
+            "#,
+            dir = dir.path().to_str().expect("a UTF-8 path"),
+            count = AGENT_CLASS_CASES.len(),
+        )),
+    );
+    for (n, (_, said)) in AGENT_CLASS_CASES.iter().enumerate() {
+        let line = imported
+            .lines()
+            .find(|line| line.starts_with(&format!("{n} ")))
+            .unwrap_or_else(|| panic!("no line for case {n} in {imported}"));
+        assert!(
+            line.contains(&format!("case_{n}.")) && line.contains(said),
+            "case {n}, in a module: {line}"
+        );
+    }
+    let left_alone = py(r#"
+        import outrig
+        class Plain(outrig.Agent):
+            "doc"
+            _x: int
+            limit = 3
+            def bar(self) -> int:
+                return self._x
+            async def plain(self):
+                "unmarked, so an ordinary coroutine method"
+                raise AssertionError("never run here")
+            @property
+            def size(self):
+                return 1
+            @outrig.agent
+            async def f(self, x: int) -> int:
+                "marked, and never run"
+                raise AssertionError("never run")
+            @outrig.agent
+            async def g(self, x: int, tags: list[str] = []) -> int:
+                "a default a message could share, made afresh for each"
+        first, second = Plain.PlainGMessage(1), Plain.PlainGMessage(2)
+        print(sorted(Plain._outrig_channels), Plain.limit, first.tags == [],
+              first.tags is not second.tags)
+        class Skipped(Plain):
+            "doc"
+            def __init__(self):
+                pass
+        try:
+            Skipped().f(1)
+        except TypeError as e:
+            print('skipped:', 'super().__init__(**inputs, model=...)' in str(e))
+        "#);
+    assert_eq!(
+        k.output(200, &left_alone),
+        "['f', 'g'] 3 True True\nskipped: True\n"
+    );
+}
+
+/// An agent class is digested from the source that declared it: its module's file, a subclass's
+/// whose body is a docstring alone too; a submission's, through a function its body defined --
+/// none when it defined none, whatever it binds from an earlier submission -- and never a base
+/// class's.
+#[test]
+fn an_agent_class_is_digested_from_the_source_that_declared_it() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let module = format!("{AGENT_CLASS_HEADER}{MARKED_BASE}class A(B):\n    'doc'\n");
+    std::fs::write(dir.path().join("digested.py"), &module).expect("write");
+    k.output(1, "def helper(self):\n    pass\n");
+    let declared = py(&format!(
+        r#"
+        import sys
+        sys.path.insert(0, {dir:?})
+        import digested
+        class Own(digested.B):
+            "doc"
+            def g(self):
+                pass
+        class Bound(digested.B):
+            "doc"
+            h = helper
+        class Bare(digested.B):
+            "doc"
+        for cls in (digested.B, digested.A, Own, Bound, Bare):
+            print(cls._outrig_digest)
+        "#,
+        dir = dir.path().to_str().expect("a UTF-8 path"),
+    ));
+    let (file, submission) = (
+        sha256_hex(module.as_bytes()),
+        sha256_hex(declared.as_bytes()),
+    );
+    assert_eq!(
+        k.output(2, &declared),
+        format!("{file}\n{file}\n{submission}\nNone\nNone\n")
+    );
+}
+
+/// The agent class the instance tests below construct.
+const FOO_AGENT: &str = r#"
+import outrig
+from dataclasses import dataclass
+@dataclass
+class Thing:
+    n: int
+class FooAgent(outrig.Agent):
+    """ROLE foo. {message} and {} stay braces."""
+    @outrig.agent
+    async def fizz(self, message: str) -> Thing:
+        """Count it."""
+        ...
+    @outrig.agent
+    async def buzz(self, foo: int, bar: str = 'x') -> Thing:
+        """Take foo."""
+        ...
+"#;
+
+/// An instance's constructor checks its inputs and returns before the host is asked anything;
+/// what is asked of it before its child exists is held, up to the session's `requests-max`, and
+/// sent in order once the spawn is answered. The spawn names the class, its docstring as written,
+/// each channel's docstring and the generated message type; `ready()` waits for the host's word;
+/// and a release ends the child, naming the requests it ended.
+#[test]
+fn an_instance_holds_what_is_asked_of_it_until_its_child_exists() {
+    let mut k = Interpreter::start();
+    k.send(json!({"t": "limits", "requests_max": 2}));
+    let class = py(FOO_AGENT);
+    k.output(1, &class);
+    let (refused, notices) = k.exec_collecting(PRIMARY, 2, "FooAgent(x=open)");
+    assert!(
+        text(&refused["error"]).contains("TypeError: x is a builtin_function_or_method"),
+        "{refused}"
+    );
+    assert!(notices.is_empty(), "nothing asked: {notices:?}");
+
+    let (said, notices) = k.noted(
+        PRIMARY,
+        3,
+        &py(r#"
+            foo = FooAgent(seed=5)
+            h1 = foo.fizz('a')
+            h2 = foo.buzz(1)
+            try:
+                foo.fizz('c')
+            except outrig.AgentLimitReached as e:
+                print('held limit', 'requests-max' in str(e))
+            print(h1.id < h2.id, h1.status, h2.done())
+            "#),
+    );
+    assert_eq!(said, "held limit True\nTrue waiting (child idle) False\n");
+    let (before, asked) = k.until("agent.spawn", notices);
+    assert!(before.is_empty(), "nothing before the spawn: {before:?}");
+    assert!(
+        asked["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("FooAgent-")),
+        "{asked}"
+    );
+    assert_eq!(asked["prompt"], "ROLE foo. {message} and {} stay braces.");
+    assert_eq!(asked["kind"], "request");
+    assert_eq!(
+        asked["manifest"],
+        json!([{"name": "seed", "type": "int", "preview": "5"}])
+    );
+    assert_eq!(asked["channels"][0]["doc"], "Count it.");
+    assert_eq!(asked["channels"][1]["request_type"], "FooAgentBuzzMessage");
+    let instance = asked["instance"].clone();
+    assert_eq!(instance["module"], PRIMARY_MODULE);
+    assert_eq!(instance["qualname"], "FooAgent");
+    assert_eq!(instance["digest"], sha256_hex(class.as_bytes()));
+
+    k.opened(json!({
+        "t": "open", "agent": "c1", "main": false,
+        "child": {"kind": "request", "spawn": asked["id"], "requests_max": 2},
+    }));
+    k.send(json!({
+        "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": "c1", "requests_max": 2,
+    }));
+    let sent: Vec<Value> = (0..2).map(|_| k.recv()).collect();
+    assert!(
+        sent.iter()
+            .all(|n| n["t"] == "agent.request" && n["child"] == "c1"),
+        "{sent:?}"
+    );
+    assert_eq!(
+        (&sent[0]["channel"], &sent[1]["channel"]),
+        (&json!("fizz"), &json!("buzz")),
+        "in the order they were made"
+    );
+
+    let (said, _) = k.noted(
+        "c1",
+        4,
+        &py(r#"
+            d1 = await runtime.channels['fizz'].receive()
+            d2 = await runtime.channels['buzz'].receive()
+            print(d1.body, type(d2.body).__name__, d2.body.foo, d2.body.bar, seed)
+            try:
+                d2.body.foo = 2
+            except Exception as e:
+                print(type(e).__name__)
+            "#),
+    );
+    assert_eq!(said, "a FooAgentBuzzMessage 1 x 5\nFrozenInstanceError\n");
+
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 5,
+                  "src": "await foo.ready()\nprint('ready')"}));
+    k.send(json!({"t": "oriented", "agent": PRIMARY, "id": instance["id"], "error": null}));
+    let ready = k.recv();
+    assert_eq!(
+        (&ready["id"], &ready["output"]),
+        (&json!(5), &json!("ready\n")),
+        "{ready}"
+    );
+
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 6,
+                  "src": "await foo.release()\nprint('released')"}));
+    let (_, ask) = k.until("agent.release", Vec::new());
+    assert_eq!(ask["children"], json!(["c1"]));
+    k.send(json!({"t": "end", "agent": "c1", "id": 900}));
+    let (ended, _) = k.until("ended", Vec::new());
+    assert_eq!(
+        ended.iter().filter(|n| n["t"] == "agent.ended").count(),
+        2,
+        "both requests end with the child: {ended:?}"
+    );
+    k.send(json!({"t": "released", "agent": PRIMARY, "id": ask["id"], "error": null}));
+    let (_, released) = k.until("agent.instance.released", Vec::new());
+    assert_eq!(
+        (&released["how"], &released["child"]),
+        (&json!("explicit"), &json!("c1"))
+    );
+    let (_, result) = k.until("result", Vec::new());
+    assert_eq!(result["output"], "released\n", "{result}");
+    let (late, notices) = k.exec_collecting(PRIMARY, 7, "foo.fizz('late')");
+    assert!(text(&late["error"]).contains("AgentReleased"), "{late}");
+    assert!(notices.is_empty(), "nothing sent: {notices:?}");
+}
+
+/// The host's word that an instance cannot be ready raises at `ready()`, as the error it names;
+/// and the session's close ends an instance still launching -- its `ready()` and what it holds
+/// raise the closing error -- and says it was released by the close once its child is known.
+#[test]
+fn ready_raises_what_the_host_says_and_the_close_ends_a_launching_instance() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    let (_, notices) = k.noted(PRIMARY, 2, "a = FooAgent()");
+    let (_, asked) = k.until("agent.spawn", notices);
+    k.opened(json!({
+        "t": "open", "agent": "c1", "main": false,
+        "child": {"kind": "request", "spawn": asked["id"], "requests_max": 4},
+    }));
+    k.send(json!({
+        "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": "c1", "requests_max": 4,
+    }));
+    k.send(
+        json!({"t": "oriented", "agent": PRIMARY, "id": asked["instance"]["id"],
+                  "error": {"kind": "budget", "message": "the budget is spent"}}),
+    );
+    let said = k.output(
+        3,
+        &py(r#"
+            for _ in range(2):
+                try:
+                    await a.ready()
+                except outrig.BudgetExhausted as e:
+                    print(e)
+            "#),
+    );
+    assert_eq!(said, "the budget is spent\nthe budget is spent\n");
+
+    let (_, notices) = k.noted(PRIMARY, 4, "b = FooAgent()\nh = b.fizz('x')");
+    let (_, asked) = k.until("agent.spawn", notices);
+    k.send(json!({"t": "close", "reason": "the owner closed it"}));
+    // `a`, whose child exists, is released by the close at once.
+    let (_, released) = k.until("agent.instance.released", Vec::new());
+    assert_eq!(
+        (&released["how"], &released["child"]),
+        (&json!("closing"), &json!("c1"))
+    );
+    let said = k.output(
+        5,
+        &py(r#"
+            for wait in (b.ready(), h):
+                try:
+                    await wait
+                except outrig.SessionClosing as e:
+                    print('closed', 'the owner closed it' in str(e))
+            "#),
+    );
+    assert_eq!(said, "closed True\nclosed True\n");
+    k.opened(json!({
+        "t": "open", "agent": "c2", "main": false,
+        "child": {"kind": "request", "spawn": asked["id"], "requests_max": 4},
+    }));
+    k.send(json!({
+        "t": "spawned", "agent": PRIMARY, "id": asked["id"], "child": "c2", "requests_max": 4,
+    }));
+    let (before, released) = k.until("agent.instance.released", Vec::new());
+    assert!(
+        before.iter().all(|n| n["t"] != "agent.request"),
+        "what it held was never sent: {before:?}"
+    );
+    assert_eq!(
+        (&released["how"], &released["child"]),
+        (&json!("closing"), &json!("c2"))
+    );
+}
+
+impl Interpreter {
+    /// Answer `asked`, an agent class instance's spawn, as the host does: open its child's
+    /// kernel as `child`, then say the spawn launched it.
+    fn instance_launched(&mut self, asked: &Value, child: &str) {
+        self.opened(json!({
+            "t": "open", "agent": child, "main": false,
+            "child": {"kind": "request", "spawn": asked["id"], "requests_max": 4},
+        }));
+        self.send(json!({
+            "t": "spawned", "agent": asked["agent"], "id": asked["id"], "child": child,
+            "requests_max": 4,
+        }));
+    }
+}
+
+/// A child that made agent class instances, its kernel ended with its subtree's, holds nothing
+/// that keeps its kernel once its parent lets go of it: each instance it made goes with it, one
+/// made as the kernel ended included, with what that one held.
+#[test]
+fn a_released_child_that_made_an_instance_is_reclaimed() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    let (_, notices) = k.noted(
+        PRIMARY,
+        2,
+        "import __main__, gc, weakref\nouter = FooAgent()",
+    );
+    let asked = k.until("agent.spawn", notices).1;
+    k.instance_launched(&asked, "c1");
+    let (_, notices) = k.noted("c1", 3, &format!("{}\ninner = FooAgent()", py(FOO_AGENT)));
+    let asked = k.until("agent.spawn", notices).1;
+    k.instance_launched(&asked, "c2");
+    k.output(4, "kernel = weakref.ref(__main__._kernels['c1'])");
+    k.output_in("c1", 5, "await inner._outrig.task");
+
+    // c1's code still runs as its kernel ends, and makes one more instance then, asking it
+    // something: that launch never runs. The request on `inner` says when to end it.
+    let late = py(r#"
+        import __main__, time
+        inner.fizz('now')
+        deadline = time.monotonic() + 30
+        while not __main__._kernels['c1'].ended and time.monotonic() < deadline:
+            time.sleep(0.01)
+        late = FooAgent()
+        h = late.fizz('late')
+        "#);
+    k.send(json!({"t": "exec", "agent": "c1", "id": 6, "src": late}));
+    k.until("agent.request", Vec::new());
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 7, "src": "await outer.release()"}));
+    let ask = k.until("agent.release", Vec::new()).1;
+    for child in ["c2", "c1"] {
+        k.send(json!({"t": "end", "agent": child, "id": 900}));
+        k.until("ended", Vec::new());
+    }
+    k.send(json!({"t": "released", "agent": PRIMARY, "id": ask["id"], "error": null}));
+    k.until("result", Vec::new());
+
+    // c1's thread may still be returning from the loop it served; and the late launch, never
+    // run, warns as it is collected.
+    let (said, _) = k.noted(
+        PRIMARY,
+        8,
+        &py(r#"
+            import warnings
+            warnings.simplefilter('ignore', RuntimeWarning)
+            del outer
+            for _ in range(200):
+                _ = gc.collect()
+                if kernel() is None:
+                    break
+                await asyncio.sleep(0.01)
+            print(kernel() is None, __main__._instances, len(__main__._works))
+            "#),
+    );
+    assert_eq!(said, "True {} 0\n");
+}
+
+/// An instance a child's task holds as the child is released, dropped by the cleanup the task's
+/// cancellation runs, releases nothing and is recorded neither collected nor released: its child
+/// ended with the subtree, as the parent's release says.
+#[test]
+fn an_instance_dropped_as_its_kernel_ends_records_nothing() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    let (_, notices) = k.noted(PRIMARY, 2, "outer = FooAgent()");
+    let asked = k.until("agent.spawn", notices).1;
+    k.instance_launched(&asked, "c1");
+    // The only reference is a task's, dropped in the cleanup its cancellation runs, which then
+    // awaits: the collection lands while c1's kernel is ending.
+    let hold = py(r#"
+        async def hold():
+            global launched
+            inner = FooAgent()
+            launched = inner._outrig
+            try:
+                await asyncio.Event().wait()
+            finally:
+                del inner
+                await asyncio.sleep(0.5)
+        held = asyncio.ensure_future(hold())
+        await asyncio.sleep(0)
+        "#);
+    let (_, notices) = k.noted("c1", 3, &format!("{}\n{hold}", py(FOO_AGENT)));
+    let asked = k.until("agent.spawn", notices).1;
+    k.instance_launched(&asked, "c2");
+    k.output_in(
+        "c1",
+        4,
+        "while launched.child is None:\n    await asyncio.sleep(0.01)",
+    );
+
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 5, "src": "await outer.release()"}));
+    let ask = k.until("agent.release", Vec::new()).1;
+    k.send(json!({"t": "end", "agent": "c2", "id": 900}));
+    k.send(json!({"t": "end", "agent": "c1", "id": 901}));
+    // Read to c1's end, refusing a release it asks for as the host would: c2 has ended.
+    let mut said = Vec::new();
+    loop {
+        let message = k.recv();
+        if message["t"] == "agent.release" && message["agent"] == "c1" {
+            k.send(json!({"t": "released", "agent": "c1", "id": message["id"],
+                          "error": "c2 was released already"}));
+        }
+        let ended = message["t"] == "ended" && message["agent"] == "c1";
+        said.push(message);
+        if ended {
+            break;
+        }
+    }
+    assert!(
+        said.iter()
+            .all(|n| n["child"] != "c2" || !text(&n["t"]).starts_with("agent.instance.")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .all(|n| n["t"] != "agent.release" || n["agent"] != "c1"),
+        "{said:?}"
+    );
+    k.send(json!({"t": "released", "agent": PRIMARY, "id": ask["id"], "error": null}));
+    let (_, result) = k.until("result", Vec::new());
+    assert_eq!(result["status"], "ok", "{result}");
+}
+
+/// A launch that fails after the host opened the child's kernel -- which it ends, then answers
+/// the spawn with why -- ends what the instance held, made before or after that end, with the
+/// spawn's error, as `ready()` and each later call raise it; and none of it, never sent, is said
+/// to have ended.
+#[test]
+fn a_launch_failing_after_its_kernel_opened_ends_what_was_held_with_its_error() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    let (_, notices) = k.noted(PRIMARY, 2, "foo = FooAgent()\nh1 = foo.fizz('a')");
+    let asked = k.until("agent.spawn", notices).1;
+    k.opened(json!({
+        "t": "open", "agent": "c1", "main": false,
+        "child": {"kind": "request", "spawn": asked["id"], "requests_max": 4},
+    }));
+    k.send(json!({"t": "end", "agent": "c1", "id": 900}));
+    let (before, _) = k.until("ended", Vec::new());
+    assert!(before.is_empty(), "{before:?}");
+    let (said, notices) = k.noted(
+        PRIMARY,
+        3,
+        "h2 = foo.fizz('b')\nprint(h1.done(), h2.done())",
+    );
+    assert_eq!((said.as_str(), notices.len()), ("False False\n", 0));
+
+    k.send(json!({
+        "t": "spawned", "agent": PRIMARY, "id": asked["id"],
+        "error": {"kind": "other", "message": "the child could not be made"},
+    }));
+    let (said, notices) = k.noted(
+        PRIMARY,
+        4,
+        &py(r#"
+            for wait in (foo.ready(), h1, h2):
+                try:
+                    await wait
+                except RuntimeError as e:
+                    print(type(e).__name__, e)
+            try:
+                foo.fizz('c')
+            except RuntimeError as e:
+                print(type(e).__name__, e)
+            "#),
+    );
+    assert_eq!(said, "RuntimeError the child could not be made\n".repeat(4));
+    assert!(notices.is_empty(), "nothing held was told of: {notices:?}");
+}
+
+/// An instance collected after the session's close released it is recorded collected, and
+/// nothing more; one collected while the close waits on its launch is recorded collected, then
+/// released by the close, once its child exists; one whose launch is refused, not at all.
+#[test]
+fn an_instance_collected_after_the_close_is_recorded_once_its_child_exists() {
+    let mut k = Interpreter::start();
+    k.output(1, &py(FOO_AGENT));
+    let mut asked = Vec::new();
+    for (n, name) in [(2, "a"), (3, "b"), (4, "c")] {
+        let (_, notices) = k.noted(PRIMARY, n, &format!("{name} = FooAgent()"));
+        asked.push(k.until("agent.spawn", notices).1);
+    }
+    // What the interpreter says of instance `n`, whose child is `child`.
+    let said = |t: &str, n: usize, child: &str| {
+        let instance = &asked[n]["instance"]["id"];
+        json!({"t": t, "agent": PRIMARY, "instance": instance, "child": child})
+    };
+    k.instance_launched(&asked[0], "c1");
+    // A cycle, which only the collector frees.
+    k.output(5, "import gc\nawait a._outrig.task\na.me = a");
+    k.send(json!({"t": "close", "reason": "the owner closed it"}));
+    k.until("agent.instance.released", Vec::new());
+    let (_, notices) = k.noted(PRIMARY, 6, "del a\ngc.collect()\nawait asyncio.sleep(0)");
+    assert_eq!(notices, [said("agent.instance.collected", 0, "c1")]);
+
+    let collect = "releases = [b._outrig.released, c._outrig.released]\ndel b, c";
+    let (_, notices) = k.noted(PRIMARY, 7, &format!("{collect}\nawait asyncio.sleep(0)"));
+    assert!(notices.is_empty(), "{notices:?}");
+    k.instance_launched(&asked[1], "c2");
+    let (_, notices) = k.noted(PRIMARY, 8, "await asyncio.wrap_future(releases[0])");
+    let mut released = said("agent.instance.released", 1, "c2");
+    released["how"] = json!("closing");
+    assert_eq!(
+        notices,
+        [said("agent.instance.collected", 1, "c2"), released]
+    );
+    k.send(json!({
+        "t": "spawned", "agent": PRIMARY, "id": asked[2]["id"],
+        "error": {"kind": "closed", "message": "the session is closing"},
+    }));
+    let (_, notices) = k.noted(PRIMARY, 9, "await asyncio.wrap_future(releases[1])");
+    assert!(notices.is_empty(), "{notices:?}");
+}
+
 #[test]
 fn a_submission_nesting_functions_past_the_recursion_limit_still_runs() {
     // Recording the source against every code object compiled walks the whole nest, which can

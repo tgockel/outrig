@@ -1425,13 +1425,13 @@ pub(super) fn serving(source: &str) -> Responder {
 /// A request held at the provider: `arrived` is told as it comes in, and it
 /// is answered once `go` is.
 #[derive(Default)]
-struct Hold {
-    arrived: Notify,
-    go: Notify,
+pub(super) struct Hold {
+    pub(super) arrived: Notify,
+    pub(super) go: Notify,
 }
 
 /// `script`, as [`scripted`] answers it, its first response held by `hold`.
-fn held(script: Vec<CannedResponse>, hold: Arc<Hold>) -> Responder {
+pub(super) fn held(script: Vec<CannedResponse>, hold: Arc<Hold>) -> Responder {
     let answer = scripted(script);
     let first = Arc::new(AtomicBool::new(true));
     Arc::new(move |request: &RecordedRequest| {
@@ -1450,7 +1450,7 @@ fn held(script: Vec<CannedResponse>, hold: Arc<Hold>) -> Responder {
 }
 
 /// Wait until `flag` is raised, failing rather than hanging.
-async fn raised(flag: &Flag) {
+pub(super) async fn raised(flag: &Flag) {
     tokio::time::timeout(Duration::from_secs(20), async {
         while !flag.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1471,7 +1471,7 @@ fn role(request: &RecordedRequest) -> String {
 }
 
 /// What each execution of `subject`'s printed, in order.
-fn exec_outputs(events: &[Arc<Event>], subject: &str) -> Vec<String> {
+pub(super) fn exec_outputs(events: &[Arc<Event>], subject: &str) -> Vec<String> {
     kind(events, "exec.completed", Some(subject))
         .into_iter()
         .map(|event| {

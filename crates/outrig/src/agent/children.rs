@@ -35,8 +35,8 @@ use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
 use crate::harness::bindings::Brief;
 use crate::harness::event::{
-    AgentRequestId, ChannelBrief, ChildKind, InputBrief, InvocationEnd, InvocationId, ParamsBy,
-    Payload, RequestEnd, Subject, Usage,
+    AgentInstanceId, AgentRequestId, ChannelBrief, ChildKind, InputBrief, InstanceRelease,
+    InvocationEnd, InvocationId, ParamsBy, Payload, RequestEnd, Subject, Usage,
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::{ClosedBy, RequestOutcome};
@@ -232,6 +232,11 @@ impl Children {
             }
         });
         inner.interpreter.attach_children(lines);
+        // The session's `requests-max`, before anything runs: an agent class instance's requests
+        // count against it before its child exists to be told it.
+        inner.interpreter.tell(json!({
+            "t": "limits", "requests_max": inner.settings.limits.requests_max,
+        }));
         let weak = Arc::downgrade(&inner);
         lifecycle.on_close(Arc::new(move |by: &ClosedBy| {
             if let Some(inner) = weak.upgrade() {
@@ -339,6 +344,9 @@ impl Inner {
             "agent.request" => self.requested(agent, &line),
             "agent.call" => self.called(agent, &line),
             "agent.call.ended" => self.call_ended(&line),
+            "agent.instance.collected"
+            | "agent.instance.released"
+            | "agent.instance.handle.collected" => self.instance(&kind, &line),
             "agent.invocation" => self.invoked(agent, &line),
             "agent.invocation.ended" => self.invocation_ended(agent, &line),
             "agent.received" => self.received(&line),
@@ -549,6 +557,14 @@ impl Inner {
             .await
             .map_err(|e| Refused::new("other", e.to_string()))?;
         let events = handle.events().clone();
+        let briefed: Vec<ChannelBrief> = channels
+            .iter()
+            .map(|channel| ChannelBrief {
+                name: channel.name.clone(),
+                request: channel.request_type.clone(),
+                reply: channel.reply_type.clone(),
+            })
+            .collect();
         events.emit(Payload::AgentSpawned {
             name: name.to_string(),
             parent: Subject::agent(parent).to_string(),
@@ -556,16 +572,12 @@ impl Inner {
             model: model.to_string(),
             depth,
             inputs: inputs.clone(),
-            channels: channels
-                .iter()
-                .map(|channel| ChannelBrief {
-                    name: channel.name.clone(),
-                    request: channel.request_type.clone(),
-                    reply: channel.reply_type.clone(),
-                })
-                .collect(),
+            channels: briefed.clone(),
         });
+        // An agent class instance's child, which has a round of its own as it launches.
+        let instance = line["instance"]["id"].as_u64();
         let brief = match kind {
+            ChildKind::Request if instance.is_some() => ChildBrief::Instance(&channels),
             ChildKind::Request => ChildBrief::Request(&channels),
             _ => ChildBrief::Work,
         };
@@ -613,6 +625,19 @@ impl Inner {
             // leaving it to this to end.
             let started = child.life != Life::Released;
             if started {
+                if let Some(instance) = instance {
+                    // Once nothing can refuse the launch, and before the runner can say the
+                    // child is ready.
+                    self.events_of(id).emit(Payload::AgentInstanceStarted {
+                        instance: AgentInstanceId::new(instance),
+                        parent: Subject::agent(parent).to_string(),
+                        module: text(&line["instance"]["module"]),
+                        qualname: text(&line["instance"]["qualname"]),
+                        digest: line["instance"]["digest"].as_str().map(str::to_string),
+                        inputs,
+                        channels: briefed,
+                    });
+                }
                 child.life = Life::Idle;
                 child.runner = Some(tokio::spawn(runner::run(
                     Arc::downgrade(self),
@@ -621,6 +646,7 @@ impl Inner {
                     agent,
                     Arc::clone(&child.wake),
                     self.ledger.budget_watch(),
+                    instance,
                 )));
             }
             started
@@ -724,6 +750,59 @@ impl Inner {
             invocation: line["invocation"].as_u64().map(InvocationId::new),
             value: line["value"].as_str().map(str::to_string),
         });
+    }
+
+    /// What an agent class's instance says of itself, `kind`: it was collected,
+    /// one of its handles was, or it released its child -- which settled what
+    /// the release or the close ended on it, and spent what every model
+    /// request the child made used. Recorded under the child.
+    fn instance(&self, kind: &str, line: &Value) {
+        let Some(id) = line["instance"].as_u64() else {
+            return;
+        };
+        let (instance, child) = (AgentInstanceId::new(id), text(&line["child"]));
+        let payload = match kind {
+            "agent.instance.collected" => Payload::AgentInstanceCollected { instance },
+            "agent.instance.handle.collected" => Payload::AgentInstanceHandleCollected {
+                instance,
+                request: AgentRequestId::new(line["request"].as_u64().unwrap_or_default()),
+            },
+            _ => {
+                let (requests, attempts) = {
+                    let state = self.state();
+                    let requests = state
+                        .requests
+                        .iter()
+                        .filter(|(_, record)| {
+                            record.child == child
+                                && matches!(
+                                    record.state,
+                                    Req::Ended(RequestEnd::Released | RequestEnd::Closed)
+                                )
+                        })
+                        .map(|(id, _)| AgentRequestId::new(*id))
+                        .collect();
+                    let attempts = state
+                        .agents
+                        .get(&child)
+                        .map(|node| node.slot.attempts())
+                        .unwrap_or_default();
+                    (requests, attempts)
+                };
+                Payload::AgentInstanceReleased {
+                    instance,
+                    how: match line["how"].as_str() {
+                        Some("async_with") => InstanceRelease::AsyncWith,
+                        Some("collected") => InstanceRelease::Collected,
+                        Some("closing") => InstanceRelease::Closing,
+                        _ => InstanceRelease::Explicit,
+                    },
+                    requests,
+                    usage: self.ledger.total(&attempts),
+                }
+            }
+        };
+        self.events_of(&child).emit(payload);
     }
 
     /// `agent`'s code is calling a skill's entry through
@@ -1118,6 +1197,27 @@ impl Inner {
         self.interpreter.tell(json!({
             "t": "settle", "agent": child, "id": id, "outcome": outcome, "message": message,
         }));
+    }
+
+    /// The orienting round of `child`, agent class instance `instance`'s,
+    /// has ended; or, with `error`, it cannot be had -- `budget` or `failed`,
+    /// and why. The instance's `ready()` hears so from its parent's kernel.
+    pub(crate) fn oriented(&self, child: &str, instance: u64, error: Option<(&str, &str)>) {
+        let parent = self
+            .state()
+            .agents
+            .get(child)
+            .and_then(|node| node.parent.clone());
+        self.events_of(child).emit(Payload::AgentInstanceReady {
+            instance: AgentInstanceId::new(instance),
+            error: error.map(|(_, why)| why.to_string()),
+        });
+        if let Some(parent) = parent {
+            self.interpreter.tell(json!({
+                "t": "oriented", "agent": parent, "id": instance,
+                "error": error.map(|(kind, message)| json!({"kind": kind, "message": message})),
+            }));
+        }
     }
 
     pub(crate) fn closed(&self) -> bool {

@@ -451,3 +451,7 @@ mod typed_tests;
 #[cfg(test)]
 #[path = "invoke_tests.rs"]
 mod invoke_tests;
+
+#[cfg(test)]
+#[path = "instance_tests.rs"]
+mod instance_tests;

@@ -785,6 +785,58 @@ fn each_event_has_exactly_its_data_fields() {
             &["request", "outcome", "usage", "invocation", "value"],
         ),
         (
+            Payload::AgentInstanceStarted {
+                instance: AgentInstanceId::new(4),
+                parent: text("agent/primary"),
+                module: text("agents"),
+                qualname: text("FooAgent"),
+                digest: None,
+                inputs: vec![],
+                channels: vec![ChannelBrief {
+                    name: text("fizz"),
+                    request: text("str"),
+                    reply: text("Thing"),
+                }],
+            },
+            "agent.instance.started",
+            &[
+                "instance", "parent", "module", "qualname", "digest", "inputs", "channels",
+            ],
+        ),
+        (
+            Payload::AgentInstanceReady {
+                instance: AgentInstanceId::new(4),
+                error: None,
+            },
+            "agent.instance.ready",
+            &["instance", "error"],
+        ),
+        (
+            Payload::AgentInstanceReleased {
+                instance: AgentInstanceId::new(4),
+                how: InstanceRelease::AsyncWith,
+                requests: vec![AgentRequestId::new(7)],
+                usage: Some(usage),
+            },
+            "agent.instance.released",
+            &["instance", "how", "requests", "usage"],
+        ),
+        (
+            Payload::AgentInstanceCollected {
+                instance: AgentInstanceId::new(4),
+            },
+            "agent.instance.collected",
+            &["instance"],
+        ),
+        (
+            Payload::AgentInstanceHandleCollected {
+                instance: AgentInstanceId::new(4),
+                request: AgentRequestId::new(7),
+            },
+            "agent.instance.handle.collected",
+            &["instance", "request"],
+        ),
+        (
             Payload::AgentReleased {
                 released: vec![text("c1")],
                 ended: vec![text("c1"), text("c2")],
@@ -1033,6 +1085,8 @@ fn each_event_has_exactly_its_data_fields() {
     );
     let state = serde_json::to_value(case("session.state")).expect("encodes");
     assert_eq!(state, json!({"state": "round_running"}));
+    let released = serde_json::to_value(case("agent.instance.released")).expect("encodes");
+    assert_eq!(released["how"], json!("async_with"));
 }
 
 /// The id a record is given is its place in the file, whichever task emitted

@@ -1143,6 +1143,11 @@ pub outrig::harness::event::HostedReason::Interception
 pub outrig::harness::event::HostedReason::Interrupted
 pub outrig::harness::event::HostedReason::Killed
 pub outrig::harness::event::HostedReason::QueueFull
+#[non_exhaustive] pub enum outrig::harness::event::InstanceRelease
+pub outrig::harness::event::InstanceRelease::AsyncWith
+pub outrig::harness::event::InstanceRelease::Closing
+pub outrig::harness::event::InstanceRelease::Collected
+pub outrig::harness::event::InstanceRelease::Explicit
 #[non_exhaustive] pub enum outrig::harness::event::InvocationEnd
 pub outrig::harness::event::InvocationEnd::Cancelled
 pub outrig::harness::event::InvocationEnd::Raised
@@ -1186,6 +1191,27 @@ pub outrig::harness::event::Payload::AgentCallStarted::module: alloc::string::St
 pub outrig::harness::event::Payload::AgentCallStarted::parent: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::qualname: alloc::string::String
 pub outrig::harness::event::Payload::AgentCallStarted::request: outrig::harness::event::AgentRequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceCollected
+pub outrig::harness::event::Payload::AgentInstanceCollected::instance: outrig::harness::event::AgentInstanceId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceHandleCollected
+pub outrig::harness::event::Payload::AgentInstanceHandleCollected::instance: outrig::harness::event::AgentInstanceId
+pub outrig::harness::event::Payload::AgentInstanceHandleCollected::request: outrig::harness::event::AgentRequestId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceReady
+pub outrig::harness::event::Payload::AgentInstanceReady::error: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentInstanceReady::instance: outrig::harness::event::AgentInstanceId
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceReleased
+pub outrig::harness::event::Payload::AgentInstanceReleased::how: outrig::harness::event::InstanceRelease
+pub outrig::harness::event::Payload::AgentInstanceReleased::instance: outrig::harness::event::AgentInstanceId
+pub outrig::harness::event::Payload::AgentInstanceReleased::requests: alloc::vec::Vec<outrig::harness::event::AgentRequestId>
+pub outrig::harness::event::Payload::AgentInstanceReleased::usage: core::option::Option<outrig::harness::event::Usage>
+#[non_exhaustive] pub outrig::harness::event::Payload::AgentInstanceStarted
+pub outrig::harness::event::Payload::AgentInstanceStarted::channels: alloc::vec::Vec<outrig::harness::event::ChannelBrief>
+pub outrig::harness::event::Payload::AgentInstanceStarted::digest: core::option::Option<alloc::string::String>
+pub outrig::harness::event::Payload::AgentInstanceStarted::inputs: alloc::vec::Vec<outrig::harness::event::InputBrief>
+pub outrig::harness::event::Payload::AgentInstanceStarted::instance: outrig::harness::event::AgentInstanceId
+pub outrig::harness::event::Payload::AgentInstanceStarted::module: alloc::string::String
+pub outrig::harness::event::Payload::AgentInstanceStarted::parent: alloc::string::String
+pub outrig::harness::event::Payload::AgentInstanceStarted::qualname: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentReleased
 pub outrig::harness::event::Payload::AgentReleased::ended: alloc::vec::Vec<alloc::string::String>
 pub outrig::harness::event::Payload::AgentReleased::released: alloc::vec::Vec<alloc::string::String>
@@ -1500,6 +1526,11 @@ pub outrig::harness::event::Why::Latest
 pub outrig::harness::event::Why::Promoted
 pub outrig::harness::event::Why::Recent
 pub outrig::harness::event::Why::Round
+pub struct outrig::harness::event::AgentInstanceId(_)
+impl outrig::harness::event::AgentInstanceId
+pub fn outrig::harness::event::AgentInstanceId::get(self) -> u64
+impl core::fmt::Display for outrig::harness::event::AgentInstanceId
+pub fn outrig::harness::event::AgentInstanceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct outrig::harness::event::AgentRequestId(_)
 impl outrig::harness::event::AgentRequestId
 pub fn outrig::harness::event::AgentRequestId::get(self) -> u64

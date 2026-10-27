@@ -205,9 +205,12 @@ its context kept; releasing the instance ends the child.
   `ShutdownReport` lists the two requests.
 - `help(foo)` lists `fizz` and `buzz` and says each returns a handle;
   `inspect.iscoroutinefunction(FooAgent.fizz)` is false.
-- **The instance events are in order** for the example: `agent.instance.started`,
-  `agent.instance.ready`, three `agent.request.sent`, and for each request `received`, `replied`
-  and `settled` naming the rounds it spanned, then `agent.instance.released`.
+- **The instance events are in order** for the example: `agent.instance.started` before the three
+  `agent.request.sent`, and `agent.instance.ready` after it; for each request `received`, `replied`
+  and `settled` naming the rounds it spanned, in that order after its `sent`; then
+  `agent.instance.released`. (Corrected in execution: the requests made before the child exists
+  are sent as the spawn answers, so `ready` falls wherever the orienting round ends; see
+  Decisions.)
 - `crates/outrig/public-api.txt` regenerated, its additions limited to the instance events; the
   request family is `0003-30`'s.
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
@@ -260,3 +263,113 @@ only are `0003-30`'s decisions, and this task does not reopen them.
 - `crates/outrig/src/agent/channel.rs` -- the announcer whose noun this task generalizes.
 - `plan/phase/0003-python/potential/resource-scheduling.md` and
   `plan/next/progress-channels-on-agent-classes.md` -- what this task leaves out.
+
+## Decisions
+
+Forks 1 and 3 were taken as recommended, and fork 2 as the task states it. What no doc settled is
+recorded here.
+
+- **The spawn answers at launch, and the orienting round follows** (the maintainer's call, as the
+  simpler of two readings). The deliverable, `agent-classes.md` and `lifecycle.md` have requests
+  made before the child exists reach it as the spawn returns, during the orienting round; the
+  acceptance line on the example's event order had them follow `agent.instance.ready`. Both
+  cannot hold, and either way `a = SomeAgent(); b = await a.foo("bar")` works. Answering the spawn
+  only once the round had ended would have tied the answer to a model round, and left a release
+  during that round waiting for it, since the instance has no child to name until then. The
+  acceptance line is corrected to the order this guarantees.
+- **The orienting round** is the runner's own loop with one more state: it opens at once, on a
+  fixed opening that says the round is for getting ready, and its baseline stays empty, so
+  whatever is still open when it ends -- arrived before it opened or during it -- opens the next
+  round. As it ends the host emits `agent.instance.ready` and sends the interpreter an `oriented`
+  line, which settles `ready()`. A round that fails before its code ran is opened again, as every
+  child round is; one that fails after counts as ended; a spent budget or a model that cannot
+  answer makes `ready()` raise `BudgetExhausted` or `AgentRequestFailed` with the host's message.
+  Only an instance's child has the round: its spawn line names the instance, and
+  `runtime.spawn(..., requests=...)` is unchanged.
+- **A held request is an ordinary request.** The instance makes its child's `_Child` record at
+  construction, `holding`, and a call is `ChildChannel.request` on it: `requests-max` counts it,
+  the handle, its status and `cancel()` work as for any request, and the close ends it with the
+  rest. `_open` adopts the record when the child's kernel opens, and the launch sends what was held,
+  in order, under the record's lock, which `withdraw` also takes, so a cancel never races the send.
+  Until the kernel opens, the record's `requests-max` is the session's, which the host says in a
+  `limits` line as the session starts (`Children::new`). A request that ends before it is sent is
+  in no event, since the host never heard of it. A kernel that ends while its record still holds
+  has opened before its spawn answered -- the host ends it so when the launch fails after
+  `open_child`, building the child's budget say -- and leaves what is held to the launch, which
+  ends it with the spawn's error, as `ready()` and each later call raise it. A failed launch takes
+  its child's id off the record, so none of what was held is said to have ended.
+- **The mark in a class body.** `@outrig.agent` tells a method by its qualified name: a function
+  defined directly in a class body (`C.f`, not `f` or `g.<locals>.f`) is marked and left to the
+  class, whose `__init_subclass__` checks it and replaces it with the method that sends a
+  request; every other function is `0003-31`'s typed call. The mark's `__set_name__` refuses a
+  class that is not an `outrig.Agent` subclass.
+- **The checks.** Each names `module.Class.member`. A channel may not be named after anything
+  `outrig.Agent` has. A restatement must match the base's parameter names, kinds and defaults and
+  the rendered schema of each type -- not the annotations themselves, since `doc()` markers do not
+  compare equal -- and keeps the base's types, taking only the new docstring. A plain member
+  anywhere in the class's order that shadows a channel is refused, a mixin's included. A class
+  with no channel is accepted at creation, as a base for subclasses, and refused at construction.
+  The generated message is `<Class><Camel>Message`, named so in the child too; a default that
+  cannot be hashed becomes a `default_factory` that deep-copies it, a keyword-only parameter a
+  `kw_only` field, and a name the class already uses is refused. Each marked method becomes a
+  plain `def` under `functools.wraps`, so `inspect.signature` follows `__wrapped__` and
+  `inspect.iscoroutinefunction` is false. The class keeps its channels as `_outrig_channels`, out
+  of `help()`'s way. A subclass whose `__init__` skips `super().__init__` raises `TypeError`
+  saying so at its first call. A `staticmethod` or `classmethod` over a mark is refused: neither
+  passes `__set_name__` on, so the mark would stay in the class as a member nothing can call.
+- **`_Instance` keeps no reference to the instance.** Each request made through an instance holds
+  it (`_Work.instance`) until the request ends, and the finalizer holds only the `_Instance`, so an
+  instance nothing else holds is released as its last request ends, or at its last reference --
+  not at the cyclic collector's pass, as `agent-classes.md` had reasoned. An exception the
+  `_Instance` keeps -- what `ready()` raises, a failed launch's -- is kept as a value and raised as
+  a copy: a raised exception's traceback holds the frames that awaited it, the instance's among
+  them, and through the finalizer that would have kept the instance for good. The close test found
+  it.
+- **Release runs once, on the constructing kernel's loop**, however it began and from whichever
+  kernel; one while the launch is in flight waits for the spawn's answer, then releases the child
+  it made. `__aenter__` releases when `ready()` raises, since `__aexit__` does not run then. The
+  session's close says each instance released at once when its child is known, after the
+  requests it ends, since the constructing kernel's loop may not turn again; one still launching
+  is said once its launch answers, after its collection when that came first.
+- **Events.** All five carry the child's subject, and started names the `parent`, as
+  `agent.call.*` do. Started and ready are the host's: started once nothing can refuse the launch,
+  before the runner starts; ready as the round ends. Released, collected and the handle's
+  collection come from the interpreter's notices. Released's `requests` are the host's own record
+  of the child's requests that ended `released` or `closed`, and its `usage` the child's own model
+  requests', as `agent.call.settled`'s is. An instance whose launch was refused records none of
+  them, as a refused typed call records no call events (`0003-31`). The handle's collection is a
+  fifth instance event, `agent.instance.handle.collected`, since the request family is
+  `0003-30`'s; a handle collected while its request is held is said once the request is sent.
+  Started's digest hashes the source of a function compiled in the class's body -- told by its
+  code's qualified name, which a `functools.wraps` wrapper does not take on, so a function bound
+  there from elsewhere is not one -- or, with none, the class's module's file. A subclass with only
+  a docstring is digested from its module, and one declared in a submission, whose module has no
+  file, is `null`: nothing it holds leads back to the submission.
+- **Finalizers only schedule.** The instance's finalizer and `Handle.__del__` hand their work to
+  the constructing kernel's loop: a collection can happen anywhere, a protocol line's write
+  included, and `_send_lock` is not reentrant.
+- **An instance ends with the kernel that made it.** Once that kernel's loop has stopped, each
+  instance it made is retired: forgotten, what it held ended, and its finalizer detached, which
+  through the `_Instance` would otherwise hold the kernel's namespace, and the instance in it, for
+  good. Retiring then rather than as the end begins takes in one that code still running made as
+  the kernel ended, whose launch never runs. The instance's child ends in that kernel's subtree, so
+  no `agent.instance.released` is recorded for it, as a typed call in flight there records no
+  `agent.call.settled`. A release that begins once the kernel has ended -- from the finalizer of an
+  instance its cancelled tasks' cleanup dropped, a `release()` in that cleanup, or the session's
+  close while the kernel's loop has yet to stop -- releases and records nothing: it begins after
+  `_stop` took the tasks it cancels, so only that check keeps it from running. A failed launch, or a release other than the close's, detaches the
+  finalizer too, since a collection after either has nothing to say. A collection and the close's
+  release, which come on different threads, decide under the instance's lock which of them says
+  the collection.
+- **`/simplify` replaced the first implementation.** An independent one built from the same
+  requirement came to about two thirds of the logic: it held requests on the child's record made
+  early, where the first kept a second holding path in `_Work` and the instance, and threaded the
+  orienting round through the runner's loop, where the first ran it in a function of its own. It
+  was adopted, and the first's fixes ported onto it: exceptions raised as copies, a dropped held
+  handle said once sent, mutable defaults, the closing release said at once, the message name's
+  check, the error for a skipped `super().__init__`, and a request that ends before its instance
+  is attached to it letting the instance go. The fixes a later review asked for went through it
+  too: the independent ones came to about half the logic and were adopted, with the first's lock
+  between a collection and the close's release, and a retired instance's held requests ended.
+- **The interpreter program** is about 118 KB of its 128 KiB argument cap after this task, from
+  113 KB; `plan/next/interpreter-program-nears-the-argument-cap.md` says so.

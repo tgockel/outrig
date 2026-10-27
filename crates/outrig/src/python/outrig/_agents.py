@@ -1,16 +1,18 @@
 """What agent code uses to launch child agents and give them work, beside `runtime.spawn`.
 
-`agent` is the decorator that declares a typed `async def` as work for a child. The errors a
-child's work ends with are here, under `outrig.AgentError`, and so are `Request`, which declares
-one of a request child's channels, and `Status`, what a handle says of its request without
-waiting. They import on the host too, where a declaration is made as in a kernel and a call
-raises.
+`agent` is the decorator that declares a typed `async def` as work for a child, and `Agent` the
+base of an agent class, whose instance is one long-lived child answering requests on the methods
+`agent` marks. The errors a child's work ends with are here, under `outrig.AgentError`, and so
+are `Request`, which declares one of a request child's channels, and `Status`, what a handle says
+of its request without waiting. They import on the host too, where a declaration is made as in a
+kernel and a call, or a construction, raises.
 
 The rest is what the interpreter uses to check what one agent gives another before it goes: a
 value given as an input is data -- `messages.md`'s serializable subset -- and the classes a child
 binds by name must not share one.
 """
 
+import copy
 import dataclasses
 import functools
 import hashlib
@@ -26,6 +28,7 @@ import typing
 from . import schema
 
 __all__ = [
+    "Agent",
     "AgentError",
     "AgentLimitReached",
     "AgentReleased",
@@ -44,10 +47,12 @@ __all__ = [
 PREVIEW_MAX = 1024
 
 # What only the interpreter has, bound as it loads the package: `_call(declaration, arguments)`
-# makes a typed call from the calling kernel and returns its handle, and `_submitted_source(code)`
-# is the source of the submission that compiled `code`, or `None` for code none did. On the host
-# both stay `None`.
+# makes a typed call from the calling kernel and returns its handle, `_launch(agent, inputs,
+# model)` launches an agent class instance's child from the calling kernel and returns what the
+# runtime keeps of the instance, and `_submitted_source(code)` is the source of the submission
+# that compiled `code`, or `None` for code none did. On the host all three stay `None`.
 _call = None
+_launch = None
 _submitted_source = None
 
 # Names a parameter, or any input, cannot take: the child's own runtime and what every kernel
@@ -57,6 +62,12 @@ RESERVED = frozenset({"runtime", "asyncio"})
 _CALL_NOTE = (
     "A call sends this work to a new child agent and returns its handle at once, before the "
     "child exists: await the handle for the result, or keep it for its status, progress and "
+    "cancel(). The body is never run."
+)
+
+_REQUEST_NOTE = (
+    "A call sends its arguments as a request to the instance's child agent and returns the "
+    "request's handle at once: await the handle for the reply, or keep it for its status and "
     "cancel(). The body is never run."
 )
 
@@ -309,9 +320,16 @@ def agent(fn=None, *, validate=None, model=None):
     attempt. `model` names a configured model or alias for the child; without it, the caller's.
     What a declaration cannot take -- a missing docstring, an unannotated parameter, a type
     outside the subset -- raises `TypeError` at decoration, naming the function.
+
+    On a method of an `outrig.Agent` subclass it marks a request channel instead, and takes
+    neither keyword: see `help(outrig.Agent)`.
     """
     if fn is None:
         return functools.partial(agent, validate=validate, model=model)
+    owner = fn.__qualname__.rpartition(".")[0] if type(fn) is types.FunctionType else ""
+    if owner and not owner.endswith("<locals>"):
+        # Defined in a class body: the class reads the mark as it is made.
+        return _Marked(fn, validate, model)
     declaration = _declare(fn, validate, model)
     signature = inspect.signature(fn)
 
@@ -412,21 +430,315 @@ def _declare(fn, validate, model):
 
 
 def _digest(fn):
-    """The SHA-256 hex digest of the source that declared `fn`: the submission's for one compiled
-    in a submission, whichever execution runs the declaring; its module's file otherwise, or what
-    the module's loader gives; `None` when none can be read."""
-    filename = fn.__code__.co_filename
+    """The SHA-256 hex digest of the source that declared `fn`, a function or a class: the
+    submission's for a function compiled in a submission, whichever execution runs the declaring;
+    its module's file otherwise, or what the module's loader gives; `None` when none can be
+    read."""
+    module = sys.modules.get(fn.__module__)
+    code = None if isinstance(fn, type) else fn.__code__
+    filename = code.co_filename if code else getattr(module, "__file__", None) or ""
     try:
         if filename == "<execution>":
-            source = None if _submitted_source is None else _submitted_source(fn.__code__)
+            source = None if _submitted_source is None else _submitted_source(code)
         elif os.path.isabs(filename):
             with open(filename, "rb") as f:
                 source = f.read()
         else:
-            loader = getattr(sys.modules.get(fn.__module__), "__loader__", None)
+            loader = getattr(module, "__loader__", None)
             source = loader.get_source(fn.__module__) if hasattr(loader, "get_source") else None
     except Exception:
         source = None
     if source is None:
         return None
     return hashlib.sha256(source.encode() if type(source) is str else source).hexdigest()
+
+
+# ---------------------------------------------------------------------------- agent classes
+
+
+class _Marked:
+    """A method `@outrig.agent` marked in a class body: a request channel, which the
+    `outrig.Agent` subclass it is in reads as it is made. Any other class refuses it."""
+
+    def __init__(self, fn, validate, model):
+        self.fn, self.validate, self.model = fn, validate, model
+
+    def __set_name__(self, owner, name):
+        if not issubclass(owner, Agent):
+            raise TypeError(
+                f"{owner.__module__}.{owner.__qualname__}.{name}: @outrig.agent on a method marks "
+                f"a request channel of an outrig.Agent subclass, and {owner.__qualname__} is not "
+                "one; declare typed work for a child as a function instead"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestMethod:
+    """What a method of an `outrig.Agent` subclass marked `@outrig.agent` declares: one request
+    channel, kept as its sender's `__outrig_channel__`."""
+
+    doc: str  # the docstring, cleaned: the channel's description
+    parameters: dict  # each parameter's name, after `self`, to the Schema of its type
+    request_type: object  # None, the one parameter's type, or the generated message dataclass
+    reply_type: object  # the return annotation
+    request: object  # the request type's Schema
+    reply: object  # the reply type's Schema
+    classes: tuple  # every dataclass the two use
+    key: object  # what a subclass restating the channel must declare alike
+
+
+class Agent:
+    """The base of an agent class: each instance is one long-lived child agent, and each method
+    marked `@outrig.agent` is one of its request channels.
+
+        class Reviewer(outrig.Agent):
+            \"\"\"You review the repository in /workspace.\"\"\"
+
+            @outrig.agent
+            async def review(self, path: str) -> Verdict:
+                \"\"\"Review the file at `path`.\"\"\"
+
+        reviewer = Reviewer()
+        verdict = await reviewer.review("src/main.py")
+
+    The class's docstring is the first part of the child's instructions, as written. A marked
+    method is an `async def` whose docstring describes its channel, whose parameters after `self`
+    are each annotated, and which has a return annotation, each a type `outrig.schema` takes. A
+    call checks its arguments and sends them as one request -- none as `None`, one as itself,
+    several as a frozen dataclass the class holds, `<Class><Method>Message` -- and returns the
+    request's handle at once: await it for the reply, of the return type. The body is never run.
+    Methods not marked are ordinary ones, which run here. What a class cannot declare raises
+    `TypeError` as the class is made, naming the member.
+
+    `Reviewer(**inputs, model=None)` binds each input, which must be data, in the child as a
+    variable, launches the child in the background -- on `model`, a configured model or alias,
+    or on yours -- and returns at once; a request made before the child exists waits for it. The
+    child's first round is its own, to get ready in: `await reviewer.ready()` returns once it has
+    ended, and raises what the launch met instead. `await reviewer.release()` ends the child and
+    every request still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on
+    entry and releases on leaving. An instance collected unreleased is released then.
+    """
+
+    # What the runtime keeps of the instance, once it is made; and the request channels its class
+    # declares, each by name its sender.
+    _outrig = None
+    _outrig_channels = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _declare_class(cls)
+
+    def __init__(self, *, model=None, **inputs):
+        name = f"{type(self).__module__}.{type(self).__qualname__}"
+        if not type(self)._outrig_channels:
+            raise TypeError(f"{name} declares no request channel -- no method marked "
+                            "@outrig.agent -- so an instance of it would answer nothing")
+        if model is not None and type(model) is not str:
+            raise TypeError(f"model names a configured model, a str, not "
+                            f"{schema._type_qualname(type(model))}")
+        if _launch is None:
+            raise RuntimeError(f"an instance of {name} runs in an agent's kernel, where OutRig "
+                               "runs agent code, and this Python is not one")
+        self._outrig = _launch(self, inputs, model)
+
+    async def ready(self):
+        """Return once the child has ended its first round, which is its own, to get ready in.
+
+        Raises what the launch met instead -- `ValueError` for an unknown model,
+        `outrig.AgentLimitReached`, `outrig.SessionClosing` -- or `outrig.BudgetExhausted` or
+        `outrig.AgentRequestFailed` when the child cannot have that round, or
+        `outrig.AgentReleased` when the instance was released first. It settles once: awaiting
+        again answers the same at once.
+        """
+        await _runs(self).ready()
+
+    async def release(self):
+        """End the child, and every request still open on it with `outrig.AgentReleased`, which
+        each call raises from now on. Returns once it has ended; a second call, once the first
+        has."""
+        await _runs(self).release("explicit")
+
+    async def __aenter__(self):
+        try:
+            await self.ready()
+        except BaseException:
+            await _runs(self).release("async_with")
+            raise
+        return self
+
+    async def __aexit__(self, *exc_info):
+        await _runs(self).release("async_with")
+
+
+def _runs(agent):
+    """What the runtime keeps of `agent`, an agent class's instance."""
+    if agent._outrig is None:
+        raise TypeError(f"this {type(agent).__qualname__} was not made by outrig.Agent.__init__: "
+                        "a subclass's __init__ calls super().__init__(**inputs, model=...)")
+    return agent._outrig
+
+
+def _declare_class(cls):
+    """Check `cls`, an `Agent` subclass being made, and make each method it marks
+    `@outrig.agent` the sender of its request channel; `TypeError` naming what is wrong."""
+    where = f"{cls.__module__}.{cls.__qualname__}"
+    if not cls.__doc__ or not cls.__doc__.strip():
+        raise TypeError(f"{where} has no docstring, which is the first part of its child's "
+                        "instructions")
+    senders, own = {}, []
+    for base in reversed(cls.__mro__[1:]):
+        senders.update(vars(base).get("_outrig_channels", {}))
+    for member, value in list(vars(cls).items()):
+        if type(value) in (staticmethod, classmethod) and type(value.__func__) is _Marked:
+            wrap = f"@{type(value).__name__}"
+            raise TypeError(f"{where}.{member}: a request channel is a method of the instance, "
+                            f"which {wrap} would make it not; remove {wrap}")
+        if type(value) is _Marked:
+            name = f"{where}.{member}"
+            if member == "user" or hasattr(Agent, member):
+                taken = "the user channel's" if member == "user" else "a member of outrig.Agent"
+                raise TypeError(f"{name}: a request channel cannot be named {member!r}, which is "
+                                f"{taken}")
+            base = senders.get(member)
+            if base is None and any(member in vars(b) for b in cls.__mro__[1:]):
+                raise TypeError(f"{name} would make a base class's ordinary member a request "
+                                "channel; name the channel otherwise")
+            method = _method(cls, member, value, base and base.__outrig_channel__)
+            senders[member] = _sender(member, method, value.fn)
+            setattr(cls, member, senders[member])
+            value = value.fn
+        if type(value) is types.FunctionType:
+            own.append(value)
+    for member, sender in senders.items():
+        if inspect.getattr_static(cls, member, None) is not sender:
+            raise TypeError(f"{where}.{member} replaces request channel {member!r} with an "
+                            "ordinary member; restate it marked @outrig.agent with the same "
+                            "signature, or name the member otherwise")
+    seen = {}
+    for member, sender in senders.items():
+        for c in sender.__outrig_channel__.classes:
+            other, by = seen.setdefault(c.__name__, (c, member))
+            if other is not c:
+                raise TypeError(
+                    f"{where}.{by} and {where}.{member} use two classes named {c.__name__!r}, "
+                    f"{schema._type_qualname(other)} and {schema._type_qualname(c)}; each is "
+                    "bound in the child under its name, where one name holds one class"
+                )
+    cls._outrig_channels = senders
+    # Its module's file; or, for a class a submission declared, that submission's source, which
+    # any function its body defined -- not one bound there from elsewhere -- was compiled from.
+    own = [fn for fn in own if fn.__code__.co_qualname.startswith(f"{cls.__qualname__}.")]
+    cls._outrig_digest = _digest(own[0] if own else cls)
+
+
+def _method(cls, member, marked, base):
+    """What `marked`, `cls`'s method `member`, declares, or `TypeError` naming it and what is
+    wrong. Restating `base`, a base class's channel, it must declare the same, and keeps that
+    channel's types."""
+    fn, name = marked.fn, f"{cls.__module__}.{cls.__qualname__}.{member}"
+    if marked.model is not None:
+        raise TypeError(f"{name}: a request method takes no model=; an instance's child runs on "
+                        f"one model, which the constructor's model= names: "
+                        f"{cls.__name__}(model=...)")
+    if marked.validate is not None:
+        raise TypeError(f"{name}: a request method takes no validate=; its reply is checked "
+                        "against its type")
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError(f"{name}: @outrig.agent marks an `async def` method, not {fn!r}")
+    if not fn.__doc__ or not fn.__doc__.strip():
+        raise TypeError(f"{name} has no docstring, which describes its channel to the child")
+    signature = inspect.signature(fn)
+    parameters = list(signature.parameters.values())
+    if not parameters or parameters[0].name != "self":
+        raise TypeError(f"{name}: a request method's first parameter is self")
+    parameters = parameters[1:]
+    for p in parameters:
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            raise TypeError(
+                f"{name} takes {'*' if p.kind is p.VAR_POSITIONAL else '**'}{p.name}; a request "
+                "has one fixed shape, each parameter one part of it"
+            )
+        if p.annotation is p.empty:
+            raise TypeError(f"{name}: parameter {p.name!r} has no type annotation")
+    if signature.return_annotation is signature.empty:
+        raise TypeError(f"{name} has no return annotation, which is the reply's type")
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception as e:
+        raise TypeError(
+            f"{name}: its annotations cannot be resolved: {schema._type_name(type(e))}: {e}"
+        ) from None
+    schemas = {}
+    for p in parameters:
+        schemas[p.name], _ = declared_with_classes(
+            hints[p.name], f"{name}: parameter {p.name!r} cannot be"
+        )
+        if p.default is not p.empty:
+            _, problems = schemas[p.name]._encoding(p.default)
+            if problems:
+                raise TypeError(
+                    f"{name}: the default of parameter {p.name!r} is not of its type:\n"
+                    f"{problems.listing()}"
+                )
+    reply, used = declared_with_classes(hints["return"], f"{name}: the reply cannot be")
+    key = ([(p.name, p.kind, p.default, schemas[p.name].text()) for p in parameters], reply.text())
+    doc = inspect.cleandoc(fn.__doc__)
+    if base is not None:
+        if key != base.key:
+            raise TypeError(f"{name} restates a base class's request channel with another "
+                            "signature, which code written against the base would not send; "
+                            "restate it alike, or name it otherwise")
+        return dataclasses.replace(base, doc=doc)
+    if len(parameters) > 1:
+        title = cls.__name__ + "".join(part[:1].upper() + part[1:] for part in member.split("_"))
+        if title + "Message" in vars(cls):
+            raise TypeError(f"{name}: its request is the dataclass {title}Message, a name "
+                            f"{cls.__qualname__} already gives a member of its own")
+        fields = []
+        for p in parameters:
+            field = {"kw_only": p.kind is p.KEYWORD_ONLY}
+            # A default the dataclass could share between messages is made afresh for each.
+            if p.default is not p.empty and type(p.default).__hash__ is None:
+                field["default_factory"] = functools.partial(copy.deepcopy, p.default)
+            elif p.default is not p.empty:
+                field["default"] = p.default
+            fields.append((p.name, hints[p.name], dataclasses.field(**field)))
+        request_type = dataclasses.make_dataclass(
+            title + "Message", fields, frozen=True, module=cls.__module__
+        )
+        setattr(cls, request_type.__name__, request_type)
+    else:
+        request_type = hints[parameters[0].name] if parameters else None
+    request, also = declared_with_classes(request_type, f"{name}: the request cannot be")
+    return RequestMethod(doc, schemas, request_type, hints["return"], request, reply,
+                         tuple(dict.fromkeys(also + used)), key)
+
+
+def _sender(member, method, fn):
+    """The method a channel's mark becomes: a call binds its arguments to `fn`'s signature,
+    checks each against its type, and sends the request they make, returning its handle."""
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def send(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(list(bound.arguments.items())[1:])
+        wrong = []
+        for name, value in arguments.items():
+            _, problems = method.parameters[name]._encoding(value)
+            wrong += [f"  {name}{p.path[1:]}: {p.message}" for p in problems.found]
+        if wrong:
+            raise TypeError(
+                f"{type(self).__qualname__}.{member}() was given arguments outside their "
+                "declared types:\n" + "\n".join(wrong)
+            )
+        if len(arguments) > 1:
+            message = method.request_type(**arguments)
+        else:
+            message = next(iter(arguments.values()), None)
+        return _runs(self).request(self, member, message)
+
+    send.__doc__ = f"{method.doc}\n\n{_REQUEST_NOTE}"
+    send.__outrig_channel__ = method
+    return send

@@ -416,6 +416,33 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   was not accepted or the session's events are not observed. It follows the `agent.released` that
   ended the child, except at the session's close, which ends every call `closed` at once and tears
   its children down afterward: a call settled `closed` precedes its child's release.
+- `agent.instance.started` -- an instance of an agent class, a subclass of `outrig.Agent`,
+  launched the subject, a child, to answer its requests: `instance`, the instance's id, which its
+  other events carry; `parent`, the subject of the agent whose code constructed it; `module` and
+  `qualname`, the class's `__module__` and `__qualname__`; `digest`, a SHA-256 of the source that
+  declared the class -- its module's file, or the submission's source for a class declared in one,
+  read through a function its body defines -- or `null` when none could be read, as for a class a
+  submission declared with no function in its body; `inputs`, each `{name, type, preview}`;
+  and `channels`, one per request method, each `{name, request, reply}`. An instance whose launch
+  was refused, by a limit say, has no child and records none of these events; its `ready()` and
+  its requests raise the refusal.
+- `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
+  its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
+  -- the token budget spent, or a model that cannot answer. A request sent before this may already
+  be among the child's other events.
+- `agent.instance.released` -- the instance was released, and its child, the subject, with it:
+  `instance`; `how`, which is `explicit`, `async_with`, `collected` when the instance was
+  collected unreleased, or `closing` when the session's close released it; `requests`, the
+  requests on the child that the release or the close ended; and `usage`, the sum over every model
+  request the child made, or `null` when none reported any. An instance a child made ends with that
+  child: the `agent.released` that ends it lists the instance's child in `ended`, and the instance
+  records nothing after it, `agent.instance.released` included, even when the cleanup of the
+  child's cancelled code drops or releases it.
+- `agent.instance.collected` -- the instance was collected unreleased: `instance`. Its
+  `agent.instance.released` follows, unless the session's close had released it already.
+- `agent.instance.handle.collected` -- the handle of a request made of the instance was collected
+  before the request ended: `instance`, and `request`. The request runs on, and nothing reads its
+  answer.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
   `from` and `to`, each `user` or `agent/primary`; and `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,

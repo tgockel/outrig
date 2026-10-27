@@ -477,6 +477,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child's subject: `agent.call.started`, with the declaration's `module`, `qualname` and a
   `digest` of the source that declared it, and `agent.call.settled`, with the outcome and the
   child's usage, after the `agent.released` that ended the child.
+- **`outrig.Agent` declares an agent class, whose instance is one long-lived child.** A
+  subclass's docstring is the first part of the child's instructions, and each `async def` it
+  marks `@outrig.agent` is a request channel of that name: the method's docstring describes it,
+  its parameters make the request -- one carries its value, several a frozen dataclass
+  `<Class><Method>Message` the class holds -- and its return annotation is the reply's type. The
+  body is never run. Every rule is checked as the class is made, alike in a module and in a
+  submission, and a class that breaks one raises `TypeError` naming the member: a missing
+  docstring, `model=` or `validate=` on a method, an unannotated parameter, `*args`, a channel
+  named `user` or after one of `outrig.Agent`'s own members, a channel under `staticmethod` or
+  `classmethod`, a subclass changing a channel's signature, two classes of one name among its
+  types; `@outrig.agent` in another class's body is refused the same way.
+  `FooAgent(**inputs, model=...)` checks its inputs and returns at once, launching the child in
+  the background with the inputs bound in it; the child's first round, opened as it launches, is
+  for getting ready, and `await foo.ready()` waits for it. A call checks its arguments, sends the
+  request, and returns its handle at once, as a request on a child's channel does: one made before
+  the child exists is held, counted against `requests-max`, and sent once the child exists. What
+  the launch meets -- an unknown model, `subagent-depth-max`, `children-max`, the session
+  closing -- raises at `ready()` and at each request, never in the constructor. The child keeps
+  its names and conversation from one request to the next. `await foo.release()` ends it and
+  everything it launched, settling what is open on it `AgentReleased`; `async with` waits for
+  `ready()` and releases on exit; an instance collected unreleased is released once the requests
+  made of it have ended, one a child made ends with that child, and the session's close releases
+  every one alive. Five events record each instance under its child's subject:
+  `agent.instance.started`, `.ready`, `.released` with how and the child's usage, `.collected`,
+  and `.handle.collected` for a handle dropped before its request ended.
 - **Skills: `SkillSource`, `DirectorySource` and `SessionBuilder::skill_source`.** A skill is a
   directory holding a `SKILL.md` -- Agent Skills frontmatter, then instructions -- and, optionally,
   a `skill.py`. A session serves the skills of the sources it is given, in order: the first that

@@ -142,11 +142,13 @@ fn rest(workspace: Option<&Path>, bindings: &[Brief], window: Window, begins: &s
 }
 
 /// What a child agent is: the one that works on submissions, or the one that
-/// answers requests on its channels, each with what its instructions say of
+/// answers requests on its channels -- an agent class instance's among them,
+/// which has a round as it launches -- each with what its instructions say of
 /// them.
 pub(crate) enum ChildBrief<'a> {
     Work,
     Request(&'a [ChannelText]),
+    Instance(&'a [ChannelText]),
 }
 
 /// One of a request child's channels, as its instructions describe it.
@@ -208,7 +210,7 @@ pub(crate) fn child_preamble(
             );
             "each time a submission is given to you, or one stays open"
         }
-        ChildBrief::Request(channels) => {
+        ChildBrief::Request(channels) | ChildBrief::Instance(channels) => {
             text.push_str("You answer requests, which arrive on these channels:\n");
             for channel in *channels {
                 let _ = write!(text, "\n- `runtime.channels[{:?}]`", channel.name);
@@ -237,7 +239,13 @@ pub(crate) fn child_preamble(
                  unread, it raises `runtime.MessageAvailable`, which `except Exception` does not \
                  catch. The request stays queued and the tasks keep running.\n\n",
             );
-            "when requests are waiting, or one you took is unanswered"
+            match brief {
+                ChildBrief::Instance(_) => {
+                    "as you are launched, to get ready in, then when requests are waiting, or \
+                     one you took is unanswered"
+                }
+                _ => "when requests are waiting, or one you took is unanswered",
+            }
         }
     };
     text.push_str(&rest(workspace, bindings, window, begins));
@@ -346,6 +354,12 @@ pub(crate) fn child_opening(lead: &str, detail: &str, omitted: usize) -> String 
     }
     text
 }
+
+/// What an agent class instance's child is told as its first round opens, as
+/// it launches: the round is for getting ready.
+pub(crate) const ORIENTING: &str = "you have just been launched, and this round is for getting \
+                                    ready: read your instructions, and prepare what answering \
+                                    requests will need";
 
 /// What a work child is told as a submission is given to it.
 pub(crate) fn submission(

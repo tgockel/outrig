@@ -693,6 +693,27 @@ def every_event() -> list[tuple[str, dict, str | None]]:
             },
             c,
         ),
+        (
+            "agent.instance.started",
+            {
+                "instance": 4,
+                "parent": a,
+                "module": "agents",
+                "qualname": "FooAgent",
+                "digest": "3b4c",
+                "inputs": [{"name": "seed", "type": "int", "preview": "5"}],
+                "channels": [{"name": "fizz", "request": "str", "reply": "Thing"}],
+            },
+            c,
+        ),
+        ("agent.instance.ready", {"instance": 4, "error": "the budget is spent"}, c),
+        ("agent.instance.handle.collected", {"instance": 4, "request": 7}, c),
+        ("agent.instance.collected", {"instance": 4}, c),
+        (
+            "agent.instance.released",
+            {"instance": 4, "how": "collected", "requests": [7], "usage": usage},
+            c,
+        ),
         ("agent.wedged", {}, "agent/c2"),
         ("model.usage.replaced", {"call_id": 1, "attempt_id": 1, "usage": usage}, a),
         (

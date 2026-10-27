@@ -148,6 +148,12 @@ id_type!(
     /// calls and the hosted requests its code made while it ran.
     InvocationId
 );
+id_type!(
+    /// One instance of an agent class -- a subclass of `outrig.Agent` -- for
+    /// the life of the session's interpreter. Every event about the instance
+    /// carries it.
+    AgentInstanceId
+);
 
 /// Seconds, as the event log writes a duration.
 fn seconds<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
@@ -477,6 +483,48 @@ pub enum Payload {
         invocation: Option<InvocationId>,
         value: Option<String>,
     },
+    /// An agent class's instance, made by `parent`'s code, launched its child,
+    /// the event's subject: the class's `__module__` and `__qualname__`, the
+    /// SHA-256 digest of the source that declared it, or `None` when none
+    /// could be read, the child's inputs, and its request channels.
+    #[non_exhaustive]
+    AgentInstanceStarted {
+        instance: AgentInstanceId,
+        parent: String,
+        module: String,
+        qualname: String,
+        digest: Option<String>,
+        inputs: Vec<InputBrief>,
+        channels: Vec<ChannelBrief>,
+    },
+    /// The instance's child ended its orienting round, the one it has as it
+    /// launches, and is ready; or `error` says why it cannot have that round.
+    #[non_exhaustive]
+    AgentInstanceReady {
+        instance: AgentInstanceId,
+        error: Option<String>,
+    },
+    /// The instance released its child, `how`, which settled `requests`.
+    /// `usage` is what the child's own model requests used, or `None` when
+    /// none reported anything.
+    #[non_exhaustive]
+    AgentInstanceReleased {
+        instance: AgentInstanceId,
+        how: InstanceRelease,
+        requests: Vec<AgentRequestId>,
+        usage: Option<Usage>,
+    },
+    /// The instance was collected: its release follows, unless the session's
+    /// close had released it.
+    #[non_exhaustive]
+    AgentInstanceCollected { instance: AgentInstanceId },
+    /// The handle of `request`, made through the instance, was collected
+    /// while the request was open. The request goes on.
+    #[non_exhaustive]
+    AgentInstanceHandleCollected {
+        instance: AgentInstanceId,
+        request: AgentRequestId,
+    },
 
     // Integration audit: what crossed to a provider, or across a channel.
     /// A round ended as its model yielded, or as a limit stopped it.
@@ -696,6 +744,11 @@ impl Payload {
             Payload::AgentWedged {} => "agent.wedged",
             Payload::AgentCallStarted { .. } => "agent.call.started",
             Payload::AgentCallSettled { .. } => "agent.call.settled",
+            Payload::AgentInstanceStarted { .. } => "agent.instance.started",
+            Payload::AgentInstanceReady { .. } => "agent.instance.ready",
+            Payload::AgentInstanceReleased { .. } => "agent.instance.released",
+            Payload::AgentInstanceCollected { .. } => "agent.instance.collected",
+            Payload::AgentInstanceHandleCollected { .. } => "agent.instance.handle.collected",
             Payload::ModelRoundUsage { .. } => "model.round.usage",
             Payload::HostedReceived { .. } => "hosted.received",
             Payload::HostedDispatched { .. } => "hosted.dispatched",
@@ -1200,6 +1253,21 @@ pub enum RequestEnd {
     Closed,
     /// The interpreter died before it was answered.
     Terminated,
+}
+
+/// How an agent class's instance was released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InstanceRelease {
+    /// Its code awaited `release()`.
+    Explicit,
+    /// Its `async with` was left.
+    AsyncWith,
+    /// It was collected unreleased.
+    Collected,
+    /// The session closed.
+    Closing,
 }
 
 /// Where the `<Skill>Params` a skill's entry was called with came from.

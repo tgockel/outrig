@@ -159,7 +159,9 @@ to answer -- receive a delivery, reply or fail by it -- with the statement that 
 **The orienting round.** The launch starts the child's first round, in which the model reads its
 instructions and may prepare before any request arrives: import what it will need, open the
 repository, bind helpers. A request arriving during it is announced on the next tool result like
-any other and can be answered in the same round ("The child's rounds"). The round costs one model
+any other and can be answered in the same round ("The child's rounds"). The round opens on no
+request, so its baseline is empty: a request that arrived before or during it and is still open
+when it ends opens the round after it. The round costs one model
 call for an instance that may never receive a request, which is the cost of a child that is
 oriented when the first one arrives; a caller that does not want to pay it before it has a request
 constructs the instance when it has one.
@@ -440,9 +442,10 @@ release is evented as a collection. Three consequences:
   old module holds its globals, and the instance among them. A skill that constructs an instance at
   import releases it itself, or accepts that the child lives until the old namespace goes.
 - **Timing is the collector's.** CPython frees an unreferenced instance at once unless it is in a
-  reference cycle, and the instance's bookkeeping of its handles is one, so the backstop runs when
-  the cyclic collector does, not at the last `del`. It is a backstop, and explicit release is the
-  rule.
+  reference cycle. What runs an instance holds no reference to it (`0003-34`), so the backstop
+  runs at the last `del` -- or as the last request made of it ends -- unless the agent's own code
+  put the instance in a cycle, which defers it to the cyclic collector's next pass. It is a
+  backstop, and explicit release is the rule.
 
 **At the session's close**, a launching instance is never ready -- `ready()` and the first handle
 raise the closing error -- and an idle or working one is released with its requests settled, as
@@ -504,15 +507,20 @@ release settles them. Its kernel is still a thread and its memory, so it counts 
 
 All execution diagnostics (`observability.md`), with bodies as bounded previews: a request's body
 and its reply are values between agents that the parent's model may never see, so they are
-recorded as messages between agents are, never as model view.
+recorded as messages between agents are, never as model view. The instance events carry the
+child's subject, as `agent.call.*` do, and an instance whose launch was refused has no child and
+records none of them (`0003-34`).
 
 - `agent.instance.started` -- the instance's id, the class's `__module__` and `__qualname__` and
   its module's digest, the child's id, the parent -- a kernel's execution, or the owner -- the
   input manifest, and the channels declared with their types;
-- `agent.instance.ready` -- the orienting round ended, or the launch failed and why;
+- `agent.instance.ready` -- the orienting round ended, or the child cannot have it -- the budget
+  spent, a model that cannot answer -- and why;
 - `agent.instance.released` -- how: explicit, `async with`, collected, or the session closing; the
   requests settled by it; and the instance's usage total;
 - `agent.instance.collected` -- the finalizer ran, before the release it scheduled;
+- `agent.instance.handle.collected` -- the handle of one of its requests was collected before the
+  request ended;
 - the request family, shared with submissions (`work.md`): `agent.request.sent`, with the id, the
   channel, a bounded body preview and the parent execution; `received`; `replied`; `invalid`, with
   the problems and the attempt number; `failed`, with the message; `cancelled`; and `settled`, with
@@ -631,9 +639,9 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
 
 ## Unverified
 
-- Nothing on this page has run. The class machinery -- `__init_subclass__` collecting the marked
-  methods, the generated dataclass, the background spawn -- has not been prototyped, and the first
-  evidence is `0003-34`'s acceptance.
+- `0003-34` built the class machinery -- `__init_subclass__` checking the marked methods, the
+  generated dataclass, the background spawn, the orienting round -- and its tests are the evidence
+  for everything above but the host program's half, which is `0003-35`'s.
 - The GC backstop's timing under asyncio was reasoned from CPython's reference counting and cyclic
   collector, not measured: a pending task that references the instance keeps it alive, a cycle
   defers collection to the collector's next pass, and a finalizer that runs at interpreter exit
@@ -643,10 +651,3 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
   `alias` among them: it declares, decodes and renders, and since its annotations are objects
   rather than strings, they resolve whatever its `__module__` names. A generator that passed
   string annotations would still have to set `__module__`.
-- The announcer generalization. `announcement` (`channel.rs:98-115`) knows a channel by name and
-  count only; saying "requests" for a request channel needs the `pending` protocol message to
-  carry each channel's kind, or the host to remember the kinds it declared. Neither exists. The
-  end-of-round summary also needs the received-and-unanswered requests, which are the host's own
-  record; a comparison of whole summaries, by id, where `Told` compares two counts; and a
-  baseline that is the summary the round opened on, where `Told::kept` takes what the round
-  announced, a mid-round announcement included.

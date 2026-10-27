@@ -251,9 +251,11 @@ Four more tasks add events beside them that are execution diagnostics, not integ
   invocation, `skill.invocation.started` and `skill.invocation.finished`, whose id the typed calls
   and hosted calls made inside it carry as context, not as authority. Invocation events are not an
   audit of what a skill did; only boundary events record every crossing (`skills.md`);
-- `0003-34`: each agent instance -- `agent.instance.started`, `ready`, `released` and
-  `collected`, the last when the runtime releases an instance that was collected unreleased.
-  Execution diagnostics like the rest, with any body they carry as a bounded preview.
+- `0003-34`, built: each agent instance -- `agent.instance.started`, `ready`, `released` and
+  `collected`, the last when the runtime releases an instance that was collected unreleased --
+  and `agent.instance.handle.collected` for the handle of a request made of one, collected before
+  the request ended. Execution diagnostics like the rest, with any body they carry as a bounded
+  preview, under the subject of the instance's child.
 
 ## Subscription becomes public; the file keeps its rules
 
