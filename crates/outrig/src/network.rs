@@ -2718,7 +2718,10 @@ fn note_joined(joined: std::result::Result<(), JoinError>, panics: &ConnPanics) 
 /// Whether the server on `port` is expected to write first. Sniffing such a
 /// connection would stall it: there are no client bytes to read until the
 /// server's greeting has been delivered. Only ssh is recognized today; its
-/// banner is read from upstream instead, in [`proxy`].
+/// banner is read from upstream instead, in [`proxy`]. Other server-first
+/// protocols (smtp, imap, ftp, mysql) pay the whole [`SNIFF_TIMEOUT`] per
+/// connection: listing a port skips the host-claim sniff for it, which is a
+/// policy change, not a latency fix.
 fn server_speaks_first(port: u16) -> bool {
     port == 22
 }

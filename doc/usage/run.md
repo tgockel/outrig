@@ -57,6 +57,11 @@ outrig run [--agent <name>]
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this run.
+  Audit and filter modes wait up to 750 ms for a connection's first client bytes, to read the
+  name it asks for, so a protocol where the server speaks first -- SMTP, IMAP, FTP, or MySQL,
+  or an SSH client that waits for the server's banner on a port other than 22 -- pays that wait
+  on every connection. Port 22 is exempt. A program that opens many short connections to such
+  a server should reuse them.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory, which must be empty or not exist yet; symlinked from the root.
 - `--session-root <path>` (default: global config's `session-root`, else XDG): root directory

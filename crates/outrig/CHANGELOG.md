@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The 750 ms network sniff window is documented for server-first protocols.** In audit and
+  filter modes a connection waits up to 750 ms for the client's first bytes, so SMTP, IMAP, FTP,
+  MySQL, and an SSH client that waits for the server's banner off port 22 -- where the server
+  speaks first -- paid it on every connection with no mention in the docs. `outrig run`'s `--network` entry now says so; the behavior is
+  unchanged, because exempting a port also skips the host-claim sniff. (#391)
 - **A network audit record names the resolved names that granted an `allow`, not only the
   client's claim.** `outrig.host` holds the name a client claimed (`Host:` or SNI) when it made
   one, and the first resolved name when it did not, with `outrig.host_source` saying which. Only a
