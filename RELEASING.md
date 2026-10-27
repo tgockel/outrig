@@ -11,6 +11,10 @@ the library is published first and the CLI second.
 - You need crates.io publish rights for both `outrig` and `outrig-cli`, with a token
   configured (`cargo login`).
 - Confirm both crate names are owned or available on crates.io.
+- Install the musl target for this machine's architecture, `x86_64-unknown-linux-musl` or
+  `aarch64-unknown-linux-musl`, with `rustup target add`. `outrig` builds its `outrig-enter`
+  launcher for it, and the dry-run and publish below set `OUTRIG_REQUIRE_ENTER`, so without the
+  target they fail instead of warning.
 
 ## Checklist
 
@@ -86,8 +90,13 @@ Catches missing files, bad README paths, a dirty tree, and a stale `outrig` requ
 `outrig-cli`:
 
 ```sh
-cargo publish --dry-run -p outrig -p outrig-cli
+OUTRIG_REQUIRE_ENTER=1 cargo publish --dry-run -p outrig -p outrig-cli
 ```
+
+The variable is what extends "missing files" to the `outrig-enter` launcher. Without it,
+`outrig`'s `build.rs` turns a launcher it cannot build -- `src/container/enter/launcher.rs`
+missing from the archive, say -- into one cargo warning, and the run stays green.
+[Packaging](CONTRIBUTING.md#packaging) has the full account.
 
 Cargo packages both, unpacks `outrig` into a temporary registry under `target/package/`,
 and verify-builds `outrig-cli` against that packaged copy -- so the dependency
@@ -102,13 +111,13 @@ for the requirement`. That is expected, not a fault in the crate.
 One invocation does both in dependency order, waiting for the index between them:
 
 ```sh
-cargo publish -p outrig -p outrig-cli
+OUTRIG_REQUIRE_ENTER=1 cargo publish -p outrig -p outrig-cli
 ```
 
-Cargo verify-builds each crate before uploading. To do them separately instead, publish
-`outrig` first and wait for the new version to reach the index before running
-`cargo publish -p outrig-cli` -- that build resolves against the real index and fails if
-the index has not caught up.
+Cargo verify-builds each crate before uploading, which is why this command takes the variable
+too. To do them separately instead, publish `outrig` first and wait for the new version to
+reach the index before running `cargo publish -p outrig-cli` -- that build resolves against
+the real index and fails if the index has not caught up. Keep the variable on both.
 
 ### Refresh the version-bearing docs
 
