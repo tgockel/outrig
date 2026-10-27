@@ -1030,8 +1030,8 @@ async fn a_canceled_label_commit_removes_its_working_container() {
     return_immediately_for(journal, "build", &token);
 
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let build = outrig::image::build_image_for("labeled", &cfg, context.path(), &final_tag, false);
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let build = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false);
     let mut build = Box::pin(build);
 
     let from = ["outrig-label-", token.as_str()];
@@ -1450,6 +1450,14 @@ async fn a_canceled_container_start_is_still_killed_outright() {
     );
 }
 
+/// The tag a build of `cfg` in `context` is keyed by, with `token` as its repository so the
+/// fakes can find it. A build is refused any other tag (#392).
+async fn keyed_tag(token: &str, cfg: &outrig::config::ImageConfig, context: &Path) -> ImageTag {
+    outrig::image::compute_tag_for(token, cfg, context)
+        .await
+        .expect("compute_tag_for")
+}
+
 /// A standalone build of `token`'s image from a scratch Dockerfile: the
 /// shortest path to a temporary tag and its removal.
 async fn standalone_build(token: &str) -> Result<(), OutrigError> {
@@ -1513,8 +1521,8 @@ async fn a_refused_working_container_removal_is_reissued() {
     refuse_for(journal, "rm", &token, 1);
 
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let err = outrig::image::build_image_for("refused", &cfg, context.path(), &final_tag, false)
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let err = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
         .await
         .expect_err("the fake refuses the commit");
     assert!(
@@ -1548,8 +1556,8 @@ async fn a_temp_tag_removal_waits_for_the_working_container_removal() {
     slow_for(journal, "rm", &token, "0.3");
 
     let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let err = outrig::image::build_image_for("chained", &cfg, context.path(), &final_tag, false)
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    let err = outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
         .await
         .expect_err("the fake refuses the commit");
     assert!(

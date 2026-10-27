@@ -408,7 +408,11 @@ async fn a_concurrent_build_from_the_same_base_is_untouched() {
     let cancel_ctx = slow_context(&base);
 
     let cfg = common::fixture_build_config();
-    let keep_tag = ImageTag::new(format!("{marker}:keep"));
+    // This one finishes, and a build is refused a tag its inputs do not hash to (#392). The
+    // marker is still its repository, which is what `sweep` finds it by.
+    let keep_tag = image::compute_tag_for(&marker, &cfg, keep_ctx.path())
+        .await
+        .expect("compute_tag_for");
     let mut keep = Box::pin(image::build_image_for(
         &marker,
         &cfg,

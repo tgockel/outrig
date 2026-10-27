@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{
-    CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, UNNAMED_IMAGE, compute_tag,
-    compute_tag_for, hash_context, pairs_block,
+    CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, OutrigError, UNNAMED_IMAGE,
+    compute_tag, compute_tag_for, ensure_key_still_holds, hash_context, pairs_block,
 };
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -1072,6 +1072,50 @@ async fn named_build_tag_tracks_repo_mcp_labels() {
         .expect("compute_tag_for");
 
     assert_ne!(fs_tag, git_tag);
+}
+
+/// What `ensure_key_still_holds` is asked after a build: does `tag` still name what the inputs
+/// hash to. Both ways the context is keyed, since each reads the files itself.
+#[tokio::test]
+async fn a_key_holds_until_the_context_changes() {
+    for in_git in [false, true] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM alpine\nCOPY payload /payload\n"),
+            ("payload", "one\n"),
+        ]);
+        if in_git {
+            git_init(ctx.path());
+        }
+        let cfg = build_cfg(ctx.path());
+        let tag = compute_tag_for("coding", &cfg, Path::new(""))
+            .await
+            .expect("compute_tag_for");
+        let no_args = BTreeMap::new();
+        let holds = || ensure_key_still_holds("coding", &cfg, Path::new(""), &no_args, &tag);
+
+        holds()
+            .await
+            .unwrap_or_else(|e| panic!("an untouched context keeps its key (git: {in_git}): {e}"));
+
+        std::fs::write(ctx.path().join("payload"), "two\n").expect("edit payload");
+        let err = holds()
+            .await
+            .expect_err("an edited context is not the one the key hashed");
+        assert!(
+            matches!(
+                &err,
+                OutrigError::BuildContextChanged { image, tag: named }
+                    if image == "coding" && named == tag.as_str()
+            ),
+            "git: {in_git}, got {err}"
+        );
+
+        // Reverting is the case the stale tag would have been served for.
+        std::fs::write(ctx.path().join("payload"), "one\n").expect("revert payload");
+        holds().await.unwrap_or_else(|e| {
+            panic!("a reverted context holds its key again (git: {in_git}): {e}")
+        });
+    }
 }
 
 #[tokio::test]

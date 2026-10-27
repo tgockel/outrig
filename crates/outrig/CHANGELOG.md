@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OutrigError::BuildContextChanged`**: a build whose Dockerfile or context changed while buildah
+  ran, discarded rather than saved. It names the image-config and the tag the build would have been
+  saved as. For a caller that computes a tag, builds into it, and has to tell this refusal from a
+  build that failed. See the fix below. (#392)
 - **`Container::start_named_held` and `Container::release`**: `start_named` with the container's
   process held back, and the `podman start` that runs it. The container is created and
   initialized, so its PID and network namespace exist and `NetworkInterceptor::attach` can work
@@ -57,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image built while its context changed is no longer saved under the old key.** The cache key
+  is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
+  file saved during an earlier `RUN` landed in an image tagged with the key of the content before
+  the edit. Restoring that content later probed the key, hit, and served the edited image. The key
+  is now hashed again once buildah finishes and before anything is named, and if it moved the build
+  is discarded, nothing is tagged, and the call fails with the new
+  `OutrigError::BuildContextChanged`. Running it again keys the edited content, and buildah's layer
+  cache keeps that short. `build_image_for` and `ensure_tagged_image_for[_with_output]` take the
+  `tag` that `compute_tag_for` gave for the same inputs, and now refuse any other the same way once
+  their build has run. `ensure_image` computes its own. (#392)
 - **`Outrig::launch` attaches the network interceptor before the primary's process runs.** An
   image that sets an `ENTRYPOINT` -- which `containers.md` asks nobody to do, and which podman
   gives `sleep infinity` as its arguments -- ran it the moment `podman run -d` returned, and

@@ -7,6 +7,9 @@
 //! first; on miss it shells out to `buildah build`. Buildah's own layer cache
 //! still helps speed up the build itself when we miss; the project-level tag
 //! cache exists so a *hit* skips buildah entirely.
+//!
+//! A finished build is hashed again, and discarded rather than tagged if the
+//! key moved ([`OutrigError::BuildContextChanged`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -392,6 +395,32 @@ async fn compute_tag_with_build_args(
     Ok(ImageTag::new(format!("{repo}:{key}")))
 }
 
+/// Refuse to name a finished build `tag` if its inputs no longer hash to it.
+///
+/// `tag` was computed before buildah started, and buildah reads the context as each `COPY` runs
+/// rather than when the build starts. A file saved while an earlier `RUN` was still going is
+/// one the image holds and the key does not hash, and under that key the image would be served
+/// the next time the old content came back. Called after `buildah build` and before anything
+/// is named `tag`, so the temporary image [`into_temp_tag`] removes on the error is all that
+/// exists. The same check also trips on an edit after the last `COPY`, which no key can tell
+/// from one before it.
+async fn ensure_key_still_holds(
+    image: &str,
+    cfg: &ImageConfig,
+    repo_root: &Path,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
+    tag: &ImageTag,
+) -> Result<()> {
+    let now = compute_tag_with_build_args(tag_repo(image), cfg, repo_root, build_args).await?;
+    if now == *tag {
+        return Ok(());
+    }
+    Err(OutrigError::BuildContextChanged {
+        image: image.to_string(),
+        tag: tag.to_string(),
+    })
+}
+
 /// Returns `true` iff `tag` already exists in buildah's local image store.
 /// `buildah images --quiet <tag>` prints the image id on a hit, and exits 125
 /// with `image not known` on a miss; any failure reads as a miss, and so does
@@ -554,6 +583,11 @@ async fn run_shown_or_captured(
 
 /// Run `buildah build` for `cfg`, tagging the result `tag`, with build-arg
 /// resolution errors framed against the selected image-config.
+///
+/// `tag` is the one [`compute_tag_for`] gave for the same `image`, `cfg` and
+/// `repo_root`. A build whose Dockerfile or context no longer hashes to it when
+/// buildah finishes is discarded and nothing is tagged; see
+/// [`OutrigError::BuildContextChanged`].
 pub async fn build_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -615,6 +649,7 @@ async fn build_image_with_build_args(
             build_termination(),
         )
         .await?;
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
         stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, None, owed_first).await
     })
     .await
@@ -640,6 +675,7 @@ async fn build_image_logged_with_build_args(
             output,
         )
         .await?;
+        ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
         stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, transcript, owed_first).await
     })
     .await
@@ -706,6 +742,11 @@ async fn ensure_image_for(
 /// framed against the selected image-config. This lets session startup
 /// write a complete `session.json` and open `logs/container.log` before the
 /// buildah probe/build begins, without hashing the Dockerfile/context twice.
+///
+/// `tag` must be the one [`compute_tag_for`] gave for the same `image`, `cfg`
+/// and `repo_root`. A build whose Dockerfile or context changed while it ran
+/// is discarded rather than tagged, and fails with
+/// [`OutrigError::BuildContextChanged`].
 ///
 /// A cache miss's build or pull is captured; see
 /// [`ensure_tagged_image_for_with_output`] to show it as it runs.

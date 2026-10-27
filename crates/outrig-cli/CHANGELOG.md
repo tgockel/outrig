@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image built while its context changed is no longer saved under the old key.** The cache key
+  is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
+  file saved during an earlier `RUN` landed in an image tagged with the key of the content before
+  the edit, and restoring that content later was served the edited image. The key is now hashed
+  again when the build ends; if it moved, the build is discarded and nothing is tagged. `outrig
+  build` fails with `image "<name>": its Dockerfile or build context changed while it was
+  building`, and a session or sidecar that needed the image ends before its container starts.
+  Running the command again keys the edited content. (#392)
 - **The network interceptor attaches to the primary before its process runs.** An image that sets
   an `ENTRYPOINT` -- which `containers.md` asks nobody to do, and which podman gives `sleep
   infinity` as its arguments -- ran it the moment the primary started, and a session attached the
