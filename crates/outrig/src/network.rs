@@ -9355,6 +9355,12 @@ mod tests {
         }
 
         tokio::time::sleep(DNS_TCP_IDLE * 2).await;
+        // The waits that needed a clock of their own are over; what follows is
+        // the kernel delivering bytes and a close, in real time. Left paused,
+        // the runtime advances the clock the moment it has nothing ready and
+        // one look at I/O found nothing, so a read waiting on a busy machine's
+        // kernel would time out at once and blame a listener that did close.
+        tokio::time::resume();
 
         // Whatever the server had already queued arrives, and then it ends:
         // closed, not parked.
