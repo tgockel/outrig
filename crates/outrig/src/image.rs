@@ -11,6 +11,7 @@
 //! A finished build is hashed again, and discarded rather than tagged if the
 //! key moved ([`OutrigError::BuildContextChanged`]).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
@@ -20,7 +21,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
 
 use crate::config::{
     ImageConfig, ImageSourceRef, McpServerSpec, ResolvedEnvValue, resolve_against,
@@ -37,7 +37,6 @@ use crate::supervise::{CLEANUP_RETRIES, CleanupGuard, RETRY_BACKOFF, Reissue};
 /// built image reads as `<image-config-name>:<hash>` in `podman images`.
 const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
-const TAR_READ_CHUNK: usize = 64 * 1024;
 const UNNAMED_IMAGE: &str = "<image>";
 const DOCKER_TRANSPORT_PREFIX: &str = "docker://";
 const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
@@ -1442,12 +1441,12 @@ fn buildah_build_cmd(
 }
 
 /// Key the build context `ctx`: by [`hash_git_context`] in a git worktree, or
-/// as a tarball of the whole directory outside one.
+/// by [`hash_non_git_context`], the same in-process walk, outside one.
 async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
     if is_git_context(ctx).await? {
         hash_git_context(ctx, hasher).await
     } else {
-        hash_tar_context(ctx, hasher).await
+        hash_non_git_context(ctx, hasher).await
     }
 }
 
@@ -1696,12 +1695,20 @@ async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
     Ok(paths)
 }
 
-/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`].
+/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`]. From the
+/// context's own root (an empty `dir`) the walk is [`TreeHasher::whole`].
 async fn hash_whole_tree(ctx: &Path, dir: &Path) -> Result<blake3::Hash> {
     let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
-    tokio::task::spawn_blocking(move || TreeHasher::new(&root).dir(&dir))
-        .await
-        .expect("context hashing task panicked")
+    tokio::task::spawn_blocking(move || {
+        let mut tree = if dir.as_os_str().is_empty() {
+            TreeHasher::whole(&root)
+        } else {
+            TreeHasher::new(&root)
+        };
+        tree.dir(&dir)
+    })
+    .await
+    .expect("context hashing task panicked")
 }
 
 /// What one listed path contributes to [`hash_git_context`].
@@ -1720,6 +1727,10 @@ enum ContextEntry {
 /// or under `.git`) and which may hold more links, so every link is followed
 /// wherever it is met. A referent is hashed once; a link back into one still
 /// being hashed is a loop, and counts by its text alone.
+///
+/// A walk of the whole context, [`Self::whole`], follows no link: it meets the
+/// referent in its own place anyway, and following into it from every link
+/// that points at an ancestor would hash a subtree again for each.
 struct TreeHasher<'a> {
     ctx: &'a Path,
     /// Mode and digest of each referent hashed so far, by context-relative
@@ -1727,6 +1738,13 @@ struct TreeHasher<'a> {
     done: HashMap<PathBuf, (u32, blake3::Hash)>,
     /// Referents being hashed now.
     active: HashSet<PathBuf>,
+    /// Set for a walk of the whole context: the first path each file with more
+    /// than one link was met at, by device and inode. buildah keeps a `COPY
+    /// .`'s hard links, so a later link to a file is keyed as such, not by
+    /// bytes a pair of copies would share. Only the one walk, in name order,
+    /// makes "first" mean something; a referent hashed from the middle of
+    /// another walk would not.
+    whole: Option<HashMap<(u64, u64), PathBuf>>,
 }
 
 impl<'a> TreeHasher<'a> {
@@ -1735,6 +1753,16 @@ impl<'a> TreeHasher<'a> {
             ctx,
             done: HashMap::new(),
             active: HashSet::new(),
+            whole: None,
+        }
+    }
+
+    /// A hasher for [`Self::dir`] of the context's own root: every path in `ctx`
+    /// is met once, in name order.
+    fn whole(ctx: &'a Path) -> Self {
+        Self {
+            whole: Some(HashMap::new()),
+            ..Self::new(ctx)
         }
     }
 
@@ -1764,13 +1792,34 @@ impl<'a> TreeHasher<'a> {
     fn entry(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Result<blake3::Hash> {
         let file_type = meta.file_type();
         if file_type.is_file() {
-            hash_file(&self.ctx.join(rel))
+            match self.earlier_link(rel, meta) {
+                Some(first) => Ok(hard_link_digest(&first)),
+                None => hash_file(&self.ctx.join(rel)),
+            }
         } else if file_type.is_symlink() {
             self.link(rel)
         } else if file_type.is_dir() {
             self.dir(rel)
         } else {
             Ok(NO_CONTENT)
+        }
+    }
+
+    /// Where a whole-context walk first met the regular file `meta` describes,
+    /// when `rel` is a later link to it. A file whose other links are outside
+    /// the context, or that has none, has no earlier one: nothing `COPY` sees
+    /// tells it from a plain file.
+    fn earlier_link(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
+        let first_links = self.whole.as_mut()?;
+        if meta.nlink() < 2 {
+            return None;
+        }
+        match first_links.entry((meta.dev(), meta.ino())) {
+            Entry::Occupied(first) => Some(first.get().clone()),
+            Entry::Vacant(slot) => {
+                slot.insert(rel.to_path_buf());
+                None
+            }
         }
     }
 
@@ -1805,7 +1854,8 @@ impl<'a> TreeHasher<'a> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(target.as_os_str().as_bytes());
         hasher.update(b"\0");
-        if let Some(referent) = resolve_in_context(self.ctx, rel)
+        if self.whole.is_none()
+            && let Some(referent) = resolve_in_context(self.ctx, rel)
             && let Some((mode, digest)) = self.referent(referent)?
         {
             hasher.update(&mode.to_le_bytes());
@@ -1832,6 +1882,16 @@ impl<'a> TreeHasher<'a> {
         self.done.insert(rel, done);
         Ok(Some(done))
     }
+}
+
+/// What a later hard link to a file contributes in place of its bytes: the
+/// context-relative path of the first link, which the key already hashes the
+/// bytes of. The derive-key domain keeps it from ever matching a file's
+/// content hash, whatever the file holds.
+fn hard_link_digest(first: &Path) -> blake3::Hash {
+    blake3::Hasher::new_derive_key("outrig build context hard link")
+        .update(first.as_os_str().as_bytes())
+        .finalize()
 }
 
 fn hash_file(path: &Path) -> Result<blake3::Hash> {
@@ -1898,57 +1958,26 @@ fn clean_lexically(path: &Path) -> PathBuf {
     cleaned
 }
 
-async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    // Reproducibility flags: --sort=name fixes file order, --mtime pins
-    // archive mtimes to the epoch (otherwise filesystem mtimes leak in),
-    // --owner=0/--group=0/--numeric-owner strip uid/gid (otherwise the
-    // hash would differ across users / machines).
-    let cmd = Cmd::new("tar")
-        .args([
-            "--sort=name",
-            "--mtime=UTC 1970-01-01",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-            "-cf",
-            "-",
-            "-C",
-        ])
-        .arg(ctx)
-        .arg(".");
-    let failed = cmd.clone();
-    let mut child = process::spawn_stdio(cmd).await?;
-
-    drop(child.stdin.take());
-
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let stderr_task = tokio::spawn(async move {
-        let mut s = stderr;
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf).await;
-        if !buf.is_empty() {
-            let text = String::from_utf8_lossy(&buf);
-            for line in text.lines() {
-                tracing::warn!(target: "outrig::image", "[tar] {line}");
-            }
-        }
-    });
-
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut chunk = vec![0u8; TAR_READ_CHUNK];
-    loop {
-        let n = stdout.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&chunk[..n]);
-    }
-
-    let status = child.wait().await?;
-    let _ = stderr_task.await;
-    if !status.success() {
-        return Err(failed.process_error(status.code(), String::new()));
-    }
+/// Key a context that is not in a git repository: every file and directory in
+/// it, by [`TreeHasher::whole`], since there is no ignore rule to narrow the
+/// set and no listing but the filesystem's own. A symlink counts by its text
+/// and a hard link by the first link to the same file, as the `tar` stream this
+/// replaced had them. Runs in process rather than shelling out to `tar`, so
+/// building from a non-git context no longer needs `tar` on the host at all,
+/// GNU or otherwise -- the prior `--sort=name` flag needed GNU tar 1.28+, which
+/// a minimal distro image's busybox `tar` does not implement -- and a read
+/// failure now comes back as the `OutrigError::Path` that named it, not a bare
+/// `tar` exit code with nothing in its stderr.
+async fn hash_non_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let root = tokio::fs::symlink_metadata(ctx)
+        .await
+        .path_ctx("stat", ctx)?;
+    update_record(
+        hasher,
+        b"",
+        root.mode(),
+        &hash_whole_tree(ctx, Path::new("")).await?,
+    );
     Ok(())
 }
 

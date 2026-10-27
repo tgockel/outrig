@@ -378,9 +378,10 @@ build context. When the context is in a git repo, that means every file in it th
 does not exclude, committed or not, by path, permission bits, and content, and every directory it
 does not exclude, empty ones included, by path and permission bits. If `.gitignore` matches the
 context directory, or every file in it, committed or not, then every file counts: the rules say
-nothing about which of them the build uses. Outside a git repo, it is a tarball hash of the whole
-directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
-podman shows as `localhost/outrig-standard`.
+nothing about which of them the build uses. Outside a git repo, every file and directory in it
+counts the same way, and so does which of its files are hard links to one another; it is walked in
+process rather than listed by git. So `[images.outrig-standard]` builds to
+`outrig-standard:<hash>`, which podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
 temporary image, reads any inherited/Dockerfile MCP label, overlays `[images.<name>.mcp]`, and

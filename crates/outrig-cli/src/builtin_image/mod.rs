@@ -158,8 +158,8 @@ fn shell_dir_or_note(notes: &mut Vec<String>) -> Option<PathBuf> {
 
 /// Write the embedded Dockerfile into `dir`, skipping the write when the
 /// bytes already match. Rewriting every session would be harmless for the
-/// content hash -- `hash_tar_context` pins mtime and ownership -- but it is
-/// pointless I/O on a path every run takes.
+/// content hash -- the non-git context walk hashes content and mode, not
+/// mtime or ownership -- but it is pointless I/O on a path every run takes.
 fn materialize(dir: &Path) -> Result<()> {
     let path = dir.join("Dockerfile");
     if std::fs::read_to_string(&path).is_ok_and(|current| current == SHELL_DOCKERFILE) {

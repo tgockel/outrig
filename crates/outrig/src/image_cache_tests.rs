@@ -1,6 +1,7 @@
 //! Pure-key tests for `image::CacheKey::compute`. These don't need
-//! buildah or podman -- the cache-key machinery is hashing and subprocess work
-//! against `git` and `tar`.
+//! buildah or podman -- the cache-key machinery is hashing, subprocess work
+//! against `git` for a git-hosted context, and an in-process directory walk
+//! otherwise.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -8,8 +9,8 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{
-    CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, OutrigError, UNNAMED_IMAGE,
-    compute_tag, compute_tag_for, ensure_key_still_holds, hash_context, pairs_block,
+    CacheKey, ImageConfig, ImageTag, KEY_HEX_LEN, McpServerSpec, OutrigError, TreeHasher,
+    UNNAMED_IMAGE, compute_tag, compute_tag_for, ensure_key_still_holds, hash_context, pairs_block,
 };
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -978,7 +979,7 @@ async fn symlink_loops_end() {
 }
 
 #[tokio::test]
-async fn non_git_context_uses_tar() {
+async fn non_git_context_is_walked_directly() {
     let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("a.txt", "alpha")]);
     assert!(
         !ctx.path().join(".git").exists(),
@@ -989,7 +990,10 @@ async fn non_git_context_uses_tar() {
     let dockerfile = ctx.path().join("Dockerfile");
     let k1 = key(&dockerfile, &args, ctx.path()).await;
     let k2 = key(&dockerfile, &args, ctx.path()).await;
-    assert_eq!(k1, k2, "tar-based hash must be deterministic across runs");
+    assert_eq!(
+        k1, k2,
+        "non-git context hash must be deterministic across runs"
+    );
 
     std::fs::write(ctx.path().join("a.txt"), "beta").unwrap();
     let k3 = key(&dockerfile, &args, ctx.path()).await;
@@ -997,11 +1001,10 @@ async fn non_git_context_uses_tar() {
 }
 
 #[tokio::test]
-async fn tar_path_key_is_mtime_independent() {
+async fn non_git_path_key_is_mtime_independent() {
     // Two non-git contexts with byte-identical content. Bump the mtime on
-    // every entry of one of them by a year so any naive tar invocation would
-    // produce different bytes. With --mtime=UTC 1970-01-01 the archive is
-    // mtime-stripped, so the hash must still match.
+    // every entry of one of them by a year; the walk hashes content and mode,
+    // never mtime, so the key must still match.
     let a = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("payload", "data")]);
     let b = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("payload", "data")]);
     for entry in ["Dockerfile", "payload"] {
@@ -1017,8 +1020,136 @@ async fn tar_path_key_is_mtime_independent() {
     let kb = key(&b.path().join("Dockerfile"), &args, b.path()).await;
     assert_eq!(
         ka, kb,
-        "tar-path hash must ignore filesystem mtimes (so fresh clones cache-hit)"
+        "non-git context hash must ignore filesystem mtimes (so fresh clones cache-hit)"
     );
+}
+
+/// A non-git context that does not exist fails with the path and the
+/// underlying I/O error named, not a bare subprocess exit code with an empty
+/// stderr tail (#394): the walk is in process, so a missing directory is a
+/// `std::fs` error `path_ctx` attaches a path to.
+#[tokio::test]
+async fn nonexistent_non_git_context_names_the_path() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let missing = ctx.path().join("does-not-exist");
+    let dockerfile = ctx.path().join("Dockerfile");
+
+    let err = CacheKey::compute(&dockerfile, &BTreeMap::new(), &missing)
+        .await
+        .expect_err("a missing context must fail the key");
+    match err {
+        OutrigError::Path { op, path, .. } => {
+            assert_eq!(op, "stat");
+            assert_eq!(path, missing);
+        }
+        other => panic!("expected OutrigError::Path, got {other:?}"),
+    }
+}
+
+/// buildah keeps the hard links a `COPY .` meets, so a `RUN` that writes one
+/// path and reads its twin sees something different from two copies of the
+/// same bytes. The key must tell them apart with every byte and mode the same,
+/// and tell which files are linked, not only that some are.
+#[tokio::test]
+async fn non_git_key_sees_which_files_are_hard_links() {
+    let ctx = make_ctx(&[
+        ("Dockerfile", "FROM alpine\n"),
+        ("x/one", "same"),
+        ("y/two", "same"),
+        ("y/three", "same"),
+    ]);
+    let (one, two, three) = (
+        ctx.path().join("x/one"),
+        ctx.path().join("y/two"),
+        ctx.path().join("y/three"),
+    );
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let copy_both = || {
+        for path in [&two, &three] {
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, "same").unwrap();
+        }
+    };
+    // `linked` becomes a link to `x/one`; the other stays a copy.
+    let link_only = |linked: &Path| {
+        copy_both();
+        std::fs::remove_file(linked).unwrap();
+        std::fs::hard_link(&one, linked).unwrap();
+    };
+
+    let copies = key(&dockerfile, &args, ctx.path()).await;
+    link_only(&two);
+    let one_two = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(
+        copies, one_two,
+        "linking two identical files must change the key"
+    );
+    assert_eq!(one_two, key(&dockerfile, &args, ctx.path()).await);
+
+    link_only(&three);
+    let one_three = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(
+        one_two, one_three,
+        "which file is linked must change the key"
+    );
+
+    copy_both();
+    assert_eq!(
+        copies,
+        key(&dockerfile, &args, ctx.path()).await,
+        "breaking the links must return the key: only topology changed"
+    );
+}
+
+/// A file's other links outside the context are not in a `COPY .`, so it is
+/// keyed as the plain file it is there.
+#[tokio::test]
+async fn non_git_key_ignores_hard_links_that_leave_the_context() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("data", "same")]);
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::hard_link(ctx.path().join("data"), elsewhere.path().join("data")).unwrap();
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "a link from outside the context changes nothing `COPY` sees"
+    );
+}
+
+/// A link to an ancestor leads back into what the walk is already hashing,
+/// and a walk of the whole context meets every referent in its own place
+/// anyway: it follows no link, so the deepest directory is hashed once, not
+/// once more for each link above it. An edit to the referent still changes the
+/// key.
+#[tokio::test]
+async fn non_git_walk_does_not_follow_links_to_ancestors() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let mut deepest = ctx.path().to_path_buf();
+    for _ in 0..20 {
+        deepest.push("d");
+        std::fs::create_dir(&deepest).unwrap();
+        std::os::unix::fs::symlink("..", deepest.join("up")).unwrap();
+    }
+    std::fs::write(deepest.join("payload"), "v1").unwrap();
+
+    let mut whole = TreeHasher::whole(ctx.path());
+    whole.dir(Path::new("")).unwrap();
+    assert!(whole.done.is_empty(), "no referent should be hashed again");
+    // The same tree from a subtree walk does follow, or the check above says nothing.
+    let mut subtree = TreeHasher::new(ctx.path());
+    subtree.dir(Path::new("")).unwrap();
+    assert!(!subtree.done.is_empty());
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    assert_eq!(before, key(&dockerfile, &args, ctx.path()).await);
+    std::fs::write(deepest.join("payload"), "v2").unwrap();
+    assert_ne!(before, key(&dockerfile, &args, ctx.path()).await);
 }
 
 fn build_cfg(ctx: &Path) -> ImageConfig {

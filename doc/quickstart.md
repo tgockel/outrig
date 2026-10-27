@@ -13,6 +13,10 @@ crates publish from this repository.
 - Linux on x86-64 or AArch64. Both are covered by a live end-to-end run in CI, not only by a
   build. WSL2 counts; macOS and native Windows are not supported.
 - Rust toolchain (you'll need it to install outrig itself).
+- `git`, on `PATH`. Every image build probes the context with `git -C <context> rev-parse
+  --git-dir` to decide whether to key it by git's listing or by walking the directory itself
+  (see [Concepts -> Containers](concepts/containers.md#image-caching)), so this runs even for
+  a context that is not itself a git repository.
 - [podman](https://podman.io) **4.3 or newer**, installed and working in rootless mode.
   Verify with `podman info` -- it should print without errors. The floor is 4.3 because
   outrig's cancellation cleanup removes containers with `podman rm --filter`, which older

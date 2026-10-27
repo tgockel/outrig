@@ -61,6 +61,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A context outside a git repository is hashed in process, not by shelling out to `tar`.**
+  `tar`'s stderr went to a `tracing::warn!` line and never into the error, so a failure --
+  a context directory that does not exist, a file in it the process cannot read -- surfaced as
+  `process `tar` exited with code 2` with an empty stderr tail and nothing to act on. It also
+  meant building from a non-git context needed `tar --sort=name`, a GNU extension a minimal
+  image's busybox `tar` does not implement, undocumented either way. The walk
+  `hash_git_context` already uses per path for an untracked file now runs over the whole
+  directory, so a read failure comes back as the `OutrigError::Path` that names the path and the
+  underlying error, and the host needs neither `tar` nor (for a context that is not itself a
+  git repository) GNU tar to build at all. As the `tar` stream did, the key counts a symlink by
+  its text and a hard link by the first link to the same file: replacing two identical files
+  with a linked pair rebuilds, and a symlink to an ancestor does not send the walk back through
+  that subtree. `doc/quickstart.md` now lists `git` as a prerequisite:
+  every build still probes the context with `git -C <context> rev-parse --git-dir` to decide
+  which of the two paths to take, whether or not the context is git-hosted. (#394)
 - **An image built while its context changed is no longer saved under the old key.** The cache key
   is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
   file saved during an earlier `RUN` landed in an image tagged with the key of the content before
