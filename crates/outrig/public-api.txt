@@ -905,10 +905,12 @@ pub async fn outrig::container::Container::inspect_existing(&str, core::option::
 pub async fn outrig::container::Container::is_running(&str) -> outrig::error::Result<bool>
 pub fn outrig::container::Container::name(&self) -> &str
 pub async fn outrig::container::Container::pid(&self) -> outrig::error::Result<u32>
+pub async fn outrig::container::Container::release(&self) -> outrig::error::Result<()>
 pub fn outrig::container::Container::selector(&self) -> &str
 pub fn outrig::container::Container::session_suffix(&self) -> &str
 pub async fn outrig::container::Container::start(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::start_named(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::start_named_held(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::stop(self, core::time::Duration) -> outrig::error::Result<()>
 pub async fn outrig::container::Container::stop_or_keep(self, core::time::Duration) -> core::option::Option<(outrig::error::OutrigError, Self)>
 pub fn outrig::container::Container::transcript(&self) -> core::option::Option<outrig::Transcript>

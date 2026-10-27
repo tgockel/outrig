@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Container::start_named_held` and `Container::release`**: `start_named` with the container's
+  process held back, and the `podman start` that runs it. The container is created and
+  initialized, so its PID and network namespace exist and `NetworkInterceptor::attach` can work
+  on it, but nothing in it runs until it is released. The interceptor's resolver is baked in at
+  create (`--dns`), as it is for an entrypoint-stdio sidecar, because nothing can be exec'd into
+  a container that has not started. For a caller that has to act on a container before the
+  image's process does. See the fix below. (#395)
 - **`Config::salvage_global_session_root`**: the global config's `session-root` read out of a
   file that does not load as a whole, resolved beside the file and `~`-expanded exactly as
   `load_global` resolves it. Only a declaration the damaged file states outright is read: one
@@ -50,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Outrig::launch` attaches the network interceptor before the primary's process runs.** An
+  image that sets an `ENTRYPOINT` -- which `containers.md` asks nobody to do, and which podman
+  gives `sleep infinity` as its arguments -- ran it the moment `podman run -d` returned, and
+  `launch` attached the interceptor only after the user bootstrap. Whatever that entrypoint sent
+  was outside audit mode's record of every connection and filter mode's policy. Under audit or
+  filter mode the primary is now created and initialized, the interceptor attached to its
+  network namespace, and only then is it started, the way an entrypoint-stdio sidecar already
+  was; the user bootstrap follows. The default mode still starts it with `podman run -d`. A
+  sidecar whose servers are `podman exec`'d is not held, and still starts before it is attached.
+  (#395)
 - **The 750 ms network sniff window is documented for server-first protocols.** In audit and
   filter modes a connection waits up to 750 ms for the client's first bytes, so SMTP, IMAP, FTP,
   MySQL, and an SSH client that waits for the server's banner off port 22 -- where the server

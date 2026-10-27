@@ -700,10 +700,10 @@ impl NetworkInterceptor {
     /// authority over that address to any other attachment.
     ///
     /// Also works on a container in the created+initialized state
-    /// (`Container::create_initialized`), whose entrypoint has not yet
-    /// executed -- `podman init` materializes the PID and namespaces this
-    /// needs. Attaching before `podman start` is what closes the
-    /// entrypoint-stdio race: policy is live in the netns before the
+    /// (`Container::create_initialized`, `Container::start_named_held`), whose
+    /// entrypoint has not yet executed -- `podman init` materializes the PID
+    /// and namespaces this needs. Attaching before `podman start` is what
+    /// closes the entrypoint race: policy is live in the netns before the
     /// entrypoint's first packet.
     ///
     /// A container launched holding `CAP_NET_ADMIN` -- `cap-add` of

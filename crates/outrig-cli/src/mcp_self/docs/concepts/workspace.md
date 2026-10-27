@@ -212,7 +212,9 @@ lookup, to `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only:
 and every lookup is still allowed, but records include the best known host, destination IP and
 port, transport, service, byte counts, and duration. HTTPS remains opaque except for TLS SNI.
 URL, method, status, and body inspection are deferred. The interceptor carries TCP and DNS over
-UDP/53; any other datagram leaves by podman's default route and is not recorded.
+UDP/53; any other datagram leaves by podman's default route and is not recorded. It is attached
+to the primary before the primary's own process runs, so the traffic of an image `ENTRYPOINT` is
+recorded like any other's (see [Containers](containers.md#dont-set-an-entrypoint)).
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:

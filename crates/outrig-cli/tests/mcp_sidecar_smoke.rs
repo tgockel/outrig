@@ -23,6 +23,12 @@
 //! - Stopping the entrypoint container mid-session degrades its tools to
 //!   errors while the session and primary-hosted tools survive.
 //!
+//! And a primary image that sets an `ENTRYPOINT`:
+//!
+//! - The primary is held until the interceptor is attached, so the
+//!   entrypoint's first request lands in `network.jsonl` attributed to it
+//!   (#395).
+//!
 //! And task 0002-11's argument criterion:
 //!
 //! - A named block whose mcp entry omits `command` is an entrypoint host: its
@@ -875,6 +881,105 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
          sidecar container:\n{log}"
     );
     wait_until_gone(&[format!("outrig-{sid}"), sidecar]).await;
+}
+
+/// A primary whose image sets an `ENTRYPOINT` -- which podman hands `sleep
+/// infinity` -- runs it the moment the primary starts, and in a session that
+/// ran it before the interceptor attached, its first request went out
+/// unrecorded for as long as the primary's bootstrap and every sidecar's image
+/// build and start took (#395). The primary is held until the interceptor is
+/// attached, so the request is in `network.jsonl`, attributed to the primary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primary_entrypoints_first_request_is_audited() {
+    common::init_tracing();
+
+    // The listener the entrypoint reaches for, answering the one request it
+    // gets. Not joined: if nothing ever arrives, nothing ends it, and the
+    // assertions below are what fail.
+    let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind fixture listener");
+    let port = listener.local_addr().expect("fixture listener addr").port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let agents_dir = repo_dir.path().join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+    // The context is the one holding this test's `entry.sh`; the Dockerfile is
+    // the entrypoint-stdio fixture's, which installs the same filesystem server
+    // and copies whatever `entry.sh` is in the context to its `ENTRYPOINT`.
+    let image_dir = fixture_dir("primary-entrypoint");
+    let dockerfile = fixture_dir("mcp-entrypoint").join("Dockerfile");
+    std::fs::write(
+        agents_dir.join("config.toml"),
+        format!(
+            r#"
+default-image = "smoke"
+
+[images.smoke]
+dockerfile = "{dockerfile}"
+context = "{context}"
+
+[images.smoke.mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#,
+            dockerfile = dockerfile.display(),
+            context = image_dir.display(),
+        ),
+    )
+    .expect("write config");
+    // How the entrypoint learns where to connect: it is given nothing else.
+    std::fs::write(repo_dir.path().join("port"), port.to_string()).expect("write port");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &["--network", "audit"]);
+    let child_stdin = run.stdin.take().expect("stdin piped");
+    let child_stdout = run.stdout.take().expect("stdout piped");
+    let service = timeout(E2E_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+        .await
+        .expect("handshake within timeout")
+        .expect("serve_client handshake");
+    wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] mcp server ready").await;
+    let sid = wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] session id:").await;
+    let primary = format!("outrig-{sid}");
+
+    let (session_dir, _) = SessionStore::new(sessions.path().to_path_buf())
+        .get_by_id(&SessionId(sid.clone()))
+        .expect("session record");
+
+    let _ = service.cancel().await;
+    let status = timeout(E2E_TIMEOUT, run.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("child did not exit within {E2E_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = run.stderr_task.await;
+    let stderr = run.stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(status.success(), "clean shutdown expected: {stderr}");
+
+    // The request is the entrypoint's own: nothing else in this session knows
+    // the port. A connection's record, not a lookup's, because the name it used
+    // came from the hosts file and was never asked of the interceptor.
+    let log = std::fs::read_to_string(session_dir.join("logs/network.jsonl"))
+        .expect("network.jsonl exists");
+    assert!(
+        log.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["outrig.container"].as_str() == Some(primary.as_str())
+                    && record["id.resp_p"].as_u64() == Some(u64::from(port))
+            })
+        }),
+        "audit log should attribute the primary entrypoint's request to port {port} to \
+         {primary}:\n{log}"
+    );
+    wait_until_gone(&[primary]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -548,6 +548,76 @@ async fn curl_http_host_writes_allow_audit_record() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
+/// The primary under interception is created and initialized, attached, and
+/// only then started (#395): attaching neither needs nor causes the image's
+/// process to run, the redirect is complete before it does, and `release` is
+/// what runs it. The resolver the interceptor would install by exec in a
+/// running container is baked in instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_container_is_attached_before_it_runs() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let name = format!("outrig-test-held-{}", std::process::id());
+    let mut container = Container::start_named_held(
+        &image,
+        ContainerLaunchSpec::workspace(workspace.path(), PathBuf::from("/workspace")),
+        name,
+        None,
+    )
+    .await
+    .expect("start container held");
+    assert!(
+        !Container::is_running(container.name())
+            .await
+            .expect("probe"),
+        "a held container has its namespaces and has run nothing"
+    );
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("attach the interceptor to the held container");
+    assert!(
+        !Container::is_running(container.name())
+            .await
+            .expect("probe"),
+        "attaching does not start the container"
+    );
+    assert!(
+        netns_has_complete_redirect(container_root_pid(&container)),
+        "the redirect is in place before the container's process has run"
+    );
+
+    container.release().await.expect("release the container");
+    assert!(
+        Container::is_running(container.name())
+            .await
+            .expect("probe")
+    );
+    container.bootstrap_user().await.expect("bootstrap user");
+
+    let resolv = read_resolv_conf(&container);
+    assert!(
+        String::from_utf8_lossy(&resolv).contains("nameserver 127.0.0.1"),
+        "the resolver baked in at create points at the interceptor: {}",
+        String::from_utf8_lossy(&resolv)
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
 /// Every IPv4 address the host has, loopback included.
 fn host_ipv4_addresses() -> Vec<Ipv4Addr> {
     let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()

@@ -45,11 +45,17 @@ exec-form `ENTRYPOINT` rather than replacing it. An image that sets one therefor
 `<entrypoint> sleep infinity`, which is rarely what either side intended. Leave `ENTRYPOINT`
 unset on an image you mean to use as a primary.
 
+Under `--network audit` or `--network filter`, outrig holds the primary's process back until the
+network interceptor is attached to it, so an `ENTRYPOINT` that does reach the network is audited
+and filtered like everything else in the session. That is a safety net for an image you cannot
+change, not a reason to set one.
+
 The same goes for a sidecar image whose servers are `podman exec`'d into it -- those containers
-start exactly the way the primary does. An *entrypoint-stdio* sidecar is the opposite case:
-there the image's `ENTRYPOINT` is the server, outrig appends no command of its own, and `args`
-supply its arguments. See [MCP Servers](mcp-servers.md#sidecar-placement) for which entries are
-which.
+start exactly the way the primary does, except that nothing holds them for the interceptor, so an
+`ENTRYPOINT` on one runs before the interceptor attaches to that sidecar. An *entrypoint-stdio*
+sidecar is the opposite case: there the image's `ENTRYPOINT` is the server, outrig appends no
+command of its own, and `args` supply its arguments. See
+[MCP Servers](mcp-servers.md#sidecar-placement) for which entries are which.
 
 The one thing the image has to supply is a `sleep` that accepts `infinity`. GNU coreutils has
 always understood it, and busybox has since 1.30 -- Alpine 3.10, June 2019 -- so any current
@@ -520,7 +526,8 @@ own namespaces. Removing the container is what stops that, which is why the guar
 than just a kill.
 
 Session `[network]` policy applies to every container: the network interceptor attaches to each
-sidecar the same way it attaches to the primary, before any MCP server connects.
+one before any MCP server connects. It attaches to the primary and to an entrypoint-stdio
+sidecar before their processes run; an exec-stdio sidecar is already running when it attaches.
 
 ## What outrig sets in the run
 
@@ -528,7 +535,11 @@ outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured
 workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It
 also supplies the container's command: `sleep infinity`, appended after the image reference,
 which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
-The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
+With network interception on, it is `podman create` and `podman init` rather than `podman run -d`:
+the interceptor attaches to the initialized container's network namespace, its resolver given to
+the create as `--dns`, and only then does `podman start` run the container's process. Without
+interception it is the one `podman run -d`. The bootstrap runs from the host, once the container
+is running: a forked child joins the container's user namespace, becomes
 its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
 entries before creating `/home/<user>`. No `podman exec` is involved. When podman's `keep-id`
 mapping already planted the entries, nothing is appended, but the planted user entry's home --

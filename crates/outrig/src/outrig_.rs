@@ -931,6 +931,11 @@ impl Outrig {
     /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
     ///
+    /// Under [`NetworkMode::Audit`] or [`NetworkMode::Filter`] the interceptor
+    /// attaches to the primary before its process runs, so the traffic of an
+    /// image's `ENTRYPOINT` is recorded and filtered like any other's. See
+    /// [`Container::start_named_held`].
+    ///
     /// Under [`EmbeddedMcpPolicy::Merge`], a server the image's
     /// `org.outrig.mcp` label declares is held to
     /// [`spec.embedded_mcp_env_allow`](LaunchSpec::embedded_mcp_env_allow)
@@ -993,8 +998,20 @@ impl Outrig {
             // it never uses the primary-view placement.
             primary_view: None,
         };
-        let mut container = Container::start(&image_tag, launch).await?;
-        container.bootstrap_user().await?;
+        // Under interception the primary's process is held until the
+        // interceptor is in its network namespace; see `start_named_held`.
+        let intercepting = spec.network.mode != NetworkMode::Default;
+        let mut container = if intercepting {
+            Container::start_named_held(
+                &image_tag,
+                launch,
+                crate::container::fresh_container_name(),
+                None,
+            )
+            .await?
+        } else {
+            Container::start(&image_tag, launch).await?
+        };
 
         let network = match spec.network.mode {
             NetworkMode::Default => None,
@@ -1024,6 +1041,10 @@ impl Outrig {
                 )
             }
         };
+        if intercepting {
+            container.release().await?;
+        }
+        container.bootstrap_user().await?;
 
         let mcp = match spec.embedded_mcp_policy {
             EmbeddedMcpPolicy::Merge => {

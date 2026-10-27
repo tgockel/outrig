@@ -715,6 +715,17 @@ async fn invocation_pid(journal: &Path, verb: &str, fragments: &[&str]) -> u32 {
     invocation(journal, verb, fragments).await.0
 }
 
+/// The pid of the `podman init` that follows the `podman create` of `name`.
+///
+/// `init` is addressed by the id `create` printed, never by the name, and the
+/// fake prints its own pid in hex for it -- so the way to find the `init` is
+/// through the `create`.
+async fn init_pid_after_create(journal: &Path, name: &str) -> u32 {
+    let created = invocation_pid(journal, "create", &[name]).await;
+    let id = format!("{created:064x}");
+    invocation_pid(journal, "init", &[id.as_str()]).await
+}
+
 /// The value podman or buildah was given for `flag` in `argv`.
 fn flag_value(argv: &str, flag: &str) -> String {
     let mut args = argv.split_whitespace();
@@ -848,20 +859,96 @@ async fn a_cancel_between_create_and_init_removes_the_container() {
     // outrig-cancel-init-...` contains the word too, and a fragment match
     // would park this test in `create` and quietly retire the boundary it
     // exists for. The name keeps the collision rather than dodging it, so the
-    // matcher stays honest. The `init` names the id the fake `create` printed,
-    // which is its pid in hex, since a name is not what it is given.
+    // matcher stays honest.
     let client = tokio::select! {
         _ = &mut create => panic!("the fake `podman init` should not have returned"),
-        pid = async {
-            let created = invocation_pid(journal, "create", &[name.as_str()]).await;
-            let id = format!("{created:064x}");
-            invocation_pid(journal, "init", &[id.as_str()]).await
-        } => pid,
+        pid = init_pid_after_create(journal, &name) => pid,
     };
     drop(create);
 
     expect_gone(client).await;
     expect_removed(journal, &name).await;
+}
+
+/// Cancelled *during* the `podman create` of a held start. The primary under
+/// interception is made this way, and the guard that covers `start_named` and
+/// `create_initialized` has to cover it too.
+#[tokio::test]
+async fn a_canceled_held_start_removes_the_container() {
+    let journal = fake_runtime();
+    let name = unique_name("held-create");
+
+    let tag = image();
+    let mut held = Box::pin(Container::start_named_held(
+        &tag,
+        ContainerLaunchSpec::default(),
+        name.clone(),
+        None,
+    ));
+
+    let creating = [name.as_str()];
+    let client = tokio::select! {
+        _ = &mut held => panic!("the fake `podman create` should not have returned"),
+        pid = invocation_pid(journal, "create", &creating) => pid,
+    };
+    drop(held);
+
+    expect_gone(client).await;
+    expect_removed(journal, &name).await;
+}
+
+/// Cancelled at the `create` -> `init` boundary of a held start, which is the
+/// phase boundary a cancelled `run -d` does not have: `create` has returned, so
+/// the engine holds a container that no `Container` owns yet.
+#[tokio::test]
+async fn a_cancel_between_create_and_init_of_a_held_start_removes_the_container() {
+    let journal = fake_runtime();
+    let name = unique_name("held-init");
+    return_immediately_for(journal, "create", &name);
+
+    let tag = image();
+    let mut held = Box::pin(Container::start_named_held(
+        &tag,
+        ContainerLaunchSpec::default(),
+        name.clone(),
+        None,
+    ));
+
+    let client = tokio::select! {
+        _ = &mut held => panic!("the fake `podman init` should not have returned"),
+        pid = init_pid_after_create(journal, &name) => pid,
+    };
+    drop(held);
+
+    expect_gone(client).await;
+    expect_removed(journal, &name).await;
+}
+
+/// `release` is a plain `podman start` of the container it is called on: no
+/// `--attach`, so it returns once the container is running rather than when it
+/// exits, and no `--interactive`.
+#[tokio::test]
+async fn release_starts_the_container_detached() {
+    let journal = fake_runtime();
+    let name = unique_name("release");
+    return_immediately_for(journal, "start", &name);
+
+    // A borrowed handle, because `start_named_held` cannot be driven to its
+    // return here: the fake's `init` is addressed by an id no test knows
+    // before `create` has run, so it could only be made quick for every test.
+    // `release` acts on whatever it is called on, which is all this needs.
+    let container = Container::attach(name.clone(), image(), None, None);
+    container
+        .release()
+        .await
+        .expect("the fake `podman start` succeeds");
+
+    let (_, argv) = invocation(journal, "start", &[name.as_str()]).await;
+    assert_eq!(
+        argv,
+        format!("start {name}"),
+        "release runs `podman start <selector>`"
+    );
 }
 
 /// A container that started successfully and was then dropped without `stop`

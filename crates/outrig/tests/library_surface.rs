@@ -165,15 +165,18 @@ fn fs_command(path: &str) -> Vec<String> {
 /// Container names carrying the given `org.outrig.sidecar` label, running
 /// or exited.
 fn sidecar_containers_labeled(sidecar: &str) -> Vec<String> {
+    podman_ps_names(&format!("label=org.outrig.sidecar={sidecar}"))
+}
+
+/// Names of every container made from `tag`, running or not.
+fn containers_of_image(tag: &str) -> Vec<String> {
+    podman_ps_names(&format!("ancestor={tag}"))
+}
+
+/// Names of the containers a `podman ps -a --filter` selects.
+fn podman_ps_names(filter: &str) -> Vec<String> {
     let output = std::process::Command::new("podman")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label=org.outrig.sidecar={sidecar}"),
-            "--format",
-            "{{.Names}}",
-        ])
+        .args(["ps", "-a", "--filter", filter, "--format", "{{.Names}}"])
         .output()
         .expect("podman ps");
     String::from_utf8_lossy(&output.stdout)
@@ -1883,6 +1886,113 @@ async fn added_sidecar_egress_obeys_network_policy() {
         "network log should attribute the added sidecar's denied egress to \
          its container:\n{log}"
     );
+}
+
+/// An image that sets an `ENTRYPOINT` -- which `containers.md` asks nobody to
+/// do, and which podman gives `sleep infinity` as its arguments -- runs it the
+/// moment the primary starts. Under interception the primary is held until the
+/// interceptor is attached, so what the entrypoint reaches for first is
+/// already under policy (#395).
+///
+/// The entrypoint's only action is one request to a listener on the host, whose
+/// port it reads from the workspace. The request has to be one that *completes*
+/// if nothing stands in its way: a target that never answers keeps retransmitting
+/// its SYN, and the redirect that is installed later catches the retransmission,
+/// so even a primary that started too early would be recorded. Started before
+/// the interceptor attached, this request is answered by the listener, unseen;
+/// started after, the deny-all policy refuses it before any upstream connection
+/// is made, and writes a record naming the primary.
+#[tokio::test]
+async fn the_primarys_entrypoint_egress_obeys_network_policy() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-primary-entrypoint-{}:latest",
+        std::process::id(),
+    );
+    build_image_with_entrypoint(
+        &tag,
+        "docker.io/library/alpine:latest",
+        &[
+            "/bin/sh",
+            "-c",
+            "wget -T 5 -qO- \"http://host.containers.internal:$(cat /workspace/port)/\" \
+             >/dev/null 2>&1; exec \"$@\"",
+            "entrypoint",
+        ],
+    );
+
+    let fixture = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind fixture listener");
+    fixture
+        .set_nonblocking(true)
+        .expect("fixture listener nonblocking");
+    let port = fixture.local_addr().expect("fixture listener addr").port();
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    std::fs::write(host_ws.path().join("port"), port.to_string()).expect("write port");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let log_dir = session_dir.path().join("logs");
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("github.com", 443)
+        .build()
+        .expect("policy builds");
+    let spec = LaunchSpec::from_image(tag.clone(), BTreeMap::new(), log_dir.clone())
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
+        .with_network_filter(policy);
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let primaries = containers_of_image(&tag);
+    assert_eq!(
+        primaries.len(),
+        1,
+        "expected one primary container: {primaries:?}"
+    );
+    let primary = &primaries[0];
+
+    // The entrypoint runs when the primary is released, which is before
+    // `launch` returns but not necessarily before its one request has been
+    // decided, so wait for the record rather than for the shutdown to flush it.
+    let log_path = log_dir.join("network.jsonl");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let record = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let found = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["id.resp_p"].as_u64() == Some(u64::from(port)));
+        if let Some(record) = found {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no record of the entrypoint's request to port {port} in {}:\n{log}",
+            log_path.display(),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        record["outrig.container"].as_str(),
+        Some(primary.as_str()),
+        "the entrypoint's request is the primary's: {record:#?}"
+    );
+    assert_eq!(
+        record["outrig.action"].as_str(),
+        Some("deny"),
+        "deny-all refuses the entrypoint's request: {record:#?}"
+    );
+    // Refused before the upstream was dialed: nothing connected. A connect
+    // that completed would be queued on the listener whether or not anything
+    // ever called `accept`.
+    match fixture.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the entrypoint's request reached the host listener: {other:?}"),
+    }
+
+    outrig.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

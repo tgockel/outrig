@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The network interceptor attaches to the primary before its process runs.** An image that sets
+  an `ENTRYPOINT` -- which `containers.md` asks nobody to do, and which podman gives `sleep
+  infinity` as its arguments -- ran it the moment the primary started, and a session attached the
+  interceptor to the primary last: after its user bootstrap, after every sidecar's image had been
+  ensured, a cold build included, and after every sidecar had started. Whatever that entrypoint
+  sent in that time was outside audit mode's record of every connection and filter mode's policy.
+  With `--network audit` or `--network filter` the primary is now created and initialized, the
+  interceptor started and attached to it, and only then is it started; `starting network
+  <mode> interceptor` prints inside `starting container`, before `container ready`, and the
+  sidecars are attached afterwards as before. A network mode or attach that cannot be honored now
+  ends the session before the user bootstrap, the MCP label read, or any sidecar start. The
+  default mode is unchanged. A sidecar whose servers are `podman exec`'d is not held, and still
+  starts before it is attached. (#395)
 - **A repo-declared mount is bound at the path the guard checked.** The guard that refuses a repo
   config mounting the home directory or the global config canonicalized each host path to compare
   it, then threw the result away; Podman re-resolved the original spelling after image

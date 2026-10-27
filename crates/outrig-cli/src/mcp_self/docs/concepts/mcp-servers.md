@@ -391,10 +391,11 @@ search = { command = ["mcp-search"], sidecar = "tools" }
 
 ## Lifecycle
 
-When `outrig run` starts, the primary container comes up first, then every `start = "auto"`
-sidecar, then network interception attaches to each container, and only then do MCP servers
-connect -- primary-hosted and sidecar-hosted alike, in name order. The sequence per MCP server
-is:
+When `outrig run` starts, the primary container comes up first -- with network interception on,
+it is created and initialized, the interceptor attaches, and only then does its process start --
+then every `start = "auto"` sidecar, then interception attaches to each of those, and only then
+do MCP servers connect -- primary-hosted and sidecar-hosted alike, in name order. The sequence
+per MCP server is:
 
 1. `podman exec -i <container> <command>` -- outrig spawns the server as a child process inside
    its placement's running container, with stdin/stdout piped back to outrig.

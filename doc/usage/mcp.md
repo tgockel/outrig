@@ -353,7 +353,10 @@ headers to it is still limited only by what can reach the port or the socket.
    explicit `--image`, top-level `default-image` still names a config block.
 3. **Prepare the container.** Fresh mode builds, cache-hits, pulls configured
    `image-name` refs, or probes raw local refs, then starts
-   `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
+   `podman run -d --rm --name outrig-<sid> ...`. With network interception on (step 5) the
+   primary is instead created and initialized with its process held, the interceptor attaches
+   to it, and only then does `podman start` run it, so an image `ENTRYPOINT` cannot reach the
+   network before policy is in place. Attach mode probes the existing
    container with `podman inspect`, verifies that it is running, and does not build,
    start, stop, or remove it.
 4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
@@ -369,8 +372,9 @@ headers to it is still limited only by what can reach the port or the socket.
    with a notice. `outrig mcp` has no mid-session start surface; manual sidecars are started
    from the `outrig run` REPL (`/sidecar add <name>`) or the library API.
 5. **Start network interception, if enabled.** The interceptor attaches to the primary
-   and every sidecar -- including created-but-not-started entrypoint sidecars, whose
-   first packet is therefore already subject to policy. Fresh sessions can write
+   -- before its process runs, as step 3 describes -- and to every sidecar, including
+   created-but-not-started entrypoint sidecars, whose first packet is therefore already
+   subject to policy. Fresh sessions can write
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured

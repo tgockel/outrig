@@ -629,8 +629,7 @@ impl Container {
     /// read-write and used as the working directory; extra mounts never
     /// affect `-w`.
     pub async fn start(image: &ImageTag, launch: ContainerLaunchSpec) -> Result<Self> {
-        let name = format!("outrig-{}", runtime_id());
-        Self::start_named(image, launch, name, None).await
+        Self::start_named(image, launch, fresh_container_name(), None).await
     }
 
     /// Start with a caller-supplied container name. Session setup uses this
@@ -642,6 +641,67 @@ impl Container {
         name: String,
         transcript: Option<Transcript>,
     ) -> Result<Self> {
+        Self::launch_named(image, launch, name, transcript, false).await
+    }
+
+    /// [`Container::start_named`] with the container's process held back: the
+    /// container is created and initialized, so its PID and namespaces exist,
+    /// but nothing in it runs until [`Container::release`]. For a caller that
+    /// has to act on the container first -- the network interceptor, which
+    /// must be in its network namespace before an image's `ENTRYPOINT` can
+    /// send a packet.
+    ///
+    /// The interceptor's resolver is baked in through `--dns`, as
+    /// [`ContainerCreateOptions::with_intercept_dns`] does: nothing can be
+    /// exec'd into a container that has not started, so the install
+    /// [`NetworkInterceptor::attach`](crate::network::NetworkInterceptor::attach)
+    /// makes in a running one is not possible here. A caller that does not
+    /// attach the interceptor would leave the container resolving through a
+    /// listener that is not there, and wants [`Container::start_named`].
+    ///
+    /// Everything else is what `start_named` runs: the same flags, and the
+    /// same `sleep infinity` as the container's command. The returned
+    /// container is not running, so [`Container::bootstrap_user`] and every
+    /// exec have to come after [`Container::release`].
+    pub async fn start_named_held(
+        image: &ImageTag,
+        launch: ContainerLaunchSpec,
+        name: String,
+        transcript: Option<Transcript>,
+    ) -> Result<Self> {
+        Self::launch_named(image, launch, name, transcript, true).await
+    }
+
+    /// Run the process a container from [`Container::start_named_held`] has
+    /// been holding back: `podman start`, detached. A container that is
+    /// already running answers it as podman does, with success.
+    pub async fn release(&self) -> Result<()> {
+        process::run_capture_logged(
+            self.engine_call(self.release_cmd()),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The start [`release`](Self::release) runs. By id where there is one,
+    /// for the reason [`stop_cmd`](Self::stop_cmd) is.
+    fn release_cmd(&self) -> Cmd {
+        Cmd::new("podman").arg("start").arg(self.selector())
+    }
+
+    /// The one body of [`Container::start_named`] and
+    /// [`Container::start_named_held`]. `held` swaps the `podman run -d` for a
+    /// `podman create` and a `podman init`, and records that the resolver was
+    /// baked in.
+    async fn launch_named(
+        image: &ImageTag,
+        launch: ContainerLaunchSpec,
+        name: String,
+        transcript: Option<Transcript>,
+        held: bool,
+    ) -> Result<Self> {
         // Armed before anything is spawned, and the only owner of what podman
         // creates until the `Container` below exists. A `?` or a dropped
         // future in between drops the guard, which removes the container this
@@ -652,7 +712,12 @@ impl Container {
         reject_bind_mount_separators(&launch)?;
         let reserved = NameGuard::reserve(&name);
 
-        let cmd = build_podman_run_cmd(
+        let build = if held {
+            build_podman_held_cmd
+        } else {
+            build_podman_run_cmd
+        };
+        let cmd = build(
             image,
             &name,
             &launch,
@@ -665,6 +730,12 @@ impl Container {
         // than left behind under a handle that cannot name it.
         let id = engine_id(&created.stdout)
             .ok_or_else(|| unidentified_container(&name, &created.stdout))?;
+        if held {
+            // As in `create_initialized`: the guard is still armed, so an
+            // `init` that fails or is cancelled leaves nothing behind.
+            let init = Cmd::new("podman").arg("init").arg(id.as_str());
+            process::run_capture_logged(init, "podman", transcript.as_ref()).await?;
+        }
 
         let workspace = match &launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
@@ -677,8 +748,8 @@ impl Container {
             workspace,
             transcript,
             LaunchFacts {
+                dns_preconfigured: held,
                 net_admin: launch.capabilities.grants_net_admin(),
-                ..LaunchFacts::default()
             },
         ))
     }
@@ -2023,8 +2094,40 @@ fn build_podman_run_cmd(
     selinux: bool,
     attempt_label: &str,
 ) -> Cmd {
+    build_idle_cmd(false, image, name, launch, selinux, attempt_label)
+}
+
+/// The argv of [`build_podman_run_cmd`] as a `podman create`, for
+/// [`Container::start_named_held`], with the interceptor's resolver baked in.
+fn build_podman_held_cmd(
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+    attempt_label: &str,
+) -> Cmd {
+    build_idle_cmd(true, image, name, launch, selinux, attempt_label)
+}
+
+/// What the two builders above share: a container whose command is `sleep
+/// infinity`. `held` makes it a `podman create` that [`Container::release`]
+/// starts later, and with that the resolver is baked in: nothing can install
+/// it in a container that has not started.
+fn build_idle_cmd(
+    held: bool,
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+    attempt_label: &str,
+) -> Cmd {
+    let verb: &[&str] = if held {
+        &["create", "--rm"]
+    } else {
+        &["run", "-d", "--rm"]
+    };
     let cmd = Cmd::new("podman")
-        .args(["run", "-d", "--rm"])
+        .args(verb)
         // PID 1 is `sleep infinity`, which installs no SIGTERM handler, so the
         // kernel discards the default stop signal and every stop would wait
         // out its whole grace (and `rm -f` podman's 10 s) before the SIGKILL
@@ -2032,13 +2135,22 @@ fn build_podman_run_cmd(
         .arg("--stop-signal=SIGKILL")
         .args(["--name"])
         .arg(name);
+    let mut cmd = append_launch_flags(cmd, launch, selinux);
+    if held {
+        cmd = append_intercept_dns(cmd);
+    }
     // After the caller's labels, so podman's last-wins parsing cannot let one
     // of theirs displace the value cleanup removes by.
-    append_launch_flags(cmd, launch, selinux)
-        .arg("--label")
+    cmd.arg("--label")
         .arg(attempt_label)
         .arg(image.as_str())
         .args(["sleep", "infinity"])
+}
+
+/// Point the container's resolver at the interceptor, at create time.
+fn append_intercept_dns(cmd: Cmd) -> Cmd {
+    cmd.args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
+        .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION])
 }
 
 /// `podman create` argv for an entrypoint-stdio container: the image's
@@ -2070,9 +2182,7 @@ fn build_podman_create_cmd(
     cmd = append_launch_flags(cmd, &options.launch, selinux);
 
     if options.intercept_dns {
-        cmd = cmd
-            .args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
-            .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION]);
+        cmd = append_intercept_dns(cmd);
     }
     // `HOME` first, so a configured `env` entry of the same name wins: podman
     // takes the last `--env` for a key. A `view = "primary"` payload is the
@@ -2452,6 +2562,12 @@ fn discharge(attempt: &str) {
     tracked().remove(attempt);
 }
 
+/// The name [`Container::start`] gives a container, for a caller that has to
+/// choose one itself.
+pub(crate) fn fresh_container_name() -> String {
+    format!("outrig-{}", runtime_id())
+}
+
 fn runtime_id() -> String {
     use jiff::Zoned;
     use rand::Rng;
@@ -2564,6 +2680,21 @@ mod tests {
         stat.extend_from_slice(b") S 7 1 1 0");
         assert!(std::str::from_utf8(&stat).is_err());
         assert_eq!(parent_pid_from_stat(&stat), Some(7));
+    }
+
+    /// The release, like the stop, names the container the engine made: a
+    /// `podman start <name>` could start whatever has taken the name since.
+    #[test]
+    fn a_release_names_the_container_and_not_a_name_something_else_can_have() {
+        let id = "2f8b1c0d".repeat(8);
+        let mut container = Container::unstoppable();
+        container.name = "outrig-a-name-that-can-come-round-again".to_string();
+        container.id = engine_id(id.as_bytes());
+
+        assert_eq!(
+            container.release_cmd().render(),
+            format!("podman start {id}")
+        );
     }
 
     /// The stop names the container the engine made, not the name it was
@@ -3340,6 +3471,62 @@ mod tests {
                 "--http-proxy=false",
                 "--image-volume=ignore",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    /// A held primary is the run argv as a `podman create`, and nothing else
+    /// but the resolver: the same stop signal (so a stop is not spent waiting
+    /// out `sleep`'s ignored SIGTERM), the same flags in the same order, the
+    /// same command, and no `--interactive` or log driver, which would change
+    /// what the image's process is handed. The resolver sits before the
+    /// attempt label, where `build_podman_create_cmd` puts it.
+    #[test]
+    fn podman_held_args_are_the_run_args_as_a_create_with_the_resolver() {
+        let launch = ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace {
+                host: "/host/repo".into(),
+                container: "/workspace".into(),
+                access: MountAccess::ReadWrite,
+            }),
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_held_cmd(
+            &ImageTag::new("local:test"),
+            "outrig-test",
+            &launch,
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--rm",
+                "--stop-signal=SIGKILL",
+                "--name",
+                "outrig-test",
+                "-v",
+                "/host/repo:/workspace:rw",
+                "--userns=keep-id",
+                "-w",
+                "/workspace",
+                "--security-opt=no-new-privileges",
+                "--http-proxy=false",
+                "--image-volume=ignore",
+                "--pull=never",
+                "--dns",
+                "127.0.0.1",
+                "--dns-option",
+                "ndots:0",
                 "--label",
                 "org.outrig.attempt=testtoken",
                 "local:test",

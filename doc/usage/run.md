@@ -214,7 +214,10 @@ tools) and `shell` is unavailable. Full details in
    become additional `-v` binds. The trailing `sleep infinity` is the container's command and
    overrides the image's `CMD`; an image that sets an `ENTRYPOINT` gets it appended instead, so
    a primary image should not set one (see
-   [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)).
+   [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)). With network
+   interception on (step 7), the same flags go on a `podman create` followed by `podman init`,
+   and `podman start` runs the container once the interceptor is attached to it, so even an
+   image's `ENTRYPOINT` runs under it.
 5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
    `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
    `/etc/passwd` if not -- and that `/home/<user>` exists, is owned by them, and is the home
@@ -231,7 +234,8 @@ tools) and `shell` is unavailable. Full details in
 7. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
-   The default mode skips this step entirely.
+   It attaches to the primary before the primary's process starts (step 4), then to each
+   sidecar. The default mode skips this step entirely.
 8. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`. Each of those two gets 120 seconds; a server
