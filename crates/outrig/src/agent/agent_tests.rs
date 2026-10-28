@@ -4375,14 +4375,34 @@ async fn a_rejected_reply_that_is_no_empty_stop_fails_the_round(
     assert!(ran, "{err}");
     assert!(err.contains(&named), "{err}");
     assert_eq!(submissions(&mut submitted), ["print('ran')"]);
+    // A refusal of what the call carried is sent once more, without the
+    // results of the turn it answers; nothing else is.
+    let refused = super::retry::is_content_refusal(finish_reason);
+    let recorded = mock_http::drain(&mut requests);
     assert_eq!(
-        mock_http::drain(&mut requests).len(),
-        4,
-        "the call, the empty reply, and its two retries"
+        recorded.len(),
+        4 + usize::from(refused),
+        "the call, the empty reply, its two retries, and the call without its results"
     );
     let records = events::recorded(dir.path());
+    let withheld = events::of_kind(&records, "model.withheld");
+    assert_eq!(withheld.len(), usize::from(refused), "{withheld:#?}");
+    if refused {
+        assert_eq!(withheld[0]["turn"], 0);
+        assert_eq!(withheld[0]["finish_reason"], finish_reason);
+        let (sent, resent) = (recorded[1].body.to_string(), recorded[4].body.to_string());
+        assert!(sent.contains(r"ran\n"), "{sent}");
+        assert!(
+            !resent.contains(r"ran\n") && resent.contains(NOTICE),
+            "{resent}"
+        );
+    }
     let retries = events::of_kind(&records, "model.retry");
-    assert_eq!(retries.len(), 2);
+    assert_eq!(
+        retries.len(),
+        2,
+        "the call without its results is sent once"
+    );
     let attempts = events::of_kind(&records, "model.attempt");
     for attempt in &attempts[1..] {
         assert!(
@@ -4436,6 +4456,143 @@ async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
         "content_filter",
     )
     .await;
+}
+
+/// How the notice sent in place of a result a provider would not read begins.
+const NOTICE: &str = "[outrig: not sent -- the model's provider refused";
+
+/// A provider that will not read one result refuses the call that first
+/// carries it, and that call is sent again with a notice in the result's place,
+/// and answered: the round goes on, every later call is sent the notice, and
+/// `runtime.history` holds the result whole. The record says what was left
+/// out, why, and what was sent in its place.
+#[tokio::test]
+async fn a_result_the_provider_will_not_read_is_left_out_and_the_round_goes_on() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_WITHHELD_{}", style.name().to_uppercase());
+        let dir = tempfile::tempdir().expect("a log dir");
+        let (events, mut submitted) = watched(Some(dir.path())).await;
+        // The marker is only ever whole in what the code printed.
+        let split = "'the-mock-will-' + 'not-read-this'";
+        let held =
+            format!("print('held whole:', ({split}) in runtime.history.turns[0].calls[0].result)");
+        let (addr, mut requests) = mock_http::start_filtering(vec![
+            style.submit("call_1", &format!("print({split})")),
+            style.submit("call_2", &held),
+            style.text("done"),
+        ])
+        .await;
+        let mut cfg = config_in(style, addr, &var, MODEL, "", "max-tokens = 4096");
+        retrying(&mut cfg, "claude");
+        let mut agent = agent_of(&cfg, &var, events).await;
+
+        assert_eq!(round(&mut agent, "read it").await, "done", "{style:?}");
+        shut_down(agent).await;
+
+        assert_eq!(submissions(&mut submitted).len(), 2, "{style:?}");
+        let bodies: Vec<String> = mock_http::drain(&mut requests)
+            .iter()
+            .map(|request| request.body.to_string())
+            .collect();
+        let carried: Vec<bool> = bodies
+            .iter()
+            .map(|body| body.contains(mock_http::FILTERED))
+            .collect();
+        assert_eq!(
+            carried,
+            [false, true, true, true, false, false],
+            "{style:?}: refused, retried twice, then sent without it, and never again"
+        );
+        for body in &bodies[4..] {
+            assert!(body.contains(NOTICE), "{style:?}: {body}");
+        }
+        assert!(
+            bodies[5].contains("held whole: True"),
+            "{style:?}: {}",
+            bodies[5]
+        );
+
+        let records = events::recorded(dir.path());
+        let reason = match style {
+            Style::Anthropic => "refusal",
+            Style::OpenAi => "content_filter",
+        };
+        let withheld = events::of_kind(&records, "model.withheld");
+        assert_eq!(withheld.len(), 1, "{style:?}: {withheld:#?}");
+        assert_eq!(
+            (&withheld[0]["turn"], &withheld[0]["finish_reason"]),
+            (&json!(0), &json!(reason)),
+            "{style:?}"
+        );
+        let calls = events::of_kind(&records, "model.call");
+        let refused: Vec<Vec<u64>> = calls
+            .iter()
+            .map(|call| {
+                call["refused"]
+                    .as_array()
+                    .expect("refused")
+                    .iter()
+                    .map(|turn| turn["turn"].as_u64().expect("a turn"))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            refused,
+            [vec![], vec![], vec![0], vec![0]],
+            "{style:?}: the call sent again is assembled again, and so is each after it"
+        );
+        let notice = calls[2]["refused"][0]["notice"].as_str().expect("a notice");
+        assert!(
+            notice.contains(&format!("finish reason {reason}")),
+            "{style:?}: {notice}"
+        );
+        assert_eq!(
+            events::of_kind(&records, "model.round.completed").len(),
+            1,
+            "{style:?}"
+        );
+    }
+}
+
+/// A provider that refuses every call refuses the one sent without the latest
+/// results too: the round fails once, naming why, and nothing stays left out,
+/// so the next message's call carries the result whole.
+#[tokio::test]
+async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_out() {
+    let style = Style::OpenAi;
+    let (mut agent, mut requests) = retrying_agent_in(
+        style,
+        "OUTRIG_TEST_AGENT_REFUSES_EVERYTHING",
+        Events::off(),
+        vec![
+            style.submit("call_1", "print('read ' + 'me')"),
+            style.empty("content_filter"),
+        ],
+    )
+    .await;
+
+    post(&agent, "run it").await;
+    let (err, _) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("every reply is refused"),
+    );
+    assert!(err.contains("finish reason content_filter: "), "{err}");
+    assert_eq!(mock_http::drain(&mut requests).len(), 1 + 3 + 1);
+
+    post(&agent, "try again").await;
+    within(agent.round())
+        .await
+        .expect_err("every reply is still refused");
+    shut_down(agent).await;
+    let next = mock_http::drain(&mut requests);
+    assert_eq!(
+        next.len(),
+        3,
+        "a round's opening has no results to leave out"
+    );
+    let body = next[0].body.to_string();
+    assert!(body.contains("read me") && !body.contains(NOTICE), "{body}");
 }
 
 /// The model said something -- a refusal, in the field rig does not read -- and

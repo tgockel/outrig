@@ -186,10 +186,13 @@ reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, 
 endpoint's `reasoning_content` -- so the turns another candidate answered reach it as their text
 and tool calls alone.
 
-`outrig run-new` fails over the same way, with two differences. A call that moves is sent a
+`outrig run-new` fails over the same way, with three differences. A call that moves is sent a
 conversation chosen for the window of the model it moves to, since each model's `context-window`
-is its own, so a smaller model is sent less. And when every candidate has failed, the **round**
-ends whatever the reasons, keeping any Python it ran, and the session goes on.
+is its own, so a smaller model is sent less. A candidate that refuses a call for what it carried
+-- an empty reply ending in `content_filter` or `refusal` -- is first sent the call once more
+without the results it was refused for (see [Transient failures](#transient-failures)), and only
+that failing too moves the call on. And when every candidate has failed, the **round** ends
+whatever the reasons, keeping any Python it ran, and the session goes on.
 
 ## `[agents.<name>]`
 
@@ -495,6 +498,15 @@ So is one with anything in it the agent cannot use, such as a refusal, whatever 
 The event log's `model.attempt` records the finish reason either way, and the error of a reply
 OutRig could not use leads with it -- `finish reason content_filter: ...` -- in each retry line,
 each move to the next model, and the round's failure.
+
+`outrig run-new` does one more thing with a reply that is empty because the provider refused what
+the call carried, with `content_filter` or `refusal`. Past the retries, the call is sent once
+more, with a note in place of each result of the turn it answers -- the one thing that call carried
+no earlier one had. The note says why, and that the results are whole in `runtime.history`, so the
+model neither works blind nor runs the same code again to see them. If that call is answered,
+every later call is sent the note in their place too; otherwise nothing is left out, and the round
+fails naming the finish reason. Without this, every later call would carry the refused result and
+be refused the same way.
 
 Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
 model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that

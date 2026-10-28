@@ -10,7 +10,9 @@
 //! through [`Style`], and accepts any request either way. What a provider
 //! would refuse is [`check_wire`]'s to find -- except as [`start_strict`], a
 //! provider that requires the user's and the model's turns to alternate, which
-//! refuses a request whose roles repeat as a gateway in front of one would.
+//! refuses a request whose roles repeat as a gateway in front of one would, and
+//! as [`start_filtering`], a provider whose content filter refuses a request
+//! carrying [`FILTERED`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -475,6 +477,34 @@ pub(super) async fn start_strict(
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
     start_with(script, strict_refusal).await
+}
+
+/// What [`start_filtering`]'s provider will not read.
+pub(super) const FILTERED: &str = "the-mock-will-not-read-this";
+
+/// [`start`], as a provider whose content filter refuses a request carrying
+/// [`FILTERED`] anywhere in its body, with an empty reply: ending in `refusal`
+/// as Anthropic's does, or in `content_filter` as an OpenAI-style provider's
+/// does. A request refused so does not advance the script.
+pub(super) async fn start_filtering(
+    script: Vec<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    start_with(script, content_refusal).await
+}
+
+/// How [`start_filtering`]'s provider answers `body`: `None` unless it carries
+/// [`FILTERED`]. Only Anthropic's requests carry the system prompt apart.
+fn content_refusal(body: &Value) -> Option<CannedResponse> {
+    if !body.to_string().contains(FILTERED) {
+        return None;
+    }
+    Some(match body.get("system") {
+        Some(_) => Style::Anthropic.empty("refusal"),
+        None => Style::OpenAi.empty("content_filter"),
+    })
 }
 
 /// [`start`], refusing each request `refuses` answers for, which the script

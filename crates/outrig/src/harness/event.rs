@@ -592,6 +592,17 @@ pub enum Payload {
         /// over without one.
         attempt_id: Option<AttemptId>,
     },
+    /// `model` refused call `call_id` for what it carried, ending an empty
+    /// reply with `finish_reason`, and the call is sent to it again with a
+    /// notice in place of each result of `turn`, the turn it answers. Once
+    /// that is answered, every later call is sent the notice too.
+    #[non_exhaustive]
+    ModelWithheld {
+        model: String,
+        call_id: CallId,
+        turn: u64,
+        finish_reason: String,
+    },
     /// A usage record that arrived after its attempt's event, accepted: it
     /// replaces that attempt's null usage, once.
     #[non_exhaustive]
@@ -719,6 +730,7 @@ impl Payload {
             Payload::ModelAttempt(_) => "model.attempt",
             Payload::ModelRetry { .. } => "model.retry",
             Payload::ModelFailover { .. } => "model.failover",
+            Payload::ModelWithheld { .. } => "model.withheld",
             Payload::ModelUsageReplaced { .. } => "model.usage.replaced",
             Payload::ModelUsageRefused { .. } => "model.usage.refused",
             Payload::MessageSent { .. } => "message.sent",
@@ -942,6 +954,7 @@ pub struct ModelCall {
     pub opening: Option<Value>,
     pub adjacent: Vec<Repeat>,
     pub left_out: Vec<LeftOut>,
+    pub refused: Vec<RefusedTurn>,
 }
 
 /// What a call was held to, in tokens.
@@ -1013,6 +1026,15 @@ pub struct LeftOut {
     pub turn: u64,
     pub message: u64,
     pub part: u64,
+}
+
+/// A carried turn whose results a provider refused a call for, which the call
+/// was sent `notice` in place of each of.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct RefusedTurn {
+    pub turn: u64,
+    pub notice: String,
 }
 
 /// What the session is doing, as an owner would show it.

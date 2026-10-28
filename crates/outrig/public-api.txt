@@ -1423,6 +1423,11 @@ pub outrig::harness::event::Payload::ModelUsageRefused::usage: outrig::harness::
 pub outrig::harness::event::Payload::ModelUsageReplaced::attempt_id: outrig::harness::event::AttemptId
 pub outrig::harness::event::Payload::ModelUsageReplaced::call_id: outrig::harness::event::CallId
 pub outrig::harness::event::Payload::ModelUsageReplaced::usage: outrig::harness::event::Usage
+#[non_exhaustive] pub outrig::harness::event::Payload::ModelWithheld
+pub outrig::harness::event::Payload::ModelWithheld::call_id: outrig::harness::event::CallId
+pub outrig::harness::event::Payload::ModelWithheld::finish_reason: alloc::string::String
+pub outrig::harness::event::Payload::ModelWithheld::model: alloc::string::String
+pub outrig::harness::event::Payload::ModelWithheld::turn: u64
 #[non_exhaustive] pub outrig::harness::event::Payload::OutputUnattributed
 pub outrig::harness::event::Payload::OutputUnattributed::text: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::RoundStarted
@@ -1630,8 +1635,12 @@ pub outrig::harness::event::ModelCall::estimate: u64
 pub outrig::harness::event::ModelCall::evicted: alloc::vec::Vec<outrig::harness::event::Chosen>
 pub outrig::harness::event::ModelCall::left_out: alloc::vec::Vec<outrig::harness::event::LeftOut>
 pub outrig::harness::event::ModelCall::opening: core::option::Option<serde_json::value::Value>
+pub outrig::harness::event::ModelCall::refused: alloc::vec::Vec<outrig::harness::event::RefusedTurn>
 pub outrig::harness::event::ModelCall::round: u32
 pub outrig::harness::event::ModelCall::withheld: alloc::vec::Vec<outrig::harness::event::Chosen>
+#[non_exhaustive] pub struct outrig::harness::event::RefusedTurn
+pub outrig::harness::event::RefusedTurn::notice: alloc::string::String
+pub outrig::harness::event::RefusedTurn::turn: u64
 #[non_exhaustive] pub struct outrig::harness::event::Repeat
 pub outrig::harness::event::Repeat::role: outrig::harness::event::Role
 pub outrig::harness::event::Repeat::turn: core::option::Option<u64>

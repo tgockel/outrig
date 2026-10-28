@@ -170,20 +170,25 @@ category says what it may hold.
     sent, each as `{turn, message, part}`, counted from 0 within the turn's `messages` and the
     message's `content`. Today that is reasoning without a signature, left out of a call to an
     Anthropic model, such as an OpenAI-compatible model's `reasoning_content`.
+  - `refused`: the carried turns whose results a provider refused a call for, each as `{turn,
+    notice}`: every tool result of the turn was sent as `notice`, which says why and where the
+    results are, in place of what it holds. See `model.withheld`.
 - `exec.submitted` -- Python the model submitted, as it goes to run: `execid` and `source`.
 
 What a call sent rebuilds from the file alone: the `messages` of each turn in its `carried`, in
-order, less each part its `left_out` names and any message all of whose parts it names, then its
-`opening`, with `model.instructions` for the system prompt and the tool. A promotion is a request
-rather than proof of what was sent; the call's `carried` is the answer. The turns themselves keep
-everything each model wrote.
+order, less each part its `left_out` names and any message all of whose parts it names, with each
+tool result of a turn its `refused` names holding that entry's `notice`, then its `opening`, with
+`model.instructions` for the system prompt and the tool. A promotion is a request rather than
+proof of what was sent; the call's `carried` is the answer. The turns themselves keep everything
+each model wrote, and every result.
 
 A call is assembled for the window of each of an alias's models it goes to, the first one's
 included, and recorded as a `model.call` of its own, whose `budget` names that model. One that
 moves is recorded again right after the `model.failover` that moved it. A model whose window
 cannot hold the call's latest turn is passed over, with the reason in the `model.failover` that
 moves the call on, and no `model.call` is recorded for it, since nothing was sent. A retry resends
-the same call, and records no new `model.call`.
+the same call, and records no new `model.call`. A call sent again to the same model without the
+results it was refused for is assembled again, and recorded right after its `model.withheld`.
 
 ## Execution diagnostics
 
@@ -369,6 +374,15 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   before had failed past its retries, or could not take the call: `from` and `to`, each a
   `[models.<name>]` row; `error`, why `from` was given up; `call_id`; and `attempt_id`, the last
   request `from` was sent, or `null` when it was passed over without one.
+- `model.withheld` -- a model refused a call for what it carried, ending an empty reply with a
+  finish reason of `content_filter` or `refusal` past its retries, and the call is sent to that
+  model once more, without retries, with a notice in place of each result of the turn it answers:
+  the one thing it carried that no earlier call had. `model`, the `[models.<name>]` row;
+  `call_id`; `turn`, the turn whose results are left out; and `finish_reason`. If that call is
+  answered, every later call is sent the notice in their place too, and its `model.call` names the
+  turn in `refused`; `runtime.history` keeps the results whole. If it is refused as well, nothing
+  stays left out, and the call moves to the next of an alias's models or fails. A round's first
+  call answers its opening, which holds no results, so it is never sent again so.
 - `model.usage.replaced` -- a usage report that arrived after its attempt's event, taken: it
   replaces that attempt's `null` usage, once. `call_id`, `attempt_id`, and `usage`.
 - `model.usage.refused` -- a usage report that changed nothing: `call_id` (`null` for an attempt

@@ -53,6 +53,13 @@
 //! * **A failure must not disappear.** Each candidate's reason for being
 //!   abandoned is kept, and exhausting the chain reports all of them together
 //!   rather than only the last.
+//! * **A refusal of what a call carried is not the last word.** A candidate
+//!   that ends an empty reply for its content -- `content_filter`, `refusal`
+//!   -- past its retries is sent the call once more, with the results of the
+//!   turn it answers replaced by a notice: the one thing that call carried no
+//!   earlier one had. Answered, every later call is sent the notice too, so a
+//!   result the provider will not read cannot refuse the rest of the session;
+//!   refused again, nothing stays withheld, and the call moves on.
 //!
 //! Copied from `outrig-cli`'s `llm/failover.rs`, which keeps its own. Besides
 //! the view, what changed in coming across is how the chain's state gets out.
@@ -79,7 +86,7 @@ use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 
 use super::budget::{Budget, Calibration};
-use super::history::{Adjacent, History, TooLarge};
+use super::history::{Adjacent, History, Refused, TooLarge, Why};
 use super::ledger::CallSlot;
 use super::retry::{BudgetSpent, RetryPolicy, candidate_failure_label};
 use crate::harness::event::{CallId, Payload};
@@ -204,8 +211,18 @@ where
 /// tests stand in for the store.
 pub(crate) trait View: Send + Sync {
     /// What call `call` to a candidate held to `budget` is sent, or why the
-    /// prompt does not fit.
-    fn view(&self, budget: &Budget, call: CallId) -> Result<Viewed, TooLarge>;
+    /// prompt does not fit. With `refused`, each result of the turn it names
+    /// is sent as a notice in its place, this once.
+    fn view(
+        &self,
+        budget: &Budget,
+        call: CallId,
+        refused: Option<&Refused>,
+    ) -> Result<Viewed, TooLarge>;
+
+    /// Send every later call the notice `refused` names in place of each of
+    /// its turn's results.
+    fn withhold(&self, refused: Refused);
 }
 
 /// What a call to one candidate is sent of the conversation.
@@ -221,19 +238,40 @@ pub(crate) struct Viewed {
     /// would have refused the call's prompt and the view lowered it to carry
     /// it ([`Budget::making_room_for`]).
     max_tokens: Option<u32>,
+    /// The turn whose results the call answers, or `None` when its prompt is
+    /// a round's opening.
+    latest: Option<usize>,
 }
 
 /// Recorded as a `model.call` manifest naming the candidate's budget, one for
-/// each candidate the call's view is assembled for.
+/// each candidate the call's view is assembled for, and one more for a call
+/// sent again without what was refused.
 impl View for History {
-    fn view(&self, budget: &Budget, call: CallId) -> Result<Viewed, TooLarge> {
-        self.assemble(budget, call)
-            .map(|(messages, manifest)| Viewed {
-                messages,
-                adjacent: manifest.adjacent.first().copied(),
-                estimate: manifest.estimate,
-                max_tokens: manifest.budget.max_tokens,
-            })
+    fn view(
+        &self,
+        budget: &Budget,
+        call: CallId,
+        refused: Option<&Refused>,
+    ) -> Result<Viewed, TooLarge> {
+        match refused {
+            Some(refused) => self.assemble_without(budget, call, refused),
+            None => self.assemble(budget, call),
+        }
+        .map(|(messages, manifest)| Viewed {
+            messages,
+            adjacent: manifest.adjacent.first().copied(),
+            estimate: manifest.estimate,
+            max_tokens: manifest.budget.max_tokens,
+            latest: manifest
+                .carried
+                .iter()
+                .find(|&&(_, why)| why == Why::Latest)
+                .map(|&(turn, _)| turn),
+        })
+    }
+
+    fn withhold(&self, refused: Refused) {
+        History::withhold(self, refused);
     }
 }
 
@@ -270,6 +308,10 @@ struct Abandoned {
 /// not being made ([`unfit`]). The exception is a request the session's spent
 /// token budget refused ([`BudgetSpent`]), which ends the call: every
 /// candidate would be refused the same.
+///
+/// A candidate that refused the call for what it carried is first sent it once
+/// more without the results of the turn it answers ([`Refused`]), and only
+/// that failing too moves the call on.
 ///
 /// Every agent's model is one of these. A chain of one returns its candidate's
 /// error as it stands, and arms a deadline whose bound reproduces what the
@@ -546,8 +588,9 @@ fn refused(err: &CompletionError) -> bool {
 /// rig moves an agent's preamble into the request's history as a leading
 /// system message (rig-core 0.40, `CompletionRequestBuilder::build`), so a view
 /// assembled from the store goes after it rather than in place of it. A view
-/// with nothing in it -- reachable only outside a round, where nothing calls
-/// the model -- leaves the history as it was.
+/// with nothing in it leaves the system prompt alone, which is how a call's
+/// requests are built without rig's prompt; a history with no system prompt
+/// to leave is kept as it was.
 fn after_system(history: &OneOrMany<Message>, view: Vec<Message>) -> OneOrMany<Message> {
     let system = history
         .iter()
@@ -589,60 +632,71 @@ impl CompletionModel for FailoverModel {
         let call = self.slot.begin_call();
 
         let mut abandoned: Vec<Abandoned> = Vec::new();
-        // Kept while a later candidate may still need it, and moved into the
-        // last one's attempt: a request holds the whole view, so a chain of
-        // one never copies it.
-        let mut request = Some(request);
-        let last = self.candidates.len() - 1;
+        // What every request the call sends is built from. What rig put after
+        // the system prompt is the prompt alone, the round's hook having
+        // patched the rest out, and each view ends with it, so it is left out
+        // here: what is cloned for each request is the system prompt and the
+        // tool, never the prompt or a view.
+        let template = CompletionRequest {
+            chat_history: after_system(&request.chat_history, Vec::new()),
+            ..request
+        };
         // Every call starts at the head. The list is a preference order, and
         // sticking to candidate two for the rest of a session because of one
         // rate-limit window would silently downgrade the user's choice. The
         // cost is one attempt against a still-dead endpoint per call, which the
         // short pre-first-byte connect bound makes cheap.
         for (index, candidate) in self.candidates.iter().enumerate() {
-            let mut attempt = if index == last {
-                request.take()
-            } else {
-                request.clone()
-            }
-            .expect("taken only for the last candidate");
             let budget = self.held_to(index);
-            // Every candidate is sent a view assembled for its own window, the
-            // head's too, which may leave out more -- or cannot hold the
-            // call's latest turn at all -- and for its own count of tokens.
-            // What rig put after the system prompt is the prompt alone, the
-            // round's hook having patched the rest out, and the view replaces
-            // it.
-            let viewed = self.view.view(&budget, call);
-            let max_tokens = viewed
-                .as_ref()
-                .map_or(budget.max_tokens, |viewed| viewed.max_tokens);
-            self.slot.candidate(
-                candidate.model_name(),
-                candidate.model_identifier(),
-                max_tokens,
-            );
-            let viewed = viewed.map(|viewed| {
-                attempt.chat_history = after_system(&attempt.chat_history, viewed.messages);
-                (viewed.adjacent, viewed.estimate)
-            });
-            // Both rewrites are per candidate. `max_tokens` is the load-bearing
-            // one: the agent carries none of its own, so without this no
-            // ceiling would be sent. `model` arrives `None` on the agent path
-            // and each candidate's rig model already carries its own
-            // identifier, so setting it is belt-and-braces against a future
-            // rig that populates the field -- correct, and free.
-            attempt.model = Some(candidate.model_identifier().to_string());
-            attempt.max_tokens = max_tokens.map(u64::from);
+            // Set once the candidate has refused the call for what it carried,
+            // for the one time it is sent again.
+            let mut withholding: Option<Refused> = None;
+            let error = loop {
+                let mut attempt = template.clone();
+                // Every candidate is sent a view assembled for its own window,
+                // the head's too, which may leave out more -- or cannot hold
+                // the call's latest turn at all -- and for its own count of
+                // tokens.
+                let viewed = self.view.view(&budget, call, withholding.as_ref());
+                let max_tokens = viewed
+                    .as_ref()
+                    .map_or(budget.max_tokens, |viewed| viewed.max_tokens);
+                self.slot.candidate(
+                    candidate.model_name(),
+                    candidate.model_identifier(),
+                    max_tokens,
+                );
+                if withholding.is_some() {
+                    // Its retries were the first send's.
+                    self.slot.send_once();
+                }
+                let viewed = viewed.map(|viewed| {
+                    attempt.chat_history = after_system(&attempt.chat_history, viewed.messages);
+                    (viewed.adjacent, viewed.estimate, viewed.latest)
+                });
+                // Both rewrites are per candidate. `max_tokens` is the
+                // load-bearing one: the agent carries none of its own, so
+                // without this no ceiling would be sent. `model` arrives `None`
+                // on the agent path and each candidate's rig model already
+                // carries its own identifier, so setting it is belt-and-braces
+                // against a future rig that populates the field -- correct,
+                // and free.
+                attempt.model = Some(candidate.model_identifier().to_string());
+                attempt.max_tokens = max_tokens.map(u64::from);
 
-            let error = match viewed {
-                // Not made: the call cannot fit this candidate. Sending it
-                // again fails the same way, which is what a `RequestError` is
-                // to `is_recoverable`; the next round's view leaves the turn
-                // out, which `candidate_may_clear` counts.
-                Err(too_large) => CompletionError::RequestError(Box::new(too_large)),
-                Ok((adjacent, estimate)) => match candidate.completion(attempt).await {
+                let (adjacent, estimate, latest) = match viewed {
+                    // Not made: the call cannot fit this candidate. Sending it
+                    // again fails the same way, which is what a `RequestError`
+                    // is to `is_recoverable`; the next round's view leaves the
+                    // turn out, which `candidate_may_clear` counts.
+                    Err(too_large) => break CompletionError::RequestError(Box::new(too_large)),
+                    Ok(viewed) => viewed,
+                };
+                match candidate.completion(attempt).await {
                     Ok(response) => {
+                        if let Some(withheld) = withholding {
+                            self.view.withhold(withheld);
+                        }
                         // Against the estimate before its scale, or each call
                         // would be measured against a correction of the last.
                         self.calibrations[index]
@@ -667,9 +721,22 @@ impl CompletionModel for FailoverModel {
                         {
                             self.slot.refused(&budget, adjacent);
                         }
-                        error
+                        // Refused for what it carried, the first time, with
+                        // results of its own to leave out: a round's opening
+                        // has none.
+                        if withholding.is_none()
+                            && let Some(turn) = latest
+                            && let Some(finish_reason) = self.slot.filtered()
+                        {
+                            withholding = Some(Refused {
+                                turn,
+                                finish_reason,
+                            });
+                            continue;
+                        }
+                        break error;
                     }
-                },
+                }
             };
             if let Some(next) = self.candidates.get(index + 1) {
                 self.announce(candidate.model_name(), next.model_name(), &error, call);
@@ -750,6 +817,9 @@ mod tests {
         composes: bool,
         /// The input tokens each answer reports having cost.
         input_tokens: u64,
+        /// Where each failure is said to be a refusal of what the request
+        /// carried, when this candidate's are.
+        filtering: Option<CallSlot>,
     }
 
     impl Scripted {
@@ -769,7 +839,15 @@ mod tests {
                 seen: Arc::default(),
                 composes: true,
                 input_tokens: 0,
+                filtering: None,
             }
+        }
+
+        /// Each failure of this candidate is a refusal of what the request
+        /// carried, said through `slot`, as its retry layer would say it.
+        fn filtering(mut self, slot: &CallSlot) -> Self {
+            self.filtering = Some(slot.clone());
+            self
         }
 
         /// This candidate's answers report `input_tokens` as the request's cost.
@@ -819,6 +897,9 @@ mod tests {
                 Some(Err(e)) => Err(clone_error(e)),
                 None => Err(CompletionError::ProviderError("script empty".into())),
             };
+            if let (Err(_), Some(slot)) = (&outcome, &self.filtering) {
+                slot.filter("content_filter");
+            }
             let input_tokens = self.input_tokens;
             Box::pin(async move {
                 outcome.map(|text| CompletionResponse {
@@ -902,12 +983,33 @@ mod tests {
         lowered_to: Option<u32>,
         too_large_for: Vec<&'static str>,
         adjacent_for: Vec<&'static str>,
+        /// The turn every view answers the results of, or `None` for a
+        /// round's opening.
+        latest: Option<usize>,
+        /// The models each view without a turn's results was asked for, in
+        /// the order asked.
+        without: Mutex<Vec<String>>,
+        /// What every later view is to leave out, in the order kept.
+        withheld: Mutex<Vec<Refused>>,
     }
 
     impl Views {
         /// The model and scale of each view asked for, in the order asked.
         fn asked(&self) -> Vec<(String, Scale)> {
             self.asked.lock().expect("asked").clone()
+        }
+
+        /// The models of each view asked for, in the order asked.
+        fn models(&self) -> Vec<String> {
+            self.asked().into_iter().map(|(model, _)| model).collect()
+        }
+
+        /// Views whose calls answer the results of turn `turn`.
+        fn answering(turn: usize) -> Self {
+            Self {
+                latest: Some(turn),
+                ..Self::default()
+            }
         }
 
         fn too_large_for(names: impl IntoIterator<Item = &'static str>) -> Self {
@@ -926,11 +1028,22 @@ mod tests {
     }
 
     impl View for Views {
-        fn view(&self, budget: &Budget, _call: CallId) -> Result<Viewed, TooLarge> {
+        fn view(
+            &self,
+            budget: &Budget,
+            _call: CallId,
+            refused: Option<&Refused>,
+        ) -> Result<Viewed, TooLarge> {
             self.asked
                 .lock()
                 .expect("asked")
                 .push((budget.model.clone(), budget.scale));
+            if refused.is_some() {
+                self.without
+                    .lock()
+                    .expect("without")
+                    .push(budget.model.clone());
+            }
             let named = |names: &[&str]| names.contains(&budget.model.as_str());
             if named(&self.too_large_for) {
                 return Err(TooLarge {
@@ -949,7 +1062,12 @@ mod tests {
                 adjacent,
                 estimate: ESTIMATE,
                 max_tokens: self.lowered_to.or(budget.max_tokens),
+                latest: self.latest,
             })
+        }
+
+        fn withhold(&self, refused: Refused) {
+            self.withheld.lock().expect("withheld").push(refused);
         }
     }
 
@@ -1251,6 +1369,100 @@ mod tests {
             refusal(Views::adjacent_for(["bedrock"]), &[("bedrock", 400)]).await,
             Some(("bedrock".to_string(), Some(2))),
             "a lone model's refusal, whose error the chain returns as it stands"
+        );
+    }
+
+    /// What a provider ends an empty reply with when it refuses what the
+    /// request carried, as the retry layer words it.
+    fn filtered() -> CompletionError {
+        CompletionError::ResponseError("finish reason content_filter: empty".into())
+    }
+
+    /// A model that refused the call for what it carried is sent it once more,
+    /// without the results of the turn it answers, and its answer keeps them
+    /// out of every later call.
+    #[tokio::test]
+    async fn a_call_refused_for_what_it_carried_is_sent_once_more_without_its_results() {
+        let slot = CallSlot::default();
+        let head = Scripted::new("bedrock", vec![Err(filtered()), Ok("hi")]).filtering(&slot);
+        let calls = Arc::clone(&head.calls);
+        let views = Arc::new(Views::answering(3));
+
+        let reply = chain_over(
+            vec![Box::new(head), Box::new(Scripted::ok("anthropic"))],
+            Arc::clone(&views) as Arc<dyn View>,
+            slot,
+        )
+        .completion(request())
+        .await
+        .expect("answered without them");
+
+        assert_eq!(reply.raw_response.model, "bedrock", "not moved on");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(views.models(), ["bedrock", "bedrock"]);
+        assert_eq!(*views.without.lock().expect("without"), ["bedrock"]);
+        assert_eq!(
+            *views.withheld.lock().expect("withheld"),
+            [Refused {
+                turn: 3,
+                finish_reason: "content_filter".to_string(),
+            }]
+        );
+    }
+
+    /// Refused again, nothing is kept out: the call moves to the next model,
+    /// which is sent the whole view. Neither a failure of another kind nor a
+    /// call answering a round's opening, which has no results, is sent again.
+    #[tokio::test]
+    async fn a_call_refused_again_without_its_results_moves_on_whole() {
+        let slot = CallSlot::default();
+        let views = Arc::new(Views::answering(3));
+        let reply = chain_over(
+            vec![
+                Box::new(Scripted::failing("bedrock", filtered()).filtering(&slot)),
+                Box::new(Scripted::ok("anthropic")),
+            ],
+            Arc::clone(&views) as Arc<dyn View>,
+            slot,
+        )
+        .completion(request())
+        .await
+        .expect("the second answers");
+
+        assert_eq!(reply.raw_response.model, "anthropic");
+        assert_eq!(views.models(), ["bedrock", "bedrock", "anthropic"]);
+        assert_eq!(*views.without.lock().expect("without"), ["bedrock"]);
+        assert!(views.withheld.lock().expect("withheld").is_empty());
+
+        let moved_on = |views: Views, head: Scripted, slot: CallSlot| {
+            let views = Arc::new(views);
+            let chain = chain_over(
+                vec![Box::new(head), Box::new(Scripted::ok("anthropic"))],
+                Arc::clone(&views) as Arc<dyn View>,
+                slot,
+            );
+            async move {
+                chain
+                    .completion(request())
+                    .await
+                    .expect("the second answers");
+                (views.models(), views.without.lock().expect("without").len())
+            }
+        };
+        let moved = || (vec!["bedrock".to_string(), "anthropic".to_string()], 0);
+        // The slot is never told the failure was a refusal of what it carried.
+        let other = Scripted::failing("bedrock", filtered());
+        assert_eq!(
+            moved_on(Views::answering(3), other, CallSlot::default()).await,
+            moved(),
+            "a failure of another kind"
+        );
+        let slot = CallSlot::default();
+        let opening = Scripted::failing("bedrock", filtered()).filtering(&slot);
+        assert_eq!(
+            moved_on(Views::default(), opening, slot).await,
+            moved(),
+            "a call answering a round's opening"
         );
     }
 

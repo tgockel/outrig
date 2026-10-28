@@ -678,6 +678,13 @@ class Builder:
         summary = f"{text(d.get('from'))} -> {text(d.get('to'))}"
         self.add(summary, parts=[Part("error", text(d.get("error")), True)])
 
+    def on_model_withheld(self, d: dict) -> None:
+        self.add(
+            f"{text(d.get('model'))} refused call {text(d.get('call_id'))} for what it carried "
+            f"(finish reason {text(d.get('finish_reason'))}); sent again with a note in place "
+            f"of turn {text(d.get('turn'))}'s results"
+        )
+
     def on_model_call(self, d: dict) -> None:
         block = self.within(d.get("round"))
         block.calls += 1
@@ -715,6 +722,10 @@ class Builder:
             f"{text(a.get('role'))} follows itself at "
             + (f"turn {text(a['turn'])}" if a.get("turn") is not None else "the opening")
             for a in objs(d.get("adjacent"))
+        ] + [
+            f"turn {text(r.get('turn'))}'s results, which a provider refused, sent as: "
+            f"{text(r.get('notice'))}"
+            for r in objs(d.get("refused"))
         ]
         parts = [Part("what it carried", "\n".join(manifest))]
         # Also the first thing the round's first turn holds, so folded away here; this is the

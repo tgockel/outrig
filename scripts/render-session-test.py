@@ -293,6 +293,7 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
         "opening": None,
         "adjacent": [],
         "left_out": [],
+        "refused": [],
     } | over
 
 
@@ -445,6 +446,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                 evicted=[{"turn": 1, "why": "recent"}],
                 opening=message,
                 adjacent=[{"turn": None, "role": "user"}],
+                refused=[{"turn": 0, "notice": "n"}],
             ),
             a,
         ),
@@ -576,6 +578,11 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         (
             "model.failover",
             {"from": "m", "to": "n", "error": "e", "call_id": 1, "attempt_id": None},
+            a,
+        ),
+        (
+            "model.withheld",
+            {"model": "m", "call_id": 1, "turn": 0, "finish_reason": "content_filter"},
             a,
         ),
         (
@@ -1101,6 +1108,30 @@ class RenderSession(unittest.TestCase):
             for kind, data in ordinary()
         ]
         self.assertIn("left out of turn 0: part 0 of message 1", self.page(events))
+
+    def test_a_refusal_of_what_a_call_carried_names_what_was_sent_in_its_place(self) -> None:
+        refused = {"refused": [{"turn": 0, "notice": "[outrig: not sent -- refused]"}]}
+        events = [
+            (kind, data | refused) if kind == "model.call" else (kind, data)
+            for kind, data in ordinary()
+        ] + [
+            (
+                "model.withheld",
+                {"model": "sonnet", "call_id": 1, "turn": 0, "finish_reason": "content_filter"},
+            )
+        ]
+        html = self.page(events)
+        self.assertIn(
+            "turn 0&#39;s results, which a provider refused, sent as: "
+            "[outrig: not sent -- refused]",
+            html,
+        )
+        self.assertIn(
+            "sonnet refused call 1 for what it carried (finish reason content_filter); sent again "
+            "with a note in place of turn 0&#39;s results",
+            html,
+        )
+        self.assertNotIn("which a provider refused", self.page(ordinary()))
 
     def test_a_call_names_what_it_withheld_so_the_roles_alternate(self) -> None:
         withheld = {"withheld": [{"turn": 3, "why": "recent"}, {"turn": 5, "why": "promoted"}]}

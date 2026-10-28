@@ -398,6 +398,14 @@ struct InFlight {
     /// The first request a candidate refused, of those whose conversation put
     /// one role after itself.
     refusal: Option<Refusal>,
+    /// The finish reason of the content refusal the current candidate's latest
+    /// attempt failed with, if it failed so: see [`is_content_refusal`].
+    ///
+    /// [`is_content_refusal`]: super::retry::is_content_refusal
+    filtered: Option<String>,
+    /// Whether the current candidate's next request is sent once, an unusable
+    /// reply to it not retried.
+    once: bool,
 }
 
 /// A candidate's refusal of a request whose conversation put one role after
@@ -534,6 +542,8 @@ impl CallSlot {
             answered: None,
             last: None,
             refusal: None,
+            filtered: None,
+            once: false,
         });
         call
     }
@@ -548,6 +558,8 @@ impl CallSlot {
             });
             call.answered = None;
             call.last = None;
+            call.filtered = None;
+            call.once = false;
         }
     }
 
@@ -571,6 +583,35 @@ impl CallSlot {
     /// The latest call's first refusal of that kind, if it met one.
     pub(crate) fn refusal(&self) -> Option<Refusal> {
         self.state().call.as_ref()?.refusal.clone()
+    }
+
+    /// The finish reason the current candidate's latest attempt was refused
+    /// with for what it carried, when it was: an empty reply the provider ended
+    /// with `content_filter` or `refusal`.
+    pub(crate) fn filtered(&self) -> Option<String> {
+        self.state().call.as_ref()?.filtered.clone()
+    }
+
+    /// Say the current candidate refused its latest attempt for what it
+    /// carried, as `finish_reason`, for a test whose candidate sends nothing.
+    #[cfg(test)]
+    pub(crate) fn filter(&self, finish_reason: &str) {
+        if let Some(call) = &mut self.state().call {
+            call.filtered = Some(finish_reason.to_string());
+        }
+    }
+
+    /// The current candidate's next request is sent once: the model layer does
+    /// not retry an unusable reply to it. Until the call moves to a candidate.
+    pub(crate) fn send_once(&self) {
+        if let Some(call) = &mut self.state().call {
+            call.once = true;
+        }
+    }
+
+    /// Whether the current candidate's next request is sent once.
+    pub(crate) fn once(&self) -> bool {
+        self.state().call.as_ref().is_some_and(|call| call.once)
     }
 
     /// A request is about to be sent: its attempt, which records itself when
@@ -609,6 +650,10 @@ impl CallSlot {
         usage: Option<Usage>,
         finish_reason: Option<String>,
     ) {
+        // A failure the provider ended for what the request or the reply held.
+        let filtered = finish_reason
+            .clone()
+            .filter(|reason| error.is_some() && super::retry::is_content_refusal(reason));
         self.ledger.record(
             ModelAttempt {
                 call_id: call,
@@ -628,6 +673,7 @@ impl CallSlot {
                 && in_flight.call == call
             {
                 in_flight.last = Some(attempt);
+                in_flight.filtered = filtered;
             }
             state.round.push(attempt);
             state.attempts.push(attempt);

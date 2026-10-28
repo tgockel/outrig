@@ -201,11 +201,15 @@ fn each_event_has_exactly_its_data_fields() {
                     message: 1,
                     part: 0,
                 }],
+                refused: vec![RefusedTurn {
+                    turn: 0,
+                    notice: text("[outrig: not sent]"),
+                }],
             }),
             "model.call",
             &[
                 "call", "call_id", "round", "budget", "estimate", "carried", "evicted", "withheld",
-                "opening", "adjacent", "left_out",
+                "opening", "adjacent", "left_out", "refused",
             ],
         ),
         (
@@ -898,6 +902,16 @@ fn each_event_has_exactly_its_data_fields() {
             },
             "model.failover",
             &["from", "to", "error", "call_id", "attempt_id"],
+        ),
+        (
+            Payload::ModelWithheld {
+                model: text("sonnet"),
+                call_id: call,
+                turn: 3,
+                finish_reason: text("content_filter"),
+            },
+            "model.withheld",
+            &["model", "call_id", "turn", "finish_reason"],
         ),
         (
             Payload::ModelUsageReplaced {

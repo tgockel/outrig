@@ -74,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interrupts anything; Ctrl-Z suspends; SIGTERM and SIGHUP put the terminal back before they end
   the process, as they did before. Piped or redirected stdin or stdout, another terminal, or
   `TERM=dumb` keep the plain lines `run-new` has always written, which also carry what the screen
-  puts in the conversation, such as why a bindings process exited.
+  puts in the conversation, such as why a bindings process exited, or that a model refused a call
+  for what it carried and it is sent again with a note in place of the results it was refused for.
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
   ignores it, saying so in one line at startup.

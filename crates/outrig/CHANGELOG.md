@@ -111,7 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing. A reply that ended for any other reason, or none, or that holds anything the agent
   cannot use, such as a refusal, is still retried, and its error leads with the finish reason the
   provider named, as in `finish reason content_filter: ...`, so each retry, each move to another
-  model and the round's failure say why it ended rather than only that it was empty. An alias naming
+  model and the round's failure say why it ended rather than only that it was empty. A reply that
+  is empty because the provider refused what the call carried, `content_filter` or `refusal`, is
+  sent to that model once more, past its retries, with a notice in place of each result of the
+  turn the call answers -- the one thing no earlier call carried -- saying why, and that the
+  results are whole in `runtime.history`. Answered, every later call is sent the notice in their
+  place, so one result the provider will not read no longer refuses every later call of the
+  session; refused again, nothing is left out, and the call fails or moves on as any other. A
+  `model.withheld` event records the re-send, and `model.call`'s `refused` names each turn sent so
+  and the notice, so a call still rebuilds from the log. (#722) An alias naming
   several models resolves to each this build can reach, in order, and a call that still fails moves
   to the next, starting again at the first on every call. Each model a call goes to is sent a view
   assembled for its own window, and carries its own reply ceiling, so a turn too large for the first

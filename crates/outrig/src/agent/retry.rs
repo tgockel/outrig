@@ -585,8 +585,10 @@ impl<M: CompletionModel> RetryingModel<M> {
     ) {
         // rig takes the request by value, so replaying one means holding a copy
         // of the whole conversation for the duration of the call. With retries
-        // off there is nothing to replay, so the wrapper costs nothing at all.
-        if self.policy.budget.is_zero() {
+        // off there is nothing to replay, so the wrapper costs nothing at all;
+        // nor for a request its chain sends once, whose call has had its
+        // retries.
+        if self.policy.budget.is_zero() || self.retries.slot.once() {
             return self.attempt(request).await;
         }
 
@@ -763,6 +765,16 @@ fn is_empty_stop(body: &[u8]) -> bool {
 /// provider's defect to retry.
 pub(crate) fn is_normal_stop(reason: &str) -> bool {
     matches!(reason, "stop" | "end_turn")
+}
+
+/// Whether `reason`, a provider's finish reason, says the provider would not
+/// answer for what the request or the reply held: OpenAI's `content_filter`
+/// and Anthropic's `refusal`. An empty reply ending so is a call a chain sends
+/// once more without the latest results it carried ([`FailoverModel`]).
+///
+/// [`FailoverModel`]: super::failover::FailoverModel
+pub(crate) fn is_content_refusal(reason: &str) -> bool {
+    matches!(reason, "content_filter" | "refusal")
 }
 
 /// What a `200`'s body says it used, for a body rig made no completion of and
@@ -1487,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finish_reason_is_read_from_either_dialect_and_only_a_stop_is_normal() {
+    fn a_finish_reason_is_read_from_either_dialect_and_named_normal_or_a_refusal() {
         let reason = |body: serde_json::Value| {
             body_finish_reason(&serde_json::to_vec(&body).expect("serializes"))
         };
@@ -1515,6 +1527,12 @@ mod tests {
         }
         for cut_short in ["length", "max_tokens", "content_filter", "tool_calls", ""] {
             assert!(!is_normal_stop(cut_short), "{cut_short}");
+        }
+        for refused in ["content_filter", "refusal"] {
+            assert!(is_content_refusal(refused), "{refused}");
+        }
+        for answered in ["stop", "end_turn", "length", "max_tokens", "tool_calls", ""] {
+            assert!(!is_content_refusal(answered), "{answered}");
         }
     }
 

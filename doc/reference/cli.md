@@ -496,7 +496,14 @@ window mends that.
 may clear -- a rate limit, a 5xx, a dropped connection, a response OutRig cannot use -- is made
 again within `retry-budget-secs`, as in `run`, and stderr says so. A reply with nothing in it that
 the provider ends with `stop` or `end_turn` is no such failure: it is a model with nothing to add,
-and the round ends without an error, keeping any Python it ran. When the model is an alias of
+and the round ends without an error, keeping any Python it ran. One the provider ends with
+`content_filter` or `refusal` is a refusal of what the call carried: past its retries, the call is
+sent to that model once more with a note in place of each result of the turn it answers -- the one
+thing no earlier call carried -- saying why, and that the results are whole in `runtime.history`.
+The conversation says so too, in a line beginning `[outrig]`. If that call is answered, every later
+call is sent the note in their place, so one result a provider will not read does not refuse the
+rest of the session; if not, nothing is left out, and the call fails as any other. A round's first
+call has no results to leave out. When the model is an alias of
 several, a call that still fails moves to the next, as in `run`, and each call starts again at
 the first. Each model a call goes to is sent a conversation chosen for its own window, which may
 leave out more than another's did. When every model has failed, the round ends with each one's

@@ -17,7 +17,9 @@
 //! answers, is never left out; when it cannot fit on its own, the call is not
 //! made ([`TooLarge`]). For a provider that requires the user's and the model's
 //! turns to alternate, the turns that would put one role after itself are
-//! withheld as well ([`Store::alternate`]).
+//! withheld as well ([`Store::alternate`]). A turn whose results a provider
+//! refused a call for is sent with a notice in place of each result
+//! ([`Refused`]), while the store keeps them whole.
 //!
 //! Each call's [`Manifest`] records what it carried and why, which is the only
 //! answer to what a model had in front of it: a promotion asks, and the window,
@@ -25,7 +27,7 @@
 //!
 //! `plan/phase/0003-python/history.md` designs both.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -169,6 +171,9 @@ pub(crate) struct Manifest {
     /// The parts of the carried turns the call's provider cannot take, which
     /// it was not sent: see [`Wire`]. Oldest first.
     pub(crate) left_out: Vec<LeftOut>,
+    /// The carried turns whose results it was sent a notice in place of, each
+    /// with the notice: see [`Refused`]. Oldest first.
+    pub(crate) refused: Vec<(usize, String)>,
 }
 
 /// One part of a carried turn a call was not sent: in turn `turn`, the
@@ -237,6 +242,45 @@ fn ends(wire: Wire, messages: &[Message]) -> Option<(Role, Role)> {
         .filter_map(Role::of);
     let first = roles.next()?;
     Some((first, roles.next_back().unwrap_or(first)))
+}
+
+/// A provider's refusal of a call for what it carried, made of an empty reply
+/// it ended with a finish reason such as `content_filter`. The results of
+/// `turn`, the turn the call answered, are the one thing that call carried no
+/// earlier one had, so each is sent as a [`notice`] in their place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub(crate) turn: usize,
+    pub(crate) finish_reason: String,
+}
+
+/// What each result of turn `turn` is sent as, once a provider refused a call
+/// that carried them with `finish_reason`: why, and where they are, so the
+/// model neither works blind nor repeats what it ran to see them again.
+fn notice(turn: usize, finish_reason: &str) -> String {
+    format!(
+        "[outrig: not sent -- the model's provider refused a request that carried this turn's \
+         results (finish reason {finish_reason}), so each call is sent this note in their place. \
+         They are kept whole in runtime.history.turns[{turn}]: work with them there in code, and \
+         print only what you need of them.]"
+    )
+}
+
+/// `messages`, with what each tool result holds replaced by `notice`. Every
+/// result stays beside the call it answers, in the message and the part it was
+/// in, so the roles, and what a [`LeftOut`] names, are as they were.
+fn without_results(mut messages: Vec<Message>, notice: &str) -> Vec<Message> {
+    for message in &mut messages {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for part in content.iter_mut() {
+            if let UserContent::ToolResult(result) = part {
+                result.content = OneOrMany::one(ToolResultContent::text(notice));
+            }
+        }
+    }
+    messages
 }
 
 /// Turn `turn`'s `messages` as the call `left_out` describes was sent them:
@@ -328,6 +372,14 @@ impl Manifest {
                         part: part as u64,
                     },
                 )
+                .collect(),
+            refused: self
+                .refused
+                .iter()
+                .map(|(turn, notice)| event::RefusedTurn {
+                    turn: *turn as u64,
+                    notice: notice.clone(),
+                })
                 .collect(),
         }
     }
@@ -554,15 +606,55 @@ impl History {
         budget: &Budget,
         call: CallId,
     ) -> Result<(Vec<Message>, Manifest), TooLarge> {
-        let (sent, manifest) = self.store().assemble(budget)?;
+        self.assemble_with(budget, call, None)
+    }
+
+    /// [`Self::assemble`], for the call a provider has just refused for what it
+    /// carried: each result of the turn it answers, `refused.turn`, is sent as
+    /// a notice in its place. Recorded as the call is sent again, before its
+    /// manifest. The store keeps the results, and only this view leaves them
+    /// out until [`Self::withhold`].
+    pub(crate) fn assemble_without(
+        &self,
+        budget: &Budget,
+        call: CallId,
+        refused: &Refused,
+    ) -> Result<(Vec<Message>, Manifest), TooLarge> {
+        self.assemble_with(budget, call, Some(refused))
+    }
+
+    fn assemble_with(
+        &self,
+        budget: &Budget,
+        call: CallId,
+        refused: Option<&Refused>,
+    ) -> Result<(Vec<Message>, Manifest), TooLarge> {
+        let (sent, manifest) = self.store().assemble(budget, refused)?;
         // Outside the store's lock: an observer may do anything.
         #[cfg(test)]
         if let Some(observer) = &*lock(&self.manifests) {
             observer(&manifest);
         }
-        self.interpreter
-            .events()
-            .emit_with(|| Payload::ModelCall(manifest.event(call)));
+        let events = self.interpreter.events();
+        if let Some(Refused {
+            turn,
+            finish_reason,
+        }) = refused
+        {
+            // Said beside the retry lines, as a move to another model is.
+            tracing::warn!(
+                "model {} refused the call for what it carried (finish reason {finish_reason}); \
+                 sending it again without turn {turn}'s results",
+                budget.model
+            );
+            events.emit(Payload::ModelWithheld {
+                model: budget.model.clone(),
+                call_id: call,
+                turn: *turn as u64,
+                finish_reason: finish_reason.clone(),
+            });
+        }
+        events.emit_with(|| Payload::ModelCall(manifest.event(call)));
         tracing::debug!(
             call = manifest.call,
             round = manifest.round,
@@ -573,6 +665,12 @@ impl History {
             "assembled a model call's view"
         );
         Ok((sent, manifest))
+    }
+
+    /// Send every later call the notice `refused` names in place of each of
+    /// its turn's results: a call sent so was answered.
+    pub(crate) fn withhold(&self, refused: Refused) {
+        self.store().withhold(&refused);
     }
 
     /// The messages `manifest`'s call was sent, its prompt included.
@@ -617,6 +715,17 @@ struct Store {
     window: Window,
     /// How many model calls have been assembled.
     calls: u64,
+    /// The turns whose results every call is sent a notice in place of: see
+    /// [`Refused`].
+    refused: BTreeMap<usize, Withheld>,
+}
+
+/// A turn whose results every call is sent a notice in place of.
+struct Withheld {
+    notice: String,
+    /// The turn's estimated tokens as it is sent so, which a view counts in
+    /// place of its own: a notice can be longer than a short result.
+    tokens: u64,
 }
 
 struct Turn {
@@ -763,11 +872,61 @@ impl Store {
     fn prompt_tokens(&self, prompt: Prompt) -> u64 {
         match prompt {
             Prompt::Opening { tokens } => tokens,
-            Prompt::Turn(id) => self.turns[id].tokens,
+            Prompt::Turn(id) => self.tokens(id),
         }
     }
 
-    fn assemble(&mut self, budget: &Budget) -> Result<(Vec<Message>, Manifest), TooLarge> {
+    /// Turn `id`'s estimated tokens as a call is sent it, before [`fit`]: its
+    /// own, or with a notice in place of each result, once it has one.
+    fn tokens(&self, id: usize) -> u64 {
+        self.refused
+            .get(&id)
+            .map_or(self.turns[id].tokens, |withheld| withheld.tokens)
+    }
+
+    /// Send every later call a notice in place of each result of the turn
+    /// `refused` names, counted as it is sent so.
+    fn withhold(&mut self, refused: &Refused) {
+        let Refused {
+            turn,
+            finish_reason,
+        } = refused;
+        if self.refused.contains_key(turn) {
+            return;
+        }
+        let notice = notice(*turn, finish_reason);
+        let tokens = budget::tokens(&without_results(
+            self.turns[*turn].messages.clone(),
+            &notice,
+        ));
+        self.refused.insert(*turn, Withheld { notice, tokens });
+    }
+
+    /// See [`History::assemble`], and, with `refusing`, [`History::assemble_without`].
+    fn assemble(
+        &mut self,
+        budget: &Budget,
+        refusing: Option<&Refused>,
+    ) -> Result<(Vec<Message>, Manifest), TooLarge> {
+        // The call sent without the results is chosen, counted, and assembled
+        // as every later one is once it is answered: the store withholds the
+        // turn while it assembles this one, and no longer.
+        let tentative = refusing
+            .filter(|refusing| !self.refused.contains_key(&refusing.turn))
+            .map(|refusing| {
+                self.withhold(refusing);
+                refusing.turn
+            });
+        let assembled = self.assemble_held(budget);
+        if let Some(turn) = tentative {
+            self.refused.remove(&turn);
+        }
+        assembled
+    }
+
+    /// What the next call is sent of what the store holds now: see
+    /// [`History::assemble`].
+    fn assemble_held(&mut self, budget: &Budget) -> Result<(Vec<Message>, Manifest), TooLarge> {
         let (round, prompt) = self.prompt();
         // The call is held to its allowance, but not to a scale that would
         // refuse a prompt the rule admits.
@@ -789,15 +948,22 @@ impl Store {
         let mut sent: Vec<Message> = Vec::new();
         let mut adjacent = Vec::new();
         let mut left_out = Vec::new();
+        let mut refused = Vec::new();
         let opening = match prompt {
             Prompt::Opening { .. } => self.opening.as_ref().map(|o| o.message.clone()),
             Prompt::Turn(_) => None,
         };
-        // Each turn as the call's provider takes it. The estimate above counts
-        // turns whole, so what is left out only makes it more conservative.
+        // Each turn as the call's provider takes it, and a turn whose results
+        // a provider refused with a notice in their place. The estimate above
+        // counts each turn whole, a refused one with its notices, so what is
+        // left out only makes it more conservative.
         let turns = carried.iter().map(|&(id, _)| {
             let messages = fit(budget.wire, id, &self.turns[id].messages, &mut left_out);
-            (Some(id), messages)
+            let Some(withheld) = self.refused.get(&id) else {
+                return (Some(id), messages);
+            };
+            refused.push((id, withheld.notice.clone()));
+            (Some(id), without_results(messages, &withheld.notice))
         });
         for (turn, messages) in turns.chain(opening.iter().map(|o| (None, vec![o.clone()]))) {
             if let (Some(before), Some(first)) = (sent.last(), messages.first())
@@ -819,6 +985,7 @@ impl Store {
             adjacent,
             left_out,
             withheld,
+            refused,
         };
         self.calls += 1;
         Ok((sent, manifest))
@@ -837,13 +1004,20 @@ impl Store {
     }
 
     /// The messages `manifest`'s call was sent, its prompt included: the turns
-    /// it carried as `left_out` leaves them, then the opening.
+    /// it carried as `left_out` leaves them, each result of one `refused`
+    /// names as its notice, then the opening.
     #[cfg(test)]
     fn reconstruct(&self, manifest: &Manifest) -> Vec<Message> {
         manifest
             .carried
             .iter()
-            .flat_map(|&(id, _)| as_sent(id, &self.turns[id].messages, &manifest.left_out))
+            .flat_map(|&(id, _)| {
+                let sent = as_sent(id, &self.turns[id].messages, &manifest.left_out);
+                match manifest.refused.iter().find(|(turn, _)| *turn == id) {
+                    Some((_, notice)) => without_results(sent, notice),
+                    None => sent,
+                }
+            })
             .chain(manifest.opening.iter().cloned())
             .collect()
     }
@@ -862,7 +1036,7 @@ impl Store {
                 selection.tokens -= selection
                     .withheld
                     .iter()
-                    .map(|&(id, _)| self.turns[id].tokens)
+                    .map(|&(id, _)| self.tokens(id))
                     .sum::<u64>();
             }
         }
@@ -1005,7 +1179,7 @@ impl Store {
             latest.map(|id| (id, Why::Latest)).into_iter().collect();
         let mut evicted = Vec::new();
         for (id, why) in order {
-            let tokens = self.turns[id].tokens;
+            let tokens = self.tokens(id);
             if tokens <= left {
                 left -= tokens;
                 carried.push((id, why));

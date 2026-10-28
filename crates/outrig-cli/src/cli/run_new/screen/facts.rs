@@ -301,6 +301,21 @@ fn from_payload(payload: &Payload) -> Option<Fact> {
             error: error.clone(),
             call: call_id.get(),
         },
+        // What the model is sent from here on changed, so it is said where
+        // the person reads the conversation.
+        Payload::ModelWithheld {
+            model,
+            turn,
+            finish_reason,
+            ..
+        } => Fact::Note {
+            text: format!(
+                "[outrig] {model} refused a call for what it carried (finish reason \
+                 {finish_reason}); it is sent again with a note in place of turn {turn}'s \
+                 results, which stay in runtime.history"
+            ),
+            inline: true,
+        },
         Payload::ModelCall(call) => Fact::Calling {
             model: call.budget.model.clone(),
             call: call.call_id.get(),

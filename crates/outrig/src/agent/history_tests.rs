@@ -3,8 +3,11 @@ use rig::completion::Message;
 use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
 use serde_json::json;
 
-use super::{Adjacent, History, Prompt, Role, Store, TooLarge, Why, Window, split_turns};
-use crate::agent::budget::{Budget, MIN_REPLY, Scale, candidate};
+use super::{
+    Adjacent, History, Prompt, Refused, Role, Store, TooLarge, Why, Window, notice, split_turns,
+    without_results,
+};
+use crate::agent::budget::{self, Budget, MIN_REPLY, Scale, candidate};
 use crate::agent::tool;
 use crate::harness::event::CallId;
 use crate::python::host::ContextChange;
@@ -153,7 +156,7 @@ fn stated(opening: &Message) -> usize {
 /// How many turns the first call of the round `store` has open leaves out,
 /// held to `budget`: all of them, when the opening alone does not fit.
 fn first_call_leaves_out(store: &mut Store, budget: &Budget) -> usize {
-    match store.assemble(budget) {
+    match store.assemble(budget, None) {
         Ok((_, manifest)) => store.turns.len() - manifest.carried.len(),
         Err(_) => store.turns.len(),
     }
@@ -456,7 +459,7 @@ fn a_promoted_turn_in_the_window_is_carried_once_as_promoted() {
     let mut store = five_rounds();
     promote(&mut store, &[7, 7]);
     let (_, manifest) = store
-        .assemble(&Budget::with_room("m", 80))
+        .assemble(&Budget::with_room("m", 80), None)
         .expect("room for everything");
     assert_eq!(
         manifest.carried,
@@ -474,7 +477,7 @@ fn a_promoted_turn_in_the_window_is_carried_once_as_promoted() {
     // At 60, two turns go: the recent window's, then the first rounds'
     // newest -- not turn 7, which is promoted.
     let (_, manifest) = store
-        .assemble(&Budget::with_room("m", 60))
+        .assemble(&Budget::with_room("m", 60), None)
         .expect("the latest fits");
     assert_eq!(manifest.evicted, [(1, Why::First), (6, Why::Recent)]);
 }
@@ -524,7 +527,7 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         wire: crate::agent::budget::Wire::OpenAi,
         alternation: crate::config::RoleAlternation::Relaxed,
     };
-    let err = store.assemble(&budget).expect_err("450 of room");
+    let err = store.assemble(&budget, None).expect_err("450 of room");
     assert_eq!(
         (err.turn, err.round, err.estimate),
         (Some(10), 5, 500),
@@ -547,7 +550,7 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
 
     // Alone, it fits exactly, and everything else goes.
     store.turns[10].tokens = 450;
-    let (sent, manifest) = store.assemble(&budget).expect("fits alone");
+    let (sent, manifest) = store.assemble(&budget, None).expect("fits alone");
     assert_eq!(manifest.carried, [(10, Why::Latest)]);
     assert_eq!(manifest.estimate, 450 + 300);
     assert_eq!(sent, store.turns[10].messages, "the latest turn alone");
@@ -565,13 +568,13 @@ fn a_scaled_allowance_carries_less_of_the_same_store() {
         ..rule.clone()
     };
 
-    let (_, at_rule) = store.assemble(&rule).expect("room for all 80");
+    let (_, at_rule) = store.assemble(&rule, None).expect("room for all 80");
     assert_eq!(at_rule.evicted, []);
     assert_eq!(at_rule.estimate, 80);
 
     // 80 of the provider's tokens are 64 of the rule's: the latest turn, the
     // round's own, the promotion and the first rounds, and not the recent one.
-    let (_, at_scale) = store.assemble(&scaled).expect("room for most");
+    let (_, at_scale) = store.assemble(&scaled, None).expect("room for most");
     let ids = |chosen: &[(usize, Why)]| chosen.iter().map(|&(id, _)| id).collect::<Vec<_>>();
     assert_eq!(ids(&at_scale.carried), [0, 1, 2, 8, 9, 10]);
     assert_eq!(ids(&at_scale.evicted), [6, 7]);
@@ -599,7 +602,7 @@ fn a_turn_too_large_for_the_scaled_room_says_so() {
         ..rule.clone()
     };
     let err = store
-        .assemble(&scaled)
+        .assemble(&scaled, None)
         .expect_err("300 of room, and 450 at the rule");
     assert_eq!((err.turn, err.estimate), (Some(10), 500), "{err}");
     let text = err.to_string();
@@ -631,7 +634,7 @@ fn a_scale_that_would_refuse_the_prompt_lowers_the_reply_instead() {
 
     let mut store = priced(five_rounds(), 100);
     let (_, manifest) = store
-        .assemble(&scaled)
+        .assemble(&scaled, None)
         .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(manifest.carried, [(10, Why::Latest)]);
     let held = &manifest.budget;
@@ -645,7 +648,7 @@ fn a_scale_that_would_refuse_the_prompt_lowers_the_reply_instead() {
     // A prompt that leaves the window less than the least reply beside it.
     store.turns[10].tokens = 35_000;
     let (_, manifest) = store
-        .assemble(&scaled)
+        .assemble(&scaled, None)
         .unwrap_or_else(|err| panic!("{err}"));
     let held = &manifest.budget;
     assert!(held.reserve >= MIN_REPLY, "{held:?}");
@@ -656,7 +659,9 @@ fn a_scale_that_would_refuse_the_prompt_lowers_the_reply_instead() {
 
     // Beyond what the rule admits is refused all the same.
     store.turns[10].tokens = 40_000;
-    store.assemble(&scaled).expect_err("36000 at the rule");
+    store
+        .assemble(&scaled, None)
+        .expect_err("36000 at the rule");
 }
 
 /// A round's opening is a prompt like any other, and the count it states of the
@@ -673,7 +678,7 @@ fn an_opening_the_scale_would_refuse_is_carried_and_counted_exactly() {
     let opening = store.open_round(&scaled, line);
     assert_eq!(stated(&opening), first_call_leaves_out(&mut store, &scaled));
     let (_, manifest) = store
-        .assemble(&scaled)
+        .assemble(&scaled, None)
         .unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(manifest.opening, Some(opening));
     assert!(manifest.budget.reserve < rule.reserve);
@@ -690,12 +695,12 @@ fn a_smaller_candidates_allowance_evicts_more_of_the_same_store() {
         .expect("8000 of room");
     let small = Budget::new(&candidate("small", Some(2_000 + 4_000)), Some(1_000), 1_000)
         .expect("4000 of room");
-    let (_, manifest) = store.assemble(&large).expect("room for all");
+    let (_, manifest) = store.assemble(&large, None).expect("room for all");
     assert_eq!(
         (manifest.budget.model.as_str(), manifest.evicted.len()),
         ("large", 0)
     );
-    let (_, manifest) = store.assemble(&small).expect("room for some");
+    let (_, manifest) = store.assemble(&small, None).expect("room for some");
     assert_eq!(manifest.budget.model, "small");
     assert_eq!(
         manifest.evicted,
@@ -710,8 +715,8 @@ fn a_smaller_candidates_allowance_evicts_more_of_the_same_store() {
 
     // A latest turn that one candidate's window holds and the other's does not.
     store.turns[10].tokens = 6_000;
-    assert!(store.assemble(&large).is_ok());
-    let err: TooLarge = store.assemble(&small).expect_err("6000 of 4000");
+    assert!(store.assemble(&large, None).is_ok());
+    let err: TooLarge = store.assemble(&small, None).expect_err("6000 of 4000");
     assert_eq!(err.budget.model, "small");
 }
 
@@ -736,7 +741,7 @@ fn a_cut_that_puts_one_role_after_itself_is_recorded() {
     // opening after a result.
     store.begin_round(Message::user("round 3"));
     let (_, manifest) = store
-        .assemble(&Budget::with_room("m", ROOMY))
+        .assemble(&Budget::with_room("m", ROOMY), None)
         .expect("room");
     assert_eq!(
         manifest.adjacent,
@@ -754,7 +759,7 @@ fn a_cut_that_puts_one_role_after_itself_is_recorded() {
     };
     promote(&mut store, &[2]);
     let (_, manifest) = store
-        .assemble(&Budget::with_room("m", ROOMY))
+        .assemble(&Budget::with_room("m", ROOMY), None)
         .expect("room");
     assert_eq!(
         manifest.adjacent,
@@ -1025,7 +1030,7 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
             wire,
             ..Budget::with_room("m", ROOMY)
         };
-        let (sent, manifest) = store.assemble(&budget).expect("room for everything");
+        let (sent, manifest) = store.assemble(&budget, None).expect("room for everything");
         assert_eq!(manifest.left_out, left_out, "{wire:?}");
         let unsigned_sent = sent.iter().any(|message| {
             matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| *part == unsigned))
@@ -1072,7 +1077,7 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
     let strict = Budget::with_room("m", ROOMY).strict();
 
     // Rounds 1 and 4 alternate with the opening on their own.
-    let (sent, manifest) = store.assemble(&strict).expect("room");
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert_eq!(manifest.carried, [(0, Why::First), (6, Why::Recent)]);
     assert!(manifest.withheld.is_empty(), "{manifest:?}");
     assert!(manifest.adjacent.is_empty(), "{manifest:?}");
@@ -1087,7 +1092,7 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
 
     // Round 2's second turn alone opens on a call right after round 1's reply.
     promote(&mut store, &[2]);
-    let (sent, manifest) = store.assemble(&strict).expect("room");
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert_eq!(manifest.withheld, [(2, Why::Promoted)]);
     assert_eq!(manifest.carried, [(0, Why::First), (6, Why::Recent)]);
     assert!(manifest.adjacent.is_empty(), "{manifest:?}");
@@ -1098,14 +1103,14 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
     // second follows its results, but round 4 then opens after a result the
     // model never answered, so the earlier side yields -- both turns.
     promote(&mut store, &[1]);
-    let (sent, manifest) = store.assemble(&strict).expect("room");
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert_eq!(manifest.withheld, [(1, Why::Promoted), (2, Why::Promoted)]);
     assert_eq!(roles(&sent), alone);
 
     // A whole promoted round alternates on its own, and stays.
     store.change(ContextChange::Demote(vec![1, 2]));
     promote(&mut store, &[3, 4, 5]);
-    let (sent, manifest) = store.assemble(&strict).expect("room");
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert!(manifest.withheld.is_empty(), "{manifest:?}");
     let carried: Vec<usize> = manifest.carried.iter().map(|&(id, _)| id).collect();
     assert_eq!(carried, [0, 3, 4, 5, 6]);
@@ -1119,7 +1124,7 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
         first: 1,
         recent: 3,
     };
-    let (sent, manifest) = store.assemble(&strict).expect("room");
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert_eq!(manifest.withheld, [(1, Why::Recent), (2, Why::Recent)]);
     assert!(manifest.adjacent.is_empty(), "{manifest:?}");
     assert!(alternates(&sent), "{:?}", roles(&sent));
@@ -1127,7 +1132,7 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
 
     // Relaxed, the same view goes whole, and the pair is recorded instead.
     let (sent, manifest) = store
-        .assemble(&Budget::with_room("m", ROOMY))
+        .assemble(&Budget::with_room("m", ROOMY), None)
         .expect("room");
     assert!(manifest.withheld.is_empty());
     assert_eq!(
@@ -1168,7 +1173,7 @@ fn a_strict_view_never_withholds_the_turn_a_call_answers() {
     let strict = Budget::with_room("m", 100).strict();
 
     // The latest would follow round 2's reply: back to round 1's results.
-    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    let (sent, manifest) = store.assemble(&strict, None).expect("the latest fits");
     assert_eq!(manifest.evicted, [(3, Why::Round)]);
     assert_eq!(manifest.withheld, [(1, Why::First), (2, Why::Recent)]);
     assert_eq!(manifest.carried, [(0, Why::First), (4, Why::Latest)]);
@@ -1189,7 +1194,7 @@ fn a_strict_view_never_withholds_the_turn_a_call_answers() {
     // on the model's side and is withheld, round 2 alone ends on a reply, and
     // the pair stands, recorded.
     store.turns[0].tokens = 1_000;
-    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    let (sent, manifest) = store.assemble(&strict, None).expect("the latest fits");
     assert_eq!(manifest.evicted, [(0, Why::First), (3, Why::Round)]);
     assert_eq!(manifest.withheld, [(1, Why::First)]);
     assert_eq!(manifest.carried, [(2, Why::Recent), (4, Why::Latest)]);
@@ -1207,7 +1212,7 @@ fn a_strict_view_never_withholds_the_turn_a_call_answers() {
 
     // Round 2 out too: the latest is sent alone.
     store.turns[2].tokens = 1_000;
-    let (sent, manifest) = store.assemble(&strict).expect("the latest fits");
+    let (sent, manifest) = store.assemble(&strict, None).expect("the latest fits");
     assert_eq!(manifest.withheld, [(1, Why::First)]);
     assert_eq!(manifest.carried, [(4, Why::Latest)]);
     assert!(manifest.adjacent.is_empty(), "{manifest:?}");
@@ -1244,7 +1249,7 @@ fn an_emptied_reply_leaves_its_round_ending_on_results() {
         wire: Wire::Anthropic,
         ..Budget::with_room("m", ROOMY).strict()
     };
-    let (sent, manifest) = store.assemble(&anthropic).expect("room");
+    let (sent, manifest) = store.assemble(&anthropic, None).expect("room");
     assert_eq!(manifest.withheld, [(1, Why::Recent)]);
     assert_eq!(manifest.carried, [(0, Why::First), (2, Why::Recent)]);
     assert_eq!(
@@ -1259,7 +1264,7 @@ fn an_emptied_reply_leaves_its_round_ending_on_results() {
     assert_eq!(store.reconstruct(&manifest), sent);
 
     let (sent, manifest) = store
-        .assemble(&Budget::with_room("m", ROOMY).strict())
+        .assemble(&Budget::with_room("m", ROOMY).strict(), None)
         .expect("room");
     assert!(manifest.withheld.is_empty(), "{manifest:?}");
     assert!(manifest.left_out.is_empty());
@@ -1298,8 +1303,137 @@ fn the_opening_counts_what_a_strict_first_call_withholds() {
     // and round 4's turn, withheld.
     let budget = Budget::with_room("m", ROOMY).strict();
     let opening = store.open_round(&budget, line);
-    let (sent, manifest) = store.assemble(&budget).expect("room");
+    let (sent, manifest) = store.assemble(&budget, None).expect("room");
     assert_eq!(stated(&opening), 2);
     assert_eq!(manifest.withheld, [(3, Why::Recent)]);
     assert!(alternates(&sent), "{:?}", roles(&sent));
+}
+
+/// Each tool result in `messages`: the call it answers, and its text.
+fn results(messages: &[Message]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            UserContent::ToolResult(result) => match result.content.first() {
+                ToolResultContent::Text(text) => Some((result.id.clone(), text.text)),
+                other => panic!("not text: {other:?}"),
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A call a provider refused for what it carried is sent again with a notice
+/// in place of each result of the turn it answers, and only that turn's: the
+/// call beside each stays, and the store keeps the results whole. That view
+/// leaves nothing out of the next; once the store withholds the turn, every
+/// later call carries the notice, in this round and the next. The record
+/// rebuilds each call.
+#[test]
+fn a_refused_turns_results_are_sent_as_a_notice_and_kept_whole() {
+    let mut store = Store::default();
+    round_of_calls(&mut store, "go", &["a", "b"], None);
+    let budget = Budget::with_room("m", ROOMY);
+    let refused = Refused {
+        turn: 1,
+        finish_reason: "content_filter".to_string(),
+    };
+    let ok = |id: &str| (id.to_string(), "ok".to_string());
+    let noted = |id: &str| (id.to_string(), notice(1, "content_filter"));
+
+    let (sent, manifest) = store.assemble(&budget, Some(&refused)).expect("room");
+    assert_eq!(results(&sent), [ok("a"), noted("b")]);
+    assert_eq!(manifest.refused, [(1, notice(1, "content_filter"))]);
+    assert_eq!(store.reconstruct(&manifest), sent);
+    assert_eq!(results(&store.turns[1].messages), [ok("b")], "kept whole");
+    assert!(
+        notice(1, "content_filter").contains("runtime.history.turns[1]")
+            && notice(1, "content_filter").contains("finish reason content_filter"),
+        "{}",
+        notice(1, "content_filter")
+    );
+
+    let (sent, manifest) = store.assemble(&budget, None).expect("room");
+    assert_eq!(results(&sent), [ok("a"), ok("b")], "nothing stays withheld");
+    assert!(manifest.refused.is_empty());
+
+    store.withhold(&refused);
+    store.commit(vec![call("c", "c"), Message::tool_result("c", "ok")]);
+    let (sent, manifest) = store.assemble(&budget, None).expect("room");
+    assert_eq!(results(&sent), [ok("a"), noted("b"), ok("c")]);
+    assert_eq!(manifest.refused, [(1, notice(1, "content_filter"))]);
+    assert_eq!(store.reconstruct(&manifest), sent);
+
+    store.commit(vec![Message::assistant("done")]);
+    round_of_calls(&mut store, "again", &["d"], None);
+    let (sent, manifest) = store.assemble(&budget, None).expect("room");
+    assert_eq!(manifest.carried[1], (1, Why::First));
+    assert_eq!(results(&sent), [ok("a"), noted("b"), ok("c"), ok("d")]);
+    assert_eq!(store.reconstruct(&manifest), sent);
+}
+
+/// A notice can be longer than the results it stands in for, so a turn sent
+/// with one is counted as it is sent, in choosing what fits as well as in the
+/// estimate: a call that held fifty short results with room to spare holds
+/// their notices only by leaving out what it carried before, or not at all.
+#[test]
+fn a_refused_turn_is_counted_with_its_notices() {
+    let mut store = Store::default();
+    round_of_calls(&mut store, "go", &["a"], None);
+    let ids: Vec<String> = (0..50).map(|n| format!("c{n}")).collect();
+    let calls = ids
+        .iter()
+        .map(|id| AssistantContent::tool_call(id, tool::NAME, json!({"source": "1"})));
+    let results = ids
+        .iter()
+        .map(|id| UserContent::tool_result(id, OneOrMany::one(ToolResultContent::text(""))));
+    store.commit(vec![
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::many(calls).expect("fifty calls"),
+        },
+        Message::User {
+            content: OneOrMany::many(results).expect("fifty results"),
+        },
+    ]);
+    let refused = Refused {
+        turn: 1,
+        finish_reason: "content_filter".to_string(),
+    };
+    let (first, latest) = (store.turns[0].tokens, store.turns[1].tokens);
+    let noted = budget::tokens(&without_results(
+        store.turns[1].messages.clone(),
+        &notice(1, "content_filter"),
+    ));
+    assert!(noted > first + latest, "{noted} against {first} + {latest}");
+
+    let both = Budget::with_room("m", first + latest);
+    let (_, manifest) = store.assemble(&both, None).expect("room for both");
+    assert_eq!(manifest.carried, [(0, Why::Round), (1, Why::Latest)]);
+    let err = store
+        .assemble(&both, Some(&refused))
+        .expect_err("no room for the notices");
+    assert_eq!((err.turn, err.estimate), (Some(1), noted));
+
+    let alone = Budget::with_room("m", noted + first - 1);
+    let (sent, manifest) = store.assemble(&alone, Some(&refused)).expect("room");
+    assert_eq!(manifest.carried, [(1, Why::Latest)]);
+    assert_eq!(manifest.evicted, [(0, Why::Round)]);
+    assert_eq!(manifest.estimate, noted);
+    assert_eq!(
+        budget::tokens(&sent),
+        noted,
+        "what was sent is what was counted"
+    );
+
+    // As the store withholds it, every later call counts it so too.
+    store.withhold(&refused);
+    let (_, manifest) = store.assemble(&alone, None).expect("room");
+    assert_eq!(manifest.evicted, [(0, Why::Round)]);
+    assert_eq!(manifest.estimate, noted);
 }

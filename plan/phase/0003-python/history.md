@@ -123,6 +123,14 @@ whole once the next round opens, since each of its turns ends on results; the tu
 answers is never withheld, and an earlier round's closing reply yields to it instead. The
 manifest names each turn withheld (#472).
 
+A provider that refuses a call for what it carried -- an empty reply ending in `content_filter`
+or `refusal` -- would refuse every later call too, since the view keeps the first rounds and a
+failed round changes nothing. So the turn stays, and only its results go: the call is sent once
+more with a notice in place of each result of the turn it answers, the one thing no earlier call
+carried, saying why and that the results are whole in `runtime.history`. Once that is answered,
+every later call carries the notice in their place, and the manifest names the turn in `refused`
+(#722).
+
 ### The budget
 
 Counting retained rounds is not a budget. A first-and-recent window plus a few promotions can
