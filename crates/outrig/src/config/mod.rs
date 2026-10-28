@@ -2270,6 +2270,40 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
     }
 }
 
+/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
+/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
+/// single name.
+///
+/// Flag lowering, `ContainerCapabilities::grants_net_admin` and the
+/// `view = "primary"` check on a `cap-drop` all go through this, so podman is
+/// handed the name the classifiers compare and none of them can read one entry
+/// differently. The upper-casing is for a hand-built spec, which skips the
+/// config path's own normalizer.
+pub(crate) fn canonical_capability_name(entry: &str) -> Option<String> {
+    normalize_capability_name(&entry.to_ascii_uppercase())
+}
+
+/// What `outrig-enter` needs of a `view = "primary"` sidecar's capability set,
+/// the part OutRig adds with `--cap-add`:
+///
+/// - `SYS_ADMIN`: `open_tree`, `setns`, `unshare`, `mount` and `move_mount`.
+/// - `SYS_PTRACE`: opening the primary's nsfs file.
+///
+/// Container lowering emits these flags and validation refuses a `cap-drop` of
+/// them, both from this list, so a capability the launcher comes to need is
+/// added in one place. `launcher.rs` carries the prose account, since it cannot
+/// import this.
+pub(crate) const PRIMARY_VIEW_ADDED_CAPS: [&str; 2] = ["SYS_ADMIN", "SYS_PTRACE"];
+
+/// The rest of what `outrig-enter` needs, which comes with podman's default
+/// set rather than a flag -- and so is what a `cap-drop` can take away:
+///
+/// - `SYS_CHROOT`: `setns(CLONE_NEWNS)`, which the kernel gates on it as well
+///   as on `SYS_ADMIN`.
+/// - `SETUID`, `SETGID`: the drop to the session's ids, which OutRig always asks
+///   the launcher for.
+pub(crate) const PRIMARY_VIEW_DEFAULT_CAPS: [&str; 3] = ["SYS_CHROOT", "SETUID", "SETGID"];
+
 /// One `[images.<name>]` entry: either a build source (`dockerfile` plus
 /// `context`) or a pull source (`image_name`), never both.
 ///

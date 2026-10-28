@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `view = "primary"` server's capabilities can no longer come back through a setuid binary,
+  and a `cap-drop` its launcher needs is refused when the config is read.** `outrig-enter` becomes
+  the session's uid/gid before it execs the server, and now sets `no_new_privs` there as well, so
+  `su`, `mount` or any other setuid-root or file-capability binary the server starts gains neither
+  the uid nor `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE`, whatever the sidecar's `[security]` block says.
+  That makes `no-new-privileges = false` on a `view = "primary"` sidecar meaningless, so it is
+  refused. A `cap-drop` of `SYS_ADMIN`, `SYS_PTRACE`, `SYS_CHROOT`, `SETUID`, `SETGID` or `ALL` on
+  one is refused too, naming the capability: it used to start the sidecar and fail in the launcher,
+  with a `setns` hint that blamed the wrong capability. (#398)
 - **An image built while its context changed is no longer saved under the old key.** The cache key
   is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
   file saved during an earlier `RUN` landed in an image tagged with the key of the content before

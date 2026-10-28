@@ -87,9 +87,11 @@ Issues that bear on **host integrity** are in scope, for example:
 - A sidecar with **`view = "primary"`** is inside the primary's trust boundary, not beside it.
   It joins the primary's mount namespace with `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` (scoped to the
   rootless user namespace, not host root) and can read the primary's entire filesystem -- so its
-  image is as trusted as the primary image. It is opt-in, defaults to `"none"`, and remains a
-  container (cgroups, seccomp, network policy, and `no-new-privileges` still apply; only the
-  mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
+  image is as trusted as the primary image. The launcher holds those capabilities only for the
+  join: the server runs as the session's uid/gid under `no_new_privs`, which the launcher sets
+  itself, so nothing it starts can regain them. It is opt-in, defaults to `"none"`, and remains a
+  container (cgroups, seccomp, and network policy still apply; only the mount namespace is
+  joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
 - A proxy handed to an MCP server through its `env` is the agent's to read, credentials
   included, and a filter policy that allows it allows whatever it will reach. See
   [Containers](doc/concepts/containers.md#the-containers-environment).

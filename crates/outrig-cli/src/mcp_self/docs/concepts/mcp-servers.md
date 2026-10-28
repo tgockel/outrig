@@ -273,10 +273,17 @@ uses the normal path.
 **The capabilities belong to the launcher, not to the server.** `outrig-enter` needs them for
 the namespace join and the graft, and gives them up the moment that work is done: it becomes the
 session's uid/gid immediately before exec'ing the payload, which clears its capability sets with
-the uid transition. The server -- and anything it shells out to -- therefore runs as the same
-user every other OutRig-launched server runs as, so what it writes into the workspace is yours
-rather than a subuid you cannot chown back, and a root-owned path in the primary is out of
-reach. The image's `USER` does not enter into it.
+the uid transition, and it sets `no_new_privs` there too, so a setuid-root binary or a file with
+capabilities that the server runs cannot hand them back. The server -- and anything it shells
+out to -- therefore runs as the same user every other OutRig-launched server runs as, so what it
+writes into the workspace is yours rather than a subuid you cannot chown back, and a root-owned
+path in the primary is out of reach. The image's `USER` does not enter into it.
+
+The launcher needs five capabilities to get that far: `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE`, which
+OutRig adds, and `CAP_SYS_CHROOT`, `CAP_SETUID` and `CAP_SETGID`, which podman's default set
+carries. A sidecar block that takes one away -- `cap-drop` naming it or `ALL`, or
+`capability-profile = "drop-all"` -- is refused when the config is read, as is
+`no-new-privileges = false`, which the launcher's own `no_new_privs` would make a no-op.
 
 That posture is identical from the library. `SidecarSpec::with_view(SidecarView::Primary)`
 takes the same capabilities in the same namespace, drops to the same ids, and a build without

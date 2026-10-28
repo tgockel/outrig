@@ -438,9 +438,12 @@ to run first; an inline `image` on an MCP entry reads `(from the inline image of
 "<name>")`. An optional `[sidecars.<sc>.security]` block reuses the
 whole security surface of the primary -- capability keys, `no-new-privileges`, `devices`, and
 `unmask` alike -- and each sidecar's block stands on its own, so opting one out of
-`no-new-privileges` leaves the others hardened. `start = "manual"` declares a sidecar that does
-not start with the session (a later release adds the surfaces that start one mid-session; until
-then its servers are skipped with a notice).
+`no-new-privileges` leaves the others hardened. The exception is a `view = "primary"` sidecar,
+whose launcher needs five capabilities and sets `no_new_privs` itself: a `cap-drop` of one of
+them (or `ALL`) and `no-new-privileges = false` are refused, as `capability-profile = "drop-all"`
+is; see [MCP Servers](mcp-servers.md#primary-filesystem-view). `start = "manual"` declares a
+sidecar that does not start with the session (a later release adds the surfaces that start one
+mid-session; until then its servers are skipped with a notice).
 
 **Naming and labels.** Sidecar containers are named `outrig-<sid>-<sc>`; an anonymous sidecar
 uses its server's name as `<sc>`. Every session container -- primary included -- carries the
@@ -552,8 +555,9 @@ to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, t
 launcher mounts a fresh `proc` over the primary's before the exec -- `/proc/self` in the
 primary's procfs would name nothing. The launcher's argv carries
 `--uid`/`--gid` with the session user's ids: it holds those capabilities only until the graft is
-in place, then becomes that user for the exec, so the *server* runs unprivileged even though the
-container was created privileged.
+in place, then becomes that user for the exec and sets `no_new_privs`, so the *server* runs
+unprivileged, and a setuid binary it starts cannot change that, even though the container was
+created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
 into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<entry>` flags

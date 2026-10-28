@@ -1159,10 +1159,15 @@ impl Outrig {
     /// With [`SidecarView::Primary`] the sidecar additionally joins the
     /// primary's mount namespace through the `outrig-enter` helper, which is
     /// materialized into the session's log directory. That is a real posture
-    /// change -- the sidecar runs with `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in
-    /// the primary's user namespace and can read the primary's whole
-    /// filesystem. A build without the helper fails here rather than emitting
-    /// a broken container.
+    /// change -- the sidecar's launcher holds `CAP_SYS_ADMIN` and
+    /// `CAP_SYS_PTRACE` in the primary's user namespace, and its server can
+    /// read the primary's whole filesystem. The server itself runs as the
+    /// session's uid/gid under `no_new_privs`, which the launcher sets, so what
+    /// the launcher holds is not passed on. A build without the helper fails
+    /// here rather than emitting a broken container, and so does a spec the
+    /// launcher cannot run under or that asks of it what it will not do --
+    /// `ConfigValidationError::SidecarViewDropsCaps`, `SidecarViewCapDrop` and
+    /// `SidecarViewNoNewPrivsOff` say which.
     pub async fn add_sidecar(&mut self, spec: SidecarSpec) -> Result<Vec<ToolHandle>> {
         validate_sidecar_spec(&spec, &self.clients, &self.sidecars, enter::is_available())?;
 
@@ -1549,6 +1554,8 @@ fn validate_sidecar_spec<C, S>(
         spec.view,
         spec.workspace,
         spec.security.capabilities.profile,
+        &spec.security.capabilities.cap_drop,
+        spec.security.no_new_privileges,
     )?;
     let hosted: Vec<(&str, bool)> = spec
         .servers
@@ -2051,6 +2058,17 @@ mod tests {
             .with_entrypoint_server("fs", ["/"])
     }
 
+    /// [`view_sidecar`] with `cap_drop` entries, spelled as given.
+    fn view_sidecar_dropping(entries: &[&str]) -> SidecarSpec {
+        view_sidecar().with_security(SecuritySpec {
+            capabilities: CapabilitySpec {
+                cap_drop: entries.iter().map(|entry| entry.to_string()).collect(),
+                ..CapabilitySpec::default()
+            },
+            ..SecuritySpec::default()
+        })
+    }
+
     #[test]
     fn validate_accepts_a_primary_view_entrypoint_spec() {
         validate_alone(&view_sidecar()).expect("spec is valid");
@@ -2097,6 +2115,56 @@ view = "primary"
             view_config_error("[sidecars.fs.security]\ncapability-profile = \"drop-all\""),
             "the two paths must produce the same text from the same code"
         );
+    }
+
+    /// A hand-built spec skips the config path's normalizer, and podman reads
+    /// `cap_sys_chroot` and `CAP_SYS_CHROOT` as the one capability -- so the
+    /// check has to, or the spelling decides whether the refusal happens.
+    #[test]
+    fn validate_rejects_primary_view_dropping_a_launcher_capability() {
+        for entry in [
+            "SYS_CHROOT",
+            "sys_chroot",
+            "CAP_SYS_CHROOT",
+            "cap_sys_chroot",
+        ] {
+            let err = validate_alone(&view_sidecar_dropping(&[entry]))
+                .expect_err("setns(CLONE_NEWNS) needs SYS_CHROOT");
+            assert!(
+                matches!(
+                    err,
+                    OutrigError::ConfigValidation(
+                        crate::config::ConfigValidationError::SidecarViewCapDrop { .. }
+                    )
+                ),
+                "cap_drop = [{entry:?}]: got {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                view_config_error("[sidecars.fs.security]\ncap-drop = [\"SYS_CHROOT\"]"),
+                "cap_drop = [{entry:?}]: the two paths must produce the same text from the same code"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_primary_view_without_no_new_privileges() {
+        let spec = view_sidecar().with_security(SecuritySpec {
+            no_new_privileges: false,
+            ..SecuritySpec::default()
+        });
+        let err = validate_alone(&spec).expect_err("the launcher sets no_new_privs regardless");
+        assert_eq!(
+            err.to_string(),
+            view_config_error("[sidecars.fs.security]\nno-new-privileges = false"),
+            "the two paths must produce the same text from the same code"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_primary_view_dropping_what_the_launcher_does_not_need() {
+        validate_alone(&view_sidecar_dropping(&["MKNOD"]))
+            .expect("an unrelated drop is the sidecar's to make");
     }
 
     #[test]

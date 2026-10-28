@@ -44,7 +44,8 @@ use serde_json::Value;
 use tokio::process::Child;
 
 use crate::config::{
-    CapabilityProfile, EnvValue, MountAccess, ResolvedEnvValue, normalize_capability_name,
+    CapabilityProfile, EnvValue, MountAccess, PRIMARY_VIEW_ADDED_CAPS, ResolvedEnvValue,
+    canonical_capability_name,
 };
 use crate::engine_env;
 use crate::error::{OutrigError, Result};
@@ -1956,17 +1957,6 @@ fn reject_reserved_labels(labels: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// The one name a `cap-add` or `cap-drop` entry stands for -- upper-cased, as
-/// podman reads it, with the `CAP_` prefix off -- or `None` if it is not a
-/// single name.
-///
-/// Flag lowering and [`ContainerCapabilities::grants_net_admin`] both go
-/// through this, so podman is handed the name the classifier compares and the
-/// two cannot read one entry differently.
-fn canonical_capability_name(entry: &str) -> Option<String> {
-    normalize_capability_name(&entry.to_ascii_uppercase())
-}
-
 /// Reject a bind-mount path carrying podman's `-v` field separator.
 ///
 /// [`append_bind_mount`] renders each mount as one colon-joined
@@ -2273,10 +2263,12 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     }
 
     cmd = append_capability_flags(cmd, &launch.capabilities);
-    // `open_tree`/`setns(CLONE_NEWNS)` need CAP_SYS_ADMIN; opening the target's
-    // nsfs file needs CAP_SYS_PTRACE. Scoped to the rootless user namespace.
+    // The launcher's join needs `PRIMARY_VIEW_ADDED_CAPS`, scoped to the
+    // rootless user namespace.
     if launch.primary_view.is_some() {
-        cmd = cmd.arg("--cap-add=SYS_ADMIN").arg("--cap-add=SYS_PTRACE");
+        for capability in PRIMARY_VIEW_ADDED_CAPS {
+            cmd = cmd.arg(format!("--cap-add={capability}"));
+        }
     }
     for device in &launch.devices {
         cmd = cmd.arg(format!("--device={device}"));

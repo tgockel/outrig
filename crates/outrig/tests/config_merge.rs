@@ -4592,6 +4592,122 @@ context    = "ctx"
         }
     }
 
+    /// A `cap-drop` of anything the launcher needs fails the sidecar late, at
+    /// whichever syscall wanted it first -- `SYS_CHROOT` at `setns`, with a hint
+    /// that used to blame another capability (#398). `ALL` is `drop-all` spelled
+    /// in the list, and a `CAP_` prefix is the same name.
+    #[test]
+    fn view_primary_with_cap_drop_of_a_launcher_capability_rejected() {
+        for dropped in [
+            "SYS_ADMIN",
+            "SYS_PTRACE",
+            "SYS_CHROOT",
+            "SETUID",
+            "SETGID",
+            "ALL",
+            "CAP_SYS_CHROOT",
+        ] {
+            let named = dropped.strip_prefix("CAP_").unwrap_or(dropped);
+            let cfg = image_block(&format!(
+                r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  cap-drop = ["MKNOD", "{dropped}"]
+
+  [images.coding.mcp]
+  fs = {{ sidecar = "tools" }}
+"#
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::SidecarViewCapDrop {
+                    sidecar,
+                    capability,
+                    ..
+                } => {
+                    assert_eq!(sidecar, "tools", "cap-drop = [{dropped:?}]");
+                    assert_eq!(capability, named, "cap-drop = [{dropped:?}]");
+                }
+                other => {
+                    panic!("cap-drop = [{dropped:?}]: expected SidecarViewCapDrop, got: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The refusal is for what the launcher needs, not for any `cap-drop`: a
+    /// primary-view sidecar can still shed the rest.
+    #[test]
+    fn view_primary_with_an_unrelated_cap_drop_validates_clean() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  capability-profile = "no-net-raw"
+  cap-drop           = ["MKNOD", "CAP_AUDIT_WRITE"]
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        cfg.validate(None)
+            .expect("dropping what the launcher does not need validates clean");
+    }
+
+    /// The launcher puts the payload under `no_new_privs` whatever the
+    /// container carries, so the opt-out on a view sidecar would do nothing --
+    /// refused rather than silently ignored, as `drop-all` is (#398).
+    #[test]
+    fn view_primary_without_no_new_privileges_rejected() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  no-new-privileges = false
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::SidecarViewNoNewPrivsOff { sidecar, .. } => {
+                assert_eq!(sidecar, "tools");
+            }
+            other => panic!("expected SidecarViewNoNewPrivsOff, got: {other:?}"),
+        }
+    }
+
+    /// The same key stays what it was everywhere the view is not in play: on a
+    /// sidecar that does not join the primary, and on an image-config.
+    #[test]
+    fn no_new_privileges_opt_out_is_untouched_without_a_view() {
+        let cfg = image_block(
+            r#"
+  [images.coding.security]
+  no-new-privileges = false
+
+  [sidecars.tools]
+  image = "mcp-tools"
+
+  [sidecars.tools.security]
+  no-new-privileges = false
+
+  [images.coding.mcp]
+  lint = { command = ["lint"], sidecar = "tools" }
+"#,
+        );
+        cfg.validate(None)
+            .expect("no-new-privileges = false validates without a view");
+    }
+
     #[test]
     fn view_primary_hosting_exec_stdio_rejected() {
         let cfg = image_block(

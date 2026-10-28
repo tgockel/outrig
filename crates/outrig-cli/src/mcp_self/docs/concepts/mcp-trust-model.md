@@ -67,12 +67,15 @@ the sidecar image is now **inside** the primary's trust boundary, as trusted as 
 itself, not beside it. What still bounds it: the `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` the join needs
 belong to OutRig's `outrig-enter` launcher, scoped to the rootless user namespace (not host root)
 the primary already runs in, and the server is exec'd only after the launcher becomes the
-session's uid/gid -- which clears those capabilities, so the server owns what it writes and can
-pass no privilege to anything it spawns; it is opt-in and defaults to `"none"`; it is still a
-container, so cgroups, seccomp, network policy, and `no-new-privileges` all still apply; and only
-the mount namespace is joined -- PID, network, and cgroup stay the sidecar's own. Grant it only
-to a sidecar image you trust with the primary's files: it reads them all, even though it writes
-as you.
+session's uid/gid -- which clears those capabilities -- and sets `no_new_privs`, so that no setuid
+binary or file capability the server runs can hand them back. The server owns what it writes and
+can pass no privilege to anything it spawns, and that holds whatever the container was started
+with: the launcher sets the flag itself, and a `view = "primary"` sidecar cannot opt out of
+`no-new-privileges` (config validation refuses it). The placement is opt-in and defaults to
+`"none"`; it is still a container, so cgroups, seccomp, and network policy all still apply; and
+only the mount namespace is joined -- PID, network, and cgroup stay the sidecar's own. Grant it
+only to a sidecar image you trust with the primary's files: it reads them all, even though it
+writes as you.
 
 ## Shell tools
 

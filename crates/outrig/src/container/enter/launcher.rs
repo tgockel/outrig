@@ -15,7 +15,11 @@
 //! Expected launch (0002-13 arranges it): `--userns=container:<target>` (so we are
 //! already in the user namespace that owns the target's mount namespace),
 //! `--cap-add=SYS_ADMIN` (setns is gated on it) and `--cap-add=SYS_PTRACE`
-//! (to open the target's nsfs file).
+//! (to open the target's nsfs file). Two more are needed and come with podman's
+//! default set rather than a flag: `CAP_SYS_CHROOT`, which `setns(CLONE_NEWNS)`
+//! demands beside `CAP_SYS_ADMIN`, and `CAP_SETUID`/`CAP_SETGID` for the drop
+//! to `--uid`/`--gid`. A `cap-drop` of any of the five fails the launch, which
+//! is why config validation refuses one on a `view = "primary"` sidecar.
 //!
 //! **The argv contract, which the caller depends on:** `PROGRAM` is in *this*
 //! container's coordinates, ungrafted -- it is opened *and resolved to a
@@ -45,7 +49,9 @@
 //! `open_tree`, `open(ns)`, `setns`, `unshare`, `mount`, `move_mount`, and a
 //! `--cwd` that may name a directory only root can enter. Nothing after it
 //! does, so `--uid`/`--gid` drop to the session's ids there, immediately
-//! before the exec. `PROGRAM` is opened at the very top, while this image's
+//! before the exec, and the drop also sets `no_new_privs`, so that nothing the
+//! payload starts can get the capabilities back (see `drop_privileges`).
+//! `PROGRAM` is opened at the very top, while this image's
 //! rootfs is still at `/` and while still privileged, so the `ElfKind::Static`
 //! `execveat` from that descriptor still works afterwards -- the kernel checks
 //! exec permission against the file's own mode, which for an image binary is
@@ -129,6 +135,7 @@ unsafe extern "C" {
     fn setgroups(size: usize, list: *const u32) -> c_int;
     fn setresgid(rgid: u32, egid: u32, sgid: u32) -> c_int;
     fn setresuid(ruid: u32, euid: u32, suid: u32) -> c_int;
+    fn prctl(option: c_int, ...) -> c_int;
     fn syscall(num: c_long, ...) -> c_long;
 }
 
@@ -141,6 +148,7 @@ const AT_RECURSIVE: c_long = 0x8000;
 const OPEN_TREE_CLONE: c_long = 1;
 const MOVE_MOUNT_F_EMPTY_PATH: c_long = 0x04;
 const CLONE_NEWNS: c_int = 0x0002_0000;
+const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
 const MS_NOEXEC: c_ulong = 8;
@@ -333,8 +341,18 @@ fn num_arg<T: std::str::FromStr>(flag: &str, value: &OsString) -> T {
 /// There is deliberately no `capset` here. The kernel clears the permitted,
 /// effective and ambient capability sets on a transition away from uid 0, so
 /// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` are gone with the `setresuid` -- for this
-/// process and for everything it spawns. Spelling that out because the absence
-/// of a capability call is otherwise the first thing a reader will flag.
+/// process. Spelling that out because the absence of a capability call is
+/// otherwise the first thing a reader will flag.
+///
+/// What the transition leaves is the *bounding* set, which still holds those
+/// two (`--cap-add` put them there), and that is what a later `exec` draws on:
+/// a setuid-root binary or one with file capabilities is handed it back.
+/// `no_new_privs` closes that for the whole subtree and for good -- an `exec`
+/// then gains neither the setuid bit's uid nor any capability. The container's
+/// `--security-opt=no-new-privileges` does the same, but a sidecar may opt out
+/// of it, and this guarantee is the launcher's own. Dropping the bounding set
+/// instead would not do: it needs `CAP_SETPCAP`, and leaves the uid change of a
+/// setuid binary alone.
 fn drop_privileges(uid: u32, gid: u32) {
     if unsafe { setgroups(0, std::ptr::null()) } < 0 {
         die("setgroups(0)", "");
@@ -344,6 +362,14 @@ fn drop_privileges(uid: u32, gid: u32) {
     }
     if unsafe { setresuid(uid, uid, uid) } < 0 {
         die(&format!("setresuid({uid})"), "");
+    }
+    // The arguments are `unsigned long` to the variadic `prctl`, so they are
+    // typed as such rather than left as the `i32` a bare literal would be.
+    if unsafe {
+        prctl(PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong)
+    } < 0
+    {
+        die("prctl(PR_SET_NO_NEW_PRIVS)", "");
     }
 }
 
@@ -525,7 +551,7 @@ fn main() {
     }
     if unsafe { setns(ns_fd, CLONE_NEWNS) } < 0 {
         let hint = if std::io::Error::last_os_error().raw_os_error() == Some(EPERM) {
-            " (need --cap-add=SYS_ADMIN and --userns=container:<target>)"
+            " (need CAP_SYS_ADMIN and CAP_SYS_CHROOT, and --userns=container:<target>)"
         } else {
             ""
         };

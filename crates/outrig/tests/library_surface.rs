@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
+use outrig::container::{
+    Container, ContainerCreateOptions, ContainerLaunchSpec, PrimaryView, sidecar,
+};
+use outrig::image::ImageTag;
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
     MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SecuritySpec, SidecarSpec,
@@ -693,6 +697,133 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         sidecar_containers_labeled("fs"),
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
+    );
+}
+
+/// Run a `view = "primary"` sidecar that `add_sidecar` would refuse, and hand
+/// back what happened to its payload. It is built below that validation, the
+/// way a caller holding a [`ContainerLaunchSpec`] can, so the launcher's own
+/// behavior can be seen without the config rules standing in front of it.
+///
+/// `configure` edits the sidecar's launch spec -- the knob under test. Stock
+/// Alpine is both containers: the payload is its own `busybox` with `args` after
+/// it (`/bin/sh` would canonicalize to `/bin/busybox` and so reach busybox as
+/// `argv[0]` = `busybox`, which reads its first argument as the applet), and the
+/// launcher's `--entrypoint` replaces whatever the image declares. `args` replace
+/// the image's `CMD` and reach the payload bare, in the primary's coordinates, so
+/// `/proc/self/status` is the fresh procfs the launcher mounted and not a path
+/// under the graft. The caller holds `E2E_LOCK`.
+async fn run_view_sidecar_below_validation(
+    configure: impl FnOnce(&mut ContainerLaunchSpec),
+    args: &[&str],
+) -> std::process::Output {
+    const ALPINE: &str = "docker.io/library/alpine:latest";
+    ensure_image(ALPINE);
+    let image = ImageTag::new(ALPINE);
+
+    let mut primary = Container::start(&image, ContainerLaunchSpec::default())
+        .await
+        .expect("start the primary");
+    primary
+        .bootstrap_user()
+        .await
+        .expect("bootstrap the primary's user");
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let mut launch = ContainerLaunchSpec::default();
+    launch.primary_view = Some(PrimaryView::new(
+        primary.selector(),
+        primary.pid().await.expect("the primary's pid"),
+        outrig::container::enter::materialize(session_dir.path())
+            .expect("materialize the launcher"),
+        primary.home_dir().expect("the primary's home"),
+    ));
+    configure(&mut launch);
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let sidecar = Container::create_initialized(
+        ContainerCreateOptions::new(image, launch, format!("{}-sidecar", primary.name()))
+            .with_args(sidecar::entrypoint_create_args(
+                SidecarView::Primary,
+                &["/bin/busybox".to_string()],
+                &[],
+                &args,
+                primary.container_workspace(),
+                Some((primary.uid(), primary.gid())),
+            )),
+    )
+    .await
+    .expect("create the view sidecar below the validation");
+
+    let output = std::process::Command::new("podman")
+        .args(["start", "--attach"])
+        .arg(sidecar.selector())
+        .output()
+        .expect("spawn podman start");
+
+    primary
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop the primary");
+    output
+}
+
+/// The launcher puts the payload under `no_new_privs` itself, whatever the
+/// container was started with (#398; see `drop_privileges` in the launcher).
+/// With the container's flag off, `NoNewPrivs: 1` can only be the launcher's,
+/// and the kernel's own record of it is what the payload prints.
+#[tokio::test]
+async fn primary_view_payload_is_under_no_new_privs_without_the_containers_flag() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let output = run_view_sidecar_below_validation(
+        |launch| launch.no_new_privileges = false,
+        &["grep", "-E", "^(NoNewPrivs|CapEff)", "/proc/self/status"],
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the payload failed: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status,
+    );
+    // Every other line the payload could print is the kernel's, so match the
+    // whole `name:<tab>value` rather than a suffix a different field might share.
+    assert!(
+        stdout.contains("NoNewPrivs:\t1"),
+        "the launcher should set no_new_privs on the payload itself, got: {stdout}",
+    );
+    assert!(
+        stdout.contains("CapEff:\t0000000000000000"),
+        "the payload should hold no effective capability, got: {stdout}",
+    );
+}
+
+/// `setns(CLONE_NEWNS)` needs `CAP_SYS_CHROOT` beside `CAP_SYS_ADMIN`, and
+/// podman's default set is where the sidecar gets it -- so a `cap-drop` of it
+/// fails the launch there. Config validation refuses that `cap-drop` now; this
+/// is what a caller that bypasses it sees, and the hint must name the
+/// capability that is missing rather than only the ones that are not (#398).
+#[tokio::test]
+async fn primary_view_launcher_without_sys_chroot_names_it() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let output = run_view_sidecar_below_validation(
+        |launch| launch.capabilities.cap_drop.push("SYS_CHROOT".to_string()),
+        &["true"],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a launcher without CAP_SYS_CHROOT cannot join the primary's mount namespace",
+    );
+    assert!(
+        stderr.contains("setns(CLONE_NEWNS): Operation not permitted")
+            && stderr.contains("CAP_SYS_CHROOT"),
+        "the launcher should fail at the setns and name the missing capability, got: {stderr}",
     );
 }
 

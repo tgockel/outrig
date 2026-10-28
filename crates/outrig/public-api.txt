@@ -244,8 +244,13 @@ pub outrig::config::ConfigValidationError::SidecarNameInvalid::sidecar: alloc::s
 #[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarSecurity
 pub outrig::config::ConfigValidationError::SidecarSecurity::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarSecurity::violation: outrig::config::SecurityRuleViolation
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarViewCapDrop
+pub outrig::config::ConfigValidationError::SidecarViewCapDrop::capability: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewCapDrop::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps
 pub outrig::config::ConfigValidationError::SidecarViewDropsCaps::sidecar: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::SidecarViewNoNewPrivsOff
+pub outrig::config::ConfigValidationError::SidecarViewNoNewPrivsOff::sidecar: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::image: alloc::string::String
 pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::server: alloc::string::String

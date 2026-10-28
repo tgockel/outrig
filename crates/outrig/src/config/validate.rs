@@ -25,9 +25,10 @@ use thiserror::Error;
 use super::{
     Config, EnvValue, ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING,
     McpServerSpec, MistralrsDeviceSpec, Model, ModelSourceRef, NetworkMode,
-    REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
-    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
-    TOOL_RESULT_MAX_FLOOR_BYTES, is_env_key, normalize_capability_name,
+    PRIMARY_VIEW_ADDED_CAPS, PRIMARY_VIEW_DEFAULT_CAPS, REQUEST_TIMEOUT_SECS_CEILING,
+    RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    canonical_capability_name, is_env_key, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -692,10 +693,30 @@ pub enum ConfigValidationError {
 
     #[error(
         "sidecar {sidecar:?} sets view = \"primary\" with capability-profile = \
-         \"drop-all\"; joining the primary's namespaces needs CAP_SYS_ADMIN and \
-         CAP_SYS_PTRACE, which drop-all removes"
+         \"drop-all\"; the launcher needs {}, which drop-all removes",
+        primary_view_capability_list()
     )]
     SidecarViewDropsCaps { sidecar: String },
+
+    // `capability` is the entry as podman reads it (upper case, no `CAP_`), so
+    // a `"cap_sys_chroot"` from a hand-built spec reads the same as the config
+    // spelling would. `ALL` is a possible value: it is `drop-all` in the list.
+    #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" with {capability:?} in cap-drop; the \
+         launcher needs {} to join the primary's mount namespace and become the session \
+         user, which dropping it removes",
+        primary_view_capability_list()
+    )]
+    #[non_exhaustive]
+    SidecarViewCapDrop { sidecar: String, capability: String },
+
+    #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" with no-new-privileges = false; the \
+         launcher puts the payload under no_new_privs itself, so that nothing it starts can \
+         regain the capabilities the join needed, and this key cannot turn that off"
+    )]
+    #[non_exhaustive]
+    SidecarViewNoNewPrivsOff { sidecar: String },
 
     #[error(
         "image {image:?} sidecar {sidecar:?} sets view = \"primary\" but hosts \
@@ -1675,6 +1696,22 @@ pub(crate) fn check_entrypoint_hosting(
     Ok(())
 }
 
+/// Everything `outrig-enter` needs of the capability set: what OutRig adds and
+/// what podman's default set provides.
+fn primary_view_capabilities() -> impl Iterator<Item = &'static str> {
+    PRIMARY_VIEW_ADDED_CAPS
+        .into_iter()
+        .chain(PRIMARY_VIEW_DEFAULT_CAPS)
+}
+
+/// [`primary_view_capabilities`] as the `CAP_`-prefixed names a message gives.
+fn primary_view_capability_list() -> String {
+    primary_view_capabilities()
+        .map(|name| format!("CAP_{name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `view = "primary"` exclusions that hold however a sidecar was declared.
 /// Shared with the library facade so a hand-built [`SidecarSpec`] is rejected
 /// by this code, with this text, rather than by a parallel copy of it.
@@ -1685,6 +1722,8 @@ pub(crate) fn check_view_exclusions(
     view: super::SidecarView,
     workspace: super::SidecarWorkspaceAccess,
     capability_profile: super::CapabilityProfile,
+    cap_drop: &[String],
+    no_new_privileges: bool,
 ) -> Result<(), ConfigValidationError> {
     if view != super::SidecarView::Primary {
         return Ok(());
@@ -1700,6 +1739,26 @@ pub(crate) fn check_view_exclusions(
     // config is contradictory rather than silently re-added.
     if capability_profile == super::CapabilityProfile::DropAll {
         return Err(ConfigValidationError::SidecarViewDropsCaps {
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+    // So does an explicit drop of one the launcher needs, or `ALL`, which is
+    // `drop-all` spelled in the list. Left alone, the sidecar starts and the
+    // launcher dies on whichever syscall needed it first.
+    if let Some(capability) = cap_drop
+        .iter()
+        .filter_map(|entry| canonical_capability_name(entry))
+        .find(|name| name == "ALL" || primary_view_capabilities().any(|cap| cap == name))
+    {
+        return Err(ConfigValidationError::SidecarViewCapDrop {
+            sidecar: sidecar_name.to_string(),
+            capability,
+        });
+    }
+    // The launcher sets `no_new_privs` on the payload whatever the container
+    // was started with, so the opt-out would do nothing but read as if it did.
+    if !no_new_privileges {
+        return Err(ConfigValidationError::SidecarViewNoNewPrivsOff {
             sidecar: sidecar_name.to_string(),
         });
     }
@@ -1782,6 +1841,8 @@ fn validate_sidecar(
         sidecar.view,
         sidecar.workspace,
         sidecar.security.capability_profile,
+        &sidecar.security.cap_drop,
+        sidecar.security.no_new_privileges,
     )?;
 
     // The workspace mount (when enabled) reuses the session's container path,

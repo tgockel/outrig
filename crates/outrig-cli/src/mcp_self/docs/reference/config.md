@@ -1266,11 +1266,14 @@ capability-profile = "no-net-raw"
   sidecar against the *primary container's* filesystem view -- its rootfs and every mount, at
   the primary's paths -- via the `outrig-enter` launcher, so an off-the-shelf MCP image serves
   the primary's files without the primary image carrying that tool. Entrypoint-stdio only, and
-  mutually exclusive with `workspace` (the view already holds the workspace) and with
-  `capability-profile = "drop-all"` (the view needs the mount capabilities). It grants
-  `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace -- a real posture
-  change; see [MCP Trust Model](../concepts/mcp-trust-model.md) and `SECURITY.md`. The same key
-  exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp) one-liner form.
+  mutually exclusive with `workspace` (the view already holds the workspace), with
+  `capability-profile = "drop-all"` and any `cap-drop` of `ALL`, `SYS_ADMIN`, `SYS_PTRACE`,
+  `SYS_CHROOT`, `SETUID` or `SETGID` (the launcher needs all five), and with
+  `no-new-privileges = false` (the launcher puts the payload under `no_new_privs` itself, so the
+  key could not do what it says). It grants `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's
+  user namespace -- a real posture change; see [MCP Trust Model](../concepts/mcp-trust-model.md)
+  and `SECURITY.md`. The same key exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp)
+  one-liner form.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
   declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
   `Outrig::add_sidecar` / `LaunchSpec::with_sidecar` from the library API. Until then its

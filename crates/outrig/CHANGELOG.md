@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ConfigValidationError::SidecarViewCapDrop` / `SidecarViewNoNewPrivsOff`**: a `view = "primary"`
+  sidecar whose `cap-drop` names a capability the `outrig-enter` launcher needs (`SYS_ADMIN`,
+  `SYS_PTRACE`, `SYS_CHROOT`, `SETUID`, `SETGID`, or `ALL`), and one that sets
+  `no-new-privileges = false`. The first carries the capability as podman reads it: upper case,
+  no `CAP_`. `Outrig::add_sidecar` refuses the same specs, with the same text, as
+  `OutrigError::ConfigValidation`. See the fix below. (#398)
 - **`OutrigError::BuildContextChanged`**: a build whose Dockerfile or context changed while buildah
   ran, discarded rather than saved. It names the image-config and the tag the build would have been
   saved as. For a caller that computes a tag, builds into it, and has to tell this refusal from a
@@ -61,6 +67,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `view = "primary"` payload can no longer regain the launcher's capabilities, and a `cap-drop`
+  the launcher needs is refused up front.** `outrig-enter` dropped to the session's uid/gid, which
+  clears the payload's own capability sets, and left the rest to the container's
+  `--security-opt=no-new-privileges`. The bounding set still held the `CAP_SYS_ADMIN` and
+  `CAP_SYS_PTRACE` the sidecar was given, and a sidecar that set `no-new-privileges = false` had
+  no `no_new_privs` at all: the kernel hands a setuid-root binary (`su`, `mount`) the bounding set,
+  so one run by the payload or anything it spawned came back as the container's root with both,
+  contrary to the trust model's "can pass no privilege to anything it spawns". The launcher now
+  sets `no_new_privs` itself when it drops, so an `exec` gains neither the uid nor a capability
+  whatever the container carries; with the container's flag off, the payload read `NoNewPrivs: 0`
+  before and `1` after, against podman 5.7. `no-new-privileges = false` on a `view = "primary"`
+  sidecar is therefore refused, as `capability-profile = "drop-all"` already was. Separately, a
+  `cap-drop` of a capability the launcher needs passed validation and failed in the launcher --
+  `SYS_CHROOT`, which `setns(CLONE_NEWNS)` needs, at the `setns` with a hint that named only
+  `SYS_ADMIN` and `--userns` -- and is now refused when the config is read or the spec is added,
+  as the `Added` entry above says. The `setns` hint names `CAP_SYS_CHROOT`. (#398)
 - **The home directory's `mkdir`s no longer honor the host process's `umask`.** A forked helper
   creating `/home` and `/home/<user>` inside the container called `mkdir(dir, 0o755)` with
   whatever `umask` it inherited still in force, so an image without `/home` (a `scratch` or
