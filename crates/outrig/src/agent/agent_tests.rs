@@ -5474,7 +5474,9 @@ fn blocks<'a>(request: &'a RecordedRequest, kind: &str) -> Vec<&'a serde_json::V
 
 /// Anthropic's own signed thinking goes back to Anthropic as it came: what
 /// keeps a call to another provider valid must not strip it from the one that
-/// wrote it.
+/// wrote it. Each call asks the API to drop a block whose conversation a cut
+/// of the view changed, rather than refuse the call, under the beta that lets
+/// it ask.
 #[tokio::test]
 async fn signed_thinking_goes_back_to_anthropic_whole() {
     let (mut agent, mut requests) = agent_over(
@@ -5499,6 +5501,19 @@ async fn signed_thinking_goes_back_to_anthropic_whole() {
             "signature": mock_http::SIGNATURE,
         })]
     );
+    for request in &recorded {
+        assert_eq!(
+            request.body["thinking"],
+            json!({
+                "type": "adaptive",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            })
+        );
+        assert_eq!(
+            request.header("anthropic-beta"),
+            Some("thinking-binding-controls-2026-08-01")
+        );
+    }
 }
 
 /// A call that moves from an OpenAI-compatible model to Anthropic's is sent
@@ -5535,6 +5550,10 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
         "{:#}",
         moved[0].body
     );
+    assert_eq!(
+        moved[0].body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
     assert!(
         check_wire(Style::Anthropic, &moved[0].body)
             .unpaired
@@ -5549,6 +5568,10 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
         "the conversation keeps what the model wrote"
     );
     let headed = mock_http::drain(&mut head_requests);
+    for request in &headed {
+        assert!(request.body.get("thinking").is_none(), "{:#}", request.body);
+        assert_eq!(request.header("anthropic-beta"), None);
+    }
     each_call_rebuilds(
         &records,
         &[

@@ -419,9 +419,20 @@ uncached, and Anthropic reports no error. `model.attempt` records what a request
 [Integration audit](../reference/events.md#integration-audit). No setting turns it off, so an
 endpoint at `base-url` that refuses a top-level `cache_control` answers `400` to every call.
 
-`run-new` and the library loop do not ask yet. Once a round's history is full, they choose it
-again on every call and its front keeps changing, so a marker at the end of the request would
-pay the write each time and never read it back.
+`run-new` and the library loop do not ask yet. A full history is cut in steps there and only
+grows between cuts, so a marker at the end of a request would be read back by the next; turning
+it on is #751.
+
+`run-new` and the library loop send every request `"thinking": {"type": "adaptive",
+"block_binding": {"prefix_mismatch_behavior": "drop_block"}}`, under the
+`thinking-binding-controls-2026-08-01` beta header. Claude Opus 5.5, Sonnet 5.5 and Fable 5.1
+bind each thinking block to everything sent before it, and a cut of a full history changes that,
+as a round's window moving on or a promotion does. Without the field, an account created on or
+after 2026-08-31 gets a `400` for each such call; with it, the API leaves the stale blocks out and
+answers. The field sets thinking to `adaptive` explicitly, which turns it on for a model that runs
+without it unless asked, such as Claude Opus 4.8. A model or endpoint that does not take it --
+Claude Haiku 4.5, or an endpoint at `base-url` that refuses the header -- answers `400` to every
+call (#750).
 
 Everything else is shared with the other remote styles: `request-timeout-secs`,
 `retry-budget-secs`, `role-alternation`, tool-call limits, tool-result truncation, conversation

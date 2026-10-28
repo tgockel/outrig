@@ -22,6 +22,12 @@ the first strategy; `active-intent-record.md` would be the second.
 The seam is narrow on purpose. General scheduler plugins and a second public action front end are
 not part of it.
 
+The shipped selector is not stateless: a full view is cut in steps, and each later call is sent
+what the cut kept and every turn since (#666), so a provider's prompt cache can match it. A
+strategy that chose from the turns alone would change the front of every request again. So the
+store hands a strategy its previous choice beside the turns, or the cut stays outside the
+strategy and a strategy only fills a cut.
+
 ## Evaluation
 
 Swap selectors in experiments and compare their outcomes on the same tasks; the long-task trials

@@ -461,20 +461,134 @@ fn a_turn_too_large_to_fit_is_left_out_and_smaller_ones_still_go() {
 /// Commit `turns` turns, each a call and its result priced 10, to the round
 /// `store` has open, and assemble a call after each, held to `room`.
 fn a_long_round(store: &mut Store, turns: usize, room: u64) -> Vec<(Vec<Message>, Manifest)> {
-    let budget = Budget::with_room("m", room);
-    (0..turns)
-        .map(|_| {
+    calls_priced(store, &vec![10; turns], &Budget::with_room("m", room))
+}
+
+/// Commit a turn priced at each of `prices`, each a call and its result, to
+/// the round `store` has open, and assemble a call after each, held to
+/// `budget`.
+fn calls_priced(
+    store: &mut Store,
+    prices: &[u64],
+    budget: &Budget,
+) -> Vec<(Vec<Message>, Manifest)> {
+    prices
+        .iter()
+        .map(|&tokens| {
             let (id, _) = store.commit(vec![call("a", "1"), Message::tool_result("a", "one")]);
-            store.turns[id].tokens = 10;
-            store.assemble(&budget, None).expect("the latest fits")
+            store.turns[id].tokens = tokens;
+            store.assemble(budget, None).expect("the latest fits")
         })
         .collect()
+}
+
+/// Once a round outgrows its room, each call is sent the turns the call
+/// before it was and then only newer ones -- which is all a provider's prompt
+/// cache can match -- until that no longer fits, and the view is cut to its
+/// prompt and half the room again. Choosing afresh on every call changed the
+/// request's front each time: each new turn evicted the round's oldest, and a
+/// small turn came back whenever a few tokens came free (#666).
+#[test]
+fn a_full_view_is_cut_in_steps_and_each_call_extends_the_one_before() {
+    let room = 100;
+    let mut store = Store::default();
+    store.begin_round(Message::user("round 1"));
+    let prices: Vec<u64> = [12, 3, 7, 5, 9].into_iter().cycle().take(60).collect();
+    let calls = calls_priced(&mut store, &prices, &Budget::with_room("m", room));
+
+    let mut cuts = Vec::new();
+    for (n, pair) in calls.windows(2).enumerate() {
+        let ((_, before), (_, after)) = (&pair[0], &pair[1]);
+        let (before, after_ids) = (ids(&before.carried), ids(&after.carried));
+        if let Some(mark) = after.cut {
+            assert_eq!(mark, room / 2 + prices[n + 1]);
+            assert!(after.estimate <= mark, "call {}: {after:?}", n + 1);
+            cuts.push(n + 1);
+            continue;
+        }
+        let newest = before.last().expect("the latest");
+        assert!(
+            after_ids.starts_with(&before)
+                && after_ids[before.len()..].iter().all(|id| id > newest),
+            "call {}: {before:?} then {after_ids:?}",
+            n + 1
+        );
+    }
+
+    // Each cut leaves the view in half the room beside its prompt, and the
+    // next comes once newer turns have taken it past the whole: at least the
+    // other half, less that prompt.
+    let first = *cuts.first().expect("the round outgrew its room");
+    assert!(cuts.len() >= 3, "{cuts:?}");
+    let since: u64 = prices[first + 1..].iter().sum();
+    let largest = prices.iter().max().expect("prices");
+    let most = 1 + since / (room / 2 - largest);
+    assert!(cuts.len() as u64 <= most, "{cuts:?}, at most {most}");
+    let overflowing = calls.iter().filter(|(_, m)| !m.evicted.is_empty()).count();
+    assert!(cuts.len() * 4 < overflowing, "{cuts:?} of {overflowing}");
+}
+
+/// A call is chosen afresh when the agent changes what is chosen, and when a
+/// round begins, since its cache is most often cold by then. Nothing else
+/// brings back a turn a cut left out, however much room comes free; promoting
+/// a turn that is already promoted changes nothing.
+#[test]
+fn a_promotion_or_a_new_round_chooses_the_view_afresh() {
+    let mut store = five_rounds();
+    let budget = Budget::with_room("m", 70);
+    // The 80 chosen do not fit, so the view is cut to the latest turn and 35
+    // besides: the openings and the round's newest.
+    let (_, manifest) = store.assemble(&budget, None).expect("the latest fits");
+    assert_eq!(
+        (manifest.cut, ids(&manifest.carried)),
+        (Some(45), vec![0, 8, 9, 10])
+    );
+
+    let (id, _) = store.commit(vec![Message::assistant("r5t4")]);
+    store.turns[id].tokens = 10;
+    let roomy = Budget::with_room("m", ROOMY);
+    for budget in [&budget, &roomy] {
+        let (_, manifest) = store.assemble(budget, None).expect("room for the cut");
+        assert_eq!(
+            (manifest.cut, ids(&manifest.carried)),
+            (None, vec![0, 8, 9, 10, 11])
+        );
+        assert_eq!(
+            manifest.evicted,
+            [
+                (1, Why::First),
+                (2, Why::Promoted),
+                (6, Why::Recent),
+                (7, Why::Recent)
+            ]
+        );
+    }
+    promote(&mut store, &[2]);
+    let (_, manifest) = store.assemble(&budget, None).expect("room for the cut");
+    assert_eq!(
+        (manifest.cut, ids(&manifest.carried)),
+        (None, vec![0, 8, 9, 10, 11])
+    );
+
+    store.change(ContextChange::Demote(vec![2]));
+    let (_, manifest) = store.assemble(&budget, None).expect("the latest fits");
+    assert_eq!(
+        (manifest.cut, ids(&manifest.carried)),
+        (Some(45), vec![0, 8, 10, 11])
+    );
+
+    store.begin_round(Message::user("round 6"));
+    let (_, manifest) = store.assemble(&roomy, None).expect("room for everything");
+    assert_eq!(
+        (manifest.cut, ids(&manifest.carried)),
+        (None, vec![0, 1, 8, 9, 10, 11])
+    );
 }
 
 /// A round longer than the room keeps the turn it opens on -- where the agent
 /// read what the user asked -- on every call, and with it a prompt of the
 /// user's, without which a provider's chat template can refuse the request.
-/// The rest of the round goes oldest first.
+/// The rest of the round goes oldest first, at each cut.
 #[test]
 fn a_first_round_longer_than_the_room_keeps_its_opening_turn_on_every_call() {
     let mut store = Store::default();
@@ -484,16 +598,12 @@ fn a_first_round_longer_than_the_room_keeps_its_opening_turn_on_every_call() {
         assert_eq!(manifest.carried[0].0, 0, "call {n}: {manifest:?}");
         assert_eq!(text(&sent[0]), "round 1", "call {n}");
     }
+    // Cut at turns 5, 8 and 11, each to the opening turn, the latest, and
+    // the one before it.
     let (_, last) = calls.last().expect("twelve calls");
     assert_eq!(
         last.carried,
-        [
-            (0, Why::Round),
-            (8, Why::Round),
-            (9, Why::Round),
-            (10, Why::Round),
-            (11, Why::Latest)
-        ]
+        [(0, Why::Round), (10, Why::Round), (11, Why::Latest)]
     );
 }
 
@@ -512,10 +622,10 @@ fn a_later_round_longer_than_the_room_keeps_its_opening_turn_on_every_call() {
         assert!(ids.contains(&0) && ids.contains(&4), "call {n}: {ids:?}");
     }
     let (_, last) = calls.last().expect("twelve calls");
-    assert_eq!(ids(&last.carried), [0, 4, 13, 14, 15]);
+    assert_eq!(ids(&last.carried), [0, 4, 14, 15]);
 }
 
-/// A round after a first round longer than the room is sent the turns that
+/// A round after a first round longer than the room keeps the turns that
 /// open the first rounds, then the window from its newest: all of round 2,
 /// and round 1's end, where its work was done, rather than its beginning.
 #[test]
@@ -526,16 +636,16 @@ fn a_round_after_a_long_first_round_is_sent_its_opening_and_its_end() {
     let mut store = priced(store, 10);
     store.begin_round(Message::user("round 3"));
     let opening = budget::tokens([&Message::user("round 3")]);
-    let (_, manifest) = store
-        .assemble(&Budget::with_room("m", opening + 70), None)
+    let selection = store
+        .select(
+            store.start,
+            Prompt::Opening { tokens: opening },
+            opening + 70,
+        )
         .expect("the opening fits");
+    assert_eq!(ids(&selection.carried), [0, 7, 8, 9, 10, 11, 12]);
     assert_eq!(
-        ids(&manifest.carried),
-        [0, 7, 8, 9, 10, 11, 12],
-        "{manifest:?}"
-    );
-    assert_eq!(
-        manifest.evicted,
+        selection.evicted,
         (1..=6).map(|id| (id, Why::First)).collect::<Vec<_>>()
     );
 }
@@ -562,12 +672,12 @@ fn a_promoted_turn_in_the_window_is_carried_once_as_promoted() {
             (10, Why::Latest),
         ]
     );
-    // At 60, two turns go: the window's oldest, the first round's then the
+    // In 60, two turns go: the window's oldest, the first round's then the
     // recent one's -- not turn 7, which is promoted.
-    let (_, manifest) = store
-        .assemble(&Budget::with_room("m", 60), None)
+    let selection = store
+        .select(store.start, Prompt::Turn(10), 60)
         .expect("the latest fits");
-    assert_eq!(manifest.evicted, [(1, Why::First), (6, Why::Recent)]);
+    assert_eq!(selection.evicted, [(1, Why::First), (6, Why::Recent)]);
 }
 
 /// Promoting twice is promoting once; a promotion lasts until it is demoted;
@@ -660,13 +770,13 @@ fn a_scaled_allowance_carries_less_of_the_same_store() {
     assert_eq!(at_rule.evicted, []);
     assert_eq!(at_rule.estimate, 80);
 
-    // 80 of the provider's tokens are 64 of the rule's: the latest turn, the
-    // openings, the round's own, the promotion and the window's newest, and
-    // not the rest of the window.
-    let (_, at_scale) = store.assemble(&scaled, None).expect("room for most");
-    assert_eq!(ids(&at_scale.carried), [0, 2, 7, 8, 9, 10]);
-    assert_eq!(ids(&at_scale.evicted), [1, 6]);
-    assert_eq!(at_scale.estimate, 60, "the estimate is the rule's count");
+    // 80 of the provider's tokens are 64 of the rule's, which the 80 chosen
+    // do not fit, so the view is cut to the latest turn and half of that
+    // besides: the openings and the round's newest.
+    let (_, at_scale) = store.assemble(&scaled, None).expect("room for some");
+    assert_eq!(at_scale.cut, Some(42));
+    assert_eq!(ids(&at_scale.carried), [0, 8, 9, 10]);
+    assert_eq!(at_scale.estimate, 40, "the estimate is the rule's count");
 
     let event = |manifest: &Manifest| manifest.event(CallId::new(1)).budget.estimate_scale;
     assert!((event(&at_rule) - 1.0).abs() < 1e-9);
@@ -774,22 +884,25 @@ fn an_opening_the_scale_would_refuse_is_carried_and_counted_exactly() {
 
 /// Each candidate has its own allowance, and the same conversation assembled
 /// for a smaller one leaves more out -- in the same order -- and names the
-/// candidate it was held to.
+/// candidate it was held to. Its cut is what the next call is sent, whatever
+/// candidate it goes to, while that fits.
 #[test]
 fn a_smaller_candidates_allowance_evicts_more_of_the_same_store() {
     // Priced so each allowance clears the least room a session starts with.
     let mut store = priced(five_rounds(), 1_000);
     let large = Budget::new(&candidate("large", Some(2_000 + 8_000)), Some(1_000), 1_000)
         .expect("8000 of room");
-    let small = Budget::new(&candidate("small", Some(2_000 + 4_000)), Some(1_000), 1_000)
-        .expect("4000 of room");
+    let small = Budget::new(&candidate("small", Some(2_000 + 6_000)), Some(1_000), 1_000)
+        .expect("6000 of room");
     let (_, manifest) = store.assemble(&large, None).expect("room for all");
     assert_eq!(
         (manifest.budget.model.as_str(), manifest.evicted.len()),
         ("large", 0)
     );
+    // Cut to the latest and 3000 besides.
     let (_, manifest) = store.assemble(&small, None).expect("room for some");
     assert_eq!(manifest.budget.model, "small");
+    assert_eq!(manifest.cut, Some(4_000));
     assert_eq!(
         manifest.evicted,
         [
@@ -800,11 +913,17 @@ fn a_smaller_candidates_allowance_evicts_more_of_the_same_store() {
         ]
     );
     assert_eq!(manifest.call, 1, "calls are counted across candidates");
+    let (_, after) = store.assemble(&large, None).expect("room for the cut");
+    assert_eq!(
+        (after.cut, ids(&after.carried)),
+        (None, ids(&manifest.carried)),
+        "the larger window is sent the cut, not everything again"
+    );
 
     // A latest turn that one candidate's window holds and the other's does not.
-    store.turns[10].tokens = 6_000;
+    store.turns[10].tokens = 7_000;
     assert!(store.assemble(&large, None).is_ok());
-    let err: TooLarge = store.assemble(&small, None).expect_err("6000 of 4000");
+    let err: TooLarge = store.assemble(&small, None).expect_err("7000 of 6000");
     assert_eq!(err.budget.model, "small");
 }
 
@@ -903,9 +1022,10 @@ async fn the_opening_count_includes_what_the_budget_leaves_out() {
     }
     assert_eq!(omitted(&history, ROOMY), 0);
     let each = history.tokens_of(1);
-    // Room for the opening and two turns, not three.
+    // Room for the opening and two turns, not three, so the first call is
+    // cut to the opening and half that, which holds one.
     let opening = crate::agent::budget::tokens([&Message::user("1")]);
-    assert_eq!(omitted(&history, opening + 2 * each + each / 2), 1);
+    assert_eq!(omitted(&history, opening + 2 * each + each / 2), 2);
     assert_eq!(omitted(&history, opening), 3);
 }
 
@@ -1138,6 +1258,24 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
     assert_eq!(kept, whole, "the turns keep what each model wrote");
 }
 
+/// Four rounds, the window the first and the latest: round 1 (turn 0) closes
+/// on text, round 2 (turns 1 and 2) is cut short after its second result, and
+/// round 3 (turns 3 to 5) and round 4 (turn 6) close on text.
+fn one_round_cut_short() -> Store {
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    round_of_calls(&mut store, "round 1", &[], Some("done"));
+    round_of_calls(&mut store, "round 2", &["a", "b"], None);
+    round_of_calls(&mut store, "round 3", &["c", "d"], Some("fine"));
+    round_of_calls(&mut store, "round 4", &[], Some("ok"));
+    store
+}
+
 /// For a provider that requires the user's and the model's turns to
 /// alternate, the view withholds what would put one role after itself rather
 /// than recording it. A round cut short goes, turn by turn, once the next
@@ -1147,20 +1285,7 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
 /// withheld, and the record still rebuilds the call.
 #[test]
 fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
-    let mut store = Store {
-        window: Window {
-            first: 1,
-            recent: 1,
-        },
-        ..Store::default()
-    };
-    // Round 1 (turn 0) closes on text. Round 2 (turns 1 and 2) is cut short
-    // after its second result. Round 3 (turns 3 to 5) and round 4 (turn 6)
-    // close on text.
-    round_of_calls(&mut store, "round 1", &[], Some("done"));
-    round_of_calls(&mut store, "round 2", &["a", "b"], None);
-    round_of_calls(&mut store, "round 3", &["c", "d"], Some("fine"));
-    round_of_calls(&mut store, "round 4", &[], Some("ok"));
+    let mut store = one_round_cut_short();
     store.begin_round(Message::user("round 5"));
     let strict = Budget::with_room("m", ROOMY).strict();
 
@@ -1230,6 +1355,36 @@ fn a_strict_view_withholds_what_would_put_one_role_after_itself() {
         }]
     );
     assert!(!alternates(&sent));
+}
+
+/// A strict view's cut keeps the turns it withholds so the roles alternate,
+/// so the calls after it withhold them again rather than call them evicted.
+#[test]
+fn a_cut_keeps_what_a_strict_view_withholds_withheld() {
+    // Round 2's second turn (2) alone opens on a call right after round 1's
+    // reply. Round 4's reply (6) is too large for half the room.
+    let mut store = one_round_cut_short();
+    promote(&mut store, &[2]);
+    for (id, tokens) in [(0, 10), (2, 10), (6, 60)] {
+        store.turns[id].tokens = tokens;
+    }
+    store.begin_round(Message::user("round 5"));
+    let strict = Budget::with_room("m", 90).strict();
+    let calls = calls_priced(&mut store, &[1; 13], &strict);
+
+    let cut = calls
+        .iter()
+        .position(|(_, manifest)| manifest.cut.is_some())
+        .expect("the round outgrew its room");
+    for (_, manifest) in &calls[cut..] {
+        assert_eq!(manifest.withheld, [(2, Why::Promoted)], "{manifest:?}");
+        assert_eq!(manifest.evicted, [(6, Why::Recent)], "{manifest:?}");
+    }
+    assert!(
+        calls
+            .last()
+            .is_some_and(|(_, manifest)| manifest.cut.is_none())
+    );
 }
 
 /// The turn a call answers is never withheld. When the budget leaves out the

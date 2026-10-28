@@ -294,6 +294,7 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
         "adjacent": [],
         "left_out": [],
         "refused": [],
+        "cut": None,
     } | over
 
 
@@ -1142,6 +1143,14 @@ class RenderSession(unittest.TestCase):
         self.assertIn("withheld so the roles alternate: 3 (recent), 5 (promoted)", self.page(events))
         self.assertNotIn("withheld so the roles alternate", self.page(ordinary()))
         self.assertIn("role alternation: relaxed", self.page(ordinary()))
+
+    def test_a_call_that_cut_the_view_says_to_how_much(self) -> None:
+        events = [
+            (kind, data | {"cut": 48000}) if kind == "model.call" else (kind, data)
+            for kind, data in ordinary()
+        ]
+        self.assertIn("cut to 48,000 tokens, which later calls grow from", self.page(events))
+        self.assertNotIn("cut to", self.page(ordinary()))
 
     def test_a_call_names_the_scale_its_estimate_was_held_to_only_above_the_rule(self) -> None:
         def scaled(scale: float) -> str:

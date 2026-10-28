@@ -955,6 +955,12 @@ pub struct ModelCall {
     pub adjacent: Vec<Repeat>,
     pub left_out: Vec<LeftOut>,
     pub refused: Vec<RefusedTurn>,
+    /// The room, in estimated tokens, the call's view was cut down to, when
+    /// this call cut it: what was chosen did not fit, so it was chosen again
+    /// in half the room beside the call's prompt, and later calls are sent
+    /// what it kept and every turn committed since until that does not fit
+    /// either.
+    pub cut: Option<u64>,
 }
 
 /// What a call was held to, in tokens.

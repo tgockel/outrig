@@ -205,11 +205,12 @@ fn each_event_has_exactly_its_data_fields() {
                     turn: 0,
                     notice: text("[outrig: not sent]"),
                 }],
+                cut: Some(48_000),
             }),
             "model.call",
             &[
                 "call", "call_id", "round", "budget", "estimate", "carried", "evicted", "withheld",
-                "opening", "adjacent", "left_out", "refused",
+                "opening", "adjacent", "left_out", "refused", "cut",
             ],
         ),
         (

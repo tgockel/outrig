@@ -173,6 +173,11 @@ category says what it may hold.
   - `refused`: the carried turns whose results a provider refused a call for, each as `{turn,
     notice}`: every tool result of the turn was sent as `notice`, which says why and where the
     results are, in place of what it holds. See `model.withheld`.
+  - `cut`: on the call that cut the view, the room it was cut down to, in estimated tokens: the
+    turn the call answers and half the call's room besides, or the whole room when that is less.
+    What was chosen did not fit, so it was chosen again in that, and each later call of the round
+    is sent what it kept and every turn committed since, until that does not fit either. `null`
+    on any other call.
 - `exec.submitted` -- Python the model submitted, as it goes to run: `execid` and `source`.
 
 What a call sent rebuilds from the file alone: the `messages` of each turn in its `carried`, in

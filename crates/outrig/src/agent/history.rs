@@ -8,19 +8,23 @@
 //! `runtime.history.turns` -- ordinary Python data, which costs no context to
 //! scan, since only what the code prints is seen.
 //!
-//! The **view** is what a model call is sent. It is chosen from the store on
-//! every call: the round in progress, every turn the agent promoted, and the
-//! conversation's first rounds and its most recent ones. Then it is held to the
-//! call's [`Budget`], and when it does not fit, the default window goes first,
-//! from its oldest turn, then promotions, oldest first, then the round's own
-//! earlier turns, and last the turn that opens each first round and the round
-//! in progress ([`Window`]). The latest turn, whose results the call
-//! answers, is never left out; when it cannot fit on its own, the call is not
-//! made ([`TooLarge`]). For a provider that requires the user's and the model's
-//! turns to alternate, the turns that would put one role after itself are
-//! withheld as well ([`Store::alternate`]). A turn whose results a provider
-//! refused a call for is sent with a notice in place of each result
-//! ([`Refused`]), while the store keeps them whole.
+//! The **view** is what a model call is sent: the round in progress, every
+//! turn the agent promoted, and the conversation's first rounds and its most
+//! recent ones, held to the call's [`Budget`]. While that fits, it is sent
+//! whole. Once it does not, it is cut: chosen again in half the room beside
+//! the call's prompt, where the default window goes first, from its oldest
+//! turn, then promotions, oldest first, then the round's own earlier turns,
+//! and last the turn that opens each first round and the round in progress
+//! ([`Window`]). Each later call of the round is sent what the cut kept and
+//! every turn committed since, so each request begins with the one before it,
+//! which is all a provider's prompt cache can match, until that no longer
+//! fits and the view is cut again ([`Store::view`]). The latest turn, whose
+//! results the call answers, is never left out; when it cannot fit on its
+//! own, the call is not made ([`TooLarge`]). For a provider that requires the
+//! user's and the model's turns to alternate, the turns that would put one
+//! role after itself are withheld as well ([`Store::alternate`]). A turn whose
+//! results a provider refused a call for is sent with a notice in place of
+//! each result ([`Refused`]), while the store keeps them whole.
 //!
 //! Each call's [`Manifest`] records what it carried and why, which is the only
 //! answer to what a model had in front of it: a promotion asks, and the window,
@@ -182,6 +186,9 @@ pub(crate) struct Manifest {
     /// The carried turns whose results it was sent a notice in place of, each
     /// with the notice: see [`Refused`]. Oldest first.
     pub(crate) refused: Vec<(usize, String)>,
+    /// The room, in estimated tokens, the view was cut down to, on the call
+    /// that cut it: see [`Store::view`].
+    pub(crate) cut: Option<u64>,
 }
 
 /// One part of a carried turn a call was not sent: in turn `turn`, the
@@ -389,6 +396,7 @@ impl Manifest {
                     notice: notice.clone(),
                 })
                 .collect(),
+            cut: self.cut,
         }
     }
 }
@@ -670,6 +678,7 @@ impl History {
             carried = manifest.carried.len(),
             evicted = manifest.evicted.len(),
             withheld = manifest.withheld.len(),
+            cut = manifest.cut,
             "assembled a model call's view"
         );
         Ok((sent, manifest))
@@ -726,6 +735,10 @@ struct Store {
     /// The turns whose results every call is sent a notice in place of: see
     /// [`Refused`].
     refused: BTreeMap<usize, Withheld>,
+    /// What the round in progress's latest cut left out, which every later
+    /// call of the round leaves out too, until a promotion or a demotion
+    /// changes what is chosen: see [`Store::view`]. Empty before a cut.
+    cut_out: BTreeSet<usize>,
 }
 
 /// A turn whose results every call is sent a notice in place of.
@@ -778,6 +791,8 @@ struct Selection {
     withheld: Chosen,
     /// The estimated tokens of what is carried, the prompt included.
     tokens: u64,
+    /// The room the selection was cut down to, when it was a cut.
+    cut: Option<u64>,
 }
 
 impl Store {
@@ -799,8 +814,9 @@ impl Store {
     }
 
     /// Start a round on `opening`, costed at `tokens` until its first turn
-    /// commits.
+    /// commits. Its first call is chosen afresh.
     fn begin(&mut self, opening: Message, tokens: u64) {
+        self.cut_out.clear();
         self.start = self.turns.len();
         self.opening = Some(Opening {
             message: opening,
@@ -832,16 +848,16 @@ impl Store {
 
     /// Apply a promotion or a demotion. A turn the store does not hold is not
     /// the agent's to name, and is ignored; demoting one that was not promoted
-    /// changes nothing.
+    /// changes nothing. One that changes what is chosen has the next call
+    /// chosen afresh, as the agent asked.
     fn change(&mut self, change: ContextChange) {
+        let mut changed = false;
         match change {
             ContextChange::Promote(ids) => {
-                let held = self.turns.len();
+                let committed = self.turns.len();
                 for id in ids {
                     match usize::try_from(id) {
-                        Ok(id) if id < held => {
-                            self.promoted.insert(id);
-                        }
+                        Ok(id) if id < committed => changed |= self.promoted.insert(id),
                         _ => tracing::warn!(
                             "ignored a promotion of turn {id}, which was never committed"
                         ),
@@ -851,10 +867,13 @@ impl Store {
             ContextChange::Demote(ids) => {
                 for id in ids {
                     if let Ok(id) = usize::try_from(id) {
-                        self.promoted.remove(&id);
+                        changed |= self.promoted.remove(&id);
                     }
                 }
             }
+        }
+        if changed {
+            self.cut_out.clear();
         }
     }
 
@@ -944,14 +963,18 @@ impl Store {
             evicted,
             withheld,
             tokens,
+            cut,
         } = self
-            .view(self.start, prompt, budget)
+            .view(self.start, prompt, budget, &self.cut_out)
             .map_err(|estimate| TooLarge {
                 turn: prompt.turn(),
                 round,
                 estimate,
                 budget: budget.clone(),
             })?;
+        if cut.is_some() {
+            self.cut_out = evicted.iter().map(|&(id, _)| id).collect();
+        }
 
         let mut sent: Vec<Message> = Vec::new();
         let mut adjacent = Vec::new();
@@ -994,6 +1017,7 @@ impl Store {
             left_out,
             withheld,
             refused,
+            cut,
         };
         self.calls += 1;
         Ok((sent, manifest))
@@ -1001,11 +1025,12 @@ impl Store {
 
     /// How many turns a round starting now, opening on a line of
     /// `opening_tokens`, would not send on its first call, held to `budget`.
+    /// That call is chosen afresh, holding no cut.
     fn omitted(&self, budget: &Budget, opening_tokens: u64) -> usize {
         let prompt = Prompt::Opening {
             tokens: opening_tokens,
         };
-        match self.view(self.turns.len(), prompt, budget) {
+        match self.view(self.turns.len(), prompt, budget, &BTreeSet::new()) {
             Ok(selection) => self.turns.len() - selection.carried.len(),
             Err(_) => self.turns.len(),
         }
@@ -1030,11 +1055,34 @@ impl Store {
             .collect()
     }
 
-    /// What a call of a round beginning at `start` is sent, held to `budget`:
-    /// [`Store::select`]'s choice, less what [`Store::alternate`] withholds
-    /// when the provider requires turns to alternate. `Err` as `select`.
-    fn view(&self, start: usize, prompt: Prompt, budget: &Budget) -> Result<Selection, u64> {
-        let mut selection = self.select(start, prompt, budget.room())?;
+    /// What a call of a round beginning at `start` is sent, held to `budget`,
+    /// less what [`Store::alternate`] withholds when the provider requires
+    /// turns to alternate. `Err` as [`Store::select`].
+    ///
+    /// A provider's prompt cache matches only a request that begins as an
+    /// earlier one did, so the view is kept as it was for as long as it fits:
+    /// everything chosen but what the round's latest cut left out, `cut_out`
+    /// -- before a cut, everything. A round's calls only add turns to that.
+    /// Once it does not fit, it is cut ([`Store::cut`]): what `select`
+    /// chooses in half the room beside the prompt, which the calls after it
+    /// are sent with each turn committed since, for some while. A turn a cut
+    /// leaves out stays out until the next, however much room comes free.
+    ///
+    /// One cut serves every candidate, so a model a call moves to is sent
+    /// what the one before it was. A candidate whose window it does not fit
+    /// cuts for its own, and the next call is sent that.
+    fn view(
+        &self,
+        start: usize,
+        prompt: Prompt,
+        budget: &Budget,
+        cut_out: &BTreeSet<usize>,
+    ) -> Result<Selection, u64> {
+        let room = budget.room();
+        let mut selection = match self.extend(cut_out, start, prompt, room) {
+            Some(selection) => selection,
+            None => self.cut(start, prompt, room)?,
+        };
         match budget.alternation {
             RoleAlternation::Relaxed => {}
             RoleAlternation::Strict => {
@@ -1166,8 +1214,51 @@ impl Store {
         id == 0 || self.turns[id - 1].round != self.turns[id].round
     }
 
+    /// What a call of a round beginning at `start` carries of what is chosen
+    /// but `cut_out`, when that and its prompt fit in `room`.
+    fn extend(
+        &self,
+        cut_out: &BTreeSet<usize>,
+        start: usize,
+        prompt: Prompt,
+        room: u64,
+    ) -> Option<Selection> {
+        let (carried, evicted): (Chosen, Chosen) = self
+            .chosen(start, prompt.turn())
+            .into_iter()
+            .partition(|&(id, why)| why == Why::Latest || !cut_out.contains(&id));
+        let tokens = carried
+            .iter()
+            .filter(|&&(_, why)| why != Why::Latest)
+            .map(|&(id, _)| self.tokens(id))
+            .sum::<u64>()
+            + self.prompt_tokens(prompt);
+        (tokens <= room).then_some(Selection {
+            carried,
+            evicted,
+            withheld: Vec::new(),
+            tokens,
+            cut: None,
+        })
+    }
+
+    /// A cut for a call of a round beginning at `start`: its prompt, and what
+    /// it carries of the rest in half of `room`, or in what the prompt leaves
+    /// of it when that is less. A prompt too large to leave half keeps what
+    /// fits beside it, as the whole room would, rather than nothing but
+    /// itself: the round's opening turn among it. `Err` as [`Store::select`].
+    fn cut(&self, start: usize, prompt: Prompt, room: u64) -> Result<Selection, u64> {
+        let mark = (room / 2 + self.prompt_tokens(prompt)).min(room);
+        let selection = self.select(start, prompt, mark)?;
+        Ok(Selection {
+            cut: Some(mark),
+            ..selection
+        })
+    }
+
     /// What a call of a round beginning at `start` carries in `room`, or the
-    /// estimate of its prompt when that alone does not fit.
+    /// estimate of its prompt when that alone does not fit: a cut, in what
+    /// [`Store::cut`] leaves it.
     ///
     /// Turns are admitted in the order they are kept longest, for the reasons
     /// [`Window`] gives: the turn that opens each first round and the round in
@@ -1222,6 +1313,7 @@ impl Store {
             evicted,
             withheld: Vec::new(),
             tokens: room - left,
+            cut: None,
         })
     }
 }

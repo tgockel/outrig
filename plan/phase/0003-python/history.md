@@ -162,6 +162,24 @@ so the estimate has to happen before the call.
   passed over, and smaller ones still go. Filling the first rounds oldest first, as this did until
   #667, kept a long first round's reading and dropped its result, all of round 2, and every recent
   round; inside a round, the round's own oldest-first eviction dropped the user's request first.
+- That fill runs only when what is chosen no longer fits, and then in half the room beside the turn
+  the call answers: a cut. Each later call of the round is sent what the cut kept and every turn
+  committed since, until that no longer fits and the view is cut again; while everything chosen
+  fits, it goes whole, and a round's calls only add to it. A provider's prompt cache matches only a
+  request that begins as an earlier one did. Filling afresh on every call, as this did until #666,
+  changed the front of nearly every request once the view was full -- each new turn evicted the
+  round's oldest, and a small turn came back whenever a few hundred tokens came free -- and in one
+  session that left 13.64M of the 13.93M input tokens of its last 131 calls uncached. So a turn a
+  cut leaves out stays out until the next cut, however much room comes free. A round's first call, a
+  promotion or a demotion, and a model whose window the cut does not fit choose afresh. One cut
+  serves every model of an alias, so a call that moves to another is sent what the one before it
+  was, and a smaller window's cut is what the next call is sent. Half is fixed: no setting says
+  whether a provider caches, and a cut costs one that does not only the context it leaves out.
+- On the `anthropic` style, a cut changes what came before each turn it keeps, as a round's
+  window moving on or a promotion does, and Anthropic's newer models refuse a thinking block
+  sent back after that. Each call asks for `prefix_mismatch_behavior: "drop_block"` under the
+  `thinking-binding-controls-2026-08-01` beta, so the API leaves such a block, and every one
+  after it, out instead. A model or endpoint that refuses the field is #750.
 - The turn a call answers is never left out. When it alone does not fit, the call is not made, and
   the round ends naming the turn; the next round is an ordinary one that leaves it out.
 

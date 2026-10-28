@@ -84,6 +84,7 @@ use rig::completion::{
 };
 use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use super::budget::{Budget, Calibration};
 use super::history::{Adjacent, History, Refused, TooLarge, Why};
@@ -151,14 +152,23 @@ pub(crate) struct ModelCandidate<M> {
     model: M,
     model_identifier: String,
     budget: Budget,
+    /// Fields every request to the candidate carries in its body besides
+    /// what rig builds of it, such as Anthropic's `drop_block`.
+    params: Map<String, Value>,
 }
 
 impl<M> ModelCandidate<M> {
-    pub(crate) fn new(model: M, model_identifier: impl Into<String>, budget: Budget) -> Self {
+    pub(crate) fn new(
+        model: M,
+        model_identifier: impl Into<String>,
+        budget: Budget,
+        params: Map<String, Value>,
+    ) -> Self {
         Self {
             model,
             model_identifier: model_identifier.into(),
             budget,
+            params,
         }
     }
 }
@@ -186,10 +196,16 @@ where
 
     fn completion(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<CompletionResponse<()>, CompletionError>> + Send + '_>,
     > {
+        if !self.params.is_empty() {
+            match &mut request.additional_params {
+                Some(Value::Object(carried)) => carried.extend(self.params.clone()),
+                other => *other = Some(Value::Object(self.params.clone())),
+            }
+        }
         Box::pin(async move {
             let response = self.model.completion(request).await?;
             // The erasure. Everything the round reads survives; only the

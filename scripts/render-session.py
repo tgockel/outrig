@@ -707,6 +707,11 @@ class Builder:
                 if (w := d.get("withheld"))
                 else []
             ),
+            *(
+                [f"cut to {tokens(cut)} tokens, which later calls grow from"]
+                if (cut := d.get("cut")) is not None
+                else []
+            ),
             f"overhead: {tokens(budget.get('overhead'))} tokens",
             *(
                 [f"estimate scale: {scale:g}x"]

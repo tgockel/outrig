@@ -1631,6 +1631,7 @@ pub outrig::harness::event::ModelCall::budget: outrig::harness::event::CallBudge
 pub outrig::harness::event::ModelCall::call: u64
 pub outrig::harness::event::ModelCall::call_id: outrig::harness::event::CallId
 pub outrig::harness::event::ModelCall::carried: alloc::vec::Vec<outrig::harness::event::Chosen>
+pub outrig::harness::event::ModelCall::cut: core::option::Option<u64>
 pub outrig::harness::event::ModelCall::estimate: u64
 pub outrig::harness::event::ModelCall::evicted: alloc::vec::Vec<outrig::harness::event::Chosen>
 pub outrig::harness::event::ModelCall::left_out: alloc::vec::Vec<outrig::harness::event::LeftOut>

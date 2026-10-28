@@ -15,6 +15,7 @@ use rig::client::CompletionClient;
 use rig::completion::CompletionModel;
 use rig::providers::{anthropic, openai};
 use rig::tool::ToolDyn;
+use serde_json::{Map, Value, json};
 
 use super::AgentError;
 use super::budget::Budget;
@@ -131,6 +132,7 @@ fn build_candidate(
                 overhead,
                 model,
                 candidate.max_tokens,
+                Map::new(),
             )
         }
         ResolvedProvider::Anthropic {
@@ -139,10 +141,12 @@ fn build_candidate(
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and the
             // native content blocks. It also normalizes a trailing `/v1` or
-            // `/messages` off the configured base URL.
+            // `/messages` off the configured base URL. The beta lets each call
+            // ask for `drop_block` (`anthropic_params`).
             let client = anthropic::Client::builder()
                 .api_key(api_key.expose())
                 .base_url(base_url)
+                .anthropic_beta(THINKING_BINDING_BETA)
                 .http_client(http)
                 .build()
                 .map_err(client_build)?;
@@ -154,14 +158,16 @@ fn build_candidate(
                 overhead,
                 model,
                 Some(max_tokens),
+                anthropic_params(),
             )
         }
     }
 }
 
 /// `model`, retried under `policy` and recorded by `retries`, as `candidate`'s
-/// link of the chain: its calls carry `max_tokens`, and `overhead` besides the
-/// conversation. What every provider's link shares.
+/// link of the chain: its calls carry `max_tokens`, `params` in their body,
+/// and `overhead` besides the conversation. What every provider's link
+/// shares.
 fn link<M>(
     candidate: &ResolvedCandidate,
     policy: &RetryPolicy,
@@ -169,6 +175,7 @@ fn link<M>(
     overhead: u64,
     model: M,
     max_tokens: Option<u32>,
+    params: Map<String, Value>,
 ) -> Result<Box<dyn Candidate>, AgentError>
 where
     M: CompletionModel + Send + Sync + 'static,
@@ -189,6 +196,7 @@ where
         RetryingModel::new(model, policy.clone(), retries),
         &candidate.model_identifier,
         budget,
+        params,
     )))
 }
 
@@ -253,6 +261,30 @@ fn remote_http_client(
     ))
 }
 
+/// The `anthropic-beta` value under which a request may say what becomes of a
+/// thinking block whose conversation changed.
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// What every request to an Anthropic candidate carries besides what rig
+/// builds of it, under [`THINKING_BINDING_BETA`].
+///
+/// Anthropic's newer models bind a thinking block to everything sent before
+/// it, and refuse a request that sends one back after that changed -- as a
+/// cut of the view, a round's window moving on, or a promotion does. With
+/// `drop_block`, the API leaves such a block out, with every one after it,
+/// and answers. Thinking is left to the model, as it is when the field is
+/// absent on the models that check. A model or endpoint that refuses the
+/// field is #750.
+fn anthropic_params() -> Map<String, Value> {
+    Map::from_iter([(
+        "thinking".to_string(),
+        json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }),
+    )])
+}
+
 /// One candidate's Anthropic model, and the output-token ceiling that reaches
 /// the wire with it.
 ///
@@ -275,11 +307,10 @@ pub(crate) fn anthropic_model(
     // off. `with_model` would have already capped every reply at 2048 tokens,
     // silently.
     //
-    // No prompt caching yet (#669), unlike `outrig run`'s. Once a round's view
-    // is full it is chosen again on every call and its front keeps changing, so
-    // a cache marker at the end of the request would pay the 1.25x write on each
-    // call and never read it back. It waits for a view that only grows between
-    // cuts (#666). Rig's `with_prompt_caching` also marks the last message, so
+    // No prompt caching yet, unlike `outrig run`'s (#669). A full view is now
+    // cut in steps and only grows between cuts (#666), so a cache marker at the
+    // end of the request is read back by the next call, and turning it on is
+    // #751. Rig's `with_prompt_caching` also marks the last message, so
     // marking only the system prompt and tools is not a flag it offers.
     let mut model = client.completion_model(&candidate.model_identifier);
     let max_tokens = match (candidate.max_tokens, model.default_max_tokens) {

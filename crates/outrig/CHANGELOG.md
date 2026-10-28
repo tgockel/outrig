@@ -96,9 +96,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then promotions, then the round's earlier turns, and last the turn that opens each first round
   and the current one, where the agent read what the user asked -- and the turn a call answers
   never is. (#667) When that turn alone does not fit, the call is not made: the round
-  ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's
-  refusal of a call whose shortened history put one role after itself says so, and names that
-  provider row's `role-alternation` as the remedy.
+  ends, keeping it, with a reason naming the turn, and the next round leaves it out. A view that
+  does not fit is cut to half the room beside the turn a call answers, in that order, and each later
+  call of the round is sent what the cut kept and every turn since, until that does not fit either,
+  so each request begins as the one before it did and a provider's prompt cache can match it; a new
+  round, a promotion, or a demotion chooses afresh, and `model.call`'s `cut` names the call that
+  cut. A call to an `anthropic` model asks the API, under the `thinking-binding-controls-2026-08-01`
+  beta, to drop a thinking block whose conversation a cut changed rather than refuse the call
+  (`drop_block`). (#666) A provider's refusal of a call whose shortened history put one role after
+  itself says so, and names that provider row's `role-alternation` as the remedy.
 
   Each model call retries a provider's transient failures -- a `408`, `425`, `429`, or any `5xx`
   (Anthropic's `529` and Cloudflare's `520`-`527` among them), honoring `Retry-After`, a dropped

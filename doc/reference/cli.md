@@ -460,16 +460,21 @@ everything else, and a warning says once when it passes an eighth of that ceilin
 (see [Remote-provider models](config.md#remote-provider-models)); without one, 128,000 tokens
 is assumed and startup warns. Before each call, OutRig estimates its size -- about three bytes to
 a token -- against the window, less the reply's `max-tokens` and the system prompt. When what was
-chosen does not fit, the first and recent rounds go first, from their oldest turn, so a long first
-round keeps its end; then promotions, oldest first; then the current round's earlier turns; and last
-the turn that opens each first round and the current one, where the agent read what was asked. A
-turn too large for what is left is passed over and smaller ones still go. The turn a call answers --
-the model's latest code and its results -- is never left out. When that alone does not fit, the
-call is not made: the round ends with `(round ended: turn N of round R ... is about X tokens, and
-a call to M has room for about Y ...)`, and keeps the turn. The next round leaves it out like any
-other, so the session goes on. For an alias of several models, each is held to its own window, the
-first one's included: a turn too large for the first model goes to the next one whose window holds
-it, and the round ends this way only when none does, naming each model and the room it had.
+chosen does not fit, the view is cut: chosen again in half that room beside the turn the call
+answers, where the first and recent rounds go first, from their oldest turn, so a long first round
+keeps its end; then promotions, oldest first; then the current round's earlier turns; and last the
+turn that opens each first round and the current one, where the agent read what was asked. A turn
+too large for what is left is passed over and smaller ones still go. Each later call of the round is
+sent what the cut kept and every turn since, until that no longer fits and the view is cut again, so
+each request begins as the one before it did, which is all a provider's prompt cache can match. A
+turn a cut left out stays out until the next cut; a new round, a promotion, or a demotion chooses
+afresh. The turn a call answers -- the model's latest code and its results -- is never left out.
+When that alone does not fit, the call is not made: the round ends with `(round ended: turn N of
+round R ... is about X tokens, and a call to M has room for about Y ...)`, and keeps the turn. The
+next round leaves it out like any other, so the session goes on. For an alias of several models,
+each is held to its own window, the first one's included: a turn too large for the first model goes
+to the next one whose window holds it, and the round ends this way only when none does, naming each
+model and the room it had.
 
 **What a shortened conversation looks like to a provider.** Every call keeps each tool call
 beside its result, which every provider requires. What a cut can do is put two of the user's
