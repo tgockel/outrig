@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 
 use super::AgentError;
 use super::budget::Budget;
-use super::failover::{Candidate, FailoverModel, ModelCandidate};
+use super::failover::{Binding, Candidate, FailoverModel, ModelCandidate};
 use super::history::History;
 use super::ledger::CallSlot;
 use super::resolve::{LlmResolveError, ResolvedAgent, ResolvedCandidate, ResolvedProvider};
@@ -132,7 +132,7 @@ fn build_candidate(
                 overhead,
                 model,
                 candidate.max_tokens,
-                Map::new(),
+                None,
             )
         }
         ResolvedProvider::Anthropic {
@@ -141,16 +141,23 @@ fn build_candidate(
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and the
             // native content blocks. It also normalizes a trailing `/v1` or
-            // `/messages` off the configured base URL. The beta lets each call
-            // ask for `drop_block` (`anthropic_params`).
-            let client = anthropic::Client::builder()
-                .api_key(api_key.expose())
-                .base_url(base_url)
-                .anthropic_beta(THINKING_BINDING_BETA)
-                .http_client(http)
-                .build()
-                .map_err(client_build)?;
-            let (model, max_tokens) = anthropic_model(&client, candidate);
+            // `/messages` off the configured base URL.
+            let client = |betas: &[&str]| {
+                anthropic::Client::builder()
+                    .api_key(api_key.expose())
+                    .base_url(base_url)
+                    .anthropic_betas(betas)
+                    .http_client(http.clone())
+                    .build()
+                    .map_err(client_build)
+            };
+            // Calls ask for `drop_block` under its beta (`anthropic_params`),
+            // until the endpoint refuses that and they go through the same
+            // model at a client that does not send it.
+            let (bound, max_tokens) =
+                anthropic_model(&client(&[THINKING_BINDING_BETA])?, candidate);
+            let mut model = client(&[])?.completion_model(&candidate.model_identifier);
+            model.default_max_tokens = bound.default_max_tokens;
             link(
                 candidate,
                 policy,
@@ -158,16 +165,17 @@ fn build_candidate(
                 overhead,
                 model,
                 Some(max_tokens),
-                anthropic_params(),
+                Some((bound, anthropic_params())),
             )
         }
     }
 }
 
 /// `model`, retried under `policy` and recorded by `retries`, as `candidate`'s
-/// link of the chain: its calls carry `max_tokens`, `params` in their body,
-/// and `overhead` besides the conversation. What every provider's link
-/// shares.
+/// link of the chain: its calls carry `max_tokens`, and `overhead` besides the
+/// conversation. With `binding`, they go through its model instead, each
+/// carrying its fields in their body, until the endpoint refuses that. What
+/// every provider's link shares.
 fn link<M>(
     candidate: &ResolvedCandidate,
     policy: &RetryPolicy,
@@ -175,7 +183,7 @@ fn link<M>(
     overhead: u64,
     model: M,
     max_tokens: Option<u32>,
-    params: Map<String, Value>,
+    binding: Option<(M, Map<String, Value>)>,
 ) -> Result<Box<dyn Candidate>, AgentError>
 where
     M: CompletionModel + Send + Sync + 'static,
@@ -192,11 +200,17 @@ where
         overhead = budget.overhead,
         "built a candidate; each call to it is held to this budget"
     );
+    let binding = binding.map(|(model, params)| {
+        Binding::new(
+            RetryingModel::new(model, policy.clone(), retries.clone()),
+            params,
+        )
+    });
     Ok(Box::new(ModelCandidate::new(
         RetryingModel::new(model, policy.clone(), retries),
         &candidate.model_identifier,
         budget,
-        params,
+        binding,
     )))
 }
 
@@ -266,15 +280,19 @@ fn remote_http_client(
 const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// What every request to an Anthropic candidate carries besides what rig
-/// builds of it, under [`THINKING_BINDING_BETA`].
+/// builds of it, under [`THINKING_BINDING_BETA`], until its endpoint refuses
+/// it.
 ///
 /// Anthropic's newer models bind a thinking block to everything sent before
 /// it, and refuse a request that sends one back after that changed -- as a
-/// cut of the view, a round's window moving on, or a promotion does. With
-/// `drop_block`, the API leaves such a block out, with every one after it,
-/// and answers. Thinking is left to the model, as it is when the field is
-/// absent on the models that check. A model or endpoint that refuses the
-/// field is #750.
+/// cut of the view, a round's window moving on, or a promotion does. Each
+/// call leaves such thinking out itself (`history::Sending`), so this is a
+/// backstop, for a change the store does not see: with `drop_block`, the API
+/// leaves out such a block, and every one after it, rather than refuse the
+/// call. Thinking is left to the model, as it is when the field is absent on
+/// the models that check. A model that takes no `adaptive` thinking, or an
+/// endpoint that does not know the beta, refuses it, and every later call to
+/// it goes without (`Candidate::unbind`).
 fn anthropic_params() -> Map<String, Value> {
     Map::from_iter([(
         "thinking".to_string(),

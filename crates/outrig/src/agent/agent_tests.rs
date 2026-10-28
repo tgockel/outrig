@@ -5516,6 +5516,51 @@ async fn signed_thinking_goes_back_to_anthropic_whole() {
     }
 }
 
+/// An endpoint that does not take the thinking-binding beta refuses a call
+/// that asks for `drop_block`. The call is sent again without the field or
+/// the header, and so is every later one, and the round goes on. Stale
+/// thinking is left out on the client either way, so the thinking the
+/// answer to it holds goes back as before.
+#[tokio::test]
+async fn a_refused_drop_block_is_sent_again_without_it() {
+    let var = "OUTRIG_TEST_AGENT_UNBINDING";
+    let (addr, mut requests) = mock_http::start_unbinding(vec![
+        submit("toolu_1", "print('ran')").with_reasoning("weighing it"),
+        text_reply("done"),
+    ])
+    .await;
+    let cfg = config_in(Style::Anthropic, addr, var, MODEL, "", "max-tokens = 4096");
+    let mut agent = agent_of(&cfg, var, Events::off()).await;
+
+    assert_eq!(round(&mut agent, "run it").await, "done");
+    shut_down(agent).await;
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3, "refused, sent again, then the next call");
+    assert!(
+        recorded[0]
+            .body
+            .pointer("/thinking/block_binding")
+            .is_some(),
+        "{:#}",
+        recorded[0].body
+    );
+    assert_eq!(
+        recorded[0].header("anthropic-beta"),
+        Some("thinking-binding-controls-2026-08-01")
+    );
+    for request in &recorded[1..] {
+        assert!(request.body.get("thinking").is_none(), "{:#}", request.body);
+        assert_eq!(request.header("anthropic-beta"), None);
+    }
+    assert_eq!(
+        blocks(&recorded[2], "thinking").len(),
+        1,
+        "{:#}",
+        recorded[2].body
+    );
+}
+
 /// A call that moves from an OpenAI-compatible model to Anthropic's is sent
 /// the earlier reasoning the first one wrote as Anthropic takes it: not at
 /// all, since there is no signature to send it with, and a thinking block

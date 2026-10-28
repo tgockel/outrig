@@ -60,6 +60,13 @@
 //!   earlier one had. Answered, every later call is sent the notice too, so a
 //!   result the provider will not read cannot refuse the rest of the session;
 //!   refused again, nothing stays withheld, and the call moves on.
+//! * **Neither is a refusal of `drop_block`.** An Anthropic candidate's calls
+//!   ask the API to drop thinking a change to the conversation made stale,
+//!   as a backstop to the view, which leaves it out itself. An endpoint that
+//!   refuses the request for asking -- a model that takes no `adaptive`
+//!   thinking, a gateway that does not know the beta -- is sent the call
+//!   again without asking, and every later call to it goes without
+//!   ([`Candidate::unbind`]).
 //!
 //! Copied from `outrig-cli`'s `llm/failover.rs`, which keeps its own. Besides
 //! the view, what changed in coming across is how the chain's state gets out.
@@ -77,6 +84,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rig::OneOrMany;
 use rig::completion::{
@@ -134,6 +142,14 @@ pub(crate) trait Candidate: Send + Sync {
     /// Whether this candidate's native structured output composes with tools.
     fn composes_native_output_with_tools(&self) -> bool;
 
+    /// Stop asking the API to drop thinking a change to the conversation made
+    /// stale (`drop_block`), because this candidate's endpoint refused a
+    /// request that asked: whether it was asking. A call leaves such thinking
+    /// out itself either way ([`History`]), so only the backstop goes.
+    fn unbind(&self) -> bool {
+        false
+    }
+
     /// Run one completion against this candidate.
     fn completion(
         &self,
@@ -152,9 +168,9 @@ pub(crate) struct ModelCandidate<M> {
     model: M,
     model_identifier: String,
     budget: Budget,
-    /// Fields every request to the candidate carries in its body besides
-    /// what rig builds of it, such as Anthropic's `drop_block`.
-    params: Map<String, Value>,
+    /// For an Anthropic candidate, the same model asking for `drop_block`,
+    /// which its calls go through until its endpoint refuses that.
+    binding: Option<Binding<M>>,
 }
 
 impl<M> ModelCandidate<M> {
@@ -162,13 +178,34 @@ impl<M> ModelCandidate<M> {
         model: M,
         model_identifier: impl Into<String>,
         budget: Budget,
-        params: Map<String, Value>,
+        binding: Option<Binding<M>>,
     ) -> Self {
         Self {
             model,
             model_identifier: model_identifier.into(),
             budget,
+            binding,
+        }
+    }
+}
+
+/// A candidate's model at a client that sends a beta its plain one does not,
+/// and the fields every request through it carries in its body besides what
+/// rig builds of it, until the endpoint refuses them: see
+/// [`Candidate::unbind`]. A request has no headers of its own, so going
+/// without the beta is going through another client.
+pub(crate) struct Binding<M> {
+    model: M,
+    params: Map<String, Value>,
+    refused: AtomicBool,
+}
+
+impl<M> Binding<M> {
+    pub(crate) fn new(model: M, params: Map<String, Value>) -> Self {
+        Self {
+            model,
             params,
+            refused: AtomicBool::new(false),
         }
     }
 }
@@ -194,20 +231,30 @@ where
         self.model.composes_native_output_with_tools()
     }
 
+    fn unbind(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| !binding.refused.swap(true, Ordering::Relaxed))
+    }
+
     fn completion(
         &self,
         mut request: CompletionRequest,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<CompletionResponse<()>, CompletionError>> + Send + '_>,
     > {
-        if !self.params.is_empty() {
-            match &mut request.additional_params {
-                Some(Value::Object(carried)) => carried.extend(self.params.clone()),
-                other => *other = Some(Value::Object(self.params.clone())),
+        let model = match &self.binding {
+            Some(binding) if !binding.refused.load(Ordering::Relaxed) => {
+                match &mut request.additional_params {
+                    Some(Value::Object(carried)) => carried.extend(binding.params.clone()),
+                    other => *other = Some(Value::Object(binding.params.clone())),
+                }
+                &binding.model
             }
-        }
+            _ => &self.model,
+        };
         Box::pin(async move {
-            let response = self.model.completion(request).await?;
+            let response = model.completion(request).await?;
             // The erasure. Everything the round reads survives; only the
             // provider's untouched raw body is dropped -- see the trait's doc.
             Ok(CompletionResponse {
@@ -599,6 +646,20 @@ fn refused(err: &CompletionError) -> bool {
         .is_some_and(|status| matches!(status.as_u16(), 400 | 422))
 }
 
+/// Whether `err` is an endpoint's refusal of a request for asking that stale
+/// thinking be dropped: one that names the field, the `thinking` it sits in,
+/// or the beta it needs. A model that takes no `adaptive` thinking, and a
+/// gateway that does not know the beta, refuse it so.
+fn refuses_binding(err: &CompletionError) -> bool {
+    refused(err)
+        && err.provider_response_body().is_some_and(|body| {
+            let body = body.to_ascii_lowercase();
+            ["block_binding", "thinking", "beta"]
+                .iter()
+                .any(|term| body.contains(term))
+        })
+}
+
 /// `history`, with the messages after the system prompt replaced by `view`.
 ///
 /// rig moves an agent's preamble into the request's history as a leading
@@ -730,6 +791,18 @@ impl CompletionModel for FailoverModel {
                     // the same.
                     Err(spent) if BudgetSpent::of(&spent) => return Err(spent),
                     Err(error) => {
+                        // Refused for asking that stale thinking be dropped:
+                        // sent again without asking, as every later call to it
+                        // is.
+                        if refuses_binding(&error) && candidate.unbind() {
+                            tracing::warn!(
+                                "model {} refused the request that asked for drop_block \
+                                 ({error}); sending it and every later call without asking, and \
+                                 leaving out stale thinking as before",
+                                candidate.model_name()
+                            );
+                            continue;
+                        }
                         // What the round says of a refusal is about the view
                         // that was refused, which only this loop has.
                         if let Some(adjacent) = adjacent

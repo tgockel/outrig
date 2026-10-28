@@ -198,19 +198,22 @@ pub(crate) enum Wire {
 }
 
 impl Wire {
-    /// Whether a call in this protocol can carry `part` of a model's reply.
-    pub(crate) fn takes(self, part: &AssistantContent) -> bool {
+    /// Whether a call in this protocol can carry `part` of a model's reply,
+    /// in a turn whose thinking is `stale`: bound to a conversation a later
+    /// call changed what came before it in, which Anthropic refuses.
+    pub(crate) fn takes(self, part: &AssistantContent, stale: bool) -> bool {
         match (self, part) {
             (Wire::Anthropic, AssistantContent::Reasoning(reasoning)) => {
-                reasoning.content.iter().all(|block| {
-                    matches!(
-                        block,
-                        ReasoningContent::Text {
-                            signature: Some(_),
-                            ..
-                        } | ReasoningContent::Redacted { .. }
-                    )
-                })
+                !stale
+                    && reasoning.content.iter().all(|block| {
+                        matches!(
+                            block,
+                            ReasoningContent::Text {
+                                signature: Some(_),
+                                ..
+                            } | ReasoningContent::Redacted { .. }
+                        )
+                    })
             }
             _ => true,
         }
@@ -227,15 +230,6 @@ impl Wire {
                 .input_tokens
                 .saturating_add(usage.cached_input_tokens)
                 .saturating_add(usage.cache_creation_input_tokens),
-        }
-    }
-
-    /// Whether a call in this protocol is sent any of `message`: a reply none
-    /// of whose parts it takes is left out whole, and anything else goes.
-    pub(crate) fn keeps(self, message: &Message) -> bool {
-        match message {
-            Message::Assistant { content, .. } => content.iter().any(|part| self.takes(part)),
-            _ => true,
         }
     }
 }

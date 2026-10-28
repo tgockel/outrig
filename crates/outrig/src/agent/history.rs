@@ -26,6 +26,13 @@
 //! results a provider refused a call for is sent with a notice in place of
 //! each result ([`Refused`]), while the store keeps them whole.
 //!
+//! To Anthropic, a call also leaves out the thinking a change to what came
+//! before it made stale ([`Sending`]). Anthropic's newer models bind each
+//! thinking block to everything sent before it, and refuse one sent back
+//! after that changed. From the first turn whose earlier context a call
+//! changed, on, each block stays out for good; those before it, and those
+//! produced since, still go.
+//!
 //! Each call's [`Manifest`] records what it carried and why, which is the only
 //! answer to what a model had in front of it: a promotion asks, and the window,
 //! the budget, and the store's order decide.
@@ -200,19 +207,52 @@ pub(crate) struct LeftOut {
     pub(crate) part: usize,
 }
 
-/// Turn `turn`'s `messages` as a call in `wire` is sent them: each part of a
-/// reply the protocol cannot take left out, and pushed onto `left_out`, and a
-/// reply left with nothing left out with it. The turn itself is not changed.
-fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut>) -> Vec<Message> {
+/// How a call is sent each turn's replies: in its provider's protocol, and,
+/// to Anthropic, without the thinking of a turn in `stale` -- one a later call
+/// changed what came before, which the API would refuse as bound to another
+/// conversation. Leaving out the first such block and every one after it is
+/// what `drop_block` does for one request; recorded in the store, it holds
+/// for every later one, and a block produced since stays valid.
+#[derive(Clone, Copy)]
+struct Sending<'a> {
+    wire: Wire,
+    stale: &'a BTreeSet<usize>,
+}
+
+impl Sending<'_> {
+    /// Whether a call sends `part` of a reply in turn `turn`.
+    fn takes(self, turn: usize, part: &AssistantContent) -> bool {
+        self.wire.takes(part, self.stale.contains(&turn))
+    }
+
+    /// Whether a call sends any of `message`, of turn `turn`: a reply none of
+    /// whose parts it takes is left out whole, and anything else goes.
+    fn keeps(self, turn: usize, message: &Message) -> bool {
+        match message {
+            Message::Assistant { content, .. } => content.iter().any(|part| self.takes(turn, part)),
+            _ => true,
+        }
+    }
+}
+
+/// Turn `turn`'s `messages` as a call is sent them: each part of a reply
+/// `sending` does not take left out, and pushed onto `left_out`, and a reply
+/// left with nothing left out with it. The turn itself is not changed.
+fn fit(
+    sending: Sending,
+    turn: usize,
+    messages: &[Message],
+    left_out: &mut Vec<LeftOut>,
+) -> Vec<Message> {
     let mut sent = Vec::with_capacity(messages.len());
     for (message, original) in messages.iter().enumerate() {
         let Message::Assistant { id, content } = original else {
             sent.push(original.clone());
             continue;
         };
-        if !wire.keeps(original) {
-            // A reply of nothing the protocol takes made no tool call, so
-            // leaving it out whole leaves no result unanswered.
+        if !sending.keeps(turn, original) {
+            // A reply of nothing the call takes made no tool call, so leaving
+            // it out whole leaves no result unanswered.
             left_out.extend(content.iter().enumerate().map(|(part, _)| LeftOut {
                 turn,
                 message,
@@ -220,13 +260,13 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
             }));
             continue;
         }
-        if content.iter().all(|part| wire.takes(part)) {
+        if content.iter().all(|part| sending.takes(turn, part)) {
             sent.push(original.clone());
             continue;
         }
         let mut kept = Vec::new();
         for (part, content) in content.iter().enumerate() {
-            if wire.takes(content) {
+            if sending.takes(turn, content) {
                 kept.push(content.clone());
             } else {
                 left_out.push(LeftOut {
@@ -236,7 +276,7 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
                 });
             }
         }
-        // Kept has a part, since the protocol keeps the reply.
+        // Kept has a part, since the call keeps the reply.
         if let Ok(content) = OneOrMany::many(kept) {
             sent.push(Message::Assistant {
                 id: id.clone(),
@@ -247,13 +287,13 @@ fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut
     sent
 }
 
-/// The roles turn `messages` opens and ends on as a call in `wire` is sent
-/// them -- what [`fit`] would leave, without building it -- or `None` when it
+/// The roles turn `turn`'s `messages` open and end on as a call is sent them
+/// -- what [`fit`] would leave, without building it -- or `None` when it
 /// would leave nothing.
-fn ends(wire: Wire, messages: &[Message]) -> Option<(Role, Role)> {
+fn ends(sending: Sending, turn: usize, messages: &[Message]) -> Option<(Role, Role)> {
     let mut roles = messages
         .iter()
-        .filter(|message| wire.keeps(message))
+        .filter(|message| sending.keeps(turn, message))
         .filter_map(Role::of);
     let first = roles.next()?;
     Some((first, roles.next_back().unwrap_or(first)))
@@ -739,6 +779,15 @@ struct Store {
     /// call of the round leaves out too, until a promotion or a demotion
     /// changes what is chosen: see [`Store::view`]. Empty before a cut.
     cut_out: BTreeSet<usize>,
+    /// The turns whose thinking a call to Anthropic leaves out: a later call
+    /// changed what came before each. Only grows, since a block put back
+    /// would break those produced while it was gone. See [`Sending`].
+    stale: BTreeSet<usize>,
+    /// The turns the latest call was sent anything of, oldest first: what
+    /// the next is checked against for a change before its end. Whatever
+    /// model it was for, and whether or not it was answered, which only
+    /// makes more stale.
+    last: Vec<usize>,
 }
 
 /// A turn whose results every call is sent a notice in place of.
@@ -783,6 +832,7 @@ type Chosen = Vec<(usize, Why)>;
 
 /// Which turns a call carries, which the budget left out, and which were
 /// withheld so the roles alternate, each by id.
+#[derive(Default)]
 struct Selection {
     carried: Chosen,
     evicted: Chosen,
@@ -793,6 +843,10 @@ struct Selection {
     tokens: u64,
     /// The room the selection was cut down to, when it was a cut.
     cut: Option<u64>,
+    /// The turns whose thinking a call to Anthropic leaves out, those this
+    /// call makes stale included: see [`Store::spoil`]. Empty until
+    /// [`Store::view`] has had its say.
+    stale: BTreeSet<usize>,
 }
 
 impl Store {
@@ -964,6 +1018,7 @@ impl Store {
             withheld,
             tokens,
             cut,
+            stale,
         } = self
             .view(self.start, prompt, budget, &self.cut_out)
             .map_err(|estimate| TooLarge {
@@ -988,8 +1043,12 @@ impl Store {
         // a provider refused with a notice in their place. The estimate above
         // counts each turn whole, a refused one with its notices, so what is
         // left out only makes it more conservative.
+        let sending = Sending {
+            wire: budget.wire,
+            stale: &stale,
+        };
         let turns = carried.iter().map(|&(id, _)| {
-            let messages = fit(budget.wire, id, &self.turns[id].messages, &mut left_out);
+            let messages = fit(sending, id, &self.turns[id].messages, &mut left_out);
             let Some(withheld) = self.refused.get(&id) else {
                 return (Some(id), messages);
             };
@@ -1019,6 +1078,8 @@ impl Store {
             refused,
             cut,
         };
+        self.last = self.sent(&manifest.carried, sending);
+        self.stale = stale;
         self.calls += 1;
         Ok((sent, manifest))
     }
@@ -1079,24 +1140,43 @@ impl Store {
         cut_out: &BTreeSet<usize>,
     ) -> Result<Selection, u64> {
         let room = budget.room();
-        let mut selection = match self.extend(cut_out, start, prompt, room) {
+        let selection = match self.extend(cut_out, start, prompt, room) {
             Some(selection) => selection,
             None => self.cut(start, prompt, room)?,
         };
-        match budget.alternation {
-            RoleAlternation::Relaxed => {}
-            RoleAlternation::Strict => {
-                let carried = std::mem::take(&mut selection.carried);
-                (selection.carried, selection.withheld) =
-                    self.alternate(carried, prompt, budget.wire);
-                selection.tokens -= selection
-                    .withheld
-                    .iter()
-                    .map(|&(id, _)| self.tokens(id))
-                    .sum::<u64>();
+        // Which thinking is stale turns on which turns are sent before it,
+        // and which turns are sent turns on the thinking: a reply of stale
+        // thinking alone is left out, which can leave its turn sent as
+        // nothing, and, where the roles must alternate, with neither role.
+        // So the two are settled together, until what is sent makes nothing
+        // more stale; `stale` only grows, so it does.
+        let mut stale = self.stale.clone();
+        let (carried, withheld) = loop {
+            let (carried, withheld) = match budget.alternation {
+                RoleAlternation::Relaxed => (selection.carried.clone(), Vec::new()),
+                RoleAlternation::Strict => {
+                    let sending = Sending {
+                        wire: budget.wire,
+                        stale: &stale,
+                    };
+                    self.alternate(&selection.carried, prompt, sending)
+                }
+            };
+            let known = stale.len();
+            self.spoil(&carried, budget.wire, &mut stale);
+            if stale.len() == known {
+                break (carried, withheld);
             }
-        }
-        Ok(selection)
+        };
+        let tokens =
+            selection.tokens - withheld.iter().map(|&(id, _)| self.tokens(id)).sum::<u64>();
+        Ok(Selection {
+            carried,
+            withheld,
+            tokens,
+            stale,
+            ..selection
+        })
     }
 
     /// `carried`, oldest first, split into what a call answering `prompt` is
@@ -1104,8 +1184,8 @@ impl Store {
     /// user's side and the model's for a provider that requires it
     /// ([`RoleAlternation::Strict`]). Both oldest first.
     ///
-    /// Each turn is a fragment that opens on one role and ends on one, as the
-    /// call in `wire` is sent it; a turn [`fit`] leaves nothing of has none and
+    /// Each turn is a fragment that opens on one role and ends on one, as
+    /// `sending` sends it; a turn [`fit`] leaves nothing of has none and
     /// stays carried out of the way. The fragments are walked oldest first
     /// onto a stack of what is kept, which begins as if on a reply so the view
     /// opens on the user's side. Where a fragment opens on the role the stack
@@ -1127,7 +1207,12 @@ impl Store {
     /// another ends on results, so it never ends a reply-after-reply seam, and
     /// the later side of a user-after-user seam is never of the round in
     /// progress. Were it reached all the same, the pair would stand.
-    fn alternate(&self, carried: Chosen, prompt: Prompt, wire: Wire) -> (Chosen, Chosen) {
+    fn alternate(
+        &self,
+        carried: &[(usize, Why)],
+        prompt: Prompt,
+        sending: Sending,
+    ) -> (Chosen, Chosen) {
         // A turn of the round in progress, or the latest, is never withheld.
         let yields = |at: usize| !matches!(carried[at].1, Why::Latest | Why::Round);
         // Each kept fragment: its place in `carried`, and the role it ends on.
@@ -1146,7 +1231,7 @@ impl Store {
         };
         for (at, &(id, _)) in carried.iter().enumerate() {
             // A turn `fit` leaves nothing of has no roles, and stays carried.
-            let Some((first, last)) = ends(wire, &self.turns[id].messages) else {
+            let Some((first, last)) = ends(sending, id, &self.turns[id].messages) else {
                 continue;
             };
             match (first, ends_on(&stack)) {
@@ -1214,6 +1299,38 @@ impl Store {
         id == 0 || self.turns[id - 1].round != self.turns[id].round
     }
 
+    /// Adds to `stale` the turns whose thinking a call to Anthropic sent
+    /// `carried`, oldest first, in `wire`'s protocol, leaves out for what came
+    /// before it: when the turns it sends anything of do not begin with those
+    /// the latest call did, the first that does not and every one after it.
+    /// What came before each of those changed: a cut, a round whose window
+    /// moved past a middle one, a promotion, a turn withheld so the roles
+    /// alternate and later sent, a model a call moved to cutting for its own
+    /// window. Turns before the change keep their thinking, and so do those
+    /// produced after; a turn sent as nothing, such as another provider's
+    /// thinking alone, changes nothing.
+    fn spoil(&self, carried: &[(usize, Why)], wire: Wire, stale: &mut BTreeSet<usize>) {
+        let sent = self.sent(carried, Sending { wire, stale });
+        let same = sent
+            .iter()
+            .zip(&self.last)
+            .take_while(|(id, last)| id == last)
+            .count();
+        if same < self.last.len() {
+            stale.extend(&sent[same..]);
+        }
+    }
+
+    /// The turns of `carried` a call `sending` them sends anything of, by
+    /// id, oldest first.
+    fn sent(&self, carried: &[(usize, Why)], sending: Sending) -> Vec<usize> {
+        carried
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|&id| ends(sending, id, &self.turns[id].messages).is_some())
+            .collect()
+    }
+
     /// What a call of a round beginning at `start` carries of what is chosen
     /// but `cut_out`, when that and its prompt fit in `room`.
     fn extend(
@@ -1236,9 +1353,8 @@ impl Store {
         (tokens <= room).then_some(Selection {
             carried,
             evicted,
-            withheld: Vec::new(),
             tokens,
-            cut: None,
+            ..Selection::default()
         })
     }
 
@@ -1311,9 +1427,8 @@ impl Store {
         Ok(Selection {
             carried,
             evicted,
-            withheld: Vec::new(),
             tokens: room - left,
-            cut: None,
+            ..Selection::default()
         })
     }
 }

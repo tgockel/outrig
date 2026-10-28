@@ -168,8 +168,9 @@ category says what it may hold.
     side, which no withholding could clear.
   - `left_out`: the parts of carried turns the call's provider cannot take, which it was not
     sent, each as `{turn, message, part}`, counted from 0 within the turn's `messages` and the
-    message's `content`. Today that is reasoning without a signature, left out of a call to an
-    Anthropic model, such as an OpenAI-compatible model's `reasoning_content`.
+    message's `content`. Today that is reasoning left out of a call to an Anthropic model: one
+    without a signature, such as an OpenAI-compatible model's `reasoning_content`, and the
+    thinking of a turn an earlier call changed what came before, which the API would refuse.
   - `refused`: the carried turns whose results a provider refused a call for, each as `{turn,
     notice}`: every tool result of the turn was sent as `notice`, which says why and where the
     results are, in place of what it holds. See `model.withheld`.

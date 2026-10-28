@@ -479,6 +479,28 @@ pub(super) async fn start_strict(
     start_with(script, strict_refusal).await
 }
 
+/// [`start`], as an Anthropic endpoint that does not take the thinking-binding
+/// beta: a request that asks for `drop_block` is refused as Anthropic refuses
+/// the field without its header, and does not advance the script.
+pub(super) async fn start_unbinding(
+    script: Vec<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    start_with(script, binding_refusal).await
+}
+
+/// How [`start_unbinding`]'s endpoint answers `body`: `None` unless it carries
+/// `thinking.block_binding`.
+fn binding_refusal(body: &Value) -> Option<CannedResponse> {
+    body.pointer("/thinking/block_binding")?;
+    let mut refusal = failure(400);
+    refusal.body["error"]["message"] =
+        "thinking.block_binding: Extra inputs are not permitted".into();
+    Some(refusal)
+}
+
 /// What [`start_filtering`]'s provider will not read.
 pub(super) const FILTERED: &str = "the-mock-will-not-read-this";
 

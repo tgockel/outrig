@@ -472,10 +472,26 @@ fn calls_priced(
     prices: &[u64],
     budget: &Budget,
 ) -> Vec<(Vec<Message>, Manifest)> {
-    prices
-        .iter()
-        .map(|&tokens| {
-            let (id, _) = store.commit(vec![call("a", "1"), Message::tool_result("a", "one")]);
+    let turns = prices.iter().map(|&tokens| {
+        (
+            vec![call("a", "1"), Message::tool_result("a", "one")],
+            tokens,
+        )
+    });
+    calls_of(store, turns, budget)
+}
+
+/// Commit each of `turns`, priced at its tokens, to the round `store` has
+/// open, and assemble a call after each, held to `budget`.
+fn calls_of(
+    store: &mut Store,
+    turns: impl IntoIterator<Item = (Vec<Message>, u64)>,
+    budget: &Budget,
+) -> Vec<(Vec<Message>, Manifest)> {
+    turns
+        .into_iter()
+        .map(|(messages, tokens)| {
+            let (id, _) = store.commit(messages);
             store.turns[id].tokens = tokens;
             store.assemble(budget, None).expect("the latest fits")
         })
@@ -1178,6 +1194,210 @@ async fn the_host_record_and_the_transport_of_a_long_session_are_measured() {
     assert!(longest < RESULT + 1024, "one line is one turn: {longest}");
 }
 
+/// A reply that reasons, signed as Anthropic signs its thinking, then makes
+/// call `id`, which its reasoning names too.
+fn reasoned_call(id: &str) -> Message {
+    use rig::completion::message::Reasoning;
+
+    Message::Assistant {
+        id: None,
+        content: OneOrMany::many([
+            AssistantContent::Reasoning(Reasoning::new_with_signature(id, Some("sig".into()))),
+            AssistantContent::tool_call(id, tool::NAME, json!({"source": id})),
+        ])
+        .expect("two parts"),
+    }
+}
+
+/// A reply of `reasoning` alone.
+fn thinking_alone(reasoning: rig::completion::message::Reasoning) -> Message {
+    Message::Assistant {
+        id: None,
+        content: OneOrMany::one(AssistantContent::Reasoning(reasoning)),
+    }
+}
+
+/// The calls whose reasoning `sent` carries, in order.
+fn reasoned(sent: &[Message]) -> Vec<String> {
+    sent.iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            AssistantContent::Reasoning(reasoning) => Some(reasoning.display_text()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Commit `turns` turns, each a reasoned call `c<n>` and its result priced
+/// 10, to the round `store` has open, and assemble a call after each, held
+/// to `budget`.
+fn reasoned_round(
+    store: &mut Store,
+    turns: usize,
+    budget: &Budget,
+) -> Vec<(Vec<Message>, Manifest)> {
+    let first = store.turns.len();
+    let turns = (first..first + turns).map(|n| {
+        let call = format!("c{n}");
+        (
+            vec![reasoned_call(&call), Message::tool_result(&call, "ok")],
+            10,
+        )
+    });
+    calls_of(store, turns, budget)
+}
+
+/// To Anthropic, a call leaves out the thinking a change to what came before
+/// it made stale, which the API would refuse as bound to another
+/// conversation: from the first turn a cut changed what came before, on. The
+/// thinking before that, and of every turn produced since, still goes, and
+/// between cuts each request begins with the one before it. A turn once stale
+/// stays stale.
+#[test]
+fn a_cut_leaves_out_the_thinking_it_made_stale_and_no_more() {
+    use super::LeftOut;
+    use crate::agent::budget::Wire;
+
+    let anthropic = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", 100)
+    };
+    let mut store = Store::default();
+    store.begin_round(Message::user("round 1"));
+    let calls = reasoned_round(&mut store, 30, &anthropic);
+
+    for (n, (sent, manifest)) in calls.iter().enumerate() {
+        assert_eq!(&store.reconstruct(manifest), sent, "call {n}");
+    }
+    for (n, pair) in calls.windows(2).enumerate() {
+        let ((before, _), (after, manifest)) = (&pair[0], &pair[1]);
+        if manifest.cut.is_none() {
+            assert!(after.starts_with(before), "call {}", n + 1);
+        }
+    }
+    // Cut at calls 10, 15, 20 and 25, each to the opening turn and the
+    // newest four. At the first, the opening turn's thinking stays, and the
+    // rest it keeps goes.
+    let (sent, manifest) = &calls[10];
+    assert_eq!(ids(&manifest.carried), [0, 6, 7, 8, 9, 10]);
+    assert_eq!(reasoned(sent), ["c0"]);
+    assert_eq!(
+        manifest.left_out,
+        (6..=10)
+            .map(|turn| LeftOut {
+                turn,
+                message: 0,
+                part: 0
+            })
+            .collect::<Vec<_>>()
+    );
+    // What the cut's own call produced is sent with its thinking.
+    assert_eq!(reasoned(&calls[11].0), ["c0", "c11"]);
+    // The last call, after the cut at 25: the opening turn and every turn
+    // produced since keep their thinking; the four the cut kept do not.
+    let (sent, manifest) = calls.last().expect("thirty calls");
+    assert_eq!(
+        ids(&manifest.carried),
+        [0, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    );
+    assert_eq!(reasoned(sent), ["c0", "c26", "c27", "c28", "c29"]);
+}
+
+/// An OpenAI-compatible provider's reasoning carries no binding to the
+/// conversation, so a call to one is sent all of it, cut or not.
+#[test]
+fn a_cut_leaves_every_turns_thinking_to_an_openai_compatible_call() {
+    let mut store = Store::default();
+    store.begin_round(Message::user("round 1"));
+    let calls = reasoned_round(&mut store, 30, &Budget::with_room("m", 100));
+    let (sent, manifest) = calls.last().expect("thirty calls");
+    assert!(manifest.left_out.is_empty(), "{manifest:?}");
+    assert_eq!(
+        reasoned(sent),
+        ids(&manifest.carried)
+            .iter()
+            .map(|id| format!("c{id}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A round whose window moves past a middle round changes what came before
+/// every turn after the gap, so their thinking goes; the first rounds', before
+/// it, stays.
+#[test]
+fn a_window_that_moves_on_leaves_out_the_thinking_after_the_gap() {
+    use crate::agent::budget::Wire;
+
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    let anthropic = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", ROOMY)
+    };
+    let mut sent = Vec::new();
+    for round in 1..=4 {
+        store.begin_round(Message::user(format!("round {round}")));
+        let call = format!("c{round}");
+        store.commit(vec![
+            reasoned_call(&call),
+            Message::tool_result(&call, "ok"),
+        ]);
+        sent.push(store.assemble(&anthropic, None).expect("room").0);
+        store.commit(vec![Message::assistant(format!("done {round}"))]);
+    }
+    // Round 3's window is rounds 1 and 2, as round 2's was round 1: it only
+    // grew. Round 4's is rounds 1 and 3, so round 3's turns follow round 1's
+    // where round 2's were.
+    assert_eq!(reasoned(&sent[2]), ["c1", "c2", "c3"]);
+    assert_eq!(reasoned(&sent[3]), ["c1"]);
+}
+
+/// A turn a call to Anthropic sends nothing of -- another provider's thinking
+/// alone -- changes nothing before what follows it, so promoting one leaves
+/// the thinking after it be, on that call and every later one.
+#[test]
+fn a_promotion_sent_as_nothing_leaves_the_thinking_after_it() {
+    use rig::completion::message::Reasoning;
+
+    use crate::agent::budget::Wire;
+
+    // Round 2 closes on an OpenAI-compatible model's thinking alone.
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    round_of_calls(&mut store, "round 1", &[], Some("done"));
+    round_of_calls(&mut store, "round 2", &["a"], None);
+    store.commit(vec![thinking_alone(Reasoning::new("mulling"))]);
+    round_of_calls(&mut store, "round 3", &[], Some("done"));
+    store.begin_round(Message::user("round 4"));
+    let anthropic = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", ROOMY)
+    };
+    store.assemble(&anthropic, None).expect("room");
+
+    store.commit(vec![reasoned_call("c4"), Message::tool_result("c4", "ok")]);
+    promote(&mut store, &[2]);
+    let (sent, manifest) = store.assemble(&anthropic, None).expect("room");
+    assert_eq!(ids(&manifest.carried), [0, 2, 3, 4]);
+    assert_eq!(reasoned(&sent), ["c4"]);
+    let (sent, _) = reasoned_round(&mut store, 1, &anthropic).remove(0);
+    assert_eq!(reasoned(&sent), ["c4", "c5"]);
+}
+
 /// A call is sent only the reasoning its provider can take back. To
 /// Anthropic, an unsigned block -- another provider's -- is left out, and with
 /// it a reply of nothing else; Anthropic's own signed block goes as it came.
@@ -1385,6 +1605,83 @@ fn a_cut_keeps_what_a_strict_view_withholds_withheld() {
             .last()
             .is_some_and(|(_, manifest)| manifest.cut.is_none())
     );
+}
+
+/// A turn a strict view withholds so the roles alternate changes nothing a
+/// call is sent, so the thinking after it is not stale. Once a call is sent
+/// it, the thinking after it is.
+#[test]
+fn a_withheld_turn_makes_the_thinking_after_it_stale_only_once_it_is_sent() {
+    use crate::agent::budget::Wire;
+
+    let mut store = one_round_cut_short();
+    store.begin_round(Message::user("round 5"));
+    let anthropic = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", ROOMY)
+    };
+    let strict = anthropic.clone().strict();
+    store.assemble(&strict, None).expect("room");
+
+    // Round 5's first turn promotes round 2's second, which alone opens on a
+    // call right after round 1's reply, and is withheld.
+    store.commit(vec![reasoned_call("c7"), Message::tool_result("c7", "ok")]);
+    promote(&mut store, &[2]);
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
+    assert_eq!(manifest.withheld, [(2, Why::Promoted)]);
+    assert_eq!(reasoned(&sent), ["c7"]);
+
+    // A model that takes the roles as they come is sent it, before round 4's
+    // turn and round 5's.
+    let (sent, manifest) = store.assemble(&anthropic, None).expect("room");
+    assert_eq!(ids(&manifest.carried), [0, 2, 6, 7]);
+    assert!(reasoned(&sent).is_empty(), "{sent:#?}");
+}
+
+/// Where the roles must alternate, a reply of thinking alone that goes stale
+/// leaves its turn with neither role, and the results before it answered by
+/// nothing, so the view withholds them -- which changes what comes before
+/// what follows too. The call is sent what alternates.
+#[test]
+fn a_strict_view_withholds_the_results_stale_thinking_answered() {
+    use rig::completion::message::Reasoning;
+
+    use crate::agent::budget::Wire;
+
+    // Rounds 1 and 2 close on text, and round 3 on thinking alone after its
+    // one call.
+    let mut store = Store {
+        window: Window {
+            first: 1,
+            recent: 1,
+        },
+        ..Store::default()
+    };
+    round_of_calls(&mut store, "round 1", &[], Some("done"));
+    round_of_calls(&mut store, "round 2", &[], Some("done"));
+    store.begin_round(Message::user("round 3"));
+    store.commit(vec![reasoned_call("c2"), Message::tool_result("c2", "ok")]);
+    store.commit(vec![thinking_alone(Reasoning::new_with_signature(
+        "r3",
+        Some("sig".into()),
+    ))]);
+    store.begin_round(Message::user("round 4"));
+    let strict = Budget {
+        wire: Wire::Anthropic,
+        ..Budget::with_room("m", ROOMY)
+    }
+    .strict();
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
+    assert_eq!(ids(&manifest.carried), [0, 2, 3]);
+    assert_eq!(reasoned(&sent), ["c2", "r3"]);
+
+    // Round 2, promoted, comes before round 3, whose thinking goes stale.
+    promote(&mut store, &[1]);
+    let (sent, manifest) = store.assemble(&strict, None).expect("room");
+    assert_eq!(manifest.withheld, [(2, Why::Recent)]);
+    assert!(reasoned(&sent).is_empty(), "{sent:#?}");
+    assert!(alternates(&sent), "{:?}", roles(&sent));
+    assert_eq!(store.reconstruct(&manifest), sent);
 }
 
 /// The turn a call answers is never withheld. When the budget leaves out the

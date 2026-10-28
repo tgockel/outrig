@@ -101,10 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call of the round is sent what the cut kept and every turn since, until that does not fit either,
   so each request begins as the one before it did and a provider's prompt cache can match it; a new
   round, a promotion, or a demotion chooses afresh, and `model.call`'s `cut` names the call that
-  cut. A call to an `anthropic` model asks the API, under the `thinking-binding-controls-2026-08-01`
-  beta, to drop a thinking block whose conversation a cut changed rather than refuse the call
-  (`drop_block`). (#666) A provider's refusal of a call whose shortened history put one role after
-  itself says so, and names that provider row's `role-alternation` as the remedy.
+  cut. (#666) A call to an `anthropic` model leaves out the thinking of the first turn whose earlier
+  context a call changed, and of every turn after it, for good, since the API refuses a thinking
+  block sent back after that; the thinking before it, and of turns produced since, still goes. It
+  also asks the API to drop such a block all the same (`drop_block`, under the
+  `thinking-binding-controls-2026-08-01` beta), and an endpoint that refuses that is sent the call
+  again without it, as every later one to it goes. (#750) A provider's refusal of a call whose
+  shortened history put one role after itself says so, and names that provider row's
+  `role-alternation` as the remedy.
 
   Each model call retries a provider's transient failures -- a `408`, `425`, `429`, or any `5xx`
   (Anthropic's `529` and Cloudflare's `520`-`527` among them), honoring `Retry-After`, a dropped

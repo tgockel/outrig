@@ -179,9 +179,15 @@ so the estimate has to happen before the call.
   whether a provider caches, and a cut costs one that does not only the context it leaves out.
 - On the `anthropic` style, a cut changes what came before each turn it keeps, as a round's
   window moving on or a promotion does, and Anthropic's newer models refuse a thinking block
-  sent back after that. Each call asks for `prefix_mismatch_behavior: "drop_block"` under the
-  `thinking-binding-controls-2026-08-01` beta, so the API leaves such a block, and every one
-  after it, out instead. A model or endpoint that refuses the field is #750.
+  sent back after that. So a call leaves out the thinking of the first turn whose earlier context
+  changed, and of every turn after it, and the store records each so it stays out: a block put
+  back would break those produced while it was gone. Thinking before the change, and of every
+  turn produced since, still goes. Each call also asks for `prefix_mismatch_behavior:
+  "drop_block"`, under the `thinking-binding-controls-2026-08-01` beta, as a backstop for a
+  change the store does not see; an endpoint that refuses that is sent the call again without
+  it, and every later one goes without (#750). The API's drop alone, as this was in #666, held
+  for one request: the stale blocks went out again with every call, and each took every block
+  after it, so nothing the model thought after a cut came back to it.
 - The turn a call answers is never left out. When it alone does not fit, the call is not made, and
   the round ends naming the turn; the next round is an ordinary one that leaves it out.
 
