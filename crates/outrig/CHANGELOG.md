@@ -67,6 +67,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Running outrig as uid 0 no longer rehomes the container's `root` entry to `/home/root`.**
+  `Container::bootstrap_user` gave the user at the host uid the home `/home/<name>` and rewrote a
+  reused `/etc/passwd` entry to name it -- a rule made for the entry podman's `--userns=keep-id`
+  plants, whose home is the container's working directory. keep-id plants none for a root caller,
+  so at uid 0 (`sudo outrig run`, a root CI runner) the entry it reused was the image's own
+  `root:x:0:0:root:/root:...`: bootstrap created `/home/root`, rewrote root's home to it, and gave
+  every exec -- and a `view = "primary"` sidecar's payload, through `Container::home_dir` --
+  `HOME=/home/root`, where nothing the Dockerfile had left under `/root` (`~/.cargo`, dotfiles)
+  was found. At uid 0 the home is now the one the image's entry names, `/root` in nearly every
+  base image, and the entry is left as it is. An image with no uid-0 entry gets one naming
+  `/root`, and an entry whose home is not a plain absolute path below `/` -- empty, relative,
+  `/` itself, a `.`, `..` or empty part such as a trailing `/`, or not UTF-8 -- is pointed at
+  `/root`. So is an entry podman planted rather than the image: an image with no root account
+  does get one from podman's `--user` handling, appended to the container's own file and naming
+  the container's working directory (the checkout for a primary, the image's `WORKDIR` for a
+  sidecar with no workspace), and keeping it would put root's caches in the checkout, or have the
+  bootstrap `chown` the developer's directory, or whatever is mounted over `WORKDIR`, to root.
+  An entry in a file `podman diff` lists as changed is taken for podman's, asked before the
+  bootstrap opens the file read-write, which copies it into the container's layer; a diff that
+  cannot be had counts as a change. So an image's own root home is kept in a container just
+  started, even when it is the image's `WORKDIR`, but a container bootstrapped before, such as
+  one borrowed with `outrig mcp --attach`, reads as changed and gets `/root`. So is a home inside
+  the workspace, however the workspace's path is spelled: a `container-path` of `/var/../root` is
+  `/root`, where podman mounts it. With the workspace at `/root` itself, root's home is
+  `/home/<name>`, as it was. The home is made like any other, so a `/root` that is a symlink (an
+  ostree-based image) or a file fails the bootstrap naming the path, where it used to be passed over
+  for `/home/root`. Every other uid is unchanged: `/home/<name>`. (#399)
+- **A home that already belongs to the user is no longer `chown`ed.** `Container::bootstrap_user`
+  handed the home directory to the session user with an `fchown` whether or not it was theirs
+  already. On a home that is a read-only mount -- a tools directory mounted over `/root`, or over
+  `/home/<user>` -- that no-op failed with `EROFS`, and the bootstrap with it: "bootstrapping the
+  runtime user failed at chown the home directory". It now compares the owner of the directory it
+  opened with the uid and gid it wants, and skips the `chown` when they match; a home owned by
+  anyone else is handed over as before. A uid or gid that is the kernel's overflow id (65534 unless
+  the host changed it) is never matched: an owner the container's user namespace has no mapping for
+  reads as that id too, so the `chown` is tried and reports it. (#399)
 - **A `-v` transcript that cannot be written no longer fails the command it records.** A full disk
   or a closed stderr made the transcript's write fail, and `capture_stream` -- having drained the
   stream -- returned that error in place of the captured output, as did the `$ <command>` echo

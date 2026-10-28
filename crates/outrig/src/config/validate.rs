@@ -2211,8 +2211,10 @@ fn has_field_separator(path: &Path) -> bool {
 /// An absolute in-container path with `.` and `..` folded by component, the way
 /// podman cleans a destination before it compares them. `..` at the root stays
 /// at the root. Lexical: there is no filesystem to resolve against, and
-/// `Path` equality alone never folds `..`.
-fn fold_container_path(path: &Path) -> PathBuf {
+/// `Path` equality alone never folds `..`. A relative path folds as if it were
+/// absolute, so an empty one is `/`: a caller that treats empty as "none" says
+/// so before it folds.
+pub(crate) fn fold_container_path(path: &Path) -> PathBuf {
     let mut folded = PathBuf::from("/");
     for component in path.components() {
         match component {

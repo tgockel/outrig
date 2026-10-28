@@ -269,17 +269,19 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
 /// Pass 2: `mkdir -p` the home directory inside the container -- stricter
 /// about the home directory itself, see [`make_home`] -- and give it to
 /// `uid`:`gid`. Created inside the container's user namespace it would
-/// otherwise belong to the container's root.
+/// otherwise belong to the container's root. A home that already belongs to
+/// them is left as it is.
 pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(), NsError> {
     let ns = open_ns(pid)?;
     let dirs = mkdir_p_paths(home)?;
+    let overflow = (overflow_id("overflowuid"), overflow_id("overflowgid"));
 
     let (status, _fds) = nsfork::fork_collect(|sock| {
         if let Err((step, errno)) = ns.enter() {
             reply_failure(sock, step.into(), errno);
             return;
         }
-        let status = match make_home(&dirs, uid, gid) {
+        let status = match make_home(&dirs, uid, gid, overflow) {
             Ok(()) => nsfork::Status::OK,
             Err((step, errno)) => nsfork::Status::failed(step as u32, errno),
         };
@@ -304,7 +306,8 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 }
 
 /// Create each of `dirs` in turn, then give the last of them -- the home
-/// directory -- to `uid`:`gid`. Runs in the forked child: syscalls only.
+/// directory -- to `uid`:`gid`, unless it is theirs already. Runs in the
+/// forked child: syscalls only.
 ///
 /// Anything already at an ancestor is fine: `/home` as a symlink to a
 /// directory is a normal layout, and a non-directory fails the next `mkdir`
@@ -316,6 +319,12 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 /// O_NOFOLLOW` and changing ownership through that descriptor settles both in
 /// one step, with no window between the check and the `chown`.
 ///
+/// The `chown` is skipped when that descriptor's owner is already `uid`:`gid`
+/// ([`owned_by`], given the `overflow` ids): it would change nothing, and it
+/// fails with `EROFS` on a home that is a read-only mount -- the image's own
+/// `/root` with a tools directory mounted over it, say -- aborting a bootstrap
+/// with nothing wrong. Anything not theirs is still handed over, mount or not.
+///
 /// The `mkdir`s run under a cleared `umask`, restored before returning (#397):
 /// a hardened `027` on a base image without `/home` would otherwise leave
 /// `mkdir(dir, 0o755)` at `0750 root:root`, untraversable by the very user
@@ -323,7 +332,12 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 /// forked, single-threaded child -- [`create_home`] guarantees that in
 /// production, and the test exercising this below forks one of its own
 /// rather than touching the test binary's shared umask directly.
-fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), (NsStep, i32)> {
+fn make_home(
+    dirs: &[CString],
+    uid: u32,
+    gid: u32,
+    overflow: (u32, u32),
+) -> Result<(), (NsStep, i32)> {
     let previous_umask = unsafe { libc::umask(0) };
     for dir in dirs {
         let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
@@ -343,13 +357,43 @@ fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), (NsStep, i32)> 
     if fd == -1 {
         return Err((NsStep::OpenHome, nsfork::errno()));
     }
-    let result = if unsafe { libc::fchown(fd, uid, gid) } == -1 {
+    let result = if !owned_by(fd, uid, gid, overflow) && unsafe { libc::fchown(fd, uid, gid) } == -1
+    {
         Err((NsStep::Chown, nsfork::errno()))
     } else {
         Ok(())
     };
     nsfork::close_fd(fd);
     result
+}
+
+/// Whether the file open at `fd` already belongs to `uid`:`gid`, as the
+/// container's user namespace sees them -- the ids `fchown` takes. A failed
+/// `fstat` is a no, which leaves the `chown` to report what is wrong.
+///
+/// So is a `uid` or `gid` equal to its `overflow` id, the one the kernel
+/// shows for an owner the namespace has no mapping for: a user that is
+/// itself that id cannot tell its own file from one that belongs to somebody
+/// unmapped, and trusting the match would report success for a home it cannot
+/// write. The `chown` then decides. Runs in the forked child: syscalls only.
+fn owned_by(fd: RawFd, uid: u32, gid: u32, (overflow_uid, overflow_gid): (u32, u32)) -> bool {
+    if uid == overflow_uid || gid == overflow_gid {
+        return false;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    rc == 0 && st.st_uid == uid && st.st_gid == gid
+}
+
+/// The kernel's `overflowuid` or `overflowgid`, per `sysctl`: the id it shows for
+/// an owner a user namespace has no mapping for, 65534 unless the host set it.
+/// Read in the parent, before the fork: the child is limited to raw syscalls and
+/// cannot parse a number.
+fn overflow_id(sysctl: &str) -> u32 {
+    std::fs::read_to_string(format!("/proc/sys/kernel/{sysctl}"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(65534)
 }
 
 /// The container's namespace files, opened in the parent so that a failure to
@@ -452,24 +496,31 @@ mod tests {
     /// copy, invisible to and unaffected by every other thread, so isolating
     /// it there is isolation for the whole test binary, not just this test.
     fn make_home_at(home: &Path) -> Result<(), NsError> {
-        make_home_at_under(home, None)
+        make_home_at_under(home, None, own_ids(), NO_OVERFLOW)
     }
+
+    /// An `overflow` for a test that is not about it: `(uid_t)-1` is no one's id,
+    /// so no owner can read as it, which is not true of the real `65534` in a
+    /// user namespace that maps only the caller.
+    const NO_OVERFLOW: (u32, u32) = (u32::MAX, u32::MAX);
 
     /// [`make_home_at`], additionally setting `umask` in the forked child
     /// before [`make_home`] runs -- a stand-in for a restrictive host shell,
-    /// set where only the child can see it.
+    /// set where only the child can see it -- giving the home to `(uid, gid)`,
+    /// and reading an unmapped owner as `overflow`.
     fn make_home_at_under(
         home: &Path,
         umask_override: Option<libc::mode_t>,
+        (uid, gid): (u32, u32),
+        overflow: (u32, u32),
     ) -> Result<(), NsError> {
-        let (uid, gid) = own_ids();
         let dirs = mkdir_p_paths(home).expect("paths");
 
         let (status, _fds) = nsfork::fork_collect(|sock| {
             if let Some(mask) = umask_override {
                 unsafe { libc::umask(mask) };
             }
-            let status = match make_home(&dirs, uid, gid) {
+            let status = match make_home(&dirs, uid, gid, overflow) {
                 Ok(()) => nsfork::Status::OK,
                 Err((step, errno)) => nsfork::Status::failed(step as u32, errno),
             };
@@ -502,6 +553,118 @@ mod tests {
         make_home_at(&home).expect("existing home");
     }
 
+    /// A home that already belongs to the user it is for is not `chown`ed. A
+    /// `chown` that changes nothing still fails with `EROFS` on a read-only
+    /// mount, which cannot be made without privilege, so `/proc` stands in: the
+    /// one directory every Linux host has that an unprivileged caller does not
+    /// own, and so cannot `chown` even to the owner it has (`EPERM`).
+    #[test]
+    fn a_home_that_already_belongs_to_its_user_is_not_chowned() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let owner = std::fs::metadata("/proc").expect("stat /proc");
+        make_home_at_under(
+            Path::new("/proc"),
+            None,
+            (owner.uid(), owner.gid()),
+            NO_OVERFLOW,
+        )
+        .expect("a home owned by the user it is for needs no chown");
+    }
+
+    /// An owner that reads as an overflow id may be anyone the namespace has no
+    /// mapping for, so for a user or group that is that id it proves nothing: the
+    /// `chown` is still tried, and reports what it finds. In a user namespace
+    /// mapping one id, `/proc` is such a case, owned by an unmapped root; in the
+    /// host's it is root's, so its own ids stand in for overflow ones, one at a
+    /// time.
+    #[test]
+    fn a_home_owned_by_an_overflow_id_is_still_chowned() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if nix::unistd::geteuid().is_root() {
+            return; // root may give `/proc` away; there is no failure to see
+        }
+        let owner = std::fs::metadata("/proc").expect("stat /proc");
+        let ids = (owner.uid(), owner.gid());
+        for overflow in [(ids.0, NO_OVERFLOW.1), (NO_OVERFLOW.0, ids.1)] {
+            let err = make_home_at_under(Path::new("/proc"), None, ids, overflow)
+                .expect_err("a match on an overflow id is no proof, and /proc refuses");
+            assert_eq!(err.step, NsStep::Chown, "{overflow:?}: {err}");
+        }
+    }
+
+    /// The skip is for an owner that matches: a home that belongs to someone
+    /// else is still handed over, so one the caller may not give away fails at
+    /// the `chown`.
+    #[test]
+    fn a_home_that_belongs_to_another_user_is_still_chowned() {
+        if nix::unistd::geteuid().is_root() {
+            // Root can give a directory to anyone, so there is no failure to see.
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (uid, gid) = own_ids();
+        let err = make_home_at_under(tmp.path(), None, (uid + 1, gid), NO_OVERFLOW)
+            .expect_err("a chown to another user");
+        assert_eq!(err.step, NsStep::Chown, "{err}");
+        // `EINVAL` where the other user is not mapped, as in a user namespace
+        // that maps the caller and no one else.
+        let errno = err.source.raw_os_error();
+        assert!(matches!(errno, Some(libc::EPERM | libc::EINVAL)), "{err}");
+    }
+
+    #[test]
+    fn owned_by_wants_both_ids_to_match() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = std::fs::File::open(tmp.path()).expect("open the directory");
+        let meta = dir.metadata().expect("stat the directory");
+        let (uid, gid) = (meta.uid(), meta.gid());
+
+        assert!(owned_by(dir.as_raw_fd(), uid, gid, NO_OVERFLOW));
+        assert!(!owned_by(dir.as_raw_fd(), uid + 1, gid, NO_OVERFLOW));
+        assert!(!owned_by(dir.as_raw_fd(), uid, gid + 1, NO_OVERFLOW));
+        assert!(
+            !owned_by(-1, uid, gid, NO_OVERFLOW),
+            "a failed fstat is not ownership"
+        );
+    }
+
+    /// A user or group that is the overflow id cannot tell its own file from an
+    /// unmapped owner's, which reads as that id too (#399): either one alone is
+    /// enough to make a match no proof.
+    #[test]
+    fn owned_by_does_not_trust_a_match_on_an_overflow_id() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = std::fs::File::open(tmp.path()).expect("open the directory");
+        let meta = dir.metadata().expect("stat the directory");
+        let (uid, gid) = (meta.uid(), meta.gid());
+        let fd = dir.as_raw_fd();
+
+        assert!(owned_by(fd, uid, gid, (u32::MAX, u32::MAX)));
+        assert!(owned_by(fd, uid, gid, (uid + 1, gid + 1)));
+        assert!(!owned_by(fd, uid, gid, (uid, gid)));
+        assert!(!owned_by(fd, uid, gid, (uid, u32::MAX)), "the uid alone");
+        assert!(!owned_by(fd, uid, gid, (u32::MAX, gid)), "the gid alone");
+    }
+
+    /// The overflow ids are the sysctls' values, and 65534 -- the kernel's own
+    /// default -- where a host does not show them.
+    #[test]
+    fn overflow_ids_are_what_the_kernel_reports() {
+        for sysctl in ["overflowuid", "overflowgid"] {
+            let reported = std::fs::read_to_string(format!("/proc/sys/kernel/{sysctl}"))
+                .map_or(65534, |text| text.trim().parse().expect("a number"));
+            assert_eq!(overflow_id(sysctl), reported, "{sysctl}");
+        }
+    }
+
     /// A hardened `umask 027` must not survive into the home directory's
     /// mode: `mkdir(dir, 0o755)` with that umask in force yields `0750`,
     /// untraversable by the very user it was created for (#397). The umask
@@ -514,7 +677,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home/dev");
 
-        make_home_at_under(&home, Some(0o027)).expect("home created under a restrictive umask");
+        make_home_at_under(&home, Some(0o027), own_ids(), NO_OVERFLOW)
+            .expect("home created under a restrictive umask");
 
         let mode = std::fs::metadata(&home)
             .expect("stat home")

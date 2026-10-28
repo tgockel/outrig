@@ -109,6 +109,10 @@ pub struct Container {
     /// In-container user name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
     user_name: Option<String>,
+    /// In-container home directory of that user, resolved by
+    /// [`Container::bootstrap_user`]: the `HOME` of every exec. `None` until
+    /// bootstrap has run.
+    home: Option<String>,
     /// In-container group name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
     group_name: Option<String>,
@@ -885,6 +889,7 @@ impl Container {
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
             user_name: None,
+            home: None,
             group_name: None,
             transcript,
             ownership,
@@ -1199,9 +1204,12 @@ impl Container {
     /// The in-container home directory of the bootstrapped user, or `None`
     /// before [`Container::bootstrap_user`] has run. The same path
     /// `Container::build_exec_argv` gives every exec-stdio server as `HOME`,
-    /// so a sidecar that takes it from here cannot disagree with them.
+    /// so a sidecar that takes it from here cannot disagree with them. It is
+    /// `/home/<user>`, except for uid 0, whose home is the one the image's
+    /// own `root` entry names -- `/root` in nearly every image -- when that
+    /// will do; see [`Container::bootstrap_user`].
     pub fn home_dir(&self) -> Option<String> {
-        self.user_name.as_deref().map(userdb::home_dir)
+        self.home.clone()
     }
 
     pub fn group_name(&self) -> Option<&str> {
@@ -1221,6 +1229,31 @@ impl Container {
     /// [`Container::home_dir`], though -- podman's names the container's
     /// working directory, which for a primary is the user's checkout -- except
     /// in a container from [`Container::attach`], whose file is left alone.
+    ///
+    /// That home is `/home/<user>`, except at uid 0, where it is the one the
+    /// image's `root` entry names -- `/root` in nearly every image, and where
+    /// the image put what root uses -- and the entry is left as it is. Root's
+    /// home is `/root` instead when the image has no entry for root, when the
+    /// entry's is not a plain absolute path below `/` (empty, relative, `/`
+    /// itself, a `.`, `..` or empty part, not UTF-8), or when it is the
+    /// workspace or inside it, however the workspace's path is spelled; the
+    /// entry is then written or pointed at `/root`. A workspace at `/root`
+    /// leaves `/home/<user>`.
+    ///
+    /// The entry has to be the image's, though. `--userns=keep-id` plants none
+    /// for a root caller, but for an image with no account at uid 0 the
+    /// `--user` it implies does, naming the container's working directory (the
+    /// checkout for a primary, the image's `WORKDIR` otherwise), which is no
+    /// home to make and `chown`. Podman appends it to the container's own file,
+    /// so `podman diff` lists `/etc/passwd` as changed, and an entry in a file
+    /// that changed is taken for podman's: root's home is `/root`, as when the
+    /// image has no entry. That is asked before this opens the file, which
+    /// copies it into the layer whether or not anything is written, and a diff
+    /// that cannot be had counts as a change. So a container this crate
+    /// bootstrapped before -- one borrowed with `outrig mcp --attach` --
+    /// already reads as changed, and gets `/root` even when the image's own
+    /// root home is elsewhere. A home that already belongs to the user is not
+    /// `chown`ed, so one that is a read-only mount does not fail the bootstrap.
     ///
     /// Records the resolved names on the struct for
     /// [`Container::exec_stdio`] to reference. Must be called once, after
@@ -1244,15 +1277,18 @@ impl Container {
         );
 
         let pid = self.pid().await?;
+        // Asked before the databases are opened: `passwd_changed` says why. Only
+        // root's home comes from the entry, so only there can it be podman's.
+        let planted = self.uid == 0 && self.passwd_changed().await;
         let db = namespace::open_user_db(pid)
             .map_err(|e| self.bootstrap_failed(e.step.label_for(pid), e.source))?;
 
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
-        // On the reuse path the name, and so the home directory, is whatever
-        // the image put at the host uid -- so it has to be checked before it
-        // becomes a path, and the path goes in the error after that.
+        // On the reuse path the name, and so (root aside) the home directory,
+        // is whatever the image put at the host uid -- so it has to be checked
+        // before it becomes a path, and the path goes in the error after that.
         if !userdb::is_path_component(&user_name) {
             return Err(self.bootstrap_failed(
                 format!(
@@ -1265,11 +1301,23 @@ impl Container {
                 ),
             ));
         }
-        let home = userdb::home_dir(&user_name);
+        let passwd = namespace::Db::Passwd;
+        let raw = db
+            .read_raw(passwd)
+            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
+        // An entry podman planted is no home of the image's: read the file as if
+        // the image had none for root.
+        let image_passwd: &[u8] = if planted { &[] } else { &raw };
+        let home = userdb::home_dir(
+            image_passwd,
+            self.uid,
+            &user_name,
+            &self.container_workspace,
+        );
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid).map_err(|e| {
             self.bootstrap_failed(format!("{} ({home})", e.step.label_for(pid)), e.source)
         })?;
-        self.reconcile_home(&db, &home).await?;
+        self.reconcile_home(&db, &raw, &home).await?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",
@@ -1278,8 +1326,24 @@ impl Container {
         .await;
 
         self.user_name = Some(user_name);
+        self.home = Some(home);
         self.group_name = Some(group_name);
         Ok(())
+    }
+
+    /// Whether `podman diff` lists `/etc/passwd` among the container's changes, or
+    /// cannot say. Podman appends the entry it plants to the container's own copy
+    /// of the file, so a file it does not list holds the image's entries alone.
+    /// Ask before anything has opened the file read-write: that copies it up into
+    /// the container's layer, and the diff lists the copy as changed.
+    async fn passwd_changed(&self) -> bool {
+        let diff = Cmd::new("podman")
+            .args(["diff", "--format", "json"])
+            .arg(self.selector());
+        let output =
+            process::run_capture_logged(self.engine_call(diff), "podman", self.transcript.as_ref())
+                .await;
+        output.map_or(true, |output| diff_lists_passwd(&output.stdout))
     }
 
     /// The name at the host's uid (or gid) in one of the container's
@@ -1311,7 +1375,7 @@ impl Container {
         let line = match which {
             namespace::Db::Group => userdb::group_line(&name, id),
             namespace::Db::Passwd => {
-                userdb::passwd_line(&name, id, self.gid, &userdb::home_dir(&name))
+                userdb::passwd_line(&name, id, self.gid, &self.container_workspace)
             }
         };
         db.append(which, &userdb::append_blob(&text, &line))
@@ -1321,9 +1385,10 @@ impl Container {
 
     /// Point the passwd entry at the host uid to `home` if it names another,
     /// so `getpwuid` agrees with the `HOME` every exec gets. Only a reused
-    /// entry can disagree; one this bootstrap appended already names `home`.
-    /// Runs after [`namespace::create_home`], so a home that step refuses
-    /// leaves the file as it was.
+    /// entry can disagree, and root's only when its own home was not kept; one
+    /// this bootstrap appended already names `home`. `raw` is the file `home`
+    /// was settled from. Runs after [`namespace::create_home`], so a home that
+    /// step refuses leaves the file as it was.
     ///
     /// Only in a container this handle started. The rewrite is safe only while
     /// nothing else can be using the file, and a failed one is cleaned up only
@@ -1331,12 +1396,9 @@ impl Container {
     /// --attach`) is already running someone else's processes, and outlives
     /// this handle, so its entry is left as it is. One outrig started was
     /// reconciled by its own bootstrap anyway.
-    async fn reconcile_home(&self, db: &namespace::UserDb, home: &str) -> Result<()> {
+    async fn reconcile_home(&self, db: &namespace::UserDb, raw: &[u8], home: &str) -> Result<()> {
         let passwd = namespace::Db::Passwd;
-        let raw = db
-            .read_raw(passwd)
-            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
-        let Some(rehome) = userdb::rehome(&raw, self.uid, home) else {
+        let Some(rehome) = userdb::rehome(raw, self.uid, home) else {
             return Ok(());
         };
         if self.ownership == ContainerOwnership::Attached {
@@ -1392,8 +1454,8 @@ impl Container {
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
     pub(crate) fn build_exec_argv(&self, cmd: &[String], options: &ExecOptions) -> Cmd {
-        let user_name = self
-            .user_name
+        let home = self
+            .home
             .as_deref()
             .expect("bootstrap_user must be called before build_exec_argv");
 
@@ -1401,7 +1463,7 @@ impl Container {
             .args(["exec", "-i"])
             .arg(format!("--user={}:{}", self.uid, self.gid))
             .arg("--env")
-            .arg(format!("HOME={}", userdb::home_dir(user_name)));
+            .arg(format!("HOME={home}"));
         c = options.env_sources.push(c, &options.env);
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
@@ -2634,6 +2696,17 @@ async fn selinux_enforcing() -> bool {
     }
 }
 
+/// Whether `diff`, the output of `podman diff --format json`, lists
+/// `/etc/passwd` as added or changed. That is an object -- `{}` when nothing
+/// changed, else a list of paths under each kind that has any -- so anything
+/// that is not one is no answer, and counts as listing it: nothing then shows
+/// the file unchanged. The path is looked for as a quoted string, which is how it
+/// appears whatever the kinds are called.
+fn diff_lists_passwd(diff: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(diff);
+    !text.trim_start().starts_with('{') || text.contains("\"/etc/passwd\"")
+}
+
 /// The parent PID in the bytes of a `/proc/<pid>/stat`. `comm`, the second
 /// field, is the kernel's raw task name -- free bytes that may hold spaces,
 /// `)`, or a multibyte character cut mid-sequence by the 15-byte limit -- so
@@ -2729,6 +2802,7 @@ mod tests {
         owned.name = "outrig-a-name-that-can-come-round-again".to_string();
         owned.id = engine_id(id.as_bytes());
         owned.user_name = Some("tester".to_string());
+        owned.home = Some("/home/tester".to_string());
 
         assert_eq!(owned.selector(), id);
         for argv in [
@@ -2745,6 +2819,7 @@ mod tests {
 
         let mut borrowed = Container::stops_cleanly();
         borrowed.user_name = Some("tester".to_string());
+        borrowed.home = Some("/home/tester".to_string());
         assert_eq!(borrowed.selector(), "outrig-test-borrowed");
         for argv in [
             borrowed.build_exec_argv(&["true".to_string()], &ExecOptions::default()),
@@ -4663,10 +4738,116 @@ mod tests {
         let mut container =
             Container::attach("outrig-test-exec", ImageTag::new("local:test"), None, None);
         container.user_name = Some("dev".to_string());
+        container.home = Some("/home/dev".to_string());
         container.group_name = Some("dev".to_string());
         container.uid = 1000;
         container.gid = 1000;
         container
+    }
+
+    /// The home is the one bootstrap resolved, so a root caller's exec gets
+    /// the image's own `/root` -- or whatever its entry names -- and not a
+    /// `/home/root` rebuilt from the name (#399).
+    #[test]
+    fn a_root_handle_execs_with_the_home_bootstrap_resolved() {
+        // The common case, which has not moved.
+        assert_eq!(
+            bootstrapped_container().home_dir().as_deref(),
+            Some("/home/dev")
+        );
+
+        for home in ["/root", "/var/lib/root"] {
+            let mut container = bootstrapped_container();
+            container.user_name = Some("root".to_string());
+            container.home = Some(home.to_string());
+            container.uid = 0;
+            container.gid = 0;
+
+            assert_eq!(container.home_dir().as_deref(), Some(home));
+            let args = argv(container.build_exec_argv(&["id".to_string()], &ExecOptions::new()));
+            let home_env = format!("HOME={home}");
+            assert_eq!(
+                args,
+                vec![
+                    "podman",
+                    "exec",
+                    "-i",
+                    "--user=0:0",
+                    "--env",
+                    home_env.as_str(),
+                    "outrig-test-exec",
+                    "id",
+                ]
+            );
+        }
+    }
+
+    /// Before bootstrap there is no home to hand a sidecar, and an exec has no
+    /// user to run as.
+    #[test]
+    #[should_panic(expected = "bootstrap_user must be called before build_exec_argv")]
+    fn an_exec_before_bootstrap_panics() {
+        let container =
+            Container::attach("outrig-test-exec", ImageTag::new("local:test"), None, None);
+        assert_eq!(container.home_dir(), None);
+        container.build_exec_argv(&["true".to_string()], &ExecOptions::new());
+    }
+
+    /// `podman diff --format json` prints an object with the paths under each
+    /// kind that has any, and `{}` for no change at all: `/etc/passwd` counts when
+    /// it is listed, and only that exact path. Anything that is not such an object
+    /// is not an answer, and shows nothing unchanged.
+    #[test]
+    fn the_diff_lists_passwd_when_it_is_added_or_changed() {
+        for (diff, listed) in [
+            ("{}", false),
+            ("\n {}\n", false),
+            (r#"{"changed":["/etc/group"],"added":["/data"]}"#, false),
+            (r#"{"changed":["/etc","/etc/group","/etc/passwd"]}"#, true),
+            (r#"{"added":["/etc/passwd"]}"#, true),
+            (r#"{"changed":null,"added":[]}"#, false),
+            (
+                r#"{"changed":["/etc/passwd-","/usr/etc/passwd","/etc/passwd/x"]}"#,
+                false,
+            ),
+            // Whatever the kinds are called.
+            (r#"{"modified":["/etc/passwd"]}"#, true),
+            // As podman 4.9.3 prints it, for an image with no account at uid 0.
+            (
+                "{\n     \"changed\": [\n          \"/etc/passwd\"\n     ],\n     \"added\": [\n          \"/data\"\n     ]\n}\n",
+                true,
+            ),
+            ("", true),
+            ("not json", true),
+            ("[]", true),
+            ("null", true),
+            (r#""/etc/passwd""#, true),
+        ] {
+            assert_eq!(diff_lists_passwd(diff.as_bytes()), listed, "{diff:?}");
+        }
+    }
+
+    /// The file counts as changed unless the diff says it did not: an engine that
+    /// fails, or prints something else, cannot vouch for its entries.
+    #[tokio::test]
+    async fn passwd_is_changed_unless_the_diff_says_it_is_not() {
+        let _emitting = crate::process::process_tests::emitting().await;
+        for (diff, changed) in [
+            (Some("{}"), false),
+            (Some(r#"{"changed":["/etc/passwd"]}"#), true),
+            (Some("not json"), true),
+            (None, true),
+        ] {
+            let mut container = Container::stops_cleanly();
+            container.engine_override = vec![(
+                "diff",
+                match diff {
+                    Some(printed) => Cmd::new("/bin/echo").arg(printed),
+                    None => Cmd::new("/bin/false"),
+                },
+            )];
+            assert_eq!(container.passwd_changed().await, changed, "{diff:?}");
+        }
     }
 
     #[test]

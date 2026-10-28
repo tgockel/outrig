@@ -78,9 +78,10 @@ below. `/etc/shadow` gets no entry -- nothing in outrig authenticates as this us
 `useradd` would write is a locked password.
 
 After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to run anything else
--- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>`. Files written under `/workspace`
-therefore appear with your UID/GID on the host. The image itself needs no user setup and no user
-tooling: any base image works, including one with no `useradd`, `groupadd`, or `getent` at all.
+-- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>` (below, for root). Files written under
+`/workspace` therefore appear with your UID/GID on the host. The image itself needs no user setup
+and no user tooling: any base image works, including one with no `useradd`, `groupadd`, or
+`getent` at all.
 
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
@@ -99,12 +100,42 @@ borrowed with `outrig mcp --attach` keeps its entry as it is. The name has to wo
 directory under `/home`: an entry named `.`, `..`, or anything with a `/` in it fails the
 bootstrap with an error naming the entry, and nothing is written or created.
 
-A `/home/<user>` the image already has is reused too, and `chown`ed to you, as long as it is a
-directory. Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a
-directory -- fails the bootstrap with an error naming the path. Taking it anyway would hand every
-tool a `$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it
-points at. `/home` itself may be a symlink to a directory; only the last component is held to
-this.
+A `/home/<user>` the image already has is reused too, as long as it is a directory, and `chown`ed
+to you unless it is yours already, so a read-only mount of your own directory there is fine. (A
+user or group that is the kernel's overflow id, 65534 unless the host changed it, cannot tell its
+own directory from one that belongs to someone the container has no mapping for, which reads as
+that id too, so for those the `chown` is always tried.)
+Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a directory --
+fails the bootstrap with an error naming the path. Taking it anyway would hand every tool a
+`$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it points at.
+`/home` itself may be a symlink to a directory; only the last component is held to this.
+
+Running outrig as root (uid 0, for example `sudo outrig run`) is the exception to the home rules
+above. The entry at uid 0 is normally the image's own `root`, whose home is where the
+Dockerfile's `RUN` steps left root's dotfiles and toolchains: `/root` in nearly every base image.
+That entry keeps its home, nothing in the file is rewritten, and every exec gets that home as
+`HOME` instead of `/home/root`. The directory is created if it is missing, and handed to root
+unless it is root's already, so a tools directory mounted read-only over `/root` is used as it
+is. A root home that is a file or a symlink fails the bootstrap the same way as any other.
+
+Root's home is `/root` instead in three cases. An image with no uid-0 entry gets one naming
+`/root`. An entry whose home is not a plain absolute path below `/` -- empty, relative, `/`
+itself, with a `.`, `..` or empty part (`//`, a trailing `/`), or not UTF-8 -- is pointed at
+`/root`, as a reused entry's home is pointed at `/home/<name>`. And so is an entry that podman
+planted rather than the image: for an image with no root account, podman's `--user` handling
+appends one, to the container's own `/etc/passwd`, naming the working directory, which is your
+checkout for the primary container and the image's `WORKDIR` for one with no workspace. As root's
+home the first would put root's caches in your repository, and either would have the bootstrap
+`chown` a directory of yours, or one you mounted there, to root. outrig takes the entry for
+podman's when `podman diff` lists `/etc/passwd` among the container's changes, and a diff it cannot
+read counts as a change. It asks before the bootstrap opens the file, which copies it into the
+container's layer whether or not anything is written. So an image's own root home is kept in a
+container outrig has just started, even when it is the image's `WORKDIR`; but a container
+bootstrapped before -- one borrowed with `outrig mcp --attach` after a session started it -- reads
+as changed already, and root's home there is `/root`. The same goes for a home inside the
+checkout, however its path is spelled: a `container-path` of `/var/../root` is `/root`, and that
+is where podman mounts it. When the checkout is mounted at `/root` itself there is no `/root` to
+use, and root's home is `/home/<name>`.
 
 ## What's mounted, what isn't
 

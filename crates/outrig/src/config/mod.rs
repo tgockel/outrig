@@ -30,7 +30,7 @@ pub use validate::{
 };
 pub(crate) use validate::{
     check_entrypoint_hosting, check_env_keys, check_mcp_call_timeout_secs, check_sidecar_image,
-    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
+    check_sidecar_name, check_view_exclusions, fold_container_path, is_valid_mcp_server_name,
     mcp_call_timeout_secs_in_range, mcp_command_is_empty,
 };
 

@@ -80,14 +80,19 @@ works unchanged. What it does need is the two files to already exist and a writa
 base so minimal that it ships neither cannot be bootstrapped, and neither can one without the
 `sleep` the section above describes.
 
-What the image installs has to work for that user. The build runs as root, but outrig execs
-nothing as root: every exec gets your UID and `HOME=/home/<user>` (see
+What the image installs has to work for that user. The build runs as root, but outrig execs as
+you: every exec gets your UID and `HOME=/home/<user>` (see
 [What outrig sets in an exec](#what-outrig-sets-in-an-exec)). Install tools under a shared prefix
 such as `/usr/local`, not into root's home, which is `0700`. A tool that keeps its state under
 `$HOME` by default -- rustup, nvm, pyenv, `pip install --user` -- needs that state pointed at the
 prefix as well, or at run time it looks under your home and finds nothing there; and whatever it
 writes as it works, as cargo does its registry cache, has to be writable by you. The `rust`
 toolchain [`outrig image add`](../usage/image.md#what-gets-written) generates does all of this.
+
+If you run outrig as root, "you" is root: every exec is uid 0, and `HOME` is the home the image's
+`root` entry names -- `/root` in nearly every base image -- not `/home/root`, so what the
+Dockerfile left in root's home is found there. See
+[Workspace](workspace.md#uidgid-runtime-user-mapping).
 
 ### Download for the image's architecture
 
@@ -547,7 +552,9 @@ is running: a forked child joins the container's user namespace, becomes
 its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
 entries before creating `/home/<user>`. No `podman exec` is involved. When podman's `keep-id`
 mapping already planted the entries, nothing is appended, but the planted user entry's home --
-the container's working directory -- is rewritten to `/home/<user>`. A
+the container's working directory -- is rewritten to `/home/<user>`. For uid 0 the image's own
+`root` entry keeps its home; podman plants one only for an image with no root account, naming
+the working directory, and that one is pointed at `/root`. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
@@ -580,7 +587,8 @@ Most real processes -- an exec-hosted MCP server, a command a library caller run
 container through `podman exec`, and that invocation is assembled separately from the run. For
 those, outrig always passes `-i` so stdin stays open for a stdio-speaking server,
 `--user=<uid>:<gid>` with the session's ids, and `--env HOME=/home/<user>` naming the home
-directory the runtime user bootstrap created. Each entry a caller supplies becomes one further
+directory the runtime user bootstrap created -- for uid 0, the home the image's `root` entry
+names, normally `/root`. Each entry a caller supplies becomes one further
 `--env K=V`, emitted in sorted key order so the same inputs always produce the same command line.
 
 **An entrypoint-stdio server is the exception, and gets none of that.** It is the image's own
