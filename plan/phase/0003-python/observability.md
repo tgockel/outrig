@@ -175,6 +175,9 @@ as zero, here and in every event that carries usage: zero is a count the provide
 retires a workaround -- today the failover chain's state is recovered by prefix-matching the
 *error string* it was rendered into.
 
+`0003-50` adds the `agent.model_requests.*` family beside these, and `0003-59` adds
+`model.selection.moved` and `model.selection.restored` (`model-policy.md`).
+
 Every model event -- a round's usage and its per-call list, a retry, a failover hop -- carries two
 ids (`0003-19`): a **logical call id**, one per model call the loop decided to make, and a
 **provider attempt id**, one per request actually sent, so a call that was retried or failed over
@@ -217,11 +220,12 @@ what reaches fd 1 without belonging to any agent -- is **logged as an event**. I
 to an agent and it should not be silently dropped.
 
 **The session's own state** (`0003-19`): starting, idle, round running, executing, closing, and
-reported. *Closing* lasts from `close_admission()` to the report, through `lifecycle.md`'s
-closing, draining and terminating steps. The interpreter's death is an event, not a state of its
-own, after which the session passes through closing to reported. These are how an embedder knows
-what its session is doing without parsing text (`embedding.md`), and the outcomes a shutdown
-report lists are events too (`lifecycle.md`).
+reported. *Closing* lasts from `close_admission()` to the report, through `lifecycle.md`'s closing,
+draining and terminating steps. The interpreter's death is an event, not a state of its own, after
+which the session passes through closing to reported. These are how an embedder knows what its
+session is doing without parsing text (`embedding.md`), and the outcomes a shutdown report lists are
+events too (`lifecycle.md`). `0003-62` adds the pause's states between `idle` and `closing`, with a
+path back to `idle` (`continuation.md`, "The pause and the cut").
 
 **The boundary.** The integration-audit category's producers are hosted objects, one task adding
 each:
@@ -256,6 +260,8 @@ Four more tasks add events beside them that are execution diagnostics, not integ
   and `agent.instance.handle.collected` for the handle of a request made of one, collected before
   the request ended. Execution diagnostics like the rest, with any body they carry as a bounded
   preview, under the subject of the instance's child.
+- `0003-51` through `0003-53`: the external channel events, `channel.*`, and `message.*` generalized
+  to a backend's end (`external-channels.md`, "Events").
 
 ## Subscription becomes public; the file keeps its rules
 
@@ -304,9 +310,9 @@ not a grant, and a call refused before dispatch is refused whether or not anyone
 
 - **A mandatory audit sink** (`plan/next/mandatory-audit-sink.md`): a subscriber whose failure to
   take an event stops admission, so that no hosted call runs without a record.
-- **Per-audience projections** (`plan/next/event-audience-projections.md`): different views of one
-  event for the agent, the CLI's file, and an embedder's interface -- a host path an operator
-  needs to see, for one, and a generic subscriber should not.
+- ~~**Per-audience projections**~~ Taken up on 2026-10-28 as `0003-68` (`diagnostics.md`,
+  "Audiences"): different views of one event for the agent, the CLI's file, and an embedder's
+  interface -- a host path an operator needs to see, for one, and a generic subscriber should not.
 
 ## The renderer
 
@@ -440,7 +446,10 @@ for it, which `history.md` records.
   description of `scripts/` widened to say it holds one thing meant for a user.
 - Whether every event carries a causal parent -- which model turn produced which execution -- or
   whether ordering alone is enough. Hosted requests carry one, because a callback names the call it
-  ran under (`0003-22`); for the rest, ordering is enough to read and not enough to query.
+  ran under (`0003-22`); for the rest, ordering is enough to read and not enough to query. `0003-67`
+  answers it narrowly: an execution names its tool call, a child's round names the requests it
+  opened on, and a new event family carries the ids the host holds (`diagnostics.md`, "Events
+  correlate where they can").
 - ~~How far a subscriber may fall behind before it loses events.~~ Settled by `0003-19`: 4,096
   events by default, chosen per subscription when it is made.
 

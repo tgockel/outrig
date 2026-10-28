@@ -9,6 +9,10 @@ user channel (`0003-30`, `plan/phase/0003-python/typed-agents.md`). A child's in
 parent's submission, its result is a Python call, and both the REPL and the embedding API's user
 channel reach the main agent only.
 
+An external channel held by a child (`plan/phase/0003-python/external-channels.md`, "Who holds a
+channel") lets the owner address a child through a channel it was given; it is not the user channel,
+and this entry stands.
+
 What that costs: a user watching a long-running child cannot redirect it, a child can tell the
 user something only through its parent, and `runtime.wait` in a child has no user input to return
 on.

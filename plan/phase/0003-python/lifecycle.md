@@ -75,6 +75,10 @@ request, and nothing the agent can reach decides it. It changes the session's st
 once. So the owner can always stop without the agent's cooperation: nothing the agent does -- a
 hosted call that never returns, an execution that never yields -- can delay the close.
 
+The continuation tasks appended on 2026-10-28 add a pause beside this gate, with a path back to
+idle, for the cut a save or a sleep takes; the close stays one-way, and `0003-62` records the change
+(`continuation.md`, "The pause and the cut").
+
 There is no agent-side counterpart. Agent code cannot end its own session through any OutRig API;
 `embedding.md` describes how an embedder whose agent should be able to say it is done builds that
 from a hosted client, and why neither side then waits on the other.
@@ -120,7 +124,9 @@ observed the flag, and otherwise runs it -- so a forwarded call can start after 
 has returned, and the drain waits for it. A child's work is cancelled: its round makes no further
 model call, and a request it had not answered is cancelled with it. Every caller waiting on
 something cancelled or refused here is woken with an error that says the session is closing, so
-nothing is left waiting.
+nothing is left waiting. A request open at a sleep's cut has ended `suspended` before this close
+reaches it, so the close settles nothing it should have recorded (`0003-65`; `continuation.md`,
+"Open work at the cut").
 
 A child's waiters are all settled alike: an `await` on its handle, a `runtime.wait` or
 `asyncio.wait` over it, and a second await of the same handle each raise the same documented
@@ -467,13 +473,15 @@ report. `run-new` already ends when the interpreter exits, with status 1 (`0003-
 API reports the death as an event, not as a state of its own, and the session then passes through
 *closing* to *reported* (`embedding.md`).
 
-**No restart in 0.3.** If a later phase continues a session past its interpreter's death, it
-follows one rule, recorded in `plan/next/interpreter-restart-with-a-reset-notice.md`: a fresh
-interpreter, a notice telling the model its Python state was reset, and no replay of source that
-already ran. Replaying source to rebuild a namespace would repeat its effects -- the push, the
-write -- which `execution-and-rounds.md` rules out for a single lost result and which is no safer
-for a whole session. A fresh interpreter inherits no pending handles and no proxies, only the
-notice.
+**No restart in 0.3.** If a later phase continues a session past its interpreter's death, it follows
+one rule, recorded in `continuation.md`, "One continuation: a new session": a fresh interpreter, a
+notice telling the model its Python state was reset, and no replay of source that already ran.
+Replaying source to rebuild a namespace would repeat its effects -- the push, the write -- which
+`execution-and-rounds.md` rules out for a single lost result and which is no safer for a whole
+session. A fresh interpreter inherits no pending handles and no proxies, only the notice. The
+continuation appended on 2026-10-28 builds what this rule governs, as a new session from a save and
+never a restart; `continuation.md` carries the rule for the notice that the `plan/next/` entry on
+interpreter restart recorded, and that entry is folded into it.
 
 ## Five different acts
 
@@ -565,7 +573,9 @@ rather than claim more than it saw.
 
 **Rejected: reattaching to proxies after the owner restarts.** A reference is usable exactly while
 its session runs. The only continuation is a fresh interpreter with a reset notice
-(`plan/next/interpreter-restart-with-a-reset-notice.md`).
+(`continuation.md`, "One continuation: a new session"). `0003-65` narrows this for a request on an
+external channel, reattached by its durable id through the channel's backend and never by a proxy
+(`continuation.md`, "Open work at the cut").
 
 ## Open questions
 

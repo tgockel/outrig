@@ -13,7 +13,11 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 - [0003 -- python](../phase/0003-python/README.md) -- an agent acts by writing Python into a
   persistent interpreter in its container rather than by calling MCP tools, and the agent loop
   moves into `outrig` behind a public session API. Host objects, a policy over what crosses to
-  them, typed child agents and Python skills follow. The code lands on `version/0.3.x`.
+  them, typed child agents and Python skills follow. The planning round of 2026-10-28 appended
+  `0003-39` through `0003-69`, from the requirements of the first application to embed the
+  harness: a task-bound agent an application constructs, external channels, MCP services and
+  Rust services in the Session, continuation from a save, and diagnostics that correlate. The
+  code lands on `version/0.3.x`.
 
 ## Recently completed
 
@@ -91,7 +95,7 @@ tasks is an invariant this file holds.
 
 ### Phase 0003 -- python
 
-`0003-01` through `0003-38` cover the phase's user-visible deliverables. The ordering is
+`0003-01` through `0003-69` cover the phase's user-visible deliverables. The ordering is
 chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
 an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
 was built from the phase's exit criteria instead and silently omitted discovery, history, and
@@ -111,11 +115,77 @@ phase.
 | --------- | ------------------------------------------------------------------ |
 | `0003-36` | A host program injects a live object                               |
 
-**Last**
+**Documentation of the first 37**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
 | `0003-38` | The docs describe the system that now exists                       |
+
+**Enabling**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-39` | The interpreter program is a file                   |
+| `0003-40` | The container facade stays beside the harness       |
+
+**Application agents**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-41` | Construction completes before attachment            |
+| `0003-42` | An agent is given its facilities                    |
+| `0003-43` | Application code is provisioned before construction |
+| `0003-44` | A Rust service is a Python object                   |
+| `0003-45` | The instance is the child's `self`                  |
+| `0003-46` | An owner constructs the root in its kernel          |
+| `0003-47` | Instructions are composed from contributions        |
+| `0003-48` | The owner reads an agent's stop                     |
+| `0003-49` | The owner reads the roster                          |
+| `0003-50` | An agent has a model-request limit                  |
+
+**External channels**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-51` | An external channel has a backend                   |
+| `0003-52` | A request crosses an external channel               |
+| `0003-53` | A send is accepted, refused, or uncertain           |
+
+**MCP services**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-54` | The Session places MCP services                     |
+| `0003-55` | MCP tools are Python objects by exact name          |
+| `0003-56` | An MCP call has three dispatch states               |
+| `0003-57` | An MCP service over HTTP                            |
+
+**Continuation**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-58` | History has a format of OutRig's own                |
+| `0003-59` | An alias member stays selected                      |
+| `0003-60` | A session assesses the cost of sleeping             |
+| `0003-61` | The agent designates what survives                  |
+| `0003-62` | A cut on which history and bytes agree              |
+| `0003-63` | Save and sleep report truthfully                    |
+| `0003-64` | A session resumes and reconciles                    |
+| `0003-65` | Open work has a disposition at the cut              |
+
+**Diagnostics**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-66` | Records name their producer                         |
+| `0003-67` | Events correlate where they can                     |
+| `0003-68` | Events are projected by audience                    |
+
+**Last**
+
+| Task      | What it settles                                     |
+| --------- | ----------------------------------------------------|
+| `0003-69` | The docs describe what the phase added              |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -147,11 +217,13 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - Close behavior lands with each resource: the task that adds a resource adds its row to
   `lifecycle.md`'s close table, so no single shutdown task has to reopen the others.
 - Credential isolation became hosted objects (`0003-16` through `0003-24`), and subagents became
-  `0003-26`, `0003-30`, `0003-31` and `0003-34`. MCP as Python objects, interpreter restart,
-  confining what a hosted library does on the host, and the other deferred subjects have design
-  pages or `plan/next/` entries and no tasks. They are out of scope by the phase README's own
-  list, not forgotten. `0003-24`'s `[policy]` was reverted before release and `0003-25`'s
-  evaluator went back to `plan/next/`: in 0.3 the binding is the grant, and finer permissions are
+  `0003-26`, `0003-30`, `0003-31` and `0003-34`. MCP as Python objects and interpreter restart were
+  out of scope by the phase README's own list until 2026-10-28: `0003-44` and `0003-54` through
+  `0003-57` build the first, and continuation from a save (`0003-58` through `0003-65`) replaces the
+  second with a new session. Confining what a hosted library does on the host and the other deferred
+  subjects have design pages or `plan/next/` entries and no tasks; they are out of scope, not
+  forgotten. `0003-24`'s `[policy]` was reverted before release and `0003-25`'s evaluator went back
+  to `plan/next/`: in 0.3 the binding is the grant, and finer permissions are
   `plan/next/binding-permissions.md`.
 - The planning round of 2026-10-26 promoted `potential/one-shot-nudging.md` to `0003-37`: a request
   is either worked on or cancelled, and its sender is told which, for request children as well as
@@ -160,6 +232,43 @@ Cross-cutting notes the individual tasks carry rather than this file:
   idle child with a request open, so `0003-37` rewrites them.
 - `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
   box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
+- The planning round of 2026-10-28 appended `0003-39` through `0003-69` from the OutRig
+  requirements of CocoClaw's phase 0008 -- its numbered set (OR-AG, OR-CH, OR-MCP, OR-SUS, OR-OBS)
+  and its A-series (OR-A1 through OR-A8) -- after validating them against the design pages. The
+  A-series' own index calls the work a new phase; the maintainer decided it belongs to this one.
+  `0003-38` keeps its place and its scope, and `0003-69` is the second documentation pass, since a
+  thirty-task insertion is not the kind the five earlier renumberings were for. `0003-35` and
+  `0003-36` stay as queued: the first application is a Rust embedder and needs neither, and
+  another program depends on both.
+- The appended order follows the requirements' dependency contract. `0003-39` first, since every
+  later task adds interpreter code and the program is near its argument cap; `0003-40` second,
+  since every later task adds surface beside the facade it must leave alone; the application
+  agents before the channels, since a channel reaches an agent as a facility; the service
+  (`0003-44`) before the owner's construction (`0003-46`), since the task facility is a service;
+  the owner's reads (`0003-48`, `0003-49`) before the limit (`0003-50`), since the owner reads the
+  stop; MCP after the service it rides; continuation after channels and MCP, since the cut
+  quiesces their writers; the format (`0003-58`) first among the continuation tasks and after the
+  limit whose counter it carries; selection (`0003-59`) after the format it fills; diagnostics
+  last, except that each facility task adds its own events as it lands.
+- Six of the appended tasks reverse a decision the design pages record, each quoting the
+  sentence in its `## Decisions`: `0003-41` (attachment moves out of `__init__`), `0003-42` (a
+  per-agent view of facilities, and facilities as constructor inputs), `0003-44` (a Rust service
+  trait, rejected for 0.3 in `embedding.md` and `hosted-objects.md`), `0003-45` (the instance is
+  the child's `self`), `0003-58` (a persisted format of OutRig's own where the store held rig
+  JSON), and `0003-62` with `0003-65` (a gate that reopens, and a close that records open work
+  before it settles it). Each reversed sentence carries a pointer to its task.
+- Two appended tasks are more than one branch's worth as written and say so in their Context:
+  `0003-62` splits between the pause and the drain-capture-package half, and `0003-46` between
+  the builder form and the Session form with its verdict fork. `0003-51` and `0003-54` are each
+  one large branch with a named seam. The numbering is not split; the executor splits on the
+  branch if it must.
+- The round folded nine `plan/next/` entries into the tasks that build them: the interpreter
+  program's argument cap into `0003-39`; the Rust-object adapter into `0003-44`; interpreter
+  restart with a reset notice and history export and import into `continuation.md` and
+  `0003-58`; the MCP startup failure's erased cause and the rmcp upgrade review into `0003-54`;
+  the bad tool schema into `0003-55`; the tool-call id on exec events into `0003-67`; and
+  event audience projections into `0003-68`. `a-subscription-names-the-kinds-it-reads.md` stays
+  until `0003-68` takes its fork.
 
 ## Not queued, deliberately
 

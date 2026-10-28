@@ -333,6 +333,10 @@ ceiling and one GIL (`agent-placement.md`), and a child that allocates or loops 
 bounded only by `runtime-protection.md`. A scheduler for active work -- children *working* at once,
 counted per launching agent -- is `plan/phase/0003-python/potential/resource-scheduling.md`.
 
+A fifth key, `model-request-limit`, bounds the model requests one agent makes: at it, the agent's
+round ends before the next request with a stop the owner can lift, and a child settles what it holds
+`limit`; `model-policy.md` has it (`0003-50`).
+
 **Rejected: a cap on live children that a launch waits for.** The decision of 2026-09-30 had a
 launch past `subagent-width-max` wait for a slot and raised the shared default to 16. It was
 revisited with the agent class on 2026-10-01: an idle instance, kept for its context, would have

@@ -181,8 +181,8 @@ What differs from a factory binding:
 - **Authority.** The object acts with the program's authority and in its environment, which is the
   user's ("What a binding grants", `security.md`).
 
-A Rust embedder has no `inject`: its objects are bindings through `bind`, and a Rust object as a
-hosted object is `plan/next/rust-object-as-python-object.md`.
+A Rust embedder has no `inject`: its objects are bindings through `bind`, and a Rust object reaches
+agent Python as a service (`services.md`, `0003-44`).
 
 ## Packages
 
@@ -456,7 +456,8 @@ exception whose `__str__` reads private state the rebuilt copy lacks, as GitPyth
 
 Args and attributes carry whatever the library put in them -- a command line, its output, a remote
 URL. Nothing scrubs them, for the reason nothing translates paths: no library-neutral rule can tell
-a token from text.
+a token from text. A projection by audience (`0003-68`) withholds such a field whole from an
+embedder's subscription and scrubs nothing: `diagnostics.md`, "Audiences".
 
 ## Presentation
 
@@ -480,10 +481,11 @@ The agent learns its bindings three ways, and none crosses the boundary:
 - **`runtime.bindings`** answers from a local manifest: each binding's name, description and
   host-side type. Asking what is bound makes no remote call, runs no `repr`, and reads no
   property.
-- **`outrig.bindings[name]`** (`0003-26`) is the authoritative lookup: the calling kernel's proxy
-  of the binding, whatever the kernel's globals hold. The convenience global of the binding's
-  name is installed only where the name is free, and a live object injected later never
-  overwrites a global agent code bound (`0003-36`).
+- **`outrig.bindings[name]`** (`0003-26`) is the authoritative lookup: the calling kernel's proxy of
+  the binding, whatever the kernel's globals hold. The convenience global of the binding's name is
+  installed only where the name is free, and a live object injected later never overwrites a global
+  agent code bound (`0003-36`). In a kernel built from a facility dict (`0003-42`), all three
+  present the dict's entries under its keys (`facilities.md`).
 
 A binding name that is not a Python identifier, or that collides with `runtime`, `asyncio`,
 `outrig`, or another binding, fails session startup rather than shadowing anything -- or, for a
@@ -667,7 +669,8 @@ ahead of its closed flag and runs it, which may be after the close has returned,
 waiting for the serialize lock when the binding observes the flag, which cancels it
 (`lifecycle.md`). The interpreter's death ends the session, bindings included: it is reported as an
 event, and the session then closes and reports as at shutdown
-(`plan/next/interpreter-restart-with-a-reset-notice.md`).
+(`continuation.md`, "One continuation: a new session"). An MCP service, which hands out no
+proxies, does reconnect for future calls (`mcp-presenter.md`, "Calls").
 
 **A call that outlives its caller runs to completion.** A call still running in its binding when its
 kernel is released (`0003-30`, through `Kernel.close_hosted`, which closes the kernel's pool and
@@ -752,8 +755,8 @@ credentials are on the host. `security.md` records the decision.
 
 **Rejected: a Rust service trait.** Presenting a Rust object to agent Python means writing RPyC's
 server side in Rust, or an FFI layer under a Python class. A Rust service can instead ship a
-pure-Python client that is hosted like any library. The trait idea is
-`plan/next/rust-object-as-python-object.md`.
+pure-Python client that is hosted like any library. Reversed by `0003-44`: the trait is
+`services.md`, a service model with no proxies.
 
 **Rejected (2026-10-14): the awaited facade.** What this page said from the round of 2026-10-09,
 and what `0003-21` built: the name bound for a binding was a lazy proxy, attribute access and calls

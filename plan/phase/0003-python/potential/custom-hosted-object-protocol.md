@@ -38,8 +38,7 @@ A hosted-object protocol of OutRig's own, asyncio-native on both sides, with RPy
   advisories (two CVEs so far) and pinned against upgrades by a conformance test. Nothing
   vendored, and no wheel to embed.
 - **Servable from Rust.** The same messages can be answered by a Rust service directly, which is
-  `plan/next/rust-object-as-python-object.md` without the hosted Python client it now needs, and
-  which `mcp-wrappers.md` asks for.
+  `../services.md` (`0003-44`) without a hosted Python client, and which `mcp-wrappers.md` asks for.
 
 What it costs: `binding.py`, the hosted half of `interpreter.py`, the hosted-object tests, and
 the hosted-objects, boundary-policy and security pages are rewritten; and RPyC's conveniences are
@@ -70,10 +69,10 @@ What would decide it, once the synchronous proxies and the relay's events are in
 - **RPyC upstream.** Its release cadence (one release a year, last 6.0.2 on 2025-04-18), its open
   asyncio issue, and any new advisory at the trust boundary. A second CVE in the handlers OutRig
   intercepts is a reason to stop vendoring them.
-- **Rust services and MCP.** Whether `plan/next/rust-object-as-python-object.md` or the MCP
-  wrapper is scheduled. Both want an awaitable protocol Rust can serve, and the alternative is
-  that protocol; building the Rust service adapter on RPyC would mean writing RPyC's server side
-  in Rust, which `hosted-objects.md` rejected.
+- **Rust services and MCP.** `../services.md` and `../mcp-presenter.md` are scheduled (`0003-44`,
+  `0003-54`). Both want an awaitable protocol Rust can serve, and the alternative is that protocol;
+  building the Rust service adapter on RPyC would mean writing RPyC's server side in Rust, which
+  `hosted-objects.md` rejected.
 
 ## When
 

@@ -84,6 +84,11 @@ The child's namespace holds the inputs the constructor was given and the message
 nothing of the instance. This is `messages.md`'s rule that object identity does not cross, applied
 to the instance itself.
 
+`0003-45` reverses this paragraph for an agent constructed in a kernel: the instance is bound as
+`self` in the child's kernel, the same object, and an ordinary method runs where it is called, in
+the child's kernel too (`task-agents.md`, "The instance is the child's `self`"). `messages.md`'s
+rule stands for what crosses a channel.
+
 **Channel names are method names.** `fizz` is `runtime.channels["fizz"]` in the child, which is
 what makes the method's docstring a description of that channel. `user` is refused: it is the user
 channel's name, which a child does not have in 0.3 and may have later
@@ -146,6 +151,11 @@ one keyword the base keeps for itself, so no input is named `model`. From a host
 constructor is the same call with `session=` optional: it uses the current session when none is
 given, raises when there is neither, and schedules the launch on the program's running loop,
 which sends it over the owner connection ("From the host program").
+
+`0003-41` moves the launch out of `__init__`: a metaclass runs the most-derived constructor, then an
+optional hook, then attaches (`task-agents.md`, "Construction completes before attachment");
+`__init__` records `model`, `facilities` and the inputs and launches nothing. `0003-42` adds
+`facilities=` (`facilities.md`).
 
 **Inputs reach the child as variables.** Each is bound under its name in the child's namespace,
 and the instructions carry a manifest -- name, type, bounded preview -- as a submission's do
@@ -309,6 +319,11 @@ asks the child once more with a warning, and when that round changes nothing eit
 request the summary holds and tells each sender, so that no child is idle holding a request it has
 not answered.
 
+A round the host opens for a purpose other than the request summary -- the assessment and
+designation rounds of `0003-60` and `0003-61` (`continuation.md`, "Assessment", "Designation") --
+neither gives nor uses `0003-37`'s warning, moves no baseline, and counts no attempt, as a round
+that ended in an error does; `0003-60` builds the exemption.
+
 Five consequences, which `0003-30` tests:
 
 - **A child that answered anything in a round gets the next round, whatever arrived meanwhile.**
@@ -447,6 +462,10 @@ release is evented as a collection. Three consequences:
   put the instance in a cycle, which defers it to the cyclic collector's next pass. It is a
   backstop, and explicit release is the rule.
 
+`0003-45`: for an instance with a kernel-side `self`, explicit release is the rule and the backstop
+does not run; it stays for an instance without one (`task-agents.md`, "The instance is the child's
+`self`").
+
 **At the session's close**, a launching instance is never ready -- `ready()` and the first handle
 raise the closing error -- and an idle or working one is released with its requests settled, as
 `lifecycle.md`'s rows for agent instances and requests say. The shutdown report lists the
@@ -490,6 +509,10 @@ there being no round above it.
   request past the queue bound held on the sending side, which bounded the child's unread queue
   and nothing else. A sender that wants to wait for room is
   `plan/next/wait-for-request-capacity.md`.
+- **Model requests, counted.** `model-request-limit` (`0003-50`) bounds the model requests the
+  child's runner issues, one per logical call. At it, the child settles what it holds `limit`, stays
+  resident and addressable with its history, and waits for the owner's or the parent's reset;
+  `model-policy.md` has the rule and how it composes with `0003-37`.
 - **Spend.** A child's model usage is attributed to the child's round. A round that answers
   several requests is attributed to the round and not divided among them, because a division
   would be invented; each request's settled event names the rounds it spanned, so a reader can
@@ -555,8 +578,11 @@ host caller changes is where the two ends are.
 - **Release.** As above, and at the session's exit for an instance still alive; agent contexts
   belong inside the session context.
 
-The explicit API -- `runtime.spawn`, `submit`, request channels by hand -- has no host
-counterpart in this phase.
+The explicit API -- `runtime.spawn`, `submit`, request channels by hand -- has no host counterpart
+in this phase. `0003-46` adds a second path beside this one: a Rust owner constructs a class the
+application code holds in a root kernel of a `no_primary` session and holds a control handle
+(`task-agents.md`, "The owner-constructed root"; `rust-owner.md`); a class not provisioned keeps
+this shape, and parity for the host program is `0003-46`'s open fork.
 
 ## Explicit plumbing
 
@@ -572,12 +598,14 @@ child.channels["fizz"].pending()                                 # not yet taken
 await runtime.release([child])
 ```
 
-`outrig.Request(request_type, reply_type, doc="...")` declares one channel with the description
-the child's instructions carry; a bare `(request_type, reply_type)` tuple is the same without one.
-The parent's endpoint has `request(body) -> handle` and `pending()`; the child's end has
-`receive()`, and its `send` raises, because the contract in that direction is empty: the child
-replies, it does not send. The direction is fixed in 0.3 -- the parent requests, the child
-replies -- and a child's own requests go to children of its own.
+`outrig.Request(request_type, reply_type, doc="...")` declares one channel with the description the
+child's instructions carry; a bare `(request_type, reply_type)` tuple is the same without one. The
+parent's endpoint has `request(body) -> handle` and `pending()`; the child's end has `receive()`,
+and its `send` raises, because the contract in that direction is empty: the child replies, it does
+not send. The direction is fixed in 0.3 -- the parent requests, the child replies -- and a child's
+own requests go to children of its own. An external request channel (`external-channels.md`) is a
+relationship between an agent and a backend, not between a parent and a child; its direction is its
+definition's, and this sentence does not speak to it.
 
 In those terms the class does four things. `__init_subclass__` derives the `requests=` dict from
 the methods marked `@outrig.agent`. `__init__` schedules the spawn. A method call builds the

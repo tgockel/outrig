@@ -78,7 +78,7 @@ accounting as a factory binding's.
 - **Who reaches it.** Every kernel reaches every binding, children included, since the grant is
   the session's; a kernel built after the injection gets the name at build.
 - Replacing or unbinding a live object, and `inject` from a Rust embedder, are out of scope and
-  stated; a Rust embedder's live object is `plan/next/rust-object-as-python-object.md`.
+  stated; a Rust embedder's object is a service (`services.md`, `0003-44`).
 
 ## Acceptance
 

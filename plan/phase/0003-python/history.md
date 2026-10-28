@@ -67,8 +67,10 @@ public surface owns that requirement (`embedding.md`).
 
 ## The store
 
-The full history, mirrored into the interpreter as ordinary Python data as the host authors
-it. Not a proxy: the agent writes expressions, not queries.
+The full history, mirrored into the interpreter as ordinary Python data as the host authors it. Not
+a proxy: the agent writes expressions, not queries. Its persisted form, which outlives the session,
+is `continuation.md`'s ("The format"; `0003-58`), which reverses the rule that the store ends with
+the session and folds in the export entry that was in `plan/next/`.
 
 ```python
 # None of this reaches the model. It is Python, over Python data.

@@ -533,9 +533,10 @@ A child is a kernel in the same interpreter (`typed-agents.md`), with the same `
 the same finder, so its code can `invoke` a skill or import one of its modules exactly as the main
 agent's code can. Its `invoke(name, text)` spawns a parser child of its own, under
 `subagent-depth-max` as any call is, and `invoke(name, params=...)` spawns nothing. A directive
-never reaches a child, since only the main agent has a user channel. A child's `invoke(name,
-text)` raises `SkillNeedsClarification` the same way, and the child has no user to ask: it passes
-`params=` from what it knows, or the error is its to handle.
+never reaches a child through a user channel, since only the main agent has one; an item on an
+external channel may carry one (`external-channels.md`, "A directive crosses as an item";
+`0003-51`). A child's `invoke(name, text)` raises `SkillNeedsClarification` the same way, and a
+child with no user to ask passes `params=` from what it knows, or the error is its to handle.
 
 ## Rejected alternatives
 
@@ -613,7 +614,8 @@ that would widen the scope beyond the words -- the empty `paths` that reviews ev
 - How the preamble bounds a large catalog. **Decided in `0003-32`:** at most 50 skills and 12 KiB
   of them, then a count, the rest in `outrig.skills.catalog()`.
 - Whether a child's instructions list the catalog. **Decided in `0003-32`:** they do not; a child
-  can still use every skill.
+  can still use every skill. An owner-constructed root (`0003-46`) is the application's primary, and
+  its instructions list the catalog (`0003-47`).
 - A reload while an invocation of the same skill runs in any kernel: refused with `skill-busy`, or
   made to wait. **Decided in `0003-33`:** refused with `skill-busy`, since waiting would never end
   when the reload is asked for from inside that invocation.

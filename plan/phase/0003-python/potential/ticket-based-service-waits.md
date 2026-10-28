@@ -29,18 +29,17 @@ a library has one.
 
 ## Evaluation
 
-`0003-17` has reported. Its numbers for the service-shaped fixture -- RPC count per operation,
-the binding and interpreter processes' memory, and tail latency, for representative list, update
-and question operations across concurrent sessions, with a call blocked for minutes present
-throughout -- are in its `## Decisions`: a wait of minutes holds one connection and one thread
-and nothing else, except under `--serialize`, where it holds every call of that binding from
-every kernel of its session. So the concurrent-connection design covers the wait and tickets
-stay an application's choice, and `serialize = true` is the case where they still matter. If a
-session's use shows memory or tail latency rising with the number of waiting calls, beyond the
-one the fixture held, tickets are the pattern the preamble should teach. The step past tickets
--- a direct Rust service adapter, with no hosted client and no RPyC -- is
-`plan/next/rust-object-as-python-object.md`, and the same numbers decide whether it is worth
-building.
+`0003-17` has reported. Its numbers for the service-shaped fixture -- RPC count per operation, the
+binding and interpreter processes' memory, and tail latency, for representative list, update and
+question operations across concurrent sessions, with a call blocked for minutes present throughout
+-- are in its `## Decisions`: a wait of minutes holds one connection and one thread and nothing
+else, except under `--serialize`, where it holds every call of that binding from every kernel of its
+session. So the concurrent-connection design covers the wait and tickets stay an application's
+choice, and `serialize = true` is the case where they still matter. If a session's use shows memory
+or tail latency rising with the number of waiting calls, beyond the one the fixture held, tickets
+are the pattern the preamble should teach. The step past tickets -- a direct Rust service adapter,
+with no hosted client and no RPyC -- is `../services.md` (`0003-44`), which the round of 2026-10-28
+made a task; the same numbers still bear on the pool's bound.
 
 ## When
 

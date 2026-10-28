@@ -61,12 +61,12 @@ phase.
 **Moved** -- `python/`: the interpreter host, console, payload locator, prompt, and tool. New on
 the prototype branch, so no 0.2.x commit can conflict with a file that line does not have.
 
-**Copied** -- `llm.rs`, `llm/retry.rs`, and `llm/failover.rs`. The 0.2.x line actively edits
-them, and copying is what keeps those merges clean. `0003-04` copied the part of `llm.rs` one
-round needs; `0003-15` brought retry and failover. From `rig_tool.rs` only the result truncation
-came across, and nothing from `session_tool.rs`. The model's one tool is `submit_python`, and
-MCP servers would reach Python as the objects `mcp-wrappers.md` designs, after this phase
-(`plan/next/rust-object-as-python-object.md`), rather than as rig tools, so the MCP adapter has
+**Copied** -- `llm.rs`, `llm/retry.rs`, and `llm/failover.rs`. The 0.2.x line actively edits them,
+and copying is what keeps those merges clean. `0003-04` copied the part of `llm.rs` one round needs;
+`0003-15` brought retry and failover. From `rig_tool.rs` only the result truncation came across, and
+nothing from `session_tool.rs`. The model's one tool is `submit_python`, and MCP servers reach
+Python as objects -- `services.md` and `mcp-presenter.md`, `0003-44` and `0003-54`, added on
+2026-10-28 on the route `mcp-wrappers.md` named -- rather than as rig tools, so the MCP adapter has
 no caller on this side. An earlier draft had it coming along anyway.
 
 **Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend was deprecated

@@ -1,10 +1,12 @@
 # MCP wrappers
 
-Not in this phase. Hosted objects (`hosted-objects.md`) now give the sandbox a way to reach
-objects on the other side of a boundary, but neither route to an MCP client fits what this phase
-builds, for a reason worth stating up front rather than discovering later: the only MCP client
-that can run is OutRig's own, written in Rust, and presenting a Rust object to agent Python is
-deferred to `plan/next/rust-object-as-python-object.md`. That entry is this page's route.
+Written when MCP was not in this phase; the round of 2026-10-28 brought it in (`mcp-presenter.md`,
+`0003-54` through `0003-57`), on the route this page names. Hosted objects (`hosted-objects.md`) now
+give the sandbox a way to reach objects on the other side of a boundary, but neither route to an MCP
+client fits what this phase builds, for a reason worth stating up front rather than discovering
+later: the only MCP client that can run is OutRig's own, written in Rust, and presenting a Rust
+object to agent Python was deferred to a `plan/next/` entry that `0003-44` now builds as
+`services.md`; that page is this page's route.
 
 The goal: an MCP server presented to the model as a Python object, its tools as methods. AI
 tooling is built around MCP, and the alternative -- telling the model that a whole category of
@@ -72,11 +74,10 @@ mcp2py would have brought real work already done: generated type hints and docst
 descriptions, resources as module attributes, prompts as template functions, OAuth with PKCE, and
 IDE stubs. Which of those this route reproduces is a separate question from the route itself.
 
-mcp2py is out for the reason above: its SDK cannot load in the embedded Python on either side of
-the boundary. What the route still needs is a way to present a Rust object to agent Python with
-the same policy and events as a hosted Python object, and that mechanism is deferred past this
-phase to `plan/next/rust-object-as-python-object.md`. Until it exists, `run-new` starts no MCP
-server.
+mcp2py is out for the reason above: its SDK cannot load in the embedded Python on either side of the
+boundary. What the route still needs is a way to present a Rust object to agent Python with the same
+policy and events as a hosted Python object, and that mechanism is `services.md` (`0003-44`), with
+MCP as its first service (`mcp-presenter.md`); until they land, `run-new` starts no MCP server.
 
 ## mcp2py, recorded honestly
 
@@ -136,7 +137,7 @@ something useful instead of `(*args, **kwargs)`.
 
 ## Open questions
 
-- Everything in `plan/next/rust-object-as-python-object.md`, which this page now depends on.
+- Everything `services.md` leaves open, which this page now depends on.
 - How an MCP tool's schema becomes a Python signature the model can read with `help()`.
 - What happens to the tool-name sanitization that exists for the current adapter. Python
   attribute names have different rules than the `^[a-zA-Z0-9_-]{1,64}$` the tool surface uses.

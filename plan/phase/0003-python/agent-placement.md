@@ -263,10 +263,11 @@ It is not disclosure. The operator's grant is per-session (`security.md`), and e
 stub for every binding (`hosted-objects.md`), so one agent's bound name is presentation over a
 session-wide grant rather than a grant of its own.
 
-What is left is interference, and it is the same kind of thing
-`doc/concepts/subagents.md` already says about the workspace -- two subagents told to edit the
-same file will fight over it, and OutRig does not stop them. Keeping concurrent work disjoint is
-the parent's job, and after this phase that extends from files to process state.
+What is left is interference, and it is the same kind of thing `doc/concepts/subagents.md` already
+says about the workspace -- two subagents told to edit the same file will fight over it, and OutRig
+does not stop them. Keeping concurrent work disjoint is the parent's job, and after this phase that
+extends from files to process state. An agent class instance is shared with its child as `self`
+(`0003-45`; `task-agents.md`).
 
 ## Rejected alternatives
 

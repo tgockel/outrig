@@ -63,8 +63,10 @@ common in code-review prose and would break it, and putting untrusted diff text 
 instructions makes prompt injection easier. The child reads an input's exact value in code, so a
 50 KB section never has to fit into a prompt.
 
-A hosted object is not in the subset, so it cannot be an input. It does not need to be one: a
-child has the session's bindings already ("Placement and limits").
+A hosted object is not in the subset, so it cannot be an input. It does not need to be one: a child
+has the session's bindings already ("Placement and limits"). `0003-42` adds facilities as
+constructor inputs by reference, in a dict beside the data inputs, for agents constructed with one
+(`facilities.md`).
 
 ## The maintainer's result type
 
@@ -357,11 +359,13 @@ uses that API directly; one that wants a child to answer many typed requests dec
 ## Placement and limits
 
 A child is a kernel in the same interpreter as its parent (`agent-placement.md`): a thread, a
-session module, an event loop and an execution slot of its own. The host runs a round loop for
-each child, as it does for the primary, and makes the child's model calls. A child has the same
-bindings, since every kernel gets a stub for each (`hosted-objects.md`), and the same skill
-catalog. That is sharing, not isolation: code in a child can reach its parent's objects, and
-giving co-hosted agents different grants would be presentation only, so none is offered.
+session module, an event loop and an execution slot of its own. The host runs a round loop for each
+child, as it does for the primary, and makes the child's model calls. A child has the same bindings,
+since every kernel gets a stub for each (`hosted-objects.md`), and the same skill catalog. That is
+sharing, not isolation: code in a child can reach its parent's objects, and giving co-hosted agents
+different grants would be presentation only, so none is offered. `0003-42` offers the presentation:
+a child constructed with a facility dict is told of its dict's entries and no other binding; the
+grant stays the session's (`facilities.md`, "The view is the agent's, the grant is the session's").
 
 - **Model.** The parent's, unless `model=` names a model from the operator's configuration, an
   alias included -- a name, not a wire identifier. #287 covers constraining that choice.
@@ -577,7 +581,7 @@ When the interpreter dies, the death is reported as an event and the session goe
 to its report, as it does in this phase whatever the agents were doing. No Python is left in which
 to settle a call, so the owner reports every open call terminated, in its events and its shutdown
 report (`lifecycle.md`). A later interpreter would
-start with none of them (`plan/next/interpreter-restart-with-a-reset-notice.md`).
+start with none of them (`continuation.md`, "One continuation: a new session").
 
 ## Rejected alternatives
 

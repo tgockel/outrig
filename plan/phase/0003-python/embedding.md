@@ -71,8 +71,13 @@ makes the same call, so the CLI, CocoClaw and any other embedder start a system 
   publishing `binding.refused`.
 - **Skill sources** (`skills.md`). The project and user sources are OutRig's; an embedder can add
   its own, so a skill can come from the embedder's store rather than from a directory.
-- **Event subscribers** (`observability.md`). Each receives the session's stream in sequence
-  order. One that falls behind loses a counted gap and never slows the session.
+- **External channels** (`external-channels.md`), each a definition and a Rust backend behind a
+  trait, given to the builder and fixed at start; inbound items are the owner's push through a
+  channel handle (`0003-51`).
+- **Event subscribers** (`observability.md`). Each receives the session's stream in sequence order.
+  One that falls behind loses a counted gap and never slows the session. A subscription declares its
+  audience, the embedder's or the operator's (`0003-68`), and the first event it receives names the
+  producer (`0003-66`).
 
 What `run-new` supplies is the CLI's half of the same list, and the last two rows are how it
 leaves (`0003-19`):
@@ -103,12 +108,13 @@ spawned meanwhile would inherit the key. Edition 2024, which this workspace uses
 
 ## What the embedder drives
 
-- **Rounds.** One call drives one round and returns its outcome. Today's `round()` returns the
-  reply text or nothing. The outcome separates the reply from how the round ended: the model
-  yielded, a limit stopped it (today written into the reply as `(round ended: <reason>)`), or
-  nothing new had arrived (today's `None`). It also carries the reasoning of a round that produced
-  no text, which today reads as an empty reply (`plan/next/python-agent-textless-round.md`). Its
-  exact shape is `0003-19`'s.
+- **Rounds.** One call drives one round and returns its outcome. Today's `round()` returns the reply
+  text or nothing. The outcome separates the reply from how the round ended: the model yielded, a
+  limit stopped it (today written into the reply as `(round ended: <reason>)`), or nothing new had
+  arrived (today's `None`). It also carries the reasoning of a round that produced no text, which
+  today reads as an empty reply (`plan/next/python-agent-textless-round.md`). Its exact shape is
+  `0003-19`'s. `0003-50` gives the stop a kind the owner reads without parsing, the model-request
+  limit among them (`model-policy.md`).
 - **User input**, through the session's end of the agent's `user` channel: what `UserChannel` does
   today -- send a message, receive what the agent sent, take what is waiting at exit -- and, since
   `0003-33`, send a `/name` directive naming one of the session's skills (`skills.md`).
@@ -123,6 +129,10 @@ for one with `no_primary()`; `round()` then answers `SessionError::NoPrimary`, `
 until `closing`. Everything else -- bindings, admission, events, the ledger, children, the report
 -- is the session's and works the same. No hidden primary is made to satisfy the API: the
 interpreter starts with no kernel, and opens one only for an agent that exists.
+
+A Rust embedder with no primary agent constructs a task agent and holds a control handle with
+readiness, release, an awaitable stop read and the session's roster (`0003-46`, `0003-48`,
+`0003-49`; `rust-owner.md`); `Session::round()` stays `NoPrimary` there.
 
 **The session's state is an event, not text to parse.** An embedder that shows "model working",
 "Python running", "waiting for input" and "stopped" reads them from events
@@ -208,9 +218,9 @@ print(session.shutdown_report)
   the configuration, repo-declared ones refused for want of an approver. Live objects come through
   `session.inject(name, obj)`, synchronous, returning once every agent can reach the object
   (`0003-36`).
-- **Events.** `session.events()` is one subscription, registered when the session is built and
-  read as an async iterator, with the stream's counted gaps as `Missed` records
-  (`observability.md`). The report never depends on it.
+- **Events.** `session.events()` is one subscription, registered when the session is built and read
+  as an async iterator, with the stream's counted gaps as `Missed` records (`observability.md`). The
+  report never depends on it. Its first record is `session.producer` (`0003-66`).
 - **Controls.** `await session.close_admission()`, acknowledged after the engine applied it.
 - **The report.** `session.shutdown_report` after exit, a mirror of `ShutdownReport`; when the
   engine cannot prove the session stopped, exit raises `outrig.ShutdownException` in the
@@ -223,14 +233,14 @@ print(session.shutdown_report)
 
 The engine survives the program (`0003-29`): a program that exits or dies with a session open has
 its sessions shut down and their reports printed, and a start still running has it interrupted and
-what it made removed, waited for; one that does not respond to a forwarded SIGINT or SIGTERM gets
-a configurable cooperative grace, then SIGTERM and SIGKILL to its group (`lifecycle.md`, "The host
+what it made removed, waited for; one that does not respond to a forwarded SIGINT or SIGTERM gets a
+configurable cooperative grace, then SIGTERM and SIGKILL to its group (`lifecycle.md`, "The host
 program"). A program's session directory, `<session-root>/<id>/logs`, holds its `events.jsonl` and
 no `session.json`, so `outrig ls` does not list it yet
-(`plan/next/host-program-sessions-are-listed.md`). What a program does not have in this phase: rounds and a user
-channel, since it has no primary; an approver, which is a `plan/next/` entry; skill sources of its
-own (#698); and the explicit child API. The Python API is fixed at the 0.3.0 release with the Rust
-one.
+(`plan/next/host-program-sessions-are-listed.md`). What a program does not have in this phase:
+rounds and a user channel, since it has no primary; an approver, which is a `plan/next/` entry;
+skill sources of its own (#698); and the explicit child API. The Python API is fixed at the 0.3.0
+release with the Rust one.
 
 ## Stopping
 
@@ -272,9 +282,10 @@ as nothing having happened. OutRig adds no durable call ledger to cover it.
 
 ## Services written in Rust
 
-There is no Rust trait for presenting a Rust object to agent Python in 0.3. An embedder whose
-service is Rust ships a pure-Python client package and declares it as a binding, hosted like any
-library (`hosted-objects.md`): installed into the binding cache with `--only-binary=:all:` from a
+There is no Rust trait for presenting a Rust object to agent Python in 0.3 as first planned;
+`0003-44` reverses this and builds one as `services.md`. An embedder whose service is Rust ships a
+pure-Python client package and declares it as a binding, hosted like any library
+(`hosted-objects.md`): installed into the binding cache with `--only-binary=:all:` from a
 pure-Python wheel -- platform tag `any`, ABI tag `none`, and a Python tag that includes Python 3, as
 `py3-none-any` and `py2.py3-none-any` are -- constructed by its factory in a host process of its
 own, and reached from agent Python as ordinary objects, with the same interception and events as any
@@ -299,15 +310,15 @@ Two consequences follow from that, and both are the embedder's to design around:
 
 **Why no trait now.** A trait needs a descriptor format -- methods, argument and result schemas --
 and a second way of presenting an object beside hosted Python objects, with interception and events
-built a second time. A pure-Python client uses the one path this phase builds.
-`plan/next/rust-object-as-python-object.md` records the trait, and `mcp-wrappers.md` routes MCP
-servers through it.
+built a second time. A pure-Python client uses the one path this phase builds. The trait was a
+`plan/next/` entry; `0003-44` builds it as `services.md`, with MCP servers as its first service
+(`mcp-presenter.md`).
 
 ## Not in this phase
 
-- **History export and import** (`plan/next/history-export-and-import.md`): handing a conversation
-  to a new session, which an embedder that gives up a task and lets another session continue it
-  would want. A task run in one session does not need it.
+- ~~**History export and import**~~ Taken up on 2026-10-28 as `0003-58`, queued (`continuation.md`,
+  "The format"): handing a conversation to a new session, which an embedder that gives up a task and
+  lets another session continue it would want. A task run in one session does not need it.
 - **A mandatory audit sink** (`plan/next/mandatory-audit-sink.md`): a subscriber whose failure to
   take an event stops admission. In this phase every subscriber is optional: one that falls behind
   loses a counted gap, and the session carries on.
@@ -338,8 +349,8 @@ Rejected because with two entry points the CLI exercises one and embedders use t
 one the CLI does not exercise is the one that breaks unnoticed. `PythonAgent` was documented as
 provisional so that it could be replaced.
 
-**Rejected for 0.3: a Rust service trait**, for the reasons above. It is recorded in `plan/next/`
-rather than refused.
+**Rejected for 0.3: a Rust service trait**, for the reasons above. It was recorded in `plan/next/`
+rather than refused, and `0003-44` builds it (`services.md`).
 
 **Rejected: secrets through the process environment.** What an embedder could do today without
 any change to OutRig: set the variable, start the session, unset it. Rejected because the

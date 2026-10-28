@@ -28,12 +28,15 @@ rules over method calls, which was taken out before release (`boundary-policy.md
 "Known boundaries" carries the entry `0003-20` added: a binding acts with the host user's
 authority, and every call to it runs and is published.
 
-Until then, OutRig starts nothing that holds a credential from its config where the agent can
-reach it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
+Until then, OutRig starts nothing that holds a credential from its config where the agent can reach
+it. That is also why `run-new` starts no MCP server: one placed in the primary would hold its
 resolved secrets beside the interpreter, as the same user, and MCP servers presented as Python
 objects are not in this phase (`mcp-wrappers.md`). What the container runtime passed in on its own
 is closed too: podman forwarded the host's proxy variables by default, and a proxy URL can carry a
-password, until 0.2.2 turned that off for every container OutRig starts (#455).
+password, until 0.2.2 turned that off for every container OutRig starts (#455). The round of
+2026-10-28 keeps the first sentence as the rule and narrows the second: the Session places MCP
+services, and one that holds a credential is never placed in the primary or the primary view
+(`mcp-presenter.md`, `0003-54`).
 
 ## OutRig's existing property, unchanged
 
@@ -198,9 +201,10 @@ binding, and any kernel can reach another's proxies through shared memory. The k
 names is diagnostic. A process boundary between agents would not change that, which is worth
 noticing before anyone proposes one as a fix.
 
-What co-hosting does introduce is interference rather than disclosure: a shared working directory,
-a shared environment, shared module state. `agent-placement.md` lists it, and it belongs beside the
-existing warning that two subagents told to edit the same file will overwrite each other's edits.
+What co-hosting does introduce is interference rather than disclosure: a shared working directory, a
+shared environment, shared module state. `agent-placement.md` lists it, and it belongs beside the
+existing warning that two subagents told to edit the same file will overwrite each other's edits. A
+facility dict (`0003-42`) narrows what a kernel is told of, not what it can reach (`facilities.md`).
 
 ## The threat model
 

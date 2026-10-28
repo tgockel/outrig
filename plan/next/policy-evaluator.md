@@ -66,7 +66,7 @@ malformed, late or missing answer never lets a request run.
   text in an argument cannot close the block or put anything outside it. The evaluator sees
   nothing that the request's events leave out. Its input is the same bounded argument previews the
   event stream carries, a projection whose field policy is still open
-  (`plan/next/event-audience-projections.md`), so a secret in an argument -- a token in a remote
+  (`plan/phase/0003-python/diagnostics.md`), so a secret in an argument -- a token in a remote
   URL, a password in a command line -- reaches the evaluator as it reaches the stream; this task
   withholds nothing the stream carries. The delimiting is formatting: it keeps argument text inside
   the block, and whether the model follows an instruction phrased inside the block is not settled
@@ -178,5 +178,5 @@ Against a mock provider:
   and gate this was written against.
 - `plan/phase/0003-python/observability.md` -- the integration-audit category its events belong
   to.
-- `plan/next/event-audience-projections.md` -- whether the evaluator's evidence becomes one
+- `plan/phase/0003-python/diagnostics.md` -- whether the evaluator's evidence becomes one
   projection among several.

@@ -129,9 +129,9 @@ effects, and on a container object it runs agent code.
 Boundary events are observability's integration-audit category (`observability.md`) and carry its
 warning: arguments are the most useful field and the most likely to hold a secret -- a token in a
 remote URL, a password in a command line. A raised exception's host traceback is recorded here and
-not shown to the agent. Which audience should see which fields -- the agent, a log -- is
-`plan/next/event-audience-projections.md`. They reach `events.jsonl` only when
-`[events] mode = "record"`.
+not shown to the agent. Which audience sees which fields -- the agent, an embedder, the operator --
+is `diagnostics.md`, "Audiences", built by `0003-68`. They reach `events.jsonl` only when `[events]
+mode = "record"`.
 
 ## What interception cannot see
 

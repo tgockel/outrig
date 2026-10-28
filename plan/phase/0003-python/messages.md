@@ -14,11 +14,13 @@ It has one consequence outside this page. A message that never reaches the host 
 nothing can observe, so the interpreter emits an observation for it separately -- see
 `observability.md`, which records that as the one cost co-hosting adds rather than removes.
 
-Only the `user` channel is built in the first milestone. The rest is designed now so that
-adding a second relationship later does not change the shape of the first. Between agents, this
-phase builds what a work item needs -- its inputs, a one-way progress channel, and its result
-(`work.md`) -- and request channels, on which a long-lived child answers typed requests
-(`agent-classes.md`); the rest of the layer stays design.
+Only the `user` channel is built in the first milestone. The rest is designed now so that adding a
+second relationship later does not change the shape of the first. Between agents, this phase builds
+what a work item needs -- its inputs, a one-way progress channel, and its result (`work.md`) -- and
+request channels, on which a long-lived child answers typed requests (`agent-classes.md`); the rest
+of the layer stays design. The round of 2026-10-28 builds the next relationship on this layer: an
+external channel, whose far end is a backend the owner supplies (`external-channels.md`). Nothing
+here changes for it.
 
 ## Channels and endpoints
 

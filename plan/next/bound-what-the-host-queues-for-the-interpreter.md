@@ -33,7 +33,7 @@ queue would never drain.
    or the session ends the interpreter there.
 2. **End the session's interpreter past a bound**, as a protocol violation: an interpreter that
    leaves the host's lines unread past the bound is treated as dead, which the session already
-   handles (`plan/next/interpreter-restart-with-a-reset-notice.md`).
+   handles (`plan/phase/0003-python/continuation.md`).
 
 ## Acceptance
 

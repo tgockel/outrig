@@ -15,6 +15,12 @@ and this one and moved `0003-23` through `0003-31` again, which made this task `
 A fifth, in the planning round of 2026-10-26 that promoted `potential/one-shot-nudging.md` to
 `0003-37`, inserted that task before this one, which made this task `0003-38`.
 
+The planning round of 2026-10-28 appended `0003-39` through `0003-69` after this task rather than
+renumbering it a sixth time: thirty tasks from the first embedding application's requirements,
+each documenting its own addition, and `0003-69` as the cross-cutting documentation pass for what
+they add. This task keeps its scope, the system `0003-01` through `0003-37` built; where a later
+task changes a page this one writes, that task edits the page.
+
 `doc/` is design-first: `.claude/CLAUDE.md` says subsystem pages carry `TODO: Incomplete` until
 their implementation exists. Individual tasks drop their own markers as behavior becomes real,
 per `next-task/SKILL.md`. This task exists for the part that belongs to no single task.
@@ -163,7 +169,9 @@ MCP now sits, and what a binding lets an agent do on the host.
   injecting a live object, and the config reference the `[host]` grace key `0003-29` adds.
 - **Hard: `0003-37`.** The concepts page and the events reference describe the two nudges, the
   cancel a child's unanswered request ends in, and the event that records it.
-- **Soft: every earlier task**, each of which drops its own markers. This one is done last.
+- **Soft: every earlier task**, each of which drops its own markers. This one is done after
+  `0003-37` and before the tasks appended on 2026-10-28, which the second documentation pass
+  (see Context) documents.
 
 ## See also
 
