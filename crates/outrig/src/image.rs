@@ -649,7 +649,7 @@ async fn build_image_with_build_args(
         )
         .await?;
         ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
-        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, None, owed_first).await
+        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, no_cache, None, owed_first).await
     })
     .await
 }
@@ -675,7 +675,10 @@ async fn build_image_logged_with_build_args(
         )
         .await?;
         ensure_key_still_holds(image, cfg, repo_root, build_args, tag).await?;
-        stamp_repo_image_labels(image, temp_tag, tag, &cfg.mcp, transcript, owed_first).await
+        stamp_repo_image_labels(
+            image, temp_tag, tag, &cfg.mcp, no_cache, transcript, owed_first,
+        )
+        .await
     })
     .await
 }
@@ -1211,18 +1214,23 @@ async fn stamp_repo_image_labels(
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     config_mcp: &BTreeMap<String, McpServerSpec>,
+    no_cache: bool,
     transcript: Option<&Transcript>,
     owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
     let labels = merged_mcp_config_to_labels(image, &inherited, config_mcp)?;
-    commit_image_with_labels(source_tag, final_tag, &labels, transcript, owed_first).await
+    commit_image_with_labels(
+        source_tag, final_tag, &labels, no_cache, transcript, owed_first,
+    )
+    .await
 }
 
 async fn commit_image_with_labels(
     source_tag: &ImageTag,
     final_tag: &ImageTag,
     labels: &BTreeMap<String, String>,
+    no_cache: bool,
     transcript: Option<&Transcript>,
     owed_first: &mut Vec<Owed>,
 ) -> Result<()> {
@@ -1230,6 +1238,10 @@ async fn commit_image_with_labels(
     // `outrig-label-<pid>-<nonce>`, so likewise this build's alone.
     let builder_owned =
         CleanupGuard::arm(Cmd::new("buildah").arg("rm").arg(&builder), Reissue::Safe);
+    // Whether this call committed `final_tag` itself (`true`) or found another
+    // session had already won the race for it (`false`): the two leave the
+    // working container in different states, so `result` alone cannot steer
+    // the cleanup below.
     let result = async {
         run_buildah_capture(
             Cmd::new("buildah")
@@ -1249,6 +1261,30 @@ async fn commit_image_with_labels(
         config = config.arg(&builder);
         run_buildah_capture(config, transcript).await?;
 
+        // Issue #393: two sessions that miss the content-addressed cache for
+        // the same tag at once both reach this commit, and `buildah commit`
+        // over an existing tag re-points it rather than refusing -- so the
+        // loser would overwrite the winner's image with its own
+        // (same-content, later-metadata) copy, leaving the winner's former
+        // image dangling with nothing left pointing at it. Re-probing `final_tag`
+        // immediately before committing to it cannot close the race outright
+        // (the two commits can still interleave), but it does close the far
+        // more common case: one build finished first and is already sitting
+        // there to be seen. Losing this probe means skipping the commit, not
+        // failing the build -- the caller asked for an image at `final_tag`,
+        // and one is there.
+        //
+        // A forced rebuild (`no_cache`) skips the probe and always commits: the
+        // caller asked to replace whatever is at `final_tag`, stale copied
+        // gitignored files and all, and treating another session's unrelated
+        // win as this one's own would silently keep it stale. `no_cache`
+        // callers are rarer and already pay for a full rebuild, so losing the
+        // ordinary race's protection here costs them only the same
+        // re-point-over-an-existing-tag outcome `buildah commit` always had.
+        if !no_cache && probe_cached_logged(final_tag, transcript).await? {
+            return Ok(false);
+        }
+
         run_buildah_capture(
             Cmd::new("buildah")
                 .arg("commit")
@@ -1259,25 +1295,27 @@ async fn commit_image_with_labels(
             transcript,
         )
         .await?;
-        Ok(())
+        Ok(true)
     }
     .await;
 
-    // `commit --rm` takes the working container on the success path, and the
-    // awaited removal on the failure path. One buildah refuses is handed to
-    // the caller still armed rather than reissued here: the caller's `rmi` of
-    // the image this container was made from is refused as in use until the
-    // container is gone, so the two are detached as one chain, `rm` first,
-    // and the `rmi` gets its whole retry budget after the `rm` is done.
+    // `commit --rm` takes the working container on the success path. On
+    // every other path -- the race lost above, or a buildah failure -- it is
+    // still there, and the awaited removal reaches it. One buildah refuses is
+    // handed to the caller still armed rather than reissued here: the
+    // caller's `rmi` of the image this container was made from is refused as
+    // in use until the container is gone, so the two are detached as one
+    // chain, `rm` first, and the `rmi` gets its whole retry budget after the
+    // `rm` is done.
     match result {
-        Ok(()) => builder_owned.release(),
-        Err(_) => owed_first.extend(
+        Ok(true) => builder_owned.release(),
+        Ok(false) | Err(_) => owed_first.extend(
             try_remove(builder_owned, "container not known", transcript)
                 .await
                 .map(|(guard, _)| (guard, "container not known")),
         ),
     }
-    result
+    result.map(|_| ())
 }
 
 async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Result<()> {

@@ -95,6 +95,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that subtree. `doc/quickstart.md` now lists `git` as a prerequisite:
   every build still probes the context with `git -C <context> rev-parse --git-dir` to decide
   which of the two paths to take, whether or not the context is git-hosted. (#394)
+- **Two sessions that miss the cache for the same tag at once no longer leave a dangling image.**
+  `build_image_with_build_args` commits the labeled image to `<repo>:<key>` once its build
+  finishes, and buildah's `commit` re-points an existing tag rather than refusing it, so the
+  second session to finish overwrote the first session's image with its own -- same content,
+  later metadata -- and left the first session's former image dangling with nothing pointing at
+  it anymore. The commit now re-probes `<repo>:<key>` immediately before committing to it, and a
+  hit skips the commit and discards its own working container instead: the caller still gets the
+  image it asked for, the one the race's winner left there, and nothing it built is left behind
+  unreferenced. The probe does not close the race outright -- the two commits can still interleave
+  -- but it closes the far more common shape, one build finishing before the other starts its own
+  commit. A forced rebuild (`--no-cache`, or a library caller's `no_cache = true`) skips this
+  probe and always commits: it is not a race loser, and treating a stale tag the probe happens to
+  find as though it were a concurrent winner's would have left `--no-cache` unable to refresh an
+  image whose content hash the stale copy shares. (#393)
 - **An image built while its context changed is no longer saved under the old key.** The cache key
   is hashed before `buildah build` starts, and buildah reads the context as each `COPY` runs, so a
   file saved during an earlier `RUN` landed in an image tagged with the key of the content before

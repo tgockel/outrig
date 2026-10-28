@@ -126,6 +126,23 @@ target=$prev
 # An image tag carries `/` and `:`, which a file name cannot.
 flat() { printf '%s' "$1" | tr '/:' '__'; }
 
+# A `cached.<flat tag>` marker simulates another session's build having
+# already landed under that tag by the time this one's probe runs --
+# `buildah images --quiet <tag>` prints an id instead of the "not known" miss
+# every untouched tag gets. Only `commit_image_with_labels`'s pre-commit
+# re-probe (issue #393) and `probe_cached` itself read this verb, so no other
+# path needs to agree with it.
+if [ "$1 $2" = "images --quiet" ]; then
+  publish
+  if [ -f "$journal/cached.$(flat "$target")" ]; then
+    printf '%064x\n' 1
+  else
+    echo "Error: $target: image not known" 1>&2
+    exit 125
+  fi
+  exit 0
+fi
+
 # What a steering marker is matched against: the argv, plus -- for a working
 # container, whose name is outrig's own nonce and carries no test's token --
 # the argv of the `from` that made it. Read without a fork, since every
@@ -407,6 +424,15 @@ fn unique_name(what: &str) -> String {
 /// `token` appears in its argv.
 fn return_immediately_for(journal: &Path, verb: &str, token: &str) {
     std::fs::write(journal.join(format!("fast.{verb}.{token}")), "").expect("write fast marker");
+}
+
+/// Make the fake's `buildah images --quiet <tag>` report `tag` as already
+/// present, the shape issue #393's race leaves behind: another session's
+/// build landed under the same tag between this one's own cache miss and its
+/// commit.
+fn mark_cached_for(journal: &Path, tag: &ImageTag) {
+    let flat = tag.as_str().replace(['/', ':'], "_");
+    std::fs::write(journal.join(format!("cached.{flat}")), "").expect("write cached marker");
 }
 
 /// Make the fake's parked `build` record a stop and refuse it, so a test can
@@ -1534,6 +1560,77 @@ async fn a_refused_working_container_removal_is_reissued() {
     let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
     let builder = flag_value(&from, "--name");
     expect_removed(journal, &builder).await;
+}
+
+/// Issue #393: two sessions that miss the cache for the same tag at once
+/// both build and both reach the commit. `buildah commit` over an existing
+/// tag re-points it rather than refusing, so the loser would otherwise
+/// overwrite the winner's image, leaving the winner's former image dangling.
+///
+/// Simulated here by marking `final_tag` cached in the fake's `buildah
+/// images` the moment this build's working container is probed, which is
+/// exactly what a concurrent winner finishing first looks like from this
+/// side. The losing build still succeeds -- the caller asked for an image at
+/// `final_tag`, and the race's winner left one there -- but its own working
+/// container is discarded, unreleased, rather than committed over it.
+#[tokio::test]
+async fn a_build_that_loses_the_commit_race_discards_its_own_container() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("commit-race");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    mark_cached_for(journal, &final_tag);
+
+    outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, false)
+        .await
+        .expect("a lost commit race is not a build failure");
+
+    assert!(
+        invocations(journal)
+            .iter()
+            .all(|(_, argv)| !(verb_of(argv) == "commit" && argv.contains(&token))),
+        "the re-probe should have skipped the commit entirely"
+    );
+
+    let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
+    let builder = flag_value(&from, "--name");
+    expect_removed(journal, &builder).await;
+}
+
+/// Issue #393 follow-up: `--no-cache` (`no_cache = true`) must still commit
+/// over an existing tag rather than silently keeping it. The pre-commit
+/// re-probe exists to let an ordinary race's loser discard its own redundant
+/// build; a *forced* rebuild is not a race loser, and skipping the commit for
+/// it would mean `outrig build --no-cache` (or any `no_cache` library caller)
+/// reports success while leaving the stale image in place -- exactly the
+/// staleness a forced rebuild exists to clear.
+#[tokio::test]
+async fn a_forced_rebuild_commits_over_an_existing_tag() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("forced-rebuild");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = keyed_tag(&token, &cfg, context.path()).await;
+    // Mark the tag cached, the same shape a race's winner (or a stale local
+    // tag `--no-cache` is meant to replace) would leave behind.
+    mark_cached_for(journal, &final_tag);
+
+    outrig::image::build_image_for(&token, &cfg, context.path(), &final_tag, true)
+        .await
+        .expect("a forced rebuild still succeeds despite the existing tag");
+
+    invocation(journal, "commit", &[token.as_str()]).await;
 }
 
 /// Issue #275: the temporary tag cannot go while the working container made
