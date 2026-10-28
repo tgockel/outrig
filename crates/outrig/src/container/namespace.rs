@@ -315,13 +315,25 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 /// points -- the bind-mounted workspace included. Opening with `O_DIRECTORY |
 /// O_NOFOLLOW` and changing ownership through that descriptor settles both in
 /// one step, with no window between the check and the `chown`.
+///
+/// The `mkdir`s run under a cleared `umask`, restored before returning (#397):
+/// a hardened `027` on a base image without `/home` would otherwise leave
+/// `mkdir(dir, 0o755)` at `0750 root:root`, untraversable by the very user
+/// it is created for. Safe only because this always runs in a freshly
+/// forked, single-threaded child -- [`create_home`] guarantees that in
+/// production, and the test exercising this below forks one of its own
+/// rather than touching the test binary's shared umask directly.
 fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), (NsStep, i32)> {
+    let previous_umask = unsafe { libc::umask(0) };
     for dir in dirs {
         let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
         if rc == -1 && nsfork::errno() != libc::EEXIST {
-            return Err((NsStep::Mkdir, nsfork::errno()));
+            let errno = nsfork::errno();
+            unsafe { libc::umask(previous_umask) };
+            return Err((NsStep::Mkdir, errno));
         }
     }
+    unsafe { libc::umask(previous_umask) };
     // Only a home of `/` itself lays out no paths at all.
     let Some(home) = dirs.last() else {
         return Err((NsStep::Mkdir, libc::EINVAL));
@@ -427,13 +439,45 @@ mod tests {
         assert_eq!(err.step, NsStep::OpenUserNsFile);
     }
 
-    /// What the child does once inside the namespaces, run in-process against
-    /// `home` -- a stand-in for `/home/<user>` under a tempdir -- and giving
-    /// it to ourselves, which needs no privilege.
+    /// What the child does once inside the namespaces, run against `home` --
+    /// a stand-in for `/home/<user>` under a tempdir -- and giving it to
+    /// ourselves, which needs no privilege.
+    ///
+    /// Runs in a forked child, the same as [`create_home`] runs it, rather
+    /// than in-process: [`make_home`] clears the process-wide `umask` for as
+    /// long as its `mkdir`s take, and this test binary runs its tests on
+    /// several threads at once, any of which may be creating files of its
+    /// own at that moment (an image-cache test hashing a fixture's mode
+    /// among them, see #397's second report). A fork's umask is its own
+    /// copy, invisible to and unaffected by every other thread, so isolating
+    /// it there is isolation for the whole test binary, not just this test.
     fn make_home_at(home: &Path) -> Result<(), NsError> {
+        make_home_at_under(home, None)
+    }
+
+    /// [`make_home_at`], additionally setting `umask` in the forked child
+    /// before [`make_home`] runs -- a stand-in for a restrictive host shell,
+    /// set where only the child can see it.
+    fn make_home_at_under(
+        home: &Path,
+        umask_override: Option<libc::mode_t>,
+    ) -> Result<(), NsError> {
         let (uid, gid) = own_ids();
-        make_home(&mkdir_p_paths(home).expect("paths"), uid, gid)
-            .map_err(|(step, errno)| NsError::errno(step, errno))
+        let dirs = mkdir_p_paths(home).expect("paths");
+
+        let (status, _fds) = nsfork::fork_collect(|sock| {
+            if let Some(mask) = umask_override {
+                unsafe { libc::umask(mask) };
+            }
+            let status = match make_home(&dirs, uid, gid) {
+                Ok(()) => nsfork::Status::OK,
+                Err((step, errno)) => nsfork::Status::failed(step as u32, errno),
+            };
+            let _ = nsfork::send_status(sock, status, &[]);
+        })
+        .expect("fork_collect");
+
+        check_reply(status)
     }
 
     fn own_ids() -> (u32, u32) {
@@ -456,6 +500,28 @@ mod tests {
 
         // Finding it already there on a second run is fine.
         make_home_at(&home).expect("existing home");
+    }
+
+    /// A hardened `umask 027` must not survive into the home directory's
+    /// mode: `mkdir(dir, 0o755)` with that umask in force yields `0750`,
+    /// untraversable by the very user it was created for (#397). The umask
+    /// is set where [`make_home_at_under`] forks it, not here, for the
+    /// reason given on [`make_home_at`].
+    #[test]
+    fn a_restrictive_umask_does_not_shrink_the_home_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home/dev");
+
+        make_home_at_under(&home, Some(0o027)).expect("home created under a restrictive umask");
+
+        let mode = std::fs::metadata(&home)
+            .expect("stat home")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "home mode is {mode:o}, want 0755");
     }
 
     /// `/home` itself a symlink to a directory is a normal distro layout.

@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The home directory's `mkdir`s no longer honor the host process's `umask`.** A forked helper
+  creating `/home` and `/home/<user>` inside the container called `mkdir(dir, 0o755)` with
+  whatever `umask` it inherited still in force, so an image without `/home` (a `scratch` or
+  Nix-style base) picked up `/home` as `0750 root:root` under a hardened `umask 027`: every exec
+  then got `HOME=/home/<user>` it could not even enter, and tools failed with `EACCES` on
+  `$HOME`. The helper now clears its `umask` before creating either directory and restores it
+  right after, so the mode asked for is the mode it gets. (#397)
 - **The nsfork helper's socketpair is `SOCK_CLOEXEC`, and its `recvmsg`/`waitpid` retry on
   `EINTR`.** The pair `fork_collect` opens to talk to its child was plain `SOCK_SEQPACKET`: a
   `podman` client another task spawned in the window before the parent closed its end inherited
