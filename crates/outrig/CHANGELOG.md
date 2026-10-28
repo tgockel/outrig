@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The nsfork helper's socketpair is `SOCK_CLOEXEC`, and its `recvmsg`/`waitpid` retry on
+  `EINTR`.** The pair `fork_collect` opens to talk to its child was plain `SOCK_SEQPACKET`: a
+  `podman` client another task spawned in the window before the parent closed its end inherited
+  both descriptors, since neither `std` nor tokio's `Command::spawn` closes an inherited fd that
+  is not `CLOEXEC`. A helper that then died without replying left its end held open by that
+  unrelated process, so the parent's `recvmsg` saw no EOF and the bootstrap hung on a tokio
+  worker until the client exited. `socketpair` now passes `SOCK_CLOEXEC` alongside
+  `SOCK_SEQPACKET`, closing both ends across any `exec` in between. Separately, an embedder
+  without `SA_RESTART` on its signal handlers (the CLI's tokio and `signal-hook` set it, so this
+  never reached it) saw a spurious bootstrap failure from an `EINTR`-interrupted `recvmsg`, or a
+  zombie left behind by one from `waitpid`; both now loop past `EINTR` instead of surfacing or
+  skipping it. (#396)
 - **A context outside a git repository is hashed in process, not by shelling out to `tar`.**
   `tar`'s stderr went to a `tracing::warn!` line and never into the error, so a failure --
   a context directory that does not exist, a file in it the process cannot read -- surfaced as
