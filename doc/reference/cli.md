@@ -460,9 +460,10 @@ everything else, and a warning says once when it passes an eighth of that ceilin
 (see [Remote-provider models](config.md#remote-provider-models)); without one, 128,000 tokens
 is assumed and startup warns. Before each call, OutRig estimates its size -- about three bytes to
 a token -- against the window, less the reply's `max-tokens` and the system prompt. When what was
-chosen does not fit, the recent rounds go first, from their oldest turn, then the first rounds,
-from their newest, then promotions, oldest first, then the current round's earlier turns; a turn
-too large for what is left is passed over and smaller ones still go. The turn a call answers --
+chosen does not fit, the first and recent rounds go first, from their oldest turn, so a long first
+round keeps its end; then promotions, oldest first; then the current round's earlier turns; and last
+the turn that opens each first round and the current one, where the agent read what was asked. A
+turn too large for what is left is passed over and smaller ones still go. The turn a call answers --
 the model's latest code and its results -- is never left out. When that alone does not fit, the
 call is not made: the round ends with `(round ended: turn N of round R ... is about X tokens, and
 a call to M has room for about Y ...)`, and keeps the turn. The next round leaves it out like any

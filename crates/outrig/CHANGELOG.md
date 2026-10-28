@@ -92,9 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window. Each model of an alias has its own, and `model.call`'s `budget.estimate_scale` records
   it. A prompt the scale would refuse but the estimate alone admits is carried with the reply's
   ceiling lowered instead, as `budget.reserve` and `budget.max_tokens` record. What does not fit
-  is left out in a fixed order -- the window's
-  recent rounds, then its first, then promotions, then the round's earlier turns -- and the turn
-  a call answers never is. When that turn alone does not fit, the call is not made: the round
+  is left out in a fixed order -- the window's first and recent rounds, from their oldest turn,
+  then promotions, then the round's earlier turns, and last the turn that opens each first round
+  and the current one, where the agent read what the user asked -- and the turn a call answers
+  never is. (#667) When that turn alone does not fit, the call is not made: the round
   ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's
   refusal of a call whose shortened history put one role after itself says so, and names that
   provider row's `role-alternation` as the remedy.

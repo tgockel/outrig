@@ -11,9 +11,10 @@
 //! The **view** is what a model call is sent. It is chosen from the store on
 //! every call: the round in progress, every turn the agent promoted, and the
 //! conversation's first rounds and its most recent ones. Then it is held to the
-//! call's [`Budget`], and when it does not fit, the default window goes first
-//! -- nearest the part already left out -- then promotions, oldest first, then
-//! the round's own earlier turns. The latest turn, whose results the call
+//! call's [`Budget`], and when it does not fit, the default window goes first,
+//! from its oldest turn, then promotions, oldest first, then the round's own
+//! earlier turns, and last the turn that opens each first round and the round
+//! in progress ([`Window`]). The latest turn, whose results the call
 //! answers, is never left out; when it cannot fit on its own, the call is not
 //! made ([`TooLarge`]). For a provider that requires the user's and the model's
 //! turns to alternate, the turns that would put one role after itself are
@@ -45,6 +46,13 @@ use crate::python::host::{ContextChange, Interpreter};
 /// Which earlier rounds a model call is sent, besides the turns the agent
 /// promoted, before the budget has its say. The round in progress is always
 /// chosen.
+///
+/// When what is chosen does not fit, the budget keeps the turn that opens each
+/// first round and the round in progress longest after the turn the call
+/// answers: the agent read what the user asked there. The rest of the window
+/// goes first, the first rounds with the recent ones, oldest first, so a first
+/// round longer than the room keeps its end -- where its work was done --
+/// rather than its beginning. See [`Store::select`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Window {
     /// The conversation's first rounds, where the user said what they wanted.
@@ -1152,14 +1160,22 @@ impl Store {
             .collect()
     }
 
+    /// Whether turn `id` is its round's first, which begins with the round's
+    /// opening.
+    fn opens_round(&self, id: usize) -> bool {
+        id == 0 || self.turns[id - 1].round != self.turns[id].round
+    }
+
     /// What a call of a round beginning at `start` carries in `room`, or the
     /// estimate of its prompt when that alone does not fit.
     ///
-    /// Turns are admitted in the order they are kept longest: the round's own,
-    /// newest first; then promotions, newest first; then the first rounds,
-    /// oldest first; then the recent rounds, newest first. So what is left out
-    /// goes the other way. A turn that does not fit is left out and the rest
-    /// are still tried, so one large turn costs only itself.
+    /// Turns are admitted in the order they are kept longest, for the reasons
+    /// [`Window`] gives: the turn that opens each first round and the round in
+    /// progress, oldest first; then the round's own, newest first; then
+    /// promotions, newest first; then the rest of the window, the first rounds
+    /// with the recent ones, newest first. So what is left out goes the other
+    /// way. A turn that does not fit is left out and the rest are still tried,
+    /// so one large turn costs only itself.
     fn select(&self, start: usize, prompt: Prompt, room: u64) -> Result<Selection, u64> {
         let latest = prompt.turn();
         let prompt_tokens = self.prompt_tokens(prompt);
@@ -1169,12 +1185,24 @@ impl Store {
         let mut left = room - prompt_tokens;
 
         let chosen = self.chosen(start, latest);
-        let of = |why: Why| chosen.iter().filter(move |(_, w)| *w == why).copied();
-        let order = of(Why::Round)
-            .rev()
-            .chain(of(Why::Promoted).rev())
-            .chain(of(Why::First))
-            .chain(of(Why::Recent).rev());
+        let opening = |&(id, why): &(usize, Why)| {
+            why != Why::Latest
+                && self.opens_round(id)
+                && (id == start || self.turns[id].round <= self.window.first)
+        };
+        let of = |whys: &'static [Why]| {
+            chosen
+                .iter()
+                .filter(move |turn| whys.contains(&turn.1) && !opening(turn))
+                .copied()
+        };
+        let order = chosen
+            .iter()
+            .filter(|turn| opening(turn))
+            .copied()
+            .chain(of(&[Why::Round]).rev())
+            .chain(of(&[Why::Promoted]).rev())
+            .chain(of(&[Why::First, Why::Recent]).rev());
         let mut carried: Vec<(usize, Why)> =
             latest.map(|id| (id, Why::Latest)).into_iter().collect();
         let mut evicted = Vec::new();

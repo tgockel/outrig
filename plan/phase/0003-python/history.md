@@ -155,9 +155,13 @@ so the estimate has to happen before the call.
 - A call's room is the window, less the reply's ceiling -- at most a quarter of an assumed window
   -- and less the system prompt and tool definition. Tokens are estimated from each message's JSON,
   a token per three ASCII bytes and one per other character, and counted once per turn.
-- The view is chosen as before, then filled in the order it is kept longest: the round in
-  progress, newest first; promotions, newest first; the first rounds, oldest first; the recent
-  rounds, newest first. A turn that does not fit is passed over, and smaller ones still go.
+- The view is chosen as before, then filled in the order it is kept longest: the turn that opens
+  each first round and the round in progress, oldest first, since the agent read what the user
+  asked there; the rest of the round in progress, newest first; promotions, newest first; the rest
+  of the window, the first rounds with the recent ones, newest first. A turn that does not fit is
+  passed over, and smaller ones still go. Filling the first rounds oldest first, as this did until
+  #667, kept a long first round's reading and dropped its result, all of round 2, and every recent
+  round; inside a round, the round's own oldest-first eviction dropped the user's request first.
 - The turn a call answers is never left out. When it alone does not fit, the call is not made, and
   the round ends naming the turn; the next round is an ordinary one that leaves it out.
 
@@ -305,6 +309,10 @@ new protocol message, and the query vocabulary becomes a surface to design and m
 - Whether a promotion is visible to the model as an event in its own context, or silently changes
   what it sees between rounds. It is silent so far; the per-call manifest records what each call
   carried and why, for a human to read.
+- Which turn holds the user's request. The budget keeps the turn that opens a round, which holds
+  the request only when the agent reads its messages on the round's first call. Keeping the turn
+  whose code received the message would be exact, but the store would have to learn which turn
+  that was (#667).
 
 ## Unverified
 
