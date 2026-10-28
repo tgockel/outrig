@@ -823,6 +823,23 @@ each described below.
 
 ### Fixed
 
+- **A child whose rounds keep failing before its code runs stops after five, and fails what it
+  holds.** Such a round was opened again with what it opened with, for as long as the session
+  lived: the wait between rounds was capped at 60 s, the count of rounds never was, and the
+  conversation keeps nothing of a round that failed, so each one sent the provider the same
+  request. One a provider refuses on every attempt -- an empty reply with finish reason
+  `content_filter` -- cost a round a minute, and the parent heard nothing. In one session a
+  single child ran 603 rounds over 5.8 hours on a view that never changed, about 82M input
+  tokens, and four others did the same. Now the fifth round in a row to fail ends the child's
+  model as one that can answer nothing, as a key its provider refuses does: what the child holds
+  open, and anything sent to it after, ends `failed` with the error named, finish reason
+  included, and no call is made again. A round that runs ends the count. A request the host
+  ends before its child has read it -- for this, a key the provider refuses, or a spent budget --
+  is also taken out of the child's queue, where its copy had stayed for a child that would never
+  read it, so a parent that goes on sending leaves nothing behind. A provider outage that
+  outlasts the five rounds, about 30 s of waiting plus each call's own retries, ends the child
+  the same way, where it used to wait the outage out. (#757)
+
 - **`help(runtime)` in a child names only what that child has.** A work child's runtime carried a
   two-line docstring deferring to `help(Runtime)`, and `Runtime` is bound in no kernel, so
   following it raised `NameError`; the text deferred to described `runtime.channels["user"]`,

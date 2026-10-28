@@ -24,6 +24,7 @@ use super::mock_http::{
     self, CannedResponse, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, system_text,
     text_reply,
 };
+use super::runner::ROUND_FAILURES_MAX;
 use crate::config::Config;
 use crate::harness::event::{Event, Received};
 use crate::harness::{Session, SessionBuilder, ShutdownReport};
@@ -1965,6 +1966,91 @@ async fn a_failed_round_opens_again_with_what_it_opened_with() {
     assert_eq!(
         kind(&events, "model.round.failed", Some("agent/c1")).len(),
         1
+    );
+}
+
+/// A round that fails before its code ran, every time, is the same request
+/// each time, so it is opened again only so often: the child then fails what
+/// it holds, naming the error, and makes no call again -- not for the request
+/// its round opened on, nor for one sent after. What it failed is not kept for
+/// it either: a parent that sends request after request, each failing, leaves
+/// none queued on the channel.
+#[tokio::test]
+async fn a_round_that_keeps_failing_ends_what_the_child_holds() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_FAILING",
+        "",
+        vec![
+            ("ROLE failing", scripted(vec![mock_http::failure(500)])),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('f', prompt='ROLE failing', requests={'fizz': (str, Thing)})
+                    for body in ('a', 'b', 'c'):
+                        try:
+                            await asyncio.wait_for(child.channels['fizz'].request(body), 30)
+                        except outrig.AgentRequestFailed as e:
+                            print('in a row' in e.message, 'failed on purpose' in e.message)
+                    print(child.channels['fizz'].pending())
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(
+        printed(&requests, "p1"),
+        "True True\nTrue True\nTrue True\n0\n"
+    );
+    assert_eq!(
+        of_agent(&requests, "ROLE failing").len(),
+        ROUND_FAILURES_MAX as usize,
+        "one call for each round, and none after the last"
+    );
+    assert_eq!(
+        kind(&events, "model.round.failed", Some("agent/c1")).len(),
+        ROUND_FAILURES_MAX as usize
+    );
+}
+
+/// Failures are counted in a row: a round that runs ends the count, so a child
+/// that fails more rounds than the limit allows, with one between that ran,
+/// answers both of its submissions.
+#[tokio::test]
+async fn a_round_that_runs_ends_the_count_of_failed_rounds() {
+    let complete = "await runtime.complete(Total(total=sum(xs)))";
+    let just_under = ROUND_FAILURES_MAX as usize - 1;
+    let mut script = vec![mock_http::failure(500); just_under];
+    script.extend(child_runs("c1", complete));
+    script.extend(vec![mock_http::failure(500); just_under]);
+    script.extend(child_runs("c2", complete));
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_FAILING_BETWEEN",
+        "",
+        vec![
+            ("ROLE flaky", scripted(script)),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('f', prompt='ROLE flaky')
+                    print((await child.submit({'xs': [1, 2]}, result=Total)).total)
+                    print((await child.submit({'xs': [3, 4]}, result=Total)).total)
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "3\n7\n");
+    assert_eq!(
+        kind(&events, "model.round.failed", Some("agent/c1")).len(),
+        2 * just_under
     );
 }
 

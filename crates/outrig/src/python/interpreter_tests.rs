@@ -5157,6 +5157,79 @@ fn a_cancelled_request_never_reaches_the_child_or_refuses_its_reply() {
     );
 }
 
+/// A request the host ends before its child reads it, because the child's model fails for good, is
+/// not kept for the child: a parent that goes on sending leaves nothing queued, on a request
+/// child's channel or in a work child's queue.
+#[test]
+fn a_request_the_host_ends_unread_is_not_kept_for_the_child() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c1",
+    );
+    k.spawn_as(3, "work = await runtime.spawn('w', prompt='p')", "c2");
+    let (_, notices) = k.noted(
+        PRIMARY,
+        4,
+        "asked = child.channels['fizz'].request('a')\nsubmitted = work.submit({}, result=int)",
+    );
+    let sent: Vec<&Value> = notices
+        .iter()
+        .filter(|n| n["t"] == "agent.request")
+        .collect();
+    assert_eq!(sent.len(), 2, "{notices:?}");
+    for request in sent {
+        k.send(json!({
+            "t": "settle", "agent": request["child"], "id": request["request"],
+            "outcome": "failed", "message": "the model fails",
+        }));
+        k.until("agent.ended", Vec::new());
+    }
+    assert_eq!(
+        k.output(
+            5,
+            "print(asked.status.state, submitted.status.state, child.channels['fizz'].pending(), \
+             len(work._child.queue), child._child.unsettled, work._child.unsettled)"
+        ),
+        "failed failed 0 0 0 0\n"
+    );
+}
+
+/// The host's word can come between a request's being told of and its being queued, since the
+/// host hears of it first. A request that ended by then is not queued after.
+#[test]
+fn a_request_the_host_ended_before_it_was_queued_is_not_queued() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(
+        2,
+        "child = await runtime.spawn('r', prompt='p', requests={'fizz': (str, int)})",
+        "c1",
+    );
+    // The host answers from its own thread; here, as the notice goes out, which is as soon as it
+    // can.
+    let (said, _) = k.noted(
+        PRIMARY,
+        3,
+        "import __main__\n\
+         real = __main__._notify\n\
+         def host_settles_first(line):\n    \
+             real(line)\n    \
+             if line.get('t') == 'agent.request':\n        \
+                 __main__._works[line['request']].end(\n            \
+                     'failed', error=outrig.AgentRequestFailed('the model fails'))\n\
+         __main__._notify = host_settles_first\n\
+         try:\n    \
+             h = child.channels['fizz'].request('a')\n\
+         finally:\n    \
+             __main__._notify = real\n\
+         print(h.status.state, child.channels['fizz'].pending(), child._child.unsettled)",
+    );
+    assert_eq!(said, "failed 0 0\n");
+}
+
 /// A submission waits until the host gives it to the work child between rounds; its inputs are
 /// then bound, and the child completes it with the JSON form of its result, which the handle
 /// gives back as an instance. Progress arrives on the handle and settles nothing.

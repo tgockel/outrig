@@ -19,13 +19,15 @@
 //!
 //! A round that fails before its code ran is opened again, with what it opened
 //! with, until it runs: the conversation keeps nothing of it, so its opening
-//! was never read. One that fails after its code ran is kept, opening and all,
-//! and what that code did -- a completion, a reply -- stands, so it is not
-//! opened again: after the same wait, the rule decides from what is open then,
-//! against the baseline from before it. Once the session's token budget is
-//! spent, or a round finds the child's model can never answer, no round opens:
-//! what the child holds open ends instead, and so does anything that arrives
-//! later.
+//! was never read. It is the same request each time, so one that fails
+//! [`ROUND_FAILURES_MAX`] times in a row is not opened again: the child's model
+//! is taken to answer nothing, as if it could never. One that fails after its
+//! code ran is kept, opening and all, and what that code did -- a completion, a
+//! reply -- stands, so it is not opened again: after the same wait, the rule
+//! decides from what is open then, against the baseline from before it. Once
+//! the session's token budget is spent, or a round finds the child's model can
+//! never answer, no round opens: what the child holds open ends instead, and
+//! so does anything that arrives later.
 //!
 //! An agent class instance's child has one round before the rule applies: its
 //! orienting round, which opens as it launches, to get ready in. Requests that
@@ -44,10 +46,19 @@ use super::{Agent, AgentError};
 use crate::harness::event::ChildKind;
 
 /// How long a child waits after a round fails before the next opens. Each
-/// failure in a row doubles it, up to [`RETRY_MAX`].
-const RETRY_FIRST: Duration = Duration::from_secs(2);
+/// failure in a row doubles it, up to [`RETRY_MAX`]. Short under test, where
+/// the failures it waits out are the point.
+const RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(5)
+} else {
+    Duration::from_secs(2)
+};
 /// The longest a child waits after a failed round.
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How many rounds in a row may fail before their code ran. A round is opened
+/// again with what it opened with, so the model is sent the same request each
+/// time, and one that refuses it refuses it again.
+pub(super) const ROUND_FAILURES_MAX: u32 = 5;
 
 /// Drive child `id`'s rounds until its registry, or the session, ends.
 /// `spent` says when the session's token budget is spent. `instance` is the
@@ -163,6 +174,7 @@ pub(crate) async fn run(
             },
         };
         drop(children);
+        let mut failures = 0;
         let ended = loop {
             agent.announcer().opened();
             let ended = agent
@@ -171,6 +183,10 @@ pub(crate) async fn run(
             let Err(AgentError::Prompt(failed)) = &ended else {
                 break ended;
             };
+            failures += 1;
+            if failures == ROUND_FAILURES_MAX {
+                break ended;
+            }
             tracing::warn!("child agent {id}'s round failed; trying again in {wait:?}: {failed}");
             back_off(&mut wait).await;
             match registry.upgrade() {
@@ -206,6 +222,14 @@ pub(crate) async fn run(
                      {wait:?}: {failed}"
                 );
                 back_off(&mut wait).await;
+            }
+            // Only the last of a run of failures gets here, the others having
+            // been opened again. The request was the same each time.
+            Err(AgentError::Prompt(failed)) => {
+                broken = Some(format!(
+                    "the child's round failed {ROUND_FAILURES_MAX} times in a row on the same \
+                     request, so it is not sent again: {failed}"
+                ));
             }
             // Its model can answer nothing until the configuration changes,
             // so what it holds cannot be answered either.

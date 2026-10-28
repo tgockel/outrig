@@ -4496,12 +4496,18 @@ class _Work:
         with self.lock:
             if self.state in _ENDED:
                 return False
+            unread = self.state in ("queued", "waiting")
             self.state = "accepted" if reason is None else "failed"
             self.reason = reason
             self.value, self.error = value, error
             self.final = _agents.Status(self.state, reason, self.child.state)
         with _works_lock:
             _works.pop(self.id, None)
+        # A request the child never read -- one the host ended because the child will not -- is not
+        # kept for it, copy and all. The state already says it ended, so a `RequestEndpoint._put`
+        # the host's word got ahead of finds that and queues nothing.
+        if unread:
+            self.child.withdraw(self)
         self.child.settled(self)
         # A request held for a child that never came to exist was never told of.
         if self.child.id is not None:
@@ -5343,9 +5349,12 @@ class RequestEndpoint(Endpoint):
 
     def _put(self, work):
         """Queue `work` for a receive, from its sender's thread. Whether it was: not once this
-        child's kernel has ended."""
+        child's kernel has ended, nor once `work` has, as the host can end it before this is
+        reached: `_Work.end` takes it out of the queue only if it is there by then."""
         with self._lock:
             if _kernels.get(self._agent) is None or _kernels[self._agent].ended:
+                return False
+            if work.state in _ENDED:
                 return False
             self._queue.append(work)
             self._delivered += 1
