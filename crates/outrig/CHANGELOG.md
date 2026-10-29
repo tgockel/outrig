@@ -493,6 +493,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parallel under the session's limits. A call nobody awaits still runs. The child is released
   however the call settles, and the call settles once the child is gone, so a call past
   `children-max` fails `AgentLimitReached` at once and the next call after a release has room.
+  The release does not cut the child's round: a work child's round ends before the model call
+  that would follow its accepted submission, when nothing else waits, so the call that completed
+  it is committed as it returned and no model call is sent to speak after it. A release gives a
+  round still running two seconds to end that way, and a round whose model call outlasts them is
+  dropped, as `model.round.dropped` records. (#685)
   `validate=` names a pure function called in the caller with the decoded result and the
   arguments by name, returning a list of problems; each answer runs it once, and its problems
   reach the child as decoding problems do, under the same attempt limit; one that raises ends

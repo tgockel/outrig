@@ -13,8 +13,11 @@
 //! child at all -- the session's admission, `subagent-depth-max`,
 //! `children-max` -- what model it runs on, when it gets a round, when a request
 //! it leaves open ends -- a work child's second round without completing, a
-//! spent token budget -- and how a release ends a child and everything below
-//! it.
+//! spent token budget -- when a round has nothing left to do, and how a release
+//! ends a child and everything below it. A release does not drop the round in
+//! flight: it ends the child's kernel, which returns the call the round waits
+//! on, and the round stops before its next model call; only one still in a
+//! model call after [`RELEASE_WAIT`] is dropped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -23,13 +26,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use super::channel::Announcer;
 use super::history::Window;
 use super::ledger::{CallSlot, Ledger};
 use super::orientation::{self, ChannelText, ChildBrief};
 use super::resolve::{self, LlmResolveError};
+use super::round::Quiet;
 use super::{Agent, AgentError, runner};
 use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
@@ -50,6 +54,13 @@ const WEDGE_WAIT: Duration = Duration::from_secs(2);
 /// does so on its reader thread, so only an interpreter nothing can run in is
 /// slower.
 const ASSIGN_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a released child's round has to end on its own before its runner
+/// is stopped. A round that ends in time is kept whole: its next model call is
+/// not made, since the child is [quiet](Inner::quiet), and what it ran is
+/// committed. One still in a model call when the wait is over is dropped, and
+/// so is one when the session closes first.
+pub(super) const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// What a session hands its children's registry: what they are resolved
 /// against, the limits they run under, and what their instructions say.
@@ -116,7 +127,11 @@ struct ChildNode {
     /// Whether it counts against `children-max`: from its launch until its
     /// kernel is gone.
     resident: bool,
+    /// Its runner, until a release takes it to wait for.
     runner: Option<JoinHandle<()>>,
+    /// Stops its runner, kept for as long as the child is: a release takes
+    /// `runner`, and a close that comes during its wait must still stop it.
+    abort: Option<AbortHandle>,
     wake: Arc<Notify>,
     /// Every request ever delivered on each of its channels.
     delivered: BTreeMap<String, u64>,
@@ -289,11 +304,7 @@ impl Children {
     /// Stop every child's runner: the session is ending, and no child makes
     /// another model call.
     pub(crate) fn stop(&self) {
-        let runners: Vec<JoinHandle<()>> = lock(&self.0.state)
-            .agents
-            .values_mut()
-            .filter_map(|node| node.child.as_mut()?.runner.take())
-            .collect();
+        let runners = lock(&self.0.state).runners();
         for runner in runners {
             runner.abort();
         }
@@ -314,6 +325,74 @@ impl State {
 
     fn child_mut(&mut self, id: &str) -> Option<&mut ChildNode> {
         self.agents.get_mut(id)?.child.as_mut()
+    }
+
+    /// Every child's runner, as what stops it: a released child's too, which
+    /// its release is waiting on.
+    fn runners(&self) -> Vec<AbortHandle> {
+        self.agents
+            .values()
+            .filter_map(|node| node.child.as_ref()?.abort.clone())
+            .collect()
+    }
+
+    /// Round `round` of `child`'s opens, unless the child was released, which
+    /// is decided here, under the lock a release marks it under: a runner that
+    /// found it live a moment ago must not make it live again. Whether it
+    /// opened.
+    fn open_round(&mut self, child: &str, round: u32) -> bool {
+        let Some(node) = self.child_mut(child) else {
+            return false;
+        };
+        if matches!(node.life, Life::Released | Life::Wedged) {
+            return false;
+        }
+        node.round = Some(round);
+        node.life = Life::Running;
+        for record in self
+            .requests
+            .values_mut()
+            .filter(|record| record.child == child && !matches!(record.state, Req::Ended(_)))
+        {
+            // A round that committed nothing leaves its number to the next.
+            if record.rounds.last() != Some(&round) {
+                record.rounds.push(round);
+            }
+        }
+        true
+    }
+
+    /// Whether `child` was released: its release has begun, or it is wedged.
+    fn released(&self, child: &str) -> bool {
+        self.child(child)
+            .is_some_and(|node| matches!(node.life, Life::Released | Life::Wedged))
+    }
+
+    /// What `child` holds open: see [`Inner::summary`].
+    fn summary(&self, child: &str, kind: ChildKind) -> Summary {
+        let mut summary = Summary::default();
+        for (id, record) in self.requests.iter().filter(|(_, r)| r.child == child) {
+            match record.state {
+                Req::Unread => {
+                    summary.unread.insert(*id);
+                }
+                Req::Received(_) => {
+                    summary.taken.insert(*id);
+                }
+                Req::Queued if kind == ChildKind::Work => {
+                    summary.unread.insert(*id);
+                }
+                Req::Queued | Req::Ended(_) => {}
+            }
+        }
+        if kind == ChildKind::Work {
+            if summary.taken.is_empty() {
+                summary.unread = summary.unread.iter().take(1).copied().collect();
+            } else {
+                summary.unread.clear();
+            }
+        }
+        summary
     }
 }
 
@@ -472,6 +551,7 @@ impl Inner {
                         life: Life::Launching,
                         resident: true,
                         runner: None,
+                        abort: None,
                         wake: Arc::new(Notify::new()),
                         delivered: BTreeMap::new(),
                         round: None,
@@ -597,6 +677,10 @@ impl Inner {
                 .map(|inner| inner.counts(&child))
                 .unwrap_or_default()
         }));
+        let weak = Arc::downgrade(self);
+        let child = id.to_string();
+        let quiet: Quiet =
+            Arc::new(move || weak.upgrade().and_then(|inner| inner.quiet(&child, kind)));
         let agent = match Agent::build_child(
             &resolved,
             handle,
@@ -604,6 +688,7 @@ impl Inner {
             preamble,
             slot.clone(),
             announcer,
+            quiet,
             Arc::clone(&self.lifecycle),
         ) {
             Ok(agent) => agent,
@@ -639,7 +724,7 @@ impl Inner {
                     });
                 }
                 child.life = Life::Idle;
-                child.runner = Some(tokio::spawn(runner::run(
+                let runner = tokio::spawn(runner::run(
                     Arc::downgrade(self),
                     id.to_string(),
                     kind,
@@ -647,7 +732,9 @@ impl Inner {
                     Arc::clone(&child.wake),
                     self.ledger.budget_watch(),
                     instance,
-                )));
+                ));
+                child.abort = Some(runner.abort_handle());
+                child.runner = Some(runner);
             }
             started
         };
@@ -1010,30 +1097,38 @@ impl Inner {
     /// work child holds one submission at a time: the one it took, or else
     /// the next waiting.
     pub(crate) fn summary(&self, child: &str, kind: ChildKind) -> Summary {
+        self.state().summary(child, kind)
+    }
+
+    /// Why `child`'s round has nothing left to do, if it has none: a work
+    /// child's last submission was accepted and no other waits, or the child
+    /// was released. The round ends before its next model call, which
+    /// would only speak after the work. The acceptance is named first: a typed
+    /// call releases its child as the answer is accepted, and what the round
+    /// records is that it was done. A request child is quiet only once
+    /// released: what it holds open is what its channels' requests come to,
+    /// and it answers them as it chooses.
+    fn quiet(&self, child: &str, kind: ChildKind) -> Option<String> {
         let state = self.state();
-        let mut summary = Summary::default();
-        for (id, record) in state.requests.iter().filter(|(_, r)| r.child == child) {
-            match record.state {
-                Req::Unread => {
-                    summary.unread.insert(*id);
-                }
-                Req::Received(_) => {
-                    summary.taken.insert(*id);
-                }
-                Req::Queued if kind == ChildKind::Work => {
-                    summary.unread.insert(*id);
-                }
-                Req::Queued | Req::Ended(_) => {}
+        if kind == ChildKind::Work && state.summary(child, kind).is_empty() {
+            // The latest, so an older acceptance does not vouch for a
+            // submission that was rejected or cancelled after it.
+            if let Some((id, record)) = state.requests.iter().rev().find(|(_, r)| r.child == child)
+                && record.state == Req::Ended(RequestEnd::Accepted)
+            {
+                return Some(format!(
+                    "submission {id} was accepted and nothing else waits"
+                ));
             }
         }
-        if kind == ChildKind::Work {
-            if summary.taken.is_empty() {
-                summary.unread = summary.unread.iter().take(1).copied().collect();
-            } else {
-                summary.unread.clear();
-            }
-        }
-        summary
+        state
+            .released(child)
+            .then(|| "the child was released".to_string())
+    }
+
+    /// Whether `child` was released: its runner has no round to open.
+    pub(crate) fn released(&self, child: &str) -> bool {
+        self.state().released(child)
     }
 
     /// The requests waiting unread on each of `child`'s channels, and every
@@ -1126,25 +1221,14 @@ impl Inner {
     }
 
     /// Round `round` of `child`'s opens: every request open on it now spans
-    /// it, and so does one made while it runs.
-    pub(crate) fn round_opened(&self, child: &str, round: u32) {
-        let mut state = self.state();
-        if let Some(node) = state.child_mut(child) {
-            node.round = Some(round);
-            node.life = Life::Running;
+    /// it, and so does one made while it runs. Whether it did: a released
+    /// child's does not, and its runner is over.
+    pub(crate) fn round_opened(&self, child: &str, round: u32) -> bool {
+        let opened = self.state().open_round(child, round);
+        if opened {
+            self.tell_life(child);
         }
-        for record in state
-            .requests
-            .values_mut()
-            .filter(|record| record.child == child && !matches!(record.state, Req::Ended(_)))
-        {
-            // A round that committed nothing leaves its number to the next.
-            if record.rounds.last() != Some(&round) {
-                record.rounds.push(round);
-            }
-        }
-        drop(state);
-        self.tell_life(child);
+        opened
     }
 
     /// `child`'s round has ended. Whether it is idle is said only once its
@@ -1303,29 +1387,37 @@ impl Inner {
                 }
                 let launching = child.life == Life::Launching;
                 child.life = Life::Released;
-                if let Some(runner) = child.runner.take() {
-                    runner.abort();
-                }
+                // Woken to see it, and not stopped: a round in flight is
+                // given until its next model call to end (see below).
+                child.wake.notify_one();
+                let runner = child.runner.take();
                 next.extend(node.children.iter().cloned());
-                subtree.push((id, launching));
+                subtree.push((id, launching, runner));
             }
             subtree
         };
         // The deepest first, so each child's kernel ends after those below it.
         // One still launching may have no kernel yet: its launch ends it.
-        for (id, _) in subtree.iter().rev().filter(|(_, launching)| !launching) {
-            if self.interpreter.end(id, WEDGE_WAIT).await {
-                self.gone(id);
+        let ended: Vec<String> = subtree.iter().map(|(id, ..)| id.clone()).collect();
+        for (id, launching, runner) in subtree.into_iter().rev() {
+            if launching {
+                continue;
+            }
+            // Ending the kernel returns the call its round waits on, so the
+            // round stops before its next model call and its runner returns.
+            let (stopped, ()) =
+                tokio::join!(self.interpreter.end(&id, WEDGE_WAIT), wind_down(runner));
+            if stopped {
+                self.gone(&id);
             } else {
                 let mut state = self.state();
-                if let Some(child) = state.child_mut(id) {
+                if let Some(child) = state.child_mut(&id) {
                     child.life = Life::Wedged;
                 }
                 drop(state);
-                self.events_of(id).emit(Payload::AgentWedged {});
+                self.events_of(&id).emit(Payload::AgentWedged {});
             }
         }
-        let ended: Vec<String> = subtree.into_iter().map(|(id, _)| id).collect();
         let requests: Vec<AgentRequestId> = {
             let state = self.state();
             state
@@ -1373,7 +1465,7 @@ impl Inner {
     /// every one of them with the closing error, as it hears of the close;
     /// one that died ends none.
     fn close(&self, by: &ClosedBy) {
-        let runners: Vec<JoinHandle<()>> = {
+        let runners = {
             let mut state = self.state();
             if state.closed.is_some() {
                 return;
@@ -1385,15 +1477,28 @@ impl Inner {
                 .filter(|(_, record)| !matches!(record.state, Req::Ended(_)))
                 .map(|(id, _)| *id)
                 .collect();
-            state
-                .agents
-                .values_mut()
-                .filter_map(|node| node.child.as_mut()?.runner.take())
-                .collect()
+            state.runners()
         };
         for runner in runners {
             runner.abort();
         }
+    }
+}
+
+/// Give a released child's runner [`RELEASE_WAIT`] to end its round and
+/// return, and stop it if it has not. The round it was in is dropped then,
+/// which is the one thing left to end a model call in flight; the stop is
+/// awaited, so the drop's record precedes the release's.
+async fn wind_down(runner: Option<JoinHandle<()>>) {
+    let Some(mut runner) = runner else {
+        return;
+    };
+    if tokio::time::timeout(RELEASE_WAIT, &mut runner)
+        .await
+        .is_err()
+    {
+        runner.abort();
+        let _ = runner.await;
     }
 }
 
@@ -1431,3 +1536,65 @@ fn text(value: &Value) -> String {
 
 /// The registry a runner holds: dropped with the session, which ends it.
 pub(crate) type Registry = Weak<Inner>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry holding one child `c1`, in `life`, with one request open on it.
+    fn state_of(life: Life) -> State {
+        let mut state = State::default();
+        state.agents.insert(
+            "c1".to_string(),
+            Node {
+                parent: Some("primary".to_string()),
+                depth: 2,
+                model: "sonnet".to_string(),
+                slot: CallSlot::default(),
+                children: Vec::new(),
+                child: Some(ChildNode {
+                    life,
+                    resident: true,
+                    runner: None,
+                    abort: None,
+                    wake: Arc::new(Notify::new()),
+                    delivered: BTreeMap::new(),
+                    round: None,
+                }),
+                invocations: Vec::new(),
+            },
+        );
+        state.requests.insert(
+            1,
+            Record {
+                child: "c1".to_string(),
+                channel: Some("fizz".to_string()),
+                state: Req::Unread,
+                attempts: 0,
+                rounds: Vec::new(),
+                submission: None,
+            },
+        );
+        state
+    }
+
+    /// A runner that read its child as live, and then lost the race to its
+    /// release, does not make the child live again by opening a round: the
+    /// child stays released, no round is recorded for it, and the request open
+    /// on it does not span one. A live child's round opens as it always did.
+    #[test]
+    fn a_released_childs_round_does_not_open() {
+        for life in [Life::Released, Life::Wedged] {
+            let mut state = state_of(life);
+            assert!(!state.open_round("c1", 3), "{life:?}");
+            let child = state.child("c1").expect("the child");
+            assert_eq!((child.life, child.round), (life, None));
+            assert!(state.requests[&1].rounds.is_empty());
+        }
+        let mut state = state_of(Life::Idle);
+        assert!(state.open_round("c1", 3));
+        let child = state.child("c1").expect("the child");
+        assert_eq!((child.life, child.round), (Life::Running, Some(3)));
+        assert_eq!(state.requests[&1].rounds, [3]);
+    }
+}

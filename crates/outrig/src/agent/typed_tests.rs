@@ -339,6 +339,82 @@ async fn a_gather_of_three_calls_makes_three_children_each_gone_once_settled() {
     }
 }
 
+/// A call releases its child as its submission is accepted, while the round
+/// that completed it is still running: whichever ends first, the call's
+/// execution or the release, the round ends rather than being dropped. Five
+/// calls, since the two race. Each child records its round as completed,
+/// stopped on the accepted submission, with the call that completed it
+/// committed as it returned, and sends no model call after the answer.
+#[tokio::test]
+async fn a_typed_calls_round_ends_when_its_submission_is_accepted() {
+    let mut tree = tree(
+        "OUTRIG_TEST_TYPED_ROUND_ENDS",
+        "",
+        vec![
+            (
+                "ROLE adder",
+                serving("await runtime.complete(Total(total=sum(xs)))"),
+            ),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    @outrig.agent
+                    async def add(xs: list[int]) -> Total:
+                        "ROLE adder: add them up"
+                    totals = await asyncio.gather(*[add([n]) for n in range(5)])
+                    print([t.total for t in totals])
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "[0, 1, 2, 3, 4]\n");
+    assert_eq!(
+        of_agent(&requests, "ROLE adder").len(),
+        5,
+        "one model call per child: none to speak after completing"
+    );
+    for n in 1..=5 {
+        let subject = format!("agent/c{n}");
+        let subject = subject.as_str();
+        let rounds = kind(&events, "model.round.completed", Some(subject));
+        assert_eq!(rounds.len(), 1, "{subject}");
+        let stopped = data(rounds[0])["stopped"].clone();
+        assert!(
+            stopped
+                .as_str()
+                .is_some_and(|why| why.contains("was accepted")),
+            "{subject} stopped on {stopped}"
+        );
+        assert!(
+            kind(&events, "model.round.dropped", Some(subject)).is_empty(),
+            "{subject}'s round was not dropped"
+        );
+        for turn in kind(&events, "turn.committed", Some(subject)) {
+            let turn = data(turn);
+            assert_eq!(turn["incomplete"], false, "{subject}: {turn}");
+            assert!(
+                !turn["messages"].to_string().contains("had not returned"),
+                "{subject}: {turn}"
+            );
+        }
+        let settled = position(&events, "agent.request.settled", |event| {
+            event.subject.as_ref().map(|s| s.as_str()) == Some(subject)
+        });
+        let calls = position(&events, "model.call", |event| {
+            event.subject.as_ref().map(|s| s.as_str()) == Some(subject)
+        });
+        assert!(
+            calls.iter().all(|call| *call < settled[0]),
+            "{subject} made a model call after its answer: {calls:?} after {settled:?}"
+        );
+    }
+}
+
 /// A child that ends its submission's round and the one more round asking
 /// for the result without completing fails the call `CompletionRejected`,
 /// saying so; the mock gets no third call, no answer was counted, and the

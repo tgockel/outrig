@@ -636,7 +636,7 @@ class Builder:
         self.end_round(d, "failed", [Part("error", text(d.get("error")), True)])
 
     def on_model_round_dropped(self, d: dict) -> None:
-        self.end_round(d, "dropped by a Ctrl-C", [])
+        self.end_round(d, "dropped", [])
 
     def on_model_retry(self, d: dict) -> None:
         summary = (

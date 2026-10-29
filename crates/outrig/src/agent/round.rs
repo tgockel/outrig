@@ -37,6 +37,11 @@ use super::tool::{self, Interrupts};
 use crate::config::RoleAlternation;
 use crate::harness::event::{AttemptId, CallUsage, Payload, Usage};
 
+/// Why a child has nothing left for its round to do, when it has none: asked
+/// before each model call, and the round ends there, as the tool-call cap
+/// ends it, when it answers.
+pub(crate) type Quiet = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// How a round ended.
 pub(crate) struct Finished {
     /// The model's closing text.
@@ -60,8 +65,14 @@ pub(crate) struct Finished {
 /// is an error. It leaves the store as it was when the round had run no
 /// Python; otherwise the store keeps the tool calls that completed, since what
 /// they did stands and nothing is rolled back. A round whose future is dropped
-/// before it returns -- Ctrl-C at the REPL while no Python runs -- keeps them
-/// the same way, as it is dropped.
+/// before it returns -- Ctrl-C at the REPL while no Python runs, or a child's
+/// release that its model call outlasted -- keeps them the same way, as it is
+/// dropped.
+///
+/// A child's round also ends when `quiet` says it has nothing left to do:
+/// its submission was accepted and nothing else waits, or it was released. It
+/// is asked before each model call, so the call that would only speak after
+/// the work is not sent and the turn that completed it is kept whole.
 ///
 /// Each model call is sent what the chain assembles from `history` within the
 /// allowance of the model it goes to. A call whose latest turn fits no model's
@@ -77,10 +88,17 @@ pub(crate) async fn round(
     history: &History,
     tool_call_max: usize,
     interrupts: &Interrupts,
+    quiet: Option<&Quiet>,
 ) -> Result<Finished, AgentError> {
     let slot = agent.model.slot().clone();
     slot.open_round(history.round());
-    let hook = RoundHook::new(tool_call_max, interrupts.clone(), history.clone(), slot);
+    let hook = RoundHook::new(
+        tool_call_max,
+        interrupts.clone(),
+        history.clone(),
+        slot,
+        quiet.cloned(),
+    );
     // rig's own budget is a backstop set above the hook's, so the hook -- with
     // its message the model can read -- is the limiter that fires first. As of
     // rig 0.40 it counts every model call, the first included.
@@ -346,6 +364,8 @@ struct RoundHook {
     round: u32,
     /// Where the round's calls are named and its attempts recorded.
     slot: CallSlot,
+    /// Whether the child has nothing left to do; none for the primary.
+    quiet: Option<Quiet>,
 }
 
 /// The round as far as it has got: how much of it is in the store, and the
@@ -395,7 +415,13 @@ impl Journal {
 }
 
 impl RoundHook {
-    fn new(max: usize, interrupts: Interrupts, history: History, slot: CallSlot) -> Self {
+    fn new(
+        max: usize,
+        interrupts: Interrupts,
+        history: History,
+        slot: CallSlot,
+        quiet: Option<Quiet>,
+    ) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::default(),
@@ -410,6 +436,7 @@ impl RoundHook {
             round: history.round(),
             history,
             slot,
+            quiet,
         }
     }
 
@@ -626,6 +653,13 @@ impl AgentHook<FailoverModel> for RoundHook {
                 history: round,
                 ..
             } => {
+                // After the budget and the cap, which say more of why. Here
+                // rather than at the tool's result, so the turn's other calls
+                // run, and the model is not sent a call that could only close
+                // the work with a word to nobody.
+                if let Some(reason) = self.quiet.as_ref().and_then(|quiet| quiet()) {
+                    return self.stop(reason);
+                }
                 self.interrupts.clear_turn();
                 // What rig holds is whole turns by now, since a call is made
                 // only once the last one's tool calls have returned. Once they

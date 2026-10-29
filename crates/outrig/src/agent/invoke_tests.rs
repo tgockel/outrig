@@ -1372,7 +1372,9 @@ async fn an_invocations_spend_is_its_childrens() {
         children,
         "the invocation's spend is its children's"
     );
-    let round = data(one(&events, "model.round.completed"));
+    let rounds = kind(&events, "model.round.completed", Some("agent/primary"));
+    assert_eq!(rounds.len(), 1, "the main round: {rounds:?}");
+    let round = data(rounds[0]);
     assert_eq!(
         round["total"]["total_tokens"].as_u64().expect("a total"),
         round["usage"]["total_tokens"]

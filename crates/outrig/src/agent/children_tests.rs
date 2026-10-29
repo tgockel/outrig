@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use super::agent_tests::{
     keyed, messages, post, round, round_end, shut_down, text_of, tool_result, watched,
 };
+use super::children::RELEASE_WAIT;
 use super::mock_http::{
     self, CannedResponse, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, system_text,
     text_reply,
@@ -462,8 +463,8 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
     let child = of_agent(&requests, "ROLE stubborn");
     assert_eq!(
         child.len(),
-        4,
-        "two rounds for the first, one for the second"
+        3,
+        "two rounds for the first, one for the second, which ends on its completion"
     );
     let nudge = child[1].body["messages"].to_string();
     assert!(nudge.contains("is still open"), "{nudge}");
@@ -1760,6 +1761,232 @@ async fn releasing_a_child_frees_its_queued_place() {
     assert_eq!(order[..3], ["", "ROLE hold", "ROLE third"], "{order:?}");
 }
 
+/// A work child's round ends on the accepted submission only when nothing
+/// else waits: with a second submission queued, the round carries on past the
+/// first, whose completion ends nothing, and the second gets a round that
+/// ends on its own acceptance.
+#[tokio::test]
+async fn a_work_child_with_a_second_submission_queued_keeps_its_round() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_SECOND_SUBMISSION",
+        "",
+        vec![
+            (
+                "ROLE adder",
+                serving("await runtime.complete(Total(total=sum(xs)))"),
+            ),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn('adder', prompt='ROLE adder: add them up')
+                    a = child.submit({'xs': [1, 2]}, result=Total)
+                    b = child.submit({'xs': [3, 4]}, result=Total)
+                    print((await a).total, (await b).total)
+                    await runtime.release([child])
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "3 7\n");
+    let stopped: Vec<Value> = kind(&events, "model.round.completed", Some("agent/c1"))
+        .into_iter()
+        .map(|event| data(event)["stopped"].clone())
+        .collect();
+    assert_eq!(stopped.len(), 2, "{stopped:?}");
+    assert_eq!(stopped[0], Value::Null, "the first round was not cut");
+    assert!(
+        stopped[1]
+            .as_str()
+            .is_some_and(|why| why.contains("was accepted and nothing else waits")),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        of_agent(&requests, "ROLE adder").len(),
+        3,
+        "the first round spoke after completing; the second did not"
+    );
+}
+
+/// A request child that answered one of two requests keeps its round: what it
+/// holds open is its requests, and it answers them as it chooses, so nothing
+/// says it is done. The first round ends on the model's own word, after a
+/// second call. (The second ends however the release that follows its answer
+/// finds it, which is not this test's to pin.)
+#[tokio::test]
+async fn a_request_child_with_a_second_request_waiting_keeps_its_round() {
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_SECOND_REQUEST",
+        "",
+        vec![
+            ("ROLE fizz", serving(ANSWER_ONE)),
+            (
+                "",
+                primary_waits(
+                    r#"
+                    child = await runtime.spawn(
+                        'fizz', prompt='ROLE fizz', requests={'fizz': (str, Thing)})
+                    a = child.channels['fizz'].request('a')
+                    b = child.channels['fizz'].request('b')
+                    print((await a).n == a.id, (await b).n == b.id)
+                    await runtime.release([child])
+                    "#,
+                ),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "True True\n");
+    let rounds = kind(&events, "model.round.completed", Some("agent/c1"));
+    let first = data(rounds[0]);
+    assert_eq!(first["stopped"], Value::Null, "the first round was not cut");
+    assert_eq!(
+        first["calls"].as_array().map(Vec::len),
+        Some(2),
+        "it answered one request, then made another call: {first}"
+    );
+}
+
+/// A release that finds its child in a model call cannot end the round, which
+/// is waiting on the provider: it gives the round its wait, and then drops it.
+/// The drop is recorded under the child before the release is, and the
+/// child's runner is over with it -- the child is gone.
+#[tokio::test]
+async fn releasing_a_child_in_a_model_call_drops_its_round_when_the_wait_is_over() {
+    let hold = Arc::new(Hold::default());
+    let (sent, over) = (Flag::new(), Flag::new());
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_RELEASE_IN_CALL",
+        "",
+        vec![
+            (
+                "ROLE slow",
+                held(child_runs("c1", ANSWER_ONE), Arc::clone(&hold)),
+            ),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    child = await runtime.spawn(
+                        'slow', prompt='ROLE slow', requests={{'fizz': (str, Thing)}})
+                    h = child.channels['fizz'].request('a')
+                    await until(lambda: os.path.exists({sent}))
+                    await runtime.release([child])
+                    print(child.status)
+                    open({over}, 'w').close()
+                    "#,
+                    sent = sent.py(),
+                    over = over.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    let (end, ()) = tokio::join!(round_end(&mut tree.session, "go"), async {
+        tokio::time::timeout(Duration::from_secs(20), hold.arrived.notified())
+            .await
+            .expect("the child's request arrived");
+        sent.raise();
+        raised(&over).await;
+        hold.go.notify_one();
+    });
+    assert_eq!(end.reply, "done");
+    let (_, events, requests) = tree.end().await;
+    assert_eq!(printed(&requests, "p1"), "released\n");
+    assert_eq!(
+        kind(&events, "model.round.dropped", Some("agent/c1")).len(),
+        1
+    );
+    assert!(kind(&events, "model.round.completed", Some("agent/c1")).is_empty());
+    assert_eq!(kind(&events, "agent.stopped", Some("agent/c1")).len(), 1);
+    let dropped = position(&events, "model.round.dropped", |_| true);
+    let released = position(&events, "agent.released", |_| true);
+    assert!(
+        dropped[0] < released[0],
+        "the release is recorded once the round it dropped is: {dropped:?} before {released:?}"
+    );
+}
+
+/// A session's close that comes while a release waits on its child's round
+/// stops that round at once, as it stops every child's, and does not leave it
+/// to the wait: the release holds the runner to wait on it, and the registry
+/// must still be able to stop it. The child's model call is in flight when the
+/// release begins, so only the close ends the round before the wait does.
+#[tokio::test]
+async fn a_close_during_a_releases_wait_stops_the_released_childs_round() {
+    let hold = Arc::new(Hold::default());
+    let (sent, releasing) = (Flag::new(), Flag::new());
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_CLOSE_IN_RELEASE",
+        "",
+        vec![
+            (
+                "ROLE slow",
+                held(child_runs("c1", ANSWER_ONE), Arc::clone(&hold)),
+            ),
+            (
+                "",
+                primary_waits(&format!(
+                    r#"
+                    child = await runtime.spawn(
+                        'slow', prompt='ROLE slow', requests={{'fizz': (str, Thing)}})
+                    h = child.channels['fizz'].request('a')
+                    await until(lambda: os.path.exists({sent}))
+                    open({releasing}, 'w').close()
+                    await runtime.release([child])
+                    "#,
+                    sent = sent.py(),
+                    releasing = releasing.py()
+                )),
+            ),
+        ],
+    )
+    .await;
+    let closer = tree.session.closer();
+    let events = Arc::clone(&tree.events);
+    let count = move |kind: &str| {
+        events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|event| event.kind() == kind)
+            .count()
+    };
+    let (_, elapsed) = tokio::join!(round_end(&mut tree.session, "go"), async {
+        tokio::time::timeout(Duration::from_secs(20), hold.arrived.notified())
+            .await
+            .expect("the child's request arrived");
+        sent.raise();
+        raised(&releasing).await;
+        // The release has the runner by now, and waits on its model call.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(count("agent.released"), 0, "the release is still waiting");
+        let closed = std::time::Instant::now();
+        closer.close_admission();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while count("model.round.dropped") == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the round was dropped");
+        let elapsed = closed.elapsed();
+        hold.go.notify_one();
+        elapsed
+    });
+    assert!(
+        elapsed < RELEASE_WAIT / 2,
+        "the close stopped the round, not the release's wait: {elapsed:?}"
+    );
+    tree.end().await;
+}
+
 /// With `model-concurrency-max = 1`, a parent awaiting a child awaiting a
 /// grandchild completes: no execution holds the permit while it waits, and
 /// the three agents' requests go one after another.
@@ -1800,13 +2027,10 @@ async fn a_waiting_parent_holds_no_permit() {
     let gauge = Arc::clone(&tree.gauge);
     let (_, _, requests) = tree.end().await;
     assert_eq!(printed(&requests, "p1"), "2\n");
-    // Each agent's first call before the one it launched, and its last once
-    // that one has answered; the last calls follow their own code's ends,
-    // which race.
-    let mut order: Vec<String> = requests.iter().map(role).collect();
-    assert_eq!(order[..3], ["", "ROLE middle", "ROLE leaf"], "{order:?}");
-    order[3..].sort();
-    assert_eq!(order[3..], ["", "ROLE leaf", "ROLE middle"], "{order:?}");
+    // Each agent's first call before the one it launched. A child's round
+    // ends on its completion, so the primary's is the one call that follows.
+    let order: Vec<String> = requests.iter().map(role).collect();
+    assert_eq!(order, ["", "ROLE middle", "ROLE leaf", ""], "{order:?}");
     assert_eq!(gauge.most(), 1);
 }
 
@@ -1956,7 +2180,11 @@ async fn a_failed_round_opens_again_with_what_it_opened_with() {
     let (_, events, requests) = tree.end().await;
     assert_eq!(printed(&requests, "p1"), "3\n");
     let child = of_agent(&requests, "ROLE flaky");
-    assert_eq!(child.len(), 3, "the failed call, then the round again");
+    assert_eq!(
+        child.len(),
+        2,
+        "the failed call, then the round again, which ends on the completion"
+    );
     assert_eq!(opening(child[0]), opening(child[1]), "the same opening");
     assert!(
         opening(child[1]).contains("`xs` (list[int]): [1, 2]"),
@@ -2093,7 +2321,11 @@ async fn a_round_that_fails_after_its_code_ran_opens_on_what_is_open_then() {
     let (_, events, requests) = tree.end().await;
     assert_eq!(printed(&requests, "p1"), "3 7\n");
     let child = of_agent(&requests, "ROLE flaky");
-    assert_eq!(child.len(), 4, "two rounds of two calls, one failing");
+    assert_eq!(
+        child.len(),
+        3,
+        "the first round's two calls, one failing, and the second's, which ends on its completion"
+    );
     let next = opening(child[2]);
     assert!(
         next.contains("`xs` (list[int]): [3, 4]") && !next.contains("[1, 2]"),
@@ -2692,12 +2924,12 @@ async fn spend_adds_up_once_each() {
     let (main, middle, leaf) = (spent("agent/primary"), spent("agent/c1"), spent("agent/c2"));
     assert_eq!(
         (leaf.1, middle.1, main.1),
-        (38, 38, 38),
-        "each round's own usage"
+        (19, 19, 38),
+        "each round's own usage: a child's one call, and the primary's two"
     );
     assert_eq!(
         (leaf.3, middle.3, main.3),
-        (38, 76, 114),
+        (19, 38, 76),
         "each tree's total"
     );
     assert!(leaf.2.is_empty());
@@ -2846,9 +3078,11 @@ async fn a_spawn_at_the_depth_limit_is_refused() {
     let (_, events, requests) = tree.end().await;
     assert_eq!(printed(&requests, "p1"), "0\n");
     assert_eq!(
-        tool_result(of_agent(&requests, "ROLE deep")[1], "c1"),
-        "refused: subagent-depth-max is 2, and this agent is at depth 2, so it cannot launch a \
-         child\n"
+        exec_outputs(&events, "agent/c1"),
+        [
+            "refused: subagent-depth-max is 2, and this agent is at depth 2, so it cannot launch \
+             a child\n"
+        ]
     );
     assert_eq!(kind(&events, "agent.spawned", None).len(), 1);
 }

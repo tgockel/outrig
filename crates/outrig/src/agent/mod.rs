@@ -62,7 +62,7 @@ use self::history::{History, Window};
 use self::ledger::{CallSlot, Ledger};
 use self::resolve::LlmResolveError;
 pub(crate) use self::resolve::{ResolvedAgent, find_agent};
-use self::round::Finished;
+use self::round::{Finished, Quiet};
 use self::tool::{Interrupts, SubmitPython};
 
 /// How long the interpreter has to say which tasks a round left running. It
@@ -103,6 +103,9 @@ pub(crate) struct Agent {
     pub(crate) interpreter: Interpreter,
     /// The session's state, which a round moves through.
     lifecycle: Arc<Lifecycle>,
+    /// For a child, whether it has nothing left for a round to do, which
+    /// ends the round before its next model call.
+    quiet: Option<Quiet>,
 }
 
 impl Agent {
@@ -161,6 +164,7 @@ impl Agent {
             &self.history,
             self.tool_call_max,
             &self.interrupts,
+            self.quiet.as_ref(),
         )
         .await
     }
@@ -193,6 +197,7 @@ impl Agent {
             &self.history,
             self.tool_call_max,
             &self.interrupts,
+            None,
         )
         .await?;
         // Only now: a round that failed or was dropped may have left the
@@ -243,14 +248,17 @@ impl Agent {
             slot,
             Announcer::new(interpreter),
             Some(user),
+            None,
             lifecycle,
         )
     }
 
     /// A child agent over `interpreter`, its own kernel's handle, with
     /// `preamble` as its system prompt, naming its calls in `slot`, and
-    /// counting what waits on its channels through `announcer`. Its rounds and
-    /// tool calls move no session state: the session's is the primary's.
+    /// counting what waits on its channels through `announcer`. Its rounds end
+    /// early once `quiet` says it has nothing left to do. Its rounds and tool
+    /// calls move no session state: the session's is the primary's.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_child(
         resolved: &ResolvedAgent,
         interpreter: Interpreter,
@@ -258,6 +266,7 @@ impl Agent {
         preamble: String,
         slot: CallSlot,
         announcer: Announcer,
+        quiet: Quiet,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
         Self::assemble(
@@ -268,6 +277,7 @@ impl Agent {
             slot,
             announcer,
             None,
+            Some(quiet),
             lifecycle,
         )
     }
@@ -281,6 +291,7 @@ impl Agent {
         slot: CallSlot,
         announcer: Announcer,
         user: Option<UserChannel>,
+        quiet: Option<Quiet>,
         lifecycle: Arc<Lifecycle>,
     ) -> Result<Self, AgentError> {
         let history = History::new(interpreter.clone(), Window::DEFAULT);
@@ -350,6 +361,7 @@ impl Agent {
             announcer,
             interpreter,
             lifecycle,
+            quiet,
         })
     }
 }

@@ -350,7 +350,10 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
     bills it; it is `null` when the body reported none.
 - `model.round.completed` -- the model yielded control: it finished a round, or OutRig stopped
   it. Not a claim that the round's work succeeded.
-  - `round`, and `stopped`: why OutRig ended it, such as the tool-call cap, or `null`.
+  - `round`, and `stopped`: why OutRig ended it, such as the tool-call cap, or `null`. A child's
+    round also ends before a model call that could only speak after its work is done: a work
+    child's last submission was accepted and nothing else waits, or the child was released. A
+    typed call's child says the first, since its call releases it as the answer is accepted.
   - `usage`: the round's tokens: the sum over its attempts, or `null` when none reported any.
   - `calls`: each call's `{index, model, call_id, attempt_id, usage}`, `index` counted from 0.
     `model` is the `[models.<name>]` row that answered it, which for an alias is not always the
@@ -363,8 +366,11 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
     reported any.
 - `model.round.failed` -- a round ended by an error: `round`, `error`, and `calls`, `usage`,
   `attempts`, `descendants`, and `total` so far.
-- `model.round.dropped` -- a round ended by a Ctrl-C while no Python ran: `round`, and `calls`,
-  `usage`, `attempts`, `descendants`, and `total` so far.
+- `model.round.dropped` -- a round ended while a model call was in flight: by a Ctrl-C, by a
+  release that the call outlasted, or by the session's end: `round`, and `calls`, `usage`,
+  `attempts`, `descendants`, and `total` so far. A release gives a child's round two seconds to
+  end on its own, which it does before its next model call, so only a round still in a call
+  after that is dropped.
 - `model.round.usage` -- requests a round's descendants sent after it ended, such as a child still
   working in a background task: `round`, `attempts`, and `usage`, their sum. Its subject is the
   agent whose round it was, and what it adds belongs to that round's `total`. One that lands as

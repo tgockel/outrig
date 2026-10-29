@@ -29,6 +29,12 @@
 //! never answer, no round opens: what the child holds open ends instead, and
 //! so does anything that arrives later.
 //!
+//! A round also ends once the child holds nothing: before the model call that
+//! would follow a work child's accepted submission, when no other waits, so a
+//! round is not spent speaking after the work. A release ends the runner. The
+//! round in flight is given until its next model call to end, and is dropped
+//! only if a model call keeps it past `RELEASE_WAIT`.
+//!
 //! An agent class instance's child has one round before the rule applies: its
 //! orienting round, which opens as it launches, to get ready in. Requests that
 //! arrive meanwhile are announced as in any round, and its baseline is empty,
@@ -82,7 +88,7 @@ pub(crate) async fn run(
         let Some(children) = registry.upgrade() else {
             return;
         };
-        if children.closed() {
+        if children.closed() || children.released(&id) {
             return;
         }
         let ended = match (children.spent_budget(), &broken) {
@@ -136,7 +142,9 @@ pub(crate) async fn run(
             continue;
         }
         // Opened before a submission is given, so its taking names this round.
-        children.round_opened(&id, agent.history.next_round());
+        if !children.round_opened(&id, agent.history.next_round()) {
+            return;
+        }
         let (lead, detail) = match kind {
             _ if orienting.is_some() => (orientation::ORIENTING.to_string(), String::new()),
             ChildKind::Request => (
@@ -191,7 +199,9 @@ pub(crate) async fn run(
             back_off(&mut wait).await;
             match registry.upgrade() {
                 Some(children) if !children.closed() => {
-                    children.round_opened(&id, agent.history.next_round());
+                    if !children.round_opened(&id, agent.history.next_round()) {
+                        return;
+                    }
                 }
                 _ => return,
             }
@@ -200,6 +210,12 @@ pub(crate) async fn run(
             return;
         };
         children.round_ended(&id);
+        // A release ended the round, or let it end, so what it held is no
+        // longer the runner's to decide: an orienting round that ended so
+        // is not ready.
+        if children.released(&id) {
+            return;
+        }
         match ended {
             Ok(_) => {
                 // An orienting round's baseline stays empty, so what is open as

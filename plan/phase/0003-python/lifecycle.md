@@ -385,7 +385,9 @@ launched -- the way a session close does, while the rest of the session runs on:
   and a reply in flight at the release is refused; a reply validated before the release stays
   settled;
 - its own children are released, so each closes its own subtree the same way;
-- its running execution is interrupted;
+- its running execution is interrupted, which returns the call its round waits on, and the round
+  stops before its next model call, its turn kept whole. A round still in a model call after two
+  seconds is dropped;
 - its forwarded hosted calls finish, or are reported `unknown`. A release kills no binding, since
   the bindings process serves every kernel in the session, and nothing stops a call on the host: a
   call whose wait an interrupt or a release ended runs on, and its reply records its outcome; one
