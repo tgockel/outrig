@@ -1,5 +1,5 @@
-//! `outrig run-legacy` is `outrig run` without a script, and `outrig run-new`
-//! is a command of its own that leaves the interactive `run` as it was.
+//! `outrig run-legacy` is `outrig run`, and `outrig run-new` is a command of
+//! its own that leaves the interactive `run` as it was.
 //!
 //! Not `e2e`-gated, like `builtin_default.rs`: the binary runs against a
 //! `podman` and `buildah` that fail at once, so each comparison is reached
@@ -195,8 +195,8 @@ async fn run_legacy_behaves_as_run() {
     }
 }
 
-/// `run-legacy` takes exactly the session's flags `run` takes, and neither a script nor the
-/// script's `--grace`.
+/// `run-legacy` takes exactly the arguments `run` takes, and neither takes a script or the
+/// script's `--grace`: those are `run-new`'s.
 #[tokio::test]
 async fn run_legacy_has_run_s_session_flags() {
     let dir = tempfile::tempdir().expect("a dir");
@@ -207,30 +207,29 @@ async fn run_legacy_has_run_s_session_flags() {
     let options = |help: &str| -> Vec<String> {
         help.lines()
             .filter(|line| line.trim_start().starts_with('-'))
-            .filter(|line| !line.trim_start().starts_with("--grace"))
             .map(str::to_string)
             .collect()
     };
     assert_eq!(options(&run), options(&legacy), "{run}\n---\n{legacy}");
-    assert!(
-        run.contains("[SCRIPT]...") && !legacy.contains("SCRIPT"),
-        "{legacy}"
-    );
-    assert!(
-        run.contains("--grace <SECS>") && !legacy.contains("--grace"),
-        "{run}\n---\n{legacy}"
-    );
+    for help in [&run, &legacy] {
+        assert!(
+            !help.contains("SCRIPT") && !help.contains("--grace") && !help.contains("Python"),
+            "{help}"
+        );
+    }
 }
 
-/// `run-new`'s help says what it is, `run`'s names both its forms and the
-/// retarget to come, and `run-legacy`'s is the interactive session's alone.
+/// `run-new`'s help names both its forms, `run`'s says it is the interactive
+/// session and names the retarget to come, and `run-legacy`'s is the
+/// interactive session's alone.
 #[tokio::test]
-async fn run_new_help_describes_it_and_run_names_both_forms() {
+async fn run_new_help_names_both_its_forms_and_run_names_the_retarget() {
     let dir = tempfile::tempdir().expect("a dir");
     let help = text(&outrig(dir.path(), &["run-new", "--help"]).await.stdout);
     assert!(
-        help.contains("acts by writing Python (preview)")
+        help.contains("acts by writing Python, or run a Python program on the host (preview)")
             && help.contains("No MCP server and no sidecar is started")
+            && help.contains("With a script, it runs the script on the host")
             && help.contains("`outrig run` is unchanged by this command")
             && help.contains("`outrig run-legacy` is another name for it"),
         "{help}"
@@ -243,30 +242,24 @@ async fn run_new_help_describes_it_and_run_names_both_forms() {
             .unwrap_or_else(|| panic!("no `{verb}` line in:\n{top}"))
             .to_string()
     };
+    for verb in ["run", "run-legacy"] {
+        assert!(
+            line(verb).contains("Start an interactive agent session")
+                && !line(verb).contains("Python"),
+            "{top}"
+        );
+    }
     assert!(
-        line("run").contains(
-            "Start an interactive agent session, or run a Python program on the host (preview)"
-        ),
-        "{top}"
-    );
-    assert!(
-        line("run-legacy").contains("Start an interactive agent session")
-            && !line("run-legacy").contains("Python"),
-        "{top}"
-    );
-    assert!(
-        line("run-new").contains("writing Python (preview)"),
+        line("run-new").contains("writing Python, or run a Python program on the host (preview)"),
         "{top}"
     );
 
     let run = text(&outrig(dir.path(), &["run", "--help"]).await.stdout);
     assert!(
-        run.starts_with(
-            "Start an interactive agent session, or run a Python program on the host \
-             (preview).\n"
-        ) && run.contains("`outrig run-legacy` is the same command")
-            && run.contains("A later release makes `outrig run` the command")
-            && !run.contains("run-new"),
+        run.starts_with("Start an interactive agent session.\n")
+            && run.contains("`outrig run-legacy` is the same command")
+            && run.contains("A later release makes `outrig run` what `outrig run-new` is today")
+            && !run.contains("Python"),
         "{run}"
     );
     let legacy = text(&outrig(dir.path(), &["run-legacy", "--help"]).await.stdout);

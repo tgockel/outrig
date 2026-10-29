@@ -363,7 +363,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its JSON key, and `text()` renders the JSON Schema with every `doc()` text verbatim.
   Channel contracts take the same types, and a dataclass sent on a channel now crosses as its
   fields' values under their keys, where before the send raised.
-- **`harness::HostProgram`: a trusted Python program on the host, as `outrig run <script.py>`
+- **`harness::HostProgram`: a trusted Python program on the host, as `outrig run-new <script.py>`
   runs one.** `HostProgram::new(config, script)`, with `args` and `repo_root`, starts the script
   as `__main__` under the payload's interpreter, isolated, with `outrig` and the script's
   directory on `sys.path`; it inherits this process's working directory, environment and stdio.

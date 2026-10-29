@@ -1,4 +1,4 @@
-//! `outrig run <script.py>` as a user runs it: the binary, a script on disk, and the payload's
+//! `outrig run-new <script.py>` as a user runs it: the binary, a script on disk, and the payload's
 //! Python on the host.
 //!
 //! Not `e2e`-gated: nothing here needs a container runtime, and `podman` and `buildah` are stubs
@@ -164,7 +164,7 @@ async fn the_requirements_example_runs_on_the_host_alone() {
     );
 
     let ran = case
-        .run(&["run", "worker.py", "./workspace", "Fix the tests"])
+        .run(&["run-new", "worker.py", "./workspace", "Fix the tests"])
         .await;
     assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
     assert_eq!(
@@ -174,11 +174,11 @@ async fn the_requirements_example_runs_on_the_host_alone() {
     assert_eq!(text(&ran.stderr), "");
 
     assert_eq!(
-        case.run(&["run", "returns_two.py"]).await.status.code(),
+        case.run(&["run-new", "returns_two.py"]).await.status.code(),
         Some(2)
     );
 
-    let raised = case.run(&["run", "raises.py"]).await;
+    let raised = case.run(&["run-new", "raises.py"]).await;
     assert_eq!(raised.status.code(), Some(1));
     assert_eq!(
         text(&raised.stderr),
@@ -187,7 +187,7 @@ async fn the_requirements_example_runs_on_the_host_alone() {
          RuntimeError: the tests are still failing\n"
     );
 
-    let missing = case.run(&["run", "missing.py"]).await;
+    let missing = case.run(&["run-new", "missing.py"]).await;
     assert_eq!(missing.status.code(), Some(1));
     assert_eq!(
         text(&missing.stderr),
@@ -209,7 +209,7 @@ async fn a_session_flag_before_the_script_is_refused_and_after_it_is_the_program
     let case = Case::new();
     case.write("argv.py", "import sys\nprint(sys.argv)\n");
 
-    let refused = case.run(&["run", "--agent", "x", "argv.py"]).await;
+    let refused = case.run(&["run-new", "--agent", "x", "argv.py"]).await;
     assert_eq!(refused.status.code(), Some(2));
     assert!(
         text(&refused.stderr)
@@ -219,7 +219,7 @@ async fn a_session_flag_before_the_script_is_refused_and_after_it_is_the_program
     );
 
     let passed = case
-        .run(&["run", "argv.py", "--agent", "x", "--help"])
+        .run(&["run-new", "argv.py", "--agent", "x", "--help"])
         .await;
     assert_eq!(passed.status.code(), Some(0), "{}", text(&passed.stderr));
     assert_eq!(
@@ -227,6 +227,36 @@ async fn a_session_flag_before_the_script_is_refused_and_after_it_is_the_program
         "['argv.py', '--agent', 'x', '--help']\n"
     );
     assert_eq!(case.runtime_calls(), "");
+}
+
+/// A script given to `run`, the interactive session's command, is a usage error that names
+/// `run-new`, the command that runs one, and `--grace` is not `run`'s.
+#[tokio::test]
+async fn a_script_given_to_run_is_refused_naming_run_new() {
+    let case = Case::new();
+    case.write("worker.py", "print('ran')\n");
+
+    for args in [
+        &["run", "worker.py", "./workspace", "Fix the tests"][..],
+        &["run-legacy", "worker.py"],
+    ] {
+        let refused = case.run(args).await;
+        assert_eq!(refused.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&refused.stdout), "", "{args:?}");
+        assert!(
+            text(&refused.stderr).contains("`outrig run-new worker.py`"),
+            "{args:?}: {}",
+            text(&refused.stderr)
+        );
+    }
+    let refused = case.run(&["run", "--grace", "1"]).await;
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("unexpected argument '--grace'"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert_eq!(case.runtime_calls(), "", "a container runtime was called");
 }
 
 /// The configuration is the invocation's: with a repo config in the working directory and
@@ -246,7 +276,7 @@ async fn the_configuration_comes_from_the_invocation() {
         "import outrig\nview = outrig.config()\nprint(view.default_model, sorted(view.models))\n",
     );
 
-    let invocation = case.run(&["run", "elsewhere/which.py"]).await;
+    let invocation = case.run(&["run-new", "elsewhere/which.py"]).await;
     assert_eq!(
         invocation.status.code(),
         Some(0),
@@ -256,7 +286,7 @@ async fn the_configuration_comes_from_the_invocation() {
     assert_eq!(text(&invocation.stdout), "from-cwd ['from-cwd']\n");
 
     let chosen = case
-        .run(&["--config", "chosen.toml", "run", "elsewhere/which.py"])
+        .run(&["--config", "chosen.toml", "run-new", "elsewhere/which.py"])
         .await;
     assert_eq!(chosen.status.code(), Some(0), "{}", text(&chosen.stderr));
     assert_eq!(text(&chosen.stdout), "from-flag ['from-flag']\n");
@@ -278,7 +308,7 @@ async fn a_workspace_path_that_is_not_utf8_is_refused_and_none_still_runs() {
     .unwrap();
     let config = repo.join(".agents/outrig/config.toml");
     let run = || {
-        let mut command = case.outrig(&["run", "probe.py"]);
+        let mut command = case.outrig(&["run-new", "probe.py"]);
         command.current_dir(&repo);
         async move {
             timeout(TEST_TIMEOUT, command.output())
@@ -355,7 +385,7 @@ async fn signals_sent_to_outrig_reach_the_program() {
         ] {
             let ready = case.path().join(format!("{script}-{signal}.ready"));
             let child = case
-                .outrig(&["run", script, ready.to_str().unwrap()])
+                .outrig(&["run-new", script, ready.to_str().unwrap()])
                 .spawn()
                 .expect("outrig starts");
             appears(&ready).await;
@@ -399,7 +429,7 @@ async fn a_sighup_to_outrig_reaches_the_program_as_a_sigterm() {
     ] {
         let ready = case.path().join(format!("{script}.hup-ready"));
         let child = case
-            .outrig(&["run", script, ready.to_str().unwrap()])
+            .outrig(&["run-new", script, ready.to_str().unwrap()])
             .spawn()
             .expect("outrig starts");
         appears(&ready).await;
@@ -431,7 +461,7 @@ async fn killing_outrig_ends_the_programs_group() {
     );
     let reported = case.path().join("pgid");
     let mut child = case
-        .outrig(&["run", "waits.py", reported.to_str().unwrap()])
+        .outrig(&["run-new", "waits.py", reported.to_str().unwrap()])
         .spawn()
         .expect("outrig starts");
     appears(&reported).await;
@@ -532,7 +562,7 @@ async fn a_terminal_read_fails_at_once() {
          try:\n    os.read(0, 100)\nexcept OSError as e:\n    \
          print('read failed:', errno.errorcode[e.errno])\n",
     );
-    let terminal = OnTerminal::start(&case, &["run", "reads.py"]);
+    let terminal = OnTerminal::start(&case, &["run-new", "reads.py"]);
     let (status, seen) = terminal.exit().await;
     assert_eq!(status.code(), Some(0), "{seen}");
     assert!(
@@ -555,7 +585,7 @@ async fn ctrl_c_at_the_terminal_reaches_the_program() {
          print('ready', flush=True)\n\
          time.sleep(60)\n",
     );
-    let mut terminal = OnTerminal::start(&case, &["run", "handles.py"]);
+    let mut terminal = OnTerminal::start(&case, &["run-new", "handles.py"]);
     terminal.saw("ready").await;
     terminal.master.write_all(b"\x03").unwrap();
     let (status, seen) = terminal.exit().await;
@@ -565,7 +595,7 @@ async fn ctrl_c_at_the_terminal_reaches_the_program() {
 
 // ------------------------------------------------------------------------- the grace and sessions
 
-/// Start `outrig run` with `args`, wait for the program to raise `ready`, and send `outrig` each
+/// Start `outrig run-new` with `args`, wait for the program to raise `ready`, and send `outrig` each
 /// of `signals`, a fifth of a second apart. How it ended, and how long after the first signal.
 async fn signalled(
     case: &Case,
@@ -592,7 +622,7 @@ async fn signalled(
 
 /// A program that ignores `SIGINT` is stopped once its grace has passed -- `SIGTERM`, which ends
 /// it -- and the grace is `--grace`, else `[host] grace-secs`, else five seconds; the flag wins
-/// over the configuration. `--grace` is the program's, and a bare `outrig run` refuses it.
+/// over the configuration. `--grace` is the program's, and `outrig run-new` without a script refuses it.
 #[tokio::test]
 async fn the_grace_is_the_flags_else_the_configurations() {
     let case = Case::new();
@@ -612,7 +642,7 @@ async fn the_grace_is_the_flags_else_the_configurations() {
     ] {
         let _ = std::fs::remove_file(&ready);
         case.write(".agents/outrig/config.toml", config);
-        let mut args = vec!["run"];
+        let mut args = vec!["run-new"];
         if let Some(flag) = flag {
             args.extend(["--grace", flag]);
         }
@@ -630,7 +660,7 @@ async fn the_grace_is_the_flags_else_the_configurations() {
         );
     }
 
-    let refused = case.run(&["run", "--grace", "1"]).await;
+    let refused = case.run(&["run-new", "--grace", "1"]).await;
     assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     assert!(
         text(&refused.stderr).contains("<SCRIPT>"),
@@ -655,7 +685,7 @@ async fn a_second_signal_ends_the_grace_at_once() {
     let (ran, waited) = signalled(
         &case,
         &[
-            "run",
+            "run-new",
             "--grace",
             "60",
             "ignores.py",
@@ -696,7 +726,7 @@ async fn a_session_asks_the_runtime_for_nothing_until_it_is_entered() {
     let (made, go) = (case.path().join("made"), case.path().join("go"));
     let child = case
         .outrig(&[
-            "run",
+            "run-new",
             "enters.py",
             made.to_str().unwrap(),
             go.to_str().unwrap(),
@@ -739,7 +769,7 @@ async fn a_repeated_mount_fails_entry_before_the_runtime_is_asked() {
          \x20       print(e)\n\
          asyncio.run(main())\n",
     );
-    let ran = case.run(&["run", "twice.py"]).await;
+    let ran = case.run(&["run-new", "twice.py"]).await;
     assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
     let data = case.path().join("data");
     assert!(

@@ -152,7 +152,7 @@ pub const RETRY_BUDGET_SECS_CEILING: u64 = 3600;
 /// keys differ because one counts attempts and the other bounds a single one.
 pub const REQUEST_TIMEOUT_SECS_CEILING: u64 = 3600;
 
-/// How long a program `outrig run <script.py>` runs on the host has to end on its own after the
+/// How long a program `outrig run-new <script.py>` runs on the host has to end on its own after the
 /// first `SIGINT` or `SIGTERM` forwarded to it, before the engine stops its process group. Five
 /// seconds: long enough for a program that handles the signal to leave its sessions, short
 /// enough that one that ignores it is not waited on for long. The engine's own shutdown of a
@@ -413,7 +413,7 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default, skip_serializing_if = "EventsConfig::is_default")]
     pub events: EventsConfig,
-    /// How a program `outrig run <script.py>` runs on the host is treated. See [`HostConfig`].
+    /// How a program `outrig run-new <script.py>` runs on the host is treated. See [`HostConfig`].
     #[serde(default, skip_serializing_if = "HostConfig::is_default")]
     pub host: HostConfig,
     /// Global-only, like [`session_root`](Self::session_root): which host
@@ -2213,7 +2213,7 @@ impl EventsConfig {
     }
 }
 
-/// The `[host]` block: how a program `outrig run <script.py>` runs on the host is treated.
+/// The `[host]` block: how a program `outrig run-new <script.py>` runs on the host is treated.
 ///
 /// `grace-secs` is how long the program has to end on its own after the first `SIGINT` or
 /// `SIGTERM` forwarded to it. Past it, or at a second signal, the engine stops the program's

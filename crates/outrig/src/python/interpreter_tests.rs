@@ -936,7 +936,7 @@ fn a_host_programs_names_are_absent_in_a_kernel() {
                  except AttributeError as e:\n    print(e)";
     assert_eq!(
         k.output(1, probe),
-        "[]\noutrig.Session exists only in a program `outrig run` runs on the host, \
+        "[]\noutrig.Session exists only in a program `outrig run-new` runs on the host, \
          and this Python is not one\n"
     );
 }

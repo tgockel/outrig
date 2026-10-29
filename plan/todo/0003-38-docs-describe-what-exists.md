@@ -59,14 +59,14 @@ MCP now sits, and what a binding lets an agent do on the host.
   persist, and that waiting watches channels. New page rather than an addition, since it is the
   phase's subject.
 - `doc/reference/cli.md` and `doc/usage/run.md`: `run-new`, `run-legacy`, what `run` still
-  means, and `run <script.py>` as the host-program form (`0003-27`), with the retarget named as
+  means, and `run-new <script.py>` as the host-program form (`0003-27`), with the retarget named as
   later work so nobody plans around it.
-- **A usage page for host programs**, `doc/usage/host-programs.md`: `outrig run <script.py>`, the
-  program's argv, cwd and streams, `async with outrig.Session(...)`, `session.inject`,
+- **A usage page for host programs**, `doc/usage/host-programs.md`: `outrig run-new <script.py>`,
+  the program's argv, cwd and streams, `async with outrig.Session(...)`, `session.inject`,
   `session.events()`, `session.shutdown_report`, `outrig.ShutdownException`, `outrig.config()`,
   `outrig.Agent` declared and driven from the program, and what the engine does when the program
-  exits, dies or ignores a signal (`0003-27`, `0003-29`, `0003-35`, `0003-36`); and the Python
-  owner API's reference beside the Rust one, every public name with its `help()` text.
+  exits, dies or ignores a signal (`0003-27`, `0003-29`, `0003-35`, `0003-36`); and the Python owner
+  API's reference beside the Rust one, every public name with its `help()` text.
 - **Vocabulary, once.** A round contains turns; the interpreter is the process and a kernel is one
   agent's environment. The docs currently use "turn" in the 0.2.x sense throughout, which is
   correct for `run` and wrong for `run-new`, so the pages must say which system they describe.

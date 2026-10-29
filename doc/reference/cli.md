@@ -215,10 +215,10 @@ See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
 
 ### `outrig run`
 
-Start an interactive agent session, or, given a script, run a Python program on the host (a
-preview; see [below](#outrig-run-scriptpy)). `outrig run-legacy` takes the same flags and starts
-the same interactive session, but never a script, so a script can name the MCP-tool agent
-explicitly before `run` moves to the Python one.
+Start an interactive agent session. `outrig run-legacy` takes the same flags and starts the same
+interactive session, so a script can name the MCP-tool agent explicitly before `run` moves to the
+Python one (see [`outrig run-new`](#outrig-run-new)). A script given to `run` is refused with a
+usage error that names `run-new`, the command that runs one.
 
 ```
 outrig run [--agent <name>]
@@ -296,53 +296,11 @@ global config to mount it on purpose; see
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
 
-#### `outrig run <script.py>`
-
-Run a trusted Python program on the host (preview): the script as `__main__` under the Python
-OutRig carries, with every argument after it as its own. It starts no container and calls no
-model until the program enters a session with `outrig.Session`.
-
-```
-outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--verbose]
-       run [--grace <secs>] <script.py> [args...]
-```
-
-| Flag             | Default             | Description                                           |
-|------------------|---------------------|-------------------------------------------------------|
-| `--grace <secs>` | `[host] grace-secs` | How long the program has to end after a first signal. |
-
-- The global flags apply before the script, wherever they are written there. The session flags
-  above -- `--agent`, `--model`, `--image`, `--session-dir`, `--max-tool-calls`,
-  `--max-tool-result-bytes`, `--env`, `--network`, `--volume` -- are refused before it, naming
-  the flag, because the program chooses its own session's inputs.
-- Everything after the script is the program's `sys.argv`, unchanged: `--help`, `--`, and any
-  spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
-- The configuration is loaded and validated once, from the invocation's directory as for every
-  command, before the program starts. The program reads it as `outrig.config()`.
-- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group, and
-  so is a `SIGHUP` -- a closed terminal, a CI timeout -- which reaches the program as the
-  `SIGTERM` it asks for. The first starts the program's grace, `--grace` seconds -- else
-  `[host] grace-secs`, else 5, at most 3600 -- not counting time spent shutting down a session the
-  program asked to shut down. Past it, or at a second signal, the program's group gets `SIGTERM`,
-  then `SIGKILL` five seconds later; a further signal sends `SIGKILL` at once. None of the three
-  ends `outrig` where it stands, which would leave the sessions the program opened running.
-  `--grace` is refused without a script.
-- Each session the program leaves open -- it exits, raises, is killed or is stopped -- is shut
-  down, its report printed on stderr under a line naming it; one it was still entering has its
-  start stopped, with one line saying so. `outrig` exits once each is stopped.
-- The exit status is the program's, or 128 plus the number of the signal that ended it, or `3`
-  when a session it left open is not proven stopped. A script that cannot be opened as a file, a
-  configuration that does not load, or a declared workspace whose path is not UTF-8, which
-  `outrig.config()` cannot show, is an `error:` line and status `1`, with nothing started.
-
-A later release makes `outrig run` the command of the sessions whose agents write Python. See
-[Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program
-sees.
-
 ### `outrig run-new`
 
 Start an interactive session whose agent acts by writing Python. A preview: `outrig run` is
-unchanged by it.
+unchanged by it. Given a script, it runs a Python program on the host instead: see
+[`outrig run-new <script.py>`](#outrig-run-new-scriptpy).
 
 ```
 outrig run-new [--agent <name>]
@@ -680,6 +638,49 @@ if any.
 `-v` writes no `logs/container.log` here; on a terminal it prints the agent's working in the
 conversation instead. `-vv` still turns on trace logging.
 
+#### `outrig run-new <script.py>`
+
+Run a trusted Python program on the host (preview): the script as `__main__` under the Python
+OutRig carries, with every argument after it as its own. It starts no container and calls no
+model until the program enters a session with `outrig.Session`.
+
+```
+outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--verbose]
+       run-new [--grace <secs>] <script.py> [args...]
+```
+
+| Flag             | Default             | Description                                           |
+|------------------|---------------------|-------------------------------------------------------|
+| `--grace <secs>` | `[host] grace-secs` | How long the program has to end after a first signal. |
+
+- The global flags apply before the script, wherever they are written there. The session flags
+  above -- `--agent`, `--model`, `--image` and `--session-dir` -- are refused before it, naming
+  the flag, because the program chooses its own session's inputs.
+- Everything after the script is the program's `sys.argv`, unchanged: `--help`, `--`, and any
+  spelling of an OutRig flag included. A script whose name starts with `-` follows `--`.
+- The configuration is loaded and validated once, from the invocation's directory as for every
+  command, before the program starts. The program reads it as `outrig.config()`.
+- `SIGINT` and `SIGTERM` that `outrig` receives are forwarded to the program's process group, and
+  so is a `SIGHUP` -- a closed terminal, a CI timeout -- which reaches the program as the
+  `SIGTERM` it asks for. The first starts the program's grace, `--grace` seconds -- else
+  `[host] grace-secs`, else 5, at most 3600 -- not counting time spent shutting down a session the
+  program asked to shut down. Past it, or at a second signal, the program's group gets `SIGTERM`,
+  then `SIGKILL` five seconds later; a further signal sends `SIGKILL` at once. None of the three
+  ends `outrig` where it stands, which would leave the sessions the program opened running.
+  `--grace` is refused without a script.
+- Each session the program leaves open -- it exits, raises, is killed or is stopped -- is shut
+  down, its report printed on stderr under a line naming it; one it was still entering has its
+  start stopped, with one line saying so. `outrig` exits once each is stopped.
+- The exit status is the program's, or 128 plus the number of the signal that ended it, or `3`
+  when a session it left open is not proven stopped. A script that cannot be opened as a file, a
+  configuration that does not load, or a declared workspace whose path is not UTF-8, which
+  `outrig.config()` cannot show, is an `error:` line and status `1`, with nothing started.
+
+A later release makes `outrig run` the command of the sessions whose agents write Python, and the
+script form comes with it. See
+[Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program
+sees.
+
 ### `outrig mcp`
 
 Serve the selected image's backing MCP servers as one MCP server over stdio.
@@ -937,7 +938,7 @@ only thing keeping it away from a build in flight.
 Once `outrig run` or `outrig mcp` has written its session record, it catches all three signals:
 it stops the session's containers and finalizes the record, which keeps the same code, before it
 exits. `outrig run-new` does the same from before it starts anything, taking SIGINT only until
-its conversation begins, where Ctrl-C is the conversation's own. A host program's `outrig run`
+its conversation begins, where Ctrl-C is the conversation's own. A host program's `outrig run-new`
 forwards all three to the program rather than exiting on one, and the status is the program's.
 `outrig mcp` exits `0` on a signal once its startup has finished; see
 [`outrig mcp`](#outrig-mcp). `outrig image build` catches them once it starts its validation
@@ -946,7 +947,7 @@ container, and stops that container before it exits.
 `outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
 there; the run is reported in full, and the container is named on stderr.
 
-`outrig run <script.py>` exits with its program's status, whatever it is, or with 128 plus the
+`outrig run-new <script.py>` exits with its program's status, whatever it is, or with 128 plus the
 number of the signal that ended the program.
 
 ## Environment variables

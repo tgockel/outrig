@@ -1,5 +1,5 @@
-"""The bootstrap of a host program: what `outrig run <script.py>` gives the payload's interpreter
-as its `-c` argument, ahead of the operator's program.
+"""The bootstrap of a host program: what `outrig run-new <script.py>` gives the payload's
+interpreter as its `-c` argument, ahead of the operator's program.
 
     python3 -I -c <this> <package-dir> <fd-in> <fd-out> <script> [args...]
 

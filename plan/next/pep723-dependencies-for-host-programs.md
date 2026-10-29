@@ -2,7 +2,7 @@
 
 ## Context
 
-`outrig run <script.py>` (`0003-27`) runs a program with the standard library, the `outrig`
+`outrig run-new <script.py>` (`0003-27`) runs a program with the standard library, the `outrig`
 package and the modules beside the script; nothing installs a dependency the script declares in a
 `# /// script` block. The host-program requirements list installation as optional (R8): the
 prototype needs only the standard library.

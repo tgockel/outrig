@@ -1,4 +1,4 @@
-//! `outrig run <script.py>` with sessions, end to end: the binary, a program entering sessions
+//! `outrig run-new <script.py>` with sessions, end to end: the binary, a program entering sessions
 //! in real containers, and what `outrig` does when the program is interrupted, ignores it, or
 //! ends with a session open. Everything is asserted from outside: the status, what the terminal
 //! showed, what podman still holds, and what the session left on disk.
@@ -51,7 +51,7 @@ impl Case {
         std::fs::write(self.repo().join(name), source).expect("write the script");
     }
 
-    /// `outrig --session-root <case> run <args>`, in the repository, in a process group of its
+    /// `outrig --session-root <case> run-new <args>`, in the repository, in a process group of its
     /// own, its stdout and stderr piped.
     fn spawn(&self, args: &[&str]) -> Child {
         Command::new(env!("CARGO_BIN_EXE_outrig"))
@@ -60,7 +60,7 @@ impl Case {
             .arg("/dev/null")
             .arg("--session-root")
             .arg(self.sessions())
-            .arg("run")
+            .arg("run-new")
             .args(args)
             .current_dir(self.repo())
             .env_remove("RUST_LOG")

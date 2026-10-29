@@ -9,8 +9,8 @@ It can also run **config-less**: in a directory with no `.agents/outrig/config.t
 current directory as the workspace and reads the agent from the global config. See
 [Config-less runs](#config-less-runs).
 
-Given a script, `outrig run <script.py> [args...]` instead runs a Python program on the host, a
-preview of a second way to drive OutRig. See
+`outrig run` takes no script: `outrig run-new <script.py> [args...]` runs a Python program on the
+host, a preview of a second way to drive OutRig. See
 [Running a Python program on the host](#running-a-python-program-on-the-host).
 
 ## Synopsis
@@ -660,12 +660,12 @@ caused by: provider returned: invalid_api_key
 
 ## Running a Python program on the host
 
-> Preview. A later release makes `outrig run` the command of the sessions whose agents write
-> Python; until then the script form sits beside the interactive session, and `outrig
-> run-legacy` is the interactive session alone.
+> Preview. The script form is `outrig run-new`'s, the command of the sessions whose agents write
+> Python; a later release makes that `outrig run`, and the script form comes with it. Until then
+> `outrig run` and `outrig run-legacy` are the interactive session alone, and refuse a script.
 
 ```sh
-$ outrig run worker.py ./workspace "Fix the tests"
+$ outrig run-new worker.py ./workspace "Fix the tests"
 ```
 
 runs `worker.py` on the host as `python3 worker.py ./workspace "Fix the tests"` would, under the

@@ -555,7 +555,7 @@ on an instance is a request.
 
 ## From the host program
 
-A program `outrig run` started (`embedding.md`, "A Python program as owner") declares the same
+A program `outrig run-new` started (`embedding.md`, "A Python program as owner") declares the same
 class and drives it from its own asyncio loop (`0003-35`). The declaration checks, the type
 derivation, the request machinery, the child's rounds and release are the ones above; what the
 host caller changes is where the two ends are.

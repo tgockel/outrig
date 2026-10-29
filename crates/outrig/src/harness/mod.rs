@@ -33,7 +33,7 @@
 //!   execution running at the close ended.
 //!
 //! - **A host program.** [`HostProgram`] runs a trusted Python program on the
-//!   host as `outrig run <script.py>` does: its own `__main__`, argv, streams
+//!   host as `outrig run-new <script.py>` does: its own `__main__`, argv, streams
 //!   and exit status, with `outrig.config()` a view of the configuration
 //!   holding no secret. Its `outrig.Session` enters a session with no primary
 //!   agent, which this process starts and owns for it; whatever the program

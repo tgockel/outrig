@@ -1,4 +1,4 @@
-//! A Python program on the host, as `outrig run <script.py>` runs it: the payload's interpreter
+//! A Python program on the host, as `outrig run-new <script.py>` runs it: the payload's interpreter
 //! running the operator's script as `__main__`, a supervised child of the engine with a private
 //! connection to it.
 //!

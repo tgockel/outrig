@@ -80,7 +80,7 @@ outrig-cli = { path = ".", features = ["internal-test-api"] }
 # drive a round whose retry backoff would otherwise take seconds of real time.
 tokio = { workspace = true, default-features = true, features = ["test-util"] }
 
-# `run_program.rs` drives `outrig run <script.py>` under a terminal of its own -- `openpty`,
+# `run_program.rs` drives `outrig run-new <script.py>` under a terminal of its own -- `openpty`,
 # `setsid` -- and signals it and its program's group; `tests/signals.rs` signals its own
 # process with `raise`.
 nix = { workspace = true, features = ["fs", "process", "signal", "term"] }

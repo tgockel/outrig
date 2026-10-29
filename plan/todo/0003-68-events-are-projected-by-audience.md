@@ -61,7 +61,7 @@ operator's, and the limit of field-level redaction is written where a reader wil
   operator projection; `run-new`'s terminal subscription is the operator's. A host program's
   `outrig.Session(audience="embedder" | "operator")`, default `"embedder"`, crosses in
   `session.start`, and `Session.events()` yields that projection; `Session`'s docstring says so,
-  and that `outrig run` runs a trusted program whose operator projection is its own to ask for.
+  and that `outrig run-new` runs a trusted program whose operator projection is its own to ask for.
 - **The agent audience is a classification, not a subscription**: the table records what the
   kernel may be told, and a test holds that the error text a kernel receives for a raised hosted
   call has no traceback in it, which `binding.py` already ensures.

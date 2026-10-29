@@ -304,7 +304,7 @@ class Events:
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-    """The configuration `outrig run` loaded before this program started: see
+    """The configuration `outrig run-new` loaded before this program started: see
     `help(outrig.config)`."""
 
     models: Mapping[str, Model]
@@ -316,10 +316,10 @@ class Config:
 
 
 def config():
-    """The configuration `outrig run` loaded before this program started, as a frozen,
+    """The configuration `outrig run-new` loaded before this program started, as a frozen,
     read-only view.
 
-    `outrig run` reads it once, from the directory it was invoked in -- with `--config` and the
+    `outrig run-new` reads it once, from the directory it was invoked in -- with `--config` and the
     global file as for every command -- and never again: not from the script's directory, nor
     from a workspace a session later names. It is what a session this program starts is built
     from.
@@ -342,7 +342,7 @@ def config():
     """
     if _connection is None:
         raise RuntimeError(
-            "outrig.config() answers in the program `outrig run` started, not in a process it "
+            "outrig.config() answers in the program `outrig run-new` started, not in a process it "
             "forked"
         )
     view = _connection.request("config")["config"]
@@ -725,7 +725,7 @@ class Session:
         try:
             if _connection is None:
                 raise RuntimeError(
-                    "a session starts in the program `outrig run` started, not a fork"
+                    "a session starts in the program `outrig run-new` started, not a fork"
                 )
             _connection.events[self._handle] = self._events
             start = _connection.post(

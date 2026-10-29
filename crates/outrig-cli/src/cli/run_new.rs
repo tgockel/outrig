@@ -31,6 +31,7 @@
 //! input box below a conversation that keeps only what the user and the agent
 //! sent each other. Anywhere else it is plain lines, as `converse` describes.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ use std::time::{Duration, SystemTime};
 use clap::Parser;
 use directories::BaseDirs;
 use nix::fcntl::{Flock, FlockArg};
-use outrig::config::{Config, EnvSecrets, EventsMode, ImageConfig};
+use outrig::config::{Config, EnvSecrets, EventsMode, HOST_GRACE_SECS_CEILING, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::harness::{
     self, DEFAULT_DRAIN, DirectorySource, Progress, SessionBuilder, Step, Verdict,
@@ -80,6 +81,11 @@ const HANDOFF_GRACE: Duration = Duration::from_secs(2);
 /// here with whatever was not written left unsaid.
 const REPORT_GRACE: Duration = Duration::from_secs(5);
 
+/// The ids of [`RunNewArgs`]' session flags, which a program, choosing its own session's inputs,
+/// refuses. Listed rather than named as a group, so that clap's refusal names the flag given
+/// rather than every flag in the group.
+const SESSION_FLAGS: [&str; 4] = ["agent", "model", "image", "session_dir"];
+
 #[derive(Debug, Parser)]
 pub struct RunNewArgs {
     /// Pick an `[agents.<name>]` block. Defaults to `default-agent` from
@@ -103,6 +109,27 @@ pub struct RunNewArgs {
     /// symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
+
+    /// With a script: how many seconds the program has to end on its own after the first SIGINT
+    /// or SIGTERM forwarded to it, before its process group is stopped -- SIGTERM, five seconds,
+    /// SIGKILL. Time spent shutting down a session the program asked to shut down does not count.
+    /// Overrides `[host] grace-secs`; 5 when neither is given.
+    #[arg(
+        long,
+        value_name = "SECS",
+        requires = "program",
+        value_parser = clap::value_parser!(u64).range(..=HOST_GRACE_SECS_CEILING)
+    )]
+    pub grace: Option<u64>,
+
+    /// A Python program to run on the host, then its own arguments (preview). Everything after
+    /// it is the program's, `--help` and OutRig's own flags included.
+    #[arg(
+        value_name = "SCRIPT",
+        trailing_var_arg = true,
+        conflicts_with_all = SESSION_FLAGS
+    )]
+    pub program: Vec<OsString>,
 }
 
 /// Run one `outrig run-new` invocation end to end. Returns the process exit
@@ -775,8 +802,25 @@ fn render_banner(banner: &Banner<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::CommandFactory;
     use outrig::EmbeddedMcpPolicy;
+
+    use super::*;
+
+    /// Every session flag is refused before a script: a flag added to [`RunNewArgs`] and not to
+    /// [`SESSION_FLAGS`] would be taken and then ignored.
+    #[test]
+    fn every_session_flag_is_refused_before_a_script() {
+        let mut ids: Vec<String> = RunNewArgs::command()
+            .get_arguments()
+            .map(|arg| arg.get_id().to_string())
+            .filter(|id| !["help", "grace", "program"].contains(&id.as_str()))
+            .collect();
+        ids.sort();
+        let mut listed = SESSION_FLAGS.map(str::to_string).to_vec();
+        listed.sort();
+        assert_eq!(ids, listed);
+    }
 
     /// A controlling terminal whose other end closed is no longer one, and
     /// that is the whole of what says it hung up: not a pipe that closes, not

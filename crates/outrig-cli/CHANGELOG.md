@@ -122,10 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python does. A call made after the close raises `outrig.Closed`. If the bindings process dies,
   the session goes on without its bindings, and a call to one raises an error saying how the
   process ended.
-- **`outrig run-legacy`**, the interactive agent session `outrig run` starts without a script,
-  with the same flags and never a script, so a script can name the MCP-tool agent explicitly
-  before `run` moves to the Python one.
-- **`outrig run <script.py> [args...]`, a preview: a Python program on the host.** The script
+- **`outrig run-legacy`**, the interactive agent session `outrig run` starts, with the same flags,
+  so a script can name the MCP-tool agent explicitly before `run` moves to the Python one.
+- **`outrig run-new <script.py> [args...]`, a preview: a Python program on the host.** The script
   runs as `__main__` under the Python OutRig carries, as `python3 <script> [args...]` would run
   it: every argument after the script is its own, `--help` and OutRig's flag names included, and
   its working directory, environment, streams and exit status are its own. It imports the
@@ -136,10 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flags are refused before the script, naming the flag. `SIGINT` and `SIGTERM` are forwarded to
   the program's process group, and the program and what it started end if `outrig` dies. The
   program does not read the terminal: a read from it fails with `EIO`. The exit status is the
-  program's, or 128 plus the signal that ended it. Bare `outrig run` is unchanged.
-- **A program's sessions: `outrig.Session`.** A program `outrig run` runs enters a session with no
+  program's, or 128 plus the signal that ended it. `outrig run` is unchanged, and a script given to
+  it, or to `run-legacy`, is a usage error that names `run-new`.
+- **A program's sessions: `outrig.Session`.** A program `outrig run-new` runs enters a session with no
   agent of its own, in the image `default-image` names or the built-in default, its directory
-  under the session root (`--session-root` applies). `outrig run --grace <secs>`, before the
+  under the session root (`--session-root` applies). `outrig run-new --grace <secs>`, before the
   script, and `[host] grace-secs` set how long the program has to end after the first forwarded
   signal, 5 by default; past it, or at a second signal, its group gets `SIGTERM` and then
   `SIGKILL`, not counting time spent shutting down a session the program asked to shut down.
@@ -250,7 +250,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A signal that cancels a start whose cleanup is not proven exits `3`, not its own status. A build cancelled
   before it created its temporary image owes the removal of nothing, and does not count as one
   that failed.
-- **A SIGHUP reaches a host program as the SIGTERM it asks for.** `outrig run <script.py>`
+- **A SIGHUP reaches a host program as the SIGTERM it asks for.** `outrig run-new <script.py>`
   forwarded SIGINT and SIGTERM to the program's process group but left SIGHUP at its default, so a
   closed terminal ended outrig along with the engine that stops the sessions the program left
   open. It is now forwarded as a SIGTERM, starting the same grace.

@@ -8,7 +8,7 @@
 //! that will not end on its own -- because the user asked, or because it is
 //! spinning. `supervisor` starts the process holding a session's bindings on
 //! the host, and `program` an operator's Python program there, under
-//! `outrig run <script.py>`.
+//! `outrig run-new <script.py>`.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly: the
 //! agent loop in `crate::agent` drives it, and `crate::harness` is how the

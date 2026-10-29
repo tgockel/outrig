@@ -7,7 +7,7 @@ In an agent's kernel, `outrig.runtime` is the runtime of the execution reading i
 `runtime` global is, reachable from a module's code too -- and `outrig.bindings[name]` is that
 execution's own proxy of a binding, whatever the kernel's globals now hold under its name.
 
-In a program `outrig run <script.py>` runs on the host, `outrig.config()` is a read-only view of
+In a program `outrig run-new <script.py>` runs on the host, `outrig.config()` is a read-only view of
 the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
 `help(outrig.config)` and `help(outrig.Session)`.
 
@@ -83,7 +83,7 @@ def __getattr__(name):
         )
     if name in _HOST_ONLY:
         raise AttributeError(
-            f"outrig.{name} exists only in a program `outrig run` runs on the host, and this "
+            f"outrig.{name} exists only in a program `outrig run-new` runs on the host, and this "
             "Python is not one"
         )
     raise AttributeError(f"module 'outrig' has no attribute {name!r}")

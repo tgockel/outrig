@@ -68,7 +68,7 @@ review = await analyze_code(section)
 async with FooAgent() as foo:
     thing = await foo.fizz("Hello")
 
-# Declared, from a host program: the same class in a script `outrig run` started, whose
+# Declared, from a host program: the same class in a script `outrig run-new` started, whose
 # handles are the program's own futures (agent-classes.md, "From the host program").
 async with ProjectReader() as agent:
     answer = await agent.explain("What does this project do?")

@@ -1,4 +1,4 @@
-//! A Python program on the host as an owner: `outrig run <script.py>`.
+//! A Python program on the host as an owner: `outrig run-new <script.py>`.
 //!
 //! The program is the owner's code, run by the engine and supervised by it. It reaches the
 //! engine over a private connection, the owner protocol below, and owns sessions through it: it
@@ -53,7 +53,7 @@ use crate::harness::{ShutdownReport, Stopped, Verdict, chosen_repo_root};
 use crate::python::program::{Launched, Spec, cannot_run, launch};
 
 /// A trusted Python program to run on the host, under the Python OutRig carries, as
-/// `outrig run <script.py> [args...]` runs one.
+/// `outrig run-new <script.py> [args...]` runs one.
 ///
 /// The program is the owner's code, not a sandbox: it runs with this process's authority, its
 /// environment, working directory and stdio, which it inherits, and its arguments, which are its

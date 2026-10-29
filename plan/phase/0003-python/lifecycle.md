@@ -2,7 +2,7 @@
 
 How a session ends, and what its owner can rely on when it stops one. The owner is the Rust
 program holding the session through the API in `embedding.md` -- `run-new`, an embedder, or the
-engine acting for a host program that `outrig run <script.py>` supervises (`0003-29`), whose
+engine acting for a host program that `outrig run-new <script.py>` supervises (`0003-29`), whose
 agents are a third party: model-driven work in the container that is not the program's own code.
 This page is the sequence that runs when the owner stops, what it does to each thing still
 running at that moment, and the report the owner reads afterwards.

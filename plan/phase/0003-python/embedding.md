@@ -4,7 +4,7 @@ How a Rust program owns an OutRig session. The program may be OutRig's own CLI o
 that runs agents for its own tasks -- CocoClaw is the first. Either way it holds one value, the
 session, and everything the session starts is stopped through it: the container, the interpreter,
 the host process holding its bindings, and the agent's rounds. A Python program on the host owns
-one the same way, through the engine: `outrig run <script.py>` runs it, and its `outrig.Session`
+one the same way, through the engine: `outrig run-new <script.py>` runs it, and its `outrig.Session`
 is a client of the engine's session over a private connection ("A Python program as owner");
 nothing of the engine moves into Python.
 
@@ -193,11 +193,11 @@ let report = session.shutdown(deadline).await;
 
 ## A Python program as owner
 
-`outrig run <script.py> [args...]` (`0003-27`) runs a trusted Python program on the host under the
-bundled CPython: its `__main__`, its argv, its cwd, its streams and its exit status are its own,
-`import outrig` is available, and the configuration is loaded from the invocation's directory
-before it runs. Starting the program starts no container and calls no model. The program decides
-when to enter a session (`0003-29`):
+`outrig run-new <script.py> [args...]` (`0003-27`) runs a trusted Python program on the host under
+the bundled CPython: its `__main__`, its argv, its cwd, its streams and its exit status are its own,
+`import outrig` is available, and the configuration is loaded from the invocation's directory before
+it runs. Starting the program starts no container and calls no model. The program decides when to
+enter a session (`0003-29`):
 
 ```python
 async with outrig.Session(workspace=workspace) as session:

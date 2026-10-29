@@ -3,7 +3,7 @@
 ## Context
 
 Two test binaries start `outrig` on a terminal of its own: `tests/run_program.rs`
-(`OnTerminal`, for `outrig run <script.py>`) and `tests/run_new_e2e.rs` (`OnTerminal`, for
+(`OnTerminal`, for `outrig run-new <script.py>`) and `tests/run_new_e2e.rs` (`OnTerminal`, for
 `run-new`'s screen). Each opens a pty, dups its terminal side onto stdio, and runs the same
 `unsafe` `pre_exec` block -- `setsid`, then `TIOCSCTTY` -- in its own copy. Surfaced by the
 review of the change that gave `run-new` its screen, which kept its copy rather than reach into

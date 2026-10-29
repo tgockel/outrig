@@ -431,7 +431,7 @@ it yet.
 
 ## `[host]`
 
-How `outrig run <script.py>` treats the Python program it runs on the host:
+How `outrig run-new <script.py>` treats the Python program it runs on the host:
 
 ```toml
 [host]
@@ -442,7 +442,7 @@ grace-secs = 5
   `SIGTERM` that `outrig` forwards to it. Past it, or at a second signal, `outrig` stops the
   program's process group: `SIGTERM`, then `SIGKILL` five seconds later. Time spent shutting down
   a session the program asked to shut down does not count. `0` stops the group at the first
-  signal; at most `3600`. `outrig run --grace <secs>` overrides it for one invocation. See
+  signal; at most `3600`. `outrig run-new --grace <secs>` overrides it for one invocation. See
   [Usage -> outrig run](https://tgockel.github.io/outrig/usage/run.html#signals-and-the-grace).
 
 ## `[repo]`

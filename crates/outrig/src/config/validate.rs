@@ -269,7 +269,7 @@ pub enum ConfigValidationError {
     },
 
     /// A host directory mounted twice in one session, the workspace's
-    /// included: what a program `outrig run` runs asks for is checked against
+    /// included: what a program `outrig run-new` runs asks for is checked against
     /// the configured mounts.
     #[error(
         "workspace mount host-path {path:?} is mounted more than once{}",
@@ -1733,7 +1733,7 @@ fn workspace_container_path(cfg: &Config, repo_root: Option<&Path>) -> Option<Pa
     }
 }
 
-/// The paths of a session a program `outrig run` runs enters, checked before
+/// The paths of a session a program `outrig run-new` runs enters, checked before
 /// anything of it starts. The workspace, when `mounted`, must be a directory.
 /// Each mount's container path must be absolute, not `/`, and its own -- the
 /// workspace's is reserved only when the workspace is mounted, so a session

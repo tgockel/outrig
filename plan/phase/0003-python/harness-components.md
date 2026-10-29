@@ -118,7 +118,7 @@ records what was weighed against that.
 ## The host side gains a process for the bindings
 
 Hosted objects (`hosted-objects.md`) add a process on the host side of the picture, and
-`outrig run <script.py>` a second one. Every factory binding a session declares is held by one
+`outrig run-new <script.py>` a second one. Every factory binding a session declares is held by one
 process: the same embedded static CPython the container mounts,
 run on the host as a child of the owner, in its own process group, with every binding's packages
 on its path. Agent code reaches it only through the interpreter: RPyC frames travel the existing
@@ -127,7 +127,7 @@ Nothing in the container listens. The new mounts are each binding's package dire
 and -- when any binding exists -- the workspace and every `[[workspace.mounts]]` entry at their
 host paths.
 
-Under `outrig run <script.py>` (`0003-27`) the host side also holds the operator's program: a
+Under `outrig run-new <script.py>` (`0003-27`) the host side also holds the operator's program: a
 supervised child of the engine, in its own process group, running the same bundled CPython with
 the `outrig` host package, connected to the engine by two inherited descriptors that carry its
 controls, its events and the `rpc` frames of the live objects it injects (`0003-29`, `0003-36`).

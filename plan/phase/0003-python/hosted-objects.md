@@ -39,7 +39,7 @@ does not have.
          v                      v
   +-------------------------+  +----------------------------+
   | bindings process        |  | host program (optional)    |   (1) the interpreter protocol,
-  |   payload CPython, -I   |  |   `outrig run script.py`   |       RPyC frames as `rpc` lines
+  |   payload CPython, -I   |  | `outrig run-new script.py` |       RPyC frames as `rpc` lines
   |   a thread per          |  |   serves its own objects   |   (2) the process's stdin and
   |   Connection, up to 4   |  |   with the same module,    |       stdout
   |   per kernel and        |  |   a thread per Connection  |   (3) the owner connection

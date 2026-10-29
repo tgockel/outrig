@@ -14,7 +14,7 @@ use crate::cli::logs::{self, LogsArgs};
 use crate::cli::ls::{self, LsArgs};
 use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
-use crate::cli::program::{self, RunCommandArgs};
+use crate::cli::program;
 use crate::cli::run::{self, RunArgs};
 use crate::cli::run_new::{self, RunNewArgs};
 use crate::error::{CliError, Result};
@@ -53,27 +53,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Start an interactive agent session, or run a Python program on the host (preview).
-    ///
-    /// Without a script, `outrig run` starts the interactive agent session, and `outrig
-    /// run-legacy` is the same command. With one, it runs the script on the host under the Python
-    /// OutRig carries, as `python3 <script> [args...]` would run it, with `import outrig`
-    /// available. That starts no container and calls no model until the program enters a session
-    /// with `outrig.Session`. The program chooses its own session's inputs, so `--agent`,
-    /// `--model` and the session's other flags are refused before the script, while `--config`,
-    /// `--global-config`, `--session-root` and `-v` apply as for every command, and `--grace` to
-    /// the program alone. Everything after the script is the program's own. A later release makes
-    /// `outrig run` the command of the sessions whose agents write Python.
-    Run(RunCommandArgs),
     /// Start an interactive agent session.
     ///
-    /// What `outrig run` is without a script.
+    /// `outrig run-legacy` is the same command. A later release makes `outrig run` what `outrig
+    /// run-new` is today.
+    Run(RunArgs),
+    /// Start an interactive agent session.
+    ///
+    /// Another name for `outrig run`.
     RunLegacy(RunArgs),
-    /// Start an interactive session whose agent acts by writing Python (preview).
+    /// Start an interactive session whose agent acts by writing Python, or run a Python program
+    /// on the host (preview).
     ///
     /// The model has one tool, which runs Python in a persistent interpreter
     /// inside the session's container. Names it binds stay bound from one
     /// message to the next. No MCP server and no sidecar is started.
+    ///
+    /// With a script, it runs the script on the host under the Python OutRig carries, as
+    /// `python3 <script> [args...]` would run it, with `import outrig` available. That starts no
+    /// container and calls no model until the program enters a session with `outrig.Session`.
+    /// The program chooses its own session's inputs, so `--agent`, `--model`, `--image` and
+    /// `--session-dir` are refused before the script, while `--config`, `--global-config`,
+    /// `--session-root` and `-v` apply as for every command, and `--grace` to the program alone.
+    /// Everything after the script is the program's own.
     ///
     /// `outrig run` is unchanged by this command, and `outrig run-legacy` is
     /// another name for it.
@@ -218,17 +220,7 @@ fn block_on_session(
 
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.cmd {
-        Cmd::Run(args) if !args.program.is_empty() => {
-            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
-            runtime.block_on(program::execute(
-                &repo_config,
-                global_config.as_deref(),
-                cli.session_root.as_deref(),
-                args.grace,
-                &args.program,
-            ))
-        }
-        Cmd::Run(RunCommandArgs { session: args, .. }) | Cmd::RunLegacy(args) => {
+        Cmd::Run(args) | Cmd::RunLegacy(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
             block_on_session(
                 runtime,
@@ -240,6 +232,16 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     cli.verbose,
                 ),
             )
+        }
+        Cmd::RunNew(args) if !args.program.is_empty() => {
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
+            runtime.block_on(program::execute(
+                &repo_config,
+                global_config.as_deref(),
+                cli.session_root.as_deref(),
+                args.grace,
+                &args.program,
+            ))
         }
         Cmd::RunNew(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
@@ -542,11 +544,11 @@ mod tests {
         Cli::try_parse_from(["outrig", "design", "prompt"]).expect("`design prompt` parses");
     }
 
-    /// The program's arguments as `outrig run` parses `argv`, or clap's refusal.
+    /// The program's arguments as `outrig run-new` parses `argv`, or clap's refusal.
     fn program(argv: &[&str]) -> Result<Vec<String>, clap::Error> {
         let cli = Cli::try_parse_from(argv)?;
-        let Cmd::Run(args) = cli.cmd else {
-            panic!("{argv:?} is not `run`");
+        let Cmd::RunNew(args) = cli.cmd else {
+            panic!("{argv:?} is not `run-new`");
         };
         assert_eq!((cli.verbose, cli.config), (0, None), "{argv:?}");
         Ok(args
@@ -562,23 +564,24 @@ mod tests {
     fn everything_after_the_script_is_the_programs() {
         assert_eq!(
             program(&[
-                "outrig", "run", "worker.py", "--agent", "x", "-v", "--config", "c", "--",
+                "outrig", "run-new", "worker.py", "--agent", "x", "-v", "--config", "c", "--",
                 "--help", ""
             ])
             .unwrap(),
             ["worker.py", "--agent", "x", "-v", "--config", "c", "--", "--help", ""]
         );
         assert_eq!(
-            program(&["outrig", "run", "--", "-dash.py", "y"]).unwrap(),
+            program(&["outrig", "run-new", "--", "-dash.py", "y"]).unwrap(),
             ["-dash.py", "y"]
         );
-        assert!(program(&["outrig", "run"]).unwrap().is_empty());
+        assert!(program(&["outrig", "run-new"]).unwrap().is_empty());
 
-        let cli = Cli::try_parse_from(["outrig", "-v", "run", "--config", "c", "w.py"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["outrig", "-v", "run-new", "--config", "c", "w.py"]).unwrap();
         assert_eq!((cli.verbose, cli.config.as_deref()), (1, Some("c".as_ref())));
 
-        for (flag, value) in [("--agent", "x"), ("--network", "audit"), ("--env", "K=V")] {
-            let err = program(&["outrig", "run", flag, value, "worker.py"]).unwrap_err();
+        for (flag, value) in [("--agent", "x"), ("--model", "m"), ("--session-dir", "d")] {
+            let err = program(&["outrig", "run-new", flag, value, "worker.py"]).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}: {err}");
             let text = err.to_string();
             assert!(
@@ -586,17 +589,78 @@ mod tests {
                 "{flag}: {text}"
             );
         }
-        let err = program(&["outrig", "run", "--unknown", "worker.py"]).unwrap_err();
+        let err = program(&["outrig", "run-new", "--unknown", "worker.py"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
-        let help = program(&["outrig", "run", "--help"]).unwrap_err();
+        let help = program(&["outrig", "run-new", "--help"]).unwrap_err();
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     }
 
-    /// `run-legacy` is the interactive session alone: it takes no script.
+    /// `--grace` is the program's alone: `run-new` refuses it without a script, and `run` and
+    /// `run-legacy` never take it.
     #[test]
-    fn run_legacy_takes_no_script() {
-        let err = Cli::try_parse_from(["outrig", "run-legacy", "worker.py"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{err}");
+    fn grace_belongs_to_the_script_form() {
+        let cli = Cli::try_parse_from(["outrig", "run-new", "--grace", "7", "w.py"]).unwrap();
+        let Cmd::RunNew(args) = cli.cmd else {
+            panic!("not `run-new`");
+        };
+        assert_eq!(args.grace, Some(7));
+
+        let err = Cli::try_parse_from(["outrig", "run-new", "--grace", "7"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+        for verb in ["run", "run-legacy"] {
+            let err = Cli::try_parse_from(["outrig", verb, "--grace", "7"]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{verb}: {err}");
+        }
+    }
+
+    /// A script given to `run` or `run-legacy` is a usage error that names `run-new`, whatever
+    /// follows the script and whatever flags precede it.
+    #[test]
+    fn a_script_given_to_run_is_refused_naming_run_new() {
+        for argv in [
+            &["outrig", "run", "worker.py"][..],
+            &["outrig", "run", "--agent", "x", "worker.py", "./workspace", "--help"],
+            &["outrig", "run", "--", "worker.py"],
+            &["outrig", "run-legacy", "worker.py", "a"],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{argv:?}: {err}");
+            assert_eq!(err.exit_code(), 2, "{argv:?}");
+            assert!(
+                err.to_string().contains("`outrig run-new worker.py`"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
+
+    /// A script path that is not UTF-8 is a path `run-new` runs, so `run` refuses it with the
+    /// same hint rather than a bare conversion error.
+    #[test]
+    fn a_script_path_that_is_not_utf8_is_refused_naming_run_new() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let script = OsString::from_vec(b"w\xffrk.py".to_vec());
+        for verb in ["run", "run-legacy"] {
+            let argv = ["outrig".into(), verb.into(), script.clone()];
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{verb}: {err}");
+            assert_eq!(err.exit_code(), 2, "{verb}");
+            assert!(
+                err.to_string().contains("`outrig run-new w\u{fffd}rk.py`"),
+                "{verb}: {err}"
+            );
+        }
+        let ran = ["outrig".into(), "run-new".into(), script];
+        let Cmd::RunNew(args) = Cli::try_parse_from(ran).unwrap().cmd else {
+            panic!("not `run-new`");
+        };
+        assert_eq!(args.program.len(), 1);
+    }
+
+    /// `run-legacy` is the interactive session alone: it takes the session's flags.
+    #[test]
+    fn run_legacy_takes_the_sessions_flags() {
         let cli = Cli::try_parse_from(["outrig", "run-legacy", "--agent", "x"]).unwrap();
         let Cmd::RunLegacy(args) = cli.cmd else {
             panic!("not `run-legacy`");

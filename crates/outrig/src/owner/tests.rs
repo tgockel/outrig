@@ -1,4 +1,4 @@
-//! Host programs that own sessions, against the real payload: a program run as `outrig run`
+//! Host programs that own sessions, against the real payload: a program run as `outrig run-new`
 //! runs it, whose sessions the engine starts on the host -- an interpreter with no container,
 //! as `SessionBuilder::start_on_host` starts one -- or, in the e2e module, in containers.
 //!

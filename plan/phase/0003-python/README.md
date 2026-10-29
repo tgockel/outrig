@@ -41,7 +41,7 @@ execution, a child's launch -- and the owner can close it at any time.
 
 Three more came with the host-program requirements of 2026-10-14. The **owner** is the Rust
 program holding a session: the CLI, a Rust embedder, or the engine acting for a **host program**
--- a Python script `outrig run <script.py>` supervises, which owns its session through
+-- a Python script `outrig run-new <script.py>` supervises, which owns its session through
 `outrig.Session` and has no primary agent. A **live object** is a binding whose object the host
 program holds, served from its process, where a **factory binding** is built in the bindings
 process from a declaration. A **root agent** is a child whose parent is the owner rather than a
@@ -94,7 +94,7 @@ public session API that `run-new` uses like any other embedder. This is a breaki
 line targets 0.3.0, but the release itself belongs to a later phase: what this one is judged on is
 whether the thing can be used.
 
-A program can own a session too. `outrig run <script.py>` runs a trusted Python program on the
+A program can own a session too. `outrig run-new <script.py>` runs a trusted Python program on the
 host that enters a session with no primary agent, injects objects it already holds for the agents
 to use with their libraries' own calling conventions, declares agent classes and typed results in
 its own module, drives them from its own asyncio loop, and reads the shutdown report; the engine
@@ -188,7 +188,7 @@ beside the harness for an application that runs both.
   the entry's parameters, a dataclass derived from its signature, so no rule parses the line.
   Skills come from the project, the user, or an embedder, and are fetched only when used.
   `skills.md` designs them.
-- `outrig run <script.py> [args...]`: a trusted Python program on the host under the bundled
+- `outrig run-new <script.py> [args...]`: a trusted Python program on the host under the bundled
   CPython, with its own argv, cwd, streams and exit status, `import outrig`, and the
   configuration loaded; it starts no container until it asks (`0003-27`). A bare `outrig run`
   stays the legacy loop until the retarget.
@@ -278,7 +278,7 @@ written against.
   end through `run-new` (`0003-33`).
 - A hosted library keeps its calling convention: `repo.head.commit.hexsha` is plain code, and a
   call blocks its caller and nothing else (`0003-23`).
-- `outrig run <script.py>` runs a program that enters a session with no primary agent, drives a
+- `outrig run-new <script.py>` runs a program that enters a session with no primary agent, drives a
   host-declared agent class, has a host-declared result repaired and decoded into its own class,
   and reads the report (`0003-35`).
 - A live object the program injects mid-session is used synchronously by an agent that already

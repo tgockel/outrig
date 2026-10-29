@@ -16,7 +16,7 @@ Three Pythons appear on this page, and confusing them inverts the design. The **
 interpreter** is the static CPython in the primary container, the one the model submits code to;
 it holds proxies, and OutRig puts no credential in it. The **bindings process** runs every factory
 binding's library of a session on the host, with the same static CPython and whatever environment
-its bindings were given. The **host program**, under `outrig run <script.py>`, is the operator's
+its bindings were given. The **host program**, under `outrig run-new <script.py>`, is the operator's
 own trusted program on the same static CPython, with the user's full environment and authority;
 it is not a sandbox, and the live objects it injects are served from it. Unqualified "the
 interpreter" means the agent interpreter.
@@ -94,13 +94,13 @@ another binding's object. Until 2026-10-13 each binding had a process of its own
 environments apart too; the maintainer chose one process for its simplicity, and an embedder that
 needs two credentials kept apart runs them in two sessions.
 
-**A host program is trusted host code.** `outrig run <script.py>` runs the operator's program with
-the user's authority and environment, outside any sandbox (`0003-27`); OutRig neither confines nor
-audits it, and the owner connection between the engine and the program carries controls, events
+**A host program is trusted host code.** `outrig run-new <script.py>` runs the operator's program
+with the user's authority and environment, outside any sandbox (`0003-27`); OutRig neither confines
+nor audits it, and the owner connection between the engine and the program carries controls, events
 and relayed frames, nothing the container reaches except through the relay. A live object the
-program injects acts with the program's authority, and every operation on it is decided and
-recorded as any binding's is (`0003-36`). What OutRig asks of the program is what it asks of an
-embedder: keep its own imports and credentials outside paths an agent can write.
+program injects acts with the program's authority, and every operation on it is decided and recorded
+as any binding's is (`0003-36`). What OutRig asks of the program is what it asks of an embedder:
+keep its own imports and credentials outside paths an agent can write.
 
 This reverses what the page used to say. It weighed two ways to make a trusted side real:
 restricting the container so a daemon in it could not be inspected -- dropping `CAP_SYS_PTRACE`,

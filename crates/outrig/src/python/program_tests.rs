@@ -441,7 +441,8 @@ async fn a_forked_child_has_no_connection() {
     assert_eq!(ran.status.code(), Some(0), "{}", ran.stderr);
     assert_eq!(
         ran.stdout,
-        "outrig.config() answers in the program `outrig run` started, not in a process it forked\n\
+        "outrig.config() answers in the program `outrig run-new` started, not in a process it \
+         forked\n\
          off\n"
     );
 }

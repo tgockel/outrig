@@ -11,12 +11,14 @@
 //! them.
 
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use clap::builder::{OsStringValueParser, TypedValueParser as _};
 use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
@@ -95,6 +97,25 @@ pub struct RunArgs {
     /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
     #[arg(long = "volume", value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
     pub volume: Vec<CliVolume>,
+
+    /// Not an argument: a script given here, with whatever follows it as it did under the
+    /// command that ran one, is refused, naming the command that runs it.
+    #[arg(
+        hide = true,
+        value_name = "SCRIPT",
+        trailing_var_arg = true,
+        value_parser = OsStringValueParser::new().try_map(refuse_script)
+    )]
+    _script: Vec<OsString>,
+}
+
+/// A Python program runs under `outrig run-new`, which `run` was once spelled as. Taken as an
+/// `OsString`, since `run-new` accepts a script whose path is not UTF-8.
+fn refuse_script(script: OsString) -> std::result::Result<OsString, String> {
+    Err(format!(
+        "no Python program runs under this command; use `outrig run-new {}`",
+        script.to_string_lossy()
+    ))
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.

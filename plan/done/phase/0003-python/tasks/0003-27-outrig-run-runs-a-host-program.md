@@ -303,3 +303,17 @@ and the view is frozen dataclasses.
   stubs that log every call, which is how "no container is created" is asserted without a
   runtime. Ctrl-C at a real terminal is exercised under a pty: `openpty`, then `setsid` and
   `TIOCSCTTY` in the child, which adds nix's `term` and `process` features as a dev-dependency.
+- **The script form moved to `run-new` (#662).** The decision above to spell it on `run` held that
+  `run` is retargeted at 0.3.0, so the script form would already be at its final name. That covers
+  the state after the retarget. Until then it put a program on the command of the legacy loop, which
+  only starts containers, with a positional that refused every session flag `run` has and a
+  `--grace` that `run` refused without one, all in one `--help`. The retarget does not need it
+  there: when `run-new` becomes `run`, the script form moves with it. So `--grace` and the
+  positional are `RunNewArgs`', the refused list names `run-new`'s four session flags, `--agent`,
+  `--model`, `--image` and `--session-dir`, and `Cmd::Run` is `Run(RunArgs)` again, as on 0.2.x. A
+  script given to `run` or `run-legacy` is still clap's usage error, status 2, and names `run-new`:
+  `RunArgs` carries a hidden trailing positional, an `OsString` because `run-new` runs a script
+  whose path is not UTF-8, whose value parser refuses with that message, so the words after the
+  script are absorbed rather than reported as unexpected, and `run --help` shows neither it nor a
+  Python program. Nothing had shipped under the old spelling, so the changelog entries were
+  rewritten rather than amended.

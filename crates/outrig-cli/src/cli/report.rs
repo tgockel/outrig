@@ -1,5 +1,5 @@
 //! What the terminal says of a session's shutdown report: `outrig run-new`'s at its end, and
-//! `outrig run <script.py>`'s for each session a program left for the engine to stop.
+//! `outrig run-new <script.py>`'s for each session a program left for the engine to stop.
 
 use outrig::harness::{
     self, ExecutionStatus, LeftOpen, SessionEnd, ShutdownReport, Stopped, Verdict,
