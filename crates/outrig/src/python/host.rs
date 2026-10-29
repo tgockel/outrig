@@ -136,6 +136,10 @@ pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 /// where an interrupt reaches it, and the agent every request here addresses.
 pub(crate) const PRIMARY: &str = "primary";
 
+/// The parent of a root child, as the protocol and the session's events name
+/// it: the program on the host that owns the session, which has no kernel.
+pub(crate) const OWNER: &str = "owner";
+
 /// How long a started interpreter has to greet. CPython starts and compiles
 /// the program in well under a second; this only has to be finite.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -441,9 +445,9 @@ struct Table {
     exiting: Option<ClosedBy>,
     /// What carries hosted calls to the session's bindings, when it has any.
     relay: Option<Relay>,
-    /// Who waits for each kernel being opened: its `ready`, or why it was not
-    /// built.
-    opening: HashMap<String, oneshot::Sender<Result<(), String>>>,
+    /// Who waits for each kernel being opened: its `ready`, with the instance
+    /// id a root child's kernel says, or why it was not built.
+    opening: HashMap<String, oneshot::Sender<Result<Option<u64>, String>>>,
     /// Who waits for each kernel being ended: its `ended`.
     ending: HashMap<String, oneshot::Sender<()>>,
     /// Where the lines about child agents go, once the session listens.
@@ -568,6 +572,8 @@ enum Reply {
     Ready {
         version: Option<String>,
         error: Option<String>,
+        /// The instance id of a root child, as its kernel says it is built.
+        instance: Option<u64>,
     },
     Result(WireResult),
     Inv {
@@ -830,16 +836,18 @@ impl Interpreter {
             json!({"t": "open", "agent": agent, "main": agent == PRIMARY}),
         )
         .await
+        .map(|_| ())
     }
 
     /// [`Interpreter::open`] a child agent's kernel, on a thread of its own,
     /// with `child` saying what kind of child it is and where what its parent
-    /// gave it waits in the interpreter.
+    /// gave it waits in the interpreter. A root child's instance id, which the
+    /// interpreter gives it as it is built.
     pub(crate) async fn open_child(
         &self,
         agent: &str,
         child: Value,
-    ) -> Result<(), InterpreterError> {
+    ) -> Result<Option<u64>, InterpreterError> {
         self.opened(
             agent,
             json!({"t": "open", "agent": agent, "main": false, "child": child}),
@@ -849,7 +857,7 @@ impl Interpreter {
 
     /// Send `open`, the line that opens `agent`'s kernel, and wait until it
     /// is built.
-    async fn opened(&self, agent: &str, open: Value) -> Result<(), InterpreterError> {
+    async fn opened(&self, agent: &str, open: Value) -> Result<Option<u64>, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
         {
             let mut table = lock(&self.table);
@@ -1934,6 +1942,7 @@ async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<String, St
                     Reply::Ready {
                         version: Some(version),
                         error: None,
+                        ..
                     },
             }) if cut == 0 => Ok(version),
             _ => {
@@ -2142,7 +2151,10 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
         }
         return;
     }
-    if let Reply::Ready { error, .. } = reply {
+    if let Reply::Ready {
+        error, instance, ..
+    } = reply
+    {
         let mut table = lock(table);
         match table.opening.remove(&agent) {
             Some(waiter) => {
@@ -2150,7 +2162,7 @@ fn dispatch(table: &Mutex<Table>, lines: &Lines, line: &[u8]) {
                 if error.is_some() {
                     table.kernels.remove(agent.as_str());
                 }
-                let _ = waiter.send(error.map_or(Ok(()), Err));
+                let _ = waiter.send(error.map_or(Ok(instance), Err));
             }
             None => tracing::warn!("ignored a ready from agent {agent:?}, which nothing opened"),
         }

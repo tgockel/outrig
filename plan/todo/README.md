@@ -106,7 +106,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-35` | A host program drives an agent class                               |
 | `0003-37` | A request is worked on or cancelled, and its sender is told        |
 
 **Live objects**

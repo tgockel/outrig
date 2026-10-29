@@ -9,7 +9,10 @@ execution's own proxy of a binding, whatever the kernel's globals now hold under
 
 In a program `outrig run-new <script.py>` runs on the host, `outrig.config()` is a read-only view of
 the configuration it loaded, and `outrig.Session` enters a session the engine starts for it: see
-`help(outrig.config)` and `help(outrig.Session)`.
+`help(outrig.config)` and `help(outrig.Session)`. An `outrig.Agent` subclass constructed there is
+a child of the session, its replies decoded into the program's own classes; construct it, and
+leave its `async with`, inside the session's. The explicit `runtime.spawn` has no counterpart
+there.
 
 Agent code launches a child agent with `runtime.spawn`, and the work it gives one ends with a
 value or with an `outrig.AgentError`: see `help(outrig.AgentError)` and `help(outrig.Request)`.

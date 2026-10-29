@@ -669,7 +669,10 @@ call. `ready()` and `async with` give the same guarantee to the code that wants 
 
 - `0003-34` built the class machinery -- `__init_subclass__` checking the marked methods, the
   generated dataclass, the background spawn, the orienting round -- and its tests are the evidence
-  for everything above but the host program's half, which is `0003-35`'s.
+  for everything above but the host program's half. `0003-35` built that half, and its tests
+  (`crates/outrig/src/agent/owned_tests.rs`) are the evidence for "From the host program": a
+  program on the host against a mock model, the types it declares made again in the child from
+  their descriptions, and its replies decoded into its own classes.
 - The GC backstop's timing under asyncio was reasoned from CPython's reference counting and cyclic
   collector, not measured: a pending task that references the instance keeps it alive, a cycle
   defers collection to the collector's next pass, and a finalizer that runs at interpreter exit

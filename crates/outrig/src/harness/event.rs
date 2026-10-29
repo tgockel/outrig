@@ -67,12 +67,14 @@ pub struct Subject(Cow<'static, str>);
 impl Subject {
     pub(crate) const PRIMARY: Subject = Subject(Cow::Borrowed(crate::events::PRIMARY_SUBJECT));
 
-    /// The agent the interpreter's protocol names `agent`.
+    /// The agent the interpreter's protocol names `agent`; or `owner`, the
+    /// program on the host that owns the session, beside the agents.
     pub(crate) fn agent(agent: &str) -> Subject {
-        if agent == crate::python::host::PRIMARY {
-            return Subject::PRIMARY;
+        match agent {
+            crate::python::host::PRIMARY => Subject::PRIMARY,
+            crate::python::host::OWNER => Subject(Cow::Borrowed(crate::python::host::OWNER)),
+            _ => Subject(Cow::Owned(format!("agent/{agent}"))),
         }
-        Subject(Cow::Owned(format!("agent/{agent}")))
     }
 
     pub fn as_str(&self) -> &str {

@@ -678,6 +678,10 @@ outrig [--config <path>] [--global-config <path>] [--session-root <path>] [--ver
   configuration that does not load, or a declared workspace whose path is not UTF-8, which
   `outrig.config()` cannot show, is an `error:` line and status `1`, with nothing started.
 
+In a session it enters, the program can construct agent classes, subclasses of `outrig.Agent`,
+each an agent of the session whose replies are decoded into the program's own classes (see
+[Usage -> Agent classes](../usage/run.md#agent-classes)).
+
 A later release makes `outrig run` the command of the sessions whose agents write Python, and the
 script form comes with it. See
 [Usage -> outrig run](../usage/run.md#running-a-python-program-on-the-host) for what the program

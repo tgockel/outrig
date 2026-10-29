@@ -76,7 +76,12 @@ pub(crate) struct Sessions {
     /// Told, with the program's number for the session, when a start that did not finish begins
     /// to wait for what it made to be stopped.
     pub(crate) settling: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// What each `${VAR}` its model calls need resolves to, in place of the environment.
+    pub(crate) secrets: Option<Resolver>,
 }
+
+/// What a secret's name resolves to, if anything.
+pub(crate) type Resolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Where a session's bindings install and remember approvals.
 pub(crate) struct Places {
@@ -113,6 +118,10 @@ impl Sessions {
         if let Some(progress) = &self.progress {
             let progress = Arc::clone(progress);
             builder = builder.progress(move |step| progress(handle, step));
+        }
+        if let Some(secrets) = &self.secrets {
+            let secrets = Arc::clone(secrets);
+            builder = builder.secrets(move |var: &str| secrets(var));
         }
         builder
     }
@@ -196,10 +205,10 @@ mod code {
 /// A program and the sessions it asks for, on the host: a directory holding its scripts, which
 /// is its working directory and where its streams are written, beside a session root and a
 /// global configuration.
-struct Bed {
+pub(crate) struct Bed {
     _root: tempfile::TempDir,
     /// The program's directory.
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     sessions: PathBuf,
     repo: PathBuf,
     global: PathBuf,
@@ -208,15 +217,15 @@ struct Bed {
 }
 
 /// How a program ended, and what it wrote.
-struct Ran {
-    exit: crate::harness::ProgramExit,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Ran {
+    pub(crate) exit: crate::harness::ProgramExit,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 impl Ran {
     /// Each line the program printed, as JSON.
-    fn json(&self) -> Vec<serde_json::Value> {
+    pub(crate) fn json(&self) -> Vec<serde_json::Value> {
         self.stdout
             .lines()
             .map(|line| {
@@ -259,7 +268,7 @@ def raise_flag(name):
 "#;
 
 impl Bed {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = tempfile::tempdir().expect("tempdir");
         let path = |name: &str| {
             let dir = root.path().join(name);
@@ -287,13 +296,13 @@ impl Bed {
     }
 
     /// Write `source`, dedented, as the script `name`.
-    fn write(&self, name: &str, source: &str) {
+    pub(crate) fn write(&self, name: &str, source: &str) {
         std::fs::write(self.dir.join(name), crate::python::testing::py(source)).expect("write");
     }
 
     /// The configuration: the bed's session root, `extra`, and the fixture binding when
     /// `fixture`, all in the global file, which needs no approval.
-    fn config(&self, extra: &str, fixture: bool) -> crate::config::Config {
+    pub(crate) fn config(&self, extra: &str, fixture: bool) -> crate::config::Config {
         let fixture = if fixture { FIXTURE } else { "" };
         std::fs::write(
             &self.global,
@@ -316,7 +325,7 @@ impl Bed {
     }
 
     /// Wait, without holding the runtime, for the program to raise `name`.
-    async fn raised(&self, name: &str) {
+    pub(crate) async fn raised(&self, name: &str) {
         let flag = self.flag(name);
         crate::python::testing::within(async {
             while !flag.exists() {
@@ -327,7 +336,7 @@ impl Bed {
     }
 
     /// The sessions the bed's programs start: on the host, the fixture's packages installed here.
-    fn sessions(&self) -> Sessions {
+    pub(crate) fn sessions(&self) -> Sessions {
         Sessions {
             on_host: true,
             ..self.in_containers()
@@ -349,7 +358,7 @@ impl Bed {
 
     /// Start the script `name`, with `program` adjusting what the bed sets: its working directory
     /// the bed's, the test `HOME`, its stdout and stderr to files in the bed.
-    async fn start(
+    pub(crate) async fn start(
         &self,
         name: &str,
         config: crate::config::Config,
@@ -380,7 +389,7 @@ impl Bed {
     }
 
     /// Wait for `program` and every session it left open, and read what it wrote.
-    async fn finish(&self, mut program: crate::harness::RunningProgram) -> Ran {
+    pub(crate) async fn finish(&self, mut program: crate::harness::RunningProgram) -> Ran {
         let exit = tokio::time::timeout(std::time::Duration::from_secs(60), program.wait())
             .await
             .expect("the program and its sessions ended within a minute")
@@ -394,7 +403,7 @@ impl Bed {
     }
 
     /// The session directories under the bed's session root.
-    fn session_dirs(&self) -> Vec<PathBuf> {
+    pub(crate) fn session_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(&self.sessions)
             .expect("read the session root")
             .map(|entry| entry.expect("an entry").path())
@@ -416,7 +425,7 @@ fn wheels() -> &'static Path {
 }
 
 /// The interpreter of the session `program` numbered `handle`.
-fn interpreter(program: &crate::harness::RunningProgram, handle: u64) -> Interpreter {
+pub(crate) fn interpreter(program: &crate::harness::RunningProgram, handle: u64) -> Interpreter {
     program
         .live
         .0
@@ -1206,7 +1215,7 @@ async fn a_program_speaking_another_protocol_is_refused_before_its_script_runs()
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap();
-        let text = text.replace("\nPROTOCOL = 1\n", "\nPROTOCOL = 2\n");
+        let text = text.replace("\nPROTOCOL = 2\n", "\nPROTOCOL = 3\n");
         std::fs::write(package.join("outrig").join(entry.file_name()), text).unwrap();
     }
     bed.write("runs.py", "open('ran', 'w').close()");
@@ -1223,7 +1232,7 @@ async fn a_program_speaking_another_protocol_is_refused_before_its_script_runs()
         .expect_err("refused at the greeting");
     assert!(
         refused.to_string().contains(
-            "it speaks version 2 of the owner protocol, and this engine speaks version 1"
+            "it speaks version 3 of the owner protocol, and this engine speaks version 2"
         ),
         "{refused}"
     );
@@ -1678,7 +1687,7 @@ async fn a_sessions_inputs_are_checked_when_it_is_made() {
                         pass
                 except RuntimeError as e:
                     out[name] = str(e)
-            too_long = outrig.Session(mounts=[f"/{'m' * 200}/{n}" for n in range(400)])
+            too_long = outrig.Session(mounts=[f"/{'m' * 200}/{n}" for n in range(5000)])
             reading = asyncio.create_task(drain(too_long.events()))
             await asyncio.sleep(0)
             try:

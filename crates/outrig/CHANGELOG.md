@@ -549,6 +549,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every one alive. Five events record each instance under its child's subject:
   `agent.instance.started`, `.ready`, `.released` with how and the child's usage, `.collected`,
   and `.handle.collected` for a handle dropped before its request ended.
+- **A host program drives an agent class.** In a program `HostProgram` runs, an `outrig.Agent`
+  subclass constructed on a running event loop inside an `outrig.Session`'s block -- or with
+  `session=` naming one, a keyword every constructor now takes and a kernel's refuses -- launches
+  a child of that session at depth 1 whose parent is the program, the subject `owner` in its
+  events. It is held to the limits every child is, `children-max`, `requests-max`,
+  `model-concurrency-max` and the token budget among them, and runs on `model=` or else
+  `default-model`: no `[agents.<name>]` table, `default-agent` or preamble applies. The class
+  reaches the child as data -- its docstring, each channel's description, and each request and
+  reply type as a description of its fields, their types, their `doc()` and `alias()` markers and
+  their defaults, a `default_factory` as the value it makes -- from which the child's kernel makes
+  the classes again, so no code of the program's crosses. A call returns a handle of the
+  program's loop at once: awaitable, with `future` for `asyncio.wait`, `result()`, `done()`,
+  `status`, and `cancel()`, which returns once the request has ended. Each reply comes back as
+  JSON and is decoded in the program into its own class; what the decoding finds goes back to the
+  child's `reply`, which raises it, and the child's interpreter decides how the request ends, so a
+  reply racing a cancel or the close has one outcome. The session's exit releases each instance
+  still alive, and `ShutdownReport.requests` in the Python mirror, new, lists the requests open at
+  the close. Every request the program sends is answered, and each it made ends, however the
+  interpreter ends. The owner protocol is version 2, with lines of up to 1 MiB.
 - **Skills: `SkillSource`, `DirectorySource` and `SessionBuilder::skill_source`.** A skill is a
   directory holding a `SKILL.md` -- Agent Skills frontmatter, then instructions -- and, optionally,
   a `skill.py`. A session serves the skills of the sources it is given, in order: the first that

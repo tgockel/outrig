@@ -697,3 +697,189 @@ fn a_declared_function_declares_on_the_host_and_a_call_says_it_needs_a_kernel() 
          __main__.nameless has no docstring, which is what a declaration tells its child\n"
     );
 }
+
+/// What every test of a type crossing to a child starts with: `crossed(t)` describes `t` as a
+/// program on the host does, passes the description through JSON, as the connection does, and
+/// makes the classes again as a child's kernel does, returning the type it names and the classes
+/// by name.
+const CROSSING: &str = r#"
+from outrig import _agents
+
+def through_json(value):
+    return json.loads(json.dumps(value, allow_nan=False))
+
+def rebuilt(table, module, inputs={}):
+    classes, _, inputs = _agents.rebuilt(
+        {'classes': through_json(table), 'channels': {}, 'inputs': through_json(inputs)}, module)
+    return {cls.__name__: cls for cls in classes}, inputs
+
+def crossed(t):
+    table = {}
+    described = through_json(_agents.described(t, table))
+    made, _ = rebuilt(table, 'outrig_session_c1')
+    return _agents.typed(described, made), made
+"#;
+
+/// The maintainer's `ReviewResult` crosses as a description and is made again with the schema
+/// text the original renders, decoding the example into classes of its own -- frozen and
+/// keyword-only as declared, an omitted `questions` a fresh empty map each time -- that encode to
+/// the JSON the original gives.
+#[test]
+fn a_type_crosses_as_a_description_and_renders_alike() {
+    let out = run(&format!(
+        "{CROSSING}\n{}",
+        py(r#"
+        t, made = crossed(ReviewResult)
+        print(sorted(made), t is made['ReviewResult'], t is not ReviewResult)
+        print(declare(t).text() == review.text())
+        result = declare(t).decode(example())
+        print(type(result.verdict).__name__, type(result).__module__,
+              declare(t).encode(result) == review.encode(review.decode(example())))
+        try:
+            result.verdict = None
+        except dataclasses.FrozenInstanceError:
+            print('frozen', all(f.kw_only for f in dataclasses.fields(made['Note'])))
+        bare = example()
+        bare.pop('questions', None)
+        a, b = declare(t).decode(bare), declare(t).decode(bare)
+        print(a.questions, a.questions is not b.questions)
+        print(problems({**example(), 'pre_existing_issues': {}}, declare(t)))
+        "#)
+    ));
+    assert_eq!(
+        out,
+        "['Note', 'Question', 'ReviewResult', 'Verdict'] True True\n\
+         True\n\
+         Verdict outrig_session_c1 True\n\
+         frozen True\n\
+         {} True\n\
+         $.pre_existing_issues: unknown key; that field's key is \"pre-existing-issues\"\n"
+    );
+}
+
+/// A type that refers to itself crosses, and its classes are made again referring to themselves:
+/// the schema text is the original's, and a nested value decodes into nested instances, each
+/// with a fresh default.
+#[test]
+fn a_type_that_refers_to_itself_crosses() {
+    let out = run(&format!(
+        "{CROSSING}\n{}",
+        py(r#"
+        trees = module('trees', '''
+        from __future__ import annotations
+        from dataclasses import dataclass, field
+        @dataclass
+        class Tree:
+            name: str
+            children: list[Tree] = field(default_factory=list)
+        ''')
+        t, made = crossed(trees.Tree)
+        print(declare(t).text() == declare(trees.Tree).text())
+        tree = declare(t).decode({'name': 'a', 'children': [{'name': 'b'}]})
+        print(type(tree.children[0]) is t, tree.children[0].children, tree.children[0].name)
+        "#)
+    ));
+    assert_eq!(out, "True\nTrue [] b\n");
+}
+
+/// Defaults cross as values: a scalar as itself, a mutable one and a `default_factory`'s value
+/// copied for each instance, and a dataclass default made an instance of the class made again --
+/// not left a dict -- so an instance built without it encodes. A `doc()` inside a field's type
+/// crosses too. A factory whose value is outside the subset, and one that raises, are refused
+/// naming the field.
+#[test]
+fn defaults_cross_as_values_and_a_factory_outside_the_subset_is_refused() {
+    let out = run(&format!(
+        "{CROSSING}\n{}",
+        py(r#"
+        settings = module('settings', '''
+        from dataclasses import dataclass, field
+        from typing import Annotated, Optional
+        from outrig.schema import doc
+        @dataclass(frozen=True)
+        class Point:
+            x: int = 0
+            y: int = 0
+        @dataclass
+        class Settings:
+            origin: Point = field(default_factory=Point)
+            tags: list[str] = field(default_factory=lambda: ['a'])
+            scale: float = 1.5
+            label: Optional[str] = None
+            marks: Annotated[list[Annotated[str, doc('a mark')]], doc('the marks')] = field(
+                default_factory=list)
+        @dataclass
+        class Bag:
+            items: list[str] = field(default_factory=lambda: {'a'})
+        def broken():
+            raise OSError('no')
+        @dataclass
+        class Broken:
+            items: list[str] = field(default_factory=broken)
+        ''')
+        t, made = crossed(settings.Settings)
+        one, two = made['Settings'](), made['Settings']()
+        print(type(one.origin) is made['Point'], one.origin == made['Point'](), one.tags,
+              one.scale, one.label)
+        print(one.tags is not two.tags, declare(t).encode(one))
+        print(declare(t).text() == declare(settings.Settings).text())
+        for cls in (settings.Bag, settings.Broken):
+            try:
+                _agents.described(cls, {})
+            except TypeError as e:
+                print(str(e).splitlines()[0])
+        "#)
+    ));
+    assert_eq!(
+        out,
+        "True True ['a'] 1.5 None\n\
+         True {'origin': {'x': 0, 'y': 0}, 'tags': ['a'], 'scale': 1.5, 'label': None, \
+         'marks': []}\n\
+         True\n\
+         the default of field 'items' of settings.Bag cannot cross to a child as data: 1 problem \
+         encoding list[str]:\n\
+         the default_factory of field 'items' of settings.Broken raised OSError: no\n"
+    );
+}
+
+/// An agent class's generated message crosses frozen, under its qualified name, its keyword-only
+/// parameter keyword-only and its mutable default copied for each message; and an input crosses
+/// tagged where its lists, dicts and dataclasses are, made again of the classes made again -- a
+/// dict beside them left a dict.
+#[test]
+fn a_generated_message_and_an_input_cross() {
+    let out = run(&format!(
+        "{CROSSING}\n{}",
+        py(r#"
+        @dataclass(frozen=True)
+        class Row:
+            n: int
+        class Foo(outrig.Agent):
+            """Foo."""
+            @outrig.agent
+            async def buzz(self, foo: int, bar: list[str] = [], *, row: Row = Row(1)) -> str:
+                """Buzz."""
+                ...
+        t, made = crossed(Foo.FooBuzzMessage)
+        one, two = t(foo=1), t(foo=2)
+        print(t.__qualname__ == Foo.FooBuzzMessage.__qualname__, one.bar is not two.bar,
+              one.row == made['Row'](1), [f.name for f in dataclasses.fields(t) if f.kw_only])
+        try:
+            one.foo = 3
+        except dataclasses.FrozenInstanceError:
+            print('frozen')
+        value = [Row(2), {'a': 1}, 3]
+        table = {}
+        _agents.described(Row, table)
+        made, inputs = rebuilt(table, 'outrig_session_c2', {'rows': _agents.tagged(value)})
+        back = inputs['rows']
+        print(type(back[0]) is made['Row'], back[0].n, back[1], back[2])
+        "#)
+    ));
+    assert_eq!(
+        out,
+        "True True True ['row']\n\
+         frozen\n\
+         True 2 {'a': 1} 3\n"
+    );
+}

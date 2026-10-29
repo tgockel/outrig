@@ -457,3 +457,7 @@ mod invoke_tests;
 #[cfg(test)]
 #[path = "instance_tests.rs"]
 mod instance_tests;
+
+#[cfg(test)]
+#[path = "owned_tests.rs"]
+mod owned_tests;

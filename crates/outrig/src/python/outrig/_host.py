@@ -15,6 +15,9 @@ The engine's death ends the program and everything it started, as the bindings p
 its owner (`supervisor.rs`). Two things say the engine is gone: the parent-death signal, SIGHUP,
 which the engine left blocked until the handler below is in place, and the end of the connection,
 which the reading thread sees.
+
+An `outrig.Agent` subclass constructed here is a root child of a session the program owns
+("agent classes", below).
 """
 
 import asyncio
@@ -22,10 +25,13 @@ import collections
 import concurrent.futures
 import contextlib
 import contextvars
+import copy
 import dataclasses
 import datetime
+import inspect
 import itertools
 import json
+import keyword
 import os
 import pathlib
 import select
@@ -33,9 +39,12 @@ import signal
 import threading
 import time
 import types
+import weakref
 from collections.abc import Mapping
 
 import outrig
+
+from . import _agents, schema
 
 # The signal the engine's death delivers: `PR_SET_PDEATHSIG`, set between fork and exec and
 # blocked until `install` has put the handler in place, so a death in between is pending rather
@@ -46,13 +55,14 @@ DEATH_SIGNAL = signal.SIGHUP
 DEATH_GRACE = 1.0
 # The version of the protocol over the connection, which the greeting names; the engine refuses
 # any other.
-PROTOCOL = 1
+PROTOCOL = 2
 # How many pushes of a session's events this program holds for a reader that falls behind before
 # it drops the oldest. The engine holds as many for this program, and drops past it too, counted.
 EVENT_CAPACITY = 4096
-# The longest request the engine reads, in bytes, its newline aside: it discards a longer line
-# unanswered, having no id to answer it by.
-LINE_MAX = 64 << 10
+# The longest line the engine reads, in bytes, its newline aside: it discards a longer one
+# unanswered, having no id to answer it by. A request's body, and an instance's inputs, are in one,
+# bounded as a kernel's message is.
+LINE_MAX = 1 << 20
 # The longest grace the engine takes for a session's shutdown, in seconds: an hour.
 GRACE_MAX = 3600
 _dying = threading.Lock()  # taken by the one call to `_die` that runs
@@ -114,8 +124,9 @@ def _write_all(fd, data):
 
 
 class _Connection:
-    """Requests to the engine, each answered by one reply with its id, and the events of the
-    program's sessions, which come unasked; all read on a thread of its own."""
+    """Requests to the engine, each answered by one reply with its id, notices it does not answer,
+    and what it says of the program's sessions unasked -- their events, and what becomes of their
+    agent class instances; all read on a thread of its own."""
 
     def __init__(self, fd_in, fd_out):
         self.fds = (fd_in, fd_out)
@@ -131,33 +142,40 @@ class _Connection:
         self._broken = None
         threading.Thread(target=self._read, name="outrig-engine", daemon=True).start()
 
-    def post(self, kind, **fields):
+    def post(self, kind, /, **fields):
         """Send a `kind` request, and return the `concurrent.futures.Future` the reading thread
         settles with the engine's reply, which names the same kind, or with `RuntimeError` when
         the engine refused the request or the connection broke. A coroutine awaits it through
         `asyncio.wrap_future`."""
+        ident = next(self._ids)
+        reply = self._waiting[ident] = concurrent.futures.Future()
+        try:
+            self.tell(kind, id=ident, **fields)
+        except BaseException:
+            self._waiting.pop(ident, None)
+            raise
+        return reply
+
+    def tell(self, kind, /, **fields):
+        """Send a `kind` line: a notice, which the engine does not answer, unless it carries the
+        `id` a request does. Raises `RuntimeError` once the connection is broken."""
         if self._broken is not None:
             raise RuntimeError(self._broken)
-        ident = next(self._ids)
-        # Encoded before anything waits on it, so a request the engine could not read is refused
-        # here rather than sent to go unanswered: a str UTF-8 cannot hold -- a path that is not
-        # UTF-8, which Python holds as lone surrogates -- raises `UnicodeEncodeError`, and a
-        # request longer than the engine reads, `ValueError`.
-        line = json.dumps({"t": kind, "id": ident, **fields}, ensure_ascii=False).encode()
+        # Encoded before it is sent, so a line the engine could not read is refused here rather
+        # than sent to go unanswered: a str UTF-8 cannot hold -- a path that is not UTF-8, which
+        # Python holds as lone surrogates -- raises `UnicodeEncodeError`, and a float JSON has no
+        # form for, or a line longer than the engine reads, `ValueError`.
+        line = json.dumps({"t": kind, **fields}, ensure_ascii=False, allow_nan=False).encode()
         if len(line) > LINE_MAX:
             raise ValueError(
                 f"a {kind} request of {len(line)} bytes is longer than the {LINE_MAX} the engine "
                 "reads"
             )
-        reply = concurrent.futures.Future()
-        self._waiting[ident] = reply
         try:
             with self._send:
                 _write_all(self.fds[1], line + b"\n")
         except OSError as e:
-            self._waiting.pop(ident, None)
             raise RuntimeError(f"the connection to the engine is broken: {e}") from None
-        return reply
 
     def request(self, kind, **fields):
         """Send a `kind` request and return the engine's reply, which names the same kind."""
@@ -186,12 +204,15 @@ class _Connection:
         try:
             message = json.loads(line)
             if "id" not in message:
-                # A push, for one session; `events.end` is its last.
+                # A push, for one session: an event, `events.end` their last, or what became of
+                # one of its agent class instances or their requests.
                 handle = message["session"]
                 if message["t"] == "events.end":
                     self.events.pop(handle).push(message)
-                else:
+                elif message["t"] in ("event", "missed"):
                     self.events[handle].push(message)
+                else:
+                    _pushed(message)
                 return
             reply = self._waiting.pop(message["id"])
         except (ValueError, KeyError, TypeError) as e:
@@ -211,9 +232,10 @@ class _Connection:
             _, reply = self._waiting.popitem()
             with contextlib.suppress(concurrent.futures.InvalidStateError):
                 reply.set_exception(RuntimeError(why))
-        # Nor will any more of a session's events come.
+        # Nor will any more of a session's events come, nor of its agent class instances.
         for events in list(self.events.values()):
             events.push({"t": "events.end"})
+        _closed(list(_roots.values()), terminated=True)
 
 
 def _forget():
@@ -254,6 +276,7 @@ def install(fd_in, fd_out):
     os.register_at_fork(after_in_child=_forget)
     for name in outrig._HOST_ONLY:
         setattr(outrig, name, globals()[name])
+    _agents._launch = _Root
 
 
 # ------------------------------------------------------------------------------- the configuration
@@ -468,6 +491,19 @@ class HostedCall:
 
 
 @dataclasses.dataclass(frozen=True)
+class RequestOutcome:
+    """A request made of a child agent that was open when a session's admission closed: its
+    `request` id, the `child` it was made of, the `channel` it was sent on -- `None` for a
+    submission -- and its `outcome`: `"closed"`, or whatever ended it first, or `"terminated"`
+    when the interpreter died before anything did."""
+
+    request: int
+    child: str
+    channel: str | None
+    outcome: str
+
+
+@dataclasses.dataclass(frozen=True)
 class BindingStop:
     """How the process holding a session's bindings stopped: SIGTERM to its process group, a
     grace, and SIGKILL if anything was left. `names` are its bindings; `group_empty` whether its
@@ -520,7 +556,8 @@ class ShutdownReport:
 
     `closed_by`, a `ClosedBy`, is what closed admission; `stopped`, a `Stopped`, whether
     everything is proven stopped; `executions`, each execution running when admission closed;
-    `hosted`, each hosted call whose outcome came after admission closed; `bindings`, a
+    `hosted`, each hosted call whose outcome came after admission closed; `requests`, each
+    `RequestOutcome`, a request made of a child agent that was open then; `bindings`, a
     `BindingStop`, how the process holding the bindings stopped, or `None` for a session with
     none; and `events`, an `EventDelivery`, how the session's events were delivered. It never
     depends on `Session.events()` having been read.
@@ -531,6 +568,7 @@ class ShutdownReport:
     stopped: Stopped
     executions: tuple[ExecutionOutcome, ...]
     hosted: tuple[HostedCall, ...]
+    requests: tuple[RequestOutcome, ...]
     bindings: BindingStop | None
     events: EventDelivery
 
@@ -552,6 +590,7 @@ def _report(raw, lost):
             ExecutionOutcome(id=row["execid"], status=row["status"]) for row in raw["executions"]
         ),
         hosted=tuple(HostedCall(**row) for row in raw["hosted"]),
+        requests=tuple(RequestOutcome(**row) for row in raw["requests"]),
         bindings=bindings,
         events=EventDelivery(
             last_sequence=events["last_sequence"],
@@ -686,6 +725,10 @@ class Session:
     and the block does not run; one asking for more mounts than the engine reads in a request
     raises `ValueError` before anything starts.
 
+    An `outrig.Agent` constructed inside the block is a child of the session (see
+    `help(outrig.Agent)`): enter its `async with` inside this one, since leaving this block
+    releases it, and its requests still open end with `outrig.SessionClosing`.
+
     Leaving the block, however it ends, closes admission, shuts the session down and sets
     `shutdown_report`, a `ShutdownReport`. When the engine could not prove that everything the
     session started stopped, leaving raises `ShutdownException`, with the block's own exception,
@@ -715,6 +758,8 @@ class Session:
         self._events = _Events()
         self._entered = False
         self._reading = False
+        # How many requests an agent class instance may hold unsettled, which entry says.
+        self._requests_max = float("inf")
         self.id = None
         self.shutdown_report = None
 
@@ -750,6 +795,7 @@ class Session:
                 self.shutdown_report = _report(stop.result()["report"], self._events.lost)
             raise
         self.id = answer["session"]["id"]
+        self._requests_max = answer["session"]["requests_max"]
         self._token = _current.set(self)
         return self
 
@@ -760,6 +806,8 @@ class Session:
         stop = _connection.post("session.shutdown", session=self._handle, grace=self._grace)
         cancelled = await _settled(stop)
         self.shutdown_report = _report(stop.result()["report"], self._events.lost)
+        # Whatever of its agent class instances nothing ended, nothing will now.
+        _closed([root for root in list(_roots.values()) if root.session is self], terminated=True)
         if self.shutdown_report.verdict == "not_proven_stopped":
             raise ShutdownException(self.shutdown_report)
         if cancelled is not None:
@@ -807,3 +855,423 @@ def current_session():
             "or pass the session where it is needed"
         )
     return session
+
+
+# ----------------------------------------------------------------------------------- agent classes
+#
+# An `outrig.Agent` subclass constructed here is a root child of a session: its parent is this
+# program, which the engine names `owner`. The program speaks for the instance as a kernel's code
+# speaks for its own -- a spawn, a release, what became of the instance -- and its requests reach
+# the child's kernel through the engine, each numbered here: its body in JSON, decoded there into
+# the classes the child made again from their descriptions, and each reply back in JSON, decoded
+# here into the program's own, which the program's verdict accepts or sends back with what is
+# wrong. What becomes of each comes unasked, on the connection's thread, and is handled on the
+# loop the instance was constructed on, since handling it may run the program's code.
+
+_numbers = itertools.count(1)  # each instance's and each request's, for the program's life
+# How long `cancel()` waits for the child's kernel to say how a request it sent ended, in seconds.
+CANCEL_WAIT = 10
+_roots = {}  # each instance not yet released, by its number
+_asks = {}  # each request not yet ended, by its number
+# What a launch, `ready()` or a request ends with, by the engine's name for how it ended.
+_ERRORS = {
+    "model": ValueError,
+    "limit": _agents.AgentLimitReached,
+    "released": _agents.AgentReleased,
+    "closed": _agents.SessionClosing,
+    "terminated": _agents.SessionClosing,
+    "budget": _agents.BudgetExhausted,
+    "failed": _agents.AgentRequestFailed,
+    "cancelled": _agents.RequestCancelled,
+}
+# A request's status when it ends with a launch's error, by the error's class.
+_REASONS = {
+    _agents.AgentLimitReached: "limit",
+    _agents.SessionClosing: "closed",
+    _agents.AgentReleased: "released",
+}
+
+
+class _Root:
+    """What the program keeps of an agent class instance it constructed, whose child is a root
+    child of a session: its launch, the requests made before its child exists, and those open.
+    Nothing here holds the instance, so that collecting it releases the child."""
+
+    def __init__(self, agent, inputs, model, session):
+        cls = type(agent)
+        if session is None:
+            session = current_session()
+        elif type(session) is not Session:
+            raise TypeError(f"session= takes an outrig.Session, not {type(session).__qualname__}")
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError(
+                f"{cls.__qualname__}() is constructed on the running event loop its requests' "
+                "handles belong to, and none runs here"
+            ) from None
+        self.methods = {
+            name: send.__outrig_channel__ for name, send in cls._outrig_channels.items()
+        }
+        manifest, found, classes = [], set(), {}
+        for name, value in inputs.items():
+            if (not name.isidentifier() or keyword.iskeyword(name) or name.startswith("__")
+                    or name in _agents.RESERVED):
+                raise ValueError(f"{cls.__qualname__}(): input {name!r} cannot name a variable in "
+                                 "the child")
+            encoded, shape, used = _agents.walk(value, name)
+            manifest.append({"name": name, "type": shape, "preview": _agents.preview(encoded)})
+            found |= used
+        bound = list(dict.fromkeys(c for method in self.methods.values() for c in method.classes))
+        _agents.one_name_each(bound, inputs)
+        _agents.one_name_each(bound + sorted(found, key=schema._type_qualname))
+        for c in found:
+            _agents.described(c, classes)
+        channels = {
+            name: {"request": _agents.described(m.request_type, classes),
+                   "reply": _agents.described(m.reply_type, classes), "doc": m.doc}
+            for name, m in self.methods.items()
+        }
+        self.id, self.session, self.child = next(_numbers), session, None
+        self.name = f"{cls.__name__[:48]}-{self.id}"
+        line = {
+            "session": session._handle, "name": self.name, "prompt": inspect.cleandoc(cls.__doc__),
+            "model": model, "kind": "request", "manifest": manifest,
+            "channels": [
+                {"name": name, "doc": m.doc, "request_type": schema._describe(m.request_type),
+                 "reply_type": schema._describe(m.reply_type), "request": m.request.text(),
+                 "reply": m.reply.text()}
+                for name, m in self.methods.items()
+            ],
+            "instance": {"id": self.id, "module": cls.__module__, "qualname": cls.__qualname__,
+                         "digest": cls._outrig_digest},
+            # As text, so the engine, which parses a line into JSON values that sort an object's
+            # keys and hold an integer past 64 bits as a float, changes none of it.
+            "root": json.dumps({
+                "name": self.name, "classes": classes, "channels": channels,
+                "inputs": {name: _agents.tagged(value) for name, value in inputs.items()},
+            }, allow_nan=False),
+        }
+        self.instance = None  # the session's id for the instance, which its launch answers
+        self.life = "idle"  # what the engine last said the child is doing
+        self.held = []  # the requests made before the child exists; `None` once the launch answers
+        self.open = {}  # each request not yet ended, by its number
+        self.requests_max = session._requests_max
+        self.error = None  # what each call raises, once one must
+        self.closed = False  # the session's close released the child
+        self.oriented = self.loop.create_future()  # `ready()`'s: `None`, or the error, as a value
+        self.releasing = None
+        self.finalizer = weakref.finalize(agent, _collected, self)
+        _roots[self.id] = self
+        self.launching = self.loop.create_task(self.launch(line))
+
+    def __str__(self):
+        return f"child {self.name!r}" + ("" if self.child is None else f" ({self.child})")
+
+    async def launch(self, line):
+        """Have the engine launch the child, then send it what was asked of it meanwhile, in order;
+        or end that as the launch did."""
+        error = None
+        try:
+            answer = await asyncio.wrap_future(_connection.post("agent.spawn", **line))
+        except RuntimeError as e:  # refused: the session is not running, or the connection broke
+            error = _agents.SessionClosing(str(e))
+        except Exception as e:  # not sent: longer than the engine reads, say
+            error = e
+        else:
+            refused = answer.get("error")
+            if refused is not None:
+                error = _ERRORS.get(refused["kind"], RuntimeError)(refused["message"])
+            else:
+                self.child, self.requests_max = answer["child"], answer["requests_max"]
+                self.instance = answer["instance"]
+        self.error = self.error or error
+        held, self.held = self.held, None
+        for request in held:
+            if self.error is None:
+                self.send(request)
+            else:
+                request.end(_REASONS.get(type(self.error), "failed"), copy.copy(self.error))
+        if self.error is not None:
+            self.settle(self.error)
+        if self.child is None:
+            # Nothing to release, so nothing to say of a collection.
+            self.finalizer.detach()
+            _roots.pop(self.id, None)
+
+    def settle(self, error):
+        """Settle `ready()`, once: ready, or raising `error`."""
+        if not self.oriented.done():
+            self.oriented.set_result(error)
+
+    async def ready(self):
+        # Kept as a value and raised as a copy, as a kernel's instance does: one raised would hold
+        # the frames that awaited it, the instance's among them, for as long as this lives.
+        error = await asyncio.shield(self.oriented)
+        if error is not None:
+            raise copy.copy(error)
+
+    def request(self, agent, name, message):
+        """Send `message` on channel `name` as `agent`'s request, which holds `agent` until it ends
+        -- held itself until the child exists -- and return its handle."""
+        if self.error is None and self.session.shutdown_report is not None:
+            self.error = _agents.SessionClosing(f"the session of {self} has ended")
+        if self.error is not None:
+            raise copy.copy(self.error)
+        if len(self.open) >= self.requests_max:
+            raise _agents.AgentLimitReached(
+                f"{self} already holds {self.requests_max} unsettled requests, its requests-max, "
+                "so nothing was sent; cancel one, or wait for an answer"
+            )
+        request = _Request(self, agent, name, self.methods[name].request.encode(message))
+        if self.held is None:
+            self.send(request)
+        else:
+            self.held.append(request)
+        return _agents.Handle(request)
+
+    def send(self, request):
+        """Send `request` to the child's kernel, unless it was cancelled first; or end it with why
+        it could not go."""
+        with request.sending:
+            with request.lock:
+                if request.state in _agents._ENDED:
+                    return
+                request.sent = True
+            try:
+                # As text, so the engine, which sorts a JSON object's keys, keeps a dict's order.
+                _connection.tell("ask", session=self.session._handle, agent=self.child,
+                                 ask=request.ask, channel=request.channel,
+                                 body=json.dumps(request.body, allow_nan=False))
+            except (RuntimeError, ValueError) as e:
+                request.end("failed", e)
+
+    def tell(self, kind, **fields):
+        """Tell the engine `kind` about the child, if it can still hear it."""
+        with contextlib.suppress(RuntimeError, ValueError):
+            _connection.tell(kind, session=self.session._handle, **fields)
+
+    def dropped(self, request):
+        """The handle of `request` was collected while it was open: said now, or once it is
+        sent."""
+        request.dropped = True
+        if request.id is not None:
+            self.said_dropped(request)
+
+    def said_dropped(self, request):
+        if request.state not in _agents._ENDED:
+            self.tell("agent.instance.handle.collected", instance=self.instance, child=self.child,
+                      request=request.id)
+
+    def pushed(self, message):
+        """What the engine says of the instance: the child's orienting round has ended, or cannot
+        be had; or the child is doing something else."""
+        if message["t"] == "oriented":
+            error = message["error"]
+            self.settle(error and _ERRORS.get(error["kind"], RuntimeError)(error["message"]))
+        else:
+            self.life = message["state"]
+
+    def close(self):
+        """The session closed, which released the child: `ready()`, and each call from now on,
+        raise the closing error."""
+        self.closed = True
+        self.error = self.error or _agents.SessionClosing(f"the session closed with {self} open")
+        self.settle(self.error)
+
+    def collected(self):
+        if self.releasing is None:
+            self.releasing = self.loop.create_task(self._release("collected"))
+
+    async def release(self, how):
+        if self.releasing is None:
+            self.releasing = self.loop.create_task(self._release(how))
+        await asyncio.shield(self.releasing)
+
+    async def _release(self, how):
+        """Release the child `how` -- `explicit`, `async_with` or `collected` -- once its launch has
+        answered, and say so: unless it never came to exist, or the session's close released it."""
+        if how != "collected":
+            self.finalizer.detach()
+        self.error = self.error or _agents.AgentReleased(f"{self} was released")
+        self.settle(self.error)
+        await asyncio.wait([self.launching])
+        if self.child is not None and not self.closed:
+            # The engine records the release, and a collection, as it makes it.
+            with contextlib.suppress(RuntimeError):
+                await asyncio.wrap_future(_connection.post(
+                    "agent.release", session=self.session._handle, children=[self.child],
+                    how=how))
+        _roots.pop(self.id, None)
+
+
+def _sendable(text):
+    """`text`, cut, as a line can carry it: a lone surrogate, which UTF-8 cannot hold, escaped."""
+    return _agents.cut(text.encode("utf-8", "backslashreplace").decode("utf-8"))
+
+
+def _collected(root):
+    """An agent class instance was collected, on whatever thread dropped it: released from its
+    loop."""
+    with contextlib.suppress(RuntimeError):
+        root.loop.call_soon_threadsafe(root.collected)
+
+
+def _closed(roots, terminated):
+    """The session of each of `roots` closed, which released its child. `terminated`, the
+    interpreter died first, so nothing else ends the requests still open: they end here, on
+    whatever thread heard so -- a `cancel()` the loop is in may be waiting for them -- and the rest
+    on each instance's loop."""
+    for root in roots:
+        if terminated:
+            for request in list(root.open.values()):
+                request.end("terminated", _agents.SessionClosing(
+                    f"the session's interpreter ended before {request} was answered"))
+        with contextlib.suppress(RuntimeError):
+            root.loop.call_soon_threadsafe(root.close)
+
+
+class _Request:
+    """One request the program made of an agent class instance's child: what its handle reads,
+    and what the engine says of it. `ask` names it to the engine; `id` is the session's for it,
+    once the child's kernel has it. That kernel decides how it ends, under the lock that orders
+    this program's verdicts, a cancel, the release and the close; only one never sent ends here."""
+
+    def __init__(self, root, agent, channel, body):
+        self.root, self.instance, self.channel, self.body = root, agent, channel, body
+        self.ask, self.id, self.loop = next(_numbers), None, root.loop
+        self.lock = threading.Lock()
+        self.state, self.final = "waiting", None
+        self.value = self.error = self.progress = None
+        self.decoded = {}  # each reply this program found nothing wrong with, by its number
+        # Whether it was sent, its handle was collected, and a cancel of it was sent; and the lock
+        # that keeps a cancel's line from going before the request's.
+        self.sent = self.dropped = self.withdrawn = False
+        self.sending = threading.Lock()
+        self.has_ended = threading.Event()
+        self.future = root.loop.create_future()
+        root.open[self.ask] = _asks[self.ask] = self
+
+    def __str__(self):
+        return f"request {self.id} on {self.root}'s channel {self.channel!r}"
+
+    def status(self):
+        with self.lock:
+            return self.final or _agents.Status(self.state, None, self.root.life)
+
+    def pushed(self, message):
+        """What the engine says of the request, on the instance's loop: the child's kernel has it,
+        the child took it, or the child replied."""
+        kind = message["t"]
+        if kind == "agent.request":
+            self.id = message["request"]
+            if self.dropped:
+                self.root.said_dropped(self)
+        elif kind == "agent.received":
+            with self.lock:
+                if self.state == "waiting":
+                    self.state = "received"
+        else:
+            self.judge(json.loads(message["value"]), message["reply"])
+
+    def told_ended(self, message):
+        """How the child's kernel ended the request, on the connection's thread: nothing of the
+        program's runs in this."""
+        outcome = message["outcome"]
+        text = message.get("error") or f"{self} ended {outcome}"
+        if outcome == "accepted":
+            with self.lock:
+                value = self.decoded.get(message["reply"])
+            self.end(None, value=value)
+        elif outcome == "rejected":
+            last = message["last"]
+            problems = tuple(schema.Problem(*problem) for problem in last["problems"])
+            value = json.loads(last["value"])
+            self.end("rejected", _agents.CompletionRejected(text, value, problems))
+        else:
+            self.end(outcome, _ERRORS.get(outcome, RuntimeError)(text))
+
+    def judge(self, value, reply):
+        """Decode `value`, the child's reply numbered `reply`, into the type this program declared,
+        and give the child's kernel the verdict: what is wrong with it, or nothing, which accepts
+        it. Here, on the instance's loop, since decoding runs the program's dataclasses."""
+        try:
+            decoded, problems = self.root.methods[self.channel].reply.decode(value), ()
+        except Exception as e:
+            decoded, problems = None, getattr(e, "problems", None)
+            problems = problems or (schema.Problem("$", f"{type(e).__name__}: {e}"),)
+        with self.lock:
+            if self.state in _agents._ENDED:
+                return  # the child's kernel ended it, which its reply hears
+            if not problems:
+                self.decoded[reply] = decoded
+        self.root.tell("verdict", agent=self.root.child, ask=self.ask, reply=reply,
+                       problems=[[_sendable(p.path), _sendable(p.message)] for p in problems])
+
+    def cancel(self):
+        """Cancel the request; whether this ended it, as a kernel's handle says. One not yet sent
+        ends here. One sent ends in the child's kernel, which may have ended it otherwise first:
+        this waits for its word, `CANCEL_WAIT` seconds at most, and says no without it."""
+        with self.sending:
+            if self.end("cancelled", _agents.RequestCancelled(f"{self} was cancelled"),
+                        unsent=True):
+                return True
+            with self.lock:
+                if self.state in _agents._ENDED:
+                    return False
+                first, self.withdrawn = not self.withdrawn, True
+            if first:
+                self.root.tell("withdraw", agent=self.root.child, ask=self.ask)
+        self.has_ended.wait(CANCEL_WAIT)
+        with self.lock:
+            # Only the program cancels its requests, and only its first cancel asked to.
+            return first and self.final is not None and self.final.reason == "cancelled"
+
+    def end(self, reason, error=None, value=None, unsent=False):
+        """End the request: accepted with `value` when `reason` is `None`, failed with `error`
+        otherwise; with `unsent`, only if it was never sent. Whether this ended it: one that had
+        ended stays as it ended. Any thread."""
+        with self.lock:
+            if self.state in _agents._ENDED or unsent and self.sent:
+                return False
+            self.state = "accepted" if reason is None else "failed"
+            self.value, self.error = value, error
+            self.final = _agents.Status(self.state, reason, self.root.life)
+        self.root.open.pop(self.ask, None)
+        _asks.pop(self.ask, None)
+        self.has_ended.set()
+        with contextlib.suppress(RuntimeError):
+            self.loop.call_soon_threadsafe(self._settle)
+        return True
+
+    def _settle(self):
+        # On the loop: letting go of the instance may collect it, which runs the program's code.
+        self.instance = None
+        if self.error is None:
+            self.future.set_result(self.value)
+        else:
+            self.future.set_exception(self.error)
+            self.future.exception()
+
+
+def _pushed(message):
+    """What the engine says of an agent class instance or of one of its requests, on the
+    connection's thread. A request's end is taken here, where a `cancel()` the loop is in waits for
+    it; the rest is handed to the loop the instance was constructed on, since handling it may run
+    the program's code."""
+    if "ask" in message:
+        request = _asks.get(message["ask"])
+        if request is not None and message["t"] == "agent.ended":
+            request.told_ended(message)
+        elif request is not None:
+            with contextlib.suppress(RuntimeError):
+                request.loop.call_soon_threadsafe(request.pushed, message)
+    elif "instance" in message:
+        root = _roots.get(message["instance"])
+        if root is not None:
+            with contextlib.suppress(RuntimeError):
+                root.loop.call_soon_threadsafe(root.pushed, message)
+    else:  # the session closed
+        handle = message["session"]
+        _closed([root for root in list(_roots.values()) if root.session._handle == handle],
+                message["terminated"])

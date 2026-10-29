@@ -9,23 +9,36 @@
 //! for in [`ProgramExit`]; and a program that does not end after a forwarded signal is ended
 //! (`program.rs`).
 //!
-//! # The owner protocol, version 1
+//! # The owner protocol, version 2
 //!
 //! NDJSON over the two pipes `python::program` sets up, one object per line, both ways.
 //!
-//! - **The greeting.** The program's first line is `{"t": "hello", "id": 0, "protocol": 1}`. The
+//! - **The greeting.** The program's first line is `{"t": "hello", "id": 0, "protocol": 2}`. The
 //!   engine answers the same at the same version, before the program's script runs; a program
 //!   speaking another version is answered with an `error` and ended, and its start fails.
 //! - **Requests**, answered by `id` with a line of the same `t`, or an `error`: `config`;
-//!   `session.start` (`session`, `workspace`, `mounts`), answered with the session's `id` once it
-//!   has started; `admission.close` (`session`), answered once the gate is closed; and
-//!   `session.shutdown` (`session`, `grace`), answered with the report once the session stopped.
-//!   `session` is a number the program chooses for each session, so what the engine pushes about
-//!   one can be routed before its start is answered.
+//!   `session.start` (`session`, `workspace`, `mounts`), answered with the session's `id` and
+//!   its `requests_max` once it has started; `admission.close` (`session`), answered once the
+//!   gate is closed; and `session.shutdown` (`session`, `grace`), answered with the report once
+//!   the session stopped. `session` is a number the program chooses for each session, so what
+//!   the engine pushes about one can be routed before its start is answered.
+//! - **Its agent class instances**, root children of the session (`agent::children`): `agent.*`
+//!   lines, as a kernel sends them -- `agent.spawn`, answered with the `instance` id the child's
+//!   kernel gave it; `agent.release`, with `how`, which the engine records as it releases, and
+//!   answers at once, releasing nothing, once admission has closed; and
+//!   `agent.instance.handle.collected` -- and three notices about one of its requests, which the
+//!   program numbers `ask`: `ask` (`agent`, `channel`, `body`), the request; `withdraw`
+//!   (`agent`), its cancel; and `verdict` (`agent`, `reply`, `problems`), what the program found
+//!   decoding reply `reply` to it, empty to accept it. Each names its `session`.
 //! - **Pushes**, which carry no `id`: `event` (`session`, `record`), each event of the session as
 //!   `events.jsonl` would hold it; `missed` (`session`, `count`), events the engine's subscription
-//!   lost; and `events.end` (`session`), after which nothing more of the session is pushed. Every
-//!   push about a session precedes the answer that ends it.
+//!   lost; and `events.end` (`session`), after which nothing more of the session is pushed. Of
+//!   its instances: `oriented` and `child`, naming the program's number for the instance; each
+//!   step of a request, as the interpreter says them, naming its `ask` -- `agent.request`,
+//!   `agent.received`, `agent.reply` (each reply numbered), and `agent.ended`, with why it ended
+//!   (`error`), the reply accepted (`reply`), or a rejected one's `last` reply and its problems;
+//!   and `agent.closed` (`terminated`), the session's close, and again, `terminated`, once its
+//!   interpreter has exited. Every push about a session precedes the answer that ends it.
 
 mod connection;
 mod program;

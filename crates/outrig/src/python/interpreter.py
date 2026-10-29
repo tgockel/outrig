@@ -4068,7 +4068,7 @@ class Runtime:
         # A handle, or a skill's invocation, is waited on through its view, and comes back as
         # itself.
         handles = {}
-        for f in [f for f in fs if type(f) is Handle or type(f) is _skills.Invocation]:
+        for f in [f for f in fs if type(f) is _agents.Handle or type(f) is _skills.Invocation]:
             handles[f.future] = f
             fs.discard(f)
             fs.add(f.future)
@@ -4189,6 +4189,11 @@ _instances = {}  # each agent class instance (`outrig.Agent`) not yet released, 
 _requests_max = 256
 _ENDED = ("accepted", "failed")
 _agents = None  # `outrig._agents`, once the package is loaded
+# The parent of each root child, as its requests' sender: the program on the host that owns the
+# session, which the host tells of each step of them. Its loop is closed, since nothing here waits.
+_OWNER = types.SimpleNamespace(agent="owner", loop=_Loop())
+_OWNER.loop.close()
+OWNER_TEXT_MAX = 64 << 10  # bytes of why a request ended that the program is told
 
 
 def _notify(message):
@@ -4477,6 +4482,10 @@ class _Work:
         # whether its handle was collected while it was held, to be said once it is sent.
         self.instance = None
         self.dropped = False
+        # A root child's request: the program on the host's number for it; the future of its
+        # verdict on the reply being checked; and how many replies were sent it, each numbered.
+        self.ask = self.verdict = None
+        self.replies = 0
 
     def __str__(self):
         if self.channel is None:
@@ -4489,10 +4498,10 @@ class _Work:
                 return self.final
             return _agents.Status(self.state, None, self.child.state)
 
-    def end(self, reason, *, value=None, error=None, **said):
-        """End the request: accepted with `value` when `reason` is `None`, failed with `error` for
-        `reason` otherwise. Whether this ended it: one that had ended is left as it was. Any
-        thread."""
+    def end(self, reason, *, value=None, error=None, reply=None, **said):
+        """End the request: accepted with `value` when `reason` is `None` -- for a root child's
+        request, the reply numbered `reply` -- failed with `error` for `reason` otherwise. Whether
+        this ended it: one that had ended is left as it was. Any thread."""
         with self.lock:
             if self.state in _ENDED:
                 return False
@@ -4511,12 +4520,20 @@ class _Work:
         self.child.settled(self)
         # A request held for a child that never came to exist was never told of.
         if self.child.id is not None:
+            if self.sender is _OWNER:
+                # What the program's handle ends with: why, or the reply the program accepted.
+                said.update(error=None if error is None else str(error)[:OWNER_TEXT_MAX],
+                            reply=reply)
             _notify({"t": "agent.ended", "agent": self.child.id, "request": self.id,
-                     "outcome": reason or "accepted", **said})
+                     "outcome": reason or "accepted", "ask": self.ask, **said})
         try:
             self.sender.loop.call_soon_threadsafe(self._settle)
         except RuntimeError:
             pass  # the sender's loop has closed with its kernel: nothing waits on this
+        if self.verdict is not None:
+            # A reply waiting on the program's verdict hears that it has ended instead.
+            with contextlib.suppress(RuntimeError):
+                self.verdict.get_loop().call_soon_threadsafe(_resolve, self.verdict, None)
         # Last, once the host has heard the request ended: letting go may collect the instance,
         # whose release is then said after it.
         self.instance = None
@@ -4532,27 +4549,6 @@ class _Work:
             # Read here: how it failed is the handle's to report, and a handle nobody awaits is not
             # a mistake in the code that dropped it.
             self.future.exception()
-
-    def view(self):
-        """A future of the sender's loop that settles as the request ends, and whose cancelling
-        cancels nothing else."""
-        view = self.sender.loop.create_future()
-
-        def settle(future):
-            if view.done():
-                return
-            error = future.exception()
-            if error is None:
-                view.set_result(future.result())
-            else:
-                view.set_exception(error)
-                view.exception()
-
-        if self.future.done():
-            settle(self.future)
-        else:
-            self.future.add_done_callback(settle)
-        return view
 
     def refused(self):
         """What an answer to this request, which has ended, raises; the host is told."""
@@ -4573,7 +4569,13 @@ class _Work:
             attempt = self.attempts + 1
         if ended:
             raise self.refused()
-        accepted, problems = _answered(self.declared, value)
+        reply = None
+        if self.sender is _OWNER:
+            accepted, problems, reply = await self._judged(value, attempt)
+            with self.lock:
+                attempt = self.attempts + 1  # another reply may have been counted meanwhile
+        else:
+            accepted, problems = _answered(self.declared, value)
         if not problems and self.validate is not None:
             # A validator that raises, whatever it raises, or returns what is not a list of str,
             # is a defect in the sender's code, which another attempt cannot fix: the request ends
@@ -4599,8 +4601,8 @@ class _Work:
                 problems += (_schema.Problem("$", f"... and {len(found) - len(kept)} more"),)
         said = None
         if _observing:
-            said = (_agents.preview(self.declared.encode(accepted)) if not problems
-                    else _loose_preview(value))
+            said = (_loose_preview(value) if problems else _agents.preview(
+                accepted if self.sender is _OWNER else self.declared.encode(accepted)))
         _notify({"t": "agent.answered", "agent": self.child.id, "request": self.id,
                  "attempt": attempt, "problems": [str(p) for p in problems], "value": said})
         with self.lock:
@@ -4616,7 +4618,11 @@ class _Work:
                         f"{self.attempts_max}: it has ended rejected, and takes no answer now:\n"
                         f"{listing}")
                 rejected = _agents.CompletionRejected(text, _copy_or_none(value), problems)
-                if not self.end("rejected", error=rejected):
+                # The program's handle carries the last reply's JSON form and what was wrong.
+                said = {} if self.sender is not _OWNER else {"last": {
+                    "value": json.dumps(accepted),
+                    "problems": [[p.path, p.message] for p in problems]}}
+                if not self.end("rejected", error=rejected, **said):
                     raise self.refused()
                 raise _agents.CompletionRejected(text, value, problems)
             raise _schema.DecodeError(
@@ -4624,8 +4630,40 @@ class _Work:
                 f"{self.attempts_max}); correct what is listed and answer again:\n{listing}",
                 problems,
             )
-        if not self.end(None, value=accepted):
+        if not self.end(None, value=accepted, reply=reply):
             raise self.refused()
+
+    async def _judged(self, value, attempt):
+        """`(json, problems, reply)` for `value`, a root child's answer: its JSON form, which the
+        program on the host decodes into the type it declared; what it found wrong there; and the
+        number it was sent under, which the end it makes names, since another reply may be
+        accepted meanwhile on another thread. One with no JSON form is found wrong here."""
+        encoded, found = self.declared._encoding(value)
+        problems = tuple(found.found)
+        if problems and not _holds_instances(value):
+            try:
+                encoded, problems = _agents.walk(value, "$")[0], ()
+            except TypeError as e:
+                problems = (_schema.Problem("$", str(e)),)
+        if problems:
+            return None, problems, None
+        # As text, so the engine, which sorts a JSON object's keys, keeps a dict's order.
+        message = {"t": "agent.reply", "agent": self.child.id, "request": self.id, "ask": self.ask,
+                   "attempt": attempt, "attempts": self.attempts_max, "value": json.dumps(encoded)}
+        _refuse_long(message, "reply", "reply with less")
+        with self.lock:
+            if self.verdict is not None and not self.verdict.done():
+                raise RuntimeError(f"an answer to {self} is being checked; await it first")
+            if self.state in _ENDED:
+                return encoded, (), None
+            self.verdict = verdict = asyncio.get_running_loop().create_future()
+            # Numbered, so a verdict on a reply whose wait was cancelled is never taken for one on
+            # the next.
+            self.replies = message["reply"] = self.replies + 1
+        _notify(message)
+        problems = await verdict
+        return (encoded, tuple(_schema.Problem(*problem) for problem in problems or ()),
+                message["reply"])
 
     async def fail(self, message):
         if type(message) is not str:
@@ -4642,89 +4680,6 @@ class _Work:
         received = not self.child.withdraw(self)
         return self.end("cancelled", error=_agents.RequestCancelled(f"{self} was cancelled"),
                         received=received)
-
-
-class Handle:
-    """One submission or request an agent made of a child: what `child.submit(...)` and
-    `child.channels[name].request(...)` return, at once, the work already sent.
-
-    `await handle` gives the accepted answer, an instance of the declared type, or raises how the
-    request ended -- an `outrig.AgentError` -- and awaiting again gives the same. Cancelling the
-    code awaiting it cancels that wait and never the request; `handle.cancel()` cancels the
-    request: one the child has not received never reaches it, and one it has ends so that its
-    answer raises `outrig.RequestCancelled`. `done()` and `result()` answer without waiting, as a
-    future's do, and `status` says what it is doing (see `help(outrig.Status)`). `future` is a
-    view `asyncio.wait` takes; `runtime.wait` and `asyncio.gather` take the handle itself. A
-    submission's `progress` is an endpoint of what the child reports while it works on it.
-    """
-
-    __slots__ = ("_work", "_future")
-
-    def __init__(self, work):
-        self._work = work
-        self._future = None
-
-    def __del__(self):
-        # An agent class's request whose handle goes while it is open goes on, and is evented:
-        # from the instance's loop, since this runs on whatever thread dropped the handle,
-        # perhaps inside a protocol write.
-        work = self._work
-        agent = work.instance
-        if agent is not None and work.state not in _ENDED:
-            with contextlib.suppress(RuntimeError):
-                agent._outrig.loop.call_soon_threadsafe(agent._outrig.dropped, work)
-
-    @property
-    def id(self):
-        """The request's id: what the child's delivery of it, and the session's events, name."""
-        return self._work.id
-
-    def __await__(self):
-        return self._work.view().__await__()
-
-    @property
-    def future(self):
-        """A future that settles as the request ends; cancelling it cancels nothing else."""
-        future = self._future
-        if future is None or future.cancelled():
-            future = self._future = self._work.view()
-        return future
-
-    def done(self):
-        """Whether the request has ended."""
-        return self._work.state in _ENDED
-
-    def result(self):
-        """The accepted answer, or the exception the request ended with, raised; raises
-        `asyncio.InvalidStateError` while it has not ended."""
-        work = self._work
-        with work.lock:
-            state, value, error = work.state, work.value, work.error
-        if state not in _ENDED:
-            raise asyncio.InvalidStateError(f"{work} has not ended")
-        if error is not None:
-            raise error
-        return value
-
-    def cancel(self):
-        """Cancel the request; whether this ended it. Not the child, which takes more work."""
-        return self._work.cancel()
-
-    @property
-    def status(self):
-        """What the request is doing, and its child: see `help(outrig.Status)`."""
-        return self._work.status()
-
-    @property
-    def progress(self):
-        """An endpoint of what the child reports on its `progress` channel while it works on this
-        submission: `await receive()` takes the next, as a `Delivery`. Only a submission has one."""
-        if self._work.progress is None:
-            raise AttributeError("a request on a channel has no progress; a submission's handle does")
-        return self._work.progress
-
-    def __repr__(self):
-        return f"<handle of {self._work}: {self._work.status()}>"
 
 
 class ChildChannel:
@@ -4774,7 +4729,7 @@ class ChildChannel:
                 child.queue.append(work)
         if not held and not _sent(work):
             work.end("released", error=_agents.AgentReleased(f"{child} was released"))
-        return Handle(work)
+        return _agents.Handle(work)
 
     def pending(self):
         """How many requests on this channel the child has not taken yet."""
@@ -4794,7 +4749,8 @@ def _sent(work):
     if type(endpoint) is not RequestEndpoint:
         return False
     _notify({"t": "agent.request", "agent": work.sender.agent, "request": work.id,
-             "child": child.id, "channel": work.channel, "attempts": work.attempts_max,
+             "ask": work.ask, "child": child.id, "channel": work.channel,
+             "attempts": work.attempts_max,
              "body": _agents.preview(child.channels[work.channel].request.encode(work.body))
              if _observing else None})
     return endpoint._put(work)
@@ -4856,7 +4812,7 @@ class Child:
         _refuse_closing()
         attempts = _attempts(attempts)
         kernel = _sending_kernel("a submission")
-        return Handle(_submit(child, kernel, inputs, result, attempts))
+        return _agents.Handle(_submit(child, kernel, inputs, result, attempts))
 
     def __repr__(self):
         return f"<{self._child}, a {self._child.kind} child, {self._child.state}>"
@@ -5049,7 +5005,7 @@ def _call(declaration, arguments):
         with _works_lock:
             _launching.pop(call.id, None)
         raise
-    return Handle(call)
+    return _agents.Handle(call)
 
 
 class _Instance:
@@ -5064,8 +5020,11 @@ class _Instance:
     however it began.
     """
 
-    def __init__(self, agent, inputs, model):
+    def __init__(self, agent, inputs, model, session):
         cls = type(agent)
+        if session is not None:
+            raise TypeError(f"{cls.__qualname__}(session=...) names a session a program on the "
+                            "host owns; an agent's instance runs in the agent's own")
         kernel = _sending_kernel(f"{cls.__qualname__}()")
         _, copies, classes, _ = _inputs(inputs, f"{cls.__qualname__}()")
         methods = {name: send.__outrig_channel__ for name, send in cls._outrig_channels.items()}
@@ -5338,7 +5297,7 @@ class RequestEndpoint(Endpoint):
         with work.lock:
             if work.state == "waiting":
                 work.state = "received"
-        _notify({"t": "agent.received", "agent": self._agent, "request": work.id})
+        _notify({"t": "agent.received", "agent": self._agent, "request": work.id, "ask": work.ask})
         return RequestDelivery(work.id, work.body, work.sender.agent,
                                datetime.datetime.now(datetime.timezone.utc), work)
 
@@ -5442,8 +5401,9 @@ class Kernel:
         self.stubs = {}
         self.bind_stubs()
 
-    def announce(self):
-        _send({"t": "ready", "agent": self.agent, "version": _VERSION})
+    def announce(self, instance=None):
+        """Say the kernel is ready: a root child's, with its instance's id."""
+        _send({"t": "ready", "agent": self.agent, "version": _VERSION, "instance": instance})
 
     def bind_stubs(self):
         """Bind each of the session's bindings under its name, as its stub, among the names bound
@@ -6243,6 +6203,10 @@ def _close(message):
         instance.settle(_agents.SessionClosing(
             f"the session closed before {instance.record} was ready: {text}"))
         instance.close()
+    for record in list(_children.values()):
+        if record.parent is _OWNER and not record.released:
+            _notify({"t": "agent.instance.released", "agent": _OWNER.agent, "how": "closing",
+                     "instance": record.instance, "child": record.id})
 
 
 def _unbind(message):
@@ -6263,7 +6227,8 @@ def _open(agent, main, child=None):
     is served on a thread of its own.
 
     `child`, for a child agent's kernel, names the spawn waiting for it -- whose parent's inputs
-    are bound in its namespace, and whose classes under their names -- and its `requests_max`.
+    are bound in its namespace, and whose classes under their names -- and its `requests_max`. A
+    root child's spawn waits on the host, and `child` brings its `root` instead (`_rooted`).
     """
     global _primary
     if not _valid_agent(agent):
@@ -6274,7 +6239,12 @@ def _open(agent, main, child=None):
         raise ValueError(f"agent {_primary.agent!r} already has the main thread")
     record = spec = None
     if child is not None:
-        spec = _spawning.get(child.get("spawn")) if isinstance(child, dict) else None
+        if isinstance(child, dict):
+            if child.get("root") and _closing is not None:
+                # Its instance would start after the close said what it released.
+                raise ValueError("the session is closing")
+            spec = _rooted(agent, child["root"]) if child.get("root") else _spawning.get(
+                child.get("spawn"))
         requests_max = child.get("requests_max") if isinstance(child, dict) else None
         if main or spec is None or type(requests_max) is not int or requests_max < 1:
             raise ValueError(f"no spawn is waiting for agent {agent!r} as {child!r} names it")
@@ -6305,7 +6275,20 @@ def _open(agent, main, child=None):
     if main:
         _primary = kernel
         _onto_main.put(kernel)
-    kernel.announce()
+    kernel.announce(getattr(record, "instance", None))
+
+
+def _rooted(agent, root):
+    """What root child `agent`'s kernel is made from: the classes, channels and inputs the program
+    on the host described in `root`, JSON text, made again here (`outrig._agents.rebuilt`), and its
+    record, whose parent is that program."""
+    root = json.loads(root)
+    classes, channels, inputs = _agents.rebuilt(root, _module_name(agent))
+    channels = {name: _Channel(rq, rp, _schema.declare(rq), _schema.declare(rp), doc)
+                for name, (rq, rp, doc) in channels.items()}
+    record = _Child(agent, root["name"], "request", _OWNER, channels, 1)
+    record.instance = next(_ids)  # among the ids every instance here takes, so none shares it
+    return {"inputs": inputs, "classes": classes, "record": record}
 
 
 def _exec(kernel, request_id, message):
@@ -6476,6 +6459,69 @@ def _oriented(kernel, instance_id, message):
                         else getattr(_agents, _HOST_ENDS[error["kind"]])(error["message"]))
 
 
+def _asked_work(ask):
+    """The request the program on the host numbered `ask`, while it is open."""
+    with _works_lock:
+        return next((work for work in _works.values() if work.ask == ask), None)
+
+
+def _ask(message):
+    """A request the program on the host made, numbered `ask`, of its root child `agent`, as
+    `ChildChannel.request` makes one: its body decoded into the child's own class. One that cannot
+    be made ends at once, and so does one a try for memory left part sent."""
+    agent, ask, name = message["agent"], message["ask"], message["channel"]
+    child = _children.get(agent)
+    work = _asked_work(ask)
+    if work is not None:
+        # Tried again for memory, the first try having stopped part way through sending it:
+        # ended rather than sent twice, or left unsent and open.
+        work.end("failed", error=_agents.AgentRequestFailed(
+            f"the interpreter ran out of memory as {work} was sent"))
+        return
+    try:
+        if child is None or child.parent is not _OWNER:
+            raise _agents.AgentReleased(f"the program has no child {agent!r}")
+        channel = child.channels[name]
+        body = channel.request.decode(json.loads(message["body"]))
+    except MemoryError:
+        raise
+    except Exception as e:
+        _notify({"t": "agent.ended", "agent": agent, "ask": ask, "outcome": "failed",
+                 "error": f"{type(e).__name__}: {e}"[:OWNER_TEXT_MAX]})
+        return
+    work = _Work(child, _OWNER, "request", name, body, channel.reply, 3)
+    work.ask = ask
+    with child.lock:
+        child.unsettled += 1
+    with _works_lock:
+        _works[work.id] = work
+    if _closing is not None:
+        work.end("closed",
+                 error=_agents.SessionClosing(f"the session closed before {work} was sent"))
+    elif not _sent(work):
+        work.end("released", error=_agents.AgentReleased(f"{child} was released"))
+
+
+def _withdraw(message):
+    """The program on the host cancelled its request `ask`, which ends it, unless it had."""
+    work = _asked_work(message["ask"])
+    if work is not None:
+        work.cancel()
+
+
+def _verdict(message):
+    """The program on the host's verdict on reply `reply` to its request `ask`: what decoding it
+    there found wrong, each a `[path, message]`, and none to accept it. Not taken for any other."""
+    work = _asked_work(message["ask"])
+    if work is None:
+        return
+    with work.lock:
+        verdict = work.verdict if work.replies == message["reply"] else None
+    if verdict is not None:
+        with contextlib.suppress(RuntimeError):
+            verdict.get_loop().call_soon_threadsafe(_resolve, verdict, message["problems"])
+
+
 def _limits(message):
     """Take the session's limits, which the host sends once, before anything runs."""
     global _requests_max
@@ -6620,6 +6666,7 @@ def _rpc_notice(agent, binding, number, reason):
 # What each message addressed to an agent does, with the id it carries. `inv` and `tasks` are
 # answered on the agent's loop and `file` by a thread of its own; the rest are handled here, on
 # the reader thread.
+_OWNER_ROUTES = {"ask": _ask, "withdraw": _withdraw, "verdict": _verdict}
 _ROUTES = {
     "exec": _exec,
     "msg": _msg,
@@ -6681,6 +6728,10 @@ def _route(line):
         return
     if kind == "skills":
         _skills._declare(message["skills"])
+        return
+    if kind in _OWNER_ROUTES:
+        # The program on the host's, about its requests: no kernel of its own to address.
+        _OWNER_ROUTES[kind](message)
         return
     if kind == "skill":
         # The answer to a request about a skill, for the thread still waiting for it.

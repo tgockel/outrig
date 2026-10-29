@@ -176,7 +176,7 @@ impl Session {
         )
         .await?;
         self.children
-            .root(PRIMARY, &resolved.model, agent.slot().clone());
+            .root(PRIMARY, 1, &resolved.model, agent.slot().clone());
         self.agent = Some(agent);
         Ok(())
     }
@@ -309,6 +309,13 @@ impl Session {
     /// runs, as [`Session::interrupter`] interrupts one.
     pub fn closer(&self) -> Closer {
         Closer(Arc::clone(&self.lifecycle))
+    }
+
+    /// The session's child agents, for a program on the host that owns it,
+    /// whose agent class instances are root children: held through its
+    /// shutdown, which a request may meet.
+    pub(crate) fn children(&self) -> Children {
+        self.children.clone()
     }
 
     /// Drive one round, if anything was sent on the user channel since the

@@ -15,6 +15,10 @@
 //! and pushes its events, from `starting` on; a start that did not finish pushes only their end.
 //! A shutdown the program asked for still answers `admission.close` while it runs, and holds the
 //! program's grace (`program.rs`) while it does, as does the cleanup of an entry it gave up on.
+//!
+//! The program is also the parent of its agent class instances' children, root children of the
+//! session: its lines about them go to the session's children, in order, through its shutdown,
+//! and what they tell it is pushed to it in order, all of it before the shutdown's answer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +32,7 @@ use tokio::task::JoinHandle;
 
 use super::connection::Out;
 use super::{LeftOpen, SessionEnd};
+use crate::agent::children::Children;
 use crate::config::{Config, EventsMode, MountAccess, MountConfig, validate_session_paths};
 use crate::events::Record;
 use crate::harness::event::{Received, Subscription};
@@ -79,8 +84,16 @@ pub(crate) struct MountRequest {
 
 /// A program's request about a session it asked for.
 pub(crate) enum Command {
-    Close { reply: Value },
-    Shutdown { reply: Value, grace: Duration },
+    Close {
+        reply: Value,
+    },
+    Shutdown {
+        reply: Value,
+        grace: Duration,
+    },
+    /// A line about its agent class instances, the session's root children: see
+    /// [`Children::owner_line`].
+    Agent(Value),
 }
 
 /// Start the session `request` asks for and serve its commands until it has ended. What the
@@ -112,6 +125,7 @@ pub(crate) async fn run(
             return None;
         }
     };
+    let requests_max = config.limits(None).requests_max;
 
     let mut builder = SessionBuilder::new(config.clone(), None, None)
         .no_primary()
@@ -139,6 +153,7 @@ pub(crate) async fn run(
             started = &mut start => break started.map_err(|why| (why, None)),
             command = commands.recv() => match command {
                 Some(Command::Close { reply }) => closes.push(reply),
+                Some(Command::Agent(line)) => refuse_agent(line, &out).await,
                 Some(Command::Shutdown { reply, .. }) => {
                     break Err((INTERRUPTED.to_string(), Some(reply)));
                 }
@@ -168,6 +183,7 @@ pub(crate) async fn run(
                     stopped = &mut settling => break stopped,
                     Some(command) = commands.recv() => match command {
                         Command::Close { reply } => closes.push(reply),
+                        Command::Agent(line) => refuse_agent(line, &out).await,
                         Command::Shutdown { reply, .. } => {
                             held.get_or_insert_with(|| Asked::new(&context.shutdowns));
                             asked.push(reply);
@@ -200,11 +216,14 @@ pub(crate) async fn run(
         }
     };
 
-    out.send(json!({"t": "session.start", "id": reply, "session": {"id": id}}))
+    let session_line = json!({"id": id, "requests_max": requests_max});
+    out.send(json!({"t": "session.start", "id": reply, "session": session_line}))
         .await;
     // Its events, from `starting` on, once the program knows the session.
     let source = format!("/outrig/session/{id}");
     let pump = tokio::spawn(pump(handle, events, out.clone(), source));
+    let children = session.children();
+    let told = tokio::spawn(forward(handle, children.attach_owner(), out.clone()));
     #[cfg(test)]
     context.testing.started(handle, &session);
     let closer = session.closer();
@@ -215,10 +234,12 @@ pub(crate) async fn run(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Close { reply }) => close(&closer, reply, &out).await,
+                Some(Command::Agent(line)) => children.owner_line(line),
                 Some(Command::Shutdown { reply, grace }) => {
                     let shutdowns = &context.shutdowns;
+                    let pumps = (pump, children, told);
                     let ended =
-                        shut_down(session, grace, reply, commands, &out, pump, shutdowns).await;
+                        shut_down(session, grace, reply, commands, &out, pumps, shutdowns).await;
                     return ended.map(|report| LeftOpen { id, end: SessionEnd::ShutDown(report) });
                 }
                 None => break,
@@ -229,6 +250,7 @@ pub(crate) async fn run(
     // The program is gone, and left the session open.
     session.close_admission();
     let report = session.shutdown(DEFAULT_DRAIN).await;
+    children.detach_owner().await;
     let _ = pump.await;
     Some(LeftOpen {
         id,
@@ -255,14 +277,15 @@ impl Drop for Asked<'_> {
 /// Shut `session` down for the program, with `grace` as the drain deadline, answering an
 /// `admission.close` that arrives meanwhile, and then every shutdown asked for with the report;
 /// the program's grace is held while the shutdown runs, counted in `shutdowns`. The report, when
-/// the program was gone before it could be answered.
+/// the program was gone before it could be answered. `pumps` push its events, and what its
+/// `children` tell the program, which goes on hearing them until the shutdown is done.
 async fn shut_down(
     session: Session,
     grace: Duration,
     reply: Value,
     mut commands: mpsc::UnboundedReceiver<Command>,
     out: &Out,
-    pump: JoinHandle<()>,
+    (pump, children, told): (JoinHandle<()>, Children, JoinHandle<()>),
     shutdowns: &AtomicUsize,
 ) -> Option<ShutdownReport> {
     let mut replies = vec![reply];
@@ -276,12 +299,16 @@ async fn shut_down(
                 report = &mut stopping => break report,
                 Some(command) = commands.recv() => match command {
                     Command::Close { reply } => close(&closer, reply, out).await,
+                    Command::Agent(line) => children.owner_line(line),
                     Command::Shutdown { reply, .. } => replies.push(reply),
                 },
             }
         }
     };
-    // Every event, and the end of them, before the answer.
+    // Everything the children told the program, and every event and the end of them, before the
+    // answer.
+    children.detach_owner().await;
+    let _ = told.await;
     let _ = pump.await;
     let answer = report_json(&report);
     let mut delivered = !out.gone().is_cancelled();
@@ -296,6 +323,7 @@ async fn shut_down(
             Command::Close { reply } => {
                 out.send(json!({"t": "admission.close", "id": reply})).await;
             }
+            Command::Agent(line) => refuse_agent(line, out).await,
             Command::Shutdown { reply, .. } => {
                 let line = json!({"t": "session.shutdown", "id": reply, "report": answer});
                 out.send(line).await;
@@ -322,8 +350,32 @@ async fn refuse_all(replies: Vec<Value>, out: &Out, why: &str) {
 async fn refuse_the_rest(mut commands: mpsc::UnboundedReceiver<Command>, out: &Out) {
     commands.close();
     while let Some(command) = commands.recv().await {
-        let (Command::Close { reply } | Command::Shutdown { reply, .. }) = command;
-        out.refuse(reply, "the session is not running").await;
+        match command {
+            Command::Close { reply } | Command::Shutdown { reply, .. } => {
+                out.refuse(reply, "the session is not running").await;
+            }
+            Command::Agent(line) => refuse_agent(line, out).await,
+        }
+    }
+}
+
+/// Answer a line about the program's agent class instances that the session is not running: a
+/// request, which carries an id. A notice is not answered.
+async fn refuse_agent(line: Value, out: &Out) {
+    if !line["id"].is_null() {
+        out.refuse(line["id"].clone(), "the session is not running")
+            .await;
+    }
+}
+
+/// Push to the program, in order, what the session's children tell it of its agent class
+/// instances and their requests, until they tell it nothing more. Stops once the program is gone.
+async fn forward(handle: u64, mut told: mpsc::UnboundedReceiver<Value>, out: Out) {
+    while let Some(mut line) = told.recv().await {
+        line["session"] = json!(handle);
+        if !out.send(line).await {
+            return;
+        }
     }
 }
 

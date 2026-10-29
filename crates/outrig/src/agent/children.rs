@@ -18,6 +18,16 @@
 //! flight: it ends the child's kernel, which returns the call the round waits
 //! on, and the round stops before its next model call; only one still in a
 //! model call after [`RELEASE_WAIT`] is dropped.
+//!
+//! A session a program on the host owns has one more parent: the program,
+//! [`OWNER`], whose children -- its agent class instances' -- are root children
+//! at depth 1. It asks what a kernel's code asks, over its connection
+//! ([`Children::owner_line`]), and hears what a kernel would be told, and what
+//! becomes of each request it made, through what [`Children::attach_owner`]
+//! returns. Its requests' bodies and replies cross as JSON, and the program
+//! decodes each reply itself: its verdict goes back to the child's kernel,
+//! which ends the request as its lock orders the verdict, a cancel and the
+//! close.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -25,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use super::channel::Announcer;
@@ -45,7 +55,7 @@ use crate::harness::event::{
 };
 use crate::harness::lifecycle::Lifecycle;
 use crate::harness::{ClosedBy, RequestOutcome};
-use crate::python::host::{Channels, ChildLines, Counts, Interpreter};
+use crate::python::host::{Channels, ChildLines, Counts, Interpreter, OWNER};
 
 /// How long a released child's kernel has to stop before it is taken for
 /// wedged: its code never yields, and its thread runs on.
@@ -92,6 +102,15 @@ pub(crate) struct Inner {
     lifecycle: Arc<Lifecycle>,
     settings: Settings,
     state: Mutex<State>,
+    /// Where what the program on the host that owns the session hears goes,
+    /// while it listens.
+    owner: Mutex<Option<mpsc::UnboundedSender<Value>>>,
+    /// The program's launches and releases still running, each of which
+    /// answers it.
+    owner_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Held from reading a child's life to telling its parent, so the last
+    /// told is the latest; never with the state's lock.
+    telling: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -110,6 +129,18 @@ struct State {
     /// Who waits for each answer to an `assign`, by its id.
     assigning: HashMap<u64, oneshot::Sender<Option<u64>>>,
     assigns: u64,
+    /// Each root child, by id: whether its instance's start, and its release,
+    /// have been recorded -- each once, whichever of the program and the
+    /// close says the release first.
+    owned: HashMap<String, Owned>,
+}
+
+#[derive(Default)]
+struct Owned {
+    /// The instance's id, once its start was recorded.
+    instance: Option<u64>,
+    started: bool,
+    released: bool,
 }
 
 struct Node {
@@ -142,6 +173,9 @@ struct ChildNode {
     delivered: BTreeMap<String, u64>,
     /// The round running now, if one is.
     round: Option<u32>,
+    /// The agent class instance it serves, if it serves one: for a root
+    /// child, the program's number for it, which what it is told names.
+    instance: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +283,9 @@ impl Children {
             lifecycle: Arc::clone(&lifecycle),
             settings,
             state: Mutex::default(),
+            owner: Mutex::default(),
+            owner_tasks: Mutex::default(),
+            telling: Mutex::default(),
         });
         let weak = Arc::downgrade(&inner);
         let lines: ChildLines = Arc::new(move |agent: &str, line: Value| {
@@ -271,14 +308,14 @@ impl Children {
         Self(inner)
     }
 
-    /// The primary agent is the tree's root, at depth 1, running on `model`
-    /// as named and spending through `slot`.
-    pub(crate) fn root(&self, agent: &str, model: &str, slot: CallSlot) {
+    /// `agent` is a root of the tree, at `depth`, running on `model` as named
+    /// and spending through `slot`: the primary agent, at 1.
+    pub(crate) fn root(&self, agent: &str, depth: u32, model: &str, slot: CallSlot) {
         lock(&self.0.state).agents.insert(
             agent.to_string(),
             Node {
                 parent: None,
-                depth: 1,
+                depth,
                 model: model.to_string(),
                 slot,
                 children: Vec::new(),
@@ -286,6 +323,61 @@ impl Children {
                 invocations: Vec::new(),
             },
         );
+    }
+
+    /// The program on the host that owns the session is a root of the tree,
+    /// at depth 0, its children on `default-model` unless a launch names
+    /// another: what it is told, and what becomes of each request it makes,
+    /// comes out of what this returns, in order, until
+    /// [`Children::detach_owner`].
+    pub(crate) fn attach_owner(&self) -> mpsc::UnboundedReceiver<Value> {
+        let (lines, told) = mpsc::unbounded_channel();
+        *lock(&self.0.owner) = Some(lines);
+        let model = self.0.settings.config.default_model.clone();
+        self.root(OWNER, 0, &model.unwrap_or_default(), CallSlot::default());
+        // The interpreter's exit ends what the program still waits on, however admission closed:
+        // after an earlier close, nothing else would.
+        let (inner, gone) = (Arc::clone(&self.0), self.0.interpreter.gone());
+        tokio::spawn(async move {
+            gone.await;
+            inner.to_owner(json!({"t": "agent.closed", "terminated": true}));
+        });
+        told
+    }
+
+    /// The program has seen the last of the session, once every launch and
+    /// release it asked for has answered it: it is told nothing more.
+    pub(crate) async fn detach_owner(&self) {
+        let tasks = std::mem::take(&mut *lock(&self.0.owner_tasks));
+        for task in tasks {
+            let _ = task.await;
+        }
+        lock(&self.0.owner).take();
+    }
+
+    /// A line from the program on the host that owns the session: what it asks
+    /// as a kernel's code would -- a spawn, a release, what became of an
+    /// instance -- or a request it makes of a root child, numbered `ask`, a
+    /// cancel of one, or its verdict on a reply, which go on to the
+    /// interpreter. A request made once admission has closed ends at once.
+    pub(crate) fn owner_line(&self, line: Value) {
+        let inner = &self.0;
+        match line["t"].as_str().unwrap_or_default() {
+            "ask" if inner.closed() => inner.to_owner(json!({
+                "t": "agent.ended", "ask": line["ask"], "outcome": "closed",
+                "error": "the session is closing, so the request was not sent",
+            })),
+            "ask" | "withdraw" | "verdict" => inner.interpreter.tell(line),
+            // Collected or released once admission has closed, the instance is the close's to
+            // release: nothing further, as for a kernel's.
+            "agent.release" if inner.closed() => inner.to_owner(json!({
+                "t": "released", "agent": OWNER, "id": line["id"], "error": null,
+            })),
+            "agent.spawn" | "agent.release" | "agent.instance.handle.collected" => {
+                inner.line(OWNER, line);
+            }
+            kind => tracing::warn!("ignored a {kind} line from the program"),
+        }
     }
 
     /// Each request open when admission closed, and how it ended: what the
@@ -416,26 +508,54 @@ impl Inner {
         self.interpreter.events().for_agent(agent)
     }
 
-    /// One line the interpreter sent about children, from `agent`'s kernel.
+    /// Tell the program on the host that owns the session `line`, while it
+    /// listens.
+    fn to_owner(&self, line: Value) {
+        if let Some(owner) = &*lock(&self.owner) {
+            let _ = owner.send(line);
+        }
+    }
+
+    /// Hand `line` to `agent`'s code: a kernel's, or the program on the
+    /// host's.
+    fn answer(&self, agent: &str, line: Value) {
+        match agent {
+            OWNER => self.to_owner(line),
+            _ => self.interpreter.tell(line),
+        }
+    }
+
+    /// One line the interpreter sent about children, from `agent`'s kernel;
+    /// or one the program on the host sent, from [`OWNER`].
     fn line(self: &Arc<Self>, agent: &str, line: Value) {
+        // A step of a request the program made of a root child, which it hears.
+        if !line["ask"].is_null() {
+            self.to_owner(line.clone());
+        }
         let kind = line["t"].as_str().unwrap_or_default().to_string();
         match kind.as_str() {
-            "agent.spawn" => {
-                let inner = Arc::clone(self);
-                let agent = agent.to_string();
-                tokio::spawn(async move { inner.spawn(agent, line).await });
-            }
-            "agent.release" => {
-                let inner = Arc::clone(self);
-                let agent = agent.to_string();
-                tokio::spawn(async move { inner.release(agent, line).await });
+            "agent.spawn" | "agent.release" => {
+                let (inner, parent) = (Arc::clone(self), agent.to_string());
+                let spawning = kind == "agent.spawn";
+                let task = tokio::spawn(async move {
+                    match spawning {
+                        true => inner.spawn(parent, line).await,
+                        false => inner.release(parent, line).await,
+                    }
+                });
+                // Each answers the program, which hears them all before it stops listening.
+                if agent == OWNER {
+                    let mut tasks = lock(&self.owner_tasks);
+                    tasks.retain(|task| !task.is_finished());
+                    tasks.push(task);
+                }
             }
             "agent.request" => self.requested(agent, &line),
             "agent.call" => self.called(agent, &line),
             "agent.call.ended" => self.call_ended(&line),
             "agent.instance.collected"
             | "agent.instance.released"
-            | "agent.instance.handle.collected" => self.instance(&kind, &line),
+            | "agent.instance.handle.collected" => self.instance(agent, &kind, &line),
             "agent.invocation" => self.invoked(agent, &line),
             "agent.invocation.ended" => self.invocation_ended(agent, &line),
             "agent.received" => self.received(&line),
@@ -451,6 +571,8 @@ impl Inner {
             }
             "agent.progress" => self.progress(agent, &line),
             "agent.gone" => self.gone(agent),
+            // A reply to a request the program made, which the program judges.
+            "agent.reply" => {}
             _ => tracing::warn!("ignored a {kind} line from agent {agent:?}"),
         }
     }
@@ -461,8 +583,8 @@ impl Inner {
     async fn spawn(self: Arc<Self>, parent: String, line: Value) {
         let ask = line["id"].clone();
         let answer = match self.launch(&parent, &line).await {
-            Ok(child) => json!({
-                "t": "spawned", "agent": parent, "id": ask, "child": child,
+            Ok((child, instance)) => json!({
+                "t": "spawned", "agent": parent, "id": ask, "child": child, "instance": instance,
                 "requests_max": self.settings.limits.requests_max,
             }),
             Err(refused) => json!({
@@ -470,14 +592,19 @@ impl Inner {
                 "error": {"kind": refused.kind, "message": refused.message},
             }),
         };
-        self.interpreter.tell(answer);
+        self.answer(&parent, answer);
     }
 
-    /// Launch the child `line` asks for under `parent`, and return its id. The
+    /// Launch the child `line` asks for under `parent`, and return its id, and
+    /// a root child's instance id, which its kernel gave it. The
     /// session's admission, the depth and `children-max` decide before
     /// anything is made, and the place it takes is its own from then on;
     /// anything that fails after gives it back, and leaves no child.
-    async fn launch(self: &Arc<Self>, parent: &str, line: &Value) -> Result<String, Refused> {
+    async fn launch(
+        self: &Arc<Self>,
+        parent: &str,
+        line: &Value,
+    ) -> Result<(String, Option<u64>), Refused> {
         let limits = self.settings.limits;
         let kind = match line["kind"].as_str() {
             Some("request") => ChildKind::Request,
@@ -493,9 +620,12 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
+        // Read before the state's lock: reading it takes the host's table lock, which the host
+        // holds as it hands this registry a line, which takes the state's.
+        let closing = self.lifecycle.closed();
         let (id, model, depth, lineage) = {
             let mut state = self.state();
-            if let Some(by) = state.closed.clone().or_else(|| self.lifecycle.closed()) {
+            if let Some(by) = state.closed.clone().or(closing) {
                 return Err(Refused::new(
                     "closed",
                     format!("the session is closing -- {by} -- so no child is launched"),
@@ -565,6 +695,7 @@ impl Inner {
                         wake: Arc::new(Notify::new()),
                         delivered: BTreeMap::new(),
                         round: None,
+                        instance: line["instance"]["id"].as_u64(),
                     }),
                     invocations,
                 },
@@ -578,7 +709,7 @@ impl Inner {
             .make(&id, &name, kind, &model, depth, lineage, parent, line)
             .await
         {
-            Ok(()) => Ok(id),
+            Ok(instance) => Ok((id, instance)),
             Err(refused) => {
                 let mut state = self.state();
                 state.agents.remove(&id);
@@ -603,18 +734,25 @@ impl Inner {
         lineage: (CallSlot, Option<u32>),
         parent: &str,
         line: &Value,
-    ) -> Result<(), Refused> {
+    ) -> Result<Option<u64>, Refused> {
         let settings = &self.settings;
+        // A root child with no model named, in a configuration with no
+        // `default-model`, has none, which resolving says.
         let mut resolved = resolve::resolve_agent(
             &settings.config,
             settings.agent.as_deref(),
-            Some(model),
+            Some(model).filter(|model| !model.is_empty()),
             &*settings.secrets,
         )
         .map_err(|e| match e {
             AgentError::Resolve(LlmResolveError::UnknownModel { .. }) => {
                 Refused::new("model", e.to_string())
             }
+            // A root child's, whose program named none.
+            AgentError::Resolve(LlmResolveError::MissingModel) => Refused::new(
+                "model",
+                "no model was named with model=, and the configuration sets no default-model",
+            ),
             e => Refused::new("other", e.to_string()),
         })?;
         settings.windows.fill(&mut resolved.candidates).await;
@@ -636,17 +774,25 @@ impl Inner {
             })
             .collect();
         let handle = self.interpreter.for_agent(id);
-        handle
+        let minted = handle
             .open_child(
                 id,
                 json!({
                     "kind": if kind == ChildKind::Request { "request" } else { "work" },
                     "spawn": line["id"],
                     "requests_max": settings.limits.requests_max,
+                    // A root child's, which the program described.
+                    "root": line["root"],
                 }),
             )
             .await
-            .map_err(|e| Refused::new("other", e.to_string()))?;
+            // A root child's kernel opens only while the session does.
+            .map_err(|e| {
+                Refused::new(
+                    if self.closed() { "closed" } else { "other" },
+                    e.to_string(),
+                )
+            })?;
         let events = handle.events().clone();
         let briefed: Vec<ChannelBrief> = channels
             .iter()
@@ -665,8 +811,9 @@ impl Inner {
             inputs: inputs.clone(),
             channels: briefed.clone(),
         });
-        // An agent class instance's child, which has a round of its own as it launches.
-        let instance = line["instance"]["id"].as_u64();
+        // An agent class instance's child, which has a round of its own as it launches: a root
+        // child's instance has the id its kernel gave it, which no other has.
+        let instance = minted.or(line["instance"]["id"].as_u64());
         let brief = match kind {
             ChildKind::Request if instance.is_some() => ChildBrief::Instance(&channels),
             ChildKind::Request => ChildBrief::Request(&channels),
@@ -708,8 +855,9 @@ impl Inner {
                 return Err(Refused::new("other", e.to_string()));
             }
         };
-        let started = {
+        let refused = {
             let mut state = self.state();
+            let state = &mut *state;
             let Some(node) = state.agents.get_mut(id) else {
                 return Err(Refused::new("other", "the child was ended as it launched"));
             };
@@ -717,10 +865,25 @@ impl Inner {
             let Some(child) = node.child.as_mut() else {
                 return Err(Refused::new("other", "the child was ended as it launched"));
             };
+            // A root child's instance the close has said is released never starts.
+            let owned = (parent == OWNER).then(|| state.owned.entry(id.to_string()).or_default());
             // Its parent may have been released while this launched it,
             // leaving it to this to end.
-            let started = child.life != Life::Released;
-            if started {
+            if child.life == Life::Released {
+                Some(Refused::new(
+                    "released",
+                    "the agent launching it was released",
+                ))
+            } else if owned.as_ref().is_some_and(|owned| owned.released) {
+                Some(Refused::new(
+                    "closed",
+                    "the session closed as the child launched",
+                ))
+            } else {
+                if let Some(owned) = owned {
+                    owned.started = true;
+                    owned.instance = instance;
+                }
                 if let Some(instance) = instance {
                     // Once nothing can refuse the launch, and before the runner can say the
                     // child is ready.
@@ -746,17 +909,14 @@ impl Inner {
                 ));
                 child.abort = Some(runner.abort_handle());
                 child.runner = Some(runner);
+                None
             }
-            started
         };
-        if !started {
+        if let Some(refused) = refused {
             self.interpreter.end(id, WEDGE_WAIT).await;
-            return Err(Refused::new(
-                "released",
-                "the agent launching it was released",
-            ));
+            return Err(refused);
         }
-        Ok(())
+        Ok(minted)
     }
 
     // -------------------------------------------------------------- requests
@@ -854,11 +1014,20 @@ impl Inner {
     /// one of its handles was, or it released its child -- which settled what
     /// the release or the close ended on it, and spent what every model
     /// request the child made used. Recorded under the child.
-    fn instance(&self, kind: &str, line: &Value) {
+    fn instance(&self, agent: &str, kind: &str, line: &Value) {
         let Some(id) = line["instance"].as_u64() else {
             return;
         };
         let (instance, child) = (AgentInstanceId::new(id), text(&line["child"]));
+        // A root child's release, which the program and the close may each say: recorded once,
+        // and not for an instance that never started, which the close kept from starting.
+        if agent == OWNER && kind == "agent.instance.released" {
+            let mut state = self.state();
+            let owned = state.owned.entry(child.clone()).or_default();
+            if std::mem::replace(&mut owned.released, true) || !owned.started {
+                return;
+            }
+        }
         let payload = match kind {
             "agent.instance.collected" => Payload::AgentInstanceCollected { instance },
             "agent.instance.handle.collected" => Payload::AgentInstanceHandleCollected {
@@ -1269,22 +1438,33 @@ impl Inner {
     /// Tell `child`'s parent what it is doing now, so its handles' status
     /// says so without asking.
     fn tell_life(&self, child: &str) {
-        let state = self.state();
-        let Some(node) = state.agents.get(child) else {
-            return;
+        let _telling = lock(&self.telling);
+        let line = {
+            let state = self.state();
+            let Some(node) = state.agents.get(child) else {
+                return;
+            };
+            let (Some(parent), Some(life)) = (&node.parent, node.child.as_ref().map(|c| c.life))
+            else {
+                return;
+            };
+            let parent_held = state
+                .agents
+                .get(parent)
+                .is_some_and(|node| node.child.as_ref().is_none_or(|c| c.resident));
+            if parent == OWNER {
+                let instance = node.child.as_ref().and_then(|c| c.instance);
+                self.to_owner(json!({"t": "child", "instance": instance, "state": life.word()}));
+                return;
+            }
+            if !parent_held {
+                return;
+            }
+            json!({"t": "child", "agent": parent, "id": 0, "child": child, "state": life.word()})
         };
-        let (Some(parent), Some(life)) = (&node.parent, node.child.as_ref().map(|c| c.life)) else {
-            return;
-        };
-        let parent_held = state
-            .agents
-            .get(parent)
-            .is_some_and(|node| node.child.as_ref().is_none_or(|c| c.resident));
-        if parent_held {
-            self.interpreter.tell(json!({
-                "t": "child", "agent": parent, "id": 0, "child": child, "state": life.word(),
-            }));
-        }
+        // Not under the state's lock: the host hands this registry lines with its table's lock
+        // held, which telling takes.
+        self.interpreter.tell(line);
     }
 
     /// End request `id`, open on `child`, `outcome` -- `rejected`, `budget`
@@ -1310,20 +1490,32 @@ impl Inner {
     /// has ended; or, with `error`, it cannot be had -- `budget` or `failed`,
     /// and why. The instance's `ready()` hears so from its parent's kernel.
     pub(crate) fn oriented(&self, child: &str, instance: u64, error: Option<(&str, &str)>) {
-        let parent = self
-            .state()
-            .agents
-            .get(child)
-            .and_then(|node| node.parent.clone());
+        let state = self.state();
+        let node = state.agents.get(child);
+        let parent = node.and_then(|node| node.parent.clone());
+        // A root child's instance at the session's close never becomes ready: under the lock
+        // the close is told under, so the program hears one of the two.
+        if parent.as_deref() == Some(OWNER) && state.closed.is_some() {
+            return;
+        }
         self.events_of(child).emit(Payload::AgentInstanceReady {
             instance: AgentInstanceId::new(instance),
             error: error.map(|(_, why)| why.to_string()),
         });
-        if let Some(parent) = parent {
-            self.interpreter.tell(json!({
-                "t": "oriented", "agent": parent, "id": instance,
-                "error": error.map(|(kind, message)| json!({"kind": kind, "message": message})),
-            }));
+        let error = error.map(|(kind, message)| json!({"kind": kind, "message": message}));
+        match parent.as_deref() {
+            Some(OWNER) => {
+                // Named by the program's number for the instance.
+                let key = node.and_then(|node| node.child.as_ref()?.instance);
+                self.to_owner(json!({"t": "oriented", "instance": key, "error": error}));
+            }
+            Some(parent) => {
+                let line =
+                    json!({"t": "oriented", "agent": parent, "id": instance, "error": error});
+                drop(state);
+                self.interpreter.tell(line);
+            }
+            None => {}
         }
     }
 
@@ -1348,10 +1540,34 @@ impl Inner {
             .flatten()
             .map(text)
             .collect();
+        // The program's instances' releases are recorded here, as they are made: a collection
+        // first, and once released, `how`.
+        let how = (releaser == OWNER).then(|| text(&line["how"]));
+        if how.as_deref() == Some("collected") {
+            self.owned_said(&ids, "agent.instance.collected", "collected");
+        }
         let error = self.release_all(&releaser, &ids).await.err();
-        self.interpreter.tell(json!({
-            "t": "released", "agent": releaser, "id": ask, "error": error,
-        }));
+        if let Some(how) = how.filter(|_| error.is_none()) {
+            self.owned_said(&ids, "agent.instance.released", &how);
+        }
+        self.answer(
+            &releaser,
+            json!({"t": "released", "agent": releaser, "id": ask, "error": error}),
+        );
+    }
+
+    /// Record `kind` -- a collection, or a release `how` -- of each of root children `ids`'
+    /// instances, as [`Inner::instance`] records what a kernel says of one.
+    fn owned_said(&self, ids: &[String], kind: &str, how: &str) {
+        for child in ids {
+            let instance = self
+                .state()
+                .owned
+                .get(child)
+                .and_then(|owned| owned.instance);
+            let line = json!({"instance": instance, "child": child, "how": how});
+            self.instance(OWNER, kind, &line);
+        }
     }
 
     async fn release_all(self: &Arc<Self>, releaser: &str, ids: &[String]) -> Result<(), String> {
@@ -1486,7 +1702,7 @@ impl Inner {
     /// Admission has closed: no child makes another model call, and each
     /// request open now is what the report accounts for. The interpreter ends
     /// every one of them with the closing error, as it hears of the close;
-    /// one that died ends none.
+    /// one that died ends none, so the program on the host ends its own.
     fn close(&self, by: &ClosedBy) {
         let runners = {
             let mut state = self.state();
@@ -1494,6 +1710,8 @@ impl Inner {
                 return;
             }
             state.closed = Some(by.clone());
+            let terminated = matches!(by, ClosedBy::InterpreterExited { .. });
+            self.to_owner(json!({"t": "agent.closed", "terminated": terminated}));
             state.at_close = state
                 .requests
                 .iter()
@@ -1583,6 +1801,7 @@ mod tests {
                     wake: Arc::new(Notify::new()),
                     delivered: BTreeMap::new(),
                     round: None,
+                    instance: None,
                 }),
                 invocations: Vec::new(),
             },

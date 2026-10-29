@@ -26,13 +26,13 @@ use crate::python::host::next_line;
 use crate::python::supervisor::quoted;
 
 /// The version of the owner protocol this engine speaks.
-pub(crate) const PROTOCOL: u64 = 1;
+pub(crate) const PROTOCOL: u64 = 2;
 /// How long a program has to greet once it is started: its interpreter's start and `outrig`'s
 /// import, which take well under a second.
 const GREETING: Duration = Duration::from_secs(30);
 /// The longest line the engine reads from the program; a longer one is discarded with a
-/// warning. Requests are small.
-const LINE_MAX: usize = 64 << 10;
+/// warning. A request's body, or an agent class instance's inputs, are in one.
+const LINE_MAX: usize = 1 << 20;
 /// The longest drain a program may ask a session's shutdown for: an hour, so a mistyped grace
 /// cannot hold a session open for days. The engine's own steps after the drain are not counted.
 const DRAIN_MAX: Duration = Duration::from_secs(3600);
@@ -219,6 +219,17 @@ pub(crate) async fn serve(
                 };
                 let routed = command.and_then(|command| route(&sessions, &request, command));
                 if let Err(why) = routed {
+                    out.refuse(id, why).await;
+                }
+            }
+            Some(kind)
+                if kind.starts_with("agent.") || matches!(kind, "ask" | "withdraw" | "verdict") =>
+            {
+                let command = Command::Agent(Value::Object(request.clone()));
+                // A notice, which carries no id, is not answered.
+                if let Err(why) = route(&sessions, &request, command)
+                    && !id.is_null()
+                {
                     out.refuse(id, why).await;
                 }
             }

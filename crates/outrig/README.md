@@ -15,10 +15,11 @@ library crate. It does two things:
   interpreter and stop with the session, and one a repository's config declares only once its
   operator approves it. `outrig run-new` is built on it and nothing else of the loop. A Python
   program on the host, run by [`harness::HostProgram`], owns sessions with no agent of their own
-  through `outrig.Session`, and whatever sessions it leaves open the engine stops and reports. A
-  session serves skills -- a `SKILL.md` of instructions and, optionally, Python -- from the
-  [`harness::SkillSource`]s it is given, each skill's files fetched from the host as the agent's
-  code imports or reads them, with nothing mounted for them; a user's `/name`, sent with
+  through `outrig.Session`, drives the agent classes it constructs in them, whose replies it
+  decodes into its own classes, and whatever sessions it leaves open the engine stops and
+  reports. A session serves skills -- a `SKILL.md` of instructions and, optionally, Python --
+  from the [`harness::SkillSource`]s it is given, each skill's files fetched from the host as the
+  agent's code imports or reads them, with nothing mounted for them; a user's `/name`, sent with
   [`harness::UserChannel::send_directive`], asks the agent to run one, which its code does with
   `outrig.skills.invoke`.
 

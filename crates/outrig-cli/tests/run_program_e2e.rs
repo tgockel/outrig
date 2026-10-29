@@ -272,3 +272,94 @@ async fn outrig_stops_the_session_a_program_left_open() {
         assert!(Path::new(&case.sessions().join(&id)).is_dir(), "{how}");
     }
 }
+
+/// How long a program whose agent runs on a real model has to finish: a few of its rounds.
+const REAL_MODEL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The requirements' program, given the directory of a project to read as its argument: a
+/// `ProjectReader` in a session where that directory is mounted read-only, at its own path,
+/// answers what the project does, and the program prints the answer on one line and then the
+/// session's verdict.
+const READER: &str = r#"
+import asyncio, sys
+import outrig
+
+class ProjectReader(outrig.Agent):
+    """You read the project under the directory `root` names, and answer questions about it from
+    what its files say. Start with its README and its manifests."""
+
+    @outrig.agent
+    async def explain(self, question: str) -> str:
+        """Answer `question` about the project in a few sentences of plain text."""
+        ...
+
+async def main():
+    root = sys.argv[1]
+    async with outrig.Session(mounts=[outrig.Mount(root)]) as session:
+        async with ProjectReader(root=root) as agent:
+            answer = await agent.explain("What does this project do?")
+    print(" ".join(answer.split()), flush=True)
+    print(session.shutdown_report.verdict, flush=True)
+
+asyncio.run(main())
+"#;
+
+/// The requirements' program against a real model, opted into with `OUTRIG_E2E_REAL_API=1` and
+/// `OUTRIG_E2E_GLOBAL_CONFIG` naming a global configuration whose providers and `default-model`
+/// it runs on, their keys in the environment: asked about this repository, mounted read-only so
+/// the model cannot change it, its agent answers, and the program exits 0 with a clean report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_requirements_reader_answers_about_this_repository() {
+    if std::env::var("OUTRIG_E2E_REAL_API").ok().as_deref() != Some("1") {
+        eprintln!(
+            "[outrig-e2e] skipping the_requirements_reader_answers_about_this_repository (set \
+             OUTRIG_E2E_REAL_API=1 and OUTRIG_E2E_GLOBAL_CONFIG to enable)"
+        );
+        return;
+    }
+    let global = std::env::var("OUTRIG_E2E_GLOBAL_CONFIG").expect(
+        "OUTRIG_E2E_REAL_API=1 set without OUTRIG_E2E_GLOBAL_CONFIG -- name the global \
+         configuration that declares the model",
+    );
+    pull();
+    let case = Case::new("");
+    case.write("reader.py", READER);
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("this repository");
+    let child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--global-config")
+        .arg(&global)
+        .arg("--session-root")
+        .arg(case.sessions())
+        .arg("run-new")
+        .arg("reader.py")
+        .arg(&repository)
+        .current_dir(case.repo())
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("outrig starts");
+    let out = timeout(REAL_MODEL_TIMEOUT, child.wait_with_output())
+        .await
+        .expect("the program ended in time")
+        .expect("wait");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{}\n{stdout}\n{stderr}", out.status);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "an answer, then the verdict: {stdout}\n{stderr}"
+    );
+    assert!(!lines[0].trim().is_empty(), "an answer: {stdout}");
+    assert_eq!(lines[1], "clean", "{stdout}\n{stderr}");
+}

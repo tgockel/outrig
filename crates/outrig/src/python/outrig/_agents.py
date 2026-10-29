@@ -3,15 +3,19 @@
 `agent` is the decorator that declares a typed `async def` as work for a child, and `Agent` the
 base of an agent class, whose instance is one long-lived child answering requests on the methods
 `agent` marks. The errors a child's work ends with are here, under `outrig.AgentError`, and so
-are `Request`, which declares one of a request child's channels, and `Status`, what a handle says
-of its request without waiting. They import on the host too, where a declaration is made as in a
-kernel and a call, or a construction, raises.
+are `Request`, which declares one of a request child's channels, `Status`, what a handle says of
+its request without waiting, and `Handle`, the handle itself. They import on the host too, where
+a declaration is made as in a kernel and a typed call raises; an agent class's instance there is
+a root child of a session the program owns.
 
 The rest is what the interpreter uses to check what one agent gives another before it goes: a
 value given as an input is data -- `messages.md`'s serializable subset -- and the classes a child
-binds by name must not share one.
+binds by name must not share one. A program on the host describes its types as data, which a root
+child's kernel makes into classes again (`described`, `rebuilt`).
 """
 
+import asyncio
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -47,13 +51,17 @@ __all__ = [
 PREVIEW_MAX = 1024
 
 # What only the interpreter has, bound as it loads the package: `_call(declaration, arguments)`
-# makes a typed call from the calling kernel and returns its handle, `_launch(agent, inputs,
-# model)` launches an agent class instance's child from the calling kernel and returns what the
-# runtime keeps of the instance, and `_submitted_source(code)` is the source of the submission
-# that compiled `code`, or `None` for code none did. On the host all three stay `None`.
+# makes a typed call from the calling kernel and returns its handle, and `_submitted_source(code)`
+# is the source of the submission that compiled `code`, or `None` for code none did; on the host
+# both stay `None`. `_launch(agent, inputs, model, session)` launches an agent class instance's
+# child and returns what the runtime keeps of the instance: the interpreter's from the calling
+# kernel, or, bound by `outrig._host`, a program's on the host.
 _call = None
 _launch = None
 _submitted_source = None
+
+# How a request whose state is one of these has ended.
+_ENDED = ("accepted", "failed")
 
 # Names a parameter, or any input, cannot take: the child's own runtime and what every kernel
 # binds at boot.
@@ -184,6 +192,112 @@ class Status:
         return f"{state} (child {self.child})"
 
 
+class Handle:
+    """One submission or request an agent made of a child: what `child.submit(...)` and
+    `child.channels[name].request(...)` return, at once, the work already sent.
+
+    `await handle` gives the accepted answer, an instance of the declared type, or raises how the
+    request ended -- an `outrig.AgentError` -- and awaiting again gives the same. Cancelling the
+    code awaiting it cancels that wait and never the request; `handle.cancel()` cancels the
+    request: one the child has not received never reaches it, and one it has ends so that its
+    answer raises `outrig.RequestCancelled`. `done()` and `result()` answer without waiting, as a
+    future's do, and `status` says what it is doing (see `help(outrig.Status)`). `future` is a
+    view `asyncio.wait` takes; `runtime.wait` and `asyncio.gather` take the handle itself. A
+    submission's `progress` is an endpoint of what the child reports while it works on it.
+    """
+
+    __slots__ = ("_work", "_future")
+
+    def __init__(self, work):
+        self._work = work
+        self._future = None
+
+    def __del__(self):
+        # An agent class's request whose handle goes while it is open goes on, and is evented:
+        # from the instance's loop, since this runs on whatever thread dropped the handle,
+        # perhaps inside a protocol write.
+        work = self._work
+        agent = work.instance
+        if agent is not None and work.state not in _ENDED:
+            with contextlib.suppress(RuntimeError):
+                agent._outrig.loop.call_soon_threadsafe(agent._outrig.dropped, work)
+
+    @property
+    def id(self):
+        """The request's id: what the child's delivery of it, and the session's events, name. In a
+        program on the host, `None` until the session has the request."""
+        return self._work.id
+
+    def __await__(self):
+        return _view(self._work.future).__await__()
+
+    @property
+    def future(self):
+        """A future that settles as the request ends; cancelling it cancels nothing else."""
+        future = self._future
+        if future is None or future.cancelled():
+            future = self._future = _view(self._work.future)
+        return future
+
+    def done(self):
+        """Whether the request has ended."""
+        return self._work.state in _ENDED
+
+    def result(self):
+        """The accepted answer, or the exception the request ended with, raised; raises
+        `asyncio.InvalidStateError` while it has not ended."""
+        work = self._work
+        with work.lock:
+            state, value, error = work.state, work.value, work.error
+        if state not in _ENDED:
+            raise asyncio.InvalidStateError(f"{work} has not ended")
+        if error is not None:
+            raise error
+        return value
+
+    def cancel(self):
+        """Cancel the request; whether this ended it. Not the child, which takes more work."""
+        return self._work.cancel()
+
+    @property
+    def status(self):
+        """What the request is doing, and its child: see `help(outrig.Status)`."""
+        return self._work.status()
+
+    @property
+    def progress(self):
+        """An endpoint of what the child reports on its `progress` channel while it works on this
+        submission: `await receive()` takes the next, as a `Delivery`. Only a submission has one."""
+        if self._work.progress is None:
+            raise AttributeError("a request on a channel has no progress; a submission's handle does")
+        return self._work.progress
+
+    def __repr__(self):
+        return f"<handle of {self._work}: {self._work.status()}>"
+
+
+def _view(future):
+    """A future of `future`'s loop that settles as `future` does, and whose cancelling cancels
+    nothing else."""
+    view = future.get_loop().create_future()
+
+    def settle(future):
+        if view.done():
+            return
+        error = future.exception()
+        if error is None:
+            view.set_result(future.result())
+        else:
+            view.set_exception(error)
+            view.exception()
+
+    if future.done():
+        settle(future)
+    else:
+        future.add_done_callback(settle)
+    return view
+
+
 # ---------------------------------------------------------------------------- inputs
 
 
@@ -281,6 +395,137 @@ def one_name_each(classes, names=()):
                 f"both be bound in the child under {name!r}; one name holds one class"
             )
         seen[name] = cls
+
+
+# ---------------------------------------------------------------------------- types as data
+#
+# A program on the host sends its root child no code: each type crosses as JSON -- a scalar's
+# name, or an object whose key says what it is: `list`, `dict`, `union`, `literal`, `annotated`
+# with its `doc` and `alias`, or `class` -- and each dataclass, by name, as its fields, each with
+# its type, its `kw_only` and its default, the value it gives, as `tagged` gives it. The child's
+# kernel makes each class again with `make_dataclass` under its name; the program keeps its own.
+
+_SCALARS = {"None": type(None), "str": str, "int": int, "float": float, "bool": bool}
+_SCALAR_NAMES = {t: name for name, t in _SCALARS.items()}
+
+
+def described(t, classes):
+    """`t`, a type `outrig.schema` takes, as JSON, each dataclass it uses described in `classes`
+    under its name. A default crosses as its value, `tagged`, and a `default_factory` as the value
+    it makes, called now; one that is not of its field's type raises `TypeError`."""
+    if t is None:
+        t = type(None)
+    if isinstance(t, type) and t in _SCALAR_NAMES:
+        return _SCALAR_NAMES[t]
+    origin, args = typing.get_origin(t), typing.get_args(t)
+    if origin is typing.Annotated:
+        base, texts, aliases = schema._markers(t)
+        if not texts and not aliases:
+            return described(base, classes)
+        return {"annotated": described(base, classes), "doc": texts[0] if texts else None,
+                "alias": aliases[0].name if aliases else None}
+    if origin is typing.Literal:
+        return {"literal": list(args)}
+    if origin in schema._UNIONS:
+        return {"union": [described(member, classes) for member in args]}
+    if origin is list:
+        return {"list": described(args[0], classes)}
+    if origin is dict:
+        return {"dict": described(args[1], classes)}
+    if t.__name__ not in classes:
+        classes[t.__name__] = None  # claimed first, so a class that refers to itself ends here
+        hints, fields = typing.get_type_hints(t, include_extras=True), []
+        for f in dataclasses.fields(t):
+            hint = hints[f.name]
+            field = {"name": f.name, "type": described(hint, classes), "kw_only": f.kw_only}
+            if f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING:
+                where = f"field {f.name!r} of {t.__module__}.{t.__qualname__}"
+                try:
+                    value = (f.default if f.default is not dataclasses.MISSING
+                             else f.default_factory())
+                except Exception as e:
+                    raise TypeError(f"the default_factory of {where} raised {type(e).__name__}: "
+                                    f"{e}") from None
+                try:
+                    schema.declare(schema._markers(hint)[0]).encode(value)
+                except TypeError as e:
+                    raise TypeError(f"the default of {where} cannot cross to a child as data: "
+                                    f"{e}") from None
+                field["default"] = tagged(value)
+            fields.append(field)
+        classes[t.__name__] = {"qualname": t.__qualname__, "fields": fields,
+                               "frozen": t.__dataclass_params__.frozen}
+    return {"class": t.__name__}
+
+
+def typed(t, made):
+    """`t`, a type as `described` gives it, a type again, each dataclass the one `made` holds."""
+    if type(t) is str:
+        return _SCALARS[t]
+    if "class" in t:
+        return made[t["class"]]
+    if "list" in t:
+        return list[typed(t["list"], made)]
+    if "dict" in t:
+        return dict[str, typed(t["dict"], made)]
+    if "literal" in t:
+        return typing.Literal[tuple(t["literal"])]
+    if "union" in t:
+        return typing.Union[tuple(typed(member, made) for member in t["union"])]
+    marks = [schema.doc(t["doc"])] if t["doc"] is not None else []
+    marks += [schema.alias(t["alias"])] if t["alias"] is not None else []
+    return typing.Annotated[(typed(t["annotated"], made), *marks)]
+
+
+def tagged(value):
+    """`value`, data -- an input, or a default -- as JSON in which each list, dict and dataclass
+    instance says which it is, an instance's fields too, so that a root child's kernel makes each
+    instance again of its own class: its JSON form alone, read against a union whose members share
+    their fields, could not say which."""
+    if type(value) is list:
+        return {"list": [tagged(item) for item in value]}
+    if type(value) is dict:
+        return {"dict": {key: tagged(item) for key, item in value.items()}}
+    if dataclasses.is_dataclass(type(value)):
+        fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+        return {"class": type(value).__name__, "fields": tagged(fields)}
+    return value
+
+
+def _untagged(value, made):
+    if type(value) is not dict:
+        return value
+    if "list" in value:
+        return [_untagged(item, made) for item in value["list"]]
+    if "dict" in value:
+        return {key: _untagged(item, made) for key, item in value["dict"].items()}
+    return made[value["class"]](**_untagged(value["fields"], made))
+
+
+def rebuilt(root, module):
+    """`(classes, channels, inputs)` for a root child, from what its program on the host
+    described: each class made again with `make_dataclass` under its name, in `module`; each
+    channel's `(request_type, reply_type, doc)`; and each input, as `tagged` gave it, made again."""
+    made = {}
+    for name, spec in root["classes"].items():
+        fields = [
+            (f["name"], object, dataclasses.field(
+                kw_only=f["kw_only"],
+                # A factory, so each instance's default is its own, made once every class exists.
+                default_factory=functools.partial(_untagged, f["default"], made)
+                if "default" in f else dataclasses.MISSING))
+            for f in spec["fields"]
+        ]
+        made[name] = dataclasses.make_dataclass(name, fields, frozen=spec["frozen"], module=module)
+        made[name].__qualname__ = spec["qualname"]
+    # Typed once every class exists: a field may use a class made after its own, or its own.
+    for name, spec in root["classes"].items():
+        for f, field in zip(spec["fields"], dataclasses.fields(made[name])):
+            field.type = made[name].__annotations__[f["name"]] = typed(f["type"], made)
+    channels = {name: (typed(c["request"], made), typed(c["reply"], made), c["doc"])
+                for name, c in root["channels"].items()}
+    inputs = {name: _untagged(value, made) for name, value in root["inputs"].items()}
+    return list(made.values()), channels, inputs
 
 
 # ---------------------------------------------------------------------------- declarations
@@ -521,6 +766,14 @@ class Agent:
     ended, and raises what the launch met instead. `await reviewer.release()` ends the child and
     every request still open on it; `async with Reviewer() as reviewer:` waits for `ready()` on
     entry and releases on leaving. An instance collected unreleased is released then.
+
+    In a program `outrig run-new` runs on the host, `Reviewer(**inputs, model=None, session=None)`
+    is constructed on the running event loop its handles belong to, and its child is a root child
+    of `session`, the current `outrig.Session` when not given: its model is `model`, or
+    `default-model`, and no `[agents.<name>]` table applies. Its types reach the child as data,
+    made into classes again there, and each reply is decoded here, into this program's own.
+    Construct it, and leave its `async with`, inside the session's; the session's exit releases
+    it. In an agent's kernel, `session=` is refused: the child is in the kernel's own session.
     """
 
     # What the runtime keeps of the instance, once it is made; and the request channels its class
@@ -532,7 +785,7 @@ class Agent:
         super().__init_subclass__(**kwargs)
         _declare_class(cls)
 
-    def __init__(self, *, model=None, **inputs):
+    def __init__(self, *, model=None, session=None, **inputs):
         name = f"{type(self).__module__}.{type(self).__qualname__}"
         if not type(self)._outrig_channels:
             raise TypeError(f"{name} declares no request channel -- no method marked "
@@ -542,8 +795,9 @@ class Agent:
                             f"{schema._type_qualname(type(model))}")
         if _launch is None:
             raise RuntimeError(f"an instance of {name} runs in an agent's kernel, where OutRig "
-                               "runs agent code, and this Python is not one")
-        self._outrig = _launch(self, inputs, model)
+                               "runs agent code, or in a program `outrig run-new` runs, and this "
+                               "Python is neither")
+        self._outrig = _launch(self, inputs, model, session)
 
     async def ready(self):
         """Return once the child has ended its first round, which is its own, to get ready in.

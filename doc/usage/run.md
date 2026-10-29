@@ -741,6 +741,74 @@ print(session.shutdown_report)
   `outrig.ShutdownException`, its `report` the same report and an exception the body raised its
   `__context__`: something the session started may still be running.
 
+### Agent classes
+
+A program drives agents by declaring them as classes, as an agent's own Python does: a subclass
+of `outrig.Agent` whose docstring is the agent's instructions, and whose `async def` methods
+marked `@outrig.agent` are the requests it answers. An instance constructed inside a session's
+block is one agent of that session, whose parent is the program. It keeps its names and its
+conversation from one request to the next, and its replies are the program's own classes.
+
+```python
+import asyncio
+from dataclasses import dataclass
+import outrig
+
+@dataclass
+class Summary:
+    purpose: str
+    languages: list[str]
+
+class ProjectReader(outrig.Agent):
+    """You read the project in /workspace, and answer questions about it."""
+
+    @outrig.agent
+    async def explain(self, question: str) -> Summary:
+        """Answer `question` about the project."""
+        ...
+
+async def main():
+    async with outrig.Session(workspace="./repo"):
+        async with ProjectReader() as agent:
+            summary = await agent.explain("What does this project do?")
+    print(summary.purpose)
+
+asyncio.run(main())
+```
+
+- **Construction starts it in the background.** `ProjectReader(**inputs, model=None,
+  session=None)` returns at once. It runs on the event loop that is running, which its requests'
+  handles belong to, in `session`, or else the session whose block it runs in; with no session,
+  or no running loop, it raises. Each input must be data -- a str, number, bool, `None`, a list
+  or str-keyed dict of these, or a dataclass instance -- and is a variable of that name in the
+  agent's Python. The agent's first round, in which it reads its instructions, follows:
+  `await agent.ready()` waits for it, and `async with` waits for it on entry and releases the
+  agent on exit.
+- **Its model.** `model=` names a configured model or alias; without it, `default-model`. No
+  `[agents.<name>]` table, `default-agent`, image or preamble applies: the class's docstring is
+  the agent's instructions. An unknown model, a full `children-max`, or a session that has closed
+  raises at `ready()` and at the first request, not in the constructor.
+- **A call sends a request.** `agent.explain(...)` checks its arguments against their types --
+  `explain(1)` raises `TypeError` and sends nothing -- and returns a handle at once: `await` it
+  for the reply, or pass `handle.future` to `asyncio.wait`. Cancelling the code that awaits it
+  leaves the request running; `handle.cancel()` cancels the request. `done()`, `result()` and
+  `status` read it without waiting. A request made before the agent exists waits for it, and one
+  made while `requests-max` requests are open on the agent raises `outrig.AgentLimitReached`.
+- **Replies are your classes.** The types an agent class names reach the agent as descriptions --
+  fields, types, `doc()` and `alias()` markers, defaults -- never as code. Each reply comes back
+  as JSON and is decoded in your program, into your class. One that does not decode goes back to
+  the agent with what is wrong, each problem with its path, and the agent corrects it without
+  running anything again; after three, the request raises `outrig.CompletionRejected`.
+- **Releasing it.** `await agent.release()`, or leaving `async with`, ends the agent, each request
+  still open on it raising `outrig.AgentReleased`. Construct agents inside the session's block:
+  leaving the session releases each one still alive, ends its open requests with
+  `outrig.SessionClosing`, and lists them in `shutdown_report.requests`.
+
+The session's events record such an agent under a subject of its own, `agent/c1` and on, its
+parent `owner`, the program (see [the event log](../reference/events.md)). The calls an agent's
+own Python makes to launch children and give them work by hand -- `runtime.spawn`, `submit` --
+have no counterpart in a program: it constructs agent classes.
+
 ### Signals and the grace
 
 The program runs in a process group of its own. Ctrl-C, and `SIGINT` or `SIGTERM` sent to

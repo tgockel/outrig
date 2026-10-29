@@ -78,7 +78,10 @@ A child agent, which an agent's code launches with `runtime.spawn`, is named `c1
 in launch order, and its events carry its own subject, `agent/c1`: its `agent.started`,
 `model.instructions`, rounds, executions, and model calls, as the main agent's carry
 `agent/primary`. `agent.spawned` and each event about a request made of a child carry the child's
-subject; `agent.released` carries the subject of the agent that released it.
+subject; `agent.released` carries the subject of the agent that released it. A program on the host
+(`outrig run-new <script.py>`) launches children too, the instances of the agent classes it
+constructs: their parent is the program, named by the subject `owner` beside the agents', and
+`agent.released` for one it released carries `owner`.
 
 Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
 also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
@@ -411,14 +414,15 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   the session has no record of), `attempt_id`, `usage`, and `reason`: `unknown`, `reported` when
   the attempt's own event carried its usage, or `replaced` when an earlier report already had.
 - `agent.spawned` -- a child agent was launched; the subject is the child's. `name`, what the
-  spawn called it; `parent`, the subject of the agent that launched it; `kind`, `work` or
-  `request`; `model`, the `[models.<name>]` row as the spawn named it, or as its parent runs;
-  `depth`, the main agent's being 1; `inputs`, each `{name, type, preview}`; and `channels`, a
+  spawn called it; `parent`, the subject of the agent that launched it, or `owner` for the
+  program's; `kind`, `work` or `request`; `model`, the `[models.<name>]` row as the spawn named
+  it, or as its parent runs -- `default-model` for the program's; `depth`, the main agent's and
+  the program's children's being 1; `inputs`, each `{name, type, preview}`; and `channels`, a
   request child's, each `{name, request, reply}`, its types as text.
 - `agent.request.sent` -- a request was made of the subject, a child: `request`; `channel`, or
-  `null` for a submission; `sender`, the subject of the agent that made it; `body`, a preview of
-  what was sent, a submission's inputs by name; and `attempts_max`, how many answers that fail
-  their check it takes before it ends rejected.
+  `null` for a submission; `sender`, the subject of the agent that made it, or `owner` for the
+  program's; `body`, a preview of what was sent, a submission's inputs by name; and
+  `attempts_max`, how many answers that fail their check it takes before it ends rejected.
 - `agent.request.received` -- the child took it: its code received it, or a submission was given
   to it as a round began. `request`, and `round`, the child's round then, or `null`.
 - `agent.request.replied` -- the child answered it: `request`; `attempt`, counted from 1; and
@@ -454,16 +458,16 @@ reported when it gave none. Where a provider reported nothing, the usage is `nul
   was not accepted or the session's events are not observed. It follows the `agent.released` that
   ended the child, except at the session's close, which ends every call `closed` at once and tears
   its children down afterward: a call settled `closed` precedes its child's release.
-- `agent.instance.started` -- an instance of an agent class, a subclass of `outrig.Agent`,
-  launched the subject, a child, to answer its requests: `instance`, the instance's id, which its
-  other events carry; `parent`, the subject of the agent whose code constructed it; `module` and
-  `qualname`, the class's `__module__` and `__qualname__`; `digest`, a SHA-256 of the source that
-  declared the class -- its module's file, or the submission's source for a class declared in one,
-  read through a function its body defines -- or `null` when none could be read, as for a class a
-  submission declared with no function in its body; `inputs`, each `{name, type, preview}`;
-  and `channels`, one per request method, each `{name, request, reply}`. An instance whose launch
-  was refused, by a limit say, has no child and records none of these events; its `ready()` and
-  its requests raise the refusal.
+- `agent.instance.started` -- an instance of an agent class, a subclass of `outrig.Agent`, launched
+  the subject, a child, to answer its requests: `instance`, the instance's id, which its other
+  events carry; `parent`, the subject of the agent whose code constructed it, or `owner` for one the
+  program constructed; `module` and `qualname`, the class's `__module__` and `__qualname__`;
+  `digest`, a SHA-256 of the source that declared the class -- its module's file, or the
+  submission's source for a class declared in one, read through a function its body defines -- or
+  `null` when none could be read, as for a class a submission declared with no function in its body;
+  `inputs`, each `{name, type, preview}`; and `channels`, one per request method, each
+  `{name, request, reply}`. An instance whose launch was refused, by a limit say, has no child and
+  records none of these events; its `ready()` and its requests raise the refusal.
 - `agent.instance.ready` -- the child has had the round it gets as it launches, in which it reads
   its instructions and prepares: `instance`, and `error`, `null`, or why it cannot have that round
   -- the token budget spent, or a model that cannot answer. A request sent before this may already
