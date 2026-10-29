@@ -1202,8 +1202,14 @@ async fn a_graceful_child_writing_invalid_utf8_still_finishes() {
 /// [`Owned::keepalive`] still holds open would block instead. The property
 /// under test is the one that matters either way: the drain does not stop
 /// before its stream ends.
+///
+/// It also hands back what it read. The record failing is not the stream's
+/// failure, and a drain that returned `Err` here discarded the bytes of a
+/// command that had already run.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failing_transcript_does_not_stop_the_drain() {
+    // The drain warns once about the transcript. See `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
     let transcript = Transcript::create(Path::new("/dev/full"), false)
         .await
         .expect("a transcript whose every write fails");
@@ -1226,17 +1232,89 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         ),
     )
     .await
-    .expect("the drain stopped reading and never returned");
+    .expect("the drain stopped reading and never returned")
+    .expect("a transcript that failed is not the stream's failure");
 
-    assert!(
-        drained.is_err(),
-        "a transcript that failed every write should still be reported"
+    assert_eq!(
+        drained,
+        b"a line of output\n".repeat(200),
+        "the drain kept everything the stream carried"
     );
     tokio::time::timeout(Duration::from_secs(20), pump)
         .await
         .expect("the writer was left blocked on a stream nobody was draining")
         .expect("the pump task panicked")
         .expect("the writer must have been able to finish");
+}
+
+/// The command is what succeeded, and what a caller reads is the command's
+/// result: `podman stop` exiting 0 is `Done` and `podman run -d` exiting 0 is
+/// a container, whatever the `-v` transcript could or could not hold.
+///
+/// Both transcript writes fail here -- the `$` echo and the lines -- and the
+/// two are reported where they happen, each stream once and the echo once,
+/// instead of in place of the output.
+#[test]
+fn a_transcript_that_cannot_be_written_does_not_fail_a_successful_command() {
+    let (output, warned) = with_captured_tracing_at(tracing::Level::WARN, async {
+        let transcript = Transcript::create(Path::new("/dev/full"), false)
+            .await
+            .expect("a transcript whose every write fails");
+        let cmd = Cmd::new("/bin/sh").args(["-c", "echo out; echo err 1>&2"]);
+        let logged = super::run_capture_logged(cmd.clone(), "test", Some(&transcript))
+            .await
+            .expect("the command succeeded, so the call does");
+        let until = super::try_capture_logged_until(
+            cmd,
+            "test",
+            Some(&transcript),
+            Termination::Kill,
+            std::future::pending(),
+        )
+        .await
+        .expect("the stoppable capture is the same call");
+        (logged, until)
+    });
+
+    for output in [&output.0, &output.1] {
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+    assert!(
+        warned.contains("the transcript could not be written"),
+        "the record coming up short should be said, got: {warned:?}"
+    );
+}
+
+/// The other half: a command that failed is reported as the command that
+/// failed -- its exit code and stderr -- and not as the transcript's `ENOSPC`,
+/// which would hide the one thing the caller can act on.
+#[test]
+fn a_transcript_that_cannot_be_written_does_not_replace_a_commands_own_failure() {
+    let (outcome, _) = with_captured_tracing_at(tracing::Level::WARN, async {
+        let transcript = Transcript::create(Path::new("/dev/full"), false)
+            .await
+            .expect("a transcript whose every write fails");
+        super::run_capture_logged(
+            Cmd::new("/bin/sh").args(["-c", "echo nope 1>&2; exit 3"]),
+            "test",
+            Some(&transcript),
+        )
+        .await
+    });
+
+    match outcome.expect_err("the command failed") {
+        OutrigError::Process {
+            exit_code,
+            stderr_tail,
+            ..
+        } => {
+            assert_eq!(exit_code, Some(3));
+            assert!(stderr_tail.contains("nope"), "tail was: {stderr_tail:?}");
+        }
+        other => panic!("expected the command's own failure, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

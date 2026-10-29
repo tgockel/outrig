@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `-v` transcript that cannot be written no longer fails the command it records.** A full disk
+  or a closed stderr made the transcript's write fail, and `capture_stream` -- having drained the
+  stream -- returned that error in place of the captured output, as did the `$ <command>` echo
+  before the command was even spawned. So a `podman stop` that succeeded classified as `Failed`
+  and kept its handle, and a successful `podman run -d` in `start_named` was torn down by the name
+  guard, the session failing with a message about `container.log`. The command's own result --
+  exit status, output, stderr tail -- is now returned as it is, and the incomplete transcript is
+  reported separately as a `tracing` warning, once per stream. The MCP transport's `$` echo
+  follows the same rule. (#401)
 - **`Outrig::launch` with `LaunchSource::Build` no longer streams `buildah`/`podman pull` onto the
   embedder's own stdout.** `ensure_image`, the one path `launch` reaches for a build-type source,
   called `pull_image` / `run_streamed_checked`, which inherits this process's stdout -- fine for the

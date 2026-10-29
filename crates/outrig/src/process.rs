@@ -761,6 +761,18 @@ async fn write_to_stderr(bytes: &[u8]) -> std::io::Result<()> {
     stderr.flush().await
 }
 
+/// Say that `prefix`'s transcript could not be written. A transcript is a
+/// record of a command, not part of what the command did: a full disk or a
+/// closed stderr under `-v` leaves the record short, and the command's own
+/// outcome -- which may already have changed the engine's state -- stands.
+pub(crate) fn warn_transcript_failed(prefix: &str, e: &std::io::Error) {
+    tracing::warn!(
+        target: "outrig::process",
+        "[{prefix}] the transcript could not be written, so it is incomplete; the command's \
+         result is unaffected: {e}"
+    );
+}
+
 /// Where a captured command's lines go besides the caller's buffer.
 ///
 /// A transcript records every line it is given and, under `-v`, mirrors it
@@ -796,9 +808,12 @@ impl Tee {
 
     /// `[prefix] line` to every sink that is on.
     ///
-    /// A transcript failure is returned: the caller asked for a record and
-    /// did not get one. A live failure is dropped: the view is best-effort,
-    /// and neither the drain nor the command stops over it.
+    /// A transcript failure is returned, so the caller can say the record is
+    /// incomplete -- [`capture_stream`] and the `$` echo do, through
+    /// [`warn_transcript_failed`], and go on: the record is a side effect of
+    /// the command, never part of its result. A live failure is dropped: the
+    /// view is best-effort, and neither the drain nor the command stops over
+    /// it.
     async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
         if self.is_idle() {
             return Ok(());
@@ -910,8 +925,10 @@ async fn try_capture_tee_until(
     keep_stdout: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
-    if let Some(t) = &tee.transcript {
-        t.line(prefix, &format!("$ {}", cmd.render())).await?;
+    if let Some(t) = &tee.transcript
+        && let Err(e) = t.line(prefix, &format!("$ {}", cmd.render())).await
+    {
+        warn_transcript_failed(prefix, &e);
     }
 
     // The `-v` transcript is opt-in and file-backed; this pair is what makes a
@@ -1289,11 +1306,13 @@ where
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     let mut captured = Vec::new();
-    // Reported once the stream is drained, never in place of draining it. A
-    // transcript on a full disk used to end this loop with the child still
-    // writing, which for a child whose read end this module holds open is a
-    // stall rather than an error -- see the drain in [`run_streamed`].
-    let mut tee_failed = None;
+    // Reported once, never in place of draining. A transcript on a full disk
+    // used to end this loop with the child still writing, which for a child
+    // whose read end this module holds open is a stall rather than an error
+    // -- see the drain in [`run_streamed`]. Nor is it this function's error:
+    // the captured bytes are the command's, and a record that came up short
+    // does not take them back; see [`warn_transcript_failed`].
+    let mut tee_failed = false;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
@@ -1306,21 +1325,19 @@ where
                 captured.drain(..captured.len() - limit);
             }
         }
-        if tee_failed.is_none() {
+        if !tee_failed {
             let rendered = String::from_utf8_lossy(&line);
             let rendered = rendered.trim_end_matches(['\r', '\n']);
             if let Err(e) = tee.line(prefix, rendered).await {
-                tee_failed = Some(e);
+                warn_transcript_failed(prefix, &e);
+                tee_failed = true;
             }
         }
     }
     if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
         captured.drain(..captured.len() - limit);
     }
-    match tee_failed {
-        Some(e) => Err(e),
-        None => Ok(captured),
-    }
+    Ok(captured)
 }
 
 /// [`capture_stream`]'s path for a stream nothing renders a line from: plain
