@@ -83,7 +83,9 @@ pub(crate) fn preamble(
          one there before the call included, it raises `runtime.MessageAvailable`, which \
          `except Exception` does not catch. The message stays queued and the tasks keep \
          running. A bare `await` is not ended by a message, and when the user interrupts your \
-         code, what it awaits is cancelled; `runtime.wait` leaves those tasks running.\n\n",
+         code, what it awaits is cancelled; `runtime.wait` leaves those tasks running. Wait \
+         with it, with a `timeout=`, for anything that may not return -- tests, builds, \
+         network calls.\n\n",
     );
     text.push_str(&rest(
         workspace,

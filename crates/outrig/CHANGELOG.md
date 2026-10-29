@@ -145,8 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each one's reason, keeping what it ran, as any failed round does.
 
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
-  user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
-  what each model call is sent of the conversation and where the rest is, the working directory
+  user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`
+  and to wait on long work with it and a `timeout=`, what each model call is sent of the conversation and where the rest is, the working directory
   is the workspace, `pip install` adds pure-Python packages and nothing compiled loads, and
   `help(runtime)` describes the rest. The agent's configured `preamble` follows it.
 

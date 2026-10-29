@@ -837,11 +837,13 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     )
     .await;
     round(&mut agent, "hello").await;
-    let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+    let recorded = mock_http::drain(&mut requests);
+    let system = system_prompt(&recorded[0]);
     assert!(
         system.starts_with("You act on this project by writing Python.")
             && system.contains("`runtime.wait` is `asyncio.wait`")
             && system.contains("`runtime.MessageAvailable`, which `except Exception` does not")
+            && system.contains("Wait with it, with a `timeout=`, for anything that may not return")
             && system.contains("`pip install` adds pure-Python packages, which import at once")
             && system.contains("Nothing compiled loads here")
             && system.contains("`help(runtime)` describes what OutRig gives you.")
@@ -850,6 +852,18 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     );
     // Run on the host, the interpreter has no workspace to name.
     assert!(!system.contains("working directory"), "{system}");
+    // Long work is a task waited on with a timeout: a bare `await` is ended
+    // by nothing but Ctrl-C, so a hung subprocess awaited that way holds the
+    // session with the user's messages unread.
+    let description = recorded[0].body["tools"][0]["description"]
+        .as_str()
+        .expect("a tool description");
+    assert!(
+        description.contains("asyncio.create_task(asyncio.to_thread(...))")
+            && description.contains("`await runtime.wait({t}, timeout=...)`")
+            && !description.contains("`await asyncio.to_thread("),
+        "{description}"
+    );
 
     let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
     let var = "OUTRIG_TEST_AGENT_ORIENTATION_AGENTLESS";
@@ -5913,7 +5927,8 @@ fn what_was_done_is_rendered_with_the_outcome_it_led_to() {
         "{raised_runaway}"
     );
     assert!(
-        raised_runaway.contains("asyncio.to_thread"),
+        raised_runaway.contains("asyncio.create_task(asyncio.to_thread(...))")
+            && raised_runaway.contains("`runtime.wait` and a `timeout=`"),
         "{raised_runaway}"
     );
 

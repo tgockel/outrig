@@ -185,8 +185,10 @@ impl ToolDyn for SubmitPython {
          bounded, but the values behind it are not: keep a large value bound to a name and print \
          the part you need. Code that keeps the event loop from \
          turning while it keeps a CPU busy is taken for a runaway after about half a minute \
-         and interrupted, so run long computations with `await asyncio.to_thread(...)`; \
-         waiting on a subprocess or a sleep is not."
+         and interrupted. Waiting on a subprocess or a sleep is not one, and only the user's \
+         Ctrl-C ends a bare `await` of it: run long work -- a test suite, a build, a network \
+         call -- as a task, `t = asyncio.create_task(asyncio.to_thread(...))`, and wait with \
+         `await runtime.wait({t}, timeout=...)`."
             .to_string()
     }
 
@@ -452,8 +454,9 @@ fn summary(outcome: &Outcome) -> String {
 }
 
 /// What a runaway's status adds, so the model does not write another.
-const RUNAWAY_ADVICE: &str = "Run long computations with `await asyncio.to_thread(...)`, which \
-     keeps the loop turning.";
+const RUNAWAY_ADVICE: &str = "Run long computations as a task, \
+     `asyncio.create_task(asyncio.to_thread(...))`, which keeps the loop turning, and wait on it \
+     with `runtime.wait` and a `timeout=`.";
 
 /// What stopping Python leaves running.
 const ORPHANS: &str = "Stopping Python does not stop the processes or threads it started, which \
