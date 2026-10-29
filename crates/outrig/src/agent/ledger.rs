@@ -586,8 +586,8 @@ impl CallSlot {
     }
 
     /// The finish reason the current candidate's latest attempt was refused
-    /// with for what it carried, when it was: an empty reply the provider ended
-    /// with `content_filter` or `refusal`.
+    /// with for what it carried, when it was: a reply the provider ended with
+    /// `content_filter` or `refusal`.
     pub(crate) fn filtered(&self) -> Option<String> {
         self.state().call.as_ref()?.filtered.clone()
     }

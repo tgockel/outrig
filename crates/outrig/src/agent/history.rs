@@ -299,8 +299,8 @@ fn ends(sending: Sending, turn: usize, messages: &[Message]) -> Option<(Role, Ro
     Some((first, roles.next_back().unwrap_or(first)))
 }
 
-/// A provider's refusal of a call for what it carried, made of an empty reply
-/// it ended with a finish reason such as `content_filter`. The results of
+/// A provider's refusal of a call for what it carried, made of a reply it
+/// ended with a finish reason such as `content_filter`. The results of
 /// `turn`, the turn the call answered, are the one thing that call carried no
 /// earlier one had, so each is sent as a [`notice`] in their place.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -54,7 +54,7 @@
 //!   abandoned is kept, and exhausting the chain reports all of them together
 //!   rather than only the last.
 //! * **A refusal of what a call carried is not the last word.** A candidate
-//!   that ends an empty reply for its content -- `content_filter`, `refusal`
+//!   that ends a reply for its content -- `content_filter`, `refusal`
 //!   -- past its retries is sent the call once more, with the results of the
 //!   turn it answers replaced by a notice: the one thing that call carried no
 //!   earlier one had. Answered, every later call is sent the notice too, so a

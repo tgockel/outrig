@@ -130,7 +130,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place, so one result the provider will not read no longer refuses every later call of the
   session; refused again, nothing is left out, and the call fails or moves on as any other. A
   `model.withheld` event records the re-send, and `model.call`'s `refused` names each turn sent so
-  and the notice, so a call still rebuilds from the log. (#722) An alias naming
+  and the notice, so a call still rebuilds from the log. (#722) A reply the agent could use,
+  reasoning or the start of an answer, that the provider ended with `content_filter` or `refusal`
+  is no turn the model ended, and is treated as the empty one is: retried, sent once more without
+  the results, and left out of the conversation. It had been read as the model finishing, and two
+  such rounds rejected a child's request as ended without completing, though the child never chose
+  to stop. (#755) An alias naming
   several models resolves to each this build can reach, in order, and a call that still fails moves
   to the next, starting again at the first on every call. Each model a call goes to is sent a view
   assembled for its own window, and carries its own reply ceiling, so a turn too large for the first

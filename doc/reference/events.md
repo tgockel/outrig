@@ -380,7 +380,7 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   before had failed past its retries, or could not take the call: `from` and `to`, each a
   `[models.<name>]` row; `error`, why `from` was given up; `call_id`; and `attempt_id`, the last
   request `from` was sent, or `null` when it was passed over without one.
-- `model.withheld` -- a model refused a call for what it carried, ending an empty reply with a
+- `model.withheld` -- a model refused a call for what it carried, ending a reply with a
   finish reason of `content_filter` or `refusal` past its retries, and the call is sent to that
   model once more, without retries, with a notice in place of each result of the turn it answers:
   the one thing it carried that no earlier call had. `model`, the `[models.<name>]` row;

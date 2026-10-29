@@ -4458,6 +4458,120 @@ async fn an_openai_reply_filtered_to_nothing_still_fails_the_round() {
     .await;
 }
 
+/// A reply with `content` in it, as a provider's `style` sends it, ending in
+/// `finish_reason`: the model's reasoning, and then what it said.
+fn said(style: Style, content: &str, finish_reason: &str) -> mock_http::CannedResponse {
+    let reasoned = |reply: mock_http::CannedResponse| reply.with_reasoning("weighing the request");
+    match style {
+        Style::Anthropic => reasoned(mock_http::message(
+            json!([{ "type": "text", "text": content }]),
+            finish_reason,
+        )),
+        Style::OpenAi => reasoned(mock_http::chat(
+            json!({ "role": "assistant", "content": content }),
+            finish_reason,
+        )),
+    }
+}
+
+/// A provider's filter that ends a reply after the model reasoned, or after it
+/// said some of what it meant to, has not had the model end its turn. It takes
+/// the way an empty reply does -- tried again, and the round fails naming the
+/// finish reason -- and it is no assistant turn in the conversation.
+#[tokio::test]
+async fn a_reply_filtered_after_the_model_reasoned_fails_the_round() {
+    for (style, reason) in [
+        (Style::Anthropic, "refusal"),
+        (Style::OpenAi, "content_filter"),
+    ] {
+        let reasoned = style.empty(reason).with_reasoning("weighing the request");
+        a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+            style,
+            &format!("reasoned_{reason}"),
+            reasoned,
+            reason,
+        )
+        .await;
+        a_rejected_reply_that_is_no_empty_stop_fails_the_round(
+            style,
+            &format!("said_{reason}"),
+            said(style, "I was about to", reason),
+            reason,
+        )
+        .await;
+    }
+}
+
+/// A filter's reply that is not usable is not left in the conversation: the
+/// next round is sent what the round before it was, and no trace of the reply.
+#[tokio::test]
+async fn the_round_after_a_filtered_reply_is_sent_no_trace_of_it() {
+    let style = Style::OpenAi;
+    let (mut agent, mut requests) = retrying_agent_in(
+        style,
+        "OUTRIG_TEST_AGENT_AFTER_FILTERED",
+        Events::off(),
+        vec![
+            style.submit("call_1", "print('ran')"),
+            // The call, its two retries, and the call without its results.
+            said(style, "I was about to", "content_filter"),
+            said(style, "I was about to", "content_filter"),
+            said(style, "I was about to", "content_filter"),
+            said(style, "I was about to", "content_filter"),
+            style.text("done"),
+        ],
+    )
+    .await;
+
+    post(&agent, "run it").await;
+    within(agent.round())
+        .await
+        .expect_err("every reply of the round is filtered");
+    assert_eq!(round(&mut agent, "again").await, "done");
+    shut_down(agent).await;
+
+    let recorded = mock_http::drain(&mut requests);
+    let last = recorded.last().expect("a request").body.to_string();
+    assert!(!last.contains("I was about to"), "{last}");
+}
+
+/// The same content ending `stop` or `length` is an ordinary turn: the filter
+/// is what makes a reply unusable, not what is in it.
+#[tokio::test]
+async fn a_reply_that_stops_or_runs_to_length_with_the_same_content_is_unchanged() {
+    for (style, reason) in [
+        (Style::Anthropic, "end_turn"),
+        (Style::Anthropic, "max_tokens"),
+        (Style::OpenAi, "stop"),
+        (Style::OpenAi, "length"),
+    ] {
+        let var = format!(
+            "OUTRIG_TEST_AGENT_ORDINARY_{}_{}",
+            style.name().to_uppercase(),
+            reason.to_uppercase()
+        );
+        let (mut agent, mut requests) = retrying_agent_in(
+            style,
+            &var,
+            Events::off(),
+            vec![said(style, "I was about to", reason)],
+        )
+        .await;
+
+        let reply = round(&mut agent, "go").await;
+        shut_down(agent).await;
+        assert!(
+            reply.starts_with("I was about to"),
+            "{style:?} {reason}: {reply}"
+        );
+        assert_eq!(
+            mock_http::drain(&mut requests).len(),
+            1,
+            "{style:?} {reason}"
+        );
+    }
+}
+
 /// How the notice sent in place of a result a provider would not read begins.
 const NOTICE: &str = "[outrig: not sent -- the model's provider refused";
 

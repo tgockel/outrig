@@ -189,7 +189,7 @@ and tool calls alone.
 `outrig run-new` fails over the same way, with three differences. A call that moves is sent a
 conversation chosen for the window of the model it moves to, since each model's `context-window`
 is its own, so a smaller model is sent less. A candidate that refuses a call for what it carried
--- an empty reply ending in `content_filter` or `refusal` -- is first sent the call once more
+-- a reply ending in `content_filter` or `refusal` -- is first sent the call once more
 without the results it was refused for (see [Transient failures](#transient-failures)), and only
 that failing too moves the call on. And when every candidate has failed, the **round** ends
 whatever the reasons, keeping any Python it ran, and the session goes on.
@@ -508,12 +508,15 @@ not retried: the round ends with an empty reply and no error, keeps the Python i
 nothing to the conversation for the empty turn. A reply that is empty for any other reason, such
 as `length` or `content_filter`, or that names none, is still retried and then fails the round.
 So is one with anything in it the agent cannot use, such as a refusal, whatever its finish reason.
+So is a reply the provider ended with `content_filter` or `refusal` that the agent could use --
+reasoning, or the start of an answer: the provider ended it, not the model, so it is no turn the
+model finished, and it is left out of the conversation.
 The event log's `model.attempt` records the finish reason either way, and the error of a reply
 OutRig could not use leads with it -- `finish reason content_filter: ...` -- in each retry line,
 each move to the next model, and the round's failure.
 
-`outrig run-new` does one more thing with a reply that is empty because the provider refused what
-the call carried, with `content_filter` or `refusal`. Past the retries, the call is sent once
+`outrig run-new` does one more thing with a reply the provider ended because it refused what the
+call carried, with `content_filter` or `refusal`. Past the retries, the call is sent once
 more, with a note in place of each result of the turn it answers -- the one thing that call carried
 no earlier one had. The note says why, and that the results are whole in `runtime.history`, so the
 model neither works blind nor runs the same code again to see them. If that call is answered,

@@ -469,6 +469,12 @@ impl HttpClientExt for RetryingHttpClient {
 /// completion ([`empty_turn`]). A reply with anything in it, a refusal for one,
 /// is still rig's error.
 ///
+/// The converse holds: a reply rig *could* use, that the provider ended with
+/// `content_filter` or `refusal`, is as unusable as an empty one. It reads as a
+/// turn the model finished, and a round that opened a submission and met two of
+/// them would be told it ended without completing, though it never chose to
+/// stop. So it takes the way an empty reply does ([`is_content_refusal`]).
+///
 /// A model-layer wrapper is what `deedd83` deliberately removed when the
 /// transient retry moved down to [`RetryingHttpClient`], and it brings back the
 /// per-call `CompletionRequest` clone that commit was glad to lose. It earns it
@@ -550,7 +556,11 @@ impl<M: CompletionModel> RetryingModel<M> {
     /// is the completion it comes back as, in place of rig's error; any other
     /// body rig rejected has the finish reason it names put first in that
     /// error, since rig's own words say only what it could not find, and every
-    /// retry line, event and round error after this one is made from it.
+    /// retry line, event and round error after this one is made from it. A
+    /// completion rig made of a reply the provider ended for its content
+    /// ([`is_content_refusal`]) is that error, too, with nothing of rig's to
+    /// add: the reply has reasoning or text in it, and is no turn the model
+    /// ended.
     async fn attempt(
         &self,
         request: CompletionRequest,
@@ -568,6 +578,16 @@ impl<M: CompletionModel> RetryingModel<M> {
             } else if let Some(reason) = body_finish_reason(&body) {
                 *message = format!("finish reason {reason}: {message}");
             }
+        } else if outcome.is_ok()
+            && let Some(body) = settling.body()
+            && let Some(reason) =
+                body_finish_reason(&body).filter(|reason| is_content_refusal(reason))
+        {
+            // Whatever rig made of the reply, the provider ended it, not the
+            // model: the content it holds is what came before.
+            outcome = Err(CompletionError::ResponseError(format!(
+                "finish reason {reason}: the provider ended the reply for its content"
+            )));
         }
         let ids = settling.settle(&outcome);
         (outcome, ids)
@@ -769,8 +789,9 @@ pub(crate) fn is_normal_stop(reason: &str) -> bool {
 
 /// Whether `reason`, a provider's finish reason, says the provider would not
 /// answer for what the request or the reply held: OpenAI's `content_filter`
-/// and Anthropic's `refusal`. An empty reply ending so is a call a chain sends
-/// once more without the latest results it carried ([`FailoverModel`]).
+/// and Anthropic's `refusal`. A reply ending so is unusable, whatever it holds,
+/// and a call a chain sends once more without the latest results it carried
+/// ([`FailoverModel`]).
 ///
 /// [`FailoverModel`]: super::failover::FailoverModel
 pub(crate) fn is_content_refusal(reason: &str) -> bool {
