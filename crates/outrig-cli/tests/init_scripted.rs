@@ -91,6 +91,33 @@ async fn fresh_state_writes_global_repo_and_container() {
     assert!(repo_text.contains("[images.repo-standard]"), "{repo_text}");
 }
 
+/// #404: input ending at "Base image", after the repo bootstrap's answers are
+/// in, leaves a config that names no image rather than one naming an image
+/// that was never scaffolded.
+#[tokio::test]
+async fn interrupted_before_the_first_image_leaves_no_default_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    // Phases 1 and 2 (22 prompts), then EOF at the first image's "Base image".
+    let (mut prompt, _stderr_r) = scripted_prompt(&ALL_DEFAULTS[..22]).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+    timeout(
+        TEST_TIMEOUT,
+        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("init must not hang")
+    .expect_err("init must fail at EOF");
+
+    Config::load(&cwd, Some(&global)).expect("interrupted config must still load");
+    let repo_text = std::fs::read_to_string(cwd.join(".agents/outrig/config.toml")).unwrap();
+    assert!(!repo_text.contains("default-image"), "{repo_text}");
+    assert!(!repo_text.contains("[images."), "{repo_text}");
+}
+
 #[tokio::test]
 async fn idempotent_rerun_leaves_files_untouched() {
     let tmp = tempfile::tempdir().unwrap();

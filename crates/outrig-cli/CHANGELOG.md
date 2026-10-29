@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An interrupted `outrig init` no longer leaves a `default-image` naming an image that was
+  never scaffolded.** The bootstrapped repo config used to carry `default-image` from the end
+  of phase 2, so Ctrl-C or EOF at "Base image" left `outrig run` failing with `default-image
+  ... does not match any [images.<name>]`. The key is now written by `image add`, in the same
+  write as the first image's block and Dockerfile. (#404)
 - **`outrig init --force` now rewrites an existing global config, as the docs always said it
   did.** Phase 1 (`~/.outrig/config.toml`) used to skip and log "using existing global
   config" regardless of `--force`; only the nested `config init`/`image add` calls honored

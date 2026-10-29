@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use outrig::config::Config;
 use outrig::error::OutrigError;
 use outrig_cli::error::CliError;
-use outrig_cli::image_setup::add::run_with;
+use outrig_cli::image_setup::add::{run_bootstrapped, run_with};
 use outrig_cli::init::repo::resolve_or_bootstrap;
 
 use common::scripted_prompt;
@@ -237,10 +237,17 @@ async fn add_from(
     let (mut prompt, _stderr) = scripted_prompt(script).await;
     let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
     let name = name.map(str::to_string);
+    let bootstraps = !cwd
+        .ancestors()
+        .any(|dir| dir.join(".agents/outrig/config.toml").exists());
     timeout(TEST_TIMEOUT, async {
         let (repo_root, name) =
             resolve_or_bootstrap(cwd, Some(global), name, &mut prompt, &mut hf).await?;
-        run_with(&repo_root, name, false, &mut prompt).await
+        if bootstraps {
+            run_bootstrapped(&repo_root, name, false, &mut prompt).await
+        } else {
+            run_with(&repo_root, name, false, &mut prompt).await
+        }
     })
     .await
     .expect("image add must not hang")

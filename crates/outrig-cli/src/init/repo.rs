@@ -57,7 +57,7 @@ pub async fn ensure(
 /// unconfigured case.
 /// `name` is the image `image add` was given, if any. One it can't build
 /// is refused before anything is asked or written; otherwise the
-/// bootstrap writes it as `default-image` rather than asking for one.
+/// bootstrap hands it to `image add` as `default-image` rather than asking for one.
 /// Returns the resolved repo root paired with `name`, or, when that is
 /// `None` and the bootstrap ran, the name it asked for.
 /// `global_override` is `--global-config`, which only the bootstrap reads: one
@@ -100,8 +100,10 @@ pub async fn resolve_or_bootstrap(
 /// [`write_atomic`] once [`check_loads`] finds the next load would take
 /// it; when that finds otherwise, nothing is written. Section headers
 /// signal each transition so the prompts don't bleed together. A given
-/// `image_name` is written as `default-image` without asking for one.
-/// Returns the name written.
+/// `image_name` is not asked for. Neither is written here: the `image add`
+/// that follows writes the name as `default-image`, with the image's block,
+/// so an interrupt before it leaves no config naming a missing image.
+/// Returns the name for it.
 async fn write_repo_config(
     repo_root: &Path,
     global_path: Option<&Path>,
@@ -145,7 +147,6 @@ async fn write_repo_config(
     let toml_text = render(
         agent_name,
         agent_model,
-        image_name.clone(),
         workspace,
         model_choices,
         preamble,
@@ -411,7 +412,6 @@ pub(crate) const DEFAULT_AGENT_NAME: &str = "coder";
 fn render(
     agent_name: String,
     agent_model: Option<String>,
-    image_name: String,
     workspace: Workspace,
     model_choices: RepoModelChoices,
     preamble: String,
@@ -423,7 +423,6 @@ fn render(
     agents.insert(agent_name.clone(), agent);
 
     let mut cfg = Config::default();
-    cfg.default_image = Some(image_name);
     cfg.default_agent = Some(agent_name);
     cfg.default_model = model_choices.default_model;
     cfg.workspace = workspace;
@@ -464,6 +463,8 @@ fn check_loads(
         pending_image.to_string(),
         ImageConfig::from_image_name(pending_image),
     );
+    // Written by the `image add` after this, beside the image's block.
+    merged.default_image = Some(pending_image.to_string());
     if let Some(agent) = modelless_agent {
         merged.agents.remove(agent);
         merged.default_agent = None;

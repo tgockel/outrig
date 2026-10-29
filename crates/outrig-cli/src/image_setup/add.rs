@@ -14,13 +14,15 @@
 use std::path::Path;
 
 use heck::ToKebabCase;
-use toml_edit::{Array, Decor, DocumentMut, InlineTable, Item, Key, Table, Value};
+use toml_edit::{Array, Decor, DocumentMut, InlineTable, Item, Key, Table, Value, value};
 
 use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use crate::paths::{image_dir, image_dir_rel, repo_config_path, write_atomic_all};
+use crate::paths::{
+    find_repo_root_from, image_dir, image_dir_rel, repo_config_path, write_atomic_all,
+};
 use outrig::config::{ConfigValidationError, check_build_image_name};
 use outrig::error::IoPathExt;
 
@@ -40,9 +42,10 @@ pub async fn run(
 ) -> Result<()> {
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
+    let bootstraps = find_repo_root_from(cwd).is_err();
     let (repo_root, name) =
         init_repo::resolve_or_bootstrap(cwd, global_override, name, &mut prompt, &mut hf).await?;
-    run_with(&repo_root, name, force, &mut prompt).await
+    run_inner(&repo_root, name, force, bootstraps, &mut prompt).await
 }
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.
@@ -58,6 +61,28 @@ pub async fn run_with(
     repo_root: &Path,
     name_arg: Option<String>,
     force: bool,
+    prompt: &mut impl PromptSource,
+) -> Result<()> {
+    run_inner(repo_root, name_arg, force, false, prompt).await
+}
+
+/// [`run_with`] for the image a bootstrap just made the repo config for: the
+/// block that lands is also written as `default-image`, in the same write, so
+/// an interrupt before it leaves no config naming an image that isn't there.
+pub async fn run_bootstrapped(
+    repo_root: &Path,
+    name_arg: Option<String>,
+    force: bool,
+    prompt: &mut impl PromptSource,
+) -> Result<()> {
+    run_inner(repo_root, name_arg, force, true, prompt).await
+}
+
+async fn run_inner(
+    repo_root: &Path,
+    name_arg: Option<String>,
+    force: bool,
+    set_default: bool,
     prompt: &mut impl PromptSource,
 ) -> Result<()> {
     let cfg_path = repo_config_path(repo_root);
@@ -109,6 +134,9 @@ pub async fn run_with(
 
     let dockerfile = render::render(base, &toolchains, &mcps);
     insert_image_block(images, &name, &mcps);
+    if set_default {
+        doc["default-image"] = value(name.as_str());
+    }
     // Staged together, so a config that can't be written doesn't leave a
     // Dockerfile behind to refuse the retry. The Dockerfile lands first, so
     // a config never names one that isn't there.

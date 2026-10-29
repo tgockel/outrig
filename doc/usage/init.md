@@ -133,14 +133,17 @@ Finally the image-config loop:
 ```
 
 Press Ctrl-C at any prompt to stop; partial files are not written until all answers are
-gathered.
+gathered. The repo config is written once its own answers are in, and the first
+image-config's answers come after it: `default-image` is written with that image's block, so
+stopping in between leaves a config that names no image. Run `outrig init` or
+`outrig image add` again to scaffold one.
 
 ## What gets written
 
-A minimal `.agents/outrig/config.toml` (image-configs will be filled in by `image add`):
+A minimal `.agents/outrig/config.toml` (image-configs, and the `default-image` naming the
+first one, are filled in by `image add`):
 
 ```toml
-default-image = "hello-outrig-standard"
 default-agent     = "coder"
 
 [workspace]
@@ -156,7 +159,7 @@ Before writing the file, outrig reads it the way the next `outrig run` will: mer
 global config and validated. If that would fail, nothing is written, and the error says why --
 a global `default-model` that names no model, for one. Two things count as settled: the
 image-config `image add` writes next, which `default-image` -- or an agent in your global
-config -- may name, and the agent's `model` when no model is defined anywhere, as above.
+config -- will name, and the agent's `model` when no model is defined anywhere, as above.
 
 The global `~/.outrig/config.toml` is written by
 [`outrig config init`](config.md#outrig-config-init); the per-image Dockerfile and

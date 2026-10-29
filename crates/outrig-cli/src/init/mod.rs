@@ -100,7 +100,11 @@ pub async fn run_with(
         } else {
             None
         };
-        image_setup::add::run_with(cwd, name, force, prompt).await?;
+        if name.is_some() {
+            image_setup::add::run_bootstrapped(cwd, name, force, prompt).await?;
+        } else {
+            image_setup::add::run_with(cwd, name, force, prompt).await?;
+        }
         first = false;
     }
 
