@@ -22,8 +22,8 @@ use super::agent_tests::{
 };
 use super::children::RELEASE_WAIT;
 use super::mock_http::{
-    self, CannedResponse, Gauge, MODEL, RecordedRequest, Responder, scripted, submit, system_text,
-    text_reply,
+    self, CannedResponse, Gauge, MODEL, RecordedRequest, Responder, Style, scripted, submit,
+    system_text, text_reply,
 };
 use super::runner::ROUND_FAILURES_MAX;
 use crate::config::Config;
@@ -98,7 +98,20 @@ pub(super) async fn tree_built(
     hold: Option<usize>,
     build: impl FnOnce(SessionBuilder) -> SessionBuilder,
 ) -> Tree {
-    let (addr, requests, gauge) = mock_http::routed(routes, hold).await;
+    tree_over(var, top, mock_http::routed(routes, hold).await, build).await
+}
+
+/// [`tree_built`] over a mock already started.
+pub(super) async fn tree_over(
+    var: &str,
+    top: &str,
+    (addr, requests, gauge): (
+        std::net::SocketAddr,
+        UnboundedReceiver<RecordedRequest>,
+        Arc<Gauge>,
+    ),
+    build: impl FnOnce(SessionBuilder) -> SessionBuilder,
+) -> Tree {
     let cfg = config(addr, var, top);
     let (events_out, mut subscription) = watched(None).await;
     let builder = SessionBuilder::new(cfg, Some("coding"), None)
@@ -235,6 +248,53 @@ class Total:
 "#;
 
 // ---------------------------------------------------------------------------- work children
+
+/// A session asks its model's provider for its window once, however many
+/// agents run on the model, and a child -- here through an alias of it -- is
+/// held to what was reported.
+#[tokio::test]
+async fn a_child_is_held_to_the_window_its_sessions_provider_reported() {
+    let mock = mock_http::routed_with(
+        vec![
+            (
+                "ROLE reader",
+                scripted(child_runs("c1", "await runtime.complete('ok')")),
+            ),
+            (
+                "",
+                primary_runs(
+                    "child = await runtime.spawn('r', prompt='ROLE reader', model='fast')\n\
+                     print(await child.submit({}, result=str), end='')",
+                ),
+            ),
+        ],
+        None,
+        Some(Style::Anthropic.window(MODEL, Some(1_000_000))),
+    )
+    .await;
+    let mut tree = tree_over("OUTRIG_TEST_CHILD_WINDOW", "", mock, |builder| builder).await;
+    assert_eq!(round(&mut tree.session, "go").await, "done");
+    let (_report, events, requests) = tree.end().await;
+
+    let asked: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the session asked once, and the child on the same model did not ask again"
+    );
+    for agent in ["agent/primary", "agent/c1"] {
+        let calls = kind(&events, "model.call", Some(agent));
+        assert!(!calls.is_empty(), "{agent} made a call");
+        for call in calls {
+            let budget = &data(call)["budget"];
+            assert_eq!(
+                (budget["window"].as_u64(), budget["window_source"].as_str()),
+                (Some(1_000_000), Some("provider")),
+                "{agent}"
+            );
+        }
+    }
+}
 
 /// The whole of a work child: the parent spawns it, submits inputs bound in
 /// the child under their names, and awaits a result the child completes with

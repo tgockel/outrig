@@ -9,7 +9,7 @@ use super::{
 };
 use crate::agent::budget::{self, Budget, MIN_REPLY, Scale, candidate};
 use crate::agent::tool;
-use crate::harness::event::CallId;
+use crate::harness::event::{CallId, WindowSource};
 use crate::python::host::ContextChange;
 use crate::python::testing::{Fake, round_trip};
 
@@ -732,7 +732,7 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
     let budget = Budget {
         model: "small".into(),
         window: 1_000,
-        window_assumed: true,
+        window_source: WindowSource::Assumed,
         reserve: 250,
         overhead: 300,
         scale: Scale::RULE,
@@ -761,6 +761,34 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         assert!(text.contains(needle), "{needle:?} in {text}");
     }
     assert_eq!(store.calls, 0, "a call not made is not counted");
+
+    // A window the provider reported says so, and is as much the row's to
+    // correct; one the row set is not the row's to correct.
+    for (source, said, remedy) in [
+        (
+            WindowSource::Provider,
+            "(reported by small's provider)",
+            true,
+        ),
+        (WindowSource::Configured, "token context window,", false),
+    ] {
+        let text = store
+            .assemble(
+                &Budget {
+                    window_source: source,
+                    ..budget.clone()
+                },
+                None,
+            )
+            .expect_err("450 of room")
+            .to_string();
+        assert!(text.contains(said), "{source:?}: {said:?} in {text}");
+        assert_eq!(
+            text.contains("Set [models.small].context-window"),
+            remedy,
+            "{source:?}: {text}"
+        );
+    }
 
     // Alone, it fits exactly, and everything else goes.
     store.turns[10].tokens = 450;

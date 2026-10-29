@@ -768,21 +768,37 @@ unknown key, ignored with a warning. The underscored form is what the provider A
 it is what appears in a raw error coming back from one.
 
 `context-window` is the model's whole context window in tokens -- a request and its reply
-together -- as the provider publishes it, such as `200000` for current Claude models. It
-configures nothing on the provider's side; it tells `outrig run-new` how much one model call can
-carry. Each call sets aside the reply's ceiling (`max-tokens`, or the lower one the provider
-holds it to) and carries the system prompt and as much of the conversation as fits in the rest.
-What fits is estimated before the call, and the estimate is scaled by what the model's provider
-has reported for the requests it has answered, so one that counts more tokens than the estimate
-does is held to less. The first call to a model is held to the estimate alone. If the scale would
-refuse a call's prompt that the estimate alone admits -- a very large system prompt in a window
-that held it by a small margin -- the reply gives way: the ceiling the call sends is lowered to
-what the request leaves, never below 1,024 tokens, so the call is made and its answer corrects
-the scale.
-Unset, `run-new` assumes a 128,000-token window, sets aside at most a quarter of it for the
-reply, and warns once at startup; it never infers a window from `identifier`. A model with a
-larger window is sent less than it could take until its row says so, and one with a smaller
-window can still refuse a request as too long. A `max-tokens` at or above `context-window` is
+together -- as the provider publishes it. It configures nothing on the provider's side; it tells
+`outrig run-new` how much one model call can carry. Each call sets aside the reply's ceiling
+(`max-tokens`, or the lower one the provider holds it to) and carries the system prompt and as
+much of the conversation as fits in the rest. What fits is estimated before the call, and the
+estimate is scaled by what the model's provider has reported for the requests it has answered, so
+one that counts more tokens than the estimate does is held to less. The first call to a model is
+held to the estimate alone. If the scale would refuse a call's prompt that the estimate alone admits
+-- a very large system prompt in a window that held it by a small margin -- the reply gives way: the
+ceiling the call sends is lowered to what the request leaves, never below 1,024 tokens, so the call
+is made and its answer corrects the scale.
+Unset, `run-new` asks the model's provider for it, once a session, as the session starts, and
+holds each call to the window it reports. The question is one `GET` against the provider's
+`base-url`, with the provider's own key, that is not retried and is given 10 seconds:
+
+- `style = "anthropic"`: `{base-url}/v1/models/{identifier}`, and its `max_input_tokens`.
+- `style = "openai"`: `{base-url}/model/info`, which a LiteLLM proxy answers, and the
+  `model_info.max_input_tokens` of the entry whose `model_name` is the `identifier` -- the
+  smallest, when a proxy lists the name once for each deployment behind it. A server without
+  the route does not answer it.
+
+A row that sets `context-window` is not asked. An alias's models, and the children an agent
+launches, are asked about the same way, and a model is asked about once however many agents run
+on it. When the provider answers with no window -- a `404`, a refusal, a redirect (which is not
+followed, so the key goes only to the provider), a page that is not JSON, a field that is `null`, no
+answer in time -- `run-new` assumes a 128,000-token window and warns once at startup, naming why
+the provider gave none; the session starts all the same. Either way it
+sets aside at most a quarter of the window for the reply, which a reported window does not
+change, and it never infers a window from `identifier`. An assumed window sends a model with a
+larger one less than it could take until its row says so, and a model with a smaller one can
+still refuse a request as too long. Each `model.call` event says which it was in
+`budget.window_source`. A `max-tokens` at or above `context-window` is
 refused when the session starts. Under an alias each model is held to its own window: a call
 that moves to the next model is sent what fits that model's. `outrig run` ignores the key, and
 says so at startup: one line naming the models that set it, which only `outrig run-new` reads.

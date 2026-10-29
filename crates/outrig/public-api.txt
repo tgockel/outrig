@@ -1532,6 +1532,10 @@ pub outrig::harness::event::Why::Latest
 pub outrig::harness::event::Why::Promoted
 pub outrig::harness::event::Why::Recent
 pub outrig::harness::event::Why::Round
+#[non_exhaustive] pub enum outrig::harness::event::WindowSource
+pub outrig::harness::event::WindowSource::Assumed
+pub outrig::harness::event::WindowSource::Configured
+pub outrig::harness::event::WindowSource::Provider
 pub struct outrig::harness::event::AgentInstanceId(_)
 impl outrig::harness::event::AgentInstanceId
 pub fn outrig::harness::event::AgentInstanceId::get(self) -> u64
@@ -1559,7 +1563,7 @@ pub outrig::harness::event::CallBudget::overhead: u64
 pub outrig::harness::event::CallBudget::reserve: u32
 pub outrig::harness::event::CallBudget::role_alternation: outrig::config::RoleAlternation
 pub outrig::harness::event::CallBudget::window: u32
-pub outrig::harness::event::CallBudget::window_assumed: bool
+pub outrig::harness::event::CallBudget::window_source: outrig::harness::event::WindowSource
 pub struct outrig::harness::event::CallId(_)
 impl outrig::harness::event::CallId
 pub fn outrig::harness::event::CallId::get(self) -> u64

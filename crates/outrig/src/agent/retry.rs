@@ -1197,6 +1197,18 @@ fn failure_label(err: &HttpError) -> String {
     }
 }
 
+/// The innermost link of `err`'s `source()` chain: `err` itself when it has no
+/// source.
+pub(super) fn innermost_cause<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> &'a (dyn std::error::Error + 'static) {
+    let mut cause = err;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause
+}
+
 /// An error's `Display` followed by the innermost link of its `source()` chain.
 ///
 /// reqwest's own text is the kind of failure and the URL; whether the connect
@@ -1205,15 +1217,11 @@ fn failure_label(err: &HttpError) -> String {
 /// when there is no source or the outer text already says it.
 fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
     let outer = err.to_string();
-    let mut innermost = None;
-    let mut link = err.source();
-    while let Some(cause) = link {
-        innermost = Some(cause);
-        link = cause.source();
-    }
-    match innermost.map(ToString::to_string) {
-        Some(cause) if !outer.contains(&cause) => format!("{outer}: {cause}"),
-        _ => outer,
+    let cause = innermost_cause(err).to_string();
+    if outer.contains(&cause) {
+        outer
+    } else {
+        format!("{outer}: {cause}")
     }
 }
 

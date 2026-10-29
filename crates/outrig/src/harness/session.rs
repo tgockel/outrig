@@ -18,6 +18,7 @@ use crate::Outrig;
 use crate::agent::children::{self, Children};
 use crate::agent::ledger::Ledger;
 use crate::agent::orientation::Holdings;
+use crate::agent::window::Windows;
 use crate::agent::{Agent, AgentError, ResolvedAgent};
 use crate::config::{Config, Secrets};
 use crate::python::host::{Interpreter, PRIMARY};
@@ -117,6 +118,7 @@ impl Session {
                 agent: setup.agent,
                 limits,
                 workspace: setup.workspace,
+                windows: Windows::default(),
                 bindings: bindings.briefs(),
                 container: container_name.clone(),
             },
@@ -151,11 +153,14 @@ impl Session {
     /// ledger, and its rounds moving the session's state.
     pub(crate) async fn build_primary(
         &mut self,
-        resolved: &ResolvedAgent,
+        resolved: &mut ResolvedAgent,
         workspace: Option<&Path>,
         catalog: &Arc<Catalog>,
     ) -> Result<(), AgentError> {
         self.interpreter.open(PRIMARY).await?;
+        // After the kernel is open, so a start that fails before it asks
+        // nothing; the session goes on whatever the provider says.
+        self.children.windows().fill(&mut resolved.candidates).await;
         let agent = Agent::build(
             resolved,
             self.interpreter.clone(),

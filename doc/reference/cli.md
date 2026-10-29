@@ -415,8 +415,9 @@ stays in the interpreter for the rest of the session, under the same memory ceil
 everything else, and a warning says once when it passes an eighth of that ceiling.
 
 **Each call is held to the model's context window.** `context-window` on the model's row sets it
-(see [Remote-provider models](config.md#remote-provider-models)); without one, 128,000 tokens
-is assumed and startup warns. Before each call, OutRig estimates its size -- about three bytes to
+(see [Remote-provider models](config.md#remote-provider-models)); without one, the session asks
+the model's provider for it as it starts, and if the provider reports none, 128,000 tokens is
+assumed and startup warns. Before each call, OutRig estimates its size -- about three bytes to
 a token -- against the window, less the reply's `max-tokens` and the system prompt. When what was
 chosen does not fit, the view is cut: chosen again in half that room beside the turn the call
 answers, where the first and recent rounds go first, from their oldest turn, so a long first round

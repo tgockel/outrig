@@ -90,6 +90,9 @@ USAGE = (
     ("reasoning_tokens", "reasoning"),
     ("total_tokens", "total"),
 )
+# What the token table says of where a call's window came from, by the manifest's
+# `window_source`. A window the model row set needs no note.
+WINDOW_SOURCES = {"assumed": " (assumed)", "provider": " (reported by provider)"}
 # The token table's columns.
 TOKEN_COLUMNS = (
     ("round", False),
@@ -693,7 +696,7 @@ class Builder:
         if estimate is not None and (block.estimate is None or estimate > block.estimate):
             block.estimate = estimate
         window = tokens(budget.get("window"))
-        block.window = window + (" (assumed)" if budget.get("window_assumed") is True else "")
+        block.window = window + WINDOW_SOURCES.get(text(budget.get("window_source")), "")
         summary = (
             f"call {text(d.get('call'))} to {text(budget.get('model'))}: "
             f"about {tokens(estimate)} tokens, window {block.window}, "
@@ -712,6 +715,7 @@ class Builder:
                 if (cut := d.get("cut")) is not None
                 else []
             ),
+            f"window source: {text(budget.get('window_source'))}",
             f"overhead: {tokens(budget.get('overhead'))} tokens",
             *(
                 [f"estimate scale: {scale:g}x"]

@@ -83,9 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended during has `Turn.incomplete` set. Past an eighth of the memory ceiling, the interpreter
   says once on stderr how much the conversation holds.
 
-  Each model call is held to the model's context window, from `Model::context_window` or an
-  assumed 128,000 tokens with a warning, less the reply's ceiling and the system prompt, by an
-  estimate made before the call. The estimate is a token per three ASCII bytes and is scaled by
+  Each model call is held to the model's context window, from `Model::context_window`, or what
+  the model's provider reports when the session starts and the row sets none -- `max_input_tokens`
+  from Anthropic's Models API, or from a LiteLLM proxy's `model/info` -- or else an assumed
+  128,000 tokens with a warning that says why the provider reported none, less the reply's
+  ceiling and the system prompt, by an estimate made before the call. The provider is asked
+  once a session for each such model, a child's included, by one request that is bounded, not
+  retried and follows no redirect, and a failure never fails the start. `model.call`'s `budget.window_source` records
+  whether the window was `configured`, `provider`, or `assumed` (#788). The estimate is a token
+  per three ASCII bytes and is scaled by
   what the model's provider has reported: the ratio of the input tokens its latest answered call
   was reported at to that call's estimate, never below the estimate itself, so a tokenizer that
   counts more than it, as Claude Opus 5's does by about a tenth, does not leave a call over the

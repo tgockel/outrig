@@ -174,7 +174,7 @@ fn each_event_has_exactly_its_data_fields() {
                 budget: CallBudget {
                     model: text("sonnet"),
                     window: 128_000,
-                    window_assumed: true,
+                    window_source: WindowSource::Assumed,
                     reserve: 32_000,
                     overhead: 900,
                     estimate_scale: 1.0,
@@ -1025,10 +1025,11 @@ fn each_event_has_exactly_its_data_fields() {
             "reserve",
             "role_alternation",
             "window",
-            "window_assumed"
+            "window_source"
         ]
     );
     let data = serde_json::to_value(call).expect("encodes");
+    assert_eq!(data["budget"]["window_source"], "assumed");
     assert_eq!(data["carried"], json!([{"turn": 0, "why": "first"}]));
     assert_eq!(data["withheld"], json!([{"turn": 2, "why": "promoted"}]));
     assert_eq!(data["adjacent"], json!([{"turn": null, "role": "user"}]));

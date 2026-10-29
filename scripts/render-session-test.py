@@ -279,7 +279,7 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
         "budget": {
             "model": "sonnet",
             "window": 128000,
-            "window_assumed": True,
+            "window_source": "assumed",
             "reserve": 4096,
             "overhead": 1662,
             "estimate_scale": 1.0,
@@ -1248,6 +1248,31 @@ class RenderSession(unittest.TestCase):
         cells = re.findall(r'<td class="n">([^<]*)</td>', tokens)
         # Its two calls, one of which reported usage, and what they were held to.
         self.assertEqual([cells[0], *cells[8:10]], ["2 (1 reported)", "1,700", "128,000 (assumed)"])
+
+    def test_the_window_says_where_it_came_from(self) -> None:
+        for source, window in (
+            ("configured", "1,000,000"),
+            ("provider", "1,000,000 (reported by provider)"),
+            ("assumed", "1,000,000 (assumed)"),
+        ):
+            budget = model_call(0, 1)["budget"] | {"window": 1000000, "window_source": source}
+            events = [
+                (kind, data | {"budget": budget}) if kind == "model.call" else (kind, data)
+                for kind, data in ordinary()
+            ]
+            html = self.page(events)
+            self.assertEqual(token_rows(html)[0][9], window, source)
+            self.assertIn(f"window source: {source}", html)
+
+    def test_a_window_source_that_is_not_a_string_is_shown_as_it_is(self) -> None:
+        for source in ([], {}, [1], {"a": 1}, 7, True, None):
+            budget = model_call(0, 1)["budget"] | {"window": 1000000, "window_source": source}
+            events = [
+                (kind, data | {"budget": budget}) if kind == "model.call" else (kind, data)
+                for kind, data in ordinary()
+            ]
+            html = self.page(events)
+            self.assertEqual(token_rows(html)[0][9], "1,000,000", repr(source))
 
     def test_lost_executions_are_not_said_never_to_have_been_submitted(self) -> None:
         events = [e for e in ordinary() if not e[0].startswith("exec.")]

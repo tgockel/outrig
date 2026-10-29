@@ -9,9 +9,11 @@
 //! a request cost arrives only after it has been accepted or refused
 //! (`plan/phase/0003-python/history.md`).
 //!
-//! The window is the candidate's `context-window`, or [`ASSUMED_CONTEXT_WINDOW`]
-//! with a warning when it names none. It is never inferred from the model's
-//! identifier: a guess that looks like knowledge is the failure this avoids.
+//! The window is the candidate's `context-window`; when it names none, the one
+//! its provider reported when asked (`window`); and when the provider reported
+//! none, [`ASSUMED_CONTEXT_WINDOW`] with a warning that says why. It is never
+//! inferred from the model's identifier: a guess that looks like knowledge is
+//! the failure this avoids.
 //!
 //! There is no tokenizer here, and each provider counts differently, so tokens
 //! are estimated from the serialized message: a token for every
@@ -37,11 +39,13 @@ use rig::completion::{Message, Usage};
 
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider};
 use crate::config::RoleAlternation;
+use crate::harness::event::WindowSource;
 
-/// The window a model is held to when its row names none. Below the window of
-/// every current hosted model this loop is meant for, so a call is rarely
-/// refused for its size; a model with a larger window is sent less than it
-/// could take until its row says so.
+/// The window a model is held to when its row names none and its provider
+/// reports none. Below the window of every current hosted model this loop is
+/// meant for, so a call is rarely refused for its size; a model with a larger
+/// window is sent less than it could take until its provider reports it or its
+/// row says so.
 pub(crate) const ASSUMED_CONTEXT_WINDOW: u32 = 128_000;
 
 /// The reply's reserve when no output-token ceiling is sent -- an OpenAI-style
@@ -158,8 +162,8 @@ pub(crate) struct Budget {
     pub(crate) provider: String,
     /// The whole window, in tokens.
     pub(crate) window: u32,
-    /// Whether `window` is [`ASSUMED_CONTEXT_WINDOW`] rather than the row's own.
-    pub(crate) window_assumed: bool,
+    /// Where `window` came from.
+    pub(crate) window_source: WindowSource,
     /// Tokens held back for the reply.
     pub(crate) reserve: u32,
     /// What every call carries besides the conversation: the system prompt and
@@ -240,31 +244,33 @@ impl Budget {
     /// configured -- on calls that each carry `overhead` besides the
     /// conversation.
     ///
-    /// The reserve is the reply's ceiling when there is one. Against an assumed
-    /// window it is at most a quarter of it: that ceiling was chosen against
-    /// the model's real window, and holding a guess to it could leave a call
-    /// no room for a full-size tool result.
+    /// The reserve is the reply's ceiling when there is one. Against a window
+    /// the row does not set it is at most a quarter of it: that ceiling was
+    /// chosen against the model's whole window, and a window that was assumed,
+    /// or that a provider reported as its input limit, can be smaller, which
+    /// would leave a call no room for a full-size tool result.
     pub(crate) fn new(
         candidate: &ResolvedCandidate,
         max_tokens: Option<u32>,
         overhead: u64,
     ) -> Result<Budget, LlmResolveError> {
         // Never from `candidate.model_identifier`: see the module header.
-        let (window, window_assumed) = match candidate.context_window {
-            Some(window) => (window, false),
-            None => (ASSUMED_CONTEXT_WINDOW, true),
+        let (window, window_source) = match (candidate.context_window, &candidate.reported_window) {
+            (Some(window), _) => (window, WindowSource::Configured),
+            (None, Some(Ok(window))) => (*window, WindowSource::Provider),
+            (None, _) => (ASSUMED_CONTEXT_WINDOW, WindowSource::Assumed),
         };
         let quarter = window / 4;
-        let reserve = match (max_tokens, window_assumed) {
-            (Some(ceiling), false) => ceiling,
-            (Some(ceiling), true) => ceiling.min(quarter),
+        let reserve = match (max_tokens, window_source) {
+            (Some(ceiling), WindowSource::Configured) => ceiling,
+            (Some(ceiling), _) => ceiling.min(quarter),
             (None, _) => DEFAULT_REPLY_RESERVE.min(quarter),
         };
         let budget = Budget {
             model: candidate.model_name.clone(),
             provider: candidate.provider_name.clone(),
             window,
-            window_assumed,
+            window_source,
             reserve,
             overhead,
             scale: Scale::RULE,
@@ -278,10 +284,14 @@ impl Budget {
         if budget.room() < MIN_ROOM {
             return Err(LlmResolveError::WindowTooSmall(budget));
         }
-        if window_assumed {
+        if window_source == WindowSource::Assumed {
+            let unreported = match &candidate.reported_window {
+                Some(Err(why)) => format!(", and its provider reported none ({why})"),
+                _ => String::new(),
+            };
             tracing::warn!(
-                "[models.{model}] sets no context-window, so each model call is held to an \
-                 assumed {window}-token window, {reserve} of it reserved for the reply. Set \
+                "[models.{model}] sets no context-window{unreported}, so each model call is held \
+                 to an assumed {window}-token window, {reserve} of it reserved for the reply. Set \
                  [models.{model}].context-window to the model's own window: a larger one lets \
                  each call carry more of the conversation.",
                 model = budget.model,
@@ -358,7 +368,7 @@ impl Budget {
             model: model.to_string(),
             provider: "p".to_string(),
             window: u32::try_from(room).expect("a test's room fits a window"),
-            window_assumed: false,
+            window_source: WindowSource::Configured,
             reserve: 0,
             overhead: 0,
             scale: Scale::RULE,
@@ -384,14 +394,18 @@ pub(crate) fn too_small(budget: &Budget) -> String {
     let Budget {
         model,
         window,
-        window_assumed,
+        window_source,
         reserve,
         overhead,
         ..
     } = budget;
-    let assumed = if *window_assumed { " (assumed)" } else { "" };
+    let source = match window_source {
+        WindowSource::Configured => "",
+        WindowSource::Provider => " (reported by its provider)",
+        WindowSource::Assumed => " (assumed)",
+    };
     format!(
-        "model {model:?}: a {window}-token context window{assumed} leaves about {} tokens for the \
+        "model {model:?}: a {window}-token context window{source} leaves about {} tokens for the \
          conversation after {reserve} reserved for the reply and about {overhead} for the system \
          prompt and tool definition, and a round needs at least {MIN_ROOM}. Set \
          [models.{model}].context-window to the model's whole window, or lower max-tokens",
@@ -417,6 +431,7 @@ pub(crate) fn candidate(model: &str, context_window: Option<u32>) -> ResolvedCan
         },
         max_tokens: None,
         context_window,
+        reported_window: None,
     }
 }
 
@@ -488,7 +503,10 @@ impl io::Write for Count {
 
 #[cfg(test)]
 mod tests {
+    use tracing::Level;
+
     use super::*;
+    use crate::process::process_tests::with_captured_tracing_at;
 
     #[test]
     fn the_reserve_is_the_ceiling_on_the_wire_or_a_quarter_of_a_guess() {
@@ -496,17 +514,21 @@ mod tests {
         assert_eq!(
             (
                 configured.window,
-                configured.window_assumed,
+                configured.window_source,
                 configured.reserve
             ),
-            (200_000, false, 64_000)
+            (200_000, WindowSource::Configured, 64_000)
         );
         assert_eq!(configured.room(), 200_000 - 64_000 - 100);
 
         let assumed = Budget::new(&candidate("m", None), Some(64_000), 100).unwrap();
         assert_eq!(
-            (assumed.window, assumed.window_assumed, assumed.reserve),
-            (ASSUMED_CONTEXT_WINDOW, true, ASSUMED_CONTEXT_WINDOW / 4)
+            (assumed.window, assumed.window_source, assumed.reserve),
+            (
+                ASSUMED_CONTEXT_WINDOW,
+                WindowSource::Assumed,
+                ASSUMED_CONTEXT_WINDOW / 4
+            )
         );
         let small_ceiling = Budget::new(&candidate("m", None), Some(4_096), 100).unwrap();
         assert_eq!(small_ceiling.reserve, 4_096);
@@ -515,6 +537,87 @@ mod tests {
         assert_eq!(unsent.reserve, 4_000, "a quarter of a small window");
         let unsent = Budget::new(&candidate("m", None), None, 100).unwrap();
         assert_eq!(unsent.reserve, DEFAULT_REPLY_RESERVE);
+    }
+
+    /// What a provider reported is the window when the row sets none, and only
+    /// then; a report that is not a number leaves the assumption.
+    #[test]
+    fn a_reported_window_is_the_window_only_when_the_row_sets_none() {
+        let mut reported = candidate("m", None);
+        reported.reported_window = Some(Ok(1_000_000));
+        let budget = Budget::new(&reported, Some(128_000), 100).unwrap();
+        assert_eq!(
+            (budget.window, budget.window_source, budget.reserve),
+            (1_000_000, WindowSource::Provider, 128_000)
+        );
+        assert_eq!(budget.room(), 1_000_000 - 128_000 - 100);
+
+        // The reserve is held to a quarter of a window the row did not set,
+        // whoever set it.
+        let budget = Budget::new(&reported, Some(900_000), 100).unwrap();
+        assert_eq!(budget.reserve, 250_000);
+
+        let mut set = candidate("m", Some(200_000));
+        set.reported_window = Some(Ok(1_000_000));
+        let budget = Budget::new(&set, Some(64_000), 100).unwrap();
+        assert_eq!(
+            (budget.window, budget.window_source),
+            (200_000, WindowSource::Configured),
+            "the row's own window wins"
+        );
+
+        let mut unreported = candidate("m", None);
+        unreported.reported_window = Some(Err("HTTP 404".to_string()));
+        let budget = Budget::new(&unreported, Some(64_000), 100).unwrap();
+        assert_eq!(
+            (budget.window, budget.window_source),
+            (ASSUMED_CONTEXT_WINDOW, WindowSource::Assumed)
+        );
+    }
+
+    /// The warning for a window nothing set says whether the provider was
+    /// asked and why it gave none; a window the provider reported warns of
+    /// nothing, and one too small for a round says whose it is.
+    #[test]
+    fn what_is_said_of_a_window_names_where_it_came_from() {
+        let warned = |reported: Option<Result<u32, String>>| {
+            let mut candidate = candidate("m", None);
+            candidate.reported_window = reported;
+            with_captured_tracing_at(Level::WARN, async {
+                Budget::new(&candidate, Some(4_096), 100).expect("room for a round")
+            })
+            .1
+        };
+        let logged = warned(Some(Err("HTTP 404".to_string())));
+        assert!(
+            logged.contains(
+                "[models.m] sets no context-window, and its provider reported none (HTTP 404), \
+                 so each model call is held to an assumed 128000-token window"
+            ),
+            "{logged}"
+        );
+        let logged = warned(None);
+        assert!(
+            logged.contains("[models.m] sets no context-window, so each model call is held to"),
+            "{logged}"
+        );
+        assert!(!logged.contains("reported none"), "{logged}");
+        assert_eq!(
+            warned(Some(Ok(1_000_000))),
+            "",
+            "a reported window warns of nothing"
+        );
+
+        let mut reported = candidate("m", None);
+        reported.reported_window = Some(Ok(1_500));
+        let text = Budget::new(&reported, Some(1_000), 1_000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("a 1500-token context window (reported by its provider) leaves"),
+            "{text}"
+        );
+        assert!(text.contains("[models.m].context-window"), "{text}");
     }
 
     #[test]

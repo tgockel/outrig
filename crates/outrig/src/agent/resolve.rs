@@ -105,7 +105,7 @@ pub(crate) enum ResolvedProvider {
 pub(crate) struct Redacted(String);
 
 impl Redacted {
-    /// The secret itself, for the one place it is sent.
+    /// The secret itself, for where it is sent.
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
@@ -186,6 +186,10 @@ pub(crate) struct ResolvedCandidate {
     /// This row's whole context window, in tokens, when it names one. Each
     /// candidate has its own, since a smaller model is a smaller window.
     pub(crate) context_window: Option<u32>,
+    /// What the model's provider said its window is, or why it said none, when
+    /// the row names none and the provider was asked (`window::Windows`).
+    /// `None` until then, and for a row that does name one.
+    pub(crate) reported_window: Option<Result<u32, String>>,
 }
 
 /// Fully-resolved view of one agent: every knob the agent loop needs to
@@ -519,5 +523,6 @@ fn resolve_candidate(
         // The agent's ceiling wins; the model's is the fallback.
         max_tokens: agent.max_tokens.or(model.max_tokens),
         context_window: model.context_window,
+        reported_window: None,
     })
 }

@@ -375,7 +375,7 @@ impl SessionBuilder {
     /// the agent -- or, for a session with no primary agent, everything but the
     /// model and the agent. On failure nothing it started is left running.
     pub async fn start(mut self) -> Result<Session, SessionError> {
-        let resolved = self.resolution()?;
+        let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         skills::check_sources(&self.skill_sources)
             .map_err(|e| start_error(OutrigError::Configuration(e)))?;
@@ -453,7 +453,7 @@ impl SessionBuilder {
         );
         #[cfg(test)]
         let session = session.failing(self.fail_stop.take());
-        assemble(session, resolved.as_ref(), workspace.as_deref(), &catalog).await
+        assemble(session, resolved.as_mut(), workspace.as_deref(), &catalog).await
     }
 
     /// `declared`, less the repository's bindings not approved, installed and
@@ -590,7 +590,7 @@ impl SessionBuilder {
     /// id is `test`.
     #[cfg(test)]
     pub(crate) async fn start_on_host(mut self) -> Result<Session, SessionError> {
-        let resolved = self.resolution()?;
+        let mut resolved = self.resolution()?;
         let declared = bindings::gather(&self.config, &self.bound).map_err(start_error)?;
         let repo_root = chosen_repo_root(self.repo_root.as_deref()).map_err(start_error)?;
         let id = self.host_id.take().unwrap_or_else(|| "test".to_string());
@@ -625,7 +625,7 @@ impl SessionBuilder {
             setup,
         )
         .failing(self.fail_stop.take());
-        assemble(session, resolved.as_ref(), workspace.as_deref(), &catalog).await
+        assemble(session, resolved.as_mut(), workspace.as_deref(), &catalog).await
     }
 }
 
@@ -678,7 +678,7 @@ async fn default_container(
 /// built stops what the start launched.
 async fn assemble(
     mut session: Session,
-    resolved: Option<&ResolvedAgent>,
+    resolved: Option<&mut ResolvedAgent>,
     workspace: Option<&Path>,
     catalog: &Arc<Catalog>,
 ) -> Result<Session, SessionError> {

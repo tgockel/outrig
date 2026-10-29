@@ -143,10 +143,12 @@ category says what it may hold.
   - `call_id`: the model call it was assembled for, from 1, which names the call in every model
     event: a call that goes to more than one model is assembled for each under the same `call_id`.
   - `round`: its round.
-  - `budget`: what it was held to: `model`; in tokens, `window`, `window_assumed`, `reserve`,
-    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`; `estimate_scale`,
-    what `estimate` was multiplied by to be held to the window; and `role_alternation`,
-    `relaxed` or `strict`, as the model's provider row says.
+  - `budget`: what it was held to: `model`; in tokens, `window`, `reserve`, `overhead`, and
+    `max_tokens`, the reply ceiling the call carried, or `null`; `window_source`, where `window`
+    came from: `configured`, the model row's `context-window`; `provider`, what the model's
+    provider reported when the session asked; or `assumed`, 128,000 tokens, which neither said;
+    `estimate_scale`, what `estimate` was multiplied by to be held to the window; and
+    `role_alternation`, `relaxed` or `strict`, as the model's provider row says.
   - `estimate`: the whole request's estimated tokens, before `estimate_scale`. The scale is `1.0`
     until the model's provider has reported what a request cost. From then on it is the ratio of
     the input tokens that model's latest answered call reported -- `usage.input_tokens` on its

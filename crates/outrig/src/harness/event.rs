@@ -973,7 +973,7 @@ pub struct ModelCall {
 pub struct CallBudget {
     pub model: String,
     pub window: u32,
-    pub window_assumed: bool,
+    pub window_source: WindowSource,
     pub reserve: u32,
     pub overhead: u64,
     /// What the call's `estimate` was multiplied by to be held to the window: 1.0
@@ -982,6 +982,21 @@ pub struct CallBudget {
     pub estimate_scale: f64,
     pub max_tokens: Option<u32>,
     pub role_alternation: RoleAlternation,
+}
+
+/// Where the window a call was held to came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum WindowSource {
+    /// The model row's `context-window`.
+    Configured,
+    /// What the model's provider reported when the session asked, because the
+    /// row sets no `context-window`.
+    Provider,
+    /// A window of 128,000 tokens, which the row and the provider both left
+    /// unsaid.
+    Assumed,
 }
 
 /// A turn a call carried or left out, and why it was chosen.

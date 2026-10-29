@@ -27,7 +27,7 @@ use super::retry::RetryingHttpClient;
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use crate::config::{Config, EnvSecrets, LlmProvider, RoleAlternation};
 use crate::events::{self, Events, StreamBuilder};
-use crate::harness::event::{DEFAULT_CAPACITY, Payload, Received, Subscription};
+use crate::harness::event::{DEFAULT_CAPACITY, Payload, Received, Subscription, WindowSource};
 use crate::harness::skills::SkillBrief;
 use crate::harness::{
     DEFAULT_DRAIN, DirectorySource, RoundEnd, RoundOutcome, Session, SessionBuilder, SessionError,
@@ -168,6 +168,22 @@ async fn agent_with(
     let (addr, requests) = mock_http::start(script).await;
     let cfg = config_in(style, addr, var, identifier, model_keys, agent_keys);
     (agent_of(&cfg, var, events).await, requests)
+}
+
+/// [`agent_in`] with no agent keys over a provider that reports `reply` when
+/// asked a model's window, and every request it saw.
+async fn agent_reporting(
+    style: Style,
+    var: &str,
+    model_keys: &str,
+    reply: CannedResponse,
+) -> (
+    Session,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let (addr, requests) = mock_http::start_reporting(vec![style.text("ok")], reply).await;
+    let cfg = config_in(style, addr, var, MODEL, model_keys, "");
+    (agent_of(&cfg, var, Events::off()).await, requests)
 }
 
 /// A resolver holding the one key `var` names.
@@ -2589,10 +2605,10 @@ async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
             (
                 budget.model.as_str(),
                 budget.window,
-                budget.window_assumed,
+                budget.window_source,
                 budget.reserve
             ),
-            ("sonnet", window, false, reserve),
+            ("sonnet", window, WindowSource::Configured, reserve),
         );
         let seen = manifests(&agent);
         round(&mut agent, "go").await;
@@ -2682,9 +2698,64 @@ async fn no_context_window_assumes_one_whatever_the_identifier() {
         .await;
         let budget = agent.primary().agent.model.head_budget();
         assert_eq!(
-            (budget.window, budget.window_assumed, budget.reserve),
-            (ASSUMED_CONTEXT_WINDOW, true, reserve),
+            (budget.window, budget.window_source, budget.reserve),
+            (ASSUMED_CONTEXT_WINDOW, WindowSource::Assumed, reserve),
             "{identifier}"
+        );
+    }
+}
+
+/// With no window on the model row, the one its provider reports when the
+/// session starts is the budget each call is held to, through both protocols;
+/// a row that sets one asks its provider nothing.
+#[tokio::test]
+async fn no_context_window_is_held_to_what_its_provider_reports() {
+    for style in Style::ALL {
+        let (mut agent, mut requests) = agent_reporting(
+            style,
+            "OUTRIG_TEST_AGENT_REPORTED_WINDOW",
+            "",
+            style.window(MODEL, Some(1_000_000)),
+        )
+        .await;
+        let budget = agent.primary().agent.model.head_budget();
+        assert_eq!(
+            (budget.window, budget.window_source),
+            (1_000_000, WindowSource::Provider),
+            "{style:?}"
+        );
+        let asked = mock_http::drain(&mut requests);
+        assert_eq!(
+            asked.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
+            ["GET"],
+            "{style:?}: one question, before any call"
+        );
+
+        let seen = manifests(&agent);
+        round(&mut agent, "go").await;
+        let manifest = seen.lock().expect("manifests")[0].clone();
+        assert_eq!(
+            (manifest.budget.window, manifest.budget.window_source),
+            (1_000_000, WindowSource::Provider),
+            "{style:?}: the call was held to it"
+        );
+
+        let (agent, mut requests) = agent_reporting(
+            style,
+            "OUTRIG_TEST_AGENT_CONFIGURED_NOT_ASKED",
+            "context-window = 200000",
+            style.window(MODEL, Some(1_000_000)),
+        )
+        .await;
+        let budget = agent.primary().agent.model.head_budget();
+        assert_eq!(
+            (budget.window, budget.window_source),
+            (200_000, WindowSource::Configured),
+            "{style:?}"
+        );
+        assert!(
+            mock_http::drain(&mut requests).is_empty(),
+            "{style:?}: a row that sets its window asks nothing"
         );
     }
 }
@@ -3210,6 +3281,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
         },
         max_tokens,
         context_window: None,
+        reported_window: None,
     }
 }
 
@@ -5432,7 +5504,7 @@ async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
         json!({
             "model": "tail",
             "window": 6000,
-            "window_assumed": false,
+            "window_source": "configured",
             "reserve": 1024,
             "overhead": moved_call["budget"]["overhead"],
             "estimate_scale": 1.0,

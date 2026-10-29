@@ -34,6 +34,7 @@ use super::ledger::{CallSlot, Ledger};
 use super::orientation::{self, ChannelText, ChildBrief};
 use super::resolve::{self, LlmResolveError};
 use super::round::Quiet;
+use super::window::Windows;
 use super::{Agent, AgentError, runner};
 use crate::config::{Config, Limits, Secrets};
 use crate::events::Events;
@@ -71,6 +72,10 @@ pub(crate) struct Settings {
     pub(crate) agent: Option<String>,
     pub(crate) limits: Limits,
     pub(crate) workspace: Option<PathBuf>,
+    /// What the session has learned of its models' windows: the primary's
+    /// build fills it, and a child on a model already asked about is not asked
+    /// again.
+    pub(crate) windows: Windows,
     pub(crate) bindings: Vec<Brief>,
     pub(crate) container: String,
 }
@@ -224,6 +229,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Children {
+    /// What the session has learned of its models' windows.
+    pub(crate) fn windows(&self) -> &Windows {
+        &self.0.settings.windows
+    }
+
     /// The registry of a session whose interpreter is `interpreter`, recording
     /// spend in `ledger`. It hears the interpreter's lines about children from
     /// now on, and the session's close once it comes.
@@ -607,6 +617,7 @@ impl Inner {
             }
             e => Refused::new("other", e.to_string()),
         })?;
+        settings.windows.fill(&mut resolved.candidates).await;
         // The tool limits come with the session's agent; its preamble does not
         // (0003-30's fork 1): what a child needs, its parent's prompt says.
         resolved.preamble = None;

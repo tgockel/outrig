@@ -13,6 +13,11 @@
 //! refuses a request whose roles repeat as a gateway in front of one would, and
 //! as [`start_filtering`], a provider whose content filter refuses a request
 //! carrying [`FILTERED`].
+//!
+//! A session asks a model's provider for its window before it starts, which is
+//! no part of any script: that request is answered `404`, and not recorded,
+//! unless the mock was started as [`start_reporting`], which answers it as given
+//! and records it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -36,6 +41,7 @@ pub(super) const SIGNATURE: &str = "signed-by-the-mock";
 /// interpret it.
 #[derive(Debug, Clone)]
 pub(crate) struct RecordedRequest {
+    pub(super) method: String,
     pub(super) path: String,
     /// Each header as sent, its name lowercased.
     pub(super) headers: Vec<(String, String)>,
@@ -57,6 +63,8 @@ impl RecordedRequest {
 pub(crate) struct CannedResponse {
     status: u16,
     body: Value,
+    /// Sent in place of `body` when it is not JSON.
+    text: Option<String>,
     /// Sent besides the content type, length, and `Connection: close`.
     headers: Vec<(&'static str, String)>,
 }
@@ -66,6 +74,7 @@ impl CannedResponse {
         Self {
             status,
             body,
+            text: None,
             headers: Vec::new(),
         }
     }
@@ -111,6 +120,40 @@ impl CannedResponse {
         self.headers.push((name, value.to_string()));
         self
     }
+}
+
+/// A `200` whose body is a page rather than JSON, as a gateway in front of a
+/// provider answers a path it does not serve.
+pub(super) fn not_json() -> CannedResponse {
+    CannedResponse {
+        text: Some("<html>gateway</html>".to_string()),
+        ..CannedResponse::new(200, Value::Null)
+    }
+}
+
+/// A `302` sending the request on to `location`, as a gateway does for a route
+/// it does not serve.
+pub(super) fn redirect(location: &str) -> CannedResponse {
+    CannedResponse::new(302, json!({})).header("Location", location)
+}
+
+/// A LiteLLM proxy's `model/info`, listing each of `models` -- a name, and the
+/// input window its deployment reports -- once.
+pub(super) fn proxy_listing(models: &[(&str, Option<u64>)]) -> CannedResponse {
+    let data: Vec<Value> = models
+        .iter()
+        .map(|(name, tokens)| {
+            json!({
+                "model_name": name,
+                "litellm_params": { "model": "mock" },
+                "model_info": {
+                    "max_input_tokens": tokens,
+                    "max_output_tokens": 32_768,
+                },
+            })
+        })
+        .collect();
+    CannedResponse::new(200, json!({ "data": data }))
 }
 
 /// A provider failing: `status` with Anthropic's error envelope.
@@ -254,6 +297,26 @@ impl Style {
                 }),
                 "tool_calls",
             ),
+        }
+    }
+
+    /// The provider's answer to a lookup of the window of the model
+    /// `identifier`, which holds `tokens` as its input, or none: Anthropic's
+    /// model object, or a LiteLLM proxy's `model/info`.
+    pub(super) fn window(self, identifier: &str, tokens: Option<u64>) -> CannedResponse {
+        match self {
+            Style::Anthropic => CannedResponse::new(
+                200,
+                json!({
+                    "type": "model",
+                    "id": identifier,
+                    "display_name": "Mock",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "max_input_tokens": tokens,
+                    "max_tokens": 64_000,
+                }),
+            ),
+            Style::OpenAi => proxy_listing(&[(identifier, tokens)]),
         }
     }
 
@@ -463,7 +526,42 @@ pub(crate) async fn start(
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    start_with(script, |_| None).await
+    start_with(script, |_| None, None).await
+}
+
+/// [`start`], as a provider that answers a lookup of a model's window with
+/// `reply` -- see [`Style::window`] -- and records it, which the script does
+/// not advance past.
+pub(super) async fn start_reporting(
+    script: Vec<CannedResponse>,
+    reply: CannedResponse,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    start_with(script, |_| None, Some(reply)).await
+}
+
+/// Whether `request` asks a provider about a model rather than for a
+/// completion, which is always a `POST`.
+fn is_lookup(request: &RecordedRequest) -> bool {
+    request.method == "GET"
+}
+
+/// The answer to `recorded`, a lookup: `reply`, with the request recorded, or
+/// a `404` that is not recorded when there is none.
+fn lookup_reply(
+    recorded: RecordedRequest,
+    tx: &mpsc::UnboundedSender<RecordedRequest>,
+    reply: Option<&CannedResponse>,
+) -> CannedResponse {
+    match reply {
+        Some(reply) => {
+            let _ = tx.send(recorded);
+            reply.clone()
+        }
+        None => failure(404),
+    }
 }
 
 /// [`start`], as a provider that requires the user's and the model's turns to
@@ -476,7 +574,7 @@ pub(super) async fn start_strict(
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    start_with(script, strict_refusal).await
+    start_with(script, strict_refusal, None).await
 }
 
 /// [`start`], as an Anthropic endpoint that does not take the thinking-binding
@@ -488,7 +586,7 @@ pub(super) async fn start_unbinding(
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    start_with(script, binding_refusal).await
+    start_with(script, binding_refusal, None).await
 }
 
 /// How [`start_unbinding`]'s endpoint answers `body`: `None` unless it carries
@@ -514,7 +612,7 @@ pub(super) async fn start_filtering(
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
-    start_with(script, content_refusal).await
+    start_with(script, content_refusal, None).await
 }
 
 /// How [`start_filtering`]'s provider answers `body`: `None` unless it carries
@@ -530,10 +628,12 @@ fn content_refusal(body: &Value) -> Option<CannedResponse> {
 }
 
 /// [`start`], refusing each request `refuses` answers for, which the script
-/// does not advance past.
+/// does not advance past, and answering a lookup of a model's window with
+/// `lookup`, or not at all.
 async fn start_with(
     script: Vec<CannedResponse>,
     refuses: fn(&Value) -> Option<CannedResponse>,
+    lookup: Option<CannedResponse>,
 ) -> (
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<RecordedRequest>,
@@ -543,7 +643,7 @@ async fn start_with(
         .expect("bind mock listener");
     let addr = listener.local_addr().expect("mock local_addr");
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(serve(listener, script, tx, refuses));
+    tokio::spawn(serve(listener, script, tx, refuses, lookup));
     (addr, rx)
 }
 
@@ -568,11 +668,7 @@ pub(super) async fn refused_cause() -> String {
         .send()
         .await
         .expect_err("nothing listens");
-    let mut cause: &(dyn std::error::Error + 'static) = &err;
-    while let Some(next) = cause.source() {
-        cause = next;
-    }
-    cause.to_string()
+    super::retry::innermost_cause(&err).to_string()
 }
 
 /// A chain of errors: each link's `Display` is its own text, and its `source()`
@@ -615,6 +711,7 @@ async fn serve(
     script: Vec<CannedResponse>,
     tx: mpsc::UnboundedSender<RecordedRequest>,
     refuses: fn(&Value) -> Option<CannedResponse>,
+    lookup: Option<CannedResponse>,
 ) {
     let mut served = 0usize;
     loop {
@@ -624,6 +721,10 @@ async fn serve(
         let Some(recorded) = read_request(&mut sock).await else {
             continue;
         };
+        if is_lookup(&recorded) {
+            respond(&mut sock, &lookup_reply(recorded, &tx, lookup.as_ref())).await;
+            continue;
+        }
         let refused = refuses(&recorded.body);
         if tx.send(recorded).is_err() {
             return;
@@ -639,23 +740,31 @@ async fn serve(
             }
         };
 
-        let body = serde_json::to_string(&canned.body).expect("canned body serializes");
-        let headers: String = canned
-            .headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {value}\r\n"))
-            .collect();
-        let response = format!(
-            "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
-            canned.status,
-            body.len(),
-            body,
-        );
-        let _ = sock.write_all(response.as_bytes()).await;
-        let _ = sock.flush().await;
-        let _ = sock.shutdown().await;
+        respond(&mut sock, &canned).await;
     }
+}
+
+/// Write `canned` to `sock`, and close it.
+async fn respond(sock: &mut TcpStream, canned: &CannedResponse) {
+    let body = canned
+        .text
+        .clone()
+        .unwrap_or_else(|| serde_json::to_string(&canned.body).expect("canned body serializes"));
+    let headers: String = canned
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let response = format!(
+        "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
+        canned.status,
+        body.len(),
+        body,
+    );
+    let _ = sock.write_all(response.as_bytes()).await;
+    let _ = sock.flush().await;
+    let _ = sock.shutdown().await;
 }
 
 /// What the routed mock answers one request with: a response, ready when the
@@ -723,6 +832,21 @@ pub(crate) async fn routed(
     mpsc::UnboundedReceiver<RecordedRequest>,
     Arc<Gauge>,
 ) {
+    routed_with(routes, hold, None).await
+}
+
+/// [`routed`], as a provider that answers a lookup of a model's window with
+/// `lookup`, when there is one, and records it: not a request to a route, so it
+/// is not held or counted by the gauge.
+pub(crate) async fn routed_with(
+    routes: Vec<(&'static str, Responder)>,
+    hold: Option<usize>,
+    lookup: Option<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    mpsc::UnboundedReceiver<RecordedRequest>,
+    Arc<Gauge>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock listener");
@@ -738,7 +862,7 @@ pub(crate) async fn routed(
                     return;
                 };
                 let (routes, tx, gauge) = (Arc::clone(&routes), tx.clone(), Arc::clone(&gauge));
-                tokio::spawn(answer_routed(sock, routes, tx, gauge, hold));
+                tokio::spawn(answer_routed(sock, routes, tx, gauge, hold, lookup.clone()));
             }
         }
     });
@@ -751,10 +875,16 @@ async fn answer_routed(
     tx: mpsc::UnboundedSender<RecordedRequest>,
     gauge: Arc<Gauge>,
     hold: Option<usize>,
+    lookup: Option<CannedResponse>,
 ) {
     let Some(recorded) = read_request(&mut sock).await else {
         return;
     };
+    // Not a model call: it is not held with them or counted.
+    if is_lookup(&recorded) {
+        respond(&mut sock, &lookup_reply(recorded, &tx, lookup.as_ref())).await;
+        return;
+    }
     let open = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
     gauge.most.fetch_max(open, Ordering::SeqCst);
     gauge.changed.notify_waiters();
@@ -783,22 +913,7 @@ async fn answer_routed(
         .expect("a route for every request");
     let _ = tx.send(recorded.clone());
     let canned = responder(&recorded).await;
-    let body = serde_json::to_string(&canned.body).expect("canned body serializes");
-    let headers: String = canned
-        .headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\r\n"))
-        .collect();
-    let response = format!(
-        "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
-        canned.status,
-        body.len(),
-        body,
-    );
-    let _ = sock.write_all(response.as_bytes()).await;
-    let _ = sock.flush().await;
-    let _ = sock.shutdown().await;
+    respond(&mut sock, &canned).await;
     gauge.open.fetch_sub(1, Ordering::SeqCst);
     gauge.changed.notify_waiters();
 }
@@ -826,7 +941,7 @@ async fn read_request(sock: &mut TcpStream) -> Option<RecordedRequest> {
     let head = String::from_utf8_lossy(&total[..header_end]).into_owned();
     let mut lines = head.lines();
     let mut request_line = lines.next()?.split_whitespace();
-    let _method = request_line.next()?;
+    let method = request_line.next()?.to_string();
     let path = request_line.next()?.to_string();
 
     let mut content_length = 0usize;
@@ -851,6 +966,7 @@ async fn read_request(sock: &mut TcpStream) -> Option<RecordedRequest> {
     let body = serde_json::from_slice(&total[header_end..]).unwrap_or(Value::Null);
 
     Some(RecordedRequest {
+        method,
         path,
         headers,
         body,

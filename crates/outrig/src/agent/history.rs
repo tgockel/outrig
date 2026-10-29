@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use super::budget::{self, Budget, Scale, Wire};
 use crate::config::RoleAlternation;
 use crate::events;
-use crate::harness::event::{self, CallId, Payload};
+use crate::harness::event::{self, CallId, Payload, WindowSource};
 use crate::python::host::{ContextChange, Interpreter};
 
 /// Which earlier rounds a model call is sent, besides the turns the agent
@@ -390,7 +390,7 @@ impl Manifest {
             budget: event::CallBudget {
                 model: self.budget.model.clone(),
                 window: self.budget.window,
-                window_assumed: self.budget.window_assumed,
+                window_source: self.budget.window_source,
                 reserve: self.budget.reserve,
                 overhead: self.budget.overhead,
                 estimate_scale: self.budget.scale.ratio(),
@@ -476,7 +476,7 @@ impl fmt::Display for TooLarge {
         let Budget {
             model,
             window,
-            window_assumed,
+            window_source,
             reserve,
             overhead,
             ..
@@ -499,8 +499,12 @@ impl fmt::Display for TooLarge {
             ", and a call to {model} has room for about {}: a {window}-token context window",
             self.budget.room()
         )?;
-        if *window_assumed {
-            write!(f, " (assumed: [models.{model}] sets no context-window)")?;
+        match window_source {
+            WindowSource::Configured => {}
+            WindowSource::Provider => write!(f, " (reported by {model}'s provider)")?,
+            WindowSource::Assumed => {
+                write!(f, " (assumed: [models.{model}] sets no context-window)")?
+            }
         }
         write!(
             f,
@@ -519,7 +523,7 @@ impl fmt::Display for TooLarge {
             f,
             ". The turn stays in runtime.history, and later calls leave it out. "
         )?;
-        if *window_assumed {
+        if *window_source != WindowSource::Configured {
             write!(
                 f,
                 "Set [models.{model}].context-window to the model's own window, or lower \

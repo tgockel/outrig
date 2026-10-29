@@ -37,6 +37,7 @@ mod retry;
 pub(crate) mod round;
 mod runner;
 mod tool;
+pub(crate) mod window;
 
 use std::path::Path;
 use std::sync::Arc;

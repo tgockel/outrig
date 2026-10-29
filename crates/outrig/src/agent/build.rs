@@ -195,7 +195,7 @@ where
         provider = %candidate.provider_name,
         max_tokens = budget.max_tokens,
         window = budget.window,
-        assumed = budget.window_assumed,
+        window_source = ?budget.window_source,
         reserve = budget.reserve,
         overhead = budget.overhead,
         "built a candidate; each call to it is held to this budget"
@@ -238,23 +238,17 @@ fn retry_policy(retry_budget_secs: Option<u64>) -> RetryPolicy {
     }
 }
 
-/// The HTTP client every remote provider gets: one per-request timeout, from
-/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
-/// and the connect bound, wrapped in the transient-retry loop `policy` bounds
-/// and `retries` records.
-fn remote_http_client(
-    request_timeout_secs: Option<u64>,
-    policy: &RetryPolicy,
-    retries: &Retries,
-) -> Result<RetryingHttpClient, AgentError> {
-    let timeout = Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
-    // Two ceilings, on two different things. `timeout` bounds the whole
-    // request, and is high because a non-streaming completion answers only
-    // when the model has finished. `connect_timeout` bounds getting connected
-    // at all, which no completion is waiting on -- without it, a host that
-    // silently drops packets would hold an attempt open for the full request
-    // timeout, and the retry loop's much shorter budget for an endpoint that
-    // never answered could not stop it (see [`retry::CONNECT_TIMEOUT`]).
+/// The client builder every request to a provider starts from: `timeout` on the
+/// whole request, and the connect bound.
+///
+/// Two ceilings, on two different things. `timeout` bounds the whole request,
+/// and is high for a model call because a non-streaming completion answers only
+/// when the model has finished. `connect_timeout` bounds getting connected at
+/// all, which no completion is waiting on -- without it, a host that silently
+/// drops packets would hold an attempt open for the full request timeout, and
+/// the retry loop's much shorter budget for an endpoint that never answered
+/// could not stop it (see [`retry::CONNECT_TIMEOUT`]).
+pub(super) fn http_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(retry::CONNECT_TIMEOUT);
@@ -267,7 +261,20 @@ fn remote_http_client(
     #[cfg(test)]
     let builder = builder.no_proxy();
 
-    let inner = builder.build().map_err(client_build)?;
+    builder
+}
+
+/// The HTTP client every remote provider gets: one per-request timeout, from
+/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
+/// and the connect bound, wrapped in the transient-retry loop `policy` bounds
+/// and `retries` records.
+fn remote_http_client(
+    request_timeout_secs: Option<u64>,
+    policy: &RetryPolicy,
+    retries: &Retries,
+) -> Result<RetryingHttpClient, AgentError> {
+    let timeout = Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
+    let inner = http_client_builder(timeout).build().map_err(client_build)?;
     Ok(RetryingHttpClient::new(
         inner,
         policy.clone(),
