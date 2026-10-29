@@ -67,6 +67,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Outrig::launch` with `LaunchSource::Build` no longer streams `buildah`/`podman pull` onto the
+  embedder's own stdout.** `ensure_image`, the one path `launch` reaches for a build-type source,
+  called `pull_image` / `run_streamed_checked`, which inherits this process's stdout -- fine for the
+  CLI, which owns the terminal, but not for a library caller serving a protocol over its own stdout:
+  a cache miss's `STEP 1/3 ...` or an image id landed on it, interleaved with whatever the embedder
+  was writing. `ensure_image` now captures a cache miss's build or pull (`BuildOutput::Captured`, no
+  transcript) instead of streaming it; `outrig build`, which calls `pull_image` / `build_image_for`
+  directly, is unaffected and still shows the live stream. (#400)
+- **A cache miss's captured build or pull no longer buffers a newline-free run of output whole.**
+  `ensure_image`'s capture (above) drains the child's stdout through `capture_stream`, which
+  split on `\n` even with nothing asking to keep a line -- `keep_stdout = false`, no transcript --
+  so a `RUN` step writing gigabytes with no newline at all (`head -c 1GiB /dev/zero`, a `\r`-driven
+  progress bar) grew the embedding process by the length of that run before the retention limit
+  ever got a completed line to trim. `capture_stream` now checks whether anything is listening
+  (`Tee::is_idle`) and, when nothing is, drains in fixed `STREAM_READ_CHUNK` reads instead of
+  hunting for `\n`; a tee or a kept stdout still goes through the line-oriented path
+  unchanged. (#400)
 - **A `view = "primary"` payload can no longer regain the launcher's capabilities, and a `cap-drop`
   the launcher needs is refused up front.** `outrig-enter` dropped to the session's uid/gid, which
   clears the payload's own capability sets, and left the rest to the container's

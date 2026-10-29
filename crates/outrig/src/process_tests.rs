@@ -1548,3 +1548,64 @@ fn the_debug_trace_shows_the_stand_in() {
     result.expect("the command succeeds");
     assert_shown_not_hidden("the debug trace", &captured);
 }
+
+/// A build's `RUN` step writing a huge run with no newline in it must not be
+/// buffered whole: the captured path has nothing to keep it for (`keep_stdout
+/// = false`, no transcript), so [`capture_stream`] takes the chunked path
+/// (`Tee::is_idle`) rather than growing one line to the length of the write.
+/// Regression for the hazard a line-buffered drain has here: `head -c 256MiB
+/// /dev/zero` with no `\n` in it at all would hold the whole write in `line`
+/// before the loop ever got to trim it.
+///
+/// The bound checked is the process's **peak** RSS (`VmHWM`), not its RSS
+/// after the call: a `Vec` that grew to 256 MiB and was then dropped can
+/// leave the resident set looking small again, while the peak the kernel
+/// recorded along the way is the thing an embedder's memory ceiling actually
+/// sees. `VmHWM` only grows, so the delta across the call is a lower bound on
+/// how big anything the call allocated got -- this test caught the
+/// regression against the pre-chunking `capture_stream` with a 267 MiB jump,
+/// comfortably outside the ceiling asserted below.
+#[tokio::test]
+async fn a_newline_free_captured_stream_drains_in_bounded_memory() {
+    let _emitting = emitting().await;
+    let written: usize = 256 * 1024 * 1024;
+    let script = format!("head -c {written} /dev/zero");
+    let before_kb = process_peak_rss_kb();
+
+    let output = super::run_capture_logged_terminating(
+        Cmd::new("/bin/sh").args(["-c", &script]),
+        "test",
+        None,
+        Termination::Kill,
+        false,
+    )
+    .await
+    .expect("exit 0");
+
+    assert!(output.stdout.is_empty(), "the discarded path keeps nothing");
+
+    let after_kb = process_peak_rss_kb();
+    let grew_kb = after_kb.saturating_sub(before_kb);
+    let ceiling_kb = 32 * 1024; // 32 MiB: generous against 256 MiB written.
+    assert!(
+        grew_kb < ceiling_kb,
+        "peak RSS grew by {grew_kb} KiB draining {written} bytes -- a line-buffered drain would \
+         have grown it by nearly the whole write"
+    );
+}
+
+/// This process's peak resident set (`VmHWM`), in KiB, from
+/// `/proc/self/status`. Monotonic for the process's life, so a delta across
+/// a call is a lower bound on what that call allocated.
+fn process_peak_rss_kb() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .expect("VmHWM line present")
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .expect("VmHWM is an integer")
+}

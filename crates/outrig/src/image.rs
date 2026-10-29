@@ -696,6 +696,15 @@ pub async fn ensure_image(
 
 /// Implementation of [`ensure_image`] with build-arg resolution errors framed
 /// against the selected image-config.
+///
+/// A cache miss's pull or build is captured rather than streamed to this
+/// process's own stdout/stderr ([`BuildOutput::Captured`], no transcript):
+/// this is the one path [`crate::Outrig::launch`] reaches with
+/// [`crate::LaunchSource::Build`], and an embedder may be serving its own
+/// protocol over the inherited stdout -- `buildah`'s `STEP 1/3 ...` or an
+/// image id landing on it would corrupt that stream. `outrig build`, which
+/// owns the terminal, goes through [`pull_image`] / [`build_image_for`]
+/// instead and keeps the live stream.
 async fn ensure_image_for(
     image: &str,
     cfg: &ImageConfig,
@@ -712,7 +721,7 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            pull_image(&tag).await?;
+            pull_image_logged(&tag, None, BuildOutput::Captured).await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,
@@ -730,7 +739,17 @@ async fn ensure_image_for(
                     cache_hit: true,
                 });
             }
-            build_image_with_build_args(image, cfg, repo_root, &tag, no_cache, &build_args).await?;
+            build_image_logged_with_build_args(
+                image,
+                cfg,
+                repo_root,
+                &tag,
+                no_cache,
+                None,
+                &build_args,
+                BuildOutput::Captured,
+            )
+            .await?;
             tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
             Ok(ImageBuildOutcome {
                 tag,

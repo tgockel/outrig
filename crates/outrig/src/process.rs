@@ -786,13 +786,21 @@ impl Tee {
         }
     }
 
+    /// True when nothing is listening -- [`Tee::line`] would be a no-op
+    /// either way. [`capture_stream`] uses this to skip line-splitting
+    /// entirely when there is also nothing to retain: the only reason it
+    /// buffers a line at all is to hand `line` something to render.
+    fn is_idle(&self) -> bool {
+        self.transcript.is_none() && !self.live_stderr
+    }
+
     /// `[prefix] line` to every sink that is on.
     ///
     /// A transcript failure is returned: the caller asked for a record and
     /// did not get one. A live failure is dropped: the view is best-effort,
     /// and neither the drain nor the command stops over it.
     async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
-        if self.transcript.is_none() && !self.live_stderr {
+        if self.is_idle() {
             return Ok(());
         }
         let rendered = render_line(prefix, line);
@@ -1254,6 +1262,17 @@ impl BoundedStderrTail {
 /// Drain `stream` through `tee`, retaining the last `retain` bytes: `None`
 /// keeps nothing, `Some(usize::MAX)` everything. A bounded buffer is trimmed
 /// back to the limit at twice its size, so the copying stays amortized.
+///
+/// With no tee listening ([`Tee::is_idle`]), nothing needs a line to render,
+/// so the read goes through [`drain_stream_chunks`] instead: fixed
+/// [`STREAM_READ_CHUNK`]-sized reads rather than [`AsyncBufReadExt::read_until`]
+/// hunting for the next `\n`. A build's `RUN` step can write gigabytes with no
+/// newline in it at all (`head -c 1G /dev/zero`, a progress bar using `\r`),
+/// and `read_until` buffers the whole run between newlines before this loop
+/// sees a byte of it -- unbounded by `retain`, since `retain` only trims what
+/// is kept *after* a line completes. A session's own stdout/stderr stays
+/// isolated either way: this is a captured pipe to the child, never the
+/// embedder's descriptor.
 async fn capture_stream<R>(
     stream: R,
     prefix: &'static str,
@@ -1263,6 +1282,10 @@ async fn capture_stream<R>(
 where
     R: AsyncRead + Unpin,
 {
+    if tee.is_idle() {
+        return drain_stream_chunks(stream, retain).await;
+    }
+
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     let mut captured = Vec::new();
@@ -1298,6 +1321,35 @@ where
         Some(e) => Err(e),
         None => Ok(captured),
     }
+}
+
+/// [`capture_stream`]'s path for a stream nothing renders a line from: plain
+/// fixed-size reads, so a single run with no newline in it costs
+/// [`STREAM_READ_CHUNK`] rather than its own length. Retention trims exactly
+/// as [`capture_stream`]'s does, just against a chunk instead of a line.
+async fn drain_stream_chunks<R>(stream: R, retain: Option<usize>) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = stream;
+    let mut captured = Vec::new();
+    let mut chunk = [0_u8; STREAM_READ_CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if let Some(limit) = retain {
+            captured.extend_from_slice(&chunk[..n]);
+            if captured.len() / 2 > limit {
+                captured.drain(..captured.len() - limit);
+            }
+        }
+    }
+    if let Some(limit) = retain.filter(|limit| captured.len() > *limit) {
+        captured.drain(..captured.len() - limit);
+    }
+    Ok(captured)
 }
 
 fn render_arg(arg: &OsStr) -> String {
