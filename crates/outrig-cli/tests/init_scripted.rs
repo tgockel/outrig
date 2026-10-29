@@ -144,6 +144,57 @@ async fn idempotent_rerun_leaves_files_untouched() {
     );
 }
 
+/// #403: `--force` does reach the global-config phase, rewriting an
+/// existing file from scratch rather than skipping it as the undocumented
+/// behavior used to.
+#[tokio::test]
+async fn force_rewrites_an_existing_global_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    // Pre-seed a global config naming a provider/model this run's answers
+    // don't: if phase 1 reran, nothing here survives it.
+    let pre_global = "default-model = \"stale\"\n\
+                      \n\
+                      [providers.stale-provider]\n\
+                      style = \"openai\"\n\
+                      base-url = \"https://stale.example/v1\"\n\
+                      api-key = \"${STALE_API_KEY}\"\n\
+                      \n\
+                      [models.stale]\n\
+                      provider = \"stale-provider\"\n\
+                      identifier = \"stale-model\"\n";
+    std::fs::write(&global, pre_global).unwrap();
+
+    let (mut prompt, _stderr_r) = scripted_prompt(ALL_DEFAULTS).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    timeout(
+        TEST_TIMEOUT,
+        run_with(true, Some(&global), &cwd, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("init must not hang")
+    .expect("init must succeed");
+
+    let global_text = std::fs::read_to_string(&global).unwrap();
+    assert_ne!(global_text, pre_global, "global config was not rewritten");
+    assert!(
+        !global_text.contains("stale"),
+        "the pre-seeded provider/model survived --force:\n{global_text}"
+    );
+    Config::load_from_str(&global_text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+
+    // The rest of the flow still ran against the freshly-written global.
+    let merged = Config::load(&cwd, Some(&global)).expect("merged config must load");
+    assert_eq!(merged.default_model.as_deref(), Some("fast"));
+}
+
 #[tokio::test]
 async fn skips_global_phase_when_global_exists() {
     let tmp = tempfile::tempdir().unwrap();

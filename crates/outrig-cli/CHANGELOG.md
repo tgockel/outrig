@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig init --force` now rewrites an existing global config, as the docs always said it
+  did.** Phase 1 (`~/.outrig/config.toml`) used to skip and log "using existing global
+  config" regardless of `--force`; only the nested `config init`/`image add` calls honored
+  it. `--force` now rewrites phase 1 the same way it already rewrites phase 3 (the
+  image-config loop). Phase 2 (the repo config) is unaffected -- it still has no safe
+  "rewrite" semantic, since the file may hold tuned `[images.*]` blocks `init` knows
+  nothing about -- and the docs are corrected to say so plainly rather than claim every
+  nested write is forced. (#403)
 - **A `view = "primary"` server's capabilities can no longer come back through a setuid binary,
   and a `cap-drop` its launcher needs is refused when the config is read.** `outrig-enter` becomes
   the session's uid/gid before it execs the server, and now sets `no_new_privs` there as well, so

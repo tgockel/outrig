@@ -19,7 +19,7 @@ outrig init [--force]
 
 | Flag      | Default | Description                                                                |
 |-----------|---------|----------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing files. Propagates to `config init` and `image add`.     |
+| `--force` | off     | Overwrite an existing global config; see "Re-running" below.              |
 
 ## Run it
 
@@ -50,10 +50,17 @@ print their options' descriptions before they open.
 [outrig] wrote ~/.outrig/config.toml
 ```
 
-If the global config already exists, that step is skipped:
+If the global config already exists, that step is skipped unless `--force` is given:
 
 ```
 [outrig] using existing global config at ~/.outrig/config.toml
+```
+
+With `--force`, it is rewritten instead -- the same providers/models prompts run again,
+and the old file's contents are discarded:
+
+```
+[outrig] --force: overwriting existing global config at ~/.outrig/config.toml
 ```
 
 Then the repo half:
@@ -165,8 +172,18 @@ Without `--force`, `outrig init` skips work that's already done:
 - Image-config loop -> always offered, since adding more image-configs later is the expected
   workflow.
 
-With `--force`, every nested write rewrites in place. You probably want the more targeted
-commands instead -- `outrig config init --force` or `outrig image add <name> --force`.
+`--force` only reaches the global-config phase and the image loop:
+
+- Global config present -> rewritten from scratch (same prompts as a fresh run).
+- Repo `config.toml` present -> still skipped. There's no safe "rewrite" semantic for it:
+  the file may hold tuned `[images.*]` blocks this orchestrator knows nothing about, and
+  a blind overwrite would discard them. Delete it yourself to redo this phase.
+- Image-config loop -> each `image add` call runs with `--force`, so a name that collides
+  with an existing `[images.<name>]` block or Dockerfile is overwritten instead of refused.
+
+To force only the repo-config phase, there's no targeted command -- it's inline to `init`.
+To rewrite only the global config or only one image-config, use the narrower commands
+instead: `outrig config init --force` or `outrig image add <name> --force`.
 
 > **TODO: Incomplete** -- non-interactive mode (`outrig init --provider openai --model fast
 > ...`) is deferred.

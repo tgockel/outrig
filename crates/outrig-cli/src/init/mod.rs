@@ -2,10 +2,14 @@
 //!
 //! Each phase is independently idempotent:
 //! 1. **Global config** -- defer to [`config::init::run_with`] when
-//!    `~/.outrig/config.toml` is absent; log + skip when present.
+//!    `~/.outrig/config.toml` is absent, or always under `--force`; log +
+//!    skip when present and `--force` is off.
 //! 2. **Repo config** -- [`repo::ensure`] writes `.agents/outrig/config.toml`
 //!    against `cwd` if missing. Also reused by `outrig image add` as a
-//!    fallback when run in an uninitialized repo.
+//!    fallback when run in an uninitialized repo. `--force` does **not**
+//!    propagate here: the file may hold tuned `[images.*]` blocks this
+//!    orchestrator knows nothing about, so there's no safe "rewrite it"
+//!    semantic. A user who wants a fresh one deletes it explicitly.
 //! 3. **Image loop** -- offer to scaffold image-configs by
 //!    delegating to [`image::add::run_with`] in a loop.
 //!
@@ -42,18 +46,28 @@ pub async fn run_with(
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
 ) -> Result<()> {
-    // Phase 1: global config.
+    // Phase 1: global config. `--force` rewrites an existing file here (the
+    // nested `config_init::run_with` already honors it); without it an
+    // existing file is left alone and this phase is skipped entirely.
     let global_path = global_config_path(global_override)?;
-    if global_path.exists() {
+    let global_exists = global_path.exists();
+    if global_exists && !force {
         eprintln!(
             "[outrig] using existing global config at {}",
             global_path.display()
         );
     } else {
-        eprintln!(
-            "[outrig] no global config found at {} -- let's create one.",
-            global_path.display()
-        );
+        if global_exists {
+            eprintln!(
+                "[outrig] --force: overwriting existing global config at {}",
+                global_path.display()
+            );
+        } else {
+            eprintln!(
+                "[outrig] no global config found at {} -- let's create one.",
+                global_path.display()
+            );
+        }
         config_init::run_with(force, &global_path, prompt, hf).await?;
         eprintln!("[outrig] wrote {}", global_path.display());
     }

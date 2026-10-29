@@ -119,7 +119,7 @@ outrig init [--force]
 
 | Flag      | Default | Description                                                                |
 |-----------|---------|----------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing files. Propagates to `config init` and `image add`.     |
+| `--force` | off     | Overwrite an existing global config; see "Re-running" in usage/init.md.   |
 
 See [Usage -> outrig init](../usage/init.md).
 
