@@ -668,7 +668,7 @@ def every_event() -> list[tuple[str, dict, str | None]]:
         ("agent.request.failed", {"request": 7, "message": "why"}, c),
         (
             "agent.request.settled",
-            {"request": 7, "outcome": "failed", "attempts": 1, "rounds": [1]},
+            {"request": 7, "outcome": "failed", "attempts": 1, "rounds": [1], "cause": None},
             c,
         ),
         ("agent.request.refused", {"request": 7, "ended": "failed"}, c),

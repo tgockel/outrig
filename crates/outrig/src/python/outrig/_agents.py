@@ -87,6 +87,10 @@ class CompletionRejected(AgentError):
 
     `value` is the last value it answered with and `problems` what was wrong with it, each a
     `outrig.schema.Problem`; both are empty when it never answered.
+
+    When a model call of the child's failed and ended one of those rounds -- the provider
+    refused a reply, say -- the child did not stop of its own accord, and `__cause__` is an
+    `AgentRequestFailed` whose message says how the call failed. It is `None` otherwise.
     """
 
     def __init__(self, message, value=None, problems=()):

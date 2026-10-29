@@ -1062,6 +1062,7 @@ impl Inner {
             outcome,
             attempts,
             rounds,
+            cause: line["cause"].as_str().map(str::to_string),
         });
     }
 
@@ -1276,10 +1277,21 @@ impl Inner {
     }
 
     /// End request `id`, open on `child`, `outcome` -- `rejected`, `budget`
-    /// or `failed` -- for `message`.
-    pub(crate) fn settle(&self, child: &str, id: u64, outcome: &str, message: &str) {
+    /// or `failed` -- for `message`. `cause`, when there is one, is how a
+    /// model call of the child's failed and ended a round: the parent's
+    /// exception carries it as its `__cause__`, and the event the end is
+    /// recorded in.
+    pub(crate) fn settle(
+        &self,
+        child: &str,
+        id: u64,
+        outcome: &str,
+        message: &str,
+        cause: Option<&str>,
+    ) {
         self.interpreter.tell(json!({
             "t": "settle", "agent": child, "id": id, "outcome": outcome, "message": message,
+            "cause": cause,
         }));
     }
 

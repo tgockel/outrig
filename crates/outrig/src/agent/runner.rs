@@ -81,6 +81,10 @@ pub(crate) async fn run(
     let mut baseline = Summary::default();
     // Why the child's model can answer nothing, once a round has found so.
     let mut broken: Option<String> = None;
+    // The latest round that failed after its code ran, by the submission it
+    // opened on and how it failed: the cause a rejection of that submission
+    // carries, and no other's.
+    let mut cut: Option<(u64, String)> = None;
     let mut wait = RETRY_FIRST;
     // The instance, until its child's orienting round has ended or cannot be had.
     let mut orienting = instance;
@@ -107,7 +111,7 @@ pub(crate) async fn run(
                 children.oriented(&id, instance, Some((outcome, &why)));
             }
             for request in children.open(&id) {
-                children.settle(&id, request, outcome, &why);
+                children.settle(&id, request, outcome, &why, None);
             }
             children.idle(&id);
             drop(children);
@@ -131,6 +135,7 @@ pub(crate) async fn run(
                         "the child ended two rounds without completing submission {submission}, \
                          so it ended without completing"
                     ),
+                    cause_of(cut.as_ref(), submission),
                 );
             }
             children.idle(&id);
@@ -145,6 +150,8 @@ pub(crate) async fn run(
         if !children.round_opened(&id, agent.history.next_round()) {
             return;
         }
+        // The submission the round opens on, if it opens on one.
+        let mut opened_on = None;
         let (lead, detail) = match kind {
             _ if orienting.is_some() => (orientation::ORIENTING.to_string(), String::new()),
             ChildKind::Request => (
@@ -153,6 +160,7 @@ pub(crate) async fn run(
             ),
             ChildKind::Work => match live.taken.first() {
                 Some(&submission) => {
+                    opened_on = Some(submission);
                     let result_type = children
                         .submission(submission)
                         .map(|given| given.result_type)
@@ -172,6 +180,7 @@ pub(crate) async fn run(
                         children.round_ended(&id);
                         continue;
                     };
+                    opened_on = Some(submission);
                     orientation::submission(
                         submission,
                         &given.inputs,
@@ -237,6 +246,7 @@ pub(crate) async fn run(
                     "child agent {id}'s round failed after its code ran; deciding again in \
                      {wait:?}: {failed}"
                 );
+                cut = opened_on.map(|submission| (submission, failed));
                 back_off(&mut wait).await;
             }
             // Only the last of a run of failures gets here, the others having
@@ -258,8 +268,38 @@ pub(crate) async fn run(
     }
 }
 
+/// What a rejection of `submission` carries of `cut`, the latest round that
+/// failed on a model call after its code ran: that round's failure, if it
+/// opened on `submission`. A submission taken late, after the runner gave up
+/// waiting for it to be given, is read by the next round without passing the
+/// place a round opens on a new one, so the failure of an earlier submission's
+/// round is not cleared before it, and is never this one's.
+fn cause_of(cut: Option<&(u64, String)>, submission: u64) -> Option<&str> {
+    cut.filter(|(of, _)| *of == submission)
+        .map(|(_, failure)| failure.as_str())
+}
+
 /// Wait `wait`, and double it for the failure after, up to [`RETRY_MAX`].
 async fn back_off(wait: &mut Duration) {
     tokio::time::sleep(*wait).await;
     *wait = (*wait * 2).min(RETRY_MAX);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cause_of;
+
+    /// A round's failure is the cause of a rejection of the submission it opened on only: one
+    /// left by an earlier submission's round is not carried to the next, however that next one
+    /// came to be taken.
+    #[test]
+    fn a_failed_rounds_cause_is_its_own_submissions() {
+        let cut = (3, "finish reason content_filter".to_string());
+        assert_eq!(
+            cause_of(Some(&cut), 3),
+            Some("finish reason content_filter")
+        );
+        assert_eq!(cause_of(Some(&cut), 4), None);
+        assert_eq!(cause_of(None, 3), None);
+    }
 }

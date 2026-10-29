@@ -135,7 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is no turn the model ended, and is treated as the empty one is: retried, sent once more without
   the results, and left out of the conversation. It had been read as the model finishing, and two
   such rounds rejected a child's request as ended without completing, though the child never chose
-  to stop. (#755) An alias naming
+  to stop. (#755) A work child's request rejected for its rounds ending without completing raises
+  a `CompletionRejected` whose `__cause__` is an `AgentRequestFailed` saying how a model call
+  ended a round, when one did after the round's code ran, so a parent can tell a provider that
+  refused the replies from a child that gave up; `agent.request.settled` records the same text as
+  `cause`. (#756) An alias naming
   several models resolves to each this build can reach, in order, and a call that still fails moves
   to the next, starting again at the first on every call. Each model a call goes to is sent a view
   assembled for its own window, and carries its own reply ceiling, so a turn too large for the first

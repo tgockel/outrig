@@ -423,7 +423,9 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
   child had taken it.
 - `agent.request.settled` -- how it ended: `request`; `outcome`, which is `accepted`, `rejected`,
   `failed`, `cancelled`, `released`, `budget`, `closed`, or `terminated`; `attempts`, the answers
-  it took; and `rounds`, the child's rounds it was open during.
+  it took; `rounds`, the child's rounds it was open during; and `cause`, `null`, or for a request
+  rejected after a round of the child failed on a model call once its code had run, the text of
+  that failure, which the sender's `CompletionRejected` carries as its `__cause__`.
 - `agent.request.refused` -- an answer to a request that had already ended, refused: `request`,
   and `ended`, how it had ended.
 - `agent.call.started` -- a call of a function declared with `@outrig.agent` launched the

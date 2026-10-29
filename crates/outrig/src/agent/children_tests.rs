@@ -444,7 +444,7 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
                      second = child.submit({{'xs': [2, 3]}}, result=Total)\n\
                      print(second.status.state)\n\
                      try:\n    await first\n\
-                     except outrig.CompletionRejected as e:\n    print(e)\n\
+                     except outrig.CompletionRejected as e:\n    print(e, e.__cause__)\n\
                      print((await second).total)"
                 )),
             ),
@@ -460,6 +460,10 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
             && said.ends_with("5\n"),
         "{said}"
     );
+    assert!(
+        said.contains("so it ended without completing None\n"),
+        "no round failed on a model call, so nothing is chained: {said}"
+    );
     let child = of_agent(&requests, "ROLE stubborn");
     assert_eq!(
         child.len(),
@@ -474,6 +478,63 @@ async fn a_work_child_that_ends_two_rounds_without_completing_fails() {
         .map(|event| data(event)["outcome"].clone())
         .collect();
     assert_eq!(outcomes, ["rejected", "accepted"]);
+    assert!(
+        kind(&events, "agent.request.settled", None)
+            .into_iter()
+            .all(|event| data(event)["cause"].is_null())
+    );
+}
+
+/// The model calls a filtered reply costs a round: the call, and the call sent again without the
+/// latest results. The config's `retry-budget-secs = 0` leaves no retry between them.
+const FILTERED_CALLS: usize = 2;
+
+/// A work child whose round runs code and then meets only replies the provider filtered fails
+/// that round, and the next ends on a plain stop without completing: the request is rejected,
+/// and the parent's exception chains the failed round as its `__cause__`, an `AgentRequestFailed`
+/// naming the finish reason, which the settled event carries too.
+#[tokio::test]
+async fn a_rejection_chains_the_round_a_filtered_reply_failed() {
+    let mut child = vec![submit("c1", &py("print('ran')"))];
+    child.extend(std::iter::repeat_n(
+        mock_http::Style::Anthropic.empty("refusal"),
+        FILTERED_CALLS,
+    ));
+    child.push(text_reply("done"));
+    let mut tree = tree(
+        "OUTRIG_TEST_CHILD_CHAINED_CAUSE",
+        "",
+        vec![
+            ("ROLE filtered", scripted(child)),
+            (
+                "",
+                primary_runs(&format!(
+                    "{TOTAL}\nimport outrig\n\
+                     child = await runtime.spawn('s', prompt='ROLE filtered')\n\
+                     first = child.submit({{'xs': [1]}}, result=Total)\n\
+                     try:\n    await first\n\
+                     except outrig.CompletionRejected as e:\n    \
+                         print(type(e.__cause__).__name__, e.__cause__)"
+                )),
+            ),
+        ],
+    )
+    .await;
+    round(&mut tree.session, "go").await;
+    let (_, events, requests) = tree.end().await;
+    let said = printed(&requests, "p1");
+    assert!(
+        said.starts_with("AgentRequestFailed ") && said.contains("finish reason refusal"),
+        "{said}"
+    );
+    let settled = data(kind(&events, "agent.request.settled", None)[0]);
+    assert_eq!(settled["outcome"], "rejected");
+    assert!(
+        settled["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("finish reason refusal")),
+        "{settled}"
+    );
 }
 
 // ---------------------------------------------------------------------------- request children

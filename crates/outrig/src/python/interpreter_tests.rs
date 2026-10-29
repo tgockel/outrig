@@ -5230,6 +5230,54 @@ fn a_request_the_host_ended_before_it_was_queued_is_not_queued() {
     assert_eq!(said, "failed 0 0\n");
 }
 
+/// A rejection the host gives a `cause` raises `CompletionRejected` with an `AgentRequestFailed`
+/// as its `__cause__`, as `raise ... from` makes it, so a traceback shows both, and the host hears
+/// the cause in the end; one it gives none has no `__cause__`.
+#[test]
+fn a_rejection_with_a_cause_raises_it_chained() {
+    let mut k = Interpreter::start();
+    k.output(1, "import outrig");
+    k.spawn_as(2, "work = await runtime.spawn('w', prompt='p')", "c1");
+    let (_, notices) = k.noted(
+        PRIMARY,
+        3,
+        "chained = work.submit({}, result=int)\nplain = work.submit({}, result=int)",
+    );
+    let sent: Vec<&Value> = notices
+        .iter()
+        .filter(|n| n["t"] == "agent.request")
+        .collect();
+    assert_eq!(sent.len(), 2, "{notices:?}");
+    let mut ended = Vec::new();
+    for (request, cause) in sent
+        .iter()
+        .zip([json!("finish reason content_filter"), Value::Null])
+    {
+        k.send(json!({
+            "t": "settle", "agent": request["child"], "id": request["request"],
+            "outcome": "rejected", "message": "ended without completing", "cause": cause,
+        }));
+        ended.push(k.until("agent.ended", Vec::new()).1);
+    }
+    assert_eq!(ended[0]["cause"], "finish reason content_filter");
+    assert!(ended[1]["cause"].is_null(), "{}", ended[1]);
+    assert_eq!(
+        k.output(
+            4,
+            "import traceback\n\
+             for h in (chained, plain):\n    \
+                 try:\n        \
+                     await h\n    \
+                 except outrig.CompletionRejected as e:\n        \
+                     shown = ''.join(traceback.format_exception(e))\n        \
+                     print(e, '|', type(e.__cause__).__name__, e.__cause__, '|', \
+                           'direct cause' in shown)"
+        ),
+        "ended without completing | AgentRequestFailed finish reason content_filter | True\n\
+         ended without completing | NoneType None | False\n"
+    );
+}
+
 /// A submission waits until the host gives it to the work child between rounds; its inputs are
 /// then bound, and the child completes it with the JSON form of its result, which the handle
 /// gives back as an instance. Progress arrives on the handle and settles nothing.

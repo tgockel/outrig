@@ -428,13 +428,17 @@ pub enum Payload {
         received: bool,
     },
     /// How the request ended, how many answers it took, and the child's
-    /// rounds it spanned.
+    /// rounds it spanned. `cause` is how a model call of the child's failed
+    /// and ended a round of them, when one did and the request was rejected
+    /// for the child's rounds ending without completing: the text its
+    /// sender's exception carries as `__cause__`.
     #[non_exhaustive]
     AgentRequestSettled {
         request: AgentRequestId,
         outcome: RequestEnd,
         attempts: u32,
         rounds: Vec<u32>,
+        cause: Option<String>,
     },
     /// An answer to a request that had already ended, refused.
     #[non_exhaustive]

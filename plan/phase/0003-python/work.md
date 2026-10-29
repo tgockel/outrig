@@ -221,7 +221,10 @@ wait only ("The handle").
 For a **work child** the summary is its one submission, and the rule has one more step. A round that
 ends without a completion that passed earns one more round asking for the result by the submission's
 id, and if that round ends without one too, the submission settles with `CompletionRejected` whose
-message says the child ended without completing. What happens to the child follows from what it is:
+message says the child ended without completing. When a model call failed and ended one of those
+rounds after its code ran, the child did not stop of its own accord, and the exception's
+`__cause__` is an `AgentRequestFailed` saying how the call failed, as `raise ... from` would set
+it. What happens to the child follows from what it is:
 a decorated call's child is released, as it is whenever its one call settles; an explicit work child
 stays, idle, and a submission queued behind the failed one opens its own round next, since a new
 submission is a change in the summary. The skill parser (`skills.md`) is a decorated call and

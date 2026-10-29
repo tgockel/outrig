@@ -1247,6 +1247,7 @@ pub outrig::harness::event::Payload::AgentRequestSent::request: outrig::harness:
 pub outrig::harness::event::Payload::AgentRequestSent::sender: alloc::string::String
 #[non_exhaustive] pub outrig::harness::event::Payload::AgentRequestSettled
 pub outrig::harness::event::Payload::AgentRequestSettled::attempts: u32
+pub outrig::harness::event::Payload::AgentRequestSettled::cause: core::option::Option<alloc::string::String>
 pub outrig::harness::event::Payload::AgentRequestSettled::outcome: outrig::harness::event::RequestEnd
 pub outrig::harness::event::Payload::AgentRequestSettled::request: outrig::harness::event::AgentRequestId
 pub outrig::harness::event::Payload::AgentRequestSettled::rounds: alloc::vec::Vec<u32>

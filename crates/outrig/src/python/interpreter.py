@@ -6458,7 +6458,13 @@ def _settle_work(kernel, work_id, message):
     if work is None or outcome not in _HOST_ENDS:
         return
     text = message.get("message") or f"{work} ended {outcome}"
-    work.end(outcome, error=getattr(_agents, _HOST_ENDS[outcome])(text), message=text)
+    error = getattr(_agents, _HOST_ENDS[outcome])(text)
+    cause = message.get("cause")
+    if cause:
+        # What `raise error from _agents.AgentRequestFailed(cause)` sets: a model call of the
+        # child's failed and ended a round, which is not the child giving up.
+        error.__cause__ = _agents.AgentRequestFailed(cause)
+    work.end(outcome, error=error, message=text, cause=cause)
 
 
 def _oriented(kernel, instance_id, message):

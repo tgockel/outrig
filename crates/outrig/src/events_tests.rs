@@ -747,9 +747,10 @@ fn each_event_has_exactly_its_data_fields() {
                 outcome: RequestEnd::Accepted,
                 attempts: 1,
                 rounds: vec![1, 2],
+                cause: None,
             },
             "agent.request.settled",
-            &["request", "outcome", "attempts", "rounds"],
+            &["request", "outcome", "attempts", "rounds", "cause"],
         ),
         (
             Payload::AgentRequestRefused {
