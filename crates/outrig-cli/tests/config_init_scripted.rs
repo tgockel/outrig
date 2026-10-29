@@ -739,3 +739,79 @@ async fn a_max_tokens_answer_that_is_not_a_number_is_asked_again() {
         "the refused max-tokens must be asked for again:\n{shown}"
     );
 }
+
+/// #402: a non-empty default (`max-tokens for this model [default: 64000]`)
+/// means Enter yields the default, not a blank answer -- so a blank line
+/// alone can never omit it. `-` must reach `None` instead.
+#[tokio::test]
+async fn a_dash_at_max_tokens_omits_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // The script of `writes_anthropic_config_with_max_tokens`, answering
+    // max-tokens with `-` instead of accepting the default.
+    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n-\n\n\n";
+    let (text, _shown) = write_config(&target, script, &mut hf).await;
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+
+    assert!(
+        !text.contains("max-tokens"),
+        "max-tokens must be omitted on `-`:\n{text}"
+    );
+    assert_eq!(cfg.models["sonnet"].max_tokens, None);
+}
+
+/// #402: with two or more models defined, the `Default model name` prompt
+/// suggests a real model name, so Enter (a blank line) always yields that
+/// name rather than a blank answer -- `-` must reach "no default-model"
+/// instead.
+#[tokio::test]
+async fn a_dash_at_default_model_name_leaves_it_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // Provider defaults (4), no extra provider, define a model; name (fast),
+    // provider, identifier gpt-a, add another (y); name fast-2 (default),
+    // provider, identifier gpt-b, no extra model, then `-` at
+    // `Default model name`.
+    let script = b"\n\n\n\n\n\n\n\ngpt-a\ny\n\n\ngpt-b\nn\n-\n";
+    let (text, _shown) = write_config(&target, script, &mut hf).await;
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+
+    assert!(
+        !text.contains("default-model"),
+        "default-model must be left unset on `-`:\n{text}"
+    );
+}
+
+/// #402 follow-up: `-` is a legal model name (a bare TOML key), so it must
+/// stay reachable as the `Default model name` answer when a model is
+/// actually named that -- the omission sentinel only applies once the typed
+/// `-` names nothing.
+#[tokio::test]
+async fn a_model_literally_named_dash_can_still_be_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    // Provider defaults (4), no extra provider, define a model; name `-`,
+    // provider, identifier gpt-dash, add another (y); name (default
+    // `fast`, since `-` is taken by the first model but `fast` is not),
+    // provider, identifier gpt-b, no extra model, then `-` at
+    // `Default model name` -- `-` sorts first among ASCII punctuation and
+    // letters, so it is the suggested default and must be accepted as the
+    // real model name rather than treated as "no default".
+    let script = b"\n\n\n\n\n\n-\n\ngpt-dash\ny\n\n\ngpt-b\nn\n-\n";
+    let (text, _shown) = write_config(&target, script, &mut hf).await;
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+
+    assert!(
+        text.contains("default-model = \"-\""),
+        "typing `-` must select the model actually named `-`, not omit it:\n{text}"
+    );
+}

@@ -61,6 +61,11 @@ variable name, or a `max-tokens` or `context-length` that is not a number. The A
 takes the name of the variable that holds the key -- `OPENAI_API_KEY`, or `${OPENAI_API_KEY}` as
 it is stored -- never the key itself, and its refusal does not repeat what was typed.
 
+A prompt whose default is itself a value -- `max-tokens for this model [default: 64000]` or,
+with two or more models defined, `Default model name` -- cannot be left unset by pressing Enter,
+since that accepts the default shown. Type `-` instead to omit `max-tokens` or leave
+`default-model` unset.
+
 The prompts that follow depend on the style you pick.
 
 `anthropic` asks the same connection questions with its own defaults
