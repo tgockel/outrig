@@ -224,7 +224,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
        | sh -s -- -y --no-modify-path --default-toolchain stable \
                   --profile minimal --component rustfmt,clippy \
  && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
-RUN npm install -g @modelcontextprotocol/server-filesystem
+RUN npm install -g @modelcontextprotocol/server-filesystem mcp-server-commands
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
 ```
@@ -236,7 +236,7 @@ context = ".agents/outrig/images/rust-dev"
 
   [images.rust-dev.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
-  shell = ["bash", "-lc", "exec shell-mcp-command"]
+  shell = ["mcp-server-commands"]
 ```
 "#;
 
