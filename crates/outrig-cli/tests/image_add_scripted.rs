@@ -261,7 +261,7 @@ async fn fallback_yes_bootstraps_repo_config() {
     // deterministic (`myproj-standard`).
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = Path::new("/dev/null");
 
     // Script: configure-now (Y) + 5 repo-config defaults (container name,
@@ -298,7 +298,7 @@ async fn fallback_yes_bootstraps_repo_config() {
 async fn fallback_yes_with_a_name_writes_it_as_default_image() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = tmp.path().join("global.toml");
     std::fs::write(&global, GLOBAL).unwrap();
 
@@ -340,6 +340,69 @@ async fn a_configured_repo_keeps_its_default_image() {
     let cfg = Config::load_from_str(&text).expect("config must parse");
     assert_eq!(cfg.default_image.as_deref(), Some("base"), "{text}");
     assert!(cfg.images.contains_key("coding"), "{text}");
+}
+
+/// #408: outside a git repository Enter declines the bootstrap, so a bare
+/// Enter in `$HOME` does not make the home directory a read-write workspace.
+#[tokio::test]
+async fn fallback_default_outside_git_declines() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A TMPDIR beneath a git repository would make the default yes.
+    if tmp.path().ancestors().any(|d| d.join(".git").exists()) {
+        eprintln!(
+            "skipping: {} is inside a git repository",
+            tmp.path().display()
+        );
+        return;
+    }
+    let global = Path::new("/dev/null");
+
+    let (mut prompt, _stderr) = scripted_prompt(b"\n").await;
+    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), Some(global), None, &mut prompt, &mut hf),
+    )
+    .await
+    .expect("fallback must not hang")
+    .expect_err("the default outside git must decline");
+
+    assert!(
+        matches!(err, CliError::Outrig(OutrigError::NoRepoConfig)),
+        "expected NoRepoConfig, got: {err:?}"
+    );
+    assert!(!tmp.path().join(".agents").exists());
+}
+
+/// #408: a `.git` above the directory counts, and an explicit `y` bootstraps
+/// even where the default is no.
+#[tokio::test]
+async fn fallback_explicit_yes_outside_git_bootstraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("myproj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = Path::new("/dev/null");
+
+    // `y`, then the same eight defaults as `fallback_yes_bootstraps_repo_config`.
+    add_from(&cwd, global, None, b"y\n\n\n\n\n\n\n\n\n\n")
+        .await
+        .expect("an explicit yes must bootstrap");
+    assert!(cwd.join(".agents/outrig/config.toml").is_file());
+}
+
+#[tokio::test]
+async fn fallback_default_below_a_git_root_bootstraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("repo/sub");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+    let global = Path::new("/dev/null");
+
+    add_from(&cwd, global, None, b"\n\n\n\n\n\n\n\n\n")
+        .await
+        .expect("the default inside a git repo must bootstrap");
+    assert!(cwd.join(".agents/outrig/config.toml").is_file());
 }
 
 #[tokio::test]
@@ -714,7 +777,7 @@ async fn a_dotted_name_is_written_quoted_and_loads() {
 async fn the_bootstraps_name_prompt_asks_again() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("myproj");
-    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
     let global = Path::new("/dev/null");
 
     // Configure-now, agent name, preamble, image name (refused), image

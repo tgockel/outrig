@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `image add` bootstrap no longer defaults to configuring a directory that is not in a git
+  repository.** Enter at "Configure outrig in this directory now?" in `$HOME` wrote
+  `host-path = "."` there, so every later `outrig run` below it mounted the home directory
+  read-write. The prompt now names the directory that becomes the workspace and defaults to no
+  unless a `.git` is in it or above it. (#408)
+
 - **`outrig image init` preserves an existing README, even with `--force`.** A project
   README no longer blocks scaffolding or gets replaced by the template. `--force` only
   regenerates `Dockerfile` and `image.toml`; a missing README is still created. (#406)
