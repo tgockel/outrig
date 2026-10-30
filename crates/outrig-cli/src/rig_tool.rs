@@ -1,7 +1,7 @@
 //! MCP -> Rig dynamic-tool adapter.
 //!
-//! [`McpToolAdapter`] wraps an MCP-discovered tool as a [`rig::tool::ToolDyn`]
-//! so the agent loop can hand it directly to a Rig `Agent`. The original
+//! [`McpToolAdapter`] wraps an MCP-discovered tool as an [`OutrigTool`] so the
+//! agent loop can hand it to a Rig `Agent` like any other. The original
 //! tool name (used on the MCP wire) lives next to the sanitized
 //! `<server>__<tool>` name (the form the LLM sees, produced by
 //! [`outrig::sanitize_tool_name`]), so a single adapter knows both ends of
@@ -9,17 +9,17 @@
 
 use std::sync::Arc;
 
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::tool::{ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde_json::Value;
 
 use crate::error::Result;
+use crate::session_tool::OutrigTool;
 use outrig::{McpClient, McpToolResult};
 
 /// A Rig dynamic-tool view of one MCP-discovered tool.
 ///
 /// `openai_name` is what the LLM sees and what
-/// [`ToolDyn::name`] returns. `mcp_tool_name` is the original name from
+/// [`OutrigTool::name`] returns. `mcp_tool_name` is the original name from
 /// `tools/list`, used on the wire when dispatching back into the MCP server.
 /// `client` is shared (via `Arc`) so multiple adapters fronting the same MCP
 /// server reuse one connection.
@@ -56,13 +56,6 @@ impl McpToolAdapter {
     }
 }
 
-/// Error wrapper that carries an MCP tool-call failure into rig's
-/// `ToolError::ToolCallError(Box<dyn Error>)` channel without leaking our
-/// concrete `OutrigError` type into rig's API.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct McpAdapterError(String);
-
 pub fn truncate_for_llm(result: &str, max: usize) -> String {
     if result.is_empty() || result.len() <= max {
         return result.to_string();
@@ -93,19 +86,21 @@ pub fn truncate_for_llm(result: &str, max: usize) -> String {
     }
 }
 
-/// Reduce a tool result to the single string `rig`'s tool interface carries.
+/// Reduce a tool result to the one text the model reads.
 ///
 /// The model sees the rendered view, not the blocks: an image block reaches a
 /// client connected to `outrig mcp`, but there is nowhere to put it here. The
-/// byte cap applies to that rendering.
-fn adapt_tool_result(result: McpToolResult, max: usize) -> std::result::Result<String, ToolError> {
+/// byte cap applies to that rendering. A failed call's text is the error's
+/// message, which is what the model is shown of it.
+fn adapt_tool_result(
+    result: McpToolResult,
+    max: usize,
+) -> std::result::Result<ToolOutput, ToolExecutionError> {
     let content_text = truncate_for_llm(&result.render_text(), max);
     if result.is_error {
-        Err(ToolError::ToolCallError(Box::new(McpAdapterError(
-            content_text,
-        ))))
+        Err(ToolExecutionError::new(ToolErrorKind::Other, content_text))
     } else {
-        Ok(content_text)
+        Ok(ToolOutput::text(content_text))
     }
 }
 
@@ -141,7 +136,7 @@ fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     index
 }
 
-impl ToolDyn for McpToolAdapter {
+impl OutrigTool for McpToolAdapter {
     fn name(&self) -> String {
         self.openai_name.clone()
     }
@@ -154,22 +149,18 @@ impl ToolDyn for McpToolAdapter {
         self.input_schema.clone()
     }
 
-    fn call(&self, args: String) -> WasmBoxedFuture<'_, std::result::Result<String, ToolError>> {
-        Box::pin(async move {
-            let parsed: Value = if args.is_empty() {
-                Value::Null
-            } else {
-                serde_json::from_str(&args)?
-            };
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> std::result::Result<ToolOutput, ToolExecutionError> {
+        let result = self
+            .client
+            .call_tool(&self.mcp_tool_name, args)
+            .await
+            .map_err(|e| ToolExecutionError::new(ToolErrorKind::Other, e.to_string()))?;
 
-            let result = self
-                .client
-                .call_tool(&self.mcp_tool_name, parsed)
-                .await
-                .map_err(|e| ToolError::ToolCallError(Box::new(McpAdapterError(e.to_string()))))?;
-
-            adapt_tool_result(result, self.result_cap_bytes)
-        })
+        adapt_tool_result(result, self.result_cap_bytes)
     }
 }
 
@@ -234,7 +225,9 @@ mod tests {
     fn adapt_tool_result_truncates_success_content() {
         let result = McpToolResult::ok("a".repeat(MAX + 1));
 
-        let output = adapt_tool_result(result, MAX).expect("success result");
+        let output = adapt_tool_result(result, MAX)
+            .expect("success result")
+            .render();
 
         assert!(output.len() <= MAX, "output len: {}", output.len());
         assert!(output.contains("[outrig: tool result truncated]"));
@@ -245,10 +238,7 @@ mod tests {
         let result = McpToolResult::error("e".repeat(MAX + 1));
 
         let err = adapt_tool_result(result, MAX).expect_err("error result");
-        let ToolError::ToolCallError(source) = err else {
-            panic!("expected tool-call error");
-        };
-        let msg = source.to_string();
+        let msg = err.message();
 
         assert!(msg.len() <= MAX, "error len: {}", msg.len());
         assert!(msg.contains("[outrig: tool result truncated]"));

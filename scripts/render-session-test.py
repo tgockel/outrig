@@ -201,25 +201,40 @@ def ordinary(
                     {"role": "user", "content": [{"type": "text", "text": "[outrig] 1 message"}]},
                     {
                         "role": "assistant",
-                        "id": None,
                         "content": [
-                            {"text": "Running it."},
                             {
-                                "id": "toolu_1",
-                                "call_id": None,
+                                "type": "text",
+                                "text": "Running it.",
+                                "native": {
+                                    "item": {"type": "text", "text": "Running it."},
+                                    "fingerprint": "9f3c1a2b4d5e6f70",
+                                },
+                            },
+                            {
+                                "type": "toolcall",
+                                "id": {"provider": "toolu_1"},
                                 "function": {
                                     "name": "submit_python",
                                     "arguments": {"source": source},
                                 },
                             },
                         ],
+                        "origin": {
+                            "api": "anthropic.messages",
+                            "provider": "anthropic",
+                            "model": "m",
+                            "response_model": "m",
+                            "response_id": "msg_1",
+                        },
+                        "stop": "tool_use",
                     },
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "toolresult",
-                                "id": "toolu_1",
+                                "call": {"provider": "toolu_1"},
+                                "name": "submit_python",
                                 "content": [{"type": "text", "text": "the result"}],
                             }
                         ],
@@ -234,7 +249,9 @@ def ordinary(
                 "turn": 1,
                 "round": 1,
                 "incomplete": False,
-                "messages": [{"role": "assistant", "id": None, "content": [{"text": "Done."}]}],
+                "messages": [
+                    {"role": "assistant", "content": [{"type": "text", "text": "Done."}]}
+                ],
             },
         ),
         (
@@ -504,43 +521,42 @@ def every_event() -> list[tuple[str, dict, str | None]]:
                     message,
                     {
                         "role": "assistant",
-                        "id": "i",
                         "content": [
-                            {"text": "t"},
+                            {"type": "text", "text": "t"},
                             {
-                                "id": "c",
-                                "call_id": None,
+                                "type": "toolcall",
+                                "id": {"provider": "c"},
                                 "function": {"name": "submit_python", "arguments": {"source": "s"}},
                             },
                             {
-                                "id": "c2",
-                                "call_id": None,
+                                "type": "toolcall",
+                                "id": {"local": "c2"},
                                 "function": {
                                     "name": "submit_python",
                                     "arguments": {"source": "refused"},
                                 },
                             },
                             {
-                                "id": "c3",
-                                "call_id": None,
+                                "type": "toolcall",
+                                "id": {"provider": "c3"},
                                 "function": {"name": "other", "arguments": {"x": "a"}},
                             },
-                            {
-                                "id": "r",
-                                "content": [
-                                    {"type": "text", "content": {"text": "t"}},
-                                    {"type": "summary", "content": "s"},
-                                ],
-                            },
+                            {"type": "reasoning", "text": "r"},
+                            {"type": "reasoning", "text": "", "redacted": True},
                         ],
+                        "stop": "tool_use",
                     },
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "toolresult",
-                                "id": "c",
-                                "content": [{"type": "text", "text": "t"}],
+                                "call": {"provider": "c"},
+                                "name": "submit_python",
+                                "content": [
+                                    {"type": "text", "text": "t"},
+                                    {"type": "json", "value": {"k": "v"}},
+                                ],
                             }
                         ],
                     },
@@ -846,8 +862,15 @@ NOT_SHOWN = [
     r"message\.(received|refused)\.data\.(channel|from|to)",
     # The model is shown from agent.started, which names the same one.
     r"model\.instructions\.data\.model",
-    # The provider's ids for a message, a tool call, reasoning, and the call a result answers.
-    r"turn\.committed\.data\.messages\.\d+(\.content\.\d+)?\.id",
+    # The provider's id for a tool call, and the call a result answers: rig's or the
+    # provider's, either way an identifier and not a reading.
+    r"turn\.committed\.data\.messages\.\d+\.content\.\d+\.(id|call)\.(provider|local)",
+    # The tool a result came from is the call's, shown with the call.
+    r"turn\.committed\.data\.messages\.\d+\.content\.\d+\.name",
+    # The provider's own item behind a block, which the block's text already renders.
+    r"turn\.committed\.data\.messages\.\d+\.content\.\d+\.native(\..+)?",
+    # Which provider and model wrote a turn, and how it stopped, are the call's to show.
+    r"turn\.committed\.data\.messages\.\d+\.(origin\..+|stop)",
     # A connection's own id, the container end, its Zeek state, and the session and container it
     # belongs to, which the page already names.
     r"network\.(uid|id\.orig_h|conn_state|outrig\.session_id|outrig\.container)",

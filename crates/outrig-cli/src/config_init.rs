@@ -428,9 +428,10 @@ pub(crate) async fn prompt_models_loop(
 
 /// An Anthropic model: the identifier, plus the output-token ceiling its API
 /// requires on every request. The default matches the published ceiling for
-/// the Claude 4 family, so accepting it never lowers one outrig would have
-/// sent anyway -- and an identifier outrig has no published ceiling for gets a
-/// number chosen for it here rather than the conservative fallback
+/// the default identifier and the current Claude families, so accepting it
+/// never lowers one outrig would have sent anyway (an older family's lower
+/// ceiling caps it) -- and an identifier outrig has no published ceiling for
+/// gets a number chosen for it here rather than the conservative fallback
 /// `build_agent` would otherwise apply.
 async fn prompt_anthropic_model(
     prompt: &mut impl PromptSource,
@@ -440,7 +441,7 @@ async fn prompt_anthropic_model(
         .ask_string(&MODEL_IDENTIFIER_FIELD, "claude-sonnet-4-6")
         .await?;
     let max_tokens =
-        ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens", 1).await?;
+        ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "128000", "max-tokens", 1).await?;
     let mut model = Model::new(provider_name);
     model.identifier = Some(identifier);
     model.max_tokens = max_tokens;

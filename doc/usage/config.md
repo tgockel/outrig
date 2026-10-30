@@ -68,7 +68,7 @@ The prompts that follow depend on the style you pick.
 
 ```sh
 ? Model identifier [default: claude-sonnet-4-6]:
-? max-tokens for this model [default: 64000]:
+? max-tokens for this model [default: 128000]:
 ```
 
 Anthropic's API requires an output-token ceiling on every request, so the generated config

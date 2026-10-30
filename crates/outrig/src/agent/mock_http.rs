@@ -31,8 +31,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 
 /// The identifier every canned response names. Recognized by rig, with a
-/// published ceiling of 64 000.
+/// published ceiling of 128 000 ([`MODEL_CEILING`]).
 pub(crate) const MODEL: &str = "claude-sonnet-4-6";
+
+/// The output-token ceiling rig's catalog publishes for [`MODEL`].
+pub(crate) const MODEL_CEILING: u32 = 128_000;
 
 /// The signature on the thinking an Anthropic canned response carries.
 pub(super) const SIGNATURE: &str = "signed-by-the-mock";
@@ -690,11 +693,13 @@ impl std::error::Error for Link {
 
 /// A transport failure as reqwest raises one: the outer text says only that
 /// sending failed, and the cause is in its `source()`.
-pub(super) fn transport_failure() -> rig::completion::CompletionError {
-    rig::completion::CompletionError::HttpError(rig::http_client::Error::Instance(Box::new(Link(
-        "error sending request",
-        Some(Box::new(Link("Connection refused", None))),
-    ))))
+pub(super) fn transport_failure() -> rig::error::ProviderError {
+    rig::error::ProviderError::Http(std::sync::Arc::new(rig::http_client::Error::instance(
+        Link(
+            "error sending request",
+            Some(Box::new(Link("Connection refused", None))),
+        ),
+    )))
 }
 
 /// Everything the mock has recorded so far.

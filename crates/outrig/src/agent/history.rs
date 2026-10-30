@@ -27,11 +27,13 @@
 //! each result ([`Refused`]), while the store keeps them whole.
 //!
 //! To Anthropic, a call also leaves out the thinking a change to what came
-//! before it made stale ([`Sending`]). Anthropic's newer models bind each
-//! thinking block to everything sent before it, and refuse one sent back
-//! after that changed. From the first turn whose earlier context a call
-//! changed, on, each block stays out for good; those before it, and those
-//! produced since, still go.
+//! before it made stale, and thinking no signature of Anthropic's vouches for
+//! ([`Sending`]). Anthropic's newer models bind each thinking block to
+//! everything sent before it, and refuse one sent back after that changed.
+//! From the first turn whose earlier context a call changed, on, each block
+//! stays out for good; those before it, and those produced since, still go.
+//! rig would send what is left out as the model's own text instead, which
+//! says the thinking aloud in the model's turn.
 //!
 //! Each call's [`Manifest`] records what it carried and why, which is the only
 //! answer to what a model had in front of it: a promotion asks, and the window,
@@ -43,7 +45,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use rig::OneOrMany;
 use rig::completion::Message;
 use rig::completion::message::{AssistantContent, ToolCall, ToolResultContent, UserContent};
 use serde_json::{Value, json};
@@ -113,7 +114,7 @@ impl Role {
     fn of(message: &Message) -> Option<Role> {
         match message {
             Message::User { .. } => Some(Role::User),
-            Message::Assistant { .. } => Some(Role::Assistant),
+            Message::Assistant(_) => Some(Role::Assistant),
             Message::System { .. } => None,
         }
     }
@@ -229,7 +230,7 @@ impl Sending<'_> {
     /// whose parts it takes is left out whole, and anything else goes.
     fn keeps(self, turn: usize, message: &Message) -> bool {
         match message {
-            Message::Assistant { content, .. } => content.iter().any(|part| self.takes(turn, part)),
+            Message::Assistant(reply) => reply.content.iter().any(|part| self.takes(turn, part)),
             _ => true,
         }
     }
@@ -246,26 +247,26 @@ fn fit(
 ) -> Vec<Message> {
     let mut sent = Vec::with_capacity(messages.len());
     for (message, original) in messages.iter().enumerate() {
-        let Message::Assistant { id, content } = original else {
+        let Message::Assistant(reply) = original else {
             sent.push(original.clone());
             continue;
         };
         if !sending.keeps(turn, original) {
             // A reply of nothing the call takes made no tool call, so leaving
             // it out whole leaves no result unanswered.
-            left_out.extend(content.iter().enumerate().map(|(part, _)| LeftOut {
+            left_out.extend(reply.content.iter().enumerate().map(|(part, _)| LeftOut {
                 turn,
                 message,
                 part,
             }));
             continue;
         }
-        if content.iter().all(|part| sending.takes(turn, part)) {
+        if reply.content.iter().all(|part| sending.takes(turn, part)) {
             sent.push(original.clone());
             continue;
         }
         let mut kept = Vec::new();
-        for (part, content) in content.iter().enumerate() {
+        for (part, content) in reply.content.iter().enumerate() {
             if sending.takes(turn, content) {
                 kept.push(content.clone());
             } else {
@@ -276,13 +277,10 @@ fn fit(
                 });
             }
         }
-        // Kept has a part, since the call keeps the reply.
-        if let Ok(content) = OneOrMany::many(kept) {
-            sent.push(Message::Assistant {
-                id: id.clone(),
-                content,
-            });
-        }
+        // Kept has a part, since the call keeps the reply. The reply's origin
+        // and stop go with it: they are what lets its provider replay what is
+        // kept as its own.
+        sent.push(Message::Assistant(reply.clone().with_content(kept)));
     }
     sent
 }
@@ -331,7 +329,7 @@ fn without_results(mut messages: Vec<Message>, notice: &str) -> Vec<Message> {
         };
         for part in content.iter_mut() {
             if let UserContent::ToolResult(result) = part {
-                result.content = OneOrMany::one(ToolResultContent::text(notice));
+                result.content = vec![ToolResultContent::text(notice)];
             }
         }
     }
@@ -354,18 +352,16 @@ pub(crate) fn as_sent(turn: usize, messages: &[Message], left_out: &[LeftOut]) -
         .iter()
         .enumerate()
         .filter_map(|(message, original)| match original {
-            Message::Assistant { id, content } => OneOrMany::many(
-                content
+            Message::Assistant(reply) => {
+                let kept: Vec<_> = reply
+                    .content
                     .iter()
                     .enumerate()
                     .filter(|&(part, _)| !named(message, part))
-                    .map(|(_, content)| content.clone()),
-            )
-            .ok()
-            .map(|content| Message::Assistant {
-                id: id.clone(),
-                content,
-            }),
+                    .map(|(_, content)| content.clone())
+                    .collect();
+                (!kept.is_empty()).then(|| Message::Assistant(reply.clone().with_content(kept)))
+            }
             other => Some(other.clone()),
         })
         .collect()
@@ -1443,7 +1439,7 @@ pub(crate) fn split_turns(messages: Vec<Message>) -> Vec<Vec<Message>> {
     let mut turns: Vec<Vec<Message>> = Vec::new();
     for message in messages {
         match turns.last_mut() {
-            Some(turn) if !matches!(message, Message::Assistant { .. }) => turn.push(message),
+            Some(turn) if !matches!(message, Message::Assistant(_)) => turn.push(message),
             _ => turns.push(vec![message]),
         }
     }
@@ -1465,14 +1461,14 @@ fn mirror(round: u32, messages: &[Message], incomplete: bool) -> Value {
                     match part {
                         UserContent::Text(part) => prompt.push(part.text.as_str()),
                         UserContent::ToolResult(result) => {
-                            results.insert(result.id.as_str(), texts(result.content.iter()));
+                            results.insert(result.call.clone(), texts(result.content.iter()));
                         }
                         _ => {}
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                for part in content.iter() {
+            Message::Assistant(reply) => {
+                for part in reply.content.iter() {
                     match part {
                         AssistantContent::Text(part) => text.push(part.text.as_str()),
                         AssistantContent::ToolCall(call) => calls.push(call),
@@ -1486,12 +1482,18 @@ fn mirror(round: u32, messages: &[Message], incomplete: bool) -> Value {
     let calls: Vec<Value> = calls
         .into_iter()
         .map(|call| {
-            let arguments = &call.function.arguments;
-            let source = match arguments.get("source").and_then(Value::as_str) {
-                Some(source) => source.to_string(),
-                None => arguments.to_string(),
+            let function = &call.function;
+            // What the model sent, when it was not the object the tool takes:
+            // rig keeps the text and leaves the arguments empty.
+            let source = match (
+                function.arguments.get("source").and_then(Value::as_str),
+                &function.invalid_arguments,
+            ) {
+                (Some(source), _) => source.to_string(),
+                (None, Some(raw)) => raw.clone(),
+                (None, None) => Value::Object(function.arguments.clone()).to_string(),
             };
-            let result = results.remove(call.id.as_str()).unwrap_or_default();
+            let result = results.remove(&call.id).unwrap_or_default();
             json!({"source": source, "result": result})
         })
         .collect();
@@ -1508,7 +1510,8 @@ fn mirror(round: u32, messages: &[Message], incomplete: bool) -> Value {
 fn texts<'a>(parts: impl Iterator<Item = &'a ToolResultContent>) -> String {
     parts
         .filter_map(|part| match part {
-            ToolResultContent::Text(part) => Some(part.text.as_str()),
+            ToolResultContent::Text(part) => Some(part.text.clone()),
+            ToolResultContent::Json { value } => Some(value.to_string()),
             ToolResultContent::Image(_) => None,
         })
         .collect::<Vec<_>>()

@@ -7,22 +7,21 @@
 //!
 //! What this pins:
 //!
-//! * a turn that produced only reasoning goes out with the next prompt, as an
-//!   assistant message with no text and its reasoning in `reasoning_content`,
-//!   so roles still alternate -- from a lone model and from a chain candidate,
-//!   which are built apart -- while outrig's own history keeps the turn as rig
-//!   returned it;
-//! * reasoning beside text goes back exactly as it always has;
+//! * a turn that produced only reasoning stays in outrig's history as rig
+//!   returned it, and the next request still alternates roles: rig leaves a
+//!   turn with nothing to send out of a Chat request and merges the prompts
+//!   on either side of it, and sends a hand-built one -- a chain's shared
+//!   history -- as the turn's text;
+//! * reasoning beside text goes back under `reasoning_content`, as it came;
 //! * a tool result goes out as the tool returned it, byte for byte, even when
-//!   it is JSON that rig would read as structured.
+//!   it is JSON that a reader could take for structure.
 
 mod common;
 
 use std::net::SocketAddr;
 
-use rig::OneOrMany;
 use rig::completion::Message;
-use rig::completion::message::AssistantContent;
+use rig::completion::message::{AssistantContent, AssistantMessage};
 use serde_json::{Value, json};
 
 use outrig::config::Config;
@@ -105,30 +104,29 @@ async fn mock_agent(addr: SocketAddr, var: &str, model: &str) -> RigAgent {
 /// The turn a reasoning model stopped at its output ceiling leaves in history:
 /// reasoning, and nothing else.
 fn reasoning_only_turn() -> Message {
-    Message::Assistant {
-        id: None,
-        content: OneOrMany::one(AssistantContent::reasoning(REASONING)),
-    }
+    Message::Assistant(AssistantMessage::new(vec![AssistantContent::reasoning(
+        REASONING,
+    )]))
 }
 
 // ---- tests ----------------------------------------------------------------
 
-/// A turn that produced only reasoning goes out with the next prompt.
+/// A turn that produced only reasoning is kept, and the next request still
+/// alternates roles.
 ///
 /// The OpenAI sibling of `anthropic_mock.rs`'s
-/// `a_reasoning_only_turn_is_recovered_and_reported`. rig's OpenAI conversion
-/// turns an assistant message with no text and no tool call into nothing, so
-/// this turn used to stay in outrig's history and vanish from every later
-/// request: the prompts on either side of it went out as two user messages in
-/// a row. The model answered without knowing it had taken a turn, and an
-/// endpoint that requires alternating roles refused the request with a `400`
-/// that ended `outrig run`.
+/// `a_reasoning_only_turn_is_recovered_and_reported`: a reasoning model that
+/// ended its turn having only reasoned. A Chat message needs content or calls,
+/// so rig leaves the turn out of the next request -- as it always did -- and
+/// merges the prompts on either side of it into one user message. That is
+/// what keeps an endpoint that requires alternating roles from refusing the
+/// request with a `400`, which used to end `outrig run`.
 #[tokio::test]
-async fn a_reasoning_only_turn_reaches_the_next_request() {
+async fn a_reasoning_only_turn_merges_the_prompts_around_it() {
     let (addr, mut requests) = start_mock_http(vec![
         completion(
             json!({ "role": "assistant", "content": null, "reasoning_content": REASONING }),
-            "length",
+            "stop",
         ),
         text_reply("Not yet."),
     ])
@@ -157,32 +155,32 @@ async fn a_reasoning_only_turn_reaches_the_next_request() {
     let messages = recorded[1].messages();
     assert_eq!(
         recorded[1].roles(),
-        ["system", "user", "assistant", "user"],
-        "the turn goes out between the prompts on either side of it: {messages:#?}",
+        ["system", "user"],
+        "the turn has nothing a Chat message can carry, so the prompts on either \
+         side of it are one user message: {messages:#?}",
     );
     assert_eq!(
-        messages[2],
-        json!({
-            "role": "assistant",
-            "content": [{ "type": "text", "text": "" }],
-            "reasoning_content": REASONING,
-        }),
-        "as the empty reply it was, its reasoning beside it",
+        messages[1]["content"],
+        json!([
+            { "type": "text", "text": "Can the helper take a &Path?" },
+            { "type": "text", "text": "Did you change anything?" },
+        ]),
+        "{messages:#?}",
     );
 
-    assert_eq!(
-        history[1],
-        reasoning_only_turn(),
-        "only the request changes: outrig's history keeps the turn as rig returned \
-         it, since a chain sends that history to an Anthropic candidate too, and \
-         Anthropic refuses an empty text block",
+    let Message::Assistant(turn) = &history[1] else {
+        panic!("the turn is the assistant's: {history:#?}");
+    };
+    assert!(
+        matches!(
+            turn.content.as_slice(),
+            [AssistantContent::Reasoning(reasoning)] if reasoning.text == REASONING
+        ),
+        "outrig's history keeps the turn as rig returned it: {turn:#?}",
     );
 }
 
-/// Reasoning beside text goes back exactly as it always has.
-///
-/// Only a message rig would otherwise drop is changed on its way out. One that
-/// carries text always reached the wire, its reasoning in `reasoning_content`.
+/// Reasoning beside text goes back under the field it came in.
 #[tokio::test]
 async fn reasoning_beside_text_goes_back_as_before() {
     let (addr, mut requests) = start_mock_http(vec![
@@ -215,7 +213,7 @@ async fn reasoning_beside_text_goes_back_as_before() {
         messages[2],
         json!({
             "role": "assistant",
-            "content": [{ "type": "text", "text": "It can." }],
+            "content": "It can.",
             "reasoning_content": REASONING,
         }),
     );
@@ -223,9 +221,10 @@ async fn reasoning_beside_text_goes_back_as_before() {
 
 /// An alias chain's OpenAI candidate is sent a reasoning-only turn too.
 ///
-/// A chain builds its candidates in `build_candidate`, apart from the
-/// `build_single` path a lone model takes, so it needs the same wrapper. The
-/// history is what such a turn leaves behind.
+/// The history holds the turn as a hand-built one, with no record of which
+/// provider wrote it: reasoning with no provider item to replay goes out as
+/// the turn's text, since there is no field on this dialect to carry it, and
+/// the model still learns it took a turn.
 #[tokio::test]
 async fn a_chain_candidate_is_sent_a_reasoning_only_turn() {
     let (addr, mut requests) = start_mock_http(vec![text_reply("Not yet.")]).await;
@@ -252,17 +251,16 @@ async fn a_chain_candidate_is_sent_a_reasoning_only_turn() {
         ["system", "user", "assistant", "user"],
         "{messages:#?}",
     );
-    assert_eq!(messages[2]["reasoning_content"], REASONING);
+    assert_eq!(messages[2]["content"], REASONING, "{messages:#?}");
 }
 
 /// A tool result goes out as the tool returned it, even when it is JSON that
-/// rig would read as structured.
+/// a reader could take for structure.
 ///
-/// rig 0.40 re-parses each tool result a hook leaves alone. One with a
-/// top-level `response` key went out as that value alone, re-serialized, so a
-/// stub mapping read from a file lost the `request` it matches. One carrying
-/// an image, in `parts` or as the whole object, became an image, which this
-/// arm's conversion refuses (#253).
+/// A tool's text is never meant as structure, and rig once re-parsed it as
+/// such (#253): one with a top-level `response` key went out as that value
+/// alone, so a stub mapping read from a file lost the `request` it matches.
+/// This pins that nothing between the tool and the wire does.
 #[tokio::test]
 async fn a_json_tool_result_reaches_the_model_as_written() {
     let var = "OUTRIG_TEST_OPENAI_RESULT_AS_WRITTEN";

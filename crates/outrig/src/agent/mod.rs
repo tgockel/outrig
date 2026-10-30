@@ -43,8 +43,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rig::completion::{PromptError, ToolDefinition};
-use rig::tool::ToolDyn;
+use rig::completion::PromptError;
+use rig::tool::tool_definition;
 
 use crate::config::{Config, Secrets};
 use crate::error::OutrigError;
@@ -305,11 +305,7 @@ impl Agent {
             user.is_some().then(|| Arc::clone(&lifecycle)),
         );
         let interrupts = tool.interrupts();
-        let definition = ToolDefinition {
-            name: tool.name(),
-            description: tool.description(),
-            parameters: tool.parameters(),
-        };
+        let definition = tool_definition(&tool);
         let overhead = budget::overhead(
             &preamble,
             [
@@ -321,14 +317,7 @@ impl Agent {
         // Each candidate's budget is settled in building: the reply's reserve
         // is the ceiling that reaches the wire, which building may fill in or
         // lower.
-        let agent = build::build_agent(
-            resolved,
-            &preamble,
-            vec![Box::new(tool) as Box<dyn ToolDyn>],
-            &history,
-            slot,
-            overhead,
-        )?;
+        let agent = build::build_agent(resolved, &preamble, tool, &history, slot, overhead)?;
         let budget = agent
             .model
             .budgets()
@@ -347,7 +336,7 @@ impl Agent {
             model: budget.model.clone(),
             preamble: preamble.clone(),
             tools: vec![event::ToolDefinition {
-                name: definition.name,
+                name: definition.name.to_string(),
                 description: definition.description,
                 parameters: definition.parameters,
             }],

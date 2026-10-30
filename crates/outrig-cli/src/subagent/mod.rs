@@ -1446,7 +1446,7 @@ mod tests {
         }
     }
 
-    impl rig::tool::ToolDyn for CountedTool {
+    impl crate::session_tool::OutrigTool for CountedTool {
         fn name(&self) -> String {
             self.name.to_string()
         }
@@ -1459,21 +1459,20 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        fn call<'a>(
-            &'a self,
-            _args: String,
-        ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>> {
-            Box::pin(async move {
-                let Some(entered) = &self.blocking else {
-                    return Ok(String::new());
-                };
-                entered.count.fetch_add(1, Ordering::SeqCst);
-                // There is one readiness waiter. notify_one retains a permit if
-                // the increment lands between its predicate check and await,
-                // unlike notify_waiters.
-                entered.ready.notify_one();
-                std::future::pending().await
-            })
+        async fn call(
+            &self,
+            _context: &mut rig::tool::ToolContext,
+            _args: serde_json::Value,
+        ) -> Result<rig::tool::ToolOutput, rig::tool::ToolExecutionError> {
+            let Some(entered) = &self.blocking else {
+                return Ok(rig::tool::ToolOutput::text(""));
+            };
+            entered.count.fetch_add(1, Ordering::SeqCst);
+            // There is one readiness waiter. notify_one retains a permit if
+            // the increment lands between its predicate check and await,
+            // unlike notify_waiters.
+            entered.ready.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -1813,11 +1812,20 @@ mod tests {
         }
 
         /// The text of the request's last message. On a round's first call,
-        /// that is the prompt the round was started with.
+        /// that is the prompt the round was started with. rig merges adjacent
+        /// user messages into one, so a prompt that follows a folded steer is
+        /// the last text block of a content array.
         fn last_text(&self) -> &str {
-            self.messages()
-                .last()
-                .and_then(|message| message["content"].as_str())
+            let content = &self.messages().last().expect("a request has messages")["content"];
+            content
+                .as_str()
+                .or_else(|| {
+                    content
+                        .as_array()?
+                        .iter()
+                        .rev()
+                        .find_map(|block| block["text"].as_str())
+                })
                 .unwrap_or_default()
         }
 
@@ -3150,6 +3158,21 @@ mod tests {
         );
     }
 
+    /// A call whose arguments are no JSON object never reaches a tool: rig
+    /// answers it itself. The breaker counts it all the same, or a model that
+    /// keeps sending one would run to the turn limit, a billed model call
+    /// each time.
+    #[tokio::test]
+    async fn a_call_with_malformed_arguments_counts_toward_the_breaker() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+        let name = crate::builtin_tool::name_of("set_result");
+        for _ in 0..4 {
+            provider.next_call().await.call_tools(&[(&name, "[]")]);
+        }
+        assert_stopped_by_the_breaker(&registry).await;
+    }
+
     /// #231: the repeat breaker ended the round from inside the call that
     /// tripped it, before rig had committed that call's result, so the
     /// subagent's history ended in a tool call nothing answered. OpenAI and
@@ -3211,6 +3234,28 @@ mod tests {
     #[tokio::test]
     async fn the_breaker_outranks_a_cap_reached_in_the_same_batch() {
         a_call_batched_after_the_breaker_does_not_run(4).await;
+    }
+
+    /// A batch whose last call rig will not dispatch -- its arguments no JSON
+    /// object -- reaches the cap through it, as it did when such a call
+    /// reached the tool. A steer queued during the batch is not folded into
+    /// the result before it, which no model call would read, and runs as the
+    /// next round, as it does when a call that ran reaches the cap.
+    #[tokio::test]
+    async fn a_steer_cut_off_by_a_cap_a_malformed_call_reached_runs_as_the_next_round() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 1).await;
+        let name = crate::builtin_tool::name_of("set_result");
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.call_tools(&[
+            (&name, r#"{"status":"result","body":"   "}"#),
+            (&name, "[]"),
+        ]);
+
+        let call = provider.next_call().await;
+        assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+        call.reply("ok");
     }
 
     /// Like the cap, the breaker ends a round at its next model call without

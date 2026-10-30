@@ -10,16 +10,22 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rig::DynModel;
 use rig::agent::{Agent, AgentBuilder};
-use rig::client::CompletionClient;
-use rig::completion::CompletionModel;
-use rig::providers::{anthropic, openai};
-use rig::tool::ToolDyn;
-use serde_json::{Map, Value, json};
+use rig::driver::Model;
+use rig::effect::model_key;
+use rig::handlers::Handlers;
+use rig::http_client::DynHttpClient;
+use rig::operation::Completion;
+use rig::providers::anthropic::wire::{
+    ANTHROPIC, AnthropicConfig, Dialect, Messages, Quirks, ToolInputStreaming,
+};
+use rig::providers::openai::OpenAIConfig;
+use rig::tool::Tool;
 
 use super::AgentError;
 use super::budget::Budget;
-use super::failover::{Binding, Candidate, FailoverModel, ModelCandidate};
+use super::failover::{Binding, CHAIN_LABEL, Candidate, FailoverModel, ModelCandidate};
 use super::history::History;
 use super::ledger::CallSlot;
 use super::resolve::{LlmResolveError, ResolvedAgent, ResolvedCandidate, ResolvedProvider};
@@ -42,11 +48,43 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// line, which is the trade this number is chosen for.
 pub(crate) const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 32_768;
 
-/// A Rig agent over a failover chain of the resolved candidates.
-pub(crate) type RigAgent = Agent<FailoverModel>;
+/// Anthropic's own dialect under another name, for a model built not to ask
+/// the API to drop stale thinking: rig asks only on the dialect it knows as
+/// Anthropic's, so a request through this one carries neither the field nor
+/// its beta. Same endpoint, same key, same quirks.
+const ANTHROPIC_UNBOUND: Dialect = Dialect {
+    name: "anthropic-unbound",
+    quirks: Quirks::anthropic(),
+    ..ANTHROPIC
+};
+
+/// A Rig agent over a failover chain of the resolved candidates: rig's runner,
+/// and the chain it dispatches every model call to, which is what the round
+/// reads of the agent's model.
+pub(crate) struct RigAgent {
+    pub(crate) agent: Agent,
+    pub(crate) model: FailoverModel,
+}
+
+impl RigAgent {
+    /// Hold calls to the chain's head to a `window` of tokens in place of the
+    /// one it was built with, for a test that could not know to configure it.
+    /// Only while no call is in flight: the agent's handler table holds the
+    /// chain too, so it is taken out while the head changes and put back.
+    #[cfg(test)]
+    pub(crate) fn narrow_head(&mut self, window: u32) {
+        let key = model_key(CHAIN_LABEL);
+        self.agent.handlers().deregister(&key);
+        self.model.narrow_head(window);
+        self.agent
+            .handlers()
+            .register(key, self.model.clone())
+            .expect("the chain registers again");
+    }
+}
 
 /// Build the agent for `resolved`, with `preamble` as its system prompt and
-/// `tools` as its whole tool list, naming its calls and attempts in `slot` and
+/// `tool` as its whole tool list, naming its calls and attempts in `slot` and
 /// taking a moved call's view from `history`. Every call carries `overhead`
 /// besides the conversation. Does no I/O.
 ///
@@ -54,18 +92,18 @@ pub(crate) type RigAgent = Agent<FailoverModel>;
 /// is the ceiling building settles: one whose window leaves a round too little
 /// room fails the build, whichever candidate it is. The chain holds them
 /// ([`FailoverModel::budgets`]).
-pub(crate) fn build_agent(
+pub(crate) fn build_agent<T: Tool + 'static>(
     resolved: &ResolvedAgent,
     preamble: &str,
-    tools: Vec<Box<dyn ToolDyn>>,
+    tool: T,
     history: &History,
     slot: CallSlot,
     overhead: u64,
 ) -> Result<RigAgent, AgentError> {
     // One policy for the whole chain, so its `chain_deadline` is the same
     // handle in every candidate's HTTP client and model wrapper. Arming it once
-    // per `completion()` call is what bounds the chain's worst case at one
-    // budget rather than one per candidate.
+    // per completion is what bounds the chain's worst case at one budget rather
+    // than one per candidate.
     //
     // The budget itself comes from the head's provider. A chain spanning
     // providers that disagree on `retry-budget-secs` has no single right
@@ -92,12 +130,25 @@ pub(crate) fn build_agent(
     }
 
     let chain = FailoverModel::new(candidates, policy, slot, Arc::new(history.clone()));
+    // The chain is the agent's model: rig dispatches every model call to the
+    // handler registered under the label the agent is built over.
+    let handlers = Handlers::default();
+    handlers
+        .register(model_key(CHAIN_LABEL), chain.clone())
+        .map_err(|report| client_build(report.message))?;
     // No `max_tokens` here: the chain sets each attempt's to its candidate's.
-    let mut builder = AgentBuilder::new(chain).preamble(preamble);
+    // A finish reason rig does not know is a normal stop, as it was before
+    // rig told them apart: a proxy's own word for one must not fail a round.
+    let mut builder = AgentBuilder::over_handlers(handlers, CHAIN_LABEL, model_key(CHAIN_LABEL))
+        .preamble(preamble)
+        .accept_unknown_finish_reasons(true);
     if let Some(temperature) = resolved.temperature {
         builder = builder.temperature(f64::from(temperature));
     }
-    Ok(builder.tools(tools).build())
+    Ok(RigAgent {
+        agent: builder.tool(tool).build(),
+        model: chain,
+    })
 }
 
 /// Build one link of the chain: its client, its retry stack, its model, and
@@ -113,18 +164,22 @@ fn build_candidate(
     overhead: u64,
 ) -> Result<Box<dyn Candidate>, AgentError> {
     let retries = Retries::new(slot.clone(), &candidate.model_name);
-    let http = remote_http_client(candidate.provider.request_timeout_secs(), policy, &retries)?;
+    let http = DynHttpClient::new(remote_http_client(
+        candidate.provider.request_timeout_secs(),
+        policy,
+        &retries,
+    )?);
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url, api_key, ..
         } => {
-            let client = openai::CompletionsClient::builder()
-                .api_key(api_key.expose())
-                .base_url(base_url)
-                .http_client(http)
-                .build()
-                .map_err(client_build)?;
-            let model = client.completion_model(&candidate.model_identifier);
+            // Chat Completions, never Responses: an OpenAI-compatible proxy
+            // serves `/chat/completions`, and the configured `base-url` is
+            // sent as written.
+            let model = OpenAIConfig::new(api_key.expose())
+                .with_base_url(base_url)
+                .connect(http)
+                .chat(&candidate.model_identifier);
             link(
                 candidate,
                 policy,
@@ -142,30 +197,29 @@ fn build_candidate(
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and the
             // native content blocks. It also normalizes a trailing `/v1` or
             // `/messages` off the configured base URL.
-            let client = |betas: &[&str]| {
-                anthropic::Client::builder()
-                    .api_key(api_key.expose())
-                    .base_url(base_url)
-                    .anthropic_betas(betas)
-                    .http_client(http.clone())
-                    .build()
-                    .map_err(client_build)
-            };
-            // Calls ask for `drop_block` under its beta (`anthropic_params`),
-            // until the endpoint refuses that and they go through the same
-            // model at a client that does not send it.
-            let (bound, max_tokens) =
-                anthropic_model(&client(&[THINKING_BINDING_BETA])?, candidate);
-            let mut model = client(&[])?.completion_model(&candidate.model_identifier);
-            model.default_max_tokens = bound.default_max_tokens;
+            //
+            // Calls ask for `drop_block`, as rig does for a model it knows to
+            // bind its thinking, until the endpoint refuses that and they go
+            // through the same model built not to ask.
+            let (bound, max_tokens) = anthropic_model(
+                AnthropicConfig::new(api_key.expose()).with_base_url(base_url),
+                http.clone(),
+                candidate,
+            );
+            let (unbound, _) = anthropic_model(
+                AnthropicConfig::with_key(&ANTHROPIC_UNBOUND, api_key.expose())
+                    .with_base_url(base_url),
+                http,
+                candidate,
+            );
             link(
                 candidate,
                 policy,
                 retries,
                 overhead,
-                model,
+                bound,
                 Some(max_tokens),
-                Some((bound, anthropic_params())),
+                Some(unbound),
             )
         }
     }
@@ -173,9 +227,9 @@ fn build_candidate(
 
 /// `model`, retried under `policy` and recorded by `retries`, as `candidate`'s
 /// link of the chain: its calls carry `max_tokens`, and `overhead` besides the
-/// conversation. With `binding`, they go through its model instead, each
-/// carrying its fields in their body, until the endpoint refuses that. What
-/// every provider's link shares.
+/// conversation. With `unbound`, they go through it instead once the endpoint
+/// has refused a request that asked for `drop_block`. What every provider's
+/// link shares.
 fn link<M>(
     candidate: &ResolvedCandidate,
     policy: &RetryPolicy,
@@ -183,10 +237,10 @@ fn link<M>(
     overhead: u64,
     model: M,
     max_tokens: Option<u32>,
-    binding: Option<(M, Map<String, Value>)>,
+    unbound: Option<M>,
 ) -> Result<Box<dyn Candidate>, AgentError>
 where
-    M: CompletionModel + Send + Sync + 'static,
+    M: Into<DynModel<Completion>>,
 {
     let budget = Budget::new(candidate, max_tokens, overhead)?;
     tracing::debug!(
@@ -200,12 +254,8 @@ where
         overhead = budget.overhead,
         "built a candidate; each call to it is held to this budget"
     );
-    let binding = binding.map(|(model, params)| {
-        Binding::new(
-            RetryingModel::new(model, policy.clone(), retries.clone()),
-            params,
-        )
-    });
+    let binding = unbound
+        .map(|model| Binding::new(RetryingModel::new(model, policy.clone(), retries.clone())));
     Ok(Box::new(ModelCandidate::new(
         RetryingModel::new(model, policy.clone(), retries),
         &candidate.model_identifier,
@@ -282,36 +332,8 @@ fn remote_http_client(
     ))
 }
 
-/// The `anthropic-beta` value under which a request may say what becomes of a
-/// thinking block whose conversation changed.
-const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
-
-/// What every request to an Anthropic candidate carries besides what rig
-/// builds of it, under [`THINKING_BINDING_BETA`], until its endpoint refuses
-/// it.
-///
-/// Anthropic's newer models bind a thinking block to everything sent before
-/// it, and refuse a request that sends one back after that changed -- as a
-/// cut of the view, a round's window moving on, or a promotion does. Each
-/// call leaves such thinking out itself (`history::Sending`), so this is a
-/// backstop, for a change the store does not see: with `drop_block`, the API
-/// leaves out such a block, and every one after it, rather than refuse the
-/// call. Thinking is left to the model, as it is when the field is absent on
-/// the models that check. A model that takes no `adaptive` thinking, or an
-/// endpoint that does not know the beta, refuses it, and every later call to
-/// it goes without (`Candidate::unbind`).
-fn anthropic_params() -> Map<String, Value> {
-    Map::from_iter([(
-        "thinking".to_string(),
-        json!({
-            "type": "adaptive",
-            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
-        }),
-    )])
-}
-
-/// One candidate's Anthropic model, and the output-token ceiling that reaches
-/// the wire with it.
+/// One candidate's Anthropic model at `config` over `http`, and the
+/// output-token ceiling that reaches the wire with it.
 ///
 /// Precedence, highest first: the agent's or model's `max-tokens`, then rig's
 /// published ceiling for an identifier it recognizes, then
@@ -319,26 +341,19 @@ fn anthropic_params() -> Map<String, Value> {
 /// rejects a request that carries none. Under a chain it runs per candidate,
 /// which is what makes the ceiling travel with the identifier instead of
 /// staying the head's.
+///
+/// The model sends its tools without `eager_input_streaming`: nothing here
+/// streams, and a gateway that does not know the field refuses the request.
 pub(crate) fn anthropic_model(
-    client: &anthropic::Client<RetryingHttpClient>,
+    config: AnthropicConfig,
+    http: DynHttpClient,
     candidate: &ResolvedCandidate,
-) -> (
-    anthropic::completion::CompletionModel<RetryingHttpClient>,
-    u32,
-) {
-    // `completion_model`, never `CompletionModel::with_model`: the two
-    // disagree about a model identifier rig does not recognize. This one
-    // leaves the default unset, which is the signal the fallback below keys
-    // off. `with_model` would have already capped every reply at 2048 tokens,
-    // silently.
-    //
-    // No prompt caching yet, unlike `outrig run`'s (#669). A full view is now
-    // cut in steps and only grows between cuts (#666), so a cache marker at the
-    // end of the request is read back by the next call, and turning it on is
-    // #751. Rig's `with_prompt_caching` also marks the last message, so
-    // marking only the system prompt and tools is not a flag it offers.
-    let mut model = client.completion_model(&candidate.model_identifier);
-    let max_tokens = match (candidate.max_tokens, model.default_max_tokens) {
+) -> (Model<Messages>, u32) {
+    let mut model = config.connect(http).completion(&candidate.model_identifier);
+    // rig's own ceiling for the identifier, from its catalog, or none for one
+    // it does not recognize -- which is the signal the fallback below keys off.
+    let published = model.wire.default_max_tokens;
+    let max_tokens = match (candidate.max_tokens, published) {
         // The published ceiling is a cap as well as a default. A configured
         // ceiling above it is a request the API refuses outright, so lowering
         // it is the only outcome that runs at all.
@@ -355,9 +370,12 @@ pub(crate) fn anthropic_model(
                 candidate.model_identifier,
                 candidate.model_name,
             );
-            model.default_max_tokens = Some(u64::from(ANTHROPIC_FALLBACK_MAX_TOKENS));
             u64::from(ANTHROPIC_FALLBACK_MAX_TOKENS)
         }
     };
+    model.wire = model
+        .wire
+        .with_default_max_tokens(max_tokens)
+        .with_tool_input_streaming(ToolInputStreaming::Off);
     (model, u32::try_from(max_tokens).unwrap_or(u32::MAX))
 }

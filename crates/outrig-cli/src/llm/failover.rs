@@ -25,51 +25,73 @@
 //! run the turn against candidate one, re-run it against candidate two -- is
 //! the wrong one, and `tools_run_before_a_move_are_not_re_executed` pins it.
 //!
-//! Three things follow from sitting there, and each is a design constraint
+//! Four things follow from sitting there, and each is a design constraint
 //! rather than a detail:
 //!
+//! * **The chain is the agent's model.** rig's runner calls its model through
+//!   a handler it dispatches completions to, and lets the host register that
+//!   handler ([`rig::agent::AgentBuilder::over_handlers`]). `FailoverModel` is
+//!   that handler ([`Serve`]): it answers each completion the runner
+//!   dispatches with the reply of whichever candidate answered, as that
+//!   candidate's wire decoded it, so the reply keeps the provider and model it
+//!   came from -- which is what lets a later call replay the model's thinking.
+//!   Every agent's model is one, of one candidate when no alias names more.
 //! * **The candidates are heterogeneous.** An alias may span an OpenAI row and
-//!   an Anthropic one, whose rig models are different concrete types with
-//!   different associated types. `CompletionModel` is not object-safe -- a
-//!   `Clone` supertrait, associated types, `impl Future` returns, a generic
-//!   `make` -- so [`Candidate`] is the small object-safe trait that stands in
-//!   front of them, and `FailoverModel` implements `CompletionModel` in terms
-//!   of a `Vec` of those.
+//!   an Anthropic one. rig erases a model's wire and transport behind a
+//!   [`DynModel`](rig::DynModel), and [`Candidate`] is the small trait that
+//!   stands in front of that with what a chain rewrites per candidate.
 //! * **The budget has to be shared.** Three candidates each spending the full
 //!   `retry-budget-secs` against a total outage is a worst case worse than no
 //!   failover at all, so the chain arms one [`ChainDeadline`] per call and
 //!   every candidate's retry loop below it observes the same bound.
 //! * **A failure must not disappear.** Each candidate's reason for being
 //!   abandoned is kept, and exhausting the chain reports all of them together
-//!   rather than only the last.
+//!   rather than only the last. What leaves the chain is the report rig hands
+//!   the turn ([`report`]), which names the failure's class by a code, so the
+//!   REPL reads a class rather than parsing an error's text.
+//! * **Neither is a refusal of `drop_block`.** rig asks Anthropic's API to
+//!   drop thinking a change to the conversation made stale, for a model its
+//!   catalog says binds its thinking to the conversation, under the beta that
+//!   takes the request. An endpoint at a custom `base-url` that refuses the
+//!   request for asking -- a gateway that does not know the beta -- is sent the
+//!   call again through the same model built not to ask, and every later call
+//!   to it goes without ([`Candidate::unbind`]).
 //!
 //! [`RetryingHttpClient`]: super::retry::RetryingHttpClient
 //! [`RetryingModel`]: super::retry::RetryingModel
 //! [`ChainDeadline`]: super::retry::ChainDeadline
 //! [`retry`]: super::retry
 
+// rig's `ProviderError` is what each candidate hands back by value, and what
+// the chain carries from one to the next; boxing it in OutRig's own functions
+// would only move the size.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rig::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, PromptError,
+    CompletionRequest, CompletionResponse, ModelRef, PromptError, ProviderCapabilities,
 };
-use rig::streaming::StreamingCompletionResponse;
+use rig::effect::{Answered, EffectKind, FamilyDescriptor, HandlerDescriptor, family, model_key};
+use rig::error::{ErrorKind, ErrorReport, ProviderError};
+use rig::serve::{Dispatch, Reply, Serve};
 
-use super::retry::RetryPolicy;
+use super::retry::{self, RetryPolicy, RetryingModel, candidate_failure_label};
 
-/// One candidate of a chain, behind an object-safe interface.
-///
-/// `CompletionModel` cannot be a trait object, so this is the reduction of it a
-/// chain actually needs: run one completion, say whether native structured
-/// output composes with tools, and carry the two things that must be rewritten
-/// per candidate.
-///
-/// `Response` is erased to `()`. That is sound because nothing in outrig ever
-/// *reads* `CompletionResponse::raw_response` -- a property of outrig rather
-/// than of rig, which is why it is stated here rather than assumed: both
-/// arms' `Response` types are rig's own and outrig never touches them. The
-/// agent loop reads `choice`, `usage`, and `message_id`, all of which survive.
+/// The label the chain is registered under in the agent's handler table, which
+/// is what rig names the agent's model.
+pub(crate) const CHAIN_LABEL: &str = "outrig";
+
+/// The code a report carries when every candidate of a chain was abandoned,
+/// and the report's `retryable` says whether any reason could clear.
+pub(crate) const CODE_EXHAUSTED: &str = "outrig.exhausted";
+
+/// One candidate of a chain, behind an object-safe interface: run one
+/// completion, say what the provider composes, and carry what must be
+/// rewritten per candidate.
 pub(crate) trait Candidate: Send + Sync {
     /// The concrete `[models.<name>]` row, for the per-candidate report and the
     /// move announcement. Never the alias's name.
@@ -80,59 +102,87 @@ pub(crate) trait Candidate: Send + Sync {
     fn model_identifier(&self) -> &str;
 
     /// This candidate's own output-token ceiling, computed at build time
-    /// through the same precedence the single-candidate path uses.
+    /// through the same precedence for every candidate.
     ///
-    /// The load-bearing per-candidate rewrite. The ceiling is folded into the
-    /// agent at resolve time and capped, for Anthropic, against what the
-    /// identifier publishes -- so the value baked into the request is candidate
-    /// one's. Without this the identifier would move on a failover and the
-    /// ceiling would not.
+    /// The load-bearing per-candidate rewrite. The ceiling is capped, for
+    /// Anthropic, against what the identifier publishes -- so without this the
+    /// identifier would move on a failover and the ceiling would not.
     fn max_tokens(&self) -> Option<u64>;
 
-    /// Whether this candidate's native structured output composes with tools.
-    fn composes_native_output_with_tools(&self) -> bool;
+    /// What this candidate's provider composes: whether native structured
+    /// output composes with tools, and whether a forced tool choice is refused.
+    fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Stop asking the API to drop thinking a change to the conversation made
+    /// stale (`drop_block`), because this candidate's endpoint refused a
+    /// request that asked: whether it was asking.
+    fn unbind(&self) -> bool {
+        false
+    }
 
     /// Run one completion against this candidate.
     fn completion(
         &self,
         request: CompletionRequest,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<CompletionResponse<()>, CompletionError>> + Send + '_>,
+        Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
     >;
 }
 
-/// A [`Candidate`] over any concrete rig [`CompletionModel`].
+/// A [`Candidate`] over a provider's model, its wire erased.
 ///
-/// One generic adapter rather than an arm per provider: everything that differs
+/// One adapter rather than an arm per provider: everything that differs
 /// between an OpenAI candidate and an Anthropic one is already a value by the
 /// time it gets here.
-pub(crate) struct ModelCandidate<M> {
-    model: M,
+pub(crate) struct ModelCandidate {
+    model: RetryingModel,
     model_name: String,
     model_identifier: String,
     max_tokens: Option<u64>,
+    /// For an Anthropic candidate, the same model built not to ask for
+    /// `drop_block`, which its calls go through once its endpoint has refused
+    /// that.
+    binding: Option<Binding>,
 }
 
-impl<M> ModelCandidate<M> {
+impl ModelCandidate {
     pub(crate) fn new(
-        model: M,
+        model: RetryingModel,
         model_name: impl Into<String>,
         model_identifier: impl Into<String>,
         max_tokens: Option<u32>,
+        binding: Option<Binding>,
     ) -> Self {
         Self {
             model,
             model_name: model_name.into(),
             model_identifier: model_identifier.into(),
             max_tokens: max_tokens.map(u64::from),
+            binding,
         }
     }
 }
 
-impl<M> Candidate for ModelCandidate<M>
-where
-    M: CompletionModel + Send + Sync + 'static,
-{
+/// A candidate's model built not to ask for `drop_block` -- on a dialect rig
+/// does not bind thinking for, so neither the field nor its beta is sent --
+/// and whether its endpoint has refused the asking, which is when calls go
+/// through it: see [`Candidate::unbind`]. A request has no headers of its own,
+/// so going without the beta is going through another model.
+pub(crate) struct Binding {
+    unbound: RetryingModel,
+    refused: AtomicBool,
+}
+
+impl Binding {
+    pub(crate) fn new(unbound: RetryingModel) -> Self {
+        Self {
+            unbound,
+            refused: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Candidate for ModelCandidate {
     fn model_name(&self) -> &str {
         &self.model_name
     }
@@ -145,39 +195,40 @@ where
         self.max_tokens
     }
 
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.model.composes_native_output_with_tools()
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.model.capabilities()
+    }
+
+    fn unbind(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| !binding.refused.swap(true, Ordering::Relaxed))
     }
 
     fn completion(
         &self,
         request: CompletionRequest,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<CompletionResponse<()>, CompletionError>> + Send + '_>,
+        Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
     > {
-        Box::pin(async move {
-            let response = self.model.completion(request).await?;
-            // The erasure. Everything outrig reads survives; only the provider's
-            // untouched raw body is dropped -- see the trait's doc comment.
-            Ok(CompletionResponse {
-                choice: response.choice,
-                usage: response.usage,
-                raw_response: (),
-                message_id: response.message_id,
-            })
-        })
+        let model = match &self.binding {
+            Some(binding) if binding.refused.load(Ordering::Relaxed) => &binding.unbound,
+            _ => &self.model,
+        };
+        Box::pin(model.completion(request))
     }
 }
 
 /// Why one candidate was abandoned, kept so exhaustion can report every reason
 /// rather than only the last one's.
+#[derive(Debug)]
 struct Abandoned {
     model_name: String,
-    error: CompletionError,
+    error: ProviderError,
 }
 
-/// A [`CompletionModel`] over an ordered set of provider-equivalent candidates,
-/// moving to the next when the current one's own retry stack has given up.
+/// The agent's model: an ordered set of provider-equivalent candidates, moving
+/// to the next when the current one's own retry stack has given up.
 ///
 /// The move rule is **any `Err`**, including ones that are terminal for that
 /// candidate. A `401` is not retryable and must keep ending the process -- but
@@ -185,15 +236,16 @@ struct Abandoned {
 /// What must not happen is a failure disappearing, so every reason is kept and
 /// reported together on exhaustion.
 ///
-/// A chain of one is not a special case in the code, and is byte-for-byte the
-/// old behavior at runtime: one candidate, its error returned as it stands, and
-/// a deadline whose bound reproduces what the per-attempt budget already gave.
+/// A chain of one is not a special case in the code: one candidate, its error
+/// returned as it stands, and a deadline whose bound reproduces what the
+/// per-attempt budget already gave.
 ///
-/// `Clone` because rig's `CompletionModel` requires it and `Agent` clones the
-/// model per request. Every field shares rather than rebuilds: the candidates
-/// behind an `Arc`, since a boxed trait object cannot be cloned, and the
-/// policy's own clone deliberately shares the chain deadline and the record of
-/// who answered.
+/// `Clone` so the agent and its builder can both hold it: the agent's handler
+/// table owns one, and what the turn reads of the chain -- who answered -- is
+/// read through another. Every field shares rather than rebuilds: the
+/// candidates behind an `Arc`, since a boxed trait object cannot be cloned,
+/// and the policy's own clone deliberately shares the chain deadline and the
+/// record of who answered.
 #[derive(Clone)]
 pub struct FailoverModel {
     candidates: Arc<Vec<Box<dyn Candidate>>>,
@@ -204,15 +256,13 @@ pub struct FailoverModel {
     ///
     /// A set, because every call starts again at the head: one round of several
     /// calls can be answered by the head, by a fallback, or by both, and the
-    /// latest call's candidate says nothing of the others. Shared across rig's
-    /// per-request clones, as the policy's chain deadline is, so whoever holds
-    /// the model sees what any clone recorded. Never held across an await.
+    /// latest call's candidate says nothing of the others. Shared across the
+    /// clones, as the policy's chain deadline is, so whoever holds the model
+    /// sees what any clone recorded. Never held across an await.
     answered: Arc<Mutex<BTreeSet<usize>>>,
-    /// ANDed across the chain, computed once at build time -- see
-    /// [`composes_native_output_with_tools`].
-    ///
-    /// [`composes_native_output_with_tools`]: Self::composes_native_output_with_tools
-    composes: bool,
+    /// Reduced across the chain, computed once at build time -- see
+    /// [`FailoverModel::new`].
+    capabilities: ProviderCapabilities,
 }
 
 impl FailoverModel {
@@ -223,21 +273,25 @@ impl FailoverModel {
     ///
     /// [`chain_deadline`]: super::retry::RetryPolicy::chain_deadline
     pub(crate) fn new(candidates: Vec<Box<dyn Candidate>>, policy: RetryPolicy) -> Self {
-        // ANDed rather than delegated to candidate one. rig resolves the output
-        // mode *before* the call, so a move mid-call cannot re-resolve it, and
-        // a chain that answered `true` on candidate one's behalf would promise
+        // Reduced rather than delegated to candidate one. rig resolves the
+        // output mode *before* the call, so a move mid-call cannot re-resolve
+        // it, and a chain that answered for candidate one would promise
         // something candidate two may not honor. The conservative reduction is
-        // the only answer a chain can give -- and a homogeneous chain (the
-        // overwhelmingly common case: the same weights at three vendors) pays
-        // nothing for it.
-        let composes = candidates
-            .iter()
-            .all(|candidate| candidate.composes_native_output_with_tools());
+        // the only answer a chain can give -- composition only when every
+        // candidate composes, a refusal when any refuses -- and a homogeneous
+        // chain (the overwhelmingly common case: the same weights at three
+        // vendors) pays nothing for it.
+        let each: Vec<_> = candidates.iter().map(|c| c.capabilities()).collect();
+        let capabilities = ProviderCapabilities::new()
+            .with_native_output_tool_composition(
+                each.iter().all(|c| c.composes_native_output_with_tools),
+            )
+            .with_forced_tool_choice_rejected(each.iter().any(|c| c.rejects_forced_tool_choice));
         Self {
             candidates: Arc::new(candidates),
             policy,
             answered: Arc::default(),
-            composes,
+            capabilities,
         }
     }
 
@@ -250,22 +304,145 @@ impl FailoverModel {
             .into_iter()
             .collect()
     }
+
+    /// One completion: each candidate in turn, until one answers.
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        // Armed per call, not per turn or per session: a turn is a sequence of
+        // these with tool calls between them, and each one gets a whole budget
+        // to find a working candidate.
+        self.policy.chain_deadline.arm(self.policy.budget);
+
+        let mut abandoned: Vec<Abandoned> = Vec::new();
+        // Every call starts at the head. The list is a preference order, and
+        // sticking to candidate two for the rest of a session because of one
+        // rate-limit window would silently downgrade the user's choice. The
+        // cost is one attempt against a still-dead endpoint per call, which the
+        // short pre-first-byte connect bound makes cheap.
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            let error = loop {
+                let mut attempt = request.clone();
+                // Both rewrites are per candidate. `max_tokens` is the
+                // load-bearing one: the agent carries none of its own, so
+                // without this no ceiling would be sent. `model` arrives `None`
+                // on the agent path and each candidate's rig model already
+                // carries its own identifier, so setting it is belt-and-braces
+                // against a future rig that populates the field -- correct,
+                // and free.
+                attempt.model = Some(candidate.model_identifier().to_string());
+                attempt.max_tokens = candidate.max_tokens();
+
+                match candidate.completion(attempt).await {
+                    Ok(response) => {
+                        self.answered
+                            .lock()
+                            .expect("answered record")
+                            .insert(index);
+                        // As the candidate's wire decoded it, its provider and
+                        // model kept.
+                        return Ok(response);
+                    }
+                    Err(error) => {
+                        // Refused for asking that stale thinking be dropped:
+                        // sent again without asking, as every later call to it
+                        // is.
+                        if refuses_binding(&error) && candidate.unbind() {
+                            eprintln!(
+                                "[outrig] model {} refused the request that asked for \
+                                 drop_block ({}); sending it and every later call without \
+                                 asking",
+                                candidate.model_name(),
+                                candidate_failure_label(&error),
+                            );
+                            continue;
+                        }
+                        break error;
+                    }
+                }
+            };
+            // Announced once per move, on stderr beside the retry lines. An
+            // alias already widens what a config typo can silently do; a chain
+            // that moves mid-turn means one reply can be half one model's
+            // work, which is the stronger version of the same hazard and wants
+            // the same mitigation.
+            if let Some(next) = self.candidates.get(index + 1) {
+                eprintln!(
+                    "[outrig] model {} failed ({}); trying {}",
+                    candidate.model_name(),
+                    candidate_failure_label(&error),
+                    next.model_name(),
+                );
+            }
+            abandoned.push(Abandoned {
+                model_name: candidate.model_name().to_string(),
+                error,
+            });
+        }
+
+        // A chain of one returns its candidate's error exactly as it stands, so
+        // its report names the class that one endpoint's failure was. Only a
+        // real chain gets the aggregate.
+        match <[Abandoned; 1]>::try_from(abandoned) {
+            Ok([only]) => Err(only.error),
+            Err(many) => Err(Exhausted::into_error(many)),
+        }
+    }
 }
 
-/// Marks a [`CompletionError::ProviderError`] as a whole chain's exhaustion
-/// rather than one provider's own complaint.
+impl Serve for FailoverModel {
+    type Family = family::Completion;
+
+    fn descriptor(&self) -> HandlerDescriptor {
+        HandlerDescriptor {
+            key: model_key(CHAIN_LABEL),
+            family: FamilyDescriptor::Completion {
+                model: ModelRef::new(CHAIN_LABEL),
+                capabilities: self.capabilities,
+            },
+            layers: Vec::new(),
+        }
+    }
+
+    /// Answer the one completion rig's runner dispatches per model call with
+    /// the chain's, as a report when it fails. The runner never streams an
+    /// awaited prompt, and the chain streams nothing: unifying a stream across
+    /// heterogeneous candidates would erase the whole stream and buy nothing.
+    async fn serve(&self, kind: EffectKind, _dispatch: Dispatch) -> Reply {
+        let outcome = match kind {
+            EffectKind::Completion {
+                request,
+                stream: false,
+            } => self
+                .completion(Arc::unwrap_or_clone(request))
+                .await
+                .map(|response| Answered::Completion(Arc::new(response)))
+                .map_err(report),
+            EffectKind::Completion { stream: true, .. } => Err(ErrorReport::new(
+                ErrorKind::Request,
+                "streaming is not supported through a model alias chain",
+            )),
+            other => Err(ErrorReport::new(
+                ErrorKind::HandlerUnavailable,
+                format!("a model chain serves completions, not {}", other.name()),
+            )),
+        };
+        Reply::Outcome(outcome)
+    }
+}
+
+/// Opens the message of a chain's exhaustion report, when a resend could fix
+/// at least one candidate's reason.
 ///
-/// A prefix, because `CompletionError` is rig's enum and has no variant for
-/// this. Named once and shared by the constructor and the predicate, so the two
-/// cannot drift into disagreeing about what a chain failure looks like.
+/// Named once and shared by the renderer and the reader, so the two cannot
+/// drift into disagreeing about what a chain failure looks like.
 const EXHAUSTED_PREFIX: &str = "every model candidate failed; tried:";
 
 /// The same, when *no* candidate failed for a reason a resend could fix.
 ///
-/// A separate marker rather than a flag inside the message, so the two are
-/// distinguished by the same mechanism that distinguishes a chain failure from
-/// a provider's own complaint, and a reader of the stderr text sees the
-/// difference too.
+/// A separate wording rather than a flag inside the message, so a reader of
+/// the stderr text sees the difference too.
 const EXHAUSTED_TERMINAL_PREFIX: &str = "every model candidate failed terminally; tried:";
 
 /// What [`chain_exhausted_label`] recovers from a chain's exhaustion.
@@ -283,149 +460,134 @@ pub struct ChainExhaustion<'a> {
     pub recoverable: bool,
 }
 
-/// The failure a chain returns when every candidate has been abandoned.
+/// The failure a chain returns when every candidate has been abandoned, carried
+/// inside [`ProviderError::Request`] so the chain can [read it back](Self::of)
+/// into the report it hands rig instead of parsing its text.
 ///
 /// Rendered as one line per candidate, mirroring the shape the static half
 /// already uses for an alias with no selectable candidate: three candidates
 /// failing for three different reasons is exactly the case a single-line error
 /// wastes an afternoon on.
-fn exhausted(abandoned: Vec<Abandoned>) -> CompletionError {
-    // Recoverable if *any* candidate was: one vendor rate-limiting while
-    // another's key is revoked is still worth waiting out, because the rate
-    // limit is the one that can lift. Only when every reason is terminal is a
-    // resend futile.
-    let recoverable = abandoned
-        .iter()
-        .any(|a| super::retry::is_recoverable(&a.error));
-    let rows: Vec<_> = abandoned
-        .iter()
-        .map(|a| (
-                a.model_name.as_str(),
-                super::retry::candidate_failure_label(&a.error),
-            ))
-        .collect();
-    let tried = super::render_candidate_reasons(&rows);
-    let prefix = if recoverable {
-        EXHAUSTED_PREFIX
-    } else {
-        EXHAUSTED_TERMINAL_PREFIX
-    };
-    CompletionError::ProviderError(format!("{prefix}\n{tried}"))
+#[derive(Debug)]
+struct Exhausted {
+    /// Every candidate, in the chain's order: the head's reason first.
+    abandoned: Vec<Abandoned>,
 }
 
-impl CompletionModel for FailoverModel {
-    type Response = ();
-    type StreamingResponse = ();
-
-    /// Erased along with `Response`, and for a stronger reason than
-    /// `RetryingModel`'s.
-    ///
-    /// `RetryingModel::make` delegates to `M::make`: outrig never constructs a
-    /// model through rig's client path, but it has a real `Client` to delegate
-    /// with. A chain has none -- its candidates are heterogeneous, so there is
-    /// no one client type that could build them -- so there is nothing to
-    /// delegate to and `make` cannot be honored at all.
-    type Client = ();
-
-    /// Unreachable: outrig builds every chain in `build_agent`, from candidates
-    /// the provider clients already made. rig's trait requires the method, and
-    /// a chain has no client type to build from -- see [`Self::Client`] -- so
-    /// this panics rather than inventing an empty chain that would fail on its
-    /// first turn with a much worse message.
-    fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-        unreachable!("a failover chain is built by build_agent, never through rig's client path")
+impl Exhausted {
+    fn into_error(abandoned: Vec<Abandoned>) -> ProviderError {
+        // By value: a boxed reason would be boxed again, as a `Box<Self>`
+        // rather than a `Self`, and `of` could not read it back.
+        ProviderError::request(Self { abandoned })
     }
 
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        // Armed per call, not per turn or per session: a turn is a sequence of
-        // these with tool calls between them, and each one gets a whole budget
-        // to find a working candidate.
-        self.policy.chain_deadline.arm(self.policy.budget);
-
-        let mut abandoned: Vec<Abandoned> = Vec::new();
-        // Every call starts at the head. The list is a preference order, and
-        // sticking to candidate two for the rest of a session because of one
-        // rate-limit window would silently downgrade the user's choice. The
-        // cost is one attempt against a still-dead endpoint per call, which the
-        // short pre-first-byte connect bound makes cheap.
-        for (index, candidate) in self.candidates.iter().enumerate() {
-            let mut attempt = request.clone();
-            // Both rewrites are per candidate. `max_tokens` is the load-bearing
-            // one: it is folded in at build time, so without this the ceiling
-            // would stay candidate one's while the identifier moved. `model`
-            // arrives `None` on the agent path and each candidate's rig model
-            // already carries its own identifier, so setting it is
-            // belt-and-braces against a future rig that populates the field --
-            // correct, and free.
-            attempt.model = Some(candidate.model_identifier().to_string());
-            attempt.max_tokens = candidate.max_tokens();
-
-            match candidate.completion(attempt).await {
-                Ok(response) => {
-                    self.answered
-                        .lock()
-                        .expect("answered record")
-                        .insert(index);
-                    return Ok(response);
-                }
-                Err(error) => {
-                    // Announced once per move, on stderr beside the retry
-                    // lines. An alias already widens what a config typo can
-                    // silently do; a chain that moves mid-turn means one reply
-                    // can be half one model's work, which is the stronger
-                    // version of the same hazard and wants the same mitigation.
-                    if let Some(next) = self.candidates.get(index + 1) {
-                        eprintln!(
-                            "[outrig] model {} failed ({}); trying {}",
-                            candidate.model_name(),
-                            super::retry::candidate_failure_label(&error),
-                            next.model_name(),
-                        );
-                    }
-                    abandoned.push(Abandoned {
-                        model_name: candidate.model_name().to_string(),
-                        error,
-                    });
-                }
-            }
-        }
-
-        // A chain of one returns its candidate's error exactly as it stands, so
-        // every existing classification -- `exhausted_transient_label`, a `401`
-        // ending the process -- still sees the error it has always seen. Only a
-        // real chain gets the aggregate.
-        match <[Abandoned; 1]>::try_from(abandoned) {
-            Ok([only]) => Err(only.error),
-            Err(many) => Err(exhausted(many)),
+    /// The exhaustion `err` is, if it is one.
+    fn of(err: &ProviderError) -> Option<&Self> {
+        match err {
+            ProviderError::Request(inner) => (**inner).downcast_ref(),
+            _ => None,
         }
     }
 
-    async fn stream(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        // No failover, and no delegation either. Unifying `StreamingResponse`
-        // across heterogeneous candidates costs an erasure of the whole stream
-        // and buys nothing here: outrig never streams, so this exists only
-        // because the trait requires it. Matches `RetryingModel::stream`'s
-        // reasoning and the precedent in
-        // `plan/next/streaming-path-has-no-http-retry.md`.
-        Err(CompletionError::ProviderError(
-            "streaming is not supported through a model alias chain".to_string(),
-        ))
+    /// Whether at least one candidate failed for a reason a resend could fix:
+    /// one vendor rate-limiting while another's key is revoked is still worth
+    /// waiting out, because the rate limit is the one that can lift. Only when
+    /// every reason is terminal is a resend futile.
+    fn may_clear(&self) -> bool {
+        self.abandoned.iter().any(|a| candidate_may_clear(&a.error))
     }
+}
 
-    /// ANDed across every candidate, computed once in [`FailoverModel::new`].
-    ///
-    /// Not delegated to the current candidate, the way `RetryingModel`
-    /// delegates to its inner model: rig resolves the output mode before the
-    /// call, and a move mid-call cannot re-resolve it.
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.composes
+impl fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows: Vec<_> = self
+            .abandoned
+            .iter()
+            .map(|a| (a.model_name.as_str(), candidate_failure_label(&a.error)))
+            .collect();
+        let prefix = if self.may_clear() {
+            EXHAUSTED_PREFIX
+        } else {
+            EXHAUSTED_TERMINAL_PREFIX
+        };
+        write!(f, "{prefix}\n{}", super::render_candidate_reasons(&rows))
     }
+}
+
+impl std::error::Error for Exhausted {}
+
+/// Whether sending another prompt after `err` could end differently, for a
+/// chain's exhaustion and a lone candidate's failure alike.
+fn may_clear(err: &ProviderError) -> bool {
+    match Exhausted::of(err) {
+        Some(chain) => chain.may_clear(),
+        None => candidate_may_clear(err),
+    }
+}
+
+/// [`may_clear`] for one candidate's error.
+///
+/// This is not [`is_recoverable`](super::retry::is_recoverable), which names
+/// what a retry loop resends: the *same* request. The next prompt sends a
+/// different one, so what a loop resends clears, and so does a `200` that was
+/// not a completion: rig raises [`ProviderError::Json`] for a body that is not
+/// JSON, and [`ProviderError::ProviderResponse`] with a success status for an
+/// error envelope a gateway answers with when it accepted a request that then
+/// failed. Nothing in a `200` says it cannot clear.
+///
+/// Anything else -- a `401`, a model that does not exist, a provider-reported
+/// fault -- stays terminal.
+fn candidate_may_clear(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::Json(_) => true,
+        other if other
+            .provider_response_status()
+            .is_some_and(|status| status.is_success()) =>
+        {
+            true
+        }
+        other => retry::is_recoverable(other),
+    }
+}
+
+/// Whether `err` is a provider's refusal of the request itself.
+fn refused(err: &ProviderError) -> bool {
+    err.provider_response_status()
+        .is_some_and(|status| matches!(status.as_u16(), 400 | 422))
+}
+
+/// Whether `err` is an endpoint's refusal of a request for asking that stale
+/// thinking be dropped: one that names the field, the `thinking` it sits in,
+/// or the beta it needs. A model that takes no `adaptive` thinking, and a
+/// gateway that does not know the beta, refuse it so.
+fn refuses_binding(err: &ProviderError) -> bool {
+    refused(err)
+        && err.provider_response_body().is_some_and(|body| {
+            let body = body.to_ascii_lowercase();
+            ["block_binding", "thinking", "beta"]
+                .iter()
+                .any(|term| body.contains(term))
+        })
+}
+
+/// The report a failure of the chain leaves rig with, which is what the turn
+/// reads: its class as a code, so the REPL can tell a whole chain's exhaustion
+/// ([`CODE_EXHAUSTED`]) from one endpoint that stayed transiently broken or
+/// answered with nothing usable ([`retry::report`]); whether it may clear, as
+/// `retryable`; and the chain's own wording of an exhaustion, row by row, as
+/// its message.
+pub(crate) fn report(error: ProviderError) -> ErrorReport {
+    let retryable = may_clear(&error);
+    let mut report = match Exhausted::of(&error) {
+        Some(exhausted) => {
+            let mut report = ErrorReport::from(&error).with_code(CODE_EXHAUSTED);
+            report.message = exhausted.to_string();
+            report
+        }
+        None => retry::report(&error),
+    };
+    report.retryable = retryable;
+    report
 }
 
 /// Did every candidate of a chain fail? Returns the rendered per-candidate
@@ -437,16 +599,20 @@ impl CompletionModel for FailoverModel {
 /// *this* class, not that one, so what reaches the transient predicate still
 /// means "the one endpoint this turn had stayed broken for its whole budget".
 pub fn chain_exhausted_label(err: &PromptError) -> Option<ChainExhaustion<'_>> {
-    let PromptError::CompletionError(CompletionError::ProviderError(message)) = err else {
+    let PromptError::Report(report) = err else {
         return None;
     };
-    let (tried, recoverable) = match message.strip_prefix(EXHAUSTED_PREFIX) {
-        Some(tried) => (tried, true),
-        None => (message.strip_prefix(EXHAUSTED_TERMINAL_PREFIX)?, false),
-    };
+    if report.code.as_deref() != Some(CODE_EXHAUSTED) {
+        return None;
+    }
+    let message = report.message.as_str();
+    let tried = message
+        .strip_prefix(EXHAUSTED_PREFIX)
+        .or_else(|| message.strip_prefix(EXHAUSTED_TERMINAL_PREFIX))
+        .unwrap_or(message);
     Some(ChainExhaustion {
         tried: tried.strip_prefix('\n').unwrap_or(tried),
-        recoverable,
+        recoverable: report.retryable,
     })
 }
 
@@ -455,7 +621,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rig::OneOrMany;
+    use rig::completion::message::Origin;
     use rig::completion::{AssistantContent, Usage};
 
     use super::*;
@@ -465,7 +631,7 @@ mod tests {
         name: &'static str,
         max_tokens: Option<u64>,
         /// One outcome per call; the last repeats.
-        script: Vec<Result<&'static str, CompletionError>>,
+        script: Vec<Result<&'static str, ProviderError>>,
         calls: Arc<AtomicUsize>,
         /// Every `max_tokens` this candidate was actually asked for.
         ///
@@ -481,11 +647,11 @@ mod tests {
             Self::new(name, vec![Ok("hi")])
         }
 
-        fn failing(name: &'static str, error: CompletionError) -> Self {
+        fn failing(name: &'static str, error: ProviderError) -> Self {
             Self::new(name, vec![Err(error)])
         }
 
-        fn new(name: &'static str, script: Vec<Result<&'static str, CompletionError>>) -> Self {
+        fn new(name: &'static str, script: Vec<Result<&'static str, ProviderError>>) -> Self {
             Self {
                 name,
                 max_tokens: None,
@@ -520,15 +686,15 @@ mod tests {
             self.max_tokens
         }
 
-        fn composes_native_output_with_tools(&self) -> bool {
-            self.composes
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::new().with_native_output_tool_composition(self.composes)
         }
 
         fn completion(
             &self,
             request: CompletionRequest,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CompletionResponse<()>, CompletionError>> + Send + '_>,
+            Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
         > {
             let nth = self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen_max_tokens
@@ -538,32 +704,35 @@ mod tests {
             let outcome = match self.script.get(nth).or_else(|| self.script.last()) {
                 Some(Ok(text)) => Ok(*text),
                 Some(Err(e)) => Err(clone_error(e)),
-                None => Err(CompletionError::ProviderError("script empty".into())),
+                None => Err(ProviderError::Provider("script empty".into())),
             };
+            // The reply names this candidate as its model, as a provider's
+            // wire names the model that answered.
+            let origin = Origin::new("mock.script", "mock", self.name);
             Box::pin(async move {
-                outcome.map(|text| CompletionResponse {
-                    choice: OneOrMany::one(AssistantContent::text(text)),
-                    usage: Usage::new(),
-                    raw_response: (),
-                    message_id: None,
+                outcome.map(|text| {
+                    CompletionResponse::new(
+                        vec![AssistantContent::text(text)],
+                        Usage::new(),
+                        origin,
+                        serde_json::Value::Null,
+                    )
                 })
             })
         }
     }
 
-    /// `CompletionError` is not `Clone`, and the *variant* matters here -- a
+    /// `ProviderError` is not `Clone`, and the *variant* matters here -- a
     /// chain of one has to hand its candidate's error back unchanged, which a
-    /// fixture that flattened everything to `ProviderError` could not observe.
-    fn clone_error(e: &CompletionError) -> CompletionError {
+    /// fixture that flattened everything to `Provider` could not observe.
+    fn clone_error(e: &ProviderError) -> ProviderError {
         match e {
-            CompletionError::ResponseError(m) => CompletionError::ResponseError(m.clone()),
-            CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(status)) => {
-                CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(*status))
+            ProviderError::Response(m) => ProviderError::Response(m.clone()),
+            ProviderError::Http(_) => transport_failure(),
+            ProviderError::ProviderResponse(response) => {
+                ProviderError::ProviderResponse(response.clone())
             }
-            CompletionError::HttpError(rig::http_client::Error::Instance(_)) => {
-                transport_failure()
-            }
-            other => CompletionError::ProviderError(other.to_string()),
+            other => ProviderError::Provider(other.to_string()),
         }
     }
 
@@ -589,33 +758,31 @@ mod tests {
     }
     impl std::error::Error for Refused {}
 
-    fn transport_failure() -> CompletionError {
-        CompletionError::HttpError(rig::http_client::Error::Instance(Box::new(Transport)))
+    fn transport_failure() -> ProviderError {
+        ProviderError::Http(Arc::new(rig::http_client::Error::instance(Transport)))
     }
 
-    fn http_status(code: u16) -> CompletionError {
-        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(
+    /// A non-success status, as rig classifies one the HTTP loop handed back:
+    /// the provider's response, its status kept.
+    fn http_status(code: u16) -> ProviderError {
+        ProviderError::from_http_response(
             reqwest::StatusCode::from_u16(code).expect("status"),
-        ))
+            "boom",
+        )
     }
 
     fn request() -> CompletionRequest {
-        CompletionRequest {
-            model: None,
-            preamble: None,
-            chat_history: OneOrMany::one("hello".into()),
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-        }
+        CompletionRequest::new("hello")
     }
 
     fn chain(candidates: Vec<Box<dyn Candidate>>) -> FailoverModel {
         FailoverModel::new(candidates, RetryPolicy::default())
+    }
+
+    /// What the turn is handed for `err`: the report the chain leaves rig
+    /// with, as `handle_prompt_error` reads it.
+    fn reported(err: ProviderError) -> PromptError {
+        PromptError::Report(report(err))
     }
 
     /// The headline case: candidate one is down past its own retries, and the
@@ -661,7 +828,7 @@ mod tests {
         .await
         .expect_err("every candidate failed");
 
-        let err = PromptError::CompletionError(err);
+        let err = reported(err);
         let chain = chain_exhausted_label(&err).expect("a chain failure is reported as one");
         assert!(chain.tried.contains("bedrock"), "{}", chain.tried);
         assert!(chain.tried.contains("anthropic"), "{}", chain.tried);
@@ -685,7 +852,7 @@ mod tests {
         .await
         .expect_err("every candidate failed");
 
-        let err = PromptError::CompletionError(err);
+        let err = reported(err);
         let chain = chain_exhausted_label(&err).expect("a chain failure is reported as one");
         assert!(
             chain.recoverable,
@@ -701,14 +868,14 @@ mod tests {
             Box::new(Scripted::failing("bedrock", http_status(503))),
             Box::new(Scripted::failing(
                 "anthropic",
-                CompletionError::ResponseError("empty body".into()),
+                ProviderError::Response("empty body".into()),
             )),
         ])
         .completion(request())
         .await
         .expect_err("every candidate failed");
 
-        let label = chain_exhausted_label(&PromptError::CompletionError(err))
+        let label = chain_exhausted_label(&reported(err))
             .expect("reported as a chain failure")
             .tried
             .to_string();
@@ -720,7 +887,7 @@ mod tests {
     }
 
     /// A transport failure in a `tried` row names its cause, as it does on the
-    /// retry line, rather than rig's `Http client error:` wrapper.
+    /// retry line, rather than rig's `HttpError:` wrapper.
     #[tokio::test]
     async fn a_transport_failure_is_reported_with_its_cause() {
         let transport = transport_failure();
@@ -732,17 +899,17 @@ mod tests {
         .await
         .expect_err("every candidate failed");
 
-        let label = chain_exhausted_label(&PromptError::CompletionError(err))
+        let label = chain_exhausted_label(&reported(err))
             .expect("reported as a chain failure")
             .tried
             .to_string();
         assert!(label.contains("error sending request: Connection refused"), "{label}");
-        assert!(!label.contains("Http client error"), "{label}");
+        assert!(!label.contains("HttpError"), "{label}");
     }
 
-    /// A chain of one hands back its candidate's error *as it stands*, so
-    /// `exhausted_transient_label` and the `401`-ends-the-process path see
-    /// exactly the error they have always seen.
+    /// A chain of one hands back its candidate's error *as it stands*, so its
+    /// report names the class that one endpoint's failure was: transient,
+    /// never a chain's exhaustion.
     #[tokio::test]
     async fn a_single_candidate_chain_returns_its_error_unwrapped() {
         let err = chain(vec![Box::new(Scripted::failing("only", http_status(503)))])
@@ -751,10 +918,10 @@ mod tests {
             .expect_err("the one candidate failed");
 
         assert!(
-            matches!(err, CompletionError::HttpError(_)),
+            Exhausted::of(&err).is_none(),
             "a chain of one must not wrap its candidate's error: {err:?}"
         );
-        let prompt_err = PromptError::CompletionError(err);
+        let prompt_err = reported(err);
         assert!(chain_exhausted_label(&prompt_err).is_none());
         assert!(
             super::super::retry::exhausted_transient_label(&prompt_err).is_some(),
@@ -790,18 +957,20 @@ mod tests {
     /// call, so a disagreement reduces to the safe answer.
     #[test]
     fn disagreeing_candidates_resolve_to_false() {
+        let composes = |chain: &FailoverModel| chain.capabilities.composes_native_output_with_tools;
+
         let mixed = chain(vec![
             Box::new(Scripted::ok("a").composing(true)),
             Box::new(Scripted::ok("b").composing(false)),
         ]);
-        assert!(!mixed.composes_native_output_with_tools());
+        assert!(!composes(&mixed));
 
         let homogeneous = chain(vec![
             Box::new(Scripted::ok("a").composing(true)),
             Box::new(Scripted::ok("b").composing(true)),
         ]);
         assert!(
-            homogeneous.composes_native_output_with_tools(),
+            composes(&homogeneous),
             "a homogeneous chain pays nothing for the reduction"
         );
     }
@@ -826,8 +995,8 @@ mod tests {
     }
 
     /// #265: after a call that moved, the record holds the candidate that
-    /// answered. Through a clone, since rig clones the model per request and
-    /// what a clone records has to reach whoever holds the original.
+    /// answered. Through a clone, since the agent's handler table holds one
+    /// and what it records has to reach whoever holds the other.
     #[tokio::test]
     async fn the_record_holds_the_candidate_a_move_landed_on() {
         let model = chain(vec![
@@ -905,12 +1074,16 @@ mod tests {
     async fn streaming_is_refused_rather_than_fanned_out() {
         let candidate = Scripted::ok("only");
         let calls = Arc::clone(&candidate.calls);
-        assert!(
-            chain(vec![Box::new(candidate)])
-                .stream(request())
-                .await
-                .is_err()
-        );
+        let reply = chain(vec![Box::new(candidate)])
+            .serve(
+                EffectKind::Completion {
+                    request: Arc::new(request()),
+                    stream: true,
+                },
+                Dispatch::new(rig::effect::EffectId::from_raw(0), true),
+            )
+            .await;
+        assert!(matches!(reply, Reply::Outcome(Err(_))), "a stream is refused");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

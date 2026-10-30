@@ -53,31 +53,16 @@ pub enum CliError {
         source: serde_json::Error,
     },
 
+    /// Rig's agent failed the turn. Boxed, as `Session` is: the error carries
+    /// a run's history, and inline it would dominate every `CliError`.
     #[error("agent prompt failed: {0}")]
-    Prompt(rig::completion::PromptError),
+    Prompt(Box<rig::completion::PromptError>),
 
     /// A failure from an `outrig` harness session, which renders its own
     /// errors. Boxed, as `McpServerInitialize` is: inline, it is as large as
     /// [`OutrigError`], and the two together would grow every `CliError`.
     #[error(transparent)]
     Session(Box<outrig::harness::SessionError>),
-
-    /// Rig refused to build the request because no output-token ceiling was
-    /// set. Its own wording names `max_tokens`, which is the field on the wire
-    /// and not a key any outrig config can carry -- the model and agent tables
-    /// are `rename_all = "kebab-case"`, so `max_tokens` would be an unknown
-    /// key, ignored with a warning. Say `max-tokens` instead, and say where it
-    /// goes.
-    ///
-    /// `build_agent` supplies a fallback ceiling on the native Anthropic path,
-    /// so this should not be reachable there. It stays for the paths that have
-    /// no such fallback: a provider arm added later, or a rig upgrade that
-    /// moves where the default comes from.
-    #[error(
-        "the model needs an output-token ceiling: set max-tokens under [models.<name>] \
-         or [agents.<name>] in outrig.toml (the provider's API calls it `max_tokens`)"
-    )]
-    PromptMissingMaxTokens,
 
     /// An error the process exits with `status` for, not the 1 every other
     /// error gets. It prints as the error it wraps, so `error: ...` reads as
@@ -111,23 +96,9 @@ impl CliError {
     }
 }
 
-/// Rig's wording for the missing ceiling, matched to replace it. Pinned by the
-/// tests below; a rig upgrade that rephrases it makes them fail rather than
-/// silently letting the raw text back through.
-const RIG_MISSING_MAX_TOKENS: &str = "`max_tokens` must be set for Anthropic";
-
 impl From<rig::completion::PromptError> for CliError {
     fn from(e: rig::completion::PromptError) -> Self {
-        use rig::completion::{CompletionError, PromptError};
-
-        match &e {
-            PromptError::CompletionError(CompletionError::RequestError(source))
-                if source.to_string().contains(RIG_MISSING_MAX_TOKENS) =>
-            {
-                CliError::PromptMissingMaxTokens
-            }
-            _ => CliError::Prompt(e),
-        }
+        CliError::Prompt(Box::new(e))
     }
 }
 
@@ -154,39 +125,23 @@ pub type Result<T> = std::result::Result<T, CliError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::completion::{CompletionError, PromptError};
+    use rig::completion::PromptError;
+    use rig::error::ProviderError;
 
-    fn request_error(message: &str) -> PromptError {
-        PromptError::CompletionError(CompletionError::RequestError(message.into()))
-    }
-
-    /// The whole point of the rewrite: a user reading this must be able to go
-    /// straight to their config, so it names the key they type and the tables
-    /// it belongs in -- never rig's `max_tokens`, which no config accepts.
+    /// A prompt failure keeps rig's text, under the prefix that frames it.
     #[test]
-    fn a_missing_ceiling_names_the_config_key_not_the_wire_field() {
-        let rendered = CliError::from(request_error(RIG_MISSING_MAX_TOKENS)).to_string();
+    fn a_prompt_failure_keeps_rigs_text_under_the_prefix() {
+        let failed = PromptError::Provider(ProviderError::request(std::io::Error::other(
+            "something else entirely",
+        )));
+        let rendered = CliError::from(failed).to_string();
         assert!(
-            rendered.contains("max-tokens")
-                && rendered.contains("[models.<name>]")
-                && rendered.contains("[agents.<name>]"),
-            "the message should point at the config, got: {rendered}",
+            rendered.starts_with("agent prompt failed: "),
+            "got: {rendered}"
         );
         assert!(
-            !rendered.contains("agent prompt failed"),
-            "the rewrite replaces the generic prefix rather than nesting under it, \
-             got: {rendered}",
-        );
-    }
-
-    /// Everything else keeps rig's text and the prefix that frames it. Without
-    /// this the rewrite could quietly widen to swallow unrelated failures.
-    #[test]
-    fn any_other_prompt_failure_is_left_alone() {
-        let rendered = CliError::from(request_error("something else entirely")).to_string();
-        assert_eq!(
-            rendered,
-            "agent prompt failed: CompletionError: RequestError: something else entirely",
+            rendered.contains("something else entirely"),
+            "rig's own text must come through: {rendered}"
         );
     }
 

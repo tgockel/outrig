@@ -820,9 +820,10 @@ The Messages API rejects a request with no `max_tokens`, so outrig has to send o
 tiers decide which, highest priority first:
 
 1. `[agents.<name>].max-tokens`, then `[models.<name>].max-tokens`.
-2. The published ceiling for a Claude identifier outrig recognizes -- 128000 for the
-   `claude-opus-4-6` and later families, 64000 for the `claude-opus-4`, `claude-sonnet-4`,
-   and `claude-haiku-4-5` families.
+2. The published ceiling for a Claude identifier outrig recognizes, from rig's model catalog:
+   128000 for `claude-sonnet-4-6`, `claude-opus-4-6` and every later family; 64000 for
+   `claude-sonnet-4` and `4-5`, `claude-opus-4-5`, and `claude-haiku-4-5`; 32000 for
+   `claude-opus-4` and `4-1`.
 3. Otherwise a fallback of **32768**, announced once on stderr:
 
    ```text

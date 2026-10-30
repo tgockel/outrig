@@ -16,38 +16,32 @@
 
 use std::sync::{Arc, OnceLock};
 
-use rig::tool::{ToolCallExtensions, ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::tool::{ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::llm::{ANTHROPIC_FALLBACK_MAX_TOKENS, EffectiveCeiling, TurnUndo};
 use crate::rig_tool::truncate_for_llm;
+use crate::session_tool::OutrigTool;
 use crate::subagent::state::{GaveUp, Outcome, SubagentShared};
 use crate::subagent::{Read, SubagentRegistry};
 
-/// Wraps a failure as the model-visible tool error.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct BuiltinError(String);
-
-pub(crate) fn fail<T>(message: impl Into<String>) -> Result<T, ToolError> {
-    Err(ToolError::ToolCallError(Box::new(BuiltinError(
-        message.into(),
-    ))))
+/// Wraps a failure as the model-visible tool error: its text is what the
+/// model reads, so it is never redacted the way rig's `from_error` would.
+pub(crate) fn fail<T>(message: impl Into<String>) -> Result<T, ToolExecutionError> {
+    Err(ToolExecutionError::new(ToolErrorKind::Other, message))
 }
 
 /// Every tool schema below advertises `additionalProperties: false`, and each
 /// arg struct carries `deny_unknown_fields` to match. Letting the decoder be
 /// laxer than the advertised contract is the same class of drift that made
-/// `set_result` accept `{}` while its prose said otherwise.
-pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(args: &str) -> Result<T, ToolError> {
-    let value: Value = if args.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(args)?
-    };
-    serde_json::from_value(value).map_err(ToolError::JsonError)
+/// `set_result` accept `{}` while its prose said otherwise. The arguments are
+/// always an object by the time they get here: rig decodes the model's JSON,
+/// and sends a call whose arguments are anything else to no tool.
+pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(
+    args: Value,
+) -> Result<T, ToolExecutionError> {
+    serde_json::from_value(args).map_err(|e| ToolExecutionError::invalid_args(e.to_string()))
 }
 
 pub(crate) fn name_of(tool: &str) -> String {
@@ -100,7 +94,7 @@ impl SubagentTool {
     }
 }
 
-impl ToolDyn for SubagentTool {
+impl OutrigTool for SubagentTool {
     fn name(&self) -> String {
         name_of("subagent")
     }
@@ -159,36 +153,38 @@ impl ToolDyn for SubagentTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: LaunchArgs = parse_args(&args)?;
-            match self
-                .registry
-                .launch(
-                    &args.name,
-                    args.model.as_deref(),
-                    args.preamble,
-                    args.prompt,
-                )
-                .await
-            {
-                Ok(launched_as) => {
-                    // Empty unless the launch named a model, so an inherited one
-                    // reads exactly as it always has. The name comes back from
-                    // the launch rather than from `args.model`, so an alias
-                    // shows the row it resolved to.
-                    let suffix = launched_as.map_or(String::new(), |label| {
-                        format!(" (model: {})", label.display_name())
-                    });
-                    eprintln!("[outrig] subagent {} started{suffix}", args.name);
-                    Ok(format!(
-                        "subagent {:?} started{suffix}; collect it with outrig__get_result",
-                        args.name
-                    ))
-                }
-                Err(e) => fail(e),
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        let args: LaunchArgs = parse_args(args)?;
+        match self
+            .registry
+            .launch(
+                &args.name,
+                args.model.as_deref(),
+                args.preamble,
+                args.prompt,
+            )
+            .await
+        {
+            Ok(launched_as) => {
+                // Empty unless the launch named a model, so an inherited one
+                // reads exactly as it always has. The name comes back from
+                // the launch rather than from `args.model`, so an alias
+                // shows the row it resolved to.
+                let suffix = launched_as.map_or(String::new(), |label| {
+                    format!(" (model: {})", label.display_name())
+                });
+                eprintln!("[outrig] subagent {} started{suffix}", args.name);
+                Ok(ToolOutput::text(format!(
+                    "subagent {:?} started{suffix}; collect it with outrig__get_result",
+                    args.name
+                )))
             }
-        })
+            Err(e) => fail(e),
+        }
     }
 }
 
@@ -213,7 +209,7 @@ impl SubagentSendTool {
     }
 }
 
-impl ToolDyn for SubagentSendTool {
+impl OutrigTool for SubagentSendTool {
     fn name(&self) -> String {
         name_of("subagent_send")
     }
@@ -239,14 +235,19 @@ impl ToolDyn for SubagentSendTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: SendArgs = parse_args(&args)?;
-            match self.registry.send(&args.name, args.prompt) {
-                Ok(what) => Ok(format!("delivered to {:?}: {what}", args.name)),
-                Err(e) => fail(e),
-            }
-        })
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        let args: SendArgs = parse_args(args)?;
+        match self.registry.send(&args.name, args.prompt) {
+            Ok(what) => Ok(ToolOutput::text(format!(
+                "delivered to {:?}: {what}",
+                args.name
+            ))),
+            Err(e) => fail(e),
+        }
     }
 }
 
@@ -273,7 +274,7 @@ impl WaitResultsTool {
     }
 }
 
-impl ToolDyn for WaitResultsTool {
+impl OutrigTool for WaitResultsTool {
     fn name(&self) -> String {
         name_of("wait_results")
     }
@@ -312,21 +313,24 @@ impl ToolDyn for WaitResultsTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: WaitArgs = parse_args(&args)?;
-            let min_count = args.min_count.unwrap_or(args.names.len()).max(1);
-            if min_count > args.names.len() {
-                return fail(format!(
-                    "min_count {min_count} exceeds the {} name(s) given",
-                    args.names.len()
-                ));
-            }
-            match self.registry.wait_results(&args.names, min_count).await {
-                Ok(ready) => Ok(json!({ "ready": ready }).to_string()),
-                Err(e) => fail(e),
-            }
-        })
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        let args: WaitArgs = parse_args(args)?;
+        let min_count = args.min_count.unwrap_or(args.names.len()).max(1);
+        if min_count > args.names.len() {
+            return fail(format!(
+                "min_count {min_count} exceeds the {} name(s) given",
+                args.names.len()
+            ));
+        }
+        match self.registry.wait_results(&args.names, min_count).await {
+            // As text, not a JSON block: the wire reads as it always has.
+            Ok(ready) => Ok(ToolOutput::text(json!({ "ready": ready }).to_string())),
+            Err(e) => fail(e),
+        }
     }
 }
 
@@ -356,8 +360,12 @@ impl GetResultTool {
     }
 
     /// The call, with the turn it is part of when there is one.
-    async fn get(&self, args: String, turn: Option<&TurnUndo>) -> Result<String, ToolError> {
-        let args: GetArgs = parse_args(&args)?;
+    async fn get(
+        &self,
+        args: Value,
+        turn: Option<Arc<TurnUndo>>,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        let args: GetArgs = parse_args(args)?;
         let Read { outcome, claim } = match self.registry.read(&args.name).await {
             Ok(read) => read,
             Err(e) => return fail(e),
@@ -374,13 +382,16 @@ impl GetResultTool {
             });
         }
         match outcome {
-            Outcome::Result(text) => Ok(truncate_for_llm(&text, self.result_cap_bytes)),
+            Outcome::Result(text) => Ok(ToolOutput::text(truncate_for_llm(
+                &text,
+                self.result_cap_bytes,
+            ))),
             Outcome::Error(text) => fail(truncate_for_llm(&text, self.result_cap_bytes)),
         }
     }
 }
 
-impl ToolDyn for GetResultTool {
+impl OutrigTool for GetResultTool {
     fn name(&self) -> String {
         name_of("get_result")
     }
@@ -405,18 +416,14 @@ impl ToolDyn for GetResultTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(self.get(args, None))
-    }
-
-    /// The path rig takes: a turn hands each call its extensions, and
-    /// [`TurnUndo::of`] finds the turn among them.
-    fn call_with_extensions<'a>(
-        &'a self,
-        args: String,
-        extensions: &'a ToolCallExtensions,
-    ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(self.get(args, TurnUndo::of(extensions)))
+    /// A turn hands each call its context, and [`TurnUndo::of`] finds the
+    /// turn in it; a call outside one is part of no turn.
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        self.get(args, TurnUndo::of(context)).await
     }
 }
 
@@ -440,7 +447,7 @@ impl SubagentReleaseTool {
     }
 }
 
-impl ToolDyn for SubagentReleaseTool {
+impl OutrigTool for SubagentReleaseTool {
     fn name(&self) -> String {
         name_of("subagent_release")
     }
@@ -467,14 +474,19 @@ impl ToolDyn for SubagentReleaseTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: ReleaseArgs = parse_args(&args)?;
-            match self.registry.release(&args.names) {
-                Ok(released) => Ok(format!("released: {}", released.join(", "))),
-                Err(e) => fail(e),
-            }
-        })
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        let args: ReleaseArgs = parse_args(args)?;
+        match self.registry.release(&args.names) {
+            Ok(released) => Ok(ToolOutput::text(format!(
+                "released: {}",
+                released.join(", ")
+            ))),
+            Err(e) => fail(e),
+        }
     }
 }
 
@@ -518,8 +530,8 @@ struct SetResultArgs {
 /// the model no reason to do anything differently, so it regenerates the same
 /// oversized body and fails identically. Naming the likely cause turns that
 /// loop into a recoverable one, because shortening the report actually works.
-fn looks_truncated(args: &str) -> bool {
-    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(args) else {
+fn looks_truncated(args: &Value) -> bool {
+    let Value::Object(map) = args else {
         return false;
     };
     map.contains_key("status") && !map.contains_key("body")
@@ -746,7 +758,7 @@ impl SetResultTool {
     }
 }
 
-impl ToolDyn for SetResultTool {
+impl OutrigTool for SetResultTool {
     fn name(&self) -> String {
         name_of("set_result")
     }
@@ -784,67 +796,69 @@ impl ToolDyn for SetResultTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            if looks_truncated(&args) {
-                // Remember it on the subagent too: if the round goes on to end
-                // without publishing, the parent gets the cause rather than a
-                // bare "it stopped".
-                let attempt = self.shared.note_truncated_attempt();
-                // Checked before the attempt count, and latched rather than
-                // derived from it, so that everything below happens exactly
-                // once per round however many truncated calls keep arriving.
-                if let Some(how) = self.shared.gave_up() {
-                    return fail(refusal(how));
-                }
-                return match attempt {
-                    1 => {
-                        self.warn_about_the_ceiling();
-                        fail(if self.shared.report_stands() {
-                            SHORTEN_A_REVISION
-                        } else {
-                            SHORTEN_THE_REPORT
-                        })
-                    }
-                    n if n <= TRUNCATION_RETRY_BUDGET => fail(if self.shared.report_stands() {
-                        LEAVE_THE_REPORT
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        if looks_truncated(&args) {
+            // Remember it on the subagent too: if the round goes on to end
+            // without publishing, the parent gets the cause rather than a
+            // bare "it stopped".
+            let attempt = self.shared.note_truncated_attempt();
+            // Checked before the attempt count, and latched rather than
+            // derived from it, so that everything below happens exactly
+            // once per round however many truncated calls keep arriving.
+            if let Some(how) = self.shared.gave_up() {
+                return fail(refusal(how));
+            }
+            return match attempt {
+                1 => {
+                    self.warn_about_the_ceiling();
+                    fail(if self.shared.report_stands() {
+                        SHORTEN_A_REVISION
                     } else {
-                        SEND_A_SHORT_ERROR
-                    }),
-                    // Out of retries. Publishing on the subagent's behalf is
-                    // what makes this converge: `end_round` sees a round that
-                    // published, and a parent blocked in `get_result` wakes now
-                    // with the cause instead of once the tool-call budget has
-                    // drained into the same failing call. A round that reported
-                    // already keeps its report instead (#350).
-                    _ => fail(refusal(self.shared.give_up())),
-                };
-            }
-            let args: SetResultArgs = parse_args(&args)?;
-            // `required` keeps the fields present; it cannot keep `body`
-            // meaningful, and publishing an empty report would leave the parent
-            // with nothing while looking like success.
-            if args.body.trim().is_empty() {
-                return fail(
-                    "nothing was recorded: `body` was empty. Call again with the \
-                     full report in `body`.",
-                );
-            }
-            // A body that arrived whole is the only evidence that the ceiling
-            // is survivable, so it -- and not merely publishing -- is what
-            // restores the retry budget.
-            self.shared.note_report_fit();
-            match args.status {
-                ResultStatus::Result => {
-                    self.shared.publish(Outcome::Result(args.body));
-                    Ok("result recorded".to_string())
+                        SHORTEN_THE_REPORT
+                    })
                 }
-                ResultStatus::Error => {
-                    self.shared.publish(Outcome::Error(args.body));
-                    Ok("error recorded".to_string())
-                }
+                n if n <= TRUNCATION_RETRY_BUDGET => fail(if self.shared.report_stands() {
+                    LEAVE_THE_REPORT
+                } else {
+                    SEND_A_SHORT_ERROR
+                }),
+                // Out of retries. Publishing on the subagent's behalf is
+                // what makes this converge: `end_round` sees a round that
+                // published, and a parent blocked in `get_result` wakes now
+                // with the cause instead of once the tool-call budget has
+                // drained into the same failing call. A round that reported
+                // already keeps its report instead (#350).
+                _ => fail(refusal(self.shared.give_up())),
+            };
+        }
+        let args: SetResultArgs = parse_args(args)?;
+        // `required` keeps the fields present; it cannot keep `body`
+        // meaningful, and publishing an empty report would leave the parent
+        // with nothing while looking like success.
+        if args.body.trim().is_empty() {
+            return fail(
+                "nothing was recorded: `body` was empty. Call again with the \
+                 full report in `body`.",
+            );
+        }
+        // A body that arrived whole is the only evidence that the ceiling
+        // is survivable, so it -- and not merely publishing -- is what
+        // restores the retry budget.
+        self.shared.note_report_fit();
+        match args.status {
+            ResultStatus::Result => {
+                self.shared.publish(Outcome::Result(args.body));
+                Ok(ToolOutput::text("result recorded"))
             }
-        })
+            ResultStatus::Error => {
+                self.shared.publish(Outcome::Error(args.body));
+                Ok(ToolOutput::text("error recorded"))
+            }
+        }
     }
 }
 
@@ -868,6 +882,19 @@ mod tests {
     use super::*;
     use crate::subagent::state::TRUNCATED_REPORT;
 
+    /// The argument text `json`, decoded as rig decodes a call's arguments.
+    fn json_args(json: &str) -> Value {
+        serde_json::from_str(json).expect("test arguments are JSON")
+    }
+
+    /// Run `tool` on the argument text `json` outside a turn, and render
+    /// what it returned.
+    async fn call<T: OutrigTool>(tool: &T, json: &str) -> Result<String, ToolExecutionError> {
+        tool.call(&mut ToolContext::new(), json_args(json))
+            .await
+            .map(|output| output.render())
+    }
+
     /// The built-ins must look exactly like MCP tools to the model, which
     /// means going through the same `<server>__<tool>` sanitizer.
     #[test]
@@ -883,7 +910,8 @@ mod tests {
     #[test]
     fn launch_args_accept_an_omitted_preamble() {
         let args: LaunchArgs =
-            parse_args(r#"{"name":"audit","prompt":"check the config"}"#).expect("parses");
+            parse_args(json_args(r#"{"name":"audit","prompt":"check the config"}"#))
+                .expect("parses");
         assert_eq!(args.name, "audit");
         assert!(args.preamble.is_none());
         assert!(args.model.is_none(), "an omitted model means \"mine\"");
@@ -972,10 +1000,12 @@ mod tests {
     async fn a_launch_that_named_a_model_says_so_in_its_result() {
         let (tool, _log_dir) = subagent_tool();
 
-        let result = tool
-            .call(r#"{"name":"audit","prompt":"check the config","model":"fast"}"#.to_string())
-            .await
-            .expect("launch succeeds -- the client is built offline");
+        let result = call(
+            &tool,
+            r#"{"name":"audit","prompt":"check the config","model":"fast"}"#,
+        )
+        .await
+        .expect("launch succeeds -- the client is built offline");
         assert_eq!(
             result,
             "subagent \"audit\" started (model: fast); collect it with outrig__get_result"
@@ -994,10 +1024,12 @@ mod tests {
         );
         let tool = SubagentTool::new(Arc::new(registry));
 
-        let result = tool
-            .call(r#"{"name":"audit","prompt":"check the config","model":"cheap"}"#.to_string())
-            .await
-            .expect("launch succeeds -- the client is built offline");
+        let result = call(
+            &tool,
+            r#"{"name":"audit","prompt":"check the config","model":"cheap"}"#,
+        )
+        .await
+        .expect("launch succeeds -- the client is built offline");
         assert_eq!(
             result,
             "subagent \"audit\" started (model: cheap -> fast); collect it with outrig__get_result"
@@ -1023,8 +1055,7 @@ mod tests {
     async fn an_inherited_launch_reads_exactly_as_it_did_before() {
         let (tool, _log_dir) = subagent_tool();
 
-        let result = tool
-            .call(r#"{"name":"audit","prompt":"check the config"}"#.to_string())
+        let result = call(&tool, r#"{"name":"audit","prompt":"check the config"}"#)
             .await
             .expect("launch succeeds");
         assert_eq!(
@@ -1035,7 +1066,7 @@ mod tests {
 
     #[test]
     fn wait_args_accept_an_omitted_min_count() {
-        let args: WaitArgs = parse_args(r#"{"names":["a","b"]}"#).expect("parses");
+        let args: WaitArgs = parse_args(json_args(r#"{"names":["a","b"]}"#)).expect("parses");
         assert_eq!(args.min_count, None);
     }
 
@@ -1154,8 +1185,8 @@ mod tests {
 
     /// The truncated shape, as it arrives from the provider: `status` present
     /// because it generates first, `body` lost to the ceiling.
-    async fn truncated_call(tool: &SetResultTool) -> Result<String, ToolError> {
-        tool.call(r#"{"status":"result"}"#.to_string()).await
+    async fn truncated_call(tool: &SetResultTool) -> Result<String, ToolExecutionError> {
+        call(tool, r#"{"status":"result"}"#).await
     }
 
     #[test]
@@ -1185,17 +1216,19 @@ mod tests {
     /// generic tool error.
     #[test]
     fn set_result_args_reject_an_empty_call() {
-        assert!(parse_args::<SetResultArgs>("{}").is_err());
-        assert!(parse_args::<SetResultArgs>(r#"{"status":"result"}"#).is_err());
-        assert!(parse_args::<SetResultArgs>(r#"{"body":"a"}"#).is_err());
-        assert!(parse_args::<SetResultArgs>(r#"{"status":"maybe","body":"a"}"#).is_err());
+        assert!(parse_args::<SetResultArgs>(json_args("{}")).is_err());
+        assert!(parse_args::<SetResultArgs>(json_args(r#"{"status":"result"}"#)).is_err());
+        assert!(parse_args::<SetResultArgs>(json_args(r#"{"body":"a"}"#)).is_err());
+        assert!(
+            parse_args::<SetResultArgs>(json_args(r#"{"status":"maybe","body":"a"}"#)).is_err()
+        );
     }
 
     #[tokio::test]
     async fn set_result_publishes_under_the_status_it_was_given() {
         let (tool, shared) = set_result_tool();
 
-        tool.call(r#"{"status":"result","body":"found it"}"#.to_string())
+        call(&tool, r#"{"status":"result","body":"found it"}"#)
             .await
             .expect("a result publishes");
         assert_eq!(
@@ -1203,7 +1236,7 @@ mod tests {
             Some(Outcome::Result("found it".to_string()))
         );
 
-        tool.call(r#"{"status":"error","body":"could not finish"}"#.to_string())
+        call(&tool, r#"{"status":"error","body":"could not finish"}"#)
             .await
             .expect("an error publishes");
         let snapshot = shared.snapshot();
@@ -1337,7 +1370,7 @@ mod tests {
 
         truncated_call(&tool).await.expect_err("first attempt");
         truncated_call(&tool).await.expect_err("second attempt");
-        tool.call(r#"{"status":"result","body":"the short version"}"#.to_string())
+        call(&tool, r#"{"status":"result","body":"the short version"}"#)
             .await
             .expect("a body that fits");
 
@@ -1360,19 +1393,19 @@ mod tests {
     async fn giving_up_on_a_revision_keeps_the_report_that_fit() {
         let (tool, shared) = set_result_tool();
 
-        tool.call(r#"{"status":"result","body":"the short version"}"#.to_string())
+        call(&tool, r#"{"status":"result","body":"the short version"}"#)
             .await
             .expect("a body that fits");
         truncated_call(&tool).await.expect_err("first attempt");
         truncated_call(&tool).await.expect_err("second attempt");
-        for call in 3..=4 {
+        for nth in 3..=4 {
             let err = truncated_call(&tool)
                 .await
                 .expect_err("past the budget, every call is refused");
             assert!(
                 err.to_string()
                     .contains("keeps the report you recorded earlier"),
-                "call {call}: {err}"
+                "call {nth}: {err}"
             );
         }
 
@@ -1391,17 +1424,17 @@ mod tests {
     async fn a_revision_cut_off_after_a_report_is_not_asked_for_an_error() {
         let (tool, shared) = set_result_tool();
 
-        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+        call(&tool, r#"{"status":"result","body":"the findings"}"#)
             .await
             .expect("a body that fits");
-        for call in 1..=2 {
+        for nth in 1..=2 {
             let err = truncated_call(&tool).await.expect_err("cut off");
             let text = err.to_string();
             assert!(
                 text.contains("recorded earlier stands"),
-                "call {call}: {text}"
+                "call {nth}: {text}"
             );
-            assert!(!text.contains("\"error\""), "call {call}: {text}");
+            assert!(!text.contains("\"error\""), "call {nth}: {text}");
         }
 
         let snapshot = shared.snapshot();
@@ -1418,7 +1451,7 @@ mod tests {
     async fn a_revision_cut_off_after_a_steer_is_still_asked_for_a_short_error() {
         let (tool, shared) = set_result_tool();
 
-        tool.call(r#"{"status":"result","body":"the findings"}"#.to_string())
+        call(&tool, r#"{"status":"result","body":"the findings"}"#)
             .await
             .expect("a body that fits");
         shared.accept("and what about the tests?".into());
@@ -1440,9 +1473,12 @@ mod tests {
         let (tool, shared) = set_result_tool();
 
         shared.accept("and what about the tests?".into());
-        tool.call(r#"{"status":"result","body":"composed before the steer"}"#.to_string())
-            .await
-            .expect("a body that fits");
+        call(
+            &tool,
+            r#"{"status":"result","body":"composed before the steer"}"#,
+        )
+        .await
+        .expect("a body that fits");
         let (steers, _) = shared.deliver_injections();
         assert_eq!(steers.len(), 1);
         let first = truncated_call(&tool).await.expect_err("first attempt");
@@ -1460,8 +1496,7 @@ mod tests {
     async fn set_result_rejects_an_empty_body_without_publishing() {
         let (tool, shared) = set_result_tool();
 
-        let err = tool
-            .call(r#"{"status":"result","body":"   "}"#.to_string())
+        let err = call(&tool, r#"{"status":"result","body":"   "}"#)
             .await
             .expect_err("empty body");
         assert!(

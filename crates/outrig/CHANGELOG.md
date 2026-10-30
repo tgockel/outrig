@@ -609,6 +609,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The agent loop runs on rig 0.45** (`rig-core` 0.40 before), through the `rig` facade over
+  `rig-core`, `rig-agent`, `rig-reqwest` and `rig-http`, and the minimum supported Rust is 1.97.1.
+  No type of rig's crosses the public API, as before. What a session's record and its rounds show
+  of the move:
+  - `turn.committed.messages` is rig's JSON, and its shape changed: every content item is tagged
+    by `type`, a tool call's id and a result's `call` are objects, and a model's turn carries the
+    `origin` that wrote it and the `stop` it ended on. `scripts/render-session.py` renders both
+    shapes. See `doc/reference/events.md`.
+  - `usage.input_tokens` counts cached input on every provider. Anthropic reports what its cache
+    read and wrote apart from `input_tokens`, and rig now adds them in, as OpenAI's own count
+    does; `cached_input_tokens` is still reported beside it, and `total_tokens` is unchanged.
+  - The published ceiling of an Anthropic identifier is rig's catalog's, which lists more models
+    and newer numbers: `claude-sonnet-4-6` is 128,000 tokens where rig 0.40 said 64,000, so a
+    model row without `max-tokens` sends that, and a larger configured value is lowered to it.
+  - A reply cut off at the output ceiling that holds reasoning and nothing else fails the round,
+    with rig's error naming `max_tokens` as the remedy, where it used to end the round with the
+    reasoning as `RoundOutcome`'s. A reply the model ended itself after thinking still does.
+  - A reply an OpenAI-style provider answered in `refusal` with a normal stop is the model's
+    reply, where it used to be retried as unusable.
+  - Anthropic's thinking-binding beta (`thinking.block_binding = drop_block`) is asked for the
+    models rig's catalog says bind their signed thinking to the conversation -- `claude-sonnet-5-5`,
+    `claude-opus-5` and later, `claude-fable-5-1` -- rather than for every Anthropic model. An
+    endpoint that refuses it is still sent the call again without it.
+  - A round's opening after a turn's results goes in the same user message as those results on
+    Anthropic's wire, since rig sends adjacent user messages as one; on OpenAI's wire the results
+    are `tool` messages the opening follows, as before.
+  - A tool call naming no tool is answered with a note naming the tools, and the round goes on,
+    as before; the other calls of its batch are answered as not run, which is rig's rule for a
+    batch with an invalid call in it, where they used to run. A call whose arguments are no JSON
+    object is answered with a note saying so, and still counts against the round's tool-call cap.
+
 - **`Abandonable::abandon` returns whether the cleanup it waited for is proven done.** It returns
   `Result<(), Vec<String>>`, the reasons being one per piece that failed or was still running when
   the wait ended, so a caller can tell a stopped start from one not known to be stopped.

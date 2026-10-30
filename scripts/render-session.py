@@ -931,8 +931,9 @@ def id_gaps(ids: list[int]) -> list[tuple[int, int]]:
 
 
 def turn_parts(messages: object, claim) -> list[Part]:
-    """A turn's messages, in rig's JSON: tagged by `role`; user items tagged by `type`;
-    assistant items untagged, so told apart by their fields."""
+    """A turn's messages, in rig's JSON: tagged by `role`, and each item by `type`. A log
+    written before rig 0.45 left assistant items untagged, so those are told apart by their
+    fields."""
     parts: list[Part] = []
     for message in objs(messages):
         role = text(message.get("role"))
@@ -956,18 +957,24 @@ def user_part(item: dict) -> Part:
     if kind == "text":
         return Part("sent to the model", text(item.get("text")), True)
     if kind == "toolresult":
-        body = "\n".join(
-            text(obj(c).get("text"))
-            if obj(c).get("type") == "text"
-            else f"[{text(obj(c).get('type'))}]"
-            for c in seq(item.get("content"))
-        )
+        body = "\n".join(result_block(obj(c)) for c in seq(item.get("content")))
         return Part("the tool result the model read", body)
     return Part(kind or "user content", text(item))
 
 
+def result_block(block: dict) -> str:
+    """One block of a tool result: its text, structured JSON as text, or its kind."""
+    kind = text(block.get("type"))
+    if kind == "text":
+        return text(block.get("text"))
+    if kind == "json":
+        return json.dumps(block.get("value"), ensure_ascii=False)
+    return f"[{kind}]"
+
+
 def assistant_part(item: dict, claim) -> Part:
-    if "function" in item:
+    kind = text(item.get("type"))
+    if kind == "toolcall" or "function" in item:
         function = obj(item.get("function"))
         arguments = function.get("arguments")
         if isinstance(arguments, str):
@@ -981,8 +988,17 @@ def assistant_part(item: dict, claim) -> Part:
             name = text(function.get("name"))
             return Part(f"{name}, with no submission of this source recorded", source, True)
         return Part(f"call to {text(function.get('name'))}", text(arguments), True)
-    if isinstance(item.get("text"), str):
-        return Part("the model", item["text"], True)
+    if kind == "reasoning":
+        body = text(item.get("text"))
+        if not body and item.get("redacted"):
+            body = "[reasoning the provider withheld]"
+        return Part("reasoning", body)
+    if kind == "text" or (not kind and isinstance(item.get("text"), str)):
+        return Part("the model", text(item.get("text")), True)
+    if kind == "image":
+        return Part("an image the model produced", text(item.get("media_type")))
+    if kind == "opaque":
+        return Part("a provider item with no reading here", text(item.get("item")))
     if isinstance(item.get("content"), list):
         body = []
         for block in objs(item["content"]):

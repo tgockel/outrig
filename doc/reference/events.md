@@ -134,7 +134,11 @@ category says what it may hold.
   - `incomplete`: `true` for a turn the round ended while its calls ran, whose missing results
     are OutRig's note saying so.
   - `messages`: the turn's messages, in [rig](https://docs.rs/rig-core)'s own JSON form, which can
-    change when OutRig upgrades rig. The first turn of a round begins with the round's opening.
+    change when OutRig upgrades rig. As of rig 0.45 every content item is tagged by `type`
+    (`text`, `toolcall`, `toolresult`, `reasoning`, ...), a tool call's id and a result's `call`
+    are objects (`{"provider": ..}` or `{"local": ..}`), and a model's turn carries the `origin`
+    that wrote it and the `stop` it ended on. The first turn of a round begins with the round's
+    opening.
 - `model.text` -- what a model said in a reply, as the call returns: its text parts joined. A reply
   with no text, only tool calls or reasoning, records none.
   - `text`: the text.
@@ -152,7 +156,7 @@ category says what it may hold.
   - `estimate`: the whole request's estimated tokens, before `estimate_scale`. The scale is `1.0`
     until the model's provider has reported what a request cost. From then on it is the ratio of
     the input tokens that model's latest answered call reported -- `usage.input_tokens` on its
-    `model.attempt`, with the cache's added for an Anthropic model -- to that call's `estimate`,
+    `model.attempt`, which counts the cache's -- to that call's `estimate`,
     and never less than `1.0` or more than `3.0`. Each model of an alias has its own. A call
     whose prompt the scale would refuse, though the estimate alone admits it, is held to a lower
     `reserve` -- and `max_tokens` with it, never below 1,024 -- and, if that is not enough, to a
@@ -333,7 +337,11 @@ Every model call the loop decides to make has a `call_id`, and every request act
 it -- a retry, a move to another of an alias's models -- an `attempt_id` of its own. Both count
 from 1 within the session. Tokens are as the provider reported them: `input_tokens`,
 `output_tokens`, `total_tokens`, `cached_input_tokens`, `cache_creation_input_tokens`, and
-`reasoning_tokens`. Where a provider reported nothing, the usage is `null`, never zeros.
+`reasoning_tokens` -- except that `input_tokens` counts every input token on every provider,
+the cache's included. Anthropic reports what its cache read and wrote apart from its
+`input_tokens`; rig adds them in, as OpenAI's own count does, so `cached_input_tokens` is a part
+of `input_tokens` on both. `total_tokens` is the provider's, or the sum of the input and output it
+reported when it gave none. Where a provider reported nothing, the usage is `null`, never zeros.
 
 - `model.attempt` -- one request a provider was sent, and how it ended. Every attempt is recorded
   once, failed ones included.
@@ -361,8 +369,8 @@ from 1 within the session. Tokens are as the provider reported them: `input_toke
     `model` is the `[models.<name>]` row that answered it, which for an alias is not always the
     first, and `attempt_id` the request that answered.
   - `attempts`: every request the round sent, failed ones included.
-  - `input_tokens_max`: the largest `input_tokens` any call reported, or `null`. Providers differ
-    on whether cached input counts there: Anthropic's does not, OpenAI's does.
+  - `input_tokens_max`: the largest `input_tokens` any call reported, or `null`, cached input
+    counted on every provider.
   - `descendants`: the requests sent while it ran for the child agents its code launched, and
     theirs below them; `total`: its own usage and theirs, each attempt once, or `null` when none
     reported any.

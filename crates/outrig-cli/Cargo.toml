@@ -51,7 +51,7 @@ rand               = { workspace = true, default-features = true }
 ratatui            = { workspace = true, features = ["crossterm", "scrolling-regions"] }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }
-rig                = { workspace = true, features = ["reqwest", "rustls"] }
+rig                = { workspace = true, features = ["agent", "reqwest", "rustls"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 # `buffer-redux` is not optional polish: without it rustyline drops the read-ahead
 # buffer between `readline` calls, so a paste that arrives in one read loses every
@@ -79,6 +79,10 @@ outrig-cli = { path = ".", features = ["internal-test-api"] }
 # `test-util` gives tests `start_paused`, so the subagent registry tests can
 # drive a round whose retry backoff would otherwise take seconds of real time.
 tokio = { workspace = true, default-features = true, features = ["test-util"] }
+
+# `test-utils` is rig's scripted completion wire, which the retry tests drive
+# with a transport of their own.
+rig = { workspace = true, features = ["test-utils"] }
 
 # `run_program.rs` drives `outrig run-new <script.py>` under a terminal of its own -- `openpty`,
 # `setsid` -- and signals it and its program's group; `tests/signals.rs` signals its own

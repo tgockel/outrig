@@ -36,8 +36,9 @@ So the honest options, beyond the nonzero check #259 covers, in ascending order 
   ("an identifier newer than that release lands in tier 3 even though it is current") -- now with
   outrig owning the staleness instead of rig.
 - **Nothing, and lean on the clamp plus a clear runtime error.** Defensible.
-  `crates/outrig-cli/src/error.rs` already rewrites rig's missing-`max_tokens` error into config
-  language; the over-ceiling refusal could get the same treatment, turning a provider 400 into
+  `crates/outrig-cli/src/error.rs` used to rewrite rig's missing-`max_tokens` error into config
+  language (rig 0.45 defaults the ceiling itself, so that error is gone); the over-ceiling
+  refusal could get the same treatment, turning a provider 400 into
   "reduce `[models.haiku].max-tokens`".
 
 The second is probably the best value and is not what the entry's title suggests, which is why this
@@ -48,6 +49,5 @@ is filed as a question rather than a task.
 - `crates/outrig/src/config/validate.rs` -- the `*_CEILING` range checks for `tool-result-max`,
   `subagent-depth-max`, `subagent-width-max`, `retry-budget-secs`, which are the pattern a range
   rule would join.
-- `crates/outrig-cli/src/error.rs` -- `RIG_MISSING_MAX_TOKENS` and the rewrite around it, the
-  precedent for the second option.
+- `crates/outrig-cli/src/error.rs` -- the `Prompt` arm, where a provider's refusal would be read.
 - `doc/reference/config.md` -- the three-tier section, including the cap.

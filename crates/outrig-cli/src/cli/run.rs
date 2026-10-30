@@ -48,7 +48,6 @@ use outrig::container::Container;
 use outrig::container::sidecar::{SessionMcpPlan, SidecarPlan};
 use outrig::image::ImageTag;
 use outrig::network::NetworkInterceptor;
-use rig::tool::ToolDyn;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -1120,7 +1119,7 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
         let plural = if *count == 1 { "tool" } else { "tools" };
         let _ = writeln!(buf, "[outrig] mcp {name}: initialized ({count} {plural})");
     }
-    let names: Vec<String> = all_tools.iter().map(ToolDyn::name).collect();
+    let names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
     let _ = writeln!(buf, "[outrig] tools available: {}", names.join(", "));
     let _ = writeln!(
         buf,
@@ -1157,7 +1156,7 @@ fn build_tools_summary(tools: &[SessionTool]) -> String {
     let _ = writeln!(buf, "[outrig] tools available ({}):", tools.len());
     let rows: Vec<(String, String)> = tools
         .iter()
-        .map(|t| (t.name(), truncate_description(&t.description(), 60)))
+        .map(|t| (t.name().to_string(), truncate_description(&t.description(), 60)))
         .collect();
     let pad = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     for (name, desc) in &rows {

@@ -184,14 +184,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held other files loses them with it.
 
 - **`outrig run` asks for prompt caching on a model with `style = "anthropic"`.** Each request
-  carries a top-level `cache_control`, which Anthropic moves to the end of the request, and a
-  marker on the last tool definition and on the last system block, so a call reads back what the
-  one before it wrote instead of paying full price for the whole history. All three use the
-  default five-minute TTL. A prompt shorter than the model's minimum is sent uncached, and a read
-  shows as `cached_input_tokens` on `model.attempt`. No setting turns it off, so an endpoint
-  behind `base-url` that refuses a top-level `cache_control` answers `400` to every call.
+  carries a `cache_control` marker on the last tool definition, on the last system block, and on
+  the last block of the last user message -- the one that moves as the history grows -- so a call
+  reads back what the one before it wrote instead of paying full price for the whole history. All
+  three use the default five-minute TTL. A prompt shorter than the model's minimum is sent
+  uncached, and a read shows as `cached_input_tokens` on `model.attempt`. No setting turns it off,
+  so an endpoint behind `base-url` that refuses `cache_control` answers `400` to every call.
   `run-new` and the library loop do not ask yet: they wait for a history that only grows between
   cuts. (#669)
+
+- **The agent loop runs on rig 0.45** (`rig-core` 0.40 before), through the `rig` facade over
+  `rig-core`, `rig-agent`, `rig-reqwest` and `rig-http`, and the minimum supported Rust is 1.97.1.
+  What `outrig run` shows of the move:
+  - The published ceiling of an Anthropic identifier is rig's catalog's, which lists more models
+    and newer numbers: `claude-sonnet-4-6` is 128,000 tokens where rig 0.40 said 64,000, so a
+    model row without `max-tokens` sends that and a larger configured value is lowered to it.
+    `outrig config-init` offers 128000 as the default `max-tokens` to match.
+  - A reply cut off at the output ceiling that holds reasoning and nothing else fails the turn,
+    with rig's error naming `max_tokens` as the remedy, where it used to be recovered and
+    reported as a reasoning-only turn. A reply the model ended itself after thinking still is.
+  - On an OpenAI-compatible endpoint, a reasoning-only turn the model ended stays in the
+    conversation but is left out of later requests, since a chat message needs text or a call;
+    the prompts on either side of it go as one user message. It used to go as an assistant
+    message with empty text.
+  - `usage.input_tokens` on `model.attempt` counts cached input on every provider. Anthropic
+    reports what its cache read and wrote apart from `input_tokens`, and rig now adds them in;
+    `cached_input_tokens` is still reported beside it.
+  - Anthropic's thinking-binding beta (`thinking.block_binding = drop_block`) is asked for the
+    models rig's catalog says bind their signed thinking to the conversation -- `claude-sonnet-5-5`,
+    `claude-opus-5` and later, `claude-fable-5-1` -- rather than for every Anthropic model. An
+    endpoint that refuses it is still sent the call again without it.
+  - A tool call OutRig declined to run -- the repeat breaker, the tool-call cap -- reaches the
+    model as a failed call, as rig marks every skipped call; its text is unchanged.
+  - A tool call naming no tool is answered with a note naming the tools, and the turn goes on,
+    as before; the other calls of its batch are answered as not run, which is rig's rule for a
+    batch with an invalid call in it, where they used to run. A call whose arguments are no JSON
+    object is answered with a note saying so, and still counts against the tool-call cap and a
+    subagent's repeat breaker, and carries a parent's steer when it is the batch's last.
 
 ### Removed
 

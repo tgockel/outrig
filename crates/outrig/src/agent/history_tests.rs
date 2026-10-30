@@ -1,6 +1,8 @@
-use rig::OneOrMany;
 use rig::completion::Message;
-use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+use rig::completion::message::{
+    AssistantContent, AssistantMessage, CallId as RigCallId, Reasoning, ToolName,
+    ToolResultContent, UserContent,
+};
 use serde_json::json;
 
 use super::{
@@ -16,26 +18,54 @@ use crate::python::testing::{Fake, round_trip};
 /// Room for anything a test here commits.
 const ROOMY: u64 = 1_000_000;
 
+/// The tool's name, as rig types one.
+fn name() -> ToolName {
+    ToolName::new(tool::NAME).expect("a name")
+}
+
+/// A reply of `parts`, hand-built: no origin, no stop.
+fn reply(parts: Vec<AssistantContent>) -> Message {
+    Message::Assistant(AssistantMessage::new(parts))
+}
+
+/// The result `text` of call `id`, as a message of its own.
+fn tool_result(id: &str, text: &str) -> Message {
+    Message::tool_result(RigCallId::from_wire(id), name(), text)
+}
+
+/// The result `text` of call `id`, as one part of a message.
+fn result_part(id: &str, text: &str) -> UserContent {
+    UserContent::tool_result(
+        RigCallId::from_wire(id),
+        name(),
+        vec![ToolResultContent::text(text)],
+    )
+}
+
+/// Reasoning `text`, signed as Anthropic signs its thinking: the signature
+/// rides in the block's provider item.
+fn signed(text: &str) -> AssistantContent {
+    AssistantContent::Reasoning(Reasoning::new(text))
+        .with_native(json!({"type": "thinking", "thinking": text, "signature": "sig"}))
+}
+
 fn call(id: &str, source: &str) -> Message {
-    Message::Assistant {
-        id: None,
-        content: OneOrMany::one(AssistantContent::tool_call(
-            id,
-            tool::NAME,
-            json!({"source": source}),
-        )),
-    }
+    reply(vec![AssistantContent::tool_call(
+        id,
+        name(),
+        json!({"source": source}),
+    )])
 }
 
 /// The text of `message`'s first part, whatever its role.
 fn text(message: &Message) -> String {
     match message {
         Message::User { content } => match content.first() {
-            UserContent::Text(text) => text.text,
+            Some(UserContent::Text(text)) => text.text.clone(),
             other => panic!("not text: {other:?}"),
         },
-        Message::Assistant { content, .. } => match content.first() {
-            AssistantContent::Text(text) => text.text,
+        Message::Assistant(reply) => match reply.content.first() {
+            Some(AssistantContent::Text(text)) => text.text.clone(),
             other => panic!("not text: {other:?}"),
         },
         Message::System { content } => content.clone(),
@@ -132,7 +162,7 @@ fn promote(store: &mut Store, ids: &[u64]) {
 fn round_of_calls(store: &mut Store, opening: &str, calls: &[&str], reply: Option<&str>) {
     store.begin_round(Message::user(opening));
     for &id in calls {
-        store.commit(vec![call(id, id), Message::tool_result(id, "ok")]);
+        store.commit(vec![call(id, id), tool_result(id, "ok")]);
     }
     if let Some(reply) = reply {
         store.commit(vec![Message::assistant(reply)]);
@@ -171,9 +201,9 @@ fn first_call_leaves_out(store: &mut Store, budget: &Budget) -> usize {
 fn a_turn_begins_at_each_reply() {
     let round = vec![
         call("a", "1"),
-        Message::tool_result("a", "one"),
+        tool_result("a", "one"),
         call("b", "2"),
-        Message::tool_result("b", "two"),
+        tool_result("b", "two"),
         Message::assistant("done"),
     ];
     assert_eq!(
@@ -278,21 +308,13 @@ fn a_round_that_commits_nothing_leaves_no_gap_in_the_numbering() {
 fn a_turn_is_mirrored_as_its_prompt_text_and_calls() {
     let turn = [
         Message::user("[outrig] 1 message is waiting."),
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::many([
-                AssistantContent::text("Reading it."),
-                AssistantContent::tool_call("a", tool::NAME, json!({"source": "1 + 1"})),
-                AssistantContent::tool_call("b", tool::NAME, json!({"code": "x"})),
-            ])
-            .expect("three parts"),
-        },
+        reply(vec![
+            AssistantContent::text("Reading it."),
+            AssistantContent::tool_call("a", name(), json!({"source": "1 + 1"})),
+            AssistantContent::tool_call("b", name(), json!({"code": "x"})),
+        ]),
         Message::User {
-            content: OneOrMany::many([
-                UserContent::tool_result("b", OneOrMany::one(ToolResultContent::text("refused"))),
-                UserContent::tool_result("a", OneOrMany::one(ToolResultContent::text("2\n"))),
-            ])
-            .expect("two results"),
+            content: vec![result_part("b", "refused"), result_part("a", "2\n")],
         },
     ];
     assert_eq!(
@@ -472,12 +494,9 @@ fn calls_priced(
     prices: &[u64],
     budget: &Budget,
 ) -> Vec<(Vec<Message>, Manifest)> {
-    let turns = prices.iter().map(|&tokens| {
-        (
-            vec![call("a", "1"), Message::tool_result("a", "one")],
-            tokens,
-        )
-    });
+    let turns = prices
+        .iter()
+        .map(|&tokens| (vec![call("a", "1"), tool_result("a", "one")], tokens));
     calls_of(store, turns, budget)
 }
 
@@ -986,8 +1005,8 @@ fn a_cut_that_puts_one_role_after_itself_is_recorded() {
     store.begin_round(Message::user("round 1"));
     store.commit(vec![Message::assistant("done")]);
     store.begin_round(Message::user("round 2"));
-    store.commit(vec![call("a", "1"), Message::tool_result("a", "one")]);
-    store.commit(vec![call("b", "2"), Message::tool_result("b", "two")]);
+    store.commit(vec![call("a", "1"), tool_result("a", "one")]);
+    store.commit(vec![call("b", "2"), tool_result("b", "two")]);
     // Round 3 opens, and its first call carries round 1 and 2 -- and the
     // opening after a result.
     store.begin_round(Message::user("round 3"));
@@ -1115,10 +1134,7 @@ async fn an_incomplete_turn_is_mirrored_as_incomplete() {
     let (interpreter, mut fake) = Fake::connected().await;
     let history = History::new(interpreter, Window::DEFAULT);
     history.begin_round(Message::user("go"));
-    history.commit(
-        vec![call("a", "1"), Message::tool_result("a", "unknown")],
-        true,
-    );
+    history.commit(vec![call("a", "1"), tool_result("a", "unknown")], true);
     history.commit(vec![Message::assistant("done")], false);
     assert_eq!(fake.expect("turn").await["incomplete"], true);
     assert_eq!(fake.expect("turn").await["incomplete"], false);
@@ -1146,14 +1162,11 @@ async fn a_manifest_rebuilds_the_call_it_describes() {
             .expect("room");
         assert_eq!(sent.last(), Some(&Message::user(format!("r{round}"))));
         assert_eq!(history.reconstruct(&manifest), sent, "a round's first call");
-        history.commit(
-            vec![call("a", "1"), Message::tool_result("a", "one")],
-            false,
-        );
+        history.commit(vec![call("a", "1"), tool_result("a", "one")], false);
         let (sent, manifest) = history
             .assemble(&Budget::with_room("m", ROOMY), CallId::new(1))
             .expect("room");
-        assert_eq!(sent.last(), Some(&Message::tool_result("a", "one")));
+        assert_eq!(sent.last(), Some(&tool_result("a", "one")));
         assert_eq!(history.reconstruct(&manifest), sent, "a later call");
         history.commit(vec![Message::assistant("done")], false);
         history.finish_round();
@@ -1193,10 +1206,7 @@ async fn the_host_record_and_the_transport_of_a_long_session_are_measured() {
             history.begin_round(Message::user(format!("round {turn}")));
         }
         history.commit(
-            vec![
-                call("a", "print(x)"),
-                Message::tool_result("a", result.as_str()),
-            ],
+            vec![call("a", "print(x)"), tool_result("a", result.as_str())],
             false,
         );
         // Re-serialized as it was written: compact, with the same keys.
@@ -1225,36 +1235,27 @@ async fn the_host_record_and_the_transport_of_a_long_session_are_measured() {
 /// A reply that reasons, signed as Anthropic signs its thinking, then makes
 /// call `id`, which its reasoning names too.
 fn reasoned_call(id: &str) -> Message {
-    use rig::completion::message::Reasoning;
-
-    Message::Assistant {
-        id: None,
-        content: OneOrMany::many([
-            AssistantContent::Reasoning(Reasoning::new_with_signature(id, Some("sig".into()))),
-            AssistantContent::tool_call(id, tool::NAME, json!({"source": id})),
-        ])
-        .expect("two parts"),
-    }
+    reply(vec![
+        signed(id),
+        AssistantContent::tool_call(id, name(), json!({"source": id})),
+    ])
 }
 
 /// A reply of `reasoning` alone.
-fn thinking_alone(reasoning: rig::completion::message::Reasoning) -> Message {
-    Message::Assistant {
-        id: None,
-        content: OneOrMany::one(AssistantContent::Reasoning(reasoning)),
-    }
+fn thinking_alone(reasoning: AssistantContent) -> Message {
+    reply(vec![reasoning])
 }
 
 /// The calls whose reasoning `sent` carries, in order.
 fn reasoned(sent: &[Message]) -> Vec<String> {
     sent.iter()
         .filter_map(|message| match message {
-            Message::Assistant { content, .. } => Some(content.iter()),
+            Message::Assistant(reply) => Some(reply.content.iter()),
             _ => None,
         })
         .flatten()
         .filter_map(|part| match part {
-            AssistantContent::Reasoning(reasoning) => Some(reasoning.display_text()),
+            AssistantContent::Reasoning(reasoning) => Some(reasoning.text.clone()),
             _ => None,
         })
         .collect()
@@ -1271,10 +1272,7 @@ fn reasoned_round(
     let first = store.turns.len();
     let turns = (first..first + turns).map(|n| {
         let call = format!("c{n}");
-        (
-            vec![reasoned_call(&call), Message::tool_result(&call, "ok")],
-            10,
-        )
+        (vec![reasoned_call(&call), tool_result(&call, "ok")], 10)
     });
     calls_of(store, turns, budget)
 }
@@ -1375,10 +1373,7 @@ fn a_window_that_moves_on_leaves_out_the_thinking_after_the_gap() {
     for round in 1..=4 {
         store.begin_round(Message::user(format!("round {round}")));
         let call = format!("c{round}");
-        store.commit(vec![
-            reasoned_call(&call),
-            Message::tool_result(&call, "ok"),
-        ]);
+        store.commit(vec![reasoned_call(&call), tool_result(&call, "ok")]);
         sent.push(store.assemble(&anthropic, None).expect("room").0);
         store.commit(vec![Message::assistant(format!("done {round}"))]);
     }
@@ -1408,7 +1403,9 @@ fn a_promotion_sent_as_nothing_leaves_the_thinking_after_it() {
     };
     round_of_calls(&mut store, "round 1", &[], Some("done"));
     round_of_calls(&mut store, "round 2", &["a"], None);
-    store.commit(vec![thinking_alone(Reasoning::new("mulling"))]);
+    store.commit(vec![thinking_alone(AssistantContent::Reasoning(
+        Reasoning::new("mulling"),
+    ))]);
     round_of_calls(&mut store, "round 3", &[], Some("done"));
     store.begin_round(Message::user("round 4"));
     let anthropic = Budget {
@@ -1417,7 +1414,7 @@ fn a_promotion_sent_as_nothing_leaves_the_thinking_after_it() {
     };
     store.assemble(&anthropic, None).expect("room");
 
-    store.commit(vec![reasoned_call("c4"), Message::tool_result("c4", "ok")]);
+    store.commit(vec![reasoned_call("c4"), tool_result("c4", "ok")]);
     promote(&mut store, &[2]);
     let (sent, manifest) = store.assemble(&anthropic, None).expect("room");
     assert_eq!(ids(&manifest.carried), [0, 2, 3, 4]);
@@ -1433,28 +1430,19 @@ fn a_promotion_sent_as_nothing_leaves_the_thinking_after_it() {
 /// call, and the turns keep everything.
 #[test]
 fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
-    use rig::completion::message::Reasoning;
-
     use super::LeftOut;
     use crate::agent::budget::Wire;
 
     let unsigned = AssistantContent::Reasoning(Reasoning::new("thinking it over"));
-    let signed = AssistantContent::Reasoning(Reasoning::new_with_signature(
-        "weighing it",
-        Some("sig".into()),
-    ));
-    let reply = |parts: Vec<AssistantContent>| Message::Assistant {
-        id: None,
-        content: OneOrMany::many(parts).expect("a part"),
-    };
+    let signed = signed("weighing it");
     let mut store = Store::default();
     store.begin_round(Message::user("go"));
     store.commit(vec![
         reply(vec![
             unsigned.clone(),
-            AssistantContent::tool_call("call_1", tool::NAME, json!({"source": "1"})),
+            AssistantContent::tool_call("call_1", name(), json!({"source": "1"})),
         ]),
-        Message::tool_result("call_1", "1"),
+        tool_result("call_1", "1"),
     ]);
     store.commit(vec![reply(vec![unsigned.clone()])]);
     store.commit(vec![reply(vec![signed.clone()])]);
@@ -1489,7 +1477,7 @@ fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
         let (sent, manifest) = store.assemble(&budget, None).expect("room for everything");
         assert_eq!(manifest.left_out, left_out, "{wire:?}");
         let unsigned_sent = sent.iter().any(|message| {
-            matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| *part == unsigned))
+            matches!(message, Message::Assistant(reply) if reply.content.contains(&unsigned))
         });
         assert_eq!(unsigned_sent, wire == Wire::OpenAi, "{wire:?}: {sent:#?}");
         assert_eq!(
@@ -1653,7 +1641,7 @@ fn a_withheld_turn_makes_the_thinking_after_it_stale_only_once_it_is_sent() {
 
     // Round 5's first turn promotes round 2's second, which alone opens on a
     // call right after round 1's reply, and is withheld.
-    store.commit(vec![reasoned_call("c7"), Message::tool_result("c7", "ok")]);
+    store.commit(vec![reasoned_call("c7"), tool_result("c7", "ok")]);
     promote(&mut store, &[2]);
     let (sent, manifest) = store.assemble(&strict, None).expect("room");
     assert_eq!(manifest.withheld, [(2, Why::Promoted)]);
@@ -1672,8 +1660,6 @@ fn a_withheld_turn_makes_the_thinking_after_it_stale_only_once_it_is_sent() {
 /// what follows too. The call is sent what alternates.
 #[test]
 fn a_strict_view_withholds_the_results_stale_thinking_answered() {
-    use rig::completion::message::Reasoning;
-
     use crate::agent::budget::Wire;
 
     // Rounds 1 and 2 close on text, and round 3 on thinking alone after its
@@ -1688,11 +1674,8 @@ fn a_strict_view_withholds_the_results_stale_thinking_answered() {
     round_of_calls(&mut store, "round 1", &[], Some("done"));
     round_of_calls(&mut store, "round 2", &[], Some("done"));
     store.begin_round(Message::user("round 3"));
-    store.commit(vec![reasoned_call("c2"), Message::tool_result("c2", "ok")]);
-    store.commit(vec![thinking_alone(Reasoning::new_with_signature(
-        "r3",
-        Some("sig".into()),
-    ))]);
+    store.commit(vec![reasoned_call("c2"), tool_result("c2", "ok")]);
+    store.commit(vec![thinking_alone(signed("r3"))]);
     store.begin_round(Message::user("round 4"));
     let strict = Budget {
         wire: Wire::Anthropic,
@@ -1806,10 +1789,9 @@ fn an_emptied_reply_leaves_its_round_ending_on_results() {
     };
     round_of_calls(&mut store, "round 1", &[], Some("done"));
     round_of_calls(&mut store, "round 2", &["a"], None);
-    store.commit(vec![Message::Assistant {
-        id: None,
-        content: OneOrMany::one(AssistantContent::Reasoning(Reasoning::new("thinking"))),
-    }]);
+    store.commit(vec![thinking_alone(AssistantContent::Reasoning(
+        Reasoning::new("thinking"),
+    ))]);
     store.begin_round(Message::user("round 3"));
 
     let anthropic = Budget {
@@ -1887,7 +1869,9 @@ fn results(messages: &[Message]) -> Vec<(String, String)> {
         .flatten()
         .filter_map(|part| match part {
             UserContent::ToolResult(result) => match result.content.first() {
-                ToolResultContent::Text(text) => Some((result.id.clone(), text.text)),
+                Some(ToolResultContent::Text(text)) => {
+                    Some((result.call.to_string(), text.text.clone()))
+                }
                 other => panic!("not text: {other:?}"),
             },
             _ => None,
@@ -1930,7 +1914,7 @@ fn a_refused_turns_results_are_sent_as_a_notice_and_kept_whole() {
     assert!(manifest.refused.is_empty());
 
     store.withhold(&refused);
-    store.commit(vec![call("c", "c"), Message::tool_result("c", "ok")]);
+    store.commit(vec![call("c", "c"), tool_result("c", "ok")]);
     let (sent, manifest) = store.assemble(&budget, None).expect("room");
     assert_eq!(results(&sent), [ok("a"), noted("b"), ok("c")]);
     assert_eq!(manifest.refused, [(1, notice(1, "content_filter"))]);
@@ -1955,19 +1939,10 @@ fn a_refused_turn_is_counted_with_its_notices() {
     let ids: Vec<String> = (0..50).map(|n| format!("c{n}")).collect();
     let calls = ids
         .iter()
-        .map(|id| AssistantContent::tool_call(id, tool::NAME, json!({"source": "1"})));
-    let results = ids
-        .iter()
-        .map(|id| UserContent::tool_result(id, OneOrMany::one(ToolResultContent::text(""))));
-    store.commit(vec![
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::many(calls).expect("fifty calls"),
-        },
-        Message::User {
-            content: OneOrMany::many(results).expect("fifty results"),
-        },
-    ]);
+        .map(|id| AssistantContent::tool_call(id, name(), json!({"source": "1"})))
+        .collect();
+    let results = ids.iter().map(|id| result_part(id, "")).collect();
+    store.commit(vec![reply(calls), Message::User { content: results }]);
     let refused = Refused {
         turn: 1,
         finish_reason: "content_filter".to_string(),

@@ -34,7 +34,7 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rig::completion::message::{AssistantContent, ReasoningContent};
+use rig::completion::message::{Api, AssistantContent, AssistantMessage};
 use rig::completion::{Message, Usage};
 
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider};
@@ -189,17 +189,23 @@ pub(crate) struct Budget {
 /// carry of a conversation other providers wrote.
 ///
 /// Reasoning is the part that does not travel. Anthropic's API takes a
-/// thinking block back only with the signature it was signed with, and refuses
-/// a request carrying one without. An OpenAI-compatible provider's reasoning
-/// (`reasoning_content`) has no signature, so a call to Anthropic leaves it
-/// out; Anthropic's own, signed or redacted, goes back whole. rig's OpenAI
-/// adapter sends any reasoning as `reasoning_content` beside its reply, so an
+/// thinking block back only with the signature it was signed with. rig keeps
+/// that signature in the block's provider item (`Reasoning::native`), and a
+/// block without one -- an OpenAI-compatible provider's `reasoning_content`,
+/// or Anthropic's own once a change to the conversation made it stale -- rig
+/// would send to Anthropic as plain text, which says the model's thinking
+/// aloud in its own turn. A call to Anthropic leaves such a block out instead;
+/// Anthropic's own, signed or redacted, goes back whole. rig's OpenAI adapter
+/// sends any reasoning as `reasoning_content` beside its reply, so an
 /// OpenAI-compatible candidate takes everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wire {
     OpenAi,
     Anthropic,
 }
+
+/// The wire format whose provider items carry Anthropic's thinking signatures.
+const ANTHROPIC_API: Api = Api::from_static("anthropic.messages");
 
 impl Wire {
     /// Whether a call in this protocol can carry `part` of a model's reply,
@@ -209,32 +215,24 @@ impl Wire {
         match (self, part) {
             (Wire::Anthropic, AssistantContent::Reasoning(reasoning)) => {
                 !stale
-                    && reasoning.content.iter().all(|block| {
-                        matches!(
-                            block,
-                            ReasoningContent::Text {
-                                signature: Some(_),
-                                ..
-                            } | ReasoningContent::Redacted { .. }
-                        )
-                    })
+                    && reasoning
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.reasoning_blob(&ANTHROPIC_API).is_some())
             }
             _ => true,
         }
     }
 
     /// The input tokens a call in this protocol was reported to have cost, from
-    /// `usage`. Anthropic's `input_tokens` leaves out what was read from and
-    /// written to its cache, which the request carried all the same; an
-    /// OpenAI-compatible provider's counts them.
+    /// `usage`. rig normalizes every provider's `input_tokens` to the whole
+    /// prompt -- for Anthropic, what was read from and written to its cache
+    /// included, which the request carried all the same -- so both protocols
+    /// read the one counter. `None` is a count nobody gave, and reads as zero,
+    /// which [`Calibration`] ignores.
     pub(crate) fn reported_input(self, usage: &Usage) -> u64 {
-        match self {
-            Wire::OpenAi => usage.input_tokens,
-            Wire::Anthropic => usage
-                .input_tokens
-                .saturating_add(usage.cached_input_tokens)
-                .saturating_add(usage.cache_creation_input_tokens),
-        }
+        let _ = self;
+        usage.input_tokens.unwrap_or(0)
     }
 }
 
@@ -444,6 +442,10 @@ pub(crate) fn overhead<'a>(preamble: &str, tools: impl IntoIterator<Item = &'a s
 }
 
 /// The estimated tokens of `messages`, as the JSON they serialize to.
+///
+/// A model's reply is counted without its provider items: rig keeps each
+/// block's item beside its text (`native`), and a wire sends one or the other,
+/// never both, so counting the message as stored would count a reply twice.
 pub(crate) fn tokens<'a>(messages: impl IntoIterator<Item = &'a Message>) -> u64 {
     let mut count = Count::default();
     for message in messages {
@@ -451,7 +453,20 @@ pub(crate) fn tokens<'a>(messages: impl IntoIterator<Item = &'a Message>) -> u64
         // megabyte, and only its length is wanted. Writing to a counter cannot
         // fail, and a message that will not serialize is counted as far as it
         // got.
-        let _ = serde_json::to_writer(&mut count, message);
+        match message {
+            Message::Assistant(turn) => {
+                let canonical = AssistantMessage::new(
+                    turn.content
+                        .iter()
+                        .map(AssistantContent::canonical)
+                        .collect(),
+                );
+                let _ = serde_json::to_writer(&mut count, &canonical);
+            }
+            message => {
+                let _ = serde_json::to_writer(&mut count, message);
+            }
+        }
     }
     count.tokens()
 }
@@ -724,17 +739,17 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_reports_its_input_as_its_protocol_counts_it() {
-        let usage = Usage {
-            input_tokens: 100,
-            cached_input_tokens: 50,
-            cache_creation_input_tokens: 5,
-            ..Usage::new()
-        };
-        // OpenAI's prompt tokens already include what was cached.
+    fn a_providers_input_is_the_whole_prompt_rig_normalized() {
+        let usage = Usage::new()
+            .input_tokens(100)
+            .cached_input_tokens(50)
+            .cache_creation_input_tokens(5);
+        // Both counters already include what was cached: rig folds Anthropic's
+        // cache reads and writes into `input_tokens` as OpenAI's are.
         assert_eq!(Wire::OpenAi.reported_input(&usage), 100);
-        // Anthropic's leave it out.
-        assert_eq!(Wire::Anthropic.reported_input(&usage), 155);
+        assert_eq!(Wire::Anthropic.reported_input(&usage), 100);
+        // A count nobody gave reads as zero.
+        assert_eq!(Wire::Anthropic.reported_input(&Usage::new()), 0);
     }
 
     #[test]

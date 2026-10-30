@@ -1,7 +1,7 @@
-//! End-to-end dispatch through `McpToolAdapter` as a Rig `ToolDyn`. Gated
-//! behind `--features e2e` because it shells out to a real `buildah` /
-//! `podman` and runs the `@modelcontextprotocol/server-filesystem` MCP
-//! server inside the container.
+//! End-to-end dispatch through `McpToolAdapter` as the tool a Rig agent
+//! calls. Gated behind `--features e2e` because it shells out to a real
+//! `buildah` / `podman` and runs the `@modelcontextprotocol/server-filesystem`
+//! MCP server inside the container.
 //!
 //! Reuses the `tests/fixtures/mcp-fs/` Dockerfile already built for
 //! `tests/mcp_handshake.rs`. Run with:
@@ -10,9 +10,9 @@
 //! cargo test --features e2e --test rig_tool_dispatch -- --nocapture
 //! ```
 //!
-//! The test exercises the same code path an `Agent` would run: it calls
-//! `<McpToolAdapter as ToolDyn>::call(adapter, args_string).await` directly
-//! rather than spinning up an LLM. The LLM stack lands in tasks 0001-12 through 0001-16;
+//! The test exercises the same code path an `Agent` would run: it runs the
+//! adapter through the `SessionTool` the agent is handed, directly rather than
+//! spinning up an LLM. The LLM stack lands in tasks 0001-12 through 0001-16;
 //! once it's available, an Agent-shaped test can be added in 0001-19.
 
 #![cfg(feature = "e2e")]
@@ -29,7 +29,7 @@ use outrig::config::McpServerSpec;
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig_cli::rig_tool::McpToolAdapter;
-use rig::tool::ToolDyn;
+use outrig_cli::session_tool::SessionTool;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,20 +104,22 @@ async fn adapter_dispatches_tool_call_into_container() {
         read_file.openai_name
     );
 
-    // Happy path: dispatch through ToolDyn::call exactly as a Rig agent would.
-    let args = serde_json::json!({ "path": "/workspace/HELLO.txt" }).to_string();
-    let body = ToolDyn::call(read_file, args)
+    // Happy path: run the tool as a Rig agent would, through its erased form.
+    let tool = SessionTool::new(read_file.clone());
+    let body = tool
+        .run(serde_json::json!({ "path": "/workspace/HELLO.txt" }))
         .await
-        .expect("ToolDyn::call should succeed for an existing file");
+        .expect("the tool should succeed for an existing file")
+        .render();
     assert!(
         body.contains("rig-tool-dispatch e2e marker"),
         "tool output should echo the file content, got: {body}"
     );
 
     // Error path: missing file -> filesystem MCP reports `is_error: true`,
-    // which the adapter maps to ToolError::ToolCallError.
-    let bad_args = serde_json::json!({ "path": "/workspace/does-not-exist.txt" }).to_string();
-    let err = ToolDyn::call(read_file, bad_args)
+    // which the adapter maps to a tool error the model reads.
+    let err = tool
+        .run(serde_json::json!({ "path": "/workspace/does-not-exist.txt" }))
         .await
         .expect_err("missing file should surface as a tool-call error");
     let msg = err.to_string();
@@ -128,6 +130,7 @@ async fn adapter_dispatches_tool_call_into_container() {
 
     // Adapters each hold an `Arc<McpClient>`; drop them so the underlying
     // client can be reclaimed by `Arc::try_unwrap` for graceful shutdown.
+    drop(tool);
     drop(adapters);
     let client =
         Arc::try_unwrap(client).expect("client Arc should be unique once adapters are dropped");

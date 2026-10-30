@@ -34,7 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
-use rig::completion::{CompletionError, CompletionResponse};
+use rig::completion::CompletionResponse;
+use rig::error::ProviderError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use super::budget::Budget;
@@ -42,16 +43,24 @@ use super::history::Adjacent;
 use crate::events::Events;
 use crate::harness::event::{AttemptId, CallId, ModelAttempt, Payload, Usage, UsageRefusal};
 
-/// What a provider reported, or `None` when it reported nothing: rig fills a
-/// usage it was not given with zeros, and a zero is a count nobody gave.
+/// What a provider reported, or `None` when it reported nothing. rig leaves a
+/// counter it was not given as `None`; the event's counters are plain numbers,
+/// so one the provider left out reads as zero, and a usage that is all zeros
+/// -- or that carries only a cost -- is one nobody gave. The total is the
+/// provider's, or the sum of the input and output it reported when it gave
+/// none, as rig totals Anthropic's: the session's token budget is spent
+/// against it, and a gateway that omits the total must not leave the budget
+/// unspendable.
 pub(crate) fn reported(usage: rig::completion::Usage) -> Option<Usage> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
     let usage = Usage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
+        input_tokens,
+        output_tokens,
+        total_tokens: usage.total_tokens.unwrap_or(input_tokens + output_tokens),
+        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+        cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+        reasoning_tokens: usage.reasoning_tokens.unwrap_or(0),
     };
     (usage != Usage::default()).then_some(usage)
 }
@@ -533,6 +542,17 @@ impl CallSlot {
         Some((call.call, call.last?))
     }
 
+    /// The `[models.<name>]` row the call in flight is with: the candidate its
+    /// latest request went to, which is the one that answered once one has.
+    /// The reply itself names only the provider and the wire identifier, which
+    /// two rows at different endpoints can share.
+    pub(crate) fn answered_model(&self) -> Option<String> {
+        let state = self.state();
+        let call = state.call.as_ref()?;
+        call.last?;
+        Some(call.settings.model.clone())
+    }
+
     /// A call begins, and is named.
     pub(crate) fn begin_call(&self) -> CallId {
         let call = self.ledger.mint_call();
@@ -785,9 +805,9 @@ impl Settling {
     /// reported, which the provider billed whether or not rig could use it --
     /// and the finish reason its body named. The ids, or `None` when no request
     /// was answered -- a failure the HTTP layer already recorded.
-    pub(crate) fn settle<R>(
+    pub(crate) fn settle(
         mut self,
-        outcome: &Result<CompletionResponse<R>, CompletionError>,
+        outcome: &Result<CompletionResponse, ProviderError>,
     ) -> Option<(CallId, AttemptId)> {
         self.done = true;
         let (call, answered, settings) = {
@@ -800,7 +820,7 @@ impl Settling {
         let from_body = || body.and_then(|body| super::retry::body_usage(body));
         let (error, usage) = match outcome {
             Ok(response) => (None, reported(response.usage)),
-            Err(CompletionError::ResponseError(message)) => {
+            Err(ProviderError::Response(message)) => {
                 (Some(super::retry::unusable(message)), from_body())
             }
             Err(error) => (
@@ -907,10 +927,9 @@ mod tests {
     }
 
     #[test]
-    fn a_usage_rig_filled_with_zeros_is_none() {
+    fn a_usage_rig_was_not_given_is_none() {
         assert_eq!(reported(rig::completion::Usage::new()), None);
-        let mut some = rig::completion::Usage::new();
-        some.output_tokens = 3;
+        let some = rig::completion::Usage::new().output_tokens(3);
         assert_eq!(reported(some).map(|usage| usage.output_tokens), Some(3));
     }
 
@@ -938,8 +957,10 @@ mod tests {
         (slot, pending)
     }
 
-    fn unusable_outcome() -> Result<CompletionResponse<()>, CompletionError> {
-        Err(CompletionError::ResponseError("empty".into()))
+    // rig's error, by value, as `settle` takes it.
+    #[allow(clippy::result_large_err)]
+    fn unusable_outcome() -> Result<CompletionResponse, ProviderError> {
+        Err(ProviderError::Response("empty".into()))
     }
 
     #[test]
@@ -963,9 +984,8 @@ mod tests {
         pending.answered(None).arrived(&bytes(serde_json::json!({
             "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
         })));
-        let outcome: Result<CompletionResponse<()>, _> = Err(CompletionError::ProviderError(
-            "a body it could not read".into(),
-        ));
+        let outcome: Result<CompletionResponse, _> =
+            Err(ProviderError::Provider("a body it could not read".into()));
 
         let (_, attempt) = slot.awaiting().settle(&outcome).expect("answered");
         assert_eq!(slot.ledger().usage_of(attempt), Some(plain(5, 2)));
@@ -999,16 +1019,16 @@ mod tests {
         pending.answered(None).arrived(&bytes(serde_json::json!({
             "usage": { "input_tokens": 100, "output_tokens": 100 },
         })));
-        let mut given = rig::completion::Usage::new();
-        given.input_tokens = 1;
-        given.output_tokens = 2;
-        given.total_tokens = 3;
-        let outcome: Result<CompletionResponse<()>, CompletionError> = Ok(CompletionResponse {
-            choice: rig::OneOrMany::one(rig::completion::AssistantContent::text("hi")),
-            usage: given,
-            raw_response: (),
-            message_id: None,
-        });
+        let given = rig::completion::Usage::new()
+            .input_tokens(1)
+            .output_tokens(2)
+            .total_tokens(3);
+        let outcome: Result<CompletionResponse, ProviderError> = Ok(CompletionResponse::new(
+            vec![rig::completion::AssistantContent::text("hi")],
+            given,
+            rig::completion::message::Origin::new("anthropic.messages", "anthropic", MODEL),
+            serde_json::Value::Null,
+        ));
 
         let (_, attempt) = slot.awaiting().settle(&outcome).expect("answered");
         assert_eq!(slot.ledger().usage_of(attempt), Some(plain(1, 2)));

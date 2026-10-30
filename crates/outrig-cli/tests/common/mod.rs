@@ -578,7 +578,7 @@ pub struct FixedTool {
     pub output: &'static str,
 }
 
-impl rig::tool::ToolDyn for FixedTool {
+impl outrig_cli::session_tool::OutrigTool for FixedTool {
     fn name(&self) -> String {
         FIXED_TOOL.to_string()
     }
@@ -591,24 +591,24 @@ impl rig::tool::ToolDyn for FixedTool {
         serde_json::json!({ "type": "object", "properties": {} })
     }
 
-    fn call<'a>(
-        &'a self,
-        _args: String,
-    ) -> rig::wasm_compat::WasmBoxedFuture<'a, std::result::Result<String, rig::tool::ToolError>>
-    {
-        Box::pin(async move { Ok(self.output.to_string()) })
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        _args: serde_json::Value,
+    ) -> std::result::Result<rig::tool::ToolOutput, rig::tool::ToolExecutionError> {
+        Ok(rig::tool::ToolOutput::text(self.output))
     }
 }
 
-/// Tool results rig 0.40 would not send as written: each is JSON in a shape
-/// its `ToolResultContent::from_tool_output` reads as structured (#253).
+/// Tool results that are JSON in a shape a reader could take for structure
+/// (#253): rig 0.40 re-parsed each one and reshaped it on the wire, and a tool's
+/// text is never meant that way. Kept to pin that a result reaches the model
+/// as the tool returned it, whatever it looks like.
 ///
-/// * A WireMock stub mapping, as a file read returns it. It has a top-level
-///   `response` key, so it would reach the model as that value alone,
-///   re-serialized, and without the `request` it matches.
-/// * A `response` beside image `parts`, which would reach it as the quoted
-///   `response` and an image.
-/// * An object shaped as an image, which would reach it as that image.
+/// * A WireMock stub mapping, as a file read returns it, with a top-level
+///   `response` key.
+/// * A `response` beside image `parts`.
+/// * An object shaped as an image.
 #[allow(dead_code)]
 pub const RESULTS_RIG_RESHAPES: [&str; 3] = [
     r#"{

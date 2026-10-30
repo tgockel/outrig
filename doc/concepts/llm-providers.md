@@ -287,9 +287,11 @@ else.
 
 Reasoning an endpoint returns beside its reply -- in `reasoning_content`, or OpenRouter's
 `reasoning` -- goes back to it on that turn's assistant message in later requests. A turn that
-produced nothing but reasoning, usually one cut off at the output-token ceiling, goes back as an
-assistant message with empty text, so the conversation keeps alternating between user and
-assistant.
+produced nothing but reasoning, which the model ended on its own, stays in the conversation but
+is left out of later requests, since a chat message needs text or a call; the prompts on either
+side of it go as one user message, so the conversation keeps alternating between user and
+assistant. One cut off at the output-token ceiling while reasoning fails the turn instead, with
+an error that names `max-tokens` as the remedy.
 
 A gateway that requires the user's and the model's turns to alternate -- a Bedrock-backed Claude
 behind an OpenAI-compatible gateway is known to -- refuses a request in which one role follows

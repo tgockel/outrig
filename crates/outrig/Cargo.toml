@@ -56,7 +56,7 @@ rand               = { workspace = true, features = ["std", "std_rng", "thread_r
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
 # The agent loop's; private, so no rig or reqwest type reaches the public surface.
 reqwest            = { workspace = true, features = ["rustls"] }
-rig                = { workspace = true, features = ["reqwest", "rustls"] }
+rig                = { workspace = true, features = ["agent", "reqwest", "rustls"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 ruzstd             = { workspace = true, features = ["std"] }
 # A skill's `SKILL.md` frontmatter, read as events and never built into a tree.
@@ -93,6 +93,9 @@ miniz_oxide = { workspace = true, features = ["with-alloc"] }
 # `resource` starts the interpreter under a memory ceiling of the test's choosing.
 nix      = { workspace = true, features = ["resource"] }
 reqwest  = { workspace = true, features = ["json", "rustls"] }
+# `test-utils` is rig's scripted completion wire, which the retry tests drive
+# with a transport of their own.
+rig      = { workspace = true, features = ["test-utils"] }
 sha2     = { workspace = true }
 # `test-util` pauses the clock so the interceptor's sniff window can be driven
 # deterministically rather than slept through.

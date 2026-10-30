@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use rig::providers::anthropic::client::normalize_anthropic_base_url;
 use rig::providers::anthropic::completion::ANTHROPIC_VERSION_LATEST;
+use rig::providers::anthropic::wire::normalize_base_url as normalize_anthropic_base_url;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 

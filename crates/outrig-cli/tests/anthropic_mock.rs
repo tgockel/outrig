@@ -13,12 +13,10 @@
 //! * the wire shape is Anthropic's, not an OpenAI-compatible one (path,
 //!   `x-api-key`, `anthropic-version`, `input_schema`, content blocks);
 //! * a tool result goes back as the tool returned it, byte for byte, even
-//!   when it is JSON that rig would read as structured;
+//!   when it is JSON that a reader could take for structure;
 //! * which of the three `max_tokens` tiers -- config, rig's published ceiling,
 //!   OutRig's fallback -- reaches the wire for a model identifier rig
-//!   recognizes and one it does not, including the difference between
-//!   `completion_model` (what `build_agent` uses) and
-//!   `CompletionModel::with_model` (which would silently cap replies at 2048);
+//!   recognizes and one it does not;
 //! * every request asks for prompt caching, which rig leaves off unless asked;
 //! * the shared retry client covers this provider too -- including that a
 //!   `Retry-After` sets the wait, that a spent budget ends the turn without
@@ -37,8 +35,7 @@
 //! * reasoning Anthropic did not issue -- a fallback's, left in a chain's
 //!   shared history -- is not sent back to it as a `thinking` block it would
 //!   refuse, while a turn that was only its own thinking goes back as the
-//!   signed block it came as, untouched by what the OpenAI-style arm does to
-//!   the same turn.
+//!   signed block it came as.
 
 mod common;
 
@@ -46,16 +43,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rig::OneOrMany;
 use rig::completion::Message;
-use rig::completion::message::{AssistantContent, Reasoning, ToolResultContent, UserContent};
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::completion::message::{
+    AssistantContent, AssistantMessage, Origin, Reasoning, ToolResultContent, UserContent,
+};
+use rig::tool::{ToolContext, ToolExecutionError, ToolOutput};
 use serde_json::{Value, json};
 
 use outrig::config::Config;
 use outrig_cli::llm::{RigAgent, TurnStop};
-use outrig_cli::session_tool;
+use outrig_cli::session_tool::{self, OutrigTool};
 
 use common::{
     CannedResponse, FIXED_TOOL, FixedTool, RecordedRequest, drain_recorded, start_mock_http,
@@ -77,7 +74,7 @@ impl EchoTool {
     }
 }
 
-impl ToolDyn for EchoTool {
+impl OutrigTool for EchoTool {
     fn name(&self) -> String {
         "outrig_test_echo".to_string()
     }
@@ -96,16 +93,17 @@ impl ToolDyn for EchoTool {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let parsed: Value = serde_json::from_str(&args).unwrap_or(Value::Null);
-            let value = parsed
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            Ok(format!("pong:{value}"))
-        })
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let value = args
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(ToolOutput::text(format!("pong:{value}")))
     }
 }
 
@@ -116,10 +114,14 @@ const PREAMBLE: &str = "You are a careful coding assistant.";
 /// Low enough that a test can drive the agent into the cap in one turn.
 const TOOL_CALL_MAX: usize = 1;
 const MODEL: &str = "claude-sonnet-4-6";
+/// The output-token ceiling rig's catalog publishes for [`MODEL`].
+const MODEL_CEILING: u64 = 128_000;
 /// A recognized identifier whose published ceiling differs from both `MODEL`'s
 /// and outrig's fallback, so a test can tell the three apart by the number
 /// alone.
-const HIGHER_CEILING_MODEL: &str = "claude-opus-4-7";
+const OTHER_CEILING_MODEL: &str = "claude-haiku-4-5";
+/// The output-token ceiling rig's catalog publishes for [`OTHER_CEILING_MODEL`].
+const OTHER_CEILING: u64 = 64_000;
 /// An identifier outrig has no published ceiling for -- which is the case a
 /// user picking anything but a current model hits on their first run.
 const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
@@ -413,10 +415,11 @@ async fn native_tool_use_round_trip() {
 
 /// Every request asks Anthropic to cache, or no call is ever read back (#669).
 ///
-/// Three markers, of the four a request may carry: the top level's, which
-/// Anthropic moves to the end of the request, and one each on the last tool and
-/// the last system block. Both requests of a tool round trip are held to it,
-/// since the second is the one that has something to read back.
+/// Three markers, of the four a request may carry: one each on the last tool
+/// and the last system block, the part every call shares, and one on the last
+/// block of the last user message, which moves to the end of the request as
+/// the history grows. Both requests of a tool round trip are held to it, since
+/// the second is the one that has something to read back.
 #[tokio::test]
 async fn every_request_asks_for_prompt_caching() {
     let (addr, mut requests) = start_mock_http(vec![echo_tool_use(), text_reply("done")]).await;
@@ -437,9 +440,15 @@ async fn every_request_asks_for_prompt_caching() {
     let ephemeral = json!({ "type": "ephemeral" });
     for (n, request) in recorded.iter().enumerate() {
         let body = &request.body;
+        let last = request.messages().last().expect("a user message");
+        assert_eq!(last["role"], "user", "request {n} ends in the user's turn");
+        let last_block = last["content"]
+            .as_array()
+            .and_then(|blocks| blocks.last())
+            .expect("content blocks");
         assert_eq!(
-            body["cache_control"], ephemeral,
-            "request {n} carries the marker Anthropic moves to its end: {body:#?}",
+            last_block["cache_control"], ephemeral,
+            "request {n}: the end of the request is the marker that moves: {body:#?}",
         );
         let system = body["system"].as_array().expect("system blocks");
         assert_eq!(
@@ -453,8 +462,8 @@ async fn every_request_asks_for_prompt_caching() {
             ephemeral,
             "request {n}: the tool definition ends a cached prefix: {tools:#?}",
         );
-        // Those three are all of them: rig leaves the messages to the top-level
-        // marker, and none names a TTL, so the default five minutes applies.
+        // Those three are all of them: no top-level marker, and none names a
+        // TTL, so the default five minutes applies.
         assert_eq!(
             body.to_string().matches("\"cache_control\"").count(),
             3,
@@ -464,13 +473,11 @@ async fn every_request_asks_for_prompt_caching() {
 }
 
 /// A tool result goes back as the tool returned it, even when it is JSON that
-/// rig would read as structured.
+/// a reader could take for structure.
 ///
-/// The Anthropic sibling of `openai_mock.rs`'s test of the same name. rig 0.40
-/// re-parses each tool result a hook leaves alone, before either arm converts
-/// it: a top-level `response` key went out as that value alone, and an image,
-/// in `parts` or as the whole object, as an image block -- or, for a URL, as a
-/// request this arm's conversion refuses (#253).
+/// The Anthropic sibling of `openai_mock.rs`'s test of the same name. A tool's
+/// text is never meant as structure, and rig once re-parsed it as such (#253);
+/// this pins that nothing between the tool and the wire does.
 #[tokio::test]
 async fn a_json_tool_result_reaches_the_model_as_written() {
     let var = "OUTRIG_TEST_ANTHROPIC_RESULT_AS_WRITTEN";
@@ -1062,14 +1069,15 @@ fn assert_kept_the_echo(history: &[Message], prior: &[Message], prompt: &str) {
         panic!("the turn keeps its prompt, the tool call, and its result: {history:#?}");
     };
     assert_eq!(asked, &Message::user(prompt));
-    let Message::Assistant { content, .. } = called else {
+    let Message::Assistant(AssistantMessage { content, .. }) = called else {
         panic!("the tool call is the assistant's: {called:#?}");
     };
     assert!(
         content.iter().any(|part| matches!(
             part,
             AssistantContent::ToolCall(call)
-                if call.id == "toolu_mock_1" && call.function.name == "outrig_test_echo"
+                if call.id.wire() == "toolu_mock_1"
+                    && call.function.name.as_str() == "outrig_test_echo"
         )),
         "the assistant turn carries the tool_use that ran: {called:#?}",
     );
@@ -1080,7 +1088,7 @@ fn assert_kept_the_echo(history: &[Message], prior: &[Message], prompt: &str) {
         content.iter().any(|part| matches!(
             part,
             UserContent::ToolResult(result)
-                if result.id == "toolu_mock_1"
+                if result.call.wire() == "toolu_mock_1"
                     && result.content.iter().any(|item| matches!(
                         item,
                         ToolResultContent::Text(text) if text.text.contains("pong:ping")
@@ -1383,27 +1391,27 @@ async fn a_turn_dropped_in_its_first_call_adds_nothing() {
 /// gap and never overrides a ceiling rig or the user already chose.
 #[tokio::test]
 async fn max_tokens_comes_from_config_then_rig_then_the_fallback() {
-    // 1. Recognized identifier, nothing configured: rig's own default for the
-    //    Claude 4 family travels on the request.
+    // 1. Recognized identifier, nothing configured: rig's catalog ceiling for
+    //    the identifier travels on the request.
     assert_eq!(
         recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_KNOWN", MODEL, None).await,
-        64_000,
-        "rig's published ceiling for the Claude 4 family, not OutRig's fallback",
+        MODEL_CEILING,
+        "rig's published ceiling for the identifier, not OutRig's fallback",
     );
 
-    // 2. Another recognized identifier, whose published ceiling is higher than
-    //    the fallback. Together with case 1 this is what would catch a fallback
-    //    that stopped checking whether rig already had an answer: it would show
-    //    up here as a ceiling *lowered* to 32768.
+    // 2. Another recognized identifier, whose published ceiling differs from
+    //    the first's and is higher than the fallback. Together with case 1
+    //    this is what would catch a fallback that stopped checking whether rig
+    //    already had an answer: it would show up here as a ceiling *lowered*
+    //    to 32768.
     assert_eq!(
-        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_HIGHER", HIGHER_CEILING_MODEL, None).await,
-        128_000,
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_OTHER", OTHER_CEILING_MODEL, None).await,
+        OTHER_CEILING,
     );
 
     // 3. Unrecognized identifier, nothing configured: rig has no ceiling to
-    //    offer, so OutRig's fallback fills the gap and the turn runs. It is
-    //    deliberately not rig's silent 2048 -- see
-    //    `rig_max_tokens_defaults_differ_between_constructors` below.
+    //    offer, so OutRig's fallback fills the gap and the turn runs -- see
+    //    `rig_publishes_a_ceiling_only_for_the_identifiers_it_knows` below.
     assert_eq!(
         recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_UNKNOWN", UNRECOGNIZED_MODEL, None).await,
         outrig_cli::llm::ANTHROPIC_FALLBACK_MAX_TOKENS,
@@ -1434,12 +1442,12 @@ async fn max_tokens_comes_from_config_then_rig_then_the_fallback() {
 /// overriding rig would fail this test with 32768 rather than pass it.
 #[tokio::test]
 async fn a_configured_ceiling_is_capped_at_the_published_one() {
-    // Recognized identifier, configured above its published 64000. The number
-    // that travels is the model's, not the config's.
+    // Recognized identifier, configured above its published ceiling. The
+    // number that travels is the model's, not the config's.
     assert_eq!(
-        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_OVER_CEILING", MODEL, Some(128_000)).await,
-        64_000,
-        "the identifier's published ceiling, not the configured 128000 the API \
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_OVER_CEILING", MODEL, Some(256_000)).await,
+        MODEL_CEILING,
+        "the identifier's published ceiling, not the configured 256000 the API \
          would refuse -- and not the fallback",
     );
 
@@ -1460,81 +1468,53 @@ async fn a_configured_ceiling_is_capped_at_the_published_one() {
         recorded_max_tokens(
             "OUTRIG_TEST_ANTHROPIC_UNCAPPED",
             UNRECOGNIZED_MODEL,
-            Some(128_000),
+            Some(256_000),
         )
         .await,
-        128_000,
+        256_000,
     );
 }
 
-/// The constructor contract this integration depends on, asserted directly
-/// against rig so an upgrade that changes either default fails here rather
-/// than in a truncated reply months later.
+/// The catalog contract this integration depends on, asserted directly
+/// against rig so an upgrade that changes a default fails here rather than
+/// in a truncated reply months later.
 ///
-/// `build_agent` must keep using `CompletionClient::completion_model`: it
-/// leaves the default unset for an identifier rig does not recognize, and that
-/// `None` is the signal the fallback ceiling keys off. `CompletionModel::with_model`
-/// invents 2048 first, which would both hide the gap and cap replies at a
-/// quarter of what the fallback chooses.
+/// rig's Anthropic wire leaves the default unset for an identifier its
+/// catalog does not list, and that `None` is the signal the fallback ceiling
+/// keys off.
 #[test]
-fn rig_max_tokens_defaults_differ_between_constructors() {
-    use rig::client::CompletionClient;
-    use rig::providers::anthropic::{Client, completion::CompletionModel};
+fn rig_publishes_a_ceiling_only_for_the_identifiers_it_knows() {
+    use rig::providers::anthropic::wire::AnthropicConfig;
 
-    let client = Client::builder()
-        .api_key("unused-no-request-is-made")
-        .build()
-        .expect("client builds");
+    let config = AnthropicConfig::new("unused-no-request-is-made");
+    let published = |identifier: &str| config.completion(identifier).default_max_tokens;
 
+    assert_eq!(published("claude-sonnet-4-6"), Some(128_000));
+    assert_eq!(published("claude-opus-4-6"), Some(128_000));
     assert_eq!(
-        client
-            .completion_model("claude-sonnet-4-6")
-            .default_max_tokens,
-        Some(64_000),
-    );
-    assert_eq!(
-        client
-            .completion_model("claude-opus-4-6")
-            .default_max_tokens,
-        Some(128_000),
-    );
-    assert_eq!(
-        client
-            .completion_model("claude-3-5-sonnet-20241022")
-            .default_max_tokens,
+        published("claude-3-5-sonnet-20241022"),
         None,
         "an unrecognized identifier must arrive with no ceiling, so build_agent \
          can tell that gap from a ceiling rig chose",
-    );
-
-    assert_eq!(
-        CompletionModel::with_model(client.clone(), "claude-3-5-sonnet-20241022")
-            .default_max_tokens,
-        Some(2_048),
-        "with_model still invents a silent ceiling; build_agent must keep \
-         using completion_model",
     );
 }
 
 /// A turn whose only content is a thinking block is reported, not swallowed.
 ///
-/// This is the failure that prompted the change. A think-heavy turn cut off at
-/// the provider's output ceiling comes back carrying reasoning and no text.
-/// Rig treats that as an ordinary success whose `output` is the empty string --
-/// text parts are all `output` concatenates -- so before this, `run_turn`
-/// returned `""` with no stop reason, the REPL's `if !reply.is_empty()` guard
-/// printed nothing, and a minute of billed generation reached the user as
-/// silence indistinguishable from outrig having ignored the prompt.
+/// A think-heavy turn the model ends on its own comes back carrying reasoning
+/// and no text. Rig treats that as an ordinary success whose `output` is the
+/// empty string -- text parts are all `output` concatenates -- so before this,
+/// `run_turn` returned `""` with no stop reason, the REPL's
+/// `if !reply.is_empty()` guard printed nothing, and a minute of billed
+/// generation reached the user as silence indistinguishable from outrig having
+/// ignored the prompt.
 ///
 /// Pins all three of the properties that make it reportable: the turn is
 /// recognizably silent, the reasoning is recovered rather than dropped, and the
 /// report says which of the two silences this was.
 ///
 /// Then pins what the next prompt sends: the turn, as the signed `thinking`
-/// block it came as. That is the arm the OpenAI-style fix for the same turn
-/// must leave alone -- rig's OpenAI conversion drops an assistant message with
-/// no text, so outrig gives one an empty text part on its way out there, and
-/// Anthropic refuses an empty text block.
+/// block it came as.
 #[tokio::test]
 async fn a_reasoning_only_turn_is_recovered_and_reported() {
     let thinking = json!({
@@ -1543,7 +1523,7 @@ async fn a_reasoning_only_turn_is_recovered_and_reported() {
         "signature": "sig-1",
     });
     let (addr, mut requests) = start_mock_http(vec![
-        message(json!([thinking.clone()]), "max_tokens"),
+        message(json!([thinking.clone()]), "end_turn"),
         text_reply("ok"),
     ])
     .await;
@@ -1618,6 +1598,43 @@ async fn a_reasoning_only_turn_is_recovered_and_reported() {
     );
 }
 
+/// A turn of only reasoning that was cut off at the output ceiling is a turn
+/// rig fails: reasoning is not an answer, and a turn cut short of one is not
+/// a turn the model finished. It ends the turn as the endpoint's failure,
+/// naming rig's reason, and leaves the history as it was.
+///
+/// What a user used to be shown of such a turn was its recovered reasoning
+/// ([`a_reasoning_only_turn_is_recovered_and_reported`], which now takes a turn
+/// the model ended on its own); what they are shown now is why nothing came
+/// back and the ceiling to raise.
+#[tokio::test]
+async fn a_reasoning_only_turn_cut_off_at_the_ceiling_ends_the_turn() {
+    let (addr, _requests) = start_mock_http(vec![message(
+        json!([{ "type": "thinking", "thinking": "weighing it", "signature": "sig-1" }]),
+        "max_tokens",
+    )])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_REASONING_CUT_OFF";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
+
+    let mut history = Vec::new();
+    let end = agent
+        .run_turn("two images, then", &mut history)
+        .await
+        .expect("a cut-off turn ends the turn, it does not fail the session");
+
+    let Some(TurnStop::EndpointFailed(reason)) = &end.stopped else {
+        panic!("a turn cut short of an answer is the endpoint's failure: {end:?}");
+    };
+    assert!(
+        reason.contains("no answer") && reason.contains("max_tokens"),
+        "the reason names what rig found and the ceiling to raise: {reason}",
+    );
+    assert!(history.is_empty(), "nothing is kept of it: {history:#?}");
+}
+
 /// A whitespace-only text part alongside the reasoning is still a silent turn,
 /// and its reasoning is still salvaged.
 ///
@@ -1635,7 +1652,7 @@ async fn a_whitespace_reply_beside_reasoning_is_still_recovered() {
             { "type": "thinking", "thinking": "still weighing it", "signature": "sig-1" },
             { "type": "text", "text": "   " },
         ]),
-        "max_tokens",
+        "end_turn",
     )])
     .await;
 
@@ -1670,15 +1687,17 @@ async fn a_whitespace_reply_beside_reasoning_is_still_recovered() {
     );
 }
 
-/// Reasoning Anthropic did not issue is not sent back to it.
+/// Reasoning Anthropic did not issue is not sent back to it as thinking.
 ///
 /// An alias chain shares one history across its candidates, so a turn that a
 /// local fallback answered is still in it when the next call starts back at the
 /// Anthropic head. An OpenAI-style endpoint's `reasoning_content` comes back
-/// with no signature, since only Anthropic signs. rig turns every reasoning
-/// block into a native `thinking` block, and Anthropic refuses one without its
-/// signature. So the head would fail every call, long after its outage ended,
-/// and the chain would stay on the fallback without saying why.
+/// with no signature, since only Anthropic signs, and Anthropic refuses a
+/// `thinking` block without one. So the head would fail every call, long after
+/// its outage ended, and the chain would stay on the fallback without saying
+/// why. rig sends such reasoning as plain text instead, which Anthropic takes,
+/// and replays Anthropic's own thinking only from a turn it knows to be
+/// Anthropic's.
 ///
 /// The history below is what such a fallback leaves behind, next to a turn
 /// Anthropic answered itself. What this pins is the request the head is sent.
@@ -1693,21 +1712,29 @@ async fn reasoning_anthropic_did_not_issue_is_not_sent_back_to_it() {
     let cfg = mock_chain_config(head, next, vars);
     let agent = build_mock_agent(&cfg, &vars, vec![]).await;
 
-    let assistant = |parts: Vec<AssistantContent>| Message::Assistant {
-        id: None,
-        content: OneOrMany::many(parts).expect("non-empty"),
-    };
+    let assistant = |parts: Vec<AssistantContent>| Message::Assistant(AssistantMessage::new(parts));
     let mut history = vec![
         Message::user("first"),
-        // Anthropic's own turn: its thinking goes back exactly as it came.
-        assistant(vec![
-            AssistantContent::Reasoning(Reasoning::new_with_signature(
-                "claude weighs it",
-                Some("sig-1".to_string()),
-            )),
-            AssistantContent::Reasoning(Reasoning::redacted("opaque-blob")),
-            AssistantContent::text("claude's answer"),
-        ]),
+        // Anthropic's own turn, as rig keeps one: its origin names the model
+        // that wrote it, and the signature rides in the block's provider item.
+        Message::Assistant(
+            AssistantMessage::new(vec![
+                AssistantContent::Reasoning(Reasoning::new("claude weighs it")).with_native(
+                    json!({
+                        "type": "thinking",
+                        "thinking": "claude weighs it",
+                        "signature": "sig-1",
+                    }),
+                ),
+                AssistantContent::Reasoning(Reasoning {
+                    redacted: true,
+                    ..Reasoning::new("")
+                })
+                .with_native(json!({ "type": "redacted_thinking", "data": "opaque-blob" })),
+                AssistantContent::text("claude's answer"),
+            ])
+            .with_origin(Origin::new("anthropic.messages", "anthropic", MODEL)),
+        ),
         Message::user("second"),
         // A local fallback's turn: unsigned reasoning beside its reply...
         assistant(vec![
@@ -1745,19 +1772,25 @@ async fn reasoning_anthropic_did_not_issue_is_not_sent_back_to_it() {
             .all(|b| b["signature"].is_string()),
         "Anthropic refuses a thinking block without its signature: {blocks:#?}",
     );
-    let body = recorded[0].body.to_string();
     assert!(
-        body.contains("claude weighs it") && body.contains("sig-1") && body.contains("opaque-blob"),
-        "Anthropic's own thinking goes back as it came: {body}",
+        blocks.iter().any(|b| b["type"] == "thinking"
+            && b["thinking"] == "claude weighs it"
+            && b["signature"] == "sig-1")
+            && blocks
+                .iter()
+                .any(|b| b["type"] == "redacted_thinking" && b["data"] == "opaque-blob"),
+        "Anthropic's own thinking goes back as it came: {blocks:#?}",
     );
     assert!(
-        body.contains("local answer") && !body.contains("local weighs it"),
-        "the fallback's reply goes back without its reasoning: {body}",
+        blocks
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "local weighs it"),
+        "the fallback's reasoning goes back as text, which Anthropic takes: {blocks:#?}",
     );
     assert_eq!(
         messages.iter().filter(|m| m["role"] == "assistant").count(),
-        2,
-        "the reasoning-only turn is left out whole, not sent back empty, which \
-         Anthropic refuses too: {messages:#?}",
+        3,
+        "the reasoning-only turn goes back as a text turn, not left out or sent \
+         empty, which Anthropic refuses: {messages:#?}",
     );
 }

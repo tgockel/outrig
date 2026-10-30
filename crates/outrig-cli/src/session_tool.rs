@@ -3,79 +3,105 @@
 //! A session's tools come from two places: MCP servers running in the
 //! container ([`McpToolAdapter`](crate::rig_tool::McpToolAdapter)) and
 //! OutRig's own host-side built-ins ([`crate::builtin_tool`]). Both are
-//! [`ToolDyn`] implementations, so [`SessionTool`] erases the difference and
-//! the rest of the CLI handles one list.
+//! [`OutrigTool`] implementations, so [`SessionTool`] erases the difference --
+//! once, into the [`DynamicTool`] rig's agent takes -- and the rest of the CLI
+//! handles one list.
 //!
 //! The wrapper exists because the list has to be *cloned*, not just borrowed:
 //! [`RebuildingAgent`](crate::llm::RebuildingAgent) keeps the tools and hands
-//! Rig a fresh `Vec<Box<dyn ToolDyn>>` every time it rebuilds, and a
-//! `Box<dyn ToolDyn>` is not `Clone`. An `Arc` is, so cloning the list shares
-//! the tools rather than duplicating their state -- which matters for MCP
-//! adapters, whose `Arc<McpClient>` is a live connection, and for built-ins,
-//! which share the subagent registry.
+//! Rig a fresh `Vec<DynamicTool>` every time it rebuilds. A `DynamicTool`
+//! clones by sharing the tool behind it rather than duplicating its state --
+//! which matters for MCP adapters, whose `Arc<McpClient>` is a live
+//! connection, and for built-ins, which share the subagent registry.
 //!
-//! `ToolDyn` already exposes `name()` and `description()`, so the banner and
-//! `/tools` render straight off the trait and need no separate metadata.
+//! The definition already carries the name and description, so the banner
+//! and `/tools` render straight off it and need no separate metadata.
 
 use std::sync::{Arc, Mutex};
 
-use rig::tool::{ToolCallExtensions, ToolDyn, ToolError, ToolExecutionResult};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::completion::message::ToolName;
+use rig::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
 use serde_json::Value;
+
+/// A tool of OutRig's own, as the agent loop calls it.
+///
+/// Every name here is decided at runtime -- an MCP server's listing, or
+/// `sanitize_tool_name` over a built-in's -- which is why this is not rig's
+/// own [`Tool`](rig::tool::Tool), whose name is a `const`. The arguments
+/// arrive decoded: rig parses the model's JSON, and a call whose arguments
+/// are no object never reaches a tool.
+///
+/// An error reaches the model as its text, so a tool says why it failed in
+/// words the model can act on ([`ToolExecutionError::new`]); rig's
+/// `from_error` would redact them to "the tool failed".
+pub trait OutrigTool: Send + Sync + 'static {
+    /// What the model calls the tool.
+    fn name(&self) -> String;
+
+    /// What the model is told the tool does.
+    fn description(&self) -> String;
+
+    /// The JSON Schema of the arguments.
+    fn parameters(&self) -> Value;
+
+    /// Run the tool on `args`. `context` is the dispatch's, which carries the
+    /// turn's [`TurnUndo`](crate::llm::TurnUndo) to the one tool that reads it.
+    fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Value,
+    ) -> impl Future<Output = Result<ToolOutput, ToolExecutionError>> + Send;
+}
 
 /// A reference-counted handle to one tool the agent can call.
 #[derive(Clone)]
-pub struct SessionTool(Arc<dyn ToolDyn>);
+pub struct SessionTool(DynamicTool);
 
 impl SessionTool {
-    pub fn new<T: ToolDyn + 'static>(tool: T) -> Self {
-        Self(Arc::new(tool))
+    pub fn new<T: OutrigTool>(tool: T) -> Self {
+        let tool = Arc::new(tool);
+        // Every name comes through `sanitize_tool_name` or an MCP server's
+        // listing, and neither yields an empty one.
+        let name = ToolName::new(tool.name()).expect("a session tool has a name");
+        let description = tool.description();
+        let parameters = tool.parameters();
+        Self(DynamicTool::new_with_context(
+            name,
+            description,
+            parameters,
+            move |context: &mut ToolContext, args: Value| {
+                let tool = Arc::clone(&tool);
+                Box::pin(async move { tool.call(context, args).await })
+            },
+        ))
+    }
+
+    /// What the model calls the tool.
+    pub fn name(&self) -> &str {
+        self.0.name().as_str()
+    }
+
+    /// What the model is told the tool does.
+    pub fn description(&self) -> String {
+        self.0.definition().description
+    }
+
+    /// The JSON Schema of the arguments.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn parameters(&self) -> Value {
+        self.0.definition().parameters
+    }
+
+    /// Run the tool on `args` outside a turn, as a test or a smoke check does.
+    #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
+    pub async fn run(&self, args: Value) -> Result<ToolOutput, ToolExecutionError> {
+        self.0.run(args).await
     }
 }
 
 impl std::fmt::Debug for SessionTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SessionTool").field(&self.0.name()).finish()
-    }
-}
-
-/// Delegates every method rather than only `call`, so a built-in that
-/// overrides `call_structured` to report a precise [`ToolOutcome`] keeps that
-/// behavior through the wrapper instead of silently falling back to the
-/// blanket default.
-///
-/// [`ToolOutcome`]: rig::tool::ToolOutcome
-impl ToolDyn for SessionTool {
-    fn name(&self) -> String {
-        self.0.name()
-    }
-
-    fn description(&self) -> String {
-        self.0.description()
-    }
-
-    fn parameters(&self) -> Value {
-        self.0.parameters()
-    }
-
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        self.0.call(args)
-    }
-
-    fn call_with_extensions<'a>(
-        &'a self,
-        args: String,
-        extensions: &'a ToolCallExtensions,
-    ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        self.0.call_with_extensions(args, extensions)
-    }
-
-    fn call_structured<'a>(
-        &'a self,
-        args: String,
-        extensions: &'a ToolCallExtensions,
-    ) -> WasmBoxedFuture<'a, ToolExecutionResult> {
-        self.0.call_structured(args, extensions)
+        f.debug_tuple("SessionTool").field(&self.name()).finish()
     }
 }
 
@@ -111,14 +137,11 @@ impl SharedTools {
 }
 
 /// Erase a list of concrete tools into the shared form.
-pub fn erase<T: ToolDyn + 'static>(tools: impl IntoIterator<Item = T>) -> Vec<SessionTool> {
+pub fn erase<T: OutrigTool>(tools: impl IntoIterator<Item = T>) -> Vec<SessionTool> {
     tools.into_iter().map(SessionTool::new).collect()
 }
 
-/// Hand Rig the owned, boxed form its `AgentBuilder` wants.
-pub fn boxed(tools: &[SessionTool]) -> Vec<Box<dyn ToolDyn>> {
-    tools
-        .iter()
-        .map(|t| Box::new(t.clone()) as Box<dyn ToolDyn>)
-        .collect()
+/// Hand Rig the owned form its `AgentBuilder` wants.
+pub fn dynamic(tools: &[SessionTool]) -> Vec<DynamicTool> {
+    tools.iter().map(|tool| tool.0.clone()).collect()
 }

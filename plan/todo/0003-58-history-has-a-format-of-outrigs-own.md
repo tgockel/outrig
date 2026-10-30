@@ -32,7 +32,9 @@ reasoning/signatures", and that nothing is invented, rewritten or promised porta
 
 **This task reverses a recorded decision.** `doc/reference/events.md`, `turn.committed`, says of
 `messages`: "the turn's messages, in rig's own JSON form, which can change when OutRig upgrades
-rig"; `plan/next/history-export-and-import.md` says the store "is crate-private, holds rig
+rig" -- and the upgrade to rig 0.45 did change it: every item is tagged by `type`, ids are
+objects, and a model's turn carries `origin` and `stop`, so `scripts/render-session.py` reads
+both shapes; `plan/next/history-export-and-import.md` says the store "is crate-private, holds rig
 `Message`s, and ends with the session." The validation (reversal 5) found that this extends
 `embedding.md`'s rule -- no rig type in the public surface, so "a rig release cannot force an
 `outrig` major" -- to the persisted form, which the deferred export entry already asked for, and

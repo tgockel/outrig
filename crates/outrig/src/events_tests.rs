@@ -1047,11 +1047,11 @@ fn each_event_has_exactly_its_data_fields() {
     // OutRig's tool definition is written as rig's was.
     assert_eq!(
         serde_json::to_value(&tools[0]).expect("encodes"),
-        serde_json::to_value(rig::completion::ToolDefinition {
-            name: "submit_python".to_string(),
-            description: "d".to_string(),
-            parameters: json!({"type": "object"}),
-        })
+        serde_json::to_value(rig::completion::ToolDefinition::new(
+            rig::completion::message::ToolName::new("submit_python").expect("a name"),
+            "d",
+            json!({"type": "object"}),
+        ))
         .expect("rig encodes it")
     );
     let completed = serde_json::to_value(case("exec.completed")).expect("encodes");

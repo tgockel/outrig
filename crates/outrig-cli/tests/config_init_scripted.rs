@@ -97,7 +97,7 @@ async fn writes_anthropic_config_with_max_tokens() {
         "api-key = \"${ANTHROPIC_API_KEY}\"",
         "[models.sonnet]",
         "identifier = \"claude-sonnet-4-6\"",
-        "max-tokens = 64000",
+        "max-tokens = 128000",
         "default-model = \"sonnet\"",
     ] {
         assert!(text.contains(expected), "missing {expected}:\n{text}");
@@ -332,7 +332,7 @@ async fn a_zero_max_tokens_answer_is_asked_again() {
     assert!(text.contains("max-tokens = 32000"), "got:\n{text}");
     assert_eq!(
         shown
-            .matches("? max-tokens for this model [default: 64000]: ")
+            .matches("? max-tokens for this model [default: 128000]: ")
             .count(),
         2,
         "the refused 0 must be asked for again:\n{shown}"
@@ -361,7 +361,7 @@ async fn a_max_tokens_answer_that_is_not_a_number_is_asked_again() {
     );
     assert_eq!(
         shown
-            .matches("? max-tokens for this model [default: 64000]: ")
+            .matches("? max-tokens for this model [default: 128000]: ")
             .count(),
         2,
         "the refused max-tokens must be asked for again:\n{shown}"

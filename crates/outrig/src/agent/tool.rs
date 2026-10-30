@@ -20,8 +20,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::tool::{Tool, ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -39,19 +38,24 @@ pub(crate) const NAME: &str = "submit_python";
 /// empty string the model has to guess the meaning of.
 const NO_OUTPUT: &str = "(no output)";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Args {
-    source: String,
-}
-
 /// The schema advertises `additionalProperties: false` and the struct carries
 /// `deny_unknown_fields` to match, so the decoder is never laxer than the
-/// published contract. Empty arguments decode as `{}`, which then fails for
-/// the missing `source` rather than as malformed JSON.
-fn parse_args(args: &str) -> Result<Args, ToolError> {
-    let args = if args.trim().is_empty() { "{}" } else { args };
-    serde_json::from_str(args).map_err(ToolError::JsonError)
+/// published contract. rig decodes the arguments: blank or `null` ones decode
+/// as `{}`, which then fails for the missing `source` as invalid arguments
+/// rather than as malformed JSON, and arguments that are no object never
+/// reach the tool.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Args {
+    pub(crate) source: String,
+}
+
+/// Why a submission could not be made at all: the one outcome that is the
+/// tool's failure rather than the code's. Code that raises is a result.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SubmitError {
+    #[error(transparent)]
+    Interpreter(#[from] InterpreterError),
 }
 
 /// Where the user's interrupt goes: the execution a call is waiting on, and
@@ -170,10 +174,11 @@ impl SubmitPython {
     }
 }
 
-impl ToolDyn for SubmitPython {
-    fn name(&self) -> String {
-        NAME.to_string()
-    }
+impl Tool for SubmitPython {
+    const NAME: &'static str = NAME;
+    type Args = Args;
+    type Output = ToolOutput;
+    type Error = SubmitError;
 
     fn description(&self) -> String {
         "Run Python in this session's persistent interpreter, inside the project's container. \
@@ -206,18 +211,33 @@ impl ToolDyn for SubmitPython {
         })
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let Args { source } = parse_args(&args)?;
+    // No `annotations`: unset, they read as a tool that is not read-only,
+    // destructive and open-world, which is what arbitrary Python is. Stating
+    // them would also start serializing them into the tool's definition.
+
+    /// The error as the model reads it: its own text, which names the cause,
+    /// where rig's default would say only that the tool failed.
+    fn map_error(&self, error: SubmitError) -> ToolExecutionError {
+        ToolExecutionError::new(ToolErrorKind::Other, error.to_string()).with_source(error)
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        Args { source }: Args,
+    ) -> Result<ToolOutput, SubmitError> {
+        {
             let events = self.interpreter.events();
             let execution = match self.interpreter.submit(&source) {
                 Ok(execution) => execution,
                 // Refused at the close: the model reads why, and that nothing
                 // more will run, and can say so in its reply.
-                Err(InterpreterError::Closed(closed)) => return Ok(refused(closed.by())),
+                Err(InterpreterError::Closed(closed)) => {
+                    return Ok(ToolOutput::text(refused(closed.by())));
+                }
                 // Nothing was sent, so this one is a failure of the tool rather
                 // than an outcome of the code.
-                Err(e) => return Err(ToolError::ToolCallError(e.into())),
+                Err(e) => return Err(e.into()),
             };
             let id = execution.id();
             tracing::debug!(execution = %id, "submitted");
@@ -276,12 +296,12 @@ impl ToolDyn for SubmitPython {
                     kept: kept as u64,
                 });
             }
-            Ok(if announcement.is_empty() {
+            Ok(ToolOutput::text(if announcement.is_empty() {
                 text
             } else {
                 announcement + &text
-            })
-        })
+            }))
+        }
     }
 }
 

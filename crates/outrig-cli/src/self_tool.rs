@@ -14,8 +14,7 @@
 //!
 //! [`McpServerSpec`]: outrig::config::McpServerSpec
 
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
+use rig::tool::{ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput};
 use serde_json::{Value, json};
 
 use crate::builtin_tool::{fail, name_of, parse_args};
@@ -25,10 +24,14 @@ use crate::mcp_self::args::{
     ValidateConfigArgs, ValidateDockerfileArgs,
 };
 use crate::mcp_self::{docs, schema, suggestions, validate};
-use crate::session_tool::SessionTool;
+use crate::session_tool::{OutrigTool, SessionTool};
 
-fn encode<T: serde::Serialize>(value: &T) -> Result<String, ToolError> {
-    serde_json::to_string(value).map_err(ToolError::JsonError)
+/// `value` as the JSON text the model reads, which is what `outrig mcp self`
+/// serves for the same call.
+fn encode<T: serde::Serialize>(value: &T) -> Result<ToolOutput, ToolExecutionError> {
+    serde_json::to_string(value)
+        .map(ToolOutput::text)
+        .map_err(|e| ToolExecutionError::new(ToolErrorKind::Other, e.to_string()))
 }
 
 /// Which of the eight this instance is. One enum rather than eight structs:
@@ -174,7 +177,7 @@ pub struct SelfTool {
     kind: Kind,
 }
 
-impl ToolDyn for SelfTool {
+impl OutrigTool for SelfTool {
     fn name(&self) -> String {
         name_of(self.kind.tool())
     }
@@ -187,37 +190,39 @@ impl ToolDyn for SelfTool {
         self.kind.parameters()
     }
 
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            match self.kind {
-                Kind::ListDocs => encode(&docs::list_docs()),
-                Kind::GetDoc => {
-                    let args: GetDocArgs = parse_args(&args)?;
-                    match docs::get_doc(&args.page) {
-                        Some(doc) => encode(&doc),
-                        None => fail(format!(
-                            "unknown doc page: {}; call outrig__list_docs for the set",
-                            args.page
-                        )),
-                    }
-                }
-                Kind::GetConfigSchema => encode(&schema::get_config_schema()),
-                Kind::ListBaseImages => encode(&suggestions::list_base_images()),
-                Kind::ListMcpServers => encode(&suggestions::list_mcp_server_suggestions()),
-                Kind::ValidateDockerfile => {
-                    let args: ValidateDockerfileArgs = parse_args(&args)?;
-                    encode(&validate::validate_dockerfile(&args.dockerfile))
-                }
-                Kind::ValidateConfig => {
-                    let args: ValidateConfigArgs = parse_args(&args)?;
-                    encode(&validate::validate_config(&args.toml))
-                }
-                Kind::ValidateImageToml => {
-                    let args: ValidateConfigArgs = parse_args(&args)?;
-                    encode(&validate::validate_image_toml(&args.toml))
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<ToolOutput, ToolExecutionError> {
+        match self.kind {
+            Kind::ListDocs => encode(&docs::list_docs()),
+            Kind::GetDoc => {
+                let args: GetDocArgs = parse_args(args)?;
+                match docs::get_doc(&args.page) {
+                    Some(doc) => encode(&doc),
+                    None => fail(format!(
+                        "unknown doc page: {}; call outrig__list_docs for the set",
+                        args.page
+                    )),
                 }
             }
-        })
+            Kind::GetConfigSchema => encode(&schema::get_config_schema()),
+            Kind::ListBaseImages => encode(&suggestions::list_base_images()),
+            Kind::ListMcpServers => encode(&suggestions::list_mcp_server_suggestions()),
+            Kind::ValidateDockerfile => {
+                let args: ValidateDockerfileArgs = parse_args(args)?;
+                encode(&validate::validate_dockerfile(&args.dockerfile))
+            }
+            Kind::ValidateConfig => {
+                let args: ValidateConfigArgs = parse_args(args)?;
+                encode(&validate::validate_config(&args.toml))
+            }
+            Kind::ValidateImageToml => {
+                let args: ValidateConfigArgs = parse_args(args)?;
+                encode(&validate::validate_image_toml(&args.toml))
+            }
+        }
     }
 }
 
@@ -235,6 +240,19 @@ mod tests {
 
     fn tool(kind: Kind) -> SelfTool {
         SelfTool { kind }
+    }
+
+    /// Run `tool` on the argument text `args` -- `""` for none, as a model
+    /// sends an argless call -- outside a turn, and render what it returned.
+    async fn call(tool: &SelfTool, args: &str) -> Result<String, ToolExecutionError> {
+        let args = if args.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(args).expect("test arguments are JSON")
+        };
+        tool.call(&mut ToolContext::new(), args)
+            .await
+            .map(|output| output.render())
     }
 
     /// These must look exactly like MCP tools to the model, which means going
@@ -286,15 +304,14 @@ mod tests {
             Kind::ListBaseImages,
             Kind::ListMcpServers,
         ] {
-            let out = tool(kind).call(String::new()).await;
+            let out = call(&tool(kind), "").await;
             assert!(out.is_ok(), "{}: {:?}", kind.tool(), out.err());
         }
     }
 
     #[tokio::test]
     async fn get_doc_reports_an_unknown_page_rather_than_failing_opaquely() {
-        let err = tool(Kind::GetDoc)
-            .call(r#"{"page":"nope"}"#.to_string())
+        let err = call(&tool(Kind::GetDoc), r#"{"page":"nope"}"#)
             .await
             .expect_err("unknown page");
         let text = err.to_string();
@@ -306,18 +323,14 @@ mod tests {
     /// agent's first move after listing is a dead end.
     #[tokio::test]
     async fn every_listed_page_is_retrievable() {
-        let listing = tool(Kind::ListDocs)
-            .call(String::new())
-            .await
-            .expect("list");
+        let listing = call(&tool(Kind::ListDocs), "").await.expect("list");
         let listing: Value = serde_json::from_str(&listing).expect("json");
         let entries = listing["docs"].as_array().expect("docs array");
         assert!(!entries.is_empty(), "no doc pages are embedded");
 
         for entry in entries {
             let id = entry["page"].as_str().expect("page id");
-            tool(Kind::GetDoc)
-                .call(json!({ "page": id }).to_string())
+            call(&tool(Kind::GetDoc), &json!({ "page": id }).to_string())
                 .await
                 .unwrap_or_else(|e| panic!("{id} is listed but not retrievable: {e}"));
         }
@@ -325,10 +338,12 @@ mod tests {
 
     #[tokio::test]
     async fn validate_config_reports_a_bad_fragment() {
-        let out = tool(Kind::ValidateConfig)
-            .call(json!({ "toml": "[images.x]\ndockerfile = 5\n" }).to_string())
-            .await
-            .expect("validation runs");
+        let out = call(
+            &tool(Kind::ValidateConfig),
+            &json!({ "toml": "[images.x]\ndockerfile = 5\n" }).to_string(),
+        )
+        .await
+        .expect("validation runs");
         let parsed: Value = serde_json::from_str(&out).expect("json");
         assert_eq!(parsed["valid"], json!(false), "{out}");
     }
@@ -338,10 +353,12 @@ mod tests {
     #[tokio::test]
     async fn validate_config_warns_about_an_unknown_key() {
         let toml = "[images.x]\nimage-name = \"debian\"\nbogus-key = 1\n";
-        let out = tool(Kind::ValidateConfig)
-            .call(json!({ "toml": toml }).to_string())
-            .await
-            .expect("validation runs");
+        let out = call(
+            &tool(Kind::ValidateConfig),
+            &json!({ "toml": toml }).to_string(),
+        )
+        .await
+        .expect("validation runs");
         let parsed: Value = serde_json::from_str(&out).expect("json");
         assert_eq!(parsed["valid"], json!(true), "{out}");
         assert_eq!(
@@ -354,9 +371,11 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_arguments_are_rejected() {
-        let err = tool(Kind::GetDoc)
-            .call(r#"{"page":"reference/config","extra":1}"#.to_string())
-            .await;
+        let err = call(
+            &tool(Kind::GetDoc),
+            r#"{"page":"reference/config","extra":1}"#,
+        )
+        .await;
         assert!(err.is_err(), "deny_unknown_fields must reject `extra`");
     }
 }

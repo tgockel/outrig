@@ -9,7 +9,10 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use rig::tool::{ToolDyn, ToolError};
+use rig::completion::CompletionRequest;
+use rig::http_client::DynHttpClient;
+use rig::providers::anthropic::wire::AnthropicConfig;
+use rig::tool::{RegisteredTool, Tool, ToolContext, ToolErrorKind};
 use serde_json::json;
 
 use super::AgentError;
@@ -18,8 +21,8 @@ use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
 use super::history::{LeftOut, Manifest, Why, Window, as_sent};
 use super::mock_http::{
-    self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, strict_refusal,
-    submit, text_reply, undecodable,
+    self, CannedResponse, MODEL, MODEL_CEILING, RecordedRequest, Style, check_wire, failure,
+    strict_refusal, submit, text_reply, undecodable,
 };
 use super::orientation::Holdings;
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
@@ -41,6 +44,12 @@ pub(super) const KEY: &str = "sk-ant-mock-key";
 
 /// An identifier rig publishes no ceiling for.
 const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
+
+/// An identifier whose signed thinking rig's catalog says is bound to the
+/// conversation it was written in, so each call asks Anthropic to drop a
+/// block whose conversation a cut of the view changed rather than refuse the
+/// call. rig asks that for no other model, [`MODEL`] among them.
+const BINDING_MODEL: &str = "claude-sonnet-5-5";
 
 /// A session that holds no binding and no skill.
 const NOTHING_HELD: Holdings<'static> = Holdings {
@@ -344,7 +353,23 @@ pub(super) fn messages(request: &RecordedRequest) -> &[serde_json::Value] {
 
 /// The text of the `tool_result` for `id` in `request`, as the model reads it.
 pub(super) fn tool_result(request: &RecordedRequest, id: &str) -> String {
-    let block = messages(request)
+    let messages = messages(request);
+    // OpenAI's wire carries each result as a `tool` message of its own.
+    if let Some(message) = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+    {
+        return match &message["content"] {
+            serde_json::Value::String(text) => text.clone(),
+            parts => parts
+                .as_array()
+                .expect("a tool message's content")
+                .iter()
+                .map(|part| part["text"].as_str().expect("a text part"))
+                .collect(),
+        };
+    }
+    let block = messages
         .iter()
         .filter_map(|message| message["content"].as_array())
         .flatten()
@@ -1693,10 +1718,12 @@ async fn a_promoted_turn_is_sent_in_its_place_from_the_next_call() {
 
     let after = &recorded[1];
     // The first round's two messages, the promoted turn's three, the third
-    // round's two, and this round's call so far.
+    // round's two, and this round's call so far -- less one: rig sends the
+    // promoted turn's result and the third round's opening as one user
+    // message.
     assert_eq!(
         messages(after).len(),
-        2 + 3 + 2 + 3,
+        2 + 3 + 2 + 3 - 1,
         "{:#?}",
         messages(after)
     );
@@ -1811,8 +1838,14 @@ async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
     let last = mock_http::drain(&mut requests)
         .pop()
         .expect("the last round's request");
-    // The first round, the dropped round's turn, and this round's prompt.
-    assert_eq!(messages(&last).len(), 2 + 3 + 1, "{:#?}", messages(&last));
+    // The first round, the dropped round's turn, and this round's prompt,
+    // which rig sends in the one user message with the turn's result.
+    assert_eq!(
+        messages(&last).len(),
+        2 + 3 + 1 - 1,
+        "{:#?}",
+        messages(&last)
+    );
     for gone in ["second round", "toolu_a", "toolu_b", "toolu_c"] {
         assert_eq!(position(&last, gone), None, "{gone} came back");
     }
@@ -1929,8 +1962,141 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
         "{}",
         tool_result(&last, "toolu_slow")
     );
-    // The first round's four, the interrupted Python's three, and this prompt.
-    assert_eq!(messages(&last).len(), 4 + 3 + 1, "{:#?}", messages(&last));
+    // The first round's four, the interrupted Python's three, and this prompt,
+    // which rig sends in the one user message with the notice.
+    assert_eq!(
+        messages(&last).len(),
+        4 + 3 + 1 - 1,
+        "{:#?}",
+        messages(&last)
+    );
+}
+
+/// A reply of two calls, as an OpenAI-style endpoint sends them: one whose
+/// arguments are no JSON object, which rig answers without running it, and
+/// one that runs `source`. Anthropic's wire cannot carry the first: rig reads
+/// a non-object `input` there as an empty one, which the tool refuses.
+fn an_unrun_call_then(source: &str) -> CannedResponse {
+    mock_http::chat(
+        json!({
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_array",
+                    "type": "function",
+                    "function": { "name": tool::NAME, "arguments": "[]" },
+                },
+                {
+                    "id": "call_slow",
+                    "type": "function",
+                    "function": {
+                        "name": tool::NAME,
+                        "arguments": json!({ "source": source }).to_string(),
+                    },
+                },
+            ],
+        }),
+        "tool_calls",
+    )
+}
+
+/// A call rig answers without running it keeps its place among the turn's
+/// calls when the round is dropped: each result is kept by its call's id, so
+/// the call after it is not paired with its answer, and the one that was
+/// running when the round ended is the one said to have not returned.
+#[tokio::test]
+async fn a_call_rig_answered_unrun_keeps_its_place_when_the_round_is_dropped() {
+    let (events, mut submitted) = watched(None).await;
+    let (mut agent, mut requests) = agent_with(
+        events,
+        Style::OpenAi,
+        "OUTRIG_TEST_AGENT_UNRUN_PLACE",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            an_unrun_call_then("print('started')\nawait asyncio.sleep(3600)"),
+            Style::OpenAi.text("carried on"),
+        ],
+    )
+    .await;
+    dropped_round(&mut agent, "go", next_submission(&mut submitted)).await;
+
+    assert_eq!(round(&mut agent, "still there?").await, "carried on");
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last round's request");
+    for (id, answer) in [
+        ("call_array", "not a JSON object"),
+        ("call_slow", "had not returned when the round ended"),
+    ] {
+        assert!(
+            tool_result(&last, id).contains(answer),
+            "{id}: {}",
+            tool_result(&last, id)
+        );
+    }
+}
+
+/// A call rig answers without running it counts against the round's tool-call
+/// cap as one that ran would: a model that keeps sending one is stopped at
+/// the cap, not at rig's turn limit.
+#[tokio::test]
+async fn a_call_rig_answered_unrun_counts_against_the_cap() {
+    let (mut agent, mut requests) = agent_in(
+        Style::OpenAi,
+        "OUTRIG_TEST_AGENT_UNRUN_CAP",
+        MODEL,
+        "",
+        "max-tokens = 4096\ntool-call-max = 1",
+        vec![
+            an_unrun_call_then("x = 1"),
+            Style::OpenAi.text("never asked"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        round(&mut agent, "go").await,
+        "(round ended: tool-call iteration max (1) reached)"
+    );
+    assert_eq!(mock_http::drain(&mut requests).len(), 1);
+}
+
+/// A call naming no tool is answered with a note naming the tools, and the
+/// round goes on, where rig's own default would fail it. The batch's other
+/// calls are answered as not run: rig's rule for a batch with an invalid call
+/// in it.
+#[tokio::test]
+async fn a_call_naming_no_tool_is_answered_and_the_round_goes_on() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_NO_SUCH_TOOL",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            mock_http::message(
+                json!([
+                    {"type": "tool_use", "id": "toolu_nobody", "name": "no_such_tool", "input": {}},
+                    {"type": "tool_use", "id": "toolu_x", "name": tool::NAME, "input": {"source": "x = 1"}},
+                ]),
+                "tool_use",
+            ),
+            text_reply("asked"),
+        ],
+    )
+    .await;
+    assert_eq!(round(&mut agent, "go").await, "asked");
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2);
+    assert!(
+        tool_result(&recorded[1], "toolu_nobody").contains("no tool named `no_such_tool`"),
+        "{}",
+        tool_result(&recorded[1], "toolu_nobody")
+    );
+    assert!(
+        tool_result(&recorded[1], "toolu_x").contains("not executed"),
+        "{}",
+        tool_result(&recorded[1], "toolu_x")
+    );
 }
 
 // ---------------------------------------------------------------------------- the budget
@@ -2184,20 +2350,41 @@ async fn a_failed_model_call_leaves_complete_turns_and_no_marker() {
     );
 }
 
-/// `messages` as `style`'s adapter in rig puts them on the wire.
+/// `messages` as `style`'s wire in rig puts them on the wire: prepared for
+/// the wire's model and encoded as a request's body, whose `messages` this is.
+/// The request declares the tool, as the loop's do: rig sends the calls of a
+/// request that declares none as text.
 fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<serde_json::Value> {
-    use rig::providers::{anthropic, openai};
+    use rig::operation::Completion;
+    use rig::wire::{Body, Mode, Operation, Wire};
+
+    fn encoded<W: Wire<Op = Completion, Payload = rig::wire::Encoded>>(
+        wire: &W,
+        messages: Vec<rig::completion::Message>,
+    ) -> Vec<serde_json::Value> {
+        let tool = rig::completion::ToolDefinition::new(
+            rig::completion::message::ToolName::new(tool::NAME).expect("a name"),
+            "",
+            json!({"type": "object"}),
+        );
+        let request = <Completion as Operation>::prepare(
+            CompletionRequest::from(messages).tool(tool),
+            &wire.describe(),
+        )
+        .expect("prepares");
+        let encoded = wire.encode(request, Mode::Unary).expect("encodes");
+        let Body::Bytes(bytes) = encoded.request.into_body() else {
+            panic!("a JSON body");
+        };
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        body["messages"].as_array().expect("messages").clone()
+    }
     match style {
-        Style::Anthropic => messages
-            .into_iter()
-            .map(|m| anthropic::completion::Message::try_from(m).expect("converts"))
-            .map(|m| serde_json::to_value(m).expect("serializes"))
-            .collect(),
-        Style::OpenAi => messages
-            .into_iter()
-            .flat_map(|m| Vec::<openai::completion::Message>::try_from(m).expect("converts"))
-            .map(|m| serde_json::to_value(m).expect("serializes"))
-            .collect(),
+        Style::Anthropic => encoded(&AnthropicConfig::new(KEY).completion(MODEL), messages),
+        Style::OpenAi => encoded(
+            &rig::providers::openai::OpenAIConfig::new(KEY).chat(MODEL),
+            messages,
+        ),
     }
 }
 
@@ -2348,9 +2535,7 @@ async fn every_cut_driven(
     // both: the model's own budget, its window shrunk to leave that room.
     let real = agent.primary().agent.model.head_budget();
     let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
-    Arc::get_mut(&mut agent.primary_mut().agent.model)
-        .expect("no call is in flight")
-        .narrow_head(window);
+    agent.primary_mut().agent.narrow_head(window);
     let seen = manifests(&agent);
     for message in ["one", "two", "three", "four", "five"] {
         round(&mut agent, message).await;
@@ -2396,12 +2581,10 @@ async fn a_shortened_history_keeps_every_call_beside_its_result_on_both_adapters
             assistant_pairs > 0,
             "{style:?}: the promotion puts a call after text"
         );
-        match style {
-            // A cut after results puts the next opening after them.
-            Style::Anthropic => assert!(user_pairs > 0, "{style:?}"),
-            // Results are `tool` messages there, which a user message follows.
-            Style::OpenAi => assert_eq!(user_pairs, 0, "{style:?}"),
-        }
+        // A cut after results puts the next opening after them, which no
+        // wire shows as a pair: rig sends both in one user message, which on
+        // OpenAI's wire is a `tool` message the opening follows.
+        assert_eq!(user_pairs, 0, "{style:?}");
 
         // Round 5's third call left its first large turn out, and carried the
         // second -- the latest -- whole.
@@ -2552,9 +2735,13 @@ async fn a_strict_provider_is_sent_a_conversation_that_alternates_on_both_adapte
 }
 
 /// The same provider, whose row does not say so yet, refuses the first call
-/// whose view puts one role after itself -- round 4's opening, after the
-/// capped round 3's results -- and the error says where the pair is and what
-/// to set.
+/// whose view puts one role after itself as its wire shows it, and the error
+/// says where the pair is and what to set. On OpenAI's wire that is round 4's
+/// opening after the capped round 3's results, `tool` messages a gateway in
+/// front of a strict provider reads as the user's. Anthropic's wire carries
+/// results in user messages, and rig sends the opening in the same one, so
+/// the first pair it shows is the next call's: the promoted turn 2 after
+/// turn 0's reply.
 #[tokio::test]
 async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names_the_key() {
     for style in Style::ALL {
@@ -2562,20 +2749,28 @@ async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names
         let (mut agent, mut requests) =
             agent_on_a_strict_mock(style, &var, false, Events::off()).await;
         let err = refused_fourth_round(&mut agent).await;
+        let (pair, calls) = match style {
+            Style::Anthropic => (
+                "two of the model's replies in a row, where turn 2 begins",
+                9,
+            ),
+            Style::OpenAi => (
+                "a prompt right after a prompt or tool results the model never answered, \
+                 where the round's opening begins",
+                8,
+            ),
+        };
         assert!(
             err.contains("roles must alternate")
-                && err.contains(
-                    "a prompt right after a prompt or tool results the model never answered, \
-                     where the round's opening begins"
-                )
+                && err.contains(pair)
                 && err.contains(r#"set [providers.claude].role-alternation = "strict""#),
             "{style:?}: {err}"
         );
         let recorded = mock_http::drain(&mut requests);
         assert_eq!(
             recorded.len(),
-            8,
-            "{style:?}: seven calls answered, the eighth refused"
+            calls,
+            "{style:?}: every call but the last answered"
         );
     }
 }
@@ -2588,8 +2783,8 @@ async fn a_strict_provider_whose_row_does_not_say_so_refuses_and_the_error_names
 async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
     for (window, agent_keys, reserve) in [
         (200_000, "max-tokens = 4096", 4_096),
-        // rig publishes 64 000 for this identifier and lowers to it.
-        (1_000_000, "max-tokens = 999999", 64_000),
+        // rig's catalog publishes a ceiling for this identifier and lowers to it.
+        (1_000_000, "max-tokens = 999999", MODEL_CEILING),
     ] {
         let (mut agent, _requests) = agent_in(
             Style::Anthropic,
@@ -2828,16 +3023,18 @@ fn tool_over(interpreter: crate::python::host::Interpreter) -> SubmitPython {
 /// they fail as arguments, and nothing is submitted.
 #[tokio::test]
 async fn malformed_arguments_are_a_tool_error() {
-    let tool = tool_over(start_on_host().await);
+    let interpreter = start_on_host().await;
     for args in [
         "",
         "{}",
         r#"{"src": "1"}"#,
         r#"{"source": "1", "extra": true}"#,
     ] {
-        let result = within(tool.call(args.to_string())).await;
+        // Through rig's registry, which is what decodes the arguments.
+        let tool = RegisteredTool::from_tool(tool_over(interpreter.clone()));
+        let result = within(tool.execute(args.to_string(), &mut ToolContext::new())).await;
         assert!(
-            matches!(result, Err(ToolError::JsonError(_))),
+            result.is_error_kind(ToolErrorKind::InvalidArgs),
             "{args:?}: {result:?}"
         );
     }
@@ -3228,9 +3425,15 @@ async fn the_tool_reports_every_late_result_across_calls() {
     let tool = tool_over(start_on_host().await).with_unreported(late);
     let mut reported = String::new();
     for _ in 0..2 {
-        let text = within(tool.call(json!({ "source": "None" }).to_string()))
-            .await
-            .expect("the call runs");
+        let text = within(tool.call(
+            &mut ToolContext::new(),
+            tool::Args {
+                source: "None".into(),
+            },
+        ))
+        .await
+        .expect("the call runs")
+        .render();
         assert!(text.len() <= 1024, "{} bytes", text.len());
         reported.push_str(&text);
     }
@@ -3290,23 +3493,22 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
 /// where rig publishes none.
 #[test]
 fn the_ceiling_handed_back_is_the_one_in_force() {
-    let client = rig::providers::anthropic::Client::builder()
-        .api_key(KEY)
-        .base_url("http://127.0.0.1:1")
-        .http_client(RetryingHttpClient::default())
-        .build()
-        .expect("client builds");
     let ceiling = |identifier: &str, configured| {
-        anthropic_model(&client, &anthropic_candidate(identifier, configured)).1
+        anthropic_model(
+            AnthropicConfig::new(KEY).with_base_url("http://127.0.0.1:1"),
+            DynHttpClient::new(RetryingHttpClient::default()),
+            &anthropic_candidate(identifier, configured),
+        )
+        .1
     };
 
-    assert_eq!(ceiling(MODEL, None), 64_000);
+    assert_eq!(ceiling(MODEL, None), MODEL_CEILING);
     assert_eq!(
         ceiling(UNRECOGNIZED_MODEL, None),
         ANTHROPIC_FALLBACK_MAX_TOKENS
     );
     assert_eq!(ceiling(MODEL, Some(8_192)), 8_192);
-    assert_eq!(ceiling(MODEL, Some(999_999)), 64_000);
+    assert_eq!(ceiling(MODEL, Some(999_999)), MODEL_CEILING);
 }
 
 /// The ceiling building settles is the one that reached the wire, including
@@ -3319,7 +3521,7 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
             "OUTRIG_TEST_AGENT_CEILING_CLAMPED",
             MODEL,
             "max-tokens = 999999",
-            64_000,
+            MODEL_CEILING,
         ),
         (
             "OUTRIG_TEST_AGENT_CEILING_FALLBACK",
@@ -3741,14 +3943,16 @@ async fn token_usage_is_what_the_provider_reported() {
         json!({
             "round": 1,
             "stopped": null,
-            "usage": usage(400, 30, 480, 50),
+            // Anthropic reports what it read from its cache apart from
+            // `input_tokens`; rig counts it in, as OpenAI's does.
+            "usage": usage(450, 30, 480, 50),
             "calls": [
                 {
                     "index": 0,
                     "model": "sonnet",
                     "call_id": 1,
                     "attempt_id": 1,
-                    "usage": usage(100, 10, 160, 50),
+                    "usage": usage(150, 10, 160, 50),
                 },
                 {
                     "index": 1,
@@ -3761,7 +3965,7 @@ async fn token_usage_is_what_the_provider_reported() {
             "attempts": [1, 2],
             "input_tokens_max": 300,
             "descendants": [],
-            "total": usage(400, 30, 480, 50),
+            "total": usage(450, 30, 480, 50),
         })
     );
 }
@@ -4412,10 +4616,15 @@ async fn the_round_after_an_empty_reply_is_sent_no_trace_of_it() {
         assert_eq!(recorded.len(), 3, "{style:?}");
         // The request after the empty reply is the one before it, which ended on
         // the `send`'s result, and the round's opening: no message of the model's
-        // between them.
+        // between them. rig sends the opening in the result's user message,
+        // which on OpenAI's wire is a `tool` message the opening follows.
+        let opening = match style {
+            Style::Anthropic => 0,
+            Style::OpenAi => 1,
+        };
         assert_eq!(
             messages(&recorded[2]).len(),
-            messages(&recorded[1]).len() + 1,
+            messages(&recorded[1]).len() + opening,
             "{style:?}: {:#}",
             recorded[2].body
         );
@@ -4795,31 +5004,26 @@ async fn a_provider_that_refuses_everything_fails_the_round_and_leaves_nothing_o
     assert!(body.contains("read me") && !body.contains(NOTICE), "{body}");
 }
 
-/// The model said something -- a refusal, in the field rig does not read -- and
-/// stopped. A normal finish reason does not make that an empty turn, and
-/// calling it one would end the round without the provider's word, with no retry.
+/// The model declined -- in OpenAI's `refusal` field, which rig reads as the
+/// reply's text -- and stopped. That is the model's word, not an empty turn:
+/// the round ends on it, and nothing is retried.
 #[tokio::test]
-async fn an_openai_refusal_that_stopped_normally_is_not_an_empty_turn() {
-    let reply = mock_http::chat(
-        json!({ "role": "assistant", "content": null, "refusal": "I can't help with that." }),
-        "stop",
-    );
-    a_rejected_reply_that_is_no_empty_stop_fails_the_round(Style::OpenAi, "refusal", reply, "stop")
-        .await;
-}
-
-/// A message that is not the assistant's, however it stopped, is not the model
-/// ending its turn.
-#[tokio::test]
-async fn an_openai_reply_that_is_not_the_assistants_is_not_an_empty_turn() {
-    let reply = mock_http::chat(json!({ "role": "user", "content": "" }), "stop");
-    a_rejected_reply_that_is_no_empty_stop_fails_the_round(
-        Style::OpenAi,
-        "wrong_role",
-        reply,
-        "stop",
+async fn an_openai_refusal_that_stopped_normally_is_the_models_reply() {
+    let style = Style::OpenAi;
+    let (mut agent, mut requests) = retrying_agent_in(
+        style,
+        "OUTRIG_TEST_AGENT_EMPTY_OPENAI_REFUSAL",
+        Events::off(),
+        vec![mock_http::chat(
+            json!({ "role": "assistant", "content": null, "refusal": "I can't help with that." }),
+            "stop",
+        )],
     )
     .await;
+
+    assert_eq!(round(&mut agent, "run it").await, "I can't help with that.");
+    shut_down(agent).await;
+    assert_eq!(mock_http::drain(&mut requests).len(), 1, "nothing to retry");
 }
 
 /// A chain whose first model cannot be reached answers from the second, and
@@ -5120,7 +5324,9 @@ async fn a_rate_limit_that_outlasted_the_budget_still_says_to_send_another() {
     shut_down(agent).await;
 }
 
-/// A response that did not decode is not retried, but a later call may not come
+/// A response that did not decode -- a `200` whose body is no message, which
+/// rig reads as a reply the provider never ended -- fails the round when no
+/// retry budget lets the call be made again, but a later call may not come
 /// back that way, so the round still says to send another -- and the next
 /// round, sent, goes on.
 #[tokio::test]
@@ -5139,7 +5345,10 @@ async fn a_response_that_did_not_decode_still_says_to_send_another() {
             .await
             .expect_err("the response did not decode"),
     );
-    assert!(err.contains("JsonError"), "{err}");
+    assert!(
+        err.contains("the reply ended before the provider ended it"),
+        "{err}"
+    );
     assert!(
         err.contains("send another to try again") && !err.contains(RESEND_FAILS),
         "{err}"
@@ -5379,12 +5588,13 @@ async fn a_move_to_a_strict_model_is_sent_a_conversation_that_alternates() {
     let at_tail = mock_http::drain(&mut tail_requests);
     assert_eq!((at_head.len(), at_tail.len()), (7, 1));
     // The same call, as each model was sent it: the head with the promoted
-    // turn 2 right after turn 0's reply, and round 3's opening after turn 2's
-    // result; the tail without turn 2.
+    // turn 2 right after turn 0's reply (and round 3's opening after turn 2's
+    // result, which rig sends in the one user message); the tail without
+    // turn 2.
     let (headed, moved) = (&at_head[6], &at_tail[0]);
     assert_eq!(
         check_wire(Style::Anthropic, &headed.body).adjacent.len(),
-        2,
+        1,
         "{:#}",
         headed.body
     );
@@ -5681,7 +5891,7 @@ fn blocks<'a>(request: &'a RecordedRequest, kind: &str) -> Vec<&'a serde_json::V
 async fn signed_thinking_goes_back_to_anthropic_whole() {
     let (mut agent, mut requests) = agent_over(
         "OUTRIG_TEST_AGENT_SIGNED_THINKING",
-        MODEL,
+        BINDING_MODEL,
         "max-tokens = 4096",
         vec![
             submit("toolu_1", "print('ran')").with_reasoning("weighing it"),
@@ -5729,7 +5939,14 @@ async fn a_refused_drop_block_is_sent_again_without_it() {
         text_reply("done"),
     ])
     .await;
-    let cfg = config_in(Style::Anthropic, addr, var, MODEL, "", "max-tokens = 4096");
+    let cfg = config_in(
+        Style::Anthropic,
+        addr,
+        var,
+        BINDING_MODEL,
+        "",
+        "max-tokens = 4096",
+    );
     let mut agent = agent_of(&cfg, var, Events::off()).await;
 
     assert_eq!(round(&mut agent, "run it").await, "done");
@@ -5794,10 +6011,6 @@ async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
         blocks(&moved[0], "thinking").is_empty(),
         "{:#}",
         moved[0].body
-    );
-    assert_eq!(
-        moved[0].body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
-        "drop_block"
     );
     assert!(
         check_wire(Style::Anthropic, &moved[0].body)
@@ -6837,32 +7050,66 @@ async fn each_session_sends_its_own_key() {
     shut_down(second).await;
 }
 
-/// A turn whose final message held only reasoning -- cut off at its ceiling,
-/// typically -- ends in an outcome that says so and carries the reasoning,
-/// rather than reading as a model that chose to say nothing.
+/// A reply of reasoning alone, as the mock's Anthropic endpoint ends it with
+/// `stop_reason`.
+fn reasoning_only(stop_reason: &str) -> CannedResponse {
+    mock_http::message(
+        json!([{
+            "type": "thinking",
+            "thinking": "weighing it",
+            "signature": mock_http::SIGNATURE,
+        }]),
+        stop_reason,
+    )
+}
+
+/// A turn whose final message held only reasoning, which the model ended on
+/// its own, ends in an outcome that says so and carries the reasoning, rather
+/// than reading as a model that chose to say nothing.
 #[tokio::test]
 async fn a_reasoning_only_round_says_so_and_carries_the_reasoning() {
     let (mut agent, _requests) = agent_over(
         "OUTRIG_TEST_AGENT_REASONING_ONLY",
         MODEL,
         "max-tokens = 4096",
-        vec![
-            mock_http::message(
-                json!([{
-                    "type": "thinking",
-                    "thinking": "weighing it",
-                    "signature": mock_http::SIGNATURE,
-                }]),
-                "max_tokens",
-            ),
-            text_reply("ok"),
-        ],
+        vec![reasoning_only("end_turn"), text_reply("ok")],
     )
     .await;
     let end = round_end(&mut agent, "think").await;
     assert!(end.reply.trim().is_empty(), "{end:?}");
     assert_eq!(end.stopped, None);
     assert_eq!(end.reasoning.as_deref(), Some("weighing it"));
+
+    let end = round_end(&mut agent, "now say it").await;
+    assert_eq!((end.reply.as_str(), end.reasoning), ("ok", None));
+}
+
+/// A turn cut off at its output ceiling while the model was still thinking
+/// holds no answer, and rig fails the round on it, naming the ceiling as the
+/// remedy. Nothing of the turn ran, so the round says to send another, and
+/// the next round goes on without it.
+#[tokio::test]
+async fn a_reasoning_only_reply_cut_at_the_ceiling_fails_the_round() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_REASONING_CUT",
+        MODEL,
+        "max-tokens = 4096",
+        vec![reasoning_only("max_tokens"), text_reply("ok")],
+    )
+    .await;
+    post(&agent, "think").await;
+    let (err, ran) = failed_round(
+        within(agent.round())
+            .await
+            .expect_err("reasoning alone is no answer"),
+    );
+    assert!(
+        err.contains("finish_reason=Length")
+            && err.contains("raise max_tokens")
+            && err.contains("send another to try again"),
+        "{err}"
+    );
+    assert!(!ran, "{err}");
 
     let end = round_end(&mut agent, "now say it").await;
     assert_eq!((end.reply.as_str(), end.reasoning), ("ok", None));

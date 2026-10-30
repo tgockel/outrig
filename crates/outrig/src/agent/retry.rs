@@ -3,7 +3,7 @@
 //! [`RetryingHttpClient`] handles failures the transport can see -- a status
 //! code or a dead connection. [`RetryingModel`] handles the one it cannot: a
 //! `200 OK` whose body carries no usable content, which is a success to the
-//! transport and a [`CompletionError::ResponseError`] to rig.
+//! transport and a [`ProviderError::Response`] to rig.
 //!
 //! Both are safe to retry for the same reason. rig runs tools *between*
 //! `completion()` calls, never inside one, so replaying either a single request
@@ -36,18 +36,19 @@
 //! connection itself -- otherwise a host that drops packets rather than
 //! refusing them would sit in one attempt past either budget.
 //!
-//! Retrying transport failures *there* rather than around a
-//! [`CompletionModel`] call is what makes `Retry-After` reachable at all: rig's
-//! `http_client::Error` carries only a status code and a body string, so by the
-//! time a failure has become a `CompletionError` the headers are gone.
+//! Retrying transport failures *there* rather than around a model call is what
+//! keeps a failed request one request: by the time a failure has become a
+//! [`ProviderError`] rig has classified it for its own retrying, which the
+//! round never does, and a chain reads only whether it may clear.
 //!
 //! [`RetryingModel`] wraps the model itself and covers what is left: a response
-//! rig could not turn into a completion. It takes the same budget, and an
-//! attempt count on top, because an unusable body comes back immediately -- the
-//! budget alone would spend itself on dozens of tries instead of the handful a
-//! hiccup deserves. Sharing the budget keeps `retry-budget-secs = 0` the one
-//! "no retries" knob. It does not retry an empty reply the model ended of its own
-//! accord ([`empty_turn`]).
+//! rig could not turn into a completion, or made one of that no model ended --
+//! a reply cut off with nothing in it, or ended by the provider for its content.
+//! It takes the same budget, and an attempt count on top, because an unusable
+//! body comes back immediately -- the budget alone would spend itself on dozens
+//! of tries instead of the handful a hiccup deserves. Sharing the budget keeps
+//! `retry-budget-secs = 0` the one "no retries" knob. It does not retry an empty
+//! reply the model ended of its own accord ([`unusable_reply`]).
 //!
 //! The obvious "just use the ecosystem crate" answer is `reqwest-retry`, which
 //! rig itself carries as a dev-dependency. It does not fit: as of 0.9 it does
@@ -68,8 +69,11 @@
 //!   A round's failure ends the round whatever it was, so nothing reads them;
 //!   [`is_recoverable`] remains: what a loop resends, which a chain's verdict
 //!   on whether another round could help starts from.
-//!
-//! [`CompletionModel`]: rig::completion::CompletionModel
+
+// rig's `ProviderError` and `http_client::Error` are what its model and
+// transport traits hand back by value, and what this module carries between
+// them; boxing them in OutRig's own functions would only move the size.
+#![allow(clippy::result_large_err)]
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -78,17 +82,17 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::RngExt;
 use reqwest::StatusCode;
-use rig::OneOrMany;
+use rig::DynModel;
 use rig::completion::{
-    AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
-    GetTokenUsage, PromptError,
+    AssistantContent, CompletionRequest, CompletionResponse, FinishReason, PromptError,
+    ProviderCapabilities,
 };
+use rig::error::ProviderError;
 use rig::http_client::{
     Error as HttpError, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request,
-    Response, StreamingResponse, Uri,
+    ReqwestClient, Response, StreamingResponse, Uri,
 };
-use rig::providers::{anthropic, openai};
-use rig::streaming::StreamingCompletionResponse;
+use rig::operation::Completion;
 use rig::wasm_compat::WasmCompatSend;
 use serde::Deserialize;
 
@@ -365,16 +369,18 @@ impl fmt::Debug for Retries {
 }
 
 /// A `reqwest::Client` that retries transient failures, handed to rig in place
-/// of a bare one. See the module doc for why the retry lives at this layer.
+/// of its own transport. See the module doc for why the retry lives at this
+/// layer.
 ///
-/// `Default` is never used by outrig -- `build_agent` always supplies a
-/// configured client -- but rig's `CompletionModel` impls bound their HTTP
-/// backend on `Default`, so the derive has to exist and has to be sane. It
-/// yields the shipped policy against a default `reqwest::Client`, which
-/// notably has *no* request timeout; the configured path sets one.
+/// `Default` is for tests: it yields the shipped policy against a default
+/// `reqwest::Client`, which notably has *no* request timeout; `build_agent`
+/// always supplies a configured client, which sets one.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RetryingHttpClient {
     inner: reqwest::Client,
+    /// The same client as rig's own transport, for the requests this one does
+    /// not retry.
+    transport: ReqwestClient,
     policy: RetryPolicy,
     retries: Retries,
 }
@@ -382,6 +388,7 @@ pub(crate) struct RetryingHttpClient {
 impl RetryingHttpClient {
     pub(crate) fn new(inner: reqwest::Client, policy: RetryPolicy, retries: Retries) -> Self {
         Self {
+            transport: ReqwestClient::from(inner.clone()),
             inner,
             policy,
             retries,
@@ -431,7 +438,7 @@ impl HttpClientExt for RetryingHttpClient {
         // No retry: a multipart form is not cloneable, so there is no body to
         // replay. outrig has no multipart path today; a future one would need
         // the form rebuilt per attempt.
-        HttpClientExt::send_multipart(&self.inner, req)
+        self.transport.send_multipart(req)
     }
 
     fn send_streaming<T>(
@@ -445,35 +452,27 @@ impl HttpClientExt for RetryingHttpClient {
         // completion, so nothing reaches here. A streaming provider would need
         // its own handling -- a failure can land mid-stream, after bytes the
         // caller already saw.
-        HttpClientExt::send_streaming(&self.inner, req)
+        self.transport.send_streaming(req)
     }
 }
 
-/// A [`CompletionModel`] that retries a response rig could not use, which a
-/// chain's candidate holds in place of the provider's own model.
+/// A model that retries a response rig could not use, which a chain's
+/// candidate holds in place of the provider's own model.
 ///
-/// The failure it exists for is a provider answering `200 OK` with no usable
-/// content blocks. rig rejects that in its `TryFrom<CompletionResponse>` --
-/// `CompletionError::ResponseError("Response contained no message or tool call
-/// (empty)")` -- and it used to end the session six turns into a conversation.
-/// [`RetryingHttpClient`] cannot see it: a `200` is a success down there.
+/// The failure it exists for is a provider answering `200 OK` with nothing a
+/// round can go on with: a body rig could not decode, or one it decoded to a
+/// reply no model ended -- cut off with nothing in it, or ended by the
+/// provider for its content ([`unusable_reply`]). It used to end the session
+/// six turns into a conversation. [`RetryingHttpClient`] cannot see it: a
+/// `200` is a success down there.
 ///
-/// The whole `ResponseError` variant is retried, not that one message. The
-/// variant means exactly "the provider's body could not be turned into a
-/// completion", which is always the provider's doing and never a local
-/// misconfiguration, and matching the variant leaves no wording to keep in sync
-/// with rig. The exception is a reply with nothing in it that the provider says
-/// the model ended on its own ([`is_empty_stop`]): rig's Anthropic provider reads
-/// an empty `end_turn` as a legal empty turn, and the same turn from the
-/// OpenAI-style provider it rejects is no defect either, so it is made the same
-/// completion ([`empty_turn`]). A reply with anything in it, a refusal for one,
-/// is still rig's error.
-///
-/// The converse holds: a reply rig *could* use, that the provider ended with
-/// `content_filter` or `refusal`, is as unusable as an empty one. It reads as a
-/// turn the model finished, and a round that opened a submission and met two of
-/// them would be told it ended without completing, though it never chose to
-/// stop. So it takes the way an empty reply does ([`is_content_refusal`]).
+/// Every such reply becomes a [`ProviderError::Response`], rig's own class for
+/// "the provider's body could not be turned into a completion", which is
+/// always the provider's doing and never a local misconfiguration; the loop
+/// retries that class. A reply with nothing in it that the provider says the
+/// model ended on its own is no defect: rig makes an empty turn of it, which
+/// its run loop reads as a turn that finished, and it passes through. A reply
+/// with anything in it, a refusal for one, is still an error.
 ///
 /// A model-layer wrapper is what `deedd83` deliberately removed when the
 /// transient retry moved down to [`RetryingHttpClient`], and it brings back the
@@ -482,42 +481,35 @@ impl HttpClientExt for RetryingHttpClient {
 /// entirely when retries are off. Against the JSON serialization of that same
 /// request on the very next line, one clone is the cheaper half.
 #[derive(Clone, Debug)]
-pub(crate) struct RetryingModel<M> {
-    inner: M,
+pub(crate) struct RetryingModel {
+    inner: DynModel<Completion>,
     policy: RetryPolicy,
     retries: Retries,
 }
 
-impl<M> RetryingModel<M> {
-    pub(crate) fn new(inner: M, policy: RetryPolicy, retries: Retries) -> Self {
+impl RetryingModel {
+    pub(crate) fn new(
+        inner: impl Into<DynModel<Completion>>,
+        policy: RetryPolicy,
+        retries: Retries,
+    ) -> Self {
         Self {
-            inner,
+            inner: inner.into(),
             policy,
             retries,
         }
     }
-}
 
-impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
-    type Response = M::Response;
-    type StreamingResponse = M::StreamingResponse;
-    type Client = M::Client;
-
-    /// Never reached by outrig -- `build_agent` wraps a model the provider
-    /// client already made -- but rig's trait requires it, so it wraps a model
-    /// made the same way against the shipped policy, recording nowhere.
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(
-            M::make(client, model),
-            RetryPolicy::default(),
-            Retries::default(),
-        )
+    /// What the provider composes, as rig's wire for it reports.
+    pub(crate) fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities().completion
     }
 
-    async fn completion(
+    /// One completion, retried while the reply is unusable.
+    pub(crate) async fn completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<CompletionResponse, ProviderError> {
         // Read off the request before rig consumes it: naming the ceiling that
         // was in force is most of what makes a truncation report actionable,
         // and `None` -- no ceiling sent, provider's default silently in charge
@@ -530,77 +522,50 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         outcome
     }
 
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        // No retry, for the same reason `send_streaming` has none: outrig
-        // never streams, and a failure can land mid-stream, after content the
-        // caller already saw.
-        self.inner.stream(request).await
-    }
-
-    /// Delegated, not defaulted. The trait's `false` is the safe answer for a
-    /// provider whose native structured output suppresses tool calls; answering
-    /// it for OpenAI and Anthropic, which compose the two, would cost them
-    /// guaranteed structured output on every turn that has tools.
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.inner.composes_native_output_with_tools()
-    }
-}
-
-impl<M: CompletionModel> RetryingModel<M> {
     /// One completion from the inner model, and the attempt it settled, once
     /// recorded: with the usage rig gave its completion, or -- when rig could
-    /// make none -- the usage the body reported, and why not. An [`empty_turn`]
-    /// is the completion it comes back as, in place of rig's error; any other
-    /// body rig rejected has the finish reason it names put first in that
-    /// error, since rig's own words say only what it could not find, and every
-    /// retry line, event and round error after this one is made from it. A
-    /// completion rig made of a reply the provider ended for its content
-    /// ([`is_content_refusal`]) is that error, too, with nothing of rig's to
-    /// add: the reply has reasoning or text in it, and is no turn the model
-    /// ended.
+    /// make none -- the usage the body reported, and why not. A reply rig made
+    /// a completion of that no model ended ([`unusable_reply`]) is the error
+    /// it comes back as; any body rig rejected has the finish reason it names
+    /// put first in that error, since rig's own words say only what it could
+    /// not find, and every retry line, event and round error after this one is
+    /// made from it.
     async fn attempt(
         &self,
         request: CompletionRequest,
     ) -> (
-        Result<CompletionResponse<M::Response>, CompletionError>,
+        Result<CompletionResponse, ProviderError>,
         Option<(CallId, AttemptId)>,
     ) {
         let settling = self.retries.slot.awaiting();
-        let mut outcome = self.inner.completion(request).await;
-        if let Err(CompletionError::ResponseError(message)) = &mut outcome
-            && let Some(body) = settling.body()
-        {
-            if let Some(empty) = empty_turn(&body) {
-                outcome = Ok(empty);
-            } else if let Some(reason) = body_finish_reason(&body) {
-                *message = format!("finish reason {reason}: {message}");
-            }
-        } else if outcome.is_ok()
-            && let Some(body) = settling.body()
-            && let Some(reason) =
-                body_finish_reason(&body).filter(|reason| is_content_refusal(reason))
-        {
-            // Whatever rig made of the reply, the provider ended it, not the
-            // model: the content it holds is what came before.
-            outcome = Err(CompletionError::ResponseError(format!(
-                "finish reason {reason}: the provider ended the reply for its content"
-            )));
-        }
+        let outcome = match self.inner.call(request).await {
+            Ok(response) => match unusable_reply(&response) {
+                Some(message) => Err(ProviderError::Response(message)),
+                None => Ok(response),
+            },
+            Err(error) => match undecodable(error) {
+                Ok(message) => {
+                    let reason = settling.body().and_then(|body| body_finish_reason(&body));
+                    Err(ProviderError::Response(match reason {
+                        Some(reason) => format!("finish reason {reason}: {message}"),
+                        None => message,
+                    }))
+                }
+                Err(error) => Err(error),
+            },
+        };
         let ids = settling.settle(&outcome);
         (outcome, ids)
     }
 
-    /// The retry loop proper. Split out so [`CompletionModel::completion`] can
-    /// inspect what came back without the reporting having to live inside the
-    /// loop and fire once per attempt.
+    /// The retry loop proper. Split out so [`Self::completion`] can inspect
+    /// what came back without the reporting having to live inside the loop and
+    /// fire once per attempt.
     async fn completion_retried(
         &self,
         request: CompletionRequest,
     ) -> (
-        Result<CompletionResponse<M::Response>, CompletionError>,
+        Result<CompletionResponse, ProviderError>,
         Option<(CallId, AttemptId)>,
     ) {
         // rig takes the request by value, so replaying one means holding a copy
@@ -619,7 +584,7 @@ impl<M: CompletionModel> RetryingModel<M> {
         let mut attempt = 0u32;
         loop {
             let (message, ids) = match self.attempt(request.clone()).await {
-                (Err(CompletionError::ResponseError(message)), ids) => (message, ids),
+                (Err(ProviderError::Response(message)), ids) => (message, ids),
                 // A success, or a failure this layer cannot fix: one the HTTP
                 // client already retried, or a terminal one -- a bad key's
                 // `401` above all, which no number of tries will fix.
@@ -647,13 +612,13 @@ impl<M: CompletionModel> RetryingModel<M> {
                 })
                 .flatten();
             let Some(delay) = delay else {
-                return (Err(CompletionError::ResponseError(message)), ids);
+                return (Err(ProviderError::Response(message)), ids);
             };
             // The re-roll would be a request, which a spent budget refuses,
             // and the usage this attempt's body reported may have spent it.
             // A refusal needs no wait.
             if self.retries.slot.ledger().budget_spent() {
-                return (Err(HttpError::Instance(Box::new(BudgetSpent)).into()), ids);
+                return (Err(BudgetSpent::error()), ids);
             }
 
             tracing::warn!(
@@ -689,8 +654,15 @@ pub(crate) struct BudgetSpent;
 
 impl BudgetSpent {
     /// Whether `err` is this refusal.
-    pub(crate) fn of(err: &CompletionError) -> bool {
-        matches!(err, CompletionError::HttpError(HttpError::Instance(inner)) if inner.is::<Self>())
+    pub(crate) fn of(err: &ProviderError) -> bool {
+        matches!(err, ProviderError::Http(http)
+            if matches!(&**http, HttpError::Instance(inner) if inner.is::<Self>()))
+    }
+
+    /// This refusal, as the error either layer returns: a transport failure,
+    /// since nothing was sent.
+    pub(crate) fn error() -> ProviderError {
+        ProviderError::Http(Arc::new(HttpError::instance(Self)))
     }
 }
 
@@ -702,81 +674,84 @@ impl fmt::Display for BudgetSpent {
 
 impl std::error::Error for BudgetSpent {}
 
-/// The completion of a turn the model ended with nothing to add, for a `200`
-/// rig rejected as empty: the one rig's Anthropic provider makes of an empty
-/// `end_turn`, a lone empty text part. `None` unless the body is an
-/// [`is_empty_stop`] and its own response type; anything else is the provider's
-/// defect, and still rig's `ResponseError`.
+/// Why a completion rig made is no reply a round can go on with, when it is
+/// none: a reply the provider ended for its content ([`is_content_refusal`]),
+/// one the provider itself says failed, or one cut off -- at the output
+/// ceiling, or for a reason that is no stop -- with nothing in it. `None` for
+/// a reply with anything in it, and for an empty one the model ended on its
+/// own, which rig's run loop reads as a turn that finished.
 ///
-/// rig's run loop reads that completion as a turn that finished, and appends
-/// nothing to the conversation for it, so the round ends with an empty reply,
-/// keeping what it ran, and the attempt is recorded as the answer it was.
-fn empty_turn<R: serde::de::DeserializeOwned>(body: &[u8]) -> Option<CompletionResponse<R>> {
-    if !is_empty_stop(body) {
-        return None;
+/// A reply the provider ended for its content reads as a turn the model
+/// finished, whatever came before the cut, and a round that opened a
+/// submission and met two of them would be told it ended without completing,
+/// though it never chose to stop. So it is an error, as an empty reply is,
+/// and the chain sends the call once more without the results it carried.
+///
+/// The finish reason is the provider's own word for it, read from the reply's
+/// document ([`provider_finish_reason`]), so the error names what the provider
+/// said; rig's normalized reason stands in when the document has none.
+fn unusable_reply(response: &CompletionResponse) -> Option<String> {
+    let word = provider_finish_reason(&response.raw);
+    let normalized = response.finish_reason();
+    let refusal = word.as_deref().is_some_and(is_content_refusal)
+        || matches!(normalized, Some(FinishReason::ContentFilter));
+    let reason = word.or_else(|| normalized.clone().map(finish_word));
+    if refusal {
+        let reason = reason.unwrap_or_else(|| "content_filter".to_string());
+        return Some(format!(
+            "finish reason {reason}: the provider ended the reply for its content"
+        ));
     }
-    Some(CompletionResponse {
-        choice: OneOrMany::one(AssistantContent::text("")),
-        usage: body_token_usage(body).unwrap_or_default(),
-        raw_response: serde_json::from_slice(body).ok()?,
-        message_id: None,
+    if let Some(error) = &response.error {
+        return Some(format!("the provider failed the turn: {error}"));
+    }
+    let empty = response.choice.iter().all(|part| match part {
+        AssistantContent::Text(text) => text.text.trim().is_empty(),
+        _ => false,
+    });
+    let normal = match &normalized {
+        None | Some(FinishReason::Stop) | Some(FinishReason::ToolCalls) => true,
+        Some(FinishReason::Other(word)) => is_normal_stop(word),
+        _ => false,
+    };
+    (empty && !normal).then(|| {
+        let reason = reason.unwrap_or_else(|| "unknown".to_string());
+        format!("finish reason {reason}: the reply holds no text and no tool call")
     })
 }
 
-/// Whether `body` is an OpenAI-style reply that has nothing in it and says the
-/// model stopped of its own accord: the first choice's message is the
-/// assistant's, with every field but its role null or empty, and its finish
-/// reason is a normal stop ([`is_normal_stop`]).
-///
-/// A normal stop does not make a reply empty. rig sees only the message's text
-/// and tool calls, so a message that carries a `refusal`, reasoning or anything
-/// else rig sets aside is rejected as empty, too, yet is the provider saying
-/// something, and turning it into a clean empty turn would lose it -- and the
-/// retry and the move to the next model that would have been its answer. So a
-/// field that holds anything, or one of no kind this reads, is not empty, and
-/// neither is a message that is not the assistant's.
-///
-/// Only OpenAI's shape is read. rig reads an empty Anthropic `end_turn` itself,
-/// and the Anthropic reply it rejects has content it could not convert.
-fn is_empty_stop(body: &[u8]) -> bool {
-    #[derive(Deserialize)]
-    struct Choice {
-        message: serde_json::Map<String, serde_json::Value>,
-        finish_reason: Option<String>,
+/// The wire's spelling of a normalized finish reason, for an error that names
+/// one when the reply's document does not.
+fn finish_word(reason: FinishReason) -> String {
+    match reason {
+        FinishReason::Stop => "stop".to_string(),
+        FinishReason::Length => "length".to_string(),
+        FinishReason::ToolCalls => "tool_calls".to_string(),
+        FinishReason::ContentFilter => "content_filter".to_string(),
+        FinishReason::Other(word) => word,
+        _ => "unknown".to_string(),
     }
-    #[derive(Deserialize)]
-    struct Envelope {
-        choices: Vec<Choice>,
-    }
-    use serde_json::Value;
+}
 
-    let Ok(Envelope { choices }) = serde_json::from_slice(body) else {
-        return false;
-    };
-    let Some(Choice {
-        message,
-        finish_reason,
-    }) = choices.first()
-    else {
-        return false;
-    };
-    // rig reads `model` as the assistant, for the gateways that answer so.
-    let assistant = message
-        .get("role")
-        .and_then(Value::as_str)
-        .is_some_and(|role| matches!(role, "assistant" | "model"));
-    assistant
-        && finish_reason.as_deref().is_some_and(is_normal_stop)
-        && message.iter().all(|(field, value)| {
-            field == "role"
-                || match value {
-                    Value::Null => true,
-                    Value::String(text) => text.is_empty(),
-                    Value::Array(items) => items.is_empty(),
-                    Value::Object(fields) => fields.is_empty(),
-                    Value::Bool(_) | Value::Number(_) => false,
-                }
-        })
+/// `error` as the message of a `200` rig could make nothing of, when it is
+/// one: a body it rejected, one that ended before the provider ended it, or a
+/// provider's error envelope under a success status. Any other failure is
+/// handed back as it is: the HTTP layer already retried it, or no retry can
+/// clear it -- a body that is not JSON among them, which a later round may
+/// get past but a resend of the same request will not.
+fn undecodable(error: ProviderError) -> Result<String, ProviderError> {
+    match error {
+        ProviderError::Response(message) => Ok(message),
+        ProviderError::Truncated => Ok("the reply ended before the provider ended it".to_string()),
+        error
+            if error
+                .provider_response_status()
+                .is_some_and(|status| status.is_success()) =>
+        {
+            Ok(error.to_string())
+        }
+        error => Err(error),
+    }
 }
 
 /// Whether `reason`, a provider's finish reason, says the model chose to stop:
@@ -802,15 +777,15 @@ pub(crate) fn is_content_refusal(reason: &str) -> bool {
 /// so took no usage from: `None` when it carries no `usage`, or one of neither
 /// provider's shape.
 ///
-/// Both dialects are tried, as in [`body_finish_reason`], and each is read
-/// as rig reads its own, through [`GetTokenUsage`], so a count means here what
-/// it means for a response rig could use -- Anthropic's total includes its
-/// cached input, for one.
+/// Both dialects are tried, as in [`body_finish_reason`], and each is read as
+/// rig normalizes its own, so a count means here what it means for a response
+/// rig could use: Anthropic's `input_tokens` includes what was read from and
+/// written to its cache, and a total is the input and the output together.
 ///
-/// OpenAI's is tried first. Its usage needs `prompt_tokens` and
-/// `total_tokens`, which no Anthropic usage carries, while a gateway speaking
-/// OpenAI's protocol may report `input_tokens` and `output_tokens` as well --
-/// and its body is OpenAI's to read, as rig reads it when it can use it.
+/// OpenAI's is tried first. Its usage needs `prompt_tokens`, which no
+/// Anthropic usage carries, while a gateway speaking OpenAI's protocol may
+/// report `input_tokens` and `output_tokens` as well -- and its body is
+/// OpenAI's to read, as rig reads it when it can use it.
 ///
 /// Only the failure path calls it, so the body of a response rig could use is
 /// never parsed twice.
@@ -825,14 +800,73 @@ fn body_token_usage(body: &[u8]) -> Option<rig::completion::Usage> {
     struct Envelope {
         usage: Option<serde_json::Value>,
     }
+    #[derive(Deserialize)]
+    struct OpenAi {
+        prompt_tokens: u64,
+        #[serde(default)]
+        completion_tokens: Option<u64>,
+        #[serde(default)]
+        total_tokens: Option<u64>,
+        #[serde(default)]
+        prompt_tokens_details: Option<OpenAiPromptDetails>,
+        #[serde(default)]
+        completion_tokens_details: Option<OpenAiCompletionDetails>,
+    }
+    #[derive(Deserialize)]
+    struct OpenAiPromptDetails {
+        #[serde(default)]
+        cached_tokens: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct OpenAiCompletionDetails {
+        #[serde(default)]
+        reasoning_tokens: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct Anthropic {
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: Option<u64>,
+        #[serde(default)]
+        cache_read_input_tokens: Option<u64>,
+        #[serde(default)]
+        cache_creation_input_tokens: Option<u64>,
+    }
     let envelope: Envelope = serde_json::from_slice(body).ok()?;
     let usage = envelope.usage?;
-    openai::completion::Usage::deserialize(&usage)
-        .map(|usage| usage.token_usage())
-        .or_else(|_| {
-            anthropic::completion::Usage::deserialize(&usage).map(|usage| usage.token_usage())
-        })
-        .ok()
+    if let Ok(openai) = OpenAi::deserialize(&usage) {
+        // Output is the remainder of the total when unreported, as rig reads
+        // it; a total left out stays out, for `reported` to fill.
+        let output = openai.completion_tokens.or_else(|| {
+            openai
+                .total_tokens
+                .map(|total| total.saturating_sub(openai.prompt_tokens))
+        });
+        return Some(
+            rig::completion::Usage::new()
+                .input_tokens(openai.prompt_tokens)
+                .output_tokens(output)
+                .total_tokens(openai.total_tokens)
+                .cached_input_tokens(openai.prompt_tokens_details.and_then(|d| d.cached_tokens))
+                .reasoning_tokens(
+                    openai
+                        .completion_tokens_details
+                        .and_then(|d| d.reasoning_tokens),
+                ),
+        );
+    }
+    let anthropic = Anthropic::deserialize(&usage).ok()?;
+    let read = anthropic.cache_read_input_tokens.unwrap_or(0);
+    let written = anthropic.cache_creation_input_tokens.unwrap_or(0);
+    let input = anthropic.input_tokens + read + written;
+    Some(
+        rig::completion::Usage::new()
+            .input_tokens(input)
+            .output_tokens(anthropic.output_tokens)
+            .total_tokens(anthropic.output_tokens.map(|output| input + output))
+            .cached_input_tokens(anthropic.cache_read_input_tokens)
+            .cache_creation_input_tokens(anthropic.cache_creation_input_tokens),
+    )
 }
 
 /// Report a completion that came back with nothing to show for itself.
@@ -846,17 +880,13 @@ fn body_token_usage(body: &[u8]) -> Option<rig::completion::Usage> {
 /// Deliberately keyed on the *decoded* content rather than on the finish
 /// reason: that check is free on every turn, and the raw response is only
 /// serialized in the rare case that already went wrong.
-fn report_textless_completion<R: serde::Serialize>(
-    model: &str,
-    response: &CompletionResponse<R>,
-    max_tokens: Option<u64>,
-) {
-    // An empty text part is not content: it is the sentinel rig normalizes an
-    // empty provider turn into, so treating it as "the model spoke" is exactly
-    // the mistake this function exists to catch.
+fn report_textless_completion(model: &str, response: &CompletionResponse, max_tokens: Option<u64>) {
+    // An empty text part is not content: it is what an empty provider turn
+    // decodes to, so treating it as "the model spoke" is exactly the mistake
+    // this function exists to catch.
     let showed_something = response.choice.iter().any(|part| match part {
-        rig::message::AssistantContent::Text(text) => !text.text.trim().is_empty(),
-        rig::message::AssistantContent::ToolCall(_) => true,
+        AssistantContent::Text(text) => !text.text.trim().is_empty(),
+        AssistantContent::ToolCall(_) => true,
         _ => false,
     });
     if showed_something {
@@ -869,7 +899,7 @@ fn report_textless_completion<R: serde::Serialize>(
             "the request carried no max-tokens, so the provider's own default applied".to_string()
         }
     };
-    match provider_finish_reason(&response.raw_response) {
+    match provider_finish_reason(&response.raw) {
         Some(reason) => tracing::warn!(
             "{model} produced no text and no tool call this turn (provider finish reason: \
              {reason:?}); {ceiling}."
@@ -881,14 +911,17 @@ fn report_textless_completion<R: serde::Serialize>(
 }
 
 /// The provider's own word for why generation stopped, from the completion's
-/// raw response.
-///
-/// Rig parses this out of the wire and then drops it before any type outrig
-/// sees, so a completion rig made carries it only in the raw response. A
-/// response rig made nothing of is read from its bytes instead
-/// ([`body_finish_reason`]), which is the same reading.
-fn provider_finish_reason<R: serde::Serialize>(raw: &R) -> Option<String> {
-    body_finish_reason(&serde_json::to_vec(raw).ok()?)
+/// document: the provider's reply as rig received it, which it keeps beside
+/// the normalized reason. A response rig made nothing of is read from its
+/// bytes instead ([`body_finish_reason`]), which is the same reading.
+fn provider_finish_reason(raw: &serde_json::Value) -> Option<String> {
+    let word = raw
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"))
+        .or_else(|| raw.get("stop_reason"))?
+        .as_str()?;
+    Some(word.to_string())
 }
 
 /// The provider's own word for why generation stopped, from a `200`'s body:
@@ -953,7 +986,7 @@ where
         // held it last left it. A refused request is no attempt: nothing was
         // sent.
         if retries.slot.ledger().budget_spent() {
-            return Err(HttpError::Instance(Box::new(BudgetSpent)));
+            return Err(HttpError::instance(BudgetSpent));
         }
         // An attempt from here: one that is dropped in flight -- its round
         // dropped -- records itself as cancelled.
@@ -981,22 +1014,23 @@ where
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| parse_retry_after(value, jiff::Timestamp::now()));
-                // Mirrors rig's own `non_success_status_error` (keep in sync
-                // with rig-core 0.40 `src/http_client/mod.rs:69-76`), so a
+                // Mirrors rig-reqwest's own `non_success_status_error`, so a
                 // failure that escapes this loop is shaped exactly as it would
-                // have been without the wrapper -- which is what keeps rig's
-                // public `provider_response_body` helper working.
+                // have been without the wrapper -- status, headers and body --
+                // which is what keeps rig's `provider_response_*` readers
+                // working.
                 //
                 // Reading the body to completion also matters on the *retry*
                 // path, where the message is dropped unused: abandoning a
                 // partially-read body makes hyper drop the connection instead
                 // of returning it to the pool, so the retry would pay a fresh
                 // TCP and TLS handshake to save a few KiB of read.
+                let response_headers = response.headers().clone();
                 let message = response
                     .text()
                     .await
                     .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
-                let err = HttpError::InvalidStatusCodeWithMessage(status, message);
+                let err = HttpError::non_success_with_details(status, response_headers, message);
                 if !is_retryable_status(status) {
                     settle_failed(pending, &err);
                     return Err(err);
@@ -1007,7 +1041,7 @@ where
             // often it is sent, so it is final at once rather than spending the
             // budget -- and with it a failover chain's -- on replays.
             Err(error) if is_permanent(&error) => {
-                let err = HttpError::Instance(Box::new(error));
+                let err = HttpError::instance(error);
                 settle_failed(pending, &err);
                 return Err(err);
             }
@@ -1017,7 +1051,7 @@ where
                 // Read here because the box below erases the concrete type, so
                 // this is the only place a connect failure is still knowable.
                 answered |= !error.is_connect();
-                (HttpError::Instance(Box::new(error)), None)
+                (HttpError::instance(error), None)
             }
         };
 
@@ -1060,10 +1094,10 @@ fn settle_failed(pending: Option<Pending>, err: &HttpError) -> Option<(CallId, A
 }
 
 /// Repackage a successful `reqwest::Response` as the `http::Response` rig
-/// expects, with the body left lazy. Mirrors rig's `HttpClientExt for
-/// reqwest::Client` -- keep in sync with rig-core 0.40
-/// `src/http_client/mod.rs:155-215`. rig exposes no public converter for this,
-/// so it is a copy by necessity rather than by choice.
+/// expects, with the body left lazy. Mirrors rig-reqwest's `into_response`,
+/// less the binding of the body to rig's own runtime, which a process on
+/// tokio does not need. rig exposes no public converter for this, so it is a
+/// copy by necessity rather than by choice.
 ///
 /// `answered` is told the body once it is read: this future is the last place
 /// it is in hand before rig turns it into a completion or, when it cannot, an
@@ -1081,10 +1115,7 @@ where
         *hs = response.headers().clone();
     }
     let body: LazyBody<U> = Box::pin(async move {
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| HttpError::Instance(e.into()))?;
+        let bytes = response.bytes().await.map_err(HttpError::instance)?;
         if let Some(answered) = &answered {
             answered.arrived(&bytes);
         }
@@ -1184,7 +1215,7 @@ fn next_delay(
 /// and runs the line long.
 fn failure_label(err: &HttpError) -> String {
     match err {
-        HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
+        HttpError::InvalidStatusCodeWithDetails { status: code, .. } => {
             match code.canonical_reason() {
                 Some(_) => format!("HTTP {code}"),
                 None => format!("HTTP {}", code.as_u16()),
@@ -1227,11 +1258,12 @@ fn with_innermost_cause(err: &(dyn std::error::Error + 'static)) -> String {
 
 /// [`failure_label`] for a transport failure, which is the one kind of failure
 /// it words better than rig's `Display` does: that wraps the same outer text
-/// behind `HttpError: Http client error:` and drops the cause. `None` for
-/// anything else.
-fn transport_label(err: &CompletionError) -> Option<String> {
+/// behind `Http client error:` and drops the cause. `None` for anything else.
+fn transport_label(err: &ProviderError) -> Option<String> {
     match err {
-        CompletionError::HttpError(http @ HttpError::Instance(_)) => Some(failure_label(http)),
+        ProviderError::Http(http) if matches!(&**http, HttpError::Instance(_)) => {
+            Some(failure_label(http))
+        }
         _ => None,
     }
 }
@@ -1239,7 +1271,7 @@ fn transport_label(err: &CompletionError) -> Option<String> {
 /// The label for a failed candidate in a failover chain's move line and
 /// `tried` rows: a transport failure reads as it does on a retry line, and
 /// anything else keeps rig's own text.
-pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
+pub(crate) fn candidate_failure_label(err: &ProviderError) -> String {
     transport_label(err).unwrap_or_else(|| err.to_string())
 }
 
@@ -1250,7 +1282,7 @@ pub(crate) fn candidate_failure_label(err: &CompletionError) -> String {
 /// worded row by row with [`candidate_failure_label`].
 pub(crate) fn prompt_failure_text(err: &PromptError) -> String {
     match err {
-        PromptError::CompletionError(failed) => transport_label(failed),
+        PromptError::Provider(failed) => transport_label(failed),
         _ => None,
     }
     .unwrap_or_else(|| err.to_string())
@@ -1260,9 +1292,7 @@ pub(crate) fn prompt_failure_text(err: &PromptError) -> String {
 /// applies, so what a chain calls recoverable is exactly what was retried.
 fn is_transient(err: &HttpError) -> bool {
     match err {
-        HttpError::InvalidStatusCode(code) | HttpError::InvalidStatusCodeWithMessage(code, _) => {
-            is_retryable_status(*code)
-        }
+        HttpError::InvalidStatusCodeWithDetails { status, .. } => is_retryable_status(*status),
         HttpError::Instance(inner) => !inner
             .downcast_ref::<reqwest::Error>()
             .is_some_and(is_permanent),
@@ -1272,10 +1302,11 @@ fn is_transient(err: &HttpError) -> bool {
 
 /// Could this failure clear without a change to the config?
 ///
-/// A transient `HttpError`, which the HTTP loop retried until its budget
-/// stopped it, and a `ResponseError`, which [`RetryingModel`] re-rolled until
-/// its attempts ran out. Everything else -- a `401`, a model that does not
-/// exist, a provider-reported fault -- is terminal: no number of resends
+/// A transient transport failure, or a status the HTTP loop retried until its
+/// budget stopped it -- which rig hands on as the provider's response, its
+/// status kept -- and an unusable reply, which [`RetryingModel`] re-rolled
+/// until its attempts ran out. Everything else -- a `401`, a model that does
+/// not exist, a provider-reported fault -- is terminal: no number of resends
 /// satisfies it.
 ///
 /// Defined here, beside the loops whose classes it unions, so it cannot drift
@@ -1286,24 +1317,39 @@ fn is_transient(err: &HttpError) -> bool {
 /// A wrong `base-url` fails with a connection error, which is transient by
 /// this predicate. The wait before it is bounded by [`CONNECT_BUDGET`], so a
 /// typo costs seconds rather than minutes.
-pub(crate) fn is_recoverable(err: &CompletionError) -> bool {
+pub(crate) fn is_recoverable(err: &ProviderError) -> bool {
     match err {
-        CompletionError::HttpError(http) => is_transient(http),
-        CompletionError::ResponseError(_) => true,
-        _ => false,
+        ProviderError::Http(http) => is_transient(http),
+        ProviderError::Response(_) | ProviderError::Truncated => true,
+        other => other
+            .provider_response_status()
+            .is_some_and(is_retryable_status),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rig::completion::message::Origin;
+    use rig::driver::{Exchange, Model, Opened, Opening, Transport};
+    use rig::test_utils::{MOCK_API, MOCK_PROVIDER, MockFrame, MockScript};
+
     use super::*;
     use crate::agent::mock_http::{Link, REFUSED_PORT, refused_cause, transport_failure};
 
-    fn http_status(code: u16) -> CompletionError {
-        CompletionError::HttpError(HttpError::InvalidStatusCodeWithMessage(
+    /// A non-success status as the HTTP loop hands it back once its retries
+    /// are spent.
+    fn http_error(code: u16) -> HttpError {
+        HttpError::non_success_with_details(
             StatusCode::from_u16(code).unwrap(),
+            HeaderMap::new(),
             "boom".to_string(),
-        ))
+        )
+    }
+
+    /// [`http_error`], as rig's driver classifies it: the provider's response,
+    /// its status kept.
+    fn http_status(code: u16) -> ProviderError {
+        ProviderError::from_transport_error(http_error(code))
     }
 
     fn at(text: &str) -> jiff::Timestamp {
@@ -1339,12 +1385,7 @@ mod tests {
 
     #[test]
     fn a_nonstandard_status_is_labeled_by_its_code() {
-        let label_of = |code| {
-            let CompletionError::HttpError(err) = http_status(code) else {
-                unreachable!("an HTTP failure")
-            };
-            failure_label(&err)
-        };
+        let label_of = |code| failure_label(&http_error(code));
         assert_eq!(label_of(529), "HTTP 529");
         assert_eq!(label_of(503), "HTTP 503 Service Unavailable");
     }
@@ -1352,7 +1393,7 @@ mod tests {
     #[test]
     fn transport_errors_are_transient() {
         let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out");
-        let err = CompletionError::HttpError(HttpError::Instance(Box::new(io)));
+        let err = ProviderError::Http(Arc::new(HttpError::instance(io)));
         assert!(is_recoverable(&err));
     }
 
@@ -1362,56 +1403,122 @@ mod tests {
     /// though a later round may get past it (`failover::may_clear`).
     #[test]
     fn only_what_a_loop_retries_is_recoverable() {
-        assert!(is_recoverable(&CompletionError::ResponseError(
-            "empty".into()
-        )));
+        assert!(is_recoverable(&ProviderError::Response("empty".into())));
         assert!(is_recoverable(&http_status(503)));
-        assert!(!is_recoverable(&CompletionError::ProviderError(
-            "nope".into()
-        )));
-        assert!(!is_recoverable(&CompletionError::JsonError(
+        assert!(!is_recoverable(&ProviderError::Provider("nope".into())));
+        assert!(!is_recoverable(&ProviderError::Json(Arc::new(
             serde_json::from_str::<()>("{").unwrap_err()
-        )));
+        ))));
     }
 
-    /// A model that fails the way the bug does, every time, counting the calls
-    /// it took. The associated types are the trait's bare minimum: it never
-    /// returns a response and never streams.
-    /// A model that answers every request `200` with nothing rig can use, and
-    /// counts them. It stands in for the HTTP layer too: each request it
-    /// answers is one `slot` names.
+    /// A reply is unusable when the provider ended it for its content, said
+    /// the turn failed, or cut it off with nothing in it; an empty reply the
+    /// model ended on its own, and any reply with something in it, is not.
+    #[test]
+    fn a_reply_no_model_ended_is_unusable_and_names_the_providers_reason() {
+        let reply = |choice: Vec<AssistantContent>, finish: Option<FinishReason>, raw| {
+            CompletionResponse::new(
+                choice,
+                rig::completion::Usage::new(),
+                Origin::new("openai.chat", "openai", "m"),
+                raw,
+            )
+            .with_optional_finish_reason(finish)
+        };
+        let empty = Vec::new();
+        let text = vec![AssistantContent::text("hi")];
+        let raw = |word: &str| serde_json::json!({ "choices": [{ "finish_reason": word }] });
+
+        assert_eq!(
+            unusable_reply(&reply(empty.clone(), None, serde_json::Value::Null)),
+            None
+        );
+        assert_eq!(
+            unusable_reply(&reply(empty.clone(), Some(FinishReason::Stop), raw("stop"))),
+            None
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                text.clone(),
+                Some(FinishReason::Length),
+                raw("length")
+            )),
+            None
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                empty.clone(),
+                Some(FinishReason::Length),
+                raw("length")
+            )),
+            Some("finish reason length: the reply holds no text and no tool call".into())
+        );
+        assert_eq!(
+            unusable_reply(&reply(
+                empty.clone(),
+                Some(FinishReason::Length),
+                serde_json::Value::Null
+            )),
+            Some("finish reason length: the reply holds no text and no tool call".into()),
+            "rig's own reason stands in when the document names none"
+        );
+        // The provider's own word, as its document spells it, even with text.
+        assert_eq!(
+            unusable_reply(&reply(
+                text.clone(),
+                Some(FinishReason::ContentFilter),
+                raw("refusal")
+            )),
+            Some("finish reason refusal: the provider ended the reply for its content".into())
+        );
+        let mut failed = reply(text, Some(FinishReason::Stop), raw("stop"));
+        failed.error = Some("overloaded".into());
+        assert_eq!(
+            unusable_reply(&failed),
+            Some("the provider failed the turn: overloaded".into())
+        );
+    }
+
+    /// A model that answers every request `200` with a reply nothing can be
+    /// made of -- cut off at its ceiling with nothing in it -- and counts
+    /// them. It stands in for the HTTP layer too: each request it answers is
+    /// one `slot` names.
     #[derive(Clone)]
-    struct AlwaysUnusableModel(std::sync::Arc<std::sync::atomic::AtomicUsize>, CallSlot);
+    struct AlwaysUnusable(std::sync::Arc<std::sync::atomic::AtomicUsize>, CallSlot);
 
-    impl CompletionModel for AlwaysUnusableModel {
-        type Response = ();
-        type StreamingResponse = ();
-        type Client = ();
-
-        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-            Self(Default::default(), CallSlot::default())
-        }
-
-        async fn completion(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    impl Transport<MockScript> for AlwaysUnusable {
+        fn send(&self, _request: CompletionRequest, _exchange: Exchange) -> Opening<MockFrame> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(sent) = self.1.sending() {
                 sent.answered(None);
             }
-            Err(CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".into(),
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-            unreachable!("outrig never streams")
+            let empty = CompletionResponse::new(
+                Vec::new(),
+                rig::completion::Usage::new(),
+                Origin::new(MOCK_API, MOCK_PROVIDER, ""),
+                serde_json::Value::Null,
+            )
+            .with_optional_finish_reason(Some(FinishReason::Length));
+            Opening::ready(Opened::new(futures_util::stream::iter([Ok(
+                MockFrame::Response(Box::new(empty)),
+            )])))
         }
     }
+
+    /// [`AlwaysUnusable`] as the model a [`RetryingModel`] wraps.
+    fn always_unusable(
+        calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        slot: CallSlot,
+    ) -> DynModel<Completion> {
+        Model::new(
+            MockScript::default(),
+            AlwaysUnusable(std::sync::Arc::clone(calls), slot),
+        )
+        .erase()
+    }
+
+    /// What [`AlwaysUnusable`]'s reply fails as.
+    const UNUSABLE: &str = "finish reason length: the reply holds no text and no tool call";
 
     /// The count is what has to stop a provider answering empty forever: an
     /// unusable response comes back in milliseconds, so on the default
@@ -1422,17 +1529,20 @@ mod tests {
     async fn an_endlessly_unusable_response_gives_up_after_a_bounded_number_of_tries() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls), CallSlot::default()),
+            always_unusable(&calls, CallSlot::default()),
             RetryPolicy::default(),
             Retries::default(),
         );
 
         let err = model
-            .completion(model.completion_request("hi").build())
+            .completion(CompletionRequest::new("hi"))
             .await
             .expect_err("a model that only ever answers empty never recovers");
 
-        assert!(matches!(err, CompletionError::ResponseError(_)), "{err}");
+        assert!(
+            matches!(&err, ProviderError::Response(message) if message == UNUSABLE),
+            "{err}"
+        );
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1 + RESPONSE_RETRY_ATTEMPTS as usize,
@@ -1446,7 +1556,7 @@ mod tests {
     async fn a_zero_budget_makes_the_first_unusable_response_final() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls), CallSlot::default()),
+            always_unusable(&calls, CallSlot::default()),
             RetryPolicy {
                 budget: Duration::ZERO,
                 ..RetryPolicy::default()
@@ -1455,7 +1565,7 @@ mod tests {
         );
 
         model
-            .completion(model.completion_request("hi").build())
+            .completion(CompletionRequest::new("hi"))
             .await
             .expect_err("the first failure is final");
 
@@ -1478,7 +1588,7 @@ mod tests {
         slot.begin_call();
         slot.candidate("sonnet", "claude-sonnet-4-6", Some(4096));
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::default(), slot.clone()),
+            always_unusable(&std::sync::Arc::default(), slot.clone()),
             RetryPolicy {
                 base_delay: Duration::from_millis(1),
                 ..RetryPolicy::default()
@@ -1487,7 +1597,7 @@ mod tests {
         );
 
         model
-            .completion(model.completion_request("hi").build())
+            .completion(CompletionRequest::new("hi"))
             .await
             .expect_err("a model that only ever answers empty never recovers");
         events.close().await.expect("the log is finished");
@@ -1501,8 +1611,7 @@ mod tests {
                     "model": "sonnet",
                     "attempt": attempt,
                     "delay": floor,
-                    "error": "unusable response (Response contained no message or tool call \
-                              (empty))",
+                    "error": unusable(UNUSABLE),
                     "call_id": 1,
                     "attempt_id": attempt,
                 })
@@ -1562,99 +1671,6 @@ mod tests {
         }
         for answered in ["stop", "end_turn", "length", "max_tokens", "tool_calls", ""] {
             assert!(!is_content_refusal(answered), "{answered}");
-        }
-    }
-
-    #[test]
-    fn an_empty_body_a_model_ended_on_its_own_is_the_empty_text_completion() {
-        let reply = |message: serde_json::Value, finish_reason: serde_json::Value| {
-            let body = serde_json::json!({
-                "choices": [{ "message": message, "finish_reason": finish_reason }],
-                "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
-            });
-            empty_turn::<serde_json::Value>(&serde_json::to_vec(&body).expect("serializes"))
-        };
-        let turn = |finish_reason: serde_json::Value| {
-            reply(
-                serde_json::json!({ "role": "assistant", "content": "" }),
-                finish_reason,
-            )
-        };
-
-        for stop in ["stop", "end_turn"] {
-            let completion = turn(serde_json::json!(stop)).expect(stop);
-            assert!(
-                matches!(
-                    completion.choice.first(),
-                    AssistantContent::Text(text) if text.text.is_empty()
-                ),
-                "{stop}"
-            );
-            assert_eq!(completion.choice.len(), 1, "{stop}");
-            assert_eq!(completion.usage.total_tokens, 7, "the provider billed it");
-            assert_eq!(completion.raw_response["choices"][0]["finish_reason"], stop);
-        }
-        for cut_short in ["length", "content_filter", "tool_calls"] {
-            assert!(turn(serde_json::json!(cut_short)).is_none(), "{cut_short}");
-        }
-        assert!(turn(serde_json::Value::Null).is_none(), "no finish reason");
-        assert!(empty_turn::<serde_json::Value>(b"<html>bad gateway</html>").is_none());
-
-        // However the provider spells nothing, it is nothing.
-        for nothing in [
-            serde_json::json!({ "role": "assistant" }),
-            serde_json::json!({ "role": "assistant", "content": null, "refusal": null }),
-            serde_json::json!({ "role": "model", "content": [], "tool_calls": [], "audio": {} }),
-            serde_json::json!({ "role": "assistant", "content": "", "reasoning_content": "" }),
-        ] {
-            assert!(
-                reply(nothing.clone(), serde_json::json!("stop")).is_some(),
-                "{nothing}"
-            );
-        }
-    }
-
-    /// A normal stop is not a reply with nothing in it: whatever else the
-    /// message carries is the provider saying something rig set aside, so the
-    /// reply stays rig's error, retried and failed over as it was.
-    #[test]
-    fn a_reply_with_anything_in_it_is_not_an_empty_turn_whatever_its_finish_reason() {
-        let stopped = |message: serde_json::Value| {
-            let body = serde_json::json!({
-                "choices": [{ "message": message, "finish_reason": "stop" }],
-            });
-            empty_turn::<serde_json::Value>(&serde_json::to_vec(&body).expect("serializes"))
-        };
-
-        for something in [
-            // A refusal in the field rig does not read, with nothing else.
-            serde_json::json!({ "role": "assistant", "content": null, "refusal": "I can't" }),
-            // Reasoning and nothing to show for it.
-            serde_json::json!({ "role": "assistant", "content": "", "reasoning_details": [{}] }),
-            serde_json::json!({ "role": "assistant", "content": "", "reasoning_content": "hm" }),
-            // Text of a kind rig does not take, a call it cannot use.
-            serde_json::json!({ "role": "assistant", "content": [{ "type": "text" }] }),
-            serde_json::json!({ "role": "assistant", "tool_calls": [{ "id": "c" }] }),
-            serde_json::json!({ "role": "assistant", "content": "", "something": 1 }),
-            // Not the assistant's, or not saying whose.
-            serde_json::json!({ "role": "tool", "content": "" }),
-            serde_json::json!({ "role": "user", "content": "" }),
-            serde_json::json!({ "role": null, "content": "" }),
-            serde_json::json!({ "content": "" }),
-        ] {
-            assert!(stopped(something.clone()).is_none(), "{something}");
-        }
-        // No message to say it of, or no choice to hold one.
-        for body in [
-            serde_json::json!({ "choices": [{ "finish_reason": "stop" }] }),
-            serde_json::json!({ "choices": [] }),
-            serde_json::json!({ "choices": [null] }),
-            // Anthropic's reply is read by rig, or it has content rig could not use.
-            serde_json::json!({ "content": [], "stop_reason": "end_turn" }),
-            serde_json::json!({ "content": [{ "type": "other" }], "stop_reason": "end_turn" }),
-        ] {
-            let body = serde_json::to_vec(&body).expect("serializes");
-            assert!(empty_turn::<serde_json::Value>(&body).is_none());
         }
     }
 
@@ -1719,21 +1735,40 @@ mod tests {
                     "completion_tokens_details": { "reasoning_tokens": 2 },
                 }),
             ),
+            // A gateway that reports the total but not the output: the output
+            // is the remainder.
+            (
+                Style::OpenAi,
+                serde_json::json!({ "prompt_tokens": 120, "total_tokens": 200 }),
+            ),
+            // One that reports no total: the total is the sum.
+            (
+                Style::OpenAi,
+                serde_json::json!({ "prompt_tokens": 12, "completion_tokens": 7 }),
+            ),
+            // Anthropic with no output count, as a reply cut off before any
+            // leaves it.
+            (Style::Anthropic, serde_json::json!({ "input_tokens": 12 })),
         ];
         for (style, usage) in fixtures {
+            use rig::wire::{Mode, WireFrame, decode_reply};
             let body = style.text("hi").usage(usage).body().clone();
+            let bytes = serde_json::to_vec(&body).expect("serializes");
+            let request = CompletionRequest::new("hi");
             let rigs = match style {
                 Style::Anthropic => {
-                    let parsed: anthropic::completion::CompletionResponse =
-                        serde_json::from_value(body.clone()).expect("rig parses it");
-                    CompletionResponse::try_from(parsed).expect("usable").usage
+                    let wire = rig::providers::anthropic::wire::AnthropicConfig::new("k")
+                        .completion(crate::agent::mock_http::MODEL);
+                    decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])
                 }
                 Style::OpenAi => {
-                    let parsed: openai::completion::CompletionResponse =
-                        serde_json::from_value(body.clone()).expect("rig parses it");
-                    CompletionResponse::try_from(parsed).expect("usable").usage
+                    let wire = rig::providers::openai::OpenAIConfig::new("k")
+                        .chat(crate::agent::mock_http::MODEL);
+                    decode_reply(&wire, &request, Mode::Unary, [WireFrame::Bytes(bytes)])
                 }
-            };
+            }
+            .expect("rig decodes it")
+            .usage;
             assert!(reported(rigs).is_some(), "{style:?}");
             assert_eq!(usage_in(body), reported(rigs), "{style:?}");
         }
@@ -2366,7 +2401,7 @@ mod tests {
                 .is_some_and(reqwest::Error::is_redirect),
             "{err}"
         );
-        assert!(!is_recoverable(&CompletionError::HttpError(err)));
+        assert!(!is_recoverable(&ProviderError::Http(Arc::new(err))));
         let followed = super::super::mock_http::drain(&mut requests).len();
         assert!(
             (2..=11).contains(&followed),
@@ -2378,10 +2413,7 @@ mod tests {
     /// provider's body.
     #[test]
     fn the_failure_label_names_the_status_without_the_body() {
-        let CompletionError::HttpError(err) = http_status(429) else {
-            unreachable!("an HTTP failure")
-        };
-        let label = failure_label(&err);
+        let label = failure_label(&http_error(429));
         assert!(label.contains("429"), "{label}");
         assert!(!label.contains("boom"), "the body must not leak: {label}");
     }
@@ -2423,16 +2455,16 @@ mod tests {
     #[test]
     fn a_failed_rounds_transport_cause_is_named_and_nothing_else_changes() {
         assert_eq!(
-            prompt_failure_text(&PromptError::CompletionError(transport_failure())),
+            prompt_failure_text(&PromptError::Provider(transport_failure())),
             "connection error: error sending request: Connection refused"
         );
         for other in [
-            PromptError::CompletionError(http_status(401)),
-            PromptError::CompletionError(CompletionError::ProviderError("nope".into())),
-            PromptError::MaxTurnsError {
+            PromptError::Provider(http_status(401)),
+            PromptError::Provider(ProviderError::Provider("nope".into())),
+            PromptError::MaxTurns {
                 max_turns: 3,
-                chat_history: Box::default(),
-                prompt: Box::new("hi".into()),
+                chat_history: Vec::new(),
+                prompt: "hi".into(),
             },
         ] {
             assert_eq!(prompt_failure_text(&other), other.to_string());
