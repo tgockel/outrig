@@ -255,6 +255,23 @@ async fn multiselect_comma_with_whitespace() {
 }
 
 #[tokio::test]
+async fn multiselect_none_clears_the_default() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    let (stderr_w, _stderr_r) = duplex(BUF);
+    stdin_w.write_all(b"none\n").await.unwrap();
+    drop(stdin_w);
+
+    let mut prompt = TerminalPrompt::new(BufReader::new(stdin_r), stderr_w);
+    let field = extras_field();
+
+    let got = timeout(TEST_TIMEOUT, prompt.ask_multiselect(&field, &[0]))
+        .await
+        .expect("must not hang")
+        .expect("ask_multiselect must succeed");
+    assert!(got.is_empty());
+}
+
+#[tokio::test]
 async fn multiselect_unknown_token_reprompts() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
     let (stderr_w, mut stderr_r) = duplex(BUF);

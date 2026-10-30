@@ -60,7 +60,9 @@ asked for again.
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any text or yes/no prompt, or at a picker on piped stdin, for an explanation of what's
 being asked plus the available options; on a terminal, pickers print their options'
-descriptions before they open and do not treat `?` as help.
+descriptions before they open and do not treat `?` as help. Where a picker has a default you
+do not want, such as `fs` under "MCP servers", type `none` on the line-based form (piped stdin,
+or a `TERM` of `dumb`, `cons25`, or `emacs`) to select nothing.
 The default image-config name is `<repo-folder>-standard` (kebab-cased), so the example
 below assumes a `hello-outrig` repo. A folder name with a letter outside ASCII, which no image
 name can hold, suggests `standard` instead.

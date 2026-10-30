@@ -4,7 +4,8 @@
 //! sources are interchangeable. `TerminalPrompt` is the line-based impl
 //! used for tests and non-TTY (piped/CI) callers; `DialoguerPrompt` is the
 //! rich impl that drives `dialoguer` widgets on a real terminal. The
-//! `auto()` factory picks between them based on whether stdin is a TTY.
+//! `auto()` factory picks between them based on whether stdin is a TTY and
+//! `TERM` names a terminal that can take a rich interface.
 
 pub mod dialoguer;
 
@@ -17,6 +18,7 @@ use tokio::io::{
 
 use self::dialoguer::DialoguerPrompt;
 use crate::error::{OutrigError, Result};
+use crate::term;
 
 use outrig::PUBLIC_DOC_BASE_URL;
 
@@ -305,6 +307,12 @@ fn parse_multiselect(
     options: &[(&str, &str)],
     input: &str,
 ) -> std::result::Result<Vec<usize>, String> {
+    // `Enter` takes the default, so clearing a pre-selected picker (MCP servers
+    // default to `fs`) needs its own word. A field with a real `none` option
+    // keeps it as an ordinary choice.
+    if input.trim().eq_ignore_ascii_case("none") && index_of(options, "none").is_none() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for token in input.split(',') {
         let trimmed = token.trim();
@@ -362,13 +370,35 @@ impl PromptSource for AutoPrompt {
     }
 }
 
-/// TTY stdin gets the rich dialoguer-backed picker; piped / CI stdin
-/// falls back to the line-based `TerminalPrompt` so scripted input keeps
-/// working.
+/// A TTY stdin on a capable terminal gets the rich dialoguer-backed picker;
+/// piped / CI stdin, or a `dumb`-style `TERM` (see [`term::is_rich`]), falls
+/// back to the line-based `TerminalPrompt` so scripted input keeps working.
 pub fn auto() -> AutoPrompt {
-    if std::io::stdin().is_terminal() {
+    if use_dialoguer(
+        std::io::stdin().is_terminal(),
+        std::env::var("TERM").ok().as_deref(),
+    ) {
         AutoPrompt::Dialoguer(DialoguerPrompt::new())
     } else {
         AutoPrompt::Terminal(TerminalPrompt::from_real_io())
+    }
+}
+
+fn use_dialoguer(stdin_is_tty: bool, term: Option<&str>) -> bool {
+    stdin_is_tty && term::is_rich(term)
+}
+
+#[cfg(test)]
+mod auto_tests {
+    use super::use_dialoguer;
+
+    #[test]
+    fn pickers_need_a_tty_on_a_capable_terminal() {
+        assert!(use_dialoguer(true, Some("xterm-256color")));
+        assert!(use_dialoguer(true, None));
+        assert!(!use_dialoguer(false, Some("xterm-256color")));
+        for term in ["dumb", "cons25", "emacs"] {
+            assert!(!use_dialoguer(true, Some(term)), "TERM={term}");
+        }
     }
 }

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig init`, `config init`, and `image add` read plain lines on `TERM=dumb`, `cons25`,
+  and `emacs`**, as `outrig run` already did, instead of opening dialoguer's arrow-key
+  pickers. Both now share one list of such terminals. The line-based pickers accept `none`
+  to clear a default, so "MCP servers" can still be left empty there. (#438)
 - **Files the wizards write now follow the umask, and `--force` keeps an existing file's
   mode.** `config.toml`, `Dockerfile`, `image.toml`, and `README.md` were always created
   `0600`, so a group-shared checkout could not read them, and a forced rewrite reset a `0644`

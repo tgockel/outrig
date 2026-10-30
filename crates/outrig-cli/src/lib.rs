@@ -35,6 +35,7 @@ pub(crate) mod builtin_tool;
 pub(crate) mod mcp_self;
 pub(crate) mod self_tool;
 pub(crate) mod subagent;
+pub(crate) mod term;
 
 /// Run the `outrig` command-line tool, returning the process exit code.
 pub fn run() -> std::process::ExitCode {

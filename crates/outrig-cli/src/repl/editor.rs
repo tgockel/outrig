@@ -37,21 +37,6 @@ use tokio::sync::oneshot;
 use super::line_source::{LineEvent, LineSource};
 use crate::error::Result;
 
-/// Terminals rustyline refuses to drive. On any of these `readline` takes its
-/// `readline_direct` path, which writes the prompt to *stdout* -- so the check
-/// has to happen out here, before an editor exists, or `TERM=dumb outrig run >
-/// out.txt` would put `> ` in the captured output.
-///
-/// This mirrors `UNSUPPORTED_TERM` in rustyline's `src/tty/mod.rs`, which is
-/// private, as is the `Term::is_unsupported` that reads it. There is no public
-/// way to ask -- `Editor::dimensions()` keys off `is_output_tty`, which under
-/// `PreferTerm` answers for the `/dev/tty` rustyline opened and so says "fine"
-/// on `TERM=dumb`. Predicting a private list is the only option available, so
-/// **re-check it on every rustyline upgrade**: if upstream adds a name, outrig
-/// hands that terminal an editor whose prompt lands in redirected stdout, and
-/// no test here can see it.
-const UNSUPPORTED_TERMS: [&str; 3] = ["dumb", "cons25", "emacs"];
-
 /// Prompts recalled by Up/Down. In memory, for one session.
 const HISTORY_SIZE: usize = 500;
 
@@ -67,11 +52,7 @@ const HISTORY_SIZE: usize = 500;
 fn tty_capable(stdin_is_tty: bool, stdin_is_controlling_tty: bool, term: Option<&str>) -> bool {
     stdin_is_tty
         && stdin_is_controlling_tty
-        && !term.is_some_and(|term| {
-            UNSUPPORTED_TERMS
-                .iter()
-                .any(|unsupported| unsupported.eq_ignore_ascii_case(term))
-        })
+        && crate::term::is_rich(term)
 }
 
 /// Whether `fd` is this process's controlling terminal. `TIOCGSID` answers
@@ -556,29 +537,6 @@ mod tests {
         let _held = lease.acquire().expect("live lease");
         let verdict = lease.await_quiescence(&|| false, Duration::from_millis(20));
         assert!(matches!(verdict, Quiescence::Unresolved));
-    }
-
-    /// The gate is the whole defense against rustyline's `readline_direct`
-    /// path, which writes the prompt to stdout and would put it in the file a
-    /// redirected `outrig run` is capturing.
-    #[test]
-    fn unsupported_terminals_are_rejected_whatever_their_case() {
-        for term in ["dumb", "DUMB", "Dumb", "cons25", "CONS25", "emacs", "Emacs"] {
-            assert!(
-                !tty_capable(true, true, Some(term)),
-                "TERM={term} must not get an editor",
-            );
-        }
-    }
-
-    #[test]
-    fn a_usable_terminal_is_accepted() {
-        for term in [Some("xterm-256color"), Some("screen"), Some("dumber"), None] {
-            assert!(
-                tty_capable(true, true, term),
-                "TERM={term:?} must get an editor"
-            );
-        }
     }
 
     /// Piped stdin keeps the line-at-a-time reader, whatever TERM says: an

@@ -439,7 +439,9 @@ the prompt.
 The editor needs a terminal it can drive. When stdin is a pipe or a file, or a terminal other
 than the one you are typing at (`outrig run < /dev/pts/7`), or `TERM` is `dumb`, `cons25`, or
 `emacs`, the prompt falls back to reading one line at a time with no editing and no recall, which
-is what keeps scripted use (`echo "..." | outrig run`) working unchanged.
+is what keeps scripted use (`echo "..." | outrig run`) working unchanged. `outrig init`,
+`config init`, and `image add` treat those three `TERM` values the same way, asking plain line
+questions instead of opening arrow-key pickers.
 
 Input is read as UTF-8. A line from a pipe or a file with bytes that are not UTF-8 -- a Latin-1
 `é` in a prompts file -- is still sent, with U+FFFD (`�`) in place of each bad sequence. The line
