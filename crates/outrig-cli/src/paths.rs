@@ -1,10 +1,12 @@
 //! CLI-owned repo, config, and cache path policy.
 
 use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::fs::{File, Permissions};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
+use nix::libc;
 use tempfile::NamedTempFile;
 
 use outrig::config::{Config, ConfigSource, MountAccess, Workspace};
@@ -128,15 +130,103 @@ pub(crate) fn write_atomic_all(files: &[(&Path, &str)]) -> Result<()> {
 
 /// `contents` in a synced temp file in `path`'s directory, created if
 /// missing. Dropped instead of persisted, the temp file is removed.
+///
+/// The rename keeps the temp file's mode, so it is set here before any
+/// content is written. A new target gets `0666` under the umask, as `open(2)`
+/// would create it; a bare `NamedTempFile` is `0600`, which would hide a
+/// checked-in `Dockerfile` from the group. An existing target keeps its own
+/// mode and access ACL, so a forced rewrite resets nothing the user chose --
+/// and the temp file starts `0600`, never broader than the target, so nobody
+/// can open it in the window before it takes the target's mode and keep a
+/// descriptor to what is written next.
 fn stage(path: &Path, contents: &str) -> Result<NamedTempFile> {
     let parent = path.parent().ok_or_else(|| {
         OutrigError::Configuration(format!("path has no parent: {}", path.display()))
     })?;
     std::fs::create_dir_all(parent).path_ctx("create directory", parent)?;
-    let mut tmp = NamedTempFile::new_in(parent)?;
+    let mut tmp = match std::fs::metadata(path) {
+        Ok(existing) => {
+            let tmp = NamedTempFile::new_in(parent)?;
+            // A new file takes its directory's group, which can be a broader one
+            // than the target's: the group is part of who the mode and ACL grant
+            // to, so it is restored first, and a rewrite that cannot is refused.
+            if existing.gid() != tmp.as_file().metadata()?.gid() {
+                nix::unistd::fchown(tmp.as_file(), None, Some(existing.gid().into()))
+                    .map_err(std::io::Error::from)?;
+            }
+            copy_access_acl(path, tmp.as_file())?;
+            tmp.as_file().set_permissions(existing.permissions())?;
+            tmp
+        }
+        Err(_) => tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o666))
+            .tempfile_in(parent)?,
+    };
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;
     Ok(tmp)
+}
+
+/// Give `dst` the access ACL of `src`, or none when `src` has none. A file
+/// created under a directory with a default ACL inherits its named entries,
+/// which would grant readers `src` never had once a `chmod` unmasks them.
+/// Filesystems without ACLs have nothing to copy.
+fn copy_access_acl(src: &Path, dst: &File) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const ACL: &std::ffi::CStr = c"system.posix_acl_access";
+    let no_acl = |e: &Error| matches!(e.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP));
+    let src = CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    // The ACL can change size between the query and the read, so a read that
+    // finds it grown asks again.
+    let acl = loop {
+        // SAFETY: `src` and `ACL` are NUL-terminated; a null buffer of length 0
+        // asks for the size.
+        let size = unsafe { libc::getxattr(src.as_ptr(), ACL.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            break Err(Error::last_os_error());
+        }
+        let mut acl = vec![0u8; size as usize];
+        // SAFETY: as above, and `acl` is writable for the length passed.
+        let len = unsafe {
+            libc::getxattr(src.as_ptr(), ACL.as_ptr(), acl.as_mut_ptr().cast(), acl.len())
+        };
+        if len >= 0 {
+            acl.truncate(len as usize);
+            break Ok(acl);
+        }
+        let err = Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ERANGE) {
+            break Err(err);
+        }
+    };
+    let fd = dst.as_raw_fd();
+    let err = match acl {
+        Ok(acl) => {
+            // SAFETY: `fd` is open, `ACL` is NUL-terminated, and `acl` is
+            // readable for the length passed.
+            let rc = unsafe {
+                libc::fsetxattr(fd, ACL.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
+            };
+            return if rc == 0 { Ok(()) } else { Err(Error::last_os_error()) };
+        }
+        Err(err) => err,
+    };
+    if !no_acl(&err) {
+        return Err(err);
+    }
+    // SAFETY: `fd` is open and `ACL` is NUL-terminated.
+    if unsafe { libc::fremovexattr(fd, ACL.as_ptr()) } != 0 {
+        let err = Error::last_os_error();
+        if !no_acl(&err) {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// The repo config a command reads, and the repo it runs against.
@@ -821,6 +911,135 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["blocker", "first"]);
+    }
+
+    /// What [`write_atomic_follows_the_umask_and_keeps_an_existing_mode`]
+    /// runs in a child process with its own umask: write `fresh` (new) and
+    /// `existing` (a `0640` file) under `$OUTRIG_UMASK_DIR`. Does nothing
+    /// otherwise.
+    #[test]
+    fn umask_child_writes_files() {
+        let Some(dir) = std::env::var_os("OUTRIG_UMASK_DIR").map(PathBuf::from) else {
+            return;
+        };
+        write_atomic_all(&[(&dir.join("fresh"), "new"), (&dir.join("existing"), "new")]).unwrap();
+    }
+
+    /// #405: a written file follows the umask like any other the user
+    /// creates, and a forced rewrite keeps the mode the file already had. The
+    /// writes run in a child whose umask is its own: the umask is
+    /// process-wide, and other tests in this binary create files (and set it)
+    /// concurrently.
+    #[test]
+    fn write_atomic_follows_the_umask_and_keeps_an_existing_mode() {
+        use std::os::unix::process::CommandExt as _;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for (umask, fresh) in [(0o077, 0o600), (0o022, 0o644), (0o002, 0o664)] {
+            let tmp = tempdir().unwrap();
+            let existing = tmp.path().join("existing");
+            fs::write(&existing, "old").unwrap();
+            fs::set_permissions(&existing, Permissions::from_mode(0o640)).unwrap();
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "paths::tests::umask_child_writes_files"])
+                .env("OUTRIG_UMASK_DIR", tmp.path());
+            // SAFETY: `umask` is async-signal-safe, as `pre_exec` requires.
+            unsafe {
+                child.pre_exec(move || {
+                    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(umask));
+                    Ok(())
+                });
+            }
+            assert!(child.status().unwrap().success());
+
+            assert_eq!(mode(&tmp.path().join("fresh")), fresh, "umask {umask:o}");
+            assert_eq!(mode(&existing), 0o640, "umask {umask:o}");
+            assert_eq!(fs::read_to_string(&existing).unwrap(), "new");
+        }
+    }
+
+    /// An existing file's access ACL is what the rewrite has, not what the
+    /// directory's default ACL would hand a new file: no named entry appears
+    /// that the target never had.
+    #[test]
+    fn a_rewrite_does_not_inherit_the_directory_default_acl() {
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        fs::set_permissions(&existing, Permissions::from_mode(0o640)).unwrap();
+        let set = std::process::Command::new("setfacl")
+            .args(["-d", "-m", "u:1:r"])
+            .arg(tmp.path())
+            .status();
+        if !set.is_ok_and(|s| s.success()) {
+            return; // no setfacl, or a filesystem without ACLs
+        }
+
+        write_atomic(&existing, "new").unwrap();
+
+        let acl = std::process::Command::new("getfacl")
+            .arg("-nc")
+            .arg(&existing)
+            .output()
+            .unwrap();
+        assert!(acl.status.success(), "getfacl failed");
+        let acl = String::from_utf8(acl.stdout).unwrap();
+        assert!(!acl.contains("user:1:"), "{acl}");
+        assert_eq!(fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    /// An ACL past the old fixed buffer (600 named users is over 4096 bytes)
+    /// is copied whole, not a reason to refuse the rewrite.
+    #[test]
+    fn a_rewrite_copies_an_acl_larger_than_4096_bytes() {
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        let users = (1000..1600).map(|u| format!("u:{u}:r")).collect::<Vec<_>>();
+        let set = std::process::Command::new("setfacl")
+            .args(["-m", &users.join(",")])
+            .arg(&existing)
+            .status();
+        if !set.is_ok_and(|s| s.success()) {
+            return; // no setfacl, or a filesystem without ACLs
+        }
+        let getfacl = |p: &Path| {
+            let out = std::process::Command::new("getfacl")
+                .arg("-nc")
+                .arg(p)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "getfacl failed");
+            out.stdout
+        };
+        let before = getfacl(&existing);
+
+        write_atomic(&existing, "new").unwrap();
+
+        assert_eq!(getfacl(&existing), before);
+    }
+
+    /// The group is part of who a rewrite's mode grants to: the temp file
+    /// would take the directory's, so the target's own is put back.
+    #[test]
+    fn a_rewrite_keeps_the_existing_files_group() {
+        let own = nix::unistd::getegid();
+        let Some(other) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .find(|g| *g != own)
+        else {
+            return; // no supplementary group to give the file
+        };
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, "old").unwrap();
+        std::os::unix::fs::chown(&existing, None, Some(other.as_raw())).unwrap();
+
+        write_atomic(&existing, "new").unwrap();
+
+        assert_eq!(fs::metadata(&existing).unwrap().gid(), other.as_raw());
     }
 
     #[test]

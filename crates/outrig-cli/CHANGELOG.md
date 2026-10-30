@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Files the wizards write now follow the umask, and `--force` keeps an existing file's
+  mode.** `config.toml`, `Dockerfile`, `image.toml`, and `README.md` were always created
+  `0600`, so a group-shared checkout could not read them, and a forced rewrite reset a `0644`
+  file to `0600` (which also changed the Dockerfile's image cache key). (#405)
 - **An interrupted `outrig init` no longer leaves a `default-image` naming an image that was
   never scaffolded.** The bootstrapped repo config used to carry `default-image` from the end
   of phase 2, so Ctrl-C or EOF at "Base image" left `outrig run` failing with `default-image
