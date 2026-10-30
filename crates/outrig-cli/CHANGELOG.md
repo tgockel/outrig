@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig image init` preserves an existing README, even with `--force`.** A project
+  README no longer blocks scaffolding or gets replaced by the template. `--force` only
+  regenerates `Dockerfile` and `image.toml`; a missing README is still created. (#406)
+
 - **`outrig init`, `config init`, and `image add` read plain lines on `TERM=dumb`, `cons25`,
   and `emacs`**, as `outrig run` already did, instead of opening dialoguer's arrow-key
   pickers. Both now share one list of such terminals. The line-based pickers accept `none`

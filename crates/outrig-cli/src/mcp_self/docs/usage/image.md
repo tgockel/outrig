@@ -240,7 +240,7 @@ Dockerfile unwritten too, new or replaced, so a retry isn't refused over it.
 
 `outrig image init` scaffolds a *standalone* image project: a self-contained directory whose
 build output is a reusable container image. Unlike `image add`, it writes no repo config --
-it creates three files and nothing else:
+it scaffolds the following files and touches nothing else:
 
 - `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the customary
   `CMD ["sleep", "infinity"]`. It installs the tool binaries; it does not copy OutRig config.
@@ -248,7 +248,8 @@ it creates three files and nothing else:
   `outrig image build` validates this file and stamps the `[mcp]` table into the image's OCI
   labels, which outrig reads back at session startup and merges with any repo
   `[images.<name>.mcp]`.
-- `README.md` -- how to build the image and reference it from a repo.
+- `README.md` -- how to build the image and reference it from a repo. Created only if absent;
+  an existing README is always preserved, even with `--force`.
 
 The command is noninteractive -- there are no prompts. The project name (used as `[image].ref`)
 defaults to the target directory's name.
@@ -259,10 +260,10 @@ defaults to the target directory's name.
 outrig image init [<dir>] [--force]
 ```
 
-| Argument / flag | Default     | Description                                          |
-|-----------------|-------------|------------------------------------------------------|
+| Argument / flag | Default     | Description                                         |
+|-----------------|-------------|-----------------------------------------------------|
 | `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
-| `--force`       | off         | Overwrite the generated files if they already exist. |
+| `--force`       | off         | Overwrite `Dockerfile` and `image.toml` if present. |
 
 The directory name becomes the image's ref, so it follows the same rule as an `image add` name:
 lowercase letters and digits, separated by one `.`, one or two `_`, or a run of `-` (e.g.
@@ -318,16 +319,19 @@ and the live test runs its servers with their references resolved.
 
 ### Re-running
 
-Without `--force`, `init` refuses if any of the three files already exists, naming the
-conflicts:
+Without `--force`, `init` refuses if `Dockerfile` or `image.toml` already exists, naming
+the conflicts before writing anything:
 
 ```
 $ outrig image init rust-dev
-error: rust-dev/Dockerfile, rust-dev/image.toml, rust-dev/README.md
+error: rust-dev/Dockerfile, rust-dev/image.toml
        already present; pass --force to overwrite.
 ```
 
-`--force` regenerates the three files and leaves anything else in the directory untouched.
+`--force` regenerates `Dockerfile` and `image.toml`. An existing `README.md` is kept and
+reported as `keeping existing`, so a hand-written README never blocks initialization or gets
+replaced. If it is absent, `init` creates the template README, with or without `--force`.
+Everything else in the directory is left untouched.
 
 ## outrig image build
 

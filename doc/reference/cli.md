@@ -182,17 +182,18 @@ See [Usage -> outrig image](../usage/image.md).
 
 Noninteractively scaffold a standalone image project: writes a `Dockerfile`, an authoring
 `image.toml`, and a `README.md` into a target directory. The directory name becomes the image ref;
-other repos consume the built image via `image-name`.
+other repos consume the built image via `image-name`. An existing README is always preserved,
+even with `--force`.
 
 ```
 outrig image init [<dir>]
                   [--force]
 ```
 
-| Argument / flag | Default     | Description                                          |
-|-----------------|-------------|------------------------------------------------------|
+| Argument / flag | Default     | Description                                         |
+|-----------------|-------------|-----------------------------------------------------|
 | `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
-| `--force`       | off         | Overwrite the generated files if they already exist. |
+| `--force`       | off         | Overwrite `Dockerfile` and `image.toml` if present. |
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-init).
 

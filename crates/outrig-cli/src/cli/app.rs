@@ -115,7 +115,7 @@ enum ImageCmd {
         /// Project directory. Defaults to the current directory; its name
         /// becomes the image ref.
         dir: Option<PathBuf>,
-        /// Overwrite the generated files if they already exist.
+        /// Overwrite Dockerfile and image.toml if present; preserve an existing README.md.
         #[arg(long)]
         force: bool,
     },
