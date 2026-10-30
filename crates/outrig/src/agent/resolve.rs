@@ -8,16 +8,17 @@
 //!   order: the chain a failed call moves along ([`super::failover`]).
 //! - The subagent limits and the image hint have no reader here, and neither do
 //!   the names the CLI's banner prints.
-//! - There are no fallback arms for a provider style nobody taught the
-//!   resolver. `LlmProvider` is `#[non_exhaustive]` for other crates, not this
-//!   one, so here a new style fails to compile until both matches handle it.
+//! - There are no fallback arms for a style nobody taught the resolver.
+//!   `LlmProvider` and `ApiStyle` are `#[non_exhaustive]` for other crates,
+//!   not this one, so here a new style fails to compile until the matches
+//!   handle it.
 
 use thiserror::Error;
 
 use super::AgentError;
 use super::budget::Budget;
 use crate::config::{
-    Agent, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
+    Agent, ApiStyle, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
     RepoInstructions, RoleAlternation, Secrets,
 };
 use crate::error::OutrigError;
@@ -498,48 +499,59 @@ fn resolve_candidate(
                 name: provider_name.to_string(),
             })?;
 
-    let resolved_provider = match provider {
-        LlmProvider::ChatCompletions {
+    // Every style's row holds the same keys, so they are read from whichever
+    // the provider is, and the model's own `style`, else the provider's, says
+    // which protocol they are used in.
+    let (LlmProvider::ChatCompletions {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        role_alternation,
+        ..
+    }
+    | LlmProvider::Responses {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        role_alternation,
+        ..
+    }
+    | LlmProvider::Anthropic {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        role_alternation,
+        ..
+    }) = provider;
+    let base_url = base_url.clone();
+    let api_key: Redacted = api_key.resolve_with(secrets)?.into();
+    let request_timeout_secs = *request_timeout_secs;
+    let retry_budget_secs = retry_budget_secs.or(cfg.retry_budget_secs);
+    let role_alternation = role_alternation.unwrap_or_default();
+    let resolved_provider = match model.effective_style(provider) {
+        ApiStyle::ChatCompletions => ResolvedProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             role_alternation,
-            ..
-        } => ResolvedProvider::ChatCompletions {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve_with(secrets)?.into(),
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
-            role_alternation: role_alternation.unwrap_or_default(),
         },
-        LlmProvider::Responses {
+        ApiStyle::Responses => ResolvedProvider::Responses {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             role_alternation,
-            ..
-        } => ResolvedProvider::Responses {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve_with(secrets)?.into(),
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
-            role_alternation: role_alternation.unwrap_or_default(),
         },
-        LlmProvider::Anthropic {
+        ApiStyle::Anthropic => ResolvedProvider::Anthropic {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             role_alternation,
-            ..
-        } => ResolvedProvider::Anthropic {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve_with(secrets)?.into(),
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
-            role_alternation: role_alternation.unwrap_or_default(),
         },
     };
 

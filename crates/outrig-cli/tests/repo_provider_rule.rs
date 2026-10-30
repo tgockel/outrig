@@ -69,14 +69,15 @@ async fn a_repo_config_declaring_a_keyed_provider_is_refused_before_any_containe
 
 /// The recommended split loads: a repo model naming the global provider gets
 /// past config load and on to the image cascade, where the stub podman ends
-/// the run for an unrelated reason.
+/// the run for an unrelated reason. The model may set its own `style`: the
+/// key still goes only to the global provider's `base-url`.
 #[tokio::test]
 async fn a_repo_model_naming_a_global_provider_still_loads() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, global, sessions) = fixture(
         tmp.path(),
         "default-model = \"repo-fast\"\n\n[models.repo-fast]\nprovider = \"openai\"\n\
-         identifier = \"test-model\"\n",
+         identifier = \"test-model\"\nstyle = \"anthropic\"\n",
     );
 
     let (_ok, stderr) = run_outrig(

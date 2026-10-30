@@ -683,9 +683,10 @@ no model; a [session](#sessions) the program enters does.
 - **The configuration.** Loaded and validated once, from the directory you ran `outrig` in --
   with `--config` and the global file as for every command -- before the program starts, and
   never again: not from the script's directory. `outrig.config()` is a read-only view of it: each
-  model with its provider, the identifier OutRig sends and its declared window, each alias with
-  its candidates in order, each provider's style and base URL, `default-model`, the resolved
-  `[workspace] host-path`, and `[events] mode`. No API key and no `${VAR}` value is in it.
+  model with its provider, the style OutRig calls it with -- its own, else its provider's -- the
+  identifier OutRig sends and its declared window, each alias with its candidates in order, each
+  provider's style and base URL, `default-model`, the resolved `[workspace] host-path`, and
+  `[events] mode`. No API key and no `${VAR}` value is in it.
 - **Flags.** `--config`, `--global-config`, `--session-root` and `-v` go before the script, and
   so does `--grace`, which is the program's alone (see [Signals and the
   grace](#signals-and-the-grace)). The interactive session's flags -- `--agent`, `--model` and

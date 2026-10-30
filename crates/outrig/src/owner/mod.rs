@@ -360,10 +360,19 @@ pub(crate) fn view(config: &Config, repo_root: &Path) -> Result<Value, OutrigErr
                 aliases.insert(name.clone(), json!({ "candidates": candidates }));
             }
             None => {
+                // The style a call uses, so a host program does not repeat the rule. A
+                // configuration nobody validated may name no such provider, and shows the row's
+                // own.
+                let provider = model
+                    .provider
+                    .as_ref()
+                    .and_then(|p| config.providers.get(p));
+                let style = provider.map_or(model.style, |p| Some(model.effective_style(p)));
                 models.insert(
                     name.clone(),
                     json!({
                         "provider": model.provider,
+                        "style": style,
                         "identifier": model.identifier.as_deref().unwrap_or(name),
                         "context_window": model.context_window,
                         "max_tokens": model.max_tokens,

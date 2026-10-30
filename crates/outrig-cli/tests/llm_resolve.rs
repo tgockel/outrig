@@ -1029,3 +1029,117 @@ fn a_shapeless_model_fails_resolution_rather_than_panicking() {
         "got: {err}"
     );
 }
+
+/// What a model on `https://gateway.example/v1`, keyed `test-key`, resolves
+/// to when it is called in `style`.
+fn on_the_gateway(style: &str, request_timeout_secs: Option<u64>) -> ResolvedProvider {
+    let base_url = "https://gateway.example/v1".to_string();
+    let api_key = "test-key".to_string();
+    let retry_budget_secs = None;
+    match style {
+        "chat-completions" => ResolvedProvider::ChatCompletions {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            retry_budget_secs,
+        },
+        "responses" => ResolvedProvider::Responses {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            retry_budget_secs,
+        },
+        "anthropic" => ResolvedProvider::Anthropic {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            retry_budget_secs,
+        },
+        other => panic!("no style {other:?}"),
+    }
+}
+
+/// A model is called with its own `style`, else its provider's: on a provider
+/// of each style, a row that sets none resolves as it always did, and a row
+/// that sets one resolves to that one, with the provider's `base-url`, key and
+/// timeout.
+#[test]
+fn a_model_resolves_to_its_own_style_else_its_providers() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MODEL_STYLE";
+    set_env(var, "test-key");
+    let styles = ["chat-completions", "responses", "anthropic"];
+    for provider_style in styles {
+        for own in std::iter::once(None).chain(styles.map(Some)) {
+            let cfg = parse(&format!(
+                r#"
+default-model = "m"
+
+[providers.gateway]
+style                = "{provider_style}"
+base-url             = "https://gateway.example/v1"
+api-key              = "${{{var}}}"
+request-timeout-secs = 45
+
+[models.m]
+provider   = "gateway"
+identifier = "model-id"
+{}
+"#,
+                own.map_or(String::new(), |style| format!("style = \"{style}\"")),
+            ));
+            let r = resolve_agent(&cfg, None).expect("resolves");
+            assert_eq!(
+                r.provider(),
+                &on_the_gateway(own.unwrap_or(provider_style), Some(45)),
+                "a {provider_style} provider's model setting {own:?}"
+            );
+        }
+    }
+    unset_env(var);
+}
+
+/// An alias over two models of one provider, called in different styles,
+/// resolves to each in its own style, in order, both at the provider's
+/// endpoint.
+#[test]
+fn an_alias_over_one_providers_models_keeps_each_ones_style() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_STYLES";
+    set_env(var, "test-key");
+    let cfg = parse(&format!(
+        r#"
+default-model = "chain"
+
+[providers.gateway]
+style    = "chat-completions"
+base-url = "https://gateway.example/v1"
+api-key  = "${{{var}}}"
+
+[models.sonnet]
+provider   = "gateway"
+identifier = "claude-sonnet-4-6"
+style      = "anthropic"
+
+[models.fast]
+provider   = "gateway"
+identifier = "gpt-4o-mini"
+
+[models.chain]
+alias = ["sonnet", "fast"]
+"#
+    ));
+    let r = resolve_agent(&cfg, None).expect("resolves");
+    unset_env(var);
+
+    let candidates: Vec<_> = r
+        .candidates
+        .iter()
+        .map(|c| (c.model_name.as_str(), c.provider.clone()))
+        .collect();
+    assert_eq!(
+        candidates,
+        [
+            ("sonnet", on_the_gateway("anthropic", None)),
+            ("fast", on_the_gateway("chat-completions", None)),
+        ]
+    );
+}

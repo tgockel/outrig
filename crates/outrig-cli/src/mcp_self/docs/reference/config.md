@@ -515,7 +515,9 @@ belong to the global config: a repo config that declares one is rejected at load
 it uses, and its models name the global config's providers. The accepted `style` values are
 `"chat-completions"`, `"responses"`, and `"anthropic"`. Which other fields are valid depends on
 `style`. `"openai"`, the 0.2.x spelling of `"chat-completions"`, is still read as it, with a
-warning that names the new value; a later release will remove it.
+warning that names the new value; a later release will remove it. A provider's `style` is the
+default for the models on it, and a model can set its own: see
+[Remote-provider models](#remote-provider-models).
 
 A local model is an ordinary `style = "chat-completions"` provider pointed at a server on
 `localhost` (Ollama, vLLM, `llama.cpp`) -- see
@@ -627,8 +629,8 @@ Timeout, transient-retry, and `role-alternation` behavior match `style = "chat-c
 exactly. Every call sends the whole conversation, cut to the model's allowance, and `store:
 false`: OpenAI keeps nothing, and outrig never sets `previous_response_id` or `conversation`.
 The system prompt goes in `instructions`. The ceiling a call carries is sent as
-`max_output_tokens`. A reasoning item in a reply goes back to the same provider with its
-`encrypted_content`; one a call would carry to a different provider is left out. Hosted tools
+`max_output_tokens`. A reasoning item in a reply goes back, with its `encrypted_content`, to the
+model row that wrote it; one a call would carry to any other row is left out. Hosted tools
 (web search, file search, code interpreter, remote MCP) are not used.
 
 ### `style = "anthropic"`
@@ -656,8 +658,10 @@ api-key  = "${ANTHROPIC_API_KEY}"
 
 `base-url` is the API root, without the `/v1/messages` path -- outrig appends that. A
 trailing `/v1`, `/messages`, or `/v1/messages` is trimmed if you write one anyway, so
-`https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. Timeout,
-transient-retry, and `role-alternation` behavior match `style = "chat-completions"` exactly.
+`https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. That is what
+lets a gateway's `base-url`, written with the `/v1` that `chat-completions` needs, serve a model
+of either style. Timeout, transient-retry, and `role-alternation` behavior match
+`style = "chat-completions"` exactly.
 
 Anthropic requires an output-token ceiling on every request. outrig knows one for the model
 identifiers it recognizes; any other identifier needs `max-tokens` on the model or the
@@ -685,7 +689,10 @@ by `--global-config`). The reference is resolved on the host, and the provider's
 says where the host process sends the result; a repo config that could pair the two would
 decide where the operator's secret goes. `outrig run`, `outrig mcp`, and `outrig build` all
 refuse a repo config -- `.agents/outrig/config.toml` or a `--config` file -- that declares one,
-naming the provider and the variable.
+naming the provider and the variable. A repo config's model may still name a global provider,
+and set its own `style`: whatever the style, the key goes only to that provider's `base-url`.
+No request to a provider follows a redirect, so the key reaches no other address: a call
+answered with one fails, as it does on any status that is not a success.
 
 See [Concepts -> LLM Providers](https://tgockel.github.io/outrig/concepts/llm-providers.html).
 
@@ -785,11 +792,42 @@ identifier = "gpt-4o"
 |------------------|---------|----------|---------|-------------------------------------------|
 | `provider`       | string  | yes\*    | --      | Name of an entry in `[providers.<name>]`. |
 | `identifier`     | string  | yes      | --      | Model id passed to the provider API.      |
+| `style`          | string  | no       | --      | Overrides the provider's `style`.         |
 | `max-tokens`     | integer | no       | --      | Output-token ceiling per turn, see below. |
 | `context-window` | integer | no       | --      | The model's whole window in tokens.       |
 
 \* Required unless the entry sets `alias` instead, which forbids every field in this table
--- `max-tokens` and `context-window` included.
+-- `style`, `max-tokens` and `context-window` included.
+
+`style` is the API a model is called with, in place of its provider's: `"chat-completions"`,
+`"responses"`, or `"anthropic"`, the values a provider's takes. The deprecated `"openai"` is a
+provider's spelling only, and a model refuses it. Unset, the model is called with its provider's
+`style`. The request still goes to the provider's `base-url` with its `api-key`, under its
+`request-timeout-secs`, `retry-budget-secs`, and `role-alternation`; the path, the auth header,
+and the wire format follow the model's style. So one endpoint that serves two APIs is one
+provider:
+
+```toml
+[providers.gateway]
+style    = "chat-completions"       # the default for every model on it
+base-url = "https://gateway.example/v1"
+api-key  = "${GATEWAY_API_KEY}"
+
+[models.fast]
+provider   = "gateway"
+identifier = "gpt-4o-mini"          # chat-completions, from the provider
+
+[models.sonnet]
+provider   = "gateway"
+identifier = "claude-sonnet-4-6"
+style      = "anthropic"            # this model only
+max-tokens = 16384
+```
+
+Every rule below that depends on a style -- the ceiling an Anthropic request must carry, where
+the provider is asked for a window -- follows the style the model is called with. A repo
+config's model may set `style` on a global provider: the key still goes only to that provider's
+`base-url`.
 
 `max-tokens` on a model is the fallback for every agent that uses it;
 `[agents.<name>].max-tokens` wins where it is set. Leaving both unset lets the provider
@@ -814,7 +852,8 @@ ceiling the call sends is lowered to what the request leaves, never below 1,024 
 is made and its answer corrects the scale.
 Unset, `run-new` asks the model's provider for it, once a session, as the session starts, and
 holds each call to the window it reports. The question is one `GET` against the provider's
-`base-url`, with the provider's own key, that is not retried and is given 10 seconds:
+`base-url`, with the provider's own key, that is not retried and is given 10 seconds, at the
+route of the style the model is called with:
 
 - `style = "anthropic"`: `{base-url}/v1/models/{identifier}`, and its `max_input_tokens`.
 - `style = "chat-completions"` or `style = "responses"`: `{base-url}/model/info`, which a LiteLLM
@@ -1748,9 +1787,10 @@ for each thing it set aside, and goes on:
   required key. That is the key itself, or one mount of a `workspace.mounts` or
   `sidecars.<sc>.mounts` list; a bad element of any other list drops the whole key, so no argv
   runs short an argument. When what is left of a table cannot stand alone -- a provider without
-  its `style` -- the table goes too, with a warning of its own. In a repo config or a `--config`
-  file the same value is an error, and when a misspelled required key is what an entry lacks,
-  the error names the misspelling.
+  its `style` -- the table goes too, with a warning of its own. A model whose `style` goes stays,
+  and is called with its provider's. In a repo config or a `--config` file the same value is an
+  error, and when a misspelled required key is what an entry lacks, the error names the
+  misspelling.
 
 Validation then runs on what is left, so an entry something else needed is still an error --
 printed after the warning that explains it. A misspelled `provider` is warned about, and then
@@ -1782,7 +1822,7 @@ image-config in the merged config but does not require agent/model/provider wiri
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
 - Every `[models.<name>]` must set exactly one of `provider` or `alias`. Setting neither, or
-  setting `alias` alongside any provider-shape field (including `max-tokens` and
+  setting `alias` alongside any provider-shape field (including `style`, `max-tokens` and
   `context-window`), is an error naming every offending key. Unlike the other model rules,
   this one and the three below are checked on **every** path, `outrig build` included -- they
   establish the entry's shape rather than resolve a cross-reference.
@@ -1792,17 +1832,17 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An `alias` chain may be at most 32 hops deep. A graph that deep is a mistake rather than a
   configuration, and the limit is what makes it report as one.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
-- Every `providers.<name>.style` must be one of `{"chat-completions", "responses",
-  "anthropic"}`, or the deprecated `"openai"`, which loads as `"chat-completions"` with a
-  warning. Other styles are reserved for future Rig adapters and listed as TODO in the providers
-  concept page.
+- Every `providers.<name>.style` and `models.<name>.style` must be one of
+  `{"chat-completions", "responses", "anthropic"}`. A provider's may also be the deprecated
+  `"openai"`, which loads as `"chat-completions"` with a warning. Other styles are reserved for
+  future Rig adapters and listed as TODO in the providers concept page.
 - Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `providers.<name>.base-url` (on a remote style) must be an `http://` or `https://` URL.
   The error says what is wrong -- no scheme, another scheme, no parse -- without quoting the
   value, which may carry credentials. `outrig build` does not check it.
-- Every `[models.<name>]` whose provider has a remote style must set
-  `identifier`. The error names the style of the provider the model points at.
+- Every `[models.<name>]` whose provider has a remote style must set `identifier`. The error
+  names the style the model is called with: its own, else its provider's.
 - `tool-call-max`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-max`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
@@ -1827,7 +1867,8 @@ image-config in the merged config but does not require agent/model/provider wiri
   `[network].deny` are rejected there.
 - A repo config may declare no provider: a `chat-completions`, `responses`, or `anthropic`
   provider in `.agents/outrig/config.toml`, or in a `--config` file, is rejected there, naming the
-  provider and the variable its key references.
+  provider and the variable its key references. A repo model may name a global provider and set
+  its own `style`.
 - `[repo].env-allow` may be set only in the global config; a repo config that declares it, even
   as `env-allow = []`, is rejected there. Each entry must be a variable name, matching
   `^[A-Z_][A-Z0-9_]*$`; in the global config a bad entry sets the whole key aside with a warning.

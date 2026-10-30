@@ -413,6 +413,112 @@ async fn native_tool_use_round_trip() {
     );
 }
 
+/// A model's own `style` overrides its provider's: on a `chat-completions`
+/// provider whose `base-url` ends in `/v1`, the model that says `anthropic`
+/// posts to `/v1/messages` with `x-api-key`, and the one that says nothing to
+/// `/v1/chat/completions` with a bearer token -- one endpoint, one key.
+#[tokio::test]
+async fn a_models_own_style_overrides_its_providers() {
+    let var = "OUTRIG_TEST_ANTHROPIC_MODEL_STYLE";
+    let chat_reply = CannedResponse::ok(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "over chat completions" },
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19 },
+    }));
+    let (addr, mut requests) = start_mock_http(vec![chat_reply, text_reply("over messages")]).await;
+    let config = |model: &str| {
+        let cfg = Config::load_from_str(&format!(
+            r#"
+default-model = "{model}"
+
+[providers.gateway]
+style                = "chat-completions"
+base-url             = "http://{addr}/v1"
+api-key              = "${{{var}}}"
+request-timeout-secs = 10
+
+[models.gpt]
+provider   = "gateway"
+identifier = "gpt-4o"
+
+[models.sonnet]
+provider   = "gateway"
+identifier = "{MODEL}"
+style      = "anthropic"
+
+[agents.coding]
+preamble = "{PREAMBLE}"
+"#
+        ))
+        .expect("config parses");
+        cfg.validate(None).expect("config validates");
+        cfg
+    };
+
+    for (model, reply) in [
+        ("gpt", "over chat completions"),
+        ("sonnet", "over messages"),
+    ] {
+        let agent = build_mock_agent(&config(model), &[var], Vec::new()).await;
+        let end = agent
+            .run_turn("hi", &mut Vec::new())
+            .await
+            .expect("turn completes");
+        assert_eq!(end.reply, reply, "{model}");
+    }
+
+    let recorded = drain_recorded(&mut requests);
+    let sent: Vec<_> = recorded
+        .iter()
+        .map(|r| {
+            let auth = (r.header("authorization"), r.header("x-api-key"));
+            (r.path.as_str(), auth)
+        })
+        .collect();
+    let bearer = format!("Bearer {KEY}");
+    assert_eq!(
+        sent,
+        [
+            ("/v1/chat/completions", (Some(bearer.as_str()), None)),
+            ("/v1/messages", (None, Some(KEY))),
+        ]
+    );
+}
+
+/// A provider's redirect is not followed, so the key goes nowhere but the
+/// provider: `x-api-key` is a header reqwest keeps across origins, and a `307`
+/// would send the conversation again. The turn fails at the provider, and the
+/// address the redirect names is sent nothing.
+#[tokio::test]
+async fn a_providers_redirect_is_not_followed() {
+    let (elsewhere, mut sent_elsewhere) = start_mock_http(vec![text_reply("leaked")]).await;
+    let location = format!("http://{elsewhere}/v1/messages");
+    for status in [302, 307] {
+        let var = format!("OUTRIG_TEST_ANTHROPIC_REDIRECT_{status}");
+        let (addr, mut requests) = start_mock_http(vec![
+            CannedResponse::status(status, json!({})).with_header("Location", &location),
+        ])
+        .await;
+        let err = run_one_turn(addr, &var, MODEL, Some(4096), vec![])
+            .await
+            .expect_err("a redirect fails the turn");
+        assert!(
+            format!("{err:#}").contains(&status.to_string()),
+            "{status}: {err:#}"
+        );
+        assert_eq!(drain_recorded(&mut requests).len(), 1, "{status}");
+    }
+    let leaked = drain_recorded(&mut sent_elsewhere);
+    assert!(leaked.is_empty(), "{leaked:#?}");
+}
+
 /// Every request asks Anthropic to cache, or no call is ever read back (#669).
 ///
 /// Three markers, of the four a request may carry: one each on the last tool
@@ -990,13 +1096,13 @@ async fn a_rejected_api_key_stays_fatal() {
     );
 }
 
-/// A redirect loop is terminal at the transport: reqwest follows it to its
-/// limit and gives up, and a replay would do the same. So it is sent once --
-/// one request and the redirects reqwest follows -- and stays fatal, as a
-/// `401` does, rather than ending only the turn. The budget is the shipped
-/// default, so a loop that is retried runs into the timeout.
+/// A redirect is terminal: outrig follows none, even to the provider's own
+/// address, and a replay would be answered the same. So it is sent once and
+/// stays fatal, as a `401` does, rather than ending only the turn. The budget
+/// is the shipped default, so a redirect that is retried runs into the
+/// timeout.
 #[tokio::test]
-async fn a_redirect_loop_is_fatal_at_once() {
+async fn a_redirect_is_fatal_at_once() {
     let (addr, mut requests) = start_mock_http(vec![
         CannedResponse::status(307, json!({})).with_header("Location", "/v1/messages"),
     ])
@@ -1013,17 +1119,17 @@ async fn a_redirect_loop_is_fatal_at_once() {
         ),
     )
     .await
-    .expect("a redirect loop must not be retried for the whole budget")
-    .expect_err("no resend can satisfy a redirect loop, so it must not end up an Ok turn");
+    .expect("a redirect must not be retried for the whole budget")
+    .expect_err("no resend can satisfy a redirect, so it must not end up an Ok turn");
 
     assert!(
-        err.to_string().contains("redirect"),
-        "the error should say a redirect failed: {err}",
+        err.to_string().contains("307"),
+        "the error should name the status: {err}",
     );
-    let sent = drain_recorded(&mut requests).len();
-    assert!(
-        (2..=11).contains(&sent),
-        "one request and the redirects reqwest follows, once: {sent}",
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "the redirect is neither followed nor retried",
     );
 }
 

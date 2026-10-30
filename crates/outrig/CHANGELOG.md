@@ -9,12 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A model's own `style`.** `[models.<name>].style` overrides its provider's `style` for that
+  model, so an endpoint that serves some models over Chat Completions and others over Anthropic's
+  Messages API or the Responses API is one provider, its `style` the default. The request still
+  goes to the provider's `base-url` with its key. A repo config's model may set it; an alias may
+  not, as it may not set `max-tokens`. Every rule that depends on a style follows the model's, and
+  `outrig.config()` reports each model's style beside its provider's. No request to a provider
+  follows a redirect, so whichever header a style puts the key in, it reaches no other address.
+  New: `ApiStyle`, `Model::style` and `Model::effective_style`. (#796)
 - **`style = "responses"`, a provider that speaks OpenAI's Responses API.** A call posts to
   `{base-url}/responses` with the whole conversation as `input`, the output ceiling as
   `max_output_tokens`, and `store: false`; it never sets `previous_response_id`. The row takes the
-  keys `chat-completions` does. A reasoning item goes back only to a provider that issued one with
-  `encrypted_content`, so an alias chain that moves between providers sends none a candidate
-  cannot use. New: `LlmProvider::Responses`, `LlmProvider::responses` and `ResponsesOptions`.
+  keys `chat-completions` does. A reasoning item goes back, with its `encrypted_content`, only to
+  the `[models.<name>]` row that issued it, so an alias chain that moves between rows sends none a
+  candidate cannot use. New: `LlmProvider::Responses`, `LlmProvider::responses` and
+  `ResponsesOptions`.
 - **`harness`, an agent session that acts by writing Python.** A `SessionBuilder` takes
   everything a session needs from outside before it starts: the `Config`, the agent and model, the
   container as a `LaunchSpec`, a `Secrets` resolver for the keys its model calls need, event
@@ -634,6 +643,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`RemoteModelMissingIdentifier` names the style the model is called with**, its own or its
+  provider's, and its message says `style=` where it said `provider style=`.
 - **Breaking: `style = "openai"` is `style = "chat-completions"`.** The style is named for its
   protocol now that a second OpenAI request format is a style. The Rust names follow:
   `LlmProvider::OpenAi` is `LlmProvider::ChatCompletions`, `LlmProvider::openai` is

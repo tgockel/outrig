@@ -730,6 +730,7 @@ max-tokens     = 4000
 [models.slow]
 provider   = "local"
 identifier = "slow-wire-name"
+style      = "anthropic"
 
 [models.either]
 alias = ["fast", "slow"]
@@ -744,9 +745,10 @@ host-path = "work/../ws"
 mode = "record"
 "#;
 
-/// `outrig.config()` shows each model with its effective identifier and window, each alias with
-/// its candidates in order, each provider's style and base URL, the defaults, the resolved
-/// workspace and the events mode -- frozen -- and holds no key nor the variable naming it.
+/// `outrig.config()` shows each model with the style it is called with -- its own, else its
+/// provider's -- and its effective identifier and window, each alias with its candidates in order,
+/// each provider's style and base URL, the defaults, the resolved workspace and the events mode --
+/// frozen -- and holds no key nor the variable naming it.
 #[tokio::test]
 async fn the_view_holds_the_configuration_and_no_secret() {
     let case = Case::new();
@@ -787,10 +789,10 @@ async fn the_view_holds_the_configuration_and_no_secret() {
         lines[..8],
         [
             "['fast', 'slow'] ['chain', 'either'] ['local']",
-            "Model(name='fast', provider='local', identifier='fast-wire-name', \
-             context_window=32000, max_tokens=4000)",
-            "Model(name='slow', provider='local', identifier='slow-wire-name', \
-             context_window=None, max_tokens=None)",
+            "Model(name='fast', provider='local', style='chat-completions', \
+             identifier='fast-wire-name', context_window=32000, max_tokens=4000)",
+            "Model(name='slow', provider='local', style='anthropic', \
+             identifier='slow-wire-name', context_window=None, max_tokens=None)",
             "Alias(name='chain', candidates=('fast', 'slow'))",
             "Provider(name='local', style='chat-completions', base_url='http://127.0.0.1:1/v1')",
             &format!("fast {} Events(mode='record')", workspace.display()),
@@ -804,7 +806,8 @@ async fn the_view_holds_the_configuration_and_no_secret() {
 }
 
 /// Without a configured workspace, the view's is `None`; a row whose identifier the
-/// configuration leaves out shows its own name, which is what OutRig would send.
+/// configuration leaves out shows its own name, which is what OutRig would send, and a row that
+/// sets no style shows its provider's.
 #[test]
 fn the_view_falls_back_to_the_rows_name_and_no_workspace() {
     let config = Config::load_from_str(
@@ -823,7 +826,7 @@ fn the_view_falls_back_to_the_rows_name_and_no_workspace() {
     assert_eq!(
         view,
         json!({
-            "models": {"bare": {"provider": "local", "identifier": "bare",
+            "models": {"bare": {"provider": "local", "style": "anthropic", "identifier": "bare",
                                 "context_window": null, "max_tokens": null}},
             "aliases": {},
             "providers": {"local": {"style": "anthropic", "base_url": "http://127.0.0.1:1"}},

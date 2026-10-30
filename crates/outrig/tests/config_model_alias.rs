@@ -259,6 +259,22 @@ fn alias_with_context_window_fails_validate() {
     );
 }
 
+/// So is `style`: the API a model is called with belongs to the model a
+/// provider serves, and each of an alias's models says its own.
+#[test]
+fn alias_with_style_fails_validate() {
+    let cfg = with_aliases("[models.opus]\nalias = \"haiku-5\"\nstyle = \"anthropic\"\n");
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            &err,
+            ConfigValidationError::ModelSourceConflict { fields, .. }
+                if fields.contains(&"style")
+        ),
+        "expected ModelSourceConflict naming style, got: {err:?}"
+    );
+}
+
 #[test]
 fn model_with_neither_shape_fails_validate() {
     let cfg = with_aliases("[models.opus]\nidentifier = \"claude-opus-5\"\n");

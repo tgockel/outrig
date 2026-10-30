@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A model's own `style` in `outrig run`.** A `[models.<name>]` row's `style` overrides its
+  provider's, so one provider can serve models over different APIs: see the library's changelog.
+  The banner names the style the model is called with.
 - **`style = "responses"` in `outrig config init` and `outrig run`.** The picker offers it beside
   `chat-completions` and `anthropic`, and a `responses` provider runs a model against
   `{base-url}/responses`: see the library's changelog for what a call sends.
@@ -259,6 +262,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig run` follows no redirect from a provider.** reqwest kept `x-api-key`, the header
+  Anthropic's wire carries the key in, on a request a redirect sent to another origin, and a
+  `307` or `308` sent the conversation there again. A call answered with a redirect now fails as
+  one answered with any other status that is not a success does. `outrig run-new` follows none
+  either.
 - **A signal during a cold image build no longer leaves buildah's working containers behind.**
   0.2.2's signal teardown for `outrig run` and `outrig mcp` dropped a build in progress, which asks
   buildah to stop and gives it ten seconds to remove the working containers its `RUN` stages made;

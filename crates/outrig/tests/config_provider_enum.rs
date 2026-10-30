@@ -1,12 +1,13 @@
 //! Schema tests for the `LlmProvider` tagged-enum (task 0001-13). Exercises
 //! parse + validate paths the existing `config_schema` and `config_merge`
 //! tests don't cover -- the per-style field rules, the typo error message,
-//! and what a load makes of the removed in-process surface.
+//! what a load makes of the removed in-process surface, and a model's own
+//! `style`.
 
 use std::path::Path;
 
 use outrig::config::{
-    AnthropicOptions, ApiKeyRef, ChatCompletionsOptions, Config, ConfigValidationError,
+    AnthropicOptions, ApiKeyRef, ApiStyle, ChatCompletionsOptions, Config, ConfigValidationError,
     ConfigWarningKind, LlmProvider, RoleAlternation,
 };
 use outrig::error::OutrigError;
@@ -170,7 +171,7 @@ provider = "claude"
         "got: {err:?}",
     );
     assert!(
-        err.to_string().contains("provider style=anthropic"),
+        err.to_string().contains("(style=anthropic)"),
         "message should name the style the user wrote, got: {err}"
     );
 }
@@ -331,6 +332,120 @@ api-key  = "${KEY}"
         msg.contains("chat-completions") && msg.contains("responses") && msg.contains("anthropic"),
         "error should name at least one legal variant, got: {msg}",
     );
+}
+
+/// A `chat-completions` provider at `base-url` ending in `/v1`, which serves a
+/// model of any style, and a model `sonnet` on it whose row carries `keys`.
+fn gateway(keys: &str) -> String {
+    format!(
+        r#"
+[providers.gateway]
+style    = "chat-completions"
+base-url = "https://gateway.example/v1"
+api-key  = "${{GATEWAY_API_KEY}}"
+
+[models.sonnet]
+provider = "gateway"
+{keys}
+"#
+    )
+}
+
+/// A provider's `style` is the default for its models, and a model's own
+/// overrides it for that model alone: one endpoint that serves both Chat
+/// Completions and Anthropic's Messages API is one provider. The key survives a
+/// serialize/parse round trip in its documented spelling.
+#[test]
+fn a_models_style_overrides_its_providers_and_round_trips() {
+    let cfg = parse(&format!(
+        "{}\n[models.fast]\nprovider = \"gateway\"\nidentifier = \"gpt-4o-mini\"\n",
+        gateway("identifier = \"claude-sonnet-4-6\"\nstyle = \"anthropic\"\nmax-tokens = 16384"),
+    ));
+    cfg.validate(None).expect("validates");
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+    let provider = &cfg.providers["gateway"];
+    assert_eq!(provider.style(), "chat-completions");
+    assert_eq!(cfg.models["fast"].style, None);
+    assert_eq!(
+        cfg.models["fast"].effective_style(provider),
+        ApiStyle::ChatCompletions
+    );
+    assert_eq!(cfg.models["sonnet"].style, Some(ApiStyle::Anthropic));
+    assert_eq!(
+        cfg.models["sonnet"].effective_style(provider),
+        ApiStyle::Anthropic
+    );
+
+    let text = toml::to_string(&cfg).expect("serializes");
+    assert!(text.contains(r#"style = "anthropic""#), "{text}");
+    assert_eq!(parse(&text), cfg);
+}
+
+/// A model's `style` takes the values a provider's does, and a value it does
+/// not take is refused with the message the same value gets on a provider.
+/// `openai` is a provider's old spelling, which the loader reads there alone:
+/// no 0.2.x config has a model `style`, so a model refuses it like any other.
+#[test]
+fn an_unknown_model_style_is_refused_as_an_unknown_provider_style_is() {
+    let message = |toml: &str| match Config::load_from_str(toml) {
+        Err(OutrigError::Config(err)) => err.message().to_string(),
+        other => panic!("expected a parse error, got: {other:?}"),
+    };
+    let on_provider = message(
+        r#"
+[providers.gateway]
+style    = "open-ai"
+base-url = "https://gateway.example/v1"
+api-key  = "${GATEWAY_API_KEY}"
+"#,
+    );
+    assert_eq!(
+        message(&gateway("identifier = \"m\"\nstyle = \"open-ai\"")),
+        on_provider
+    );
+    assert_eq!(
+        message(&gateway("identifier = \"m\"\nstyle = \"openai\"")),
+        on_provider.replace("open-ai", "openai")
+    );
+}
+
+/// The global config sets a model `style` it cannot read aside with a
+/// warning, as it does any value it cannot use: the model stays, and is
+/// called with its provider's style. Any other file refuses it (above).
+#[test]
+fn an_unknown_model_style_is_set_aside_only_from_the_global_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let global = dir.path().join("config.toml");
+    let text = gateway("identifier = \"m\"\nstyle = \"gemini\"");
+    std::fs::write(&global, text).expect("write global config");
+
+    let cfg = Config::load_global(&global).expect("the global config loads");
+    let keys: Vec<_> = cfg.warnings().iter().map(|w| w.key()).collect();
+    assert_eq!(keys, ["models.sonnet.style"]);
+    let sonnet = &cfg.models["sonnet"];
+    assert_eq!(sonnet.style, None);
+    assert_eq!(
+        sonnet.effective_style(&cfg.providers["gateway"]),
+        ApiStyle::ChatCompletions
+    );
+}
+
+/// The `identifier` rule is the one of the style a model is called with, and
+/// its error names that style: the model's own, not its provider's.
+#[test]
+fn a_model_missing_identifier_names_its_own_style() {
+    let cfg = parse(&gateway("style = \"anthropic\""));
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
+                if model == "sonnet" && style == "anthropic"
+        ),
+        "got: {err:?}",
+    );
+    assert!(err.to_string().contains("(style=anthropic)"), "{err}");
 }
 
 /// `style = "mistralrs"` was removed rather than kept parsing: the tagged enum

@@ -65,7 +65,8 @@ sent.
   promoted ids, the round numbering, and optionally each call's manifest and per-agent usage
   totals (fork 4). Each agent's store is one entry under its agent id with its parent, as the
   children's registry knows them (`crates/outrig/src/agent/children.rs:99-112`). `provider` is the
-  provider row's `style` value, so a style added later needs no format change.
+  `style` the producing model was called with -- its own `[models.<name>].style`, else its
+  provider row's (#796) -- so a style added later needs no format change.
 - **Additive, with continuation metadata.** Within one version a reader keeps a field it does not
   know and a writer may add one, so a later task extends the document without a new version.
   Each agent's entry carries a continuation-metadata section with two fields: the agent's

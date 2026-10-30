@@ -286,14 +286,16 @@ def install(fd_in, fd_out):
 class Model:
     """A concrete model the configuration declares: a `[models.<name>]` row with a provider.
 
-    `identifier` is what OutRig sends the provider: the row's `identifier`, or its name where the
-    configuration leaves that out. `context_window` and `max_tokens` are the row's
+    `style` is the API OutRig calls it with: the row's `style`, or its provider's where the row
+    sets none. `identifier` is what OutRig sends the provider: the row's `identifier`, or its name
+    where the configuration leaves that out. `context_window` and `max_tokens` are the row's
     `context-window` and `max-tokens`, or `None` where it declares none. Each is a number the
     configuration states, not the model's capacity: OutRig does not ask the provider.
     """
 
     name: str
     provider: str
+    style: str
     identifier: str
     context_window: int | None
     max_tokens: int | None
@@ -310,8 +312,9 @@ class Alias:
 
 @dataclasses.dataclass(frozen=True)
 class Provider:
-    """A `[providers.<name>]` table: its `style`, `"chat-completions"`, `"responses"` or `"anthropic"`, and its `base-url`.
-    Its key is not here, nor the variable that holds it."""
+    """A `[providers.<name>]` table: its `style` -- `"chat-completions"`, `"responses"` or
+    `"anthropic"`, the default for the models on it -- and its `base-url`. Its key is not here,
+    nor the variable that holds it."""
 
     name: str
     style: str
@@ -347,11 +350,13 @@ def config():
     from a workspace a session later names. It is what a session this program starts is built
     from.
 
-    - `models`: each concrete model by name, a `Model`: its provider, the identifier OutRig sends
-      that provider, and its declared `context_window` and `max_tokens`.
+    - `models`: each concrete model by name, a `Model`: its provider, the style OutRig calls it
+      with, the identifier OutRig sends that provider, and its declared `context_window` and
+      `max_tokens`.
     - `aliases`: each alias by name, an `Alias`: the concrete models it stands for, in the order
       a call tries them.
-    - `providers`: each provider by name, a `Provider`: its `style` and `base_url`.
+    - `providers`: each provider by name, a `Provider`: its `style`, the default for its models,
+      and its `base_url`.
     - `default_model`: the model or alias `default-model` names, or `None`.
     - `workspace`: the configured `[workspace] host-path`, resolved to an absolute path on this
       host, or `None` where the configuration names none.

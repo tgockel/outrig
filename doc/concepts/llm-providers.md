@@ -4,7 +4,8 @@ outrig delegates LLM calls to the [Rig](https://crates.io/crates/rig-core) crate
 the LLM stack in three layers so the same providers and models can be reused across many repos
 without copy-pasting:
 
-- **Provider** -- where to talk to (`base-url`, `api-key`, wire format).
+- **Provider** -- where to talk to (`base-url`, `api-key`), and the wire format its models
+  speak unless one names its own.
 - **Model** -- either a named identifier living on one provider (e.g. `gpt-4o-mini` on
   `openai`), or an **alias** naming one or more other models.
 - **Agent** -- a runnable unit: model + system preamble (+ optional default image).
@@ -39,7 +40,7 @@ flowchart LR
 
 ## `[providers.<name>]`
 
-A provider is a wire-format + endpoint + API key.
+A provider is an endpoint + API key + the wire format its models speak by default.
 
 ```toml
 [providers.openai]
@@ -48,9 +49,10 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```
 
-`style` is the protocol. v0 wires `"chat-completions"` for any endpoint that speaks OpenAI's
-Chat Completions API -- a model served on your own machine included, see
-[Local models](#local-models) -- `"responses"` for OpenAI's Responses API (see
+`style` is the protocol each model on the provider is called with, unless the model sets its own
+(see [A model's own `style`](#a-models-own-style) below). v0 wires `"chat-completions"` for any
+endpoint that speaks OpenAI's Chat Completions API -- a model served on your own machine
+included, see [Local models](#local-models) -- `"responses"` for OpenAI's Responses API (see
 [Responses](#responses-style--responses) below), and `"anthropic"` for Anthropic's native
 Messages API (see [Native Anthropic](#native-anthropic-style--anthropic) below). `openai`, the
 0.2.x name of `"chat-completions"`, is still read as it, with a warning. `base-url` is the HTTPS
@@ -85,6 +87,36 @@ whatever string the provider expects in its API request's `model` field.
 The model layer exists so that agents can refer to a stable name (`fast`, `smart`) and swap the
 underlying API model without touching every agent. If OpenAI renames a model, you edit one
 identifier; every agent using that name picks up the change.
+
+### A model's own `style`
+
+A provider's `style` is the default for its models, and a model can set its own. One endpoint can
+serve two APIs: a gateway may answer Anthropic's Messages API for its Claude models and Chat
+Completions for the rest. That is one provider, with the Claude models set apart:
+
+```toml
+[providers.gateway]
+style    = "chat-completions"       # the default for every model on it
+base-url = "https://gateway.example/v1"
+api-key  = "${GATEWAY_API_KEY}"
+
+[models.fast]
+provider   = "gateway"
+identifier = "gpt-4o-mini"          # chat-completions, from the provider
+
+[models.sonnet]
+provider   = "gateway"
+identifier = "claude-sonnet-4-6"
+style      = "anthropic"            # this model only
+max-tokens = 16384
+```
+
+A model's `style` changes the protocol and nothing else: the request still goes to the
+provider's `base-url` with its `api-key`, and the provider's timeouts, retry budget and
+`role-alternation` still apply. One `base-url` ending in `/v1` serves all three styles:
+`chat-completions` appends `/chat/completions` to it and `responses` appends `/responses`, while
+`anthropic` trims the `/v1` and appends `/v1/messages`. The model's `style` takes the values a
+provider's does, except the deprecated `openai`.
 
 ### Aliases
 
@@ -417,7 +449,9 @@ max-tokens = 16384
 OpenAI-compatible bridge to Claude (the `openrouter` provider above, with an
 `anthropic/claude-*` identifier) work, and they are genuinely different paths: the bridge
 translates to and from chat-completions on someone else's server, while this one is the
-native protocol end to end. Prefer the native style when you hold an Anthropic key.
+native protocol end to end. Prefer the native style when you hold an Anthropic key. A gateway
+that answers both for its Claude models stays one provider: set `style = "anthropic"` on those
+models (see [A model's own `style`](#a-models-own-style)).
 
 The one thing it asks of you is `max-tokens`. The Messages API requires an output-token
 ceiling on every request, so outrig always sends one: yours if you set it on the model
@@ -479,8 +513,9 @@ stops, timing out or losing its connection mid-request -- is retried until it su
 the retry budget runs out. The budget is `retry-budget-secs` on the provider, falling back
 to the top-level value and then to ten minutes. Everything else, including the rest of the
 `4xx` family, is final on the first try: a `401` will not become a `200` on the second
-attempt. So is a call the HTTP client refuses to make -- a redirect loop that reaches its
-limit of ten hops, or a URL it cannot send to -- because each replay is refused the same way.
+attempt. So is a redirect: outrig follows none, so neither your key nor the conversation reaches
+the address it names. And so is a call the HTTP client refuses to make, such as one to a URL it
+cannot send to, because each replay is refused the same way.
 
 A call that never reaches the endpoint at all is retried on a much shorter leash. A refused
 connection, an unresolvable host, or a TLS mismatch usually means the address is wrong
@@ -630,7 +665,8 @@ api-key  = "${OPENAI_API_KEY}"
 If a name is defined in both, the repo wins -- override by redefining. Providers are the one
 map with a repo-side restriction: every provider carries an `api-key`, so a provider is always
 the global file's, `base-url` included, and a repo `[models.<name>]` names it. A repo config
-that declares a provider is rejected at load.
+that declares a provider is rejected at load. A repo model may set its own `style`: whatever the
+style, the key goes only to the global provider's `base-url`.
 
 `[workspace]` is the one block that does not merge by name. Its `host-path` and `container-path`
 merge per key, so a global `container-path` stays in effect until a repo declares its own, and

@@ -23,12 +23,12 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Agent, Binding, CHILDREN_MAX_CEILING, Config, EnvValue, HOST_GRACE_SECS_CEILING, ImageConfig,
-    ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING, MODEL_CONCURRENCY_MAX_CEILING,
-    McpServerSpec, Model, ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING,
-    REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING,
-    SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
-    TOOL_RESULT_MAX_FLOOR_BYTES, lexical, normalize_capability_name,
+    Agent, ApiStyle, Binding, CHILDREN_MAX_CEILING, Config, EnvValue, HOST_GRACE_SECS_CEILING,
+    ImageConfig, ImageSourceRef, LlmProvider, MCP_CALL_TIMEOUT_SECS_CEILING,
+    MODEL_CONCURRENCY_MAX_CEILING, McpServerSpec, Model, ModelSourceRef, NetworkMode,
+    REQUEST_TIMEOUT_SECS_CEILING, REQUESTS_MAX_CEILING, RETRY_BUDGET_SECS_CEILING,
+    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
+    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, lexical, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -489,8 +489,8 @@ pub enum ConfigValidationError {
     },
 
     #[error(
-        "model {model:?} (provider style={style}) must set 'identifier' (the \
-         string sent to the provider API)"
+        "model {model:?} (style={style}) must set 'identifier' (the string sent \
+         to the provider API)"
     )]
     #[non_exhaustive]
     RemoteModelMissingIdentifier { model: String, style: &'static str },
@@ -1013,13 +1013,14 @@ pub(super) fn validate_with_options(
             })?;
             // Deliberately without a `_` arm: this crate can match the enum
             // exhaustively even though it is `#[non_exhaustive]`, so a new
-            // provider style has to stop here and say which field rules it
-            // follows rather than inheriting someone else's by default.
-            match provider {
-                LlmProvider::ChatCompletions { .. }
-                | LlmProvider::Responses { .. }
-                | LlmProvider::Anthropic { .. } => {
-                    validate_remote_model(provider.style(), model_name, model)?
+            // style has to stop here and say which field rules it follows
+            // rather than inheriting someone else's by default. The rules are
+            // the style the model is called with: its own, else its
+            // provider's.
+            let style = model.effective_style(provider);
+            match style {
+                ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Anthropic => {
+                    validate_remote_model(style.as_str(), model_name, model)?
                 }
             }
         }
@@ -1040,8 +1041,9 @@ pub(super) fn validate_with_options(
 /// answer for itself. A provider's `api-key` names a host environment variable
 /// and its `base-url` says where the host process sends it, and every style
 /// carries a key, so a repo config may declare no provider; a repo model may
-/// still name a global provider. Checked in schema order. See
-/// [`Config::validate_as_repo`](super::Config::validate_as_repo).
+/// still name a global provider, and set its own `style`, since whatever the
+/// style the key goes only to that provider's `base-url`. Checked in schema
+/// order. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
 pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
     if cfg.session_root.is_some() {
         return Err(ConfigValidationError::RepoGlobalOnlyKey {

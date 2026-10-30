@@ -1177,6 +1177,44 @@ impl ResponsesOptions {
     }
 }
 
+/// The API a model is called with: a value of `style`.
+///
+/// A `[providers.<name>]` table's `style` is the default for every model on
+/// it, and a `[models.<name>]` row's own [`style`](field@Model::style)
+/// overrides it for that model alone -- see [`Model::effective_style`]. The
+/// request goes to the provider's `base-url` with its key either way; the
+/// style decides the path, the auth header, and the wire format.
+///
+/// The variants are [`LlmProvider`]'s, in its order, so a value neither table
+/// takes is refused with the same message, naming the same three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ApiStyle {
+    /// OpenAI's Chat Completions API: `POST {base-url}/chat/completions` with
+    /// bearer auth.
+    ChatCompletions,
+    /// OpenAI's Responses API: `POST {base-url}/responses` with bearer auth.
+    Responses,
+    /// Anthropic's Messages API: `POST {base-url}/v1/messages` with
+    /// `x-api-key` auth.
+    Anthropic,
+}
+
+impl ApiStyle {
+    /// The value `style` takes for it, for diagnostics and user-facing
+    /// labels. Written next to the serde attributes above so the two cannot
+    /// drift: a message naming a style the config file does not accept sends
+    /// the reader looking for the wrong key.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Responses => "responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "style",
@@ -1232,14 +1270,19 @@ pub enum LlmProvider {
 
 impl LlmProvider {
     /// The `style` tag this variant serializes as, for diagnostics and
-    /// user-facing labels. Written next to the serde attributes above so the
-    /// two cannot drift: a message naming a style the config file does not
-    /// accept sends the reader looking for the wrong key.
+    /// user-facing labels: the name of the [`ApiStyle`] its models are called
+    /// with unless they set their own.
     pub fn style(&self) -> &'static str {
+        self.api_style().as_str()
+    }
+
+    /// The [`ApiStyle`] of the same name as this variant: the default for the
+    /// provider's models.
+    fn api_style(&self) -> ApiStyle {
         match self {
-            Self::ChatCompletions { .. } => "chat-completions",
-            Self::Responses { .. } => "responses",
-            Self::Anthropic { .. } => "anthropic",
+            Self::ChatCompletions { .. } => ApiStyle::ChatCompletions,
+            Self::Responses { .. } => ApiStyle::Responses,
+            Self::Anthropic { .. } => ApiStyle::Anthropic,
         }
     }
 
@@ -1306,7 +1349,7 @@ pub struct Model {
     /// model (`alias = "opus-5"`) or one name for a set of provider-equivalent
     /// rows (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`); both spellings
     /// deserialize here. Mutually exclusive with every provider-shape field
-    /// above and below, including `max-tokens` and `context-window`.
+    /// above and below, including `style`, `max-tokens` and `context-window`.
     #[serde(
         default,
         deserialize_with = "deserialize_string_or_vec_string",
@@ -1315,6 +1358,14 @@ pub struct Model {
     pub alias: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+    /// The API this model is called with, in place of its provider's `style`:
+    /// an endpoint that serves some models over one API and some over another
+    /// is still one `[providers.<name>]` table, its `style` the default. Unset,
+    /// the provider's applies. Either way the request goes to the provider's
+    /// `base-url` with its key. [`effective_style`](Self::effective_style)
+    /// reads the two together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<ApiStyle>,
     /// Output-token ceiling for turns run against this model, used when the
     /// agent does not set its own. Anthropic *requires* one per request and
     /// only supplies a default for the model identifiers it recognizes, so a
@@ -1370,6 +1421,7 @@ impl Model {
             provider: None,
             alias: None,
             identifier: None,
+            style: None,
             max_tokens: None,
             context_window: None,
         }
@@ -1378,12 +1430,13 @@ impl Model {
     /// Every provider-shape field this row actually sets, in declaration order.
     ///
     /// Empty for a well-formed alias, which is what makes it the conflict list:
-    /// anything here alongside `alias` is a contradiction, `max-tokens` and
-    /// `context-window` included.
+    /// anything here alongside `alias` is a contradiction, `style`,
+    /// `max-tokens` and `context-window` included.
     pub(crate) fn provider_shape_fields(&self) -> Vec<&'static str> {
         [
             (self.provider.is_some(), "provider"),
             (self.identifier.is_some(), "identifier"),
+            (self.style.is_some(), "style"),
             (self.max_tokens.is_some(), "max-tokens"),
             (self.context_window.is_some(), "context-window"),
         ]
@@ -1412,16 +1465,23 @@ impl Model {
             ),
         }
     }
+
+    /// The API this row is called with: its own [`style`](field@Self::style),
+    /// else `provider`'s, where `provider` is the `[providers.<name>]` entry
+    /// its [`provider`](field@Self::provider) names.
+    pub fn effective_style(&self, provider: &LlmProvider) -> ApiStyle {
+        self.style.unwrap_or_else(|| provider.api_style())
+    }
 }
 
 /// Discriminated view of what a `[models.<name>]` row names -- a provider that
 /// serves it, or other models it stands for. Returned by [`Model::source`].
 ///
 /// Deliberately carries only the discriminant: every reader already holds the
-/// `&Model` and reads the provider-shape fields (`identifier`, `max-tokens`,
-/// `context-window`) off it directly, so restating them here would be surface
-/// with no consumer. The per-variant `#[non_exhaustive]` keeps adding one
-/// additive.
+/// `&Model` and reads the provider-shape fields (`identifier`, `style`,
+/// `max-tokens`, `context-window`) off it directly, so restating them here
+/// would be surface with no consumer. The per-variant `#[non_exhaustive]`
+/// keeps adding one additive.
 #[non_exhaustive]
 pub enum ModelSourceRef<'a> {
     #[non_exhaustive]

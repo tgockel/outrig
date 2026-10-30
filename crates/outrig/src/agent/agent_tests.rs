@@ -3688,6 +3688,40 @@ fn a_model_override_wins_over_the_agent_and_the_default() {
     ));
 }
 
+/// A model is called with its own `style`, else its provider's: on a provider
+/// of each style, a row that sets none resolves as it always did, and a row
+/// that sets one resolves to that one -- at the provider's `base-url`, with
+/// its key.
+#[test]
+fn a_model_resolves_to_its_own_style_else_its_providers() {
+    let var = "OUTRIG_TEST_AGENT_RESOLVE_MODEL_STYLE";
+    let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    for provider_style in Style::ALL {
+        for own in std::iter::once(None).chain(Style::ALL.map(Some)) {
+            let keys = own.map_or(String::new(), |style| {
+                format!("style = \"{}\"", style.name())
+            });
+            let cfg = config_in(provider_style, addr, var, MODEL, &keys, "");
+            let resolved = resolve_agent(&cfg, None, None, &keyed(var)).expect("resolves");
+            let (style, base_url, api_key) = match &resolved.head().provider {
+                ResolvedProvider::ChatCompletions {
+                    base_url, api_key, ..
+                } => (Style::ChatCompletions, base_url, api_key),
+                ResolvedProvider::Responses {
+                    base_url, api_key, ..
+                } => (Style::Responses, base_url, api_key),
+                ResolvedProvider::Anthropic {
+                    base_url, api_key, ..
+                } => (Style::Anthropic, base_url, api_key),
+            };
+            let case = format!("a {provider_style:?} provider's model setting {own:?}");
+            assert_eq!(style, own.unwrap_or(provider_style), "{case}");
+            assert_eq!(base_url, &format!("http://{addr}"), "{case}");
+            assert_eq!(api_key.expose(), KEY, "{case}");
+        }
+    }
+}
+
 #[test]
 fn an_unknown_agent_names_the_ones_that_exist() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_UNKNOWN";
@@ -5242,6 +5276,225 @@ async fn a_chain_moves_between_every_pair_of_styles() {
     }
 }
 
+/// The style whose path and auth `request` was sent with, by a provider whose
+/// `base-url` ends in `/v1`: Anthropic's posts to `/v1/messages` with
+/// `x-api-key`, and OpenAI's two post to their own paths with a bearer token.
+fn sent_in(request: &RecordedRequest) -> Style {
+    let style = match request.path.as_str() {
+        "/v1/messages" => Style::Anthropic,
+        "/v1/chat/completions" => Style::ChatCompletions,
+        "/v1/responses" => Style::Responses,
+        other => panic!("no style posts to {other}"),
+    };
+    let bearer = format!("Bearer {KEY}");
+    let expected = match style {
+        Style::Anthropic => (Some(KEY), None),
+        Style::ChatCompletions | Style::Responses => (None, Some(bearer.as_str())),
+    };
+    let auth = (request.header("x-api-key"), request.header("authorization"));
+    assert_eq!(auth, expected, "{}", request.path);
+    style
+}
+
+/// A provider's `style` is the default for its models, and a model's own
+/// overrides it for that model alone, whichever file declares the model: the
+/// global file's `gateway` speaks Chat Completions at a `base-url` ending in
+/// `/v1`, and the repo file's `sonnet` says `anthropic`. Each model's round
+/// goes to that `base-url` in its own style -- `fast` to
+/// `/v1/chat/completions` with a bearer token, `sonnet` to `/v1/messages`
+/// with `x-api-key` -- and so does the question about its window.
+#[tokio::test]
+async fn one_provider_serves_each_model_in_its_own_style() {
+    let var = "OUTRIG_TEST_AGENT_MODEL_STYLE";
+    let (addr, mut requests) = mock_http::start_reporting(
+        vec![
+            Style::ChatCompletions.text("over chat completions"),
+            Style::Anthropic.text("over messages"),
+        ],
+        failure(404),
+    )
+    .await;
+    let dir = tempfile::tempdir().expect("a config dir");
+    let global = dir.path().join("global.toml");
+    let provider = format!(
+        r#"
+[providers.gateway]
+style                = "chat-completions"
+base-url             = "http://{addr}/v1"
+api-key              = "${{{var}}}"
+request-timeout-secs = 10
+retry-budget-secs    = 0
+"#
+    );
+    std::fs::write(&global, provider).expect("write the global config");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".agents/outrig")).expect("a repo config dir");
+    let models = format!(
+        r#"
+[models.fast]
+provider   = "gateway"
+identifier = "{MODEL}"
+
+[models.sonnet]
+provider   = "gateway"
+identifier = "{MODEL}"
+style      = "anthropic"
+"#
+    );
+    std::fs::write(repo.join(".agents/outrig/config.toml"), models).expect("write the repo config");
+    let cfg = Config::load(&repo, Some(&global)).expect("a repo model may set its style");
+
+    for (model, reply) in [
+        ("fast", "over chat completions"),
+        ("sonnet", "over messages"),
+    ] {
+        let mut agent = host_session(&cfg, None, Some(model), Events::off())
+            .secrets(keyed(var))
+            .start_on_host()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(round(&mut agent, "hi").await, reply, "{model}");
+        shut_down(agent).await;
+    }
+
+    let recorded = mock_http::drain(&mut requests);
+    let (asked, called): (Vec<_>, Vec<_>) = recorded.iter().partition(|r| r.method == "GET");
+    let called: Vec<_> = called.into_iter().map(sent_in).collect();
+    assert_eq!(called, [Style::ChatCompletions, Style::Anthropic]);
+    let window = format!("/v1/models/{MODEL}");
+    let paths: Vec<_> = asked.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["/v1/model/info", window.as_str()]);
+    let bearer = format!("Bearer {KEY}");
+    assert_eq!(asked[0].header("authorization"), Some(bearer.as_str()));
+    assert_eq!(asked[1].header("x-api-key"), Some(KEY));
+}
+
+/// A provider's redirect is not followed, so the key goes nowhere but the
+/// provider: the call fails there, and the address the redirect names is sent
+/// nothing -- not the key, which Anthropic's wire carries in `x-api-key` and
+/// reqwest keeps across origins, nor the conversation, which a `307` would send
+/// again. So for every style a model of a `chat-completions` provider can set,
+/// `anthropic` included.
+#[tokio::test]
+async fn a_providers_redirect_is_not_followed() {
+    let (elsewhere, mut sent_elsewhere) =
+        mock_http::start_reporting(vec![Style::Anthropic.text("leaked")], failure(404)).await;
+    let location = format!("http://{elsewhere}/v1/messages");
+    for style in Style::ALL {
+        for status in [302, 307] {
+            let case = format!("a {style:?} model, {status}");
+            let var = format!(
+                "OUTRIG_TEST_AGENT_REDIRECT_{}_{status}",
+                style.name().to_uppercase().replace('-', "_")
+            );
+            let (addr, mut requests) =
+                mock_http::start(vec![failure(status).header("Location", &location)]).await;
+            let cfg = load(&format!(
+                r#"
+default-model = "m"
+
+[providers.gateway]
+style                = "chat-completions"
+base-url             = "http://{addr}/v1"
+api-key              = "${{{var}}}"
+request-timeout-secs = 10
+retry-budget-secs    = 0
+
+[models.m]
+provider   = "gateway"
+identifier = "{MODEL}"
+style      = "{style}"
+"#,
+                style = style.name(),
+            ));
+            let mut agent = host_session(&cfg, None, None, Events::off())
+                .secrets(keyed(&var))
+                .start_on_host()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+
+            post(&agent, "hi").await;
+            let err = within(agent.round())
+                .await
+                .expect_err("a redirect fails the call")
+                .to_string();
+            assert!(err.contains(&status.to_string()), "{case}: {err}");
+            shut_down(agent).await;
+            assert_eq!(mock_http::drain(&mut requests).len(), 1, "{case}");
+        }
+    }
+    let leaked = mock_http::drain(&mut sent_elsewhere);
+    assert!(leaked.is_empty(), "{leaked:#?}");
+}
+
+/// An alias over two models of one provider that are called in different
+/// styles moves between them in either direction, and each call goes out in
+/// its model's style: the head's in its own, and the tail's in the tail's,
+/// carrying the head's tool call and its result as the tail's wire requires.
+#[tokio::test]
+async fn a_chain_moves_between_the_styles_of_one_providers_models() {
+    for head_style in Style::ALL {
+        for tail_style in Style::ALL {
+            if head_style == tail_style {
+                continue;
+            }
+            let case = format!("{head_style:?} -> {tail_style:?}");
+            let var = format!(
+                "OUTRIG_TEST_AGENT_ONE_PROVIDER_{}_TO_{}",
+                head_style.name().to_uppercase().replace('-', "_"),
+                tail_style.name().to_uppercase().replace('-', "_")
+            );
+            let (addr, mut requests) = mock_http::start(vec![
+                head_style.submit("call_1", "print('ran')"),
+                head_style.failure(503),
+                tail_style.text("on the tail"),
+            ])
+            .await;
+            let cfg = load(&format!(
+                r#"
+default-model = "chain"
+
+[providers.gateway]
+style                = "{head}"
+base-url             = "http://{addr}/v1"
+api-key              = "${{{var}}}"
+request-timeout-secs = 10
+retry-budget-secs    = 0
+
+[models.head]
+provider   = "gateway"
+identifier = "{MODEL}"
+
+[models.tail]
+provider   = "gateway"
+identifier = "{MODEL}"
+style      = "{tail}"
+
+[models.chain]
+alias = ["head", "tail"]
+"#,
+                head = head_style.name(),
+                tail = tail_style.name(),
+            ));
+            let mut agent = host_session(&cfg, None, None, Events::off())
+                .secrets(keyed(&var))
+                .start_on_host()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+
+            assert_eq!(round(&mut agent, "run it").await, "on the tail", "{case}");
+            shut_down(agent).await;
+
+            let recorded = mock_http::drain(&mut requests);
+            let styles: Vec<_> = recorded.iter().map(sent_in).collect();
+            assert_eq!(styles, [head_style, head_style, tail_style], "{case}");
+            let wire = check_wire(tail_style, &recorded[2].body);
+            assert!(wire.unpaired.is_empty(), "{case}: {wire:?}");
+            assert_eq!(tool_result(&recorded[2], "call_1"), "ran\n", "{case}");
+        }
+    }
+}
+
 /// A call that moves to a Responses provider carries the conversation without
 /// the reasoning another provider's model did: the item is not the Responses
 /// provider's, which has no stored item to resolve it against.
@@ -6373,11 +6626,12 @@ async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
     );
 }
 
-/// A request that cannot succeed as sent -- a redirect loop reqwest gives up
-/// on -- is not retried: the call moves to the next model at once, with its
-/// retry budget unspent.
+/// A request that cannot succeed as sent -- one a provider answers with a
+/// redirect, which is not followed, even to its own address -- is not
+/// retried: the call moves to the next model at once, with its retry budget
+/// unspent.
 #[tokio::test]
-async fn a_redirect_loop_moves_on_without_retrying() {
+async fn a_redirect_moves_on_without_retrying() {
     let vars = "OUTRIG_TEST_AGENT_FAILOVER_REDIRECT_LOOP";
     let (head, mut head_requests) =
         mock_http::start(vec![failure(307).header("Location", "/v1/messages")]).await;
@@ -6394,10 +6648,10 @@ async fn a_redirect_loop_moves_on_without_retrying() {
     assert_eq!(round(&mut agent, "hi").await, "from the tail");
     shut_down(agent).await;
 
-    let followed = mock_http::drain(&mut head_requests).len();
-    assert!(
-        (2..=11).contains(&followed),
-        "one request and the redirects reqwest follows, once: {followed}"
+    assert_eq!(
+        mock_http::drain(&mut head_requests).len(),
+        1,
+        "the redirect is neither followed nor retried"
     );
     let records = events::recorded(dir.path());
     assert_eq!(

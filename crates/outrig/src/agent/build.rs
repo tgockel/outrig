@@ -309,7 +309,7 @@ fn retry_policy(retry_budget_secs: Option<u64>) -> RetryPolicy {
 }
 
 /// The client builder every request to a provider starts from: `timeout` on the
-/// whole request, and the connect bound.
+/// whole request, the connect bound, and no redirect.
 ///
 /// Two ceilings, on two different things. `timeout` bounds the whole request,
 /// and is high for a model call because a non-streaming completion answers only
@@ -318,10 +318,17 @@ fn retry_policy(retry_budget_secs: Option<u64>) -> RetryPolicy {
 /// drops packets would hold an attempt open for the full request timeout, and
 /// the retry loop's much shorter budget for an endpoint that never answered
 /// could not stop it (see [`retry::CONNECT_TIMEOUT`]).
+///
+/// A redirect is not followed. reqwest drops `Authorization` from a request a
+/// redirect sends to another origin, but not `x-api-key`, the header
+/// Anthropic's wire carries the key in, and a `307` or `308` sends the
+/// conversation again besides. A redirect is taken as any other status that is
+/// not a success: the call fails, and the address it names is sent nothing.
 pub(super) fn http_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .timeout(timeout)
-        .connect_timeout(retry::CONNECT_TIMEOUT);
+        .connect_timeout(retry::CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
 
     // Unit tests point providers at loopback fixtures. reqwest picks up
     // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of

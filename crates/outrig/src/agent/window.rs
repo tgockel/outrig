@@ -103,13 +103,13 @@ impl Windows {
 /// none. One request, bounded by `timeout`, and not retried.
 ///
 /// A plain client rather than the model calls': those retry, and record each
-/// attempt as a call the session made. It follows no redirect: a provider that
-/// does not serve the route may send it anywhere, and the key rides in a
-/// header (`x-api-key`) that a client carries across origins. A redirect is an
-/// answer with no window, like any other status.
+/// attempt as a call the session made. Like every request to a provider, it
+/// follows no redirect ([`http_client_builder`]): a provider that does not
+/// serve the route may send it anywhere, and the key rides in a header
+/// (`x-api-key`) that a client carries across origins. A redirect is an answer
+/// with no window, like any other status.
 async fn lookup(candidate: &ResolvedCandidate, timeout: Duration) -> Reported {
     let http = http_client_builder(timeout)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| failed(e, timeout))?;
     let identifier = &candidate.model_identifier;

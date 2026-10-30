@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::error::{CliError, Result};
 use crate::session_tool::{self, SessionTool, SharedTools};
-use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider};
+use outrig::config::{ApiStyle, Config, DEFAULT_TOOL_CALL_MAX, LlmProvider};
 
 /// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
 /// this and surfaces a controllable message. rig's own `max_turns` is a
@@ -377,10 +377,16 @@ pub(crate) fn selectability(
             name: provider_name.to_string(),
         })
     })?;
+    let known_style = matches!(
+        model.effective_style(provider),
+        ApiStyle::ChatCompletions | ApiStyle::Responses | ApiStyle::Anthropic
+    );
     match provider {
         LlmProvider::ChatCompletions { api_key, .. }
         | LlmProvider::Responses { api_key, .. }
-        | LlmProvider::Anthropic { api_key, .. } => {
+        | LlmProvider::Anthropic { api_key, .. }
+            if known_style =>
+        {
             // Through `resolve` rather than `env::var` so "not set" and "not
             // valid UTF-8" read exactly as they will when the session resolves.
             match api_key.resolve() {
@@ -389,8 +395,9 @@ pub(crate) fn selectability(
                 Err(e) => Err(Unselectable::ApiKey(e.to_string())),
             }
         }
-        // `LlmProvider` is `#[non_exhaustive]`: a style this function has not
-        // been taught about is not selectable.
+        // `LlmProvider` and `ApiStyle` are `#[non_exhaustive]`: a style this
+        // function has not been taught about, the provider's or the model's
+        // own, is not selectable.
         _ => Err(Unselectable::AsResolved(
             LlmResolveError::UnsupportedProvider {
                 name: provider_name.to_string(),
@@ -659,54 +666,65 @@ fn resolve_candidate(
                 name: provider_name.to_string(),
             })?;
 
-    let resolved_provider = match provider {
-        LlmProvider::ChatCompletions {
+    // `LlmProvider` and `ApiStyle` are `#[non_exhaustive]` and live in another
+    // crate, so neither match below can be exhaustive: a new style that forgets
+    // its arm lands in the fallback instead of failing to compile. There is no
+    // generic way to reach a style this build has no client for, so say so
+    // rather than guess at one.
+    let unsupported = || LlmResolveError::UnsupportedProvider {
+        name: provider_name.to_string(),
+    };
+    // Every style's row holds the same keys, so they are read from whichever
+    // the provider is, and the model's own `style`, else the provider's, says
+    // which protocol they are used in.
+    let (LlmProvider::ChatCompletions {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        ..
+    }
+    | LlmProvider::Responses {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        ..
+    }
+    | LlmProvider::Anthropic {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        retry_budget_secs,
+        ..
+    }) = provider
+    else {
+        return Err(unsupported().into());
+    };
+    let base_url = base_url.clone();
+    let api_key = api_key.resolve()?;
+    let request_timeout_secs = *request_timeout_secs;
+    let retry_budget_secs = retry_budget_secs.or(cfg.retry_budget_secs);
+    let resolved_provider = match model.effective_style(provider) {
+        ApiStyle::ChatCompletions => ResolvedProvider::ChatCompletions {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
-            ..
-        } => ResolvedProvider::ChatCompletions {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
         },
-        LlmProvider::Responses {
+        ApiStyle::Responses => ResolvedProvider::Responses {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
-            ..
-        } => ResolvedProvider::Responses {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
         },
-        LlmProvider::Anthropic {
+        ApiStyle::Anthropic => ResolvedProvider::Anthropic {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
-            ..
-        } => ResolvedProvider::Anthropic {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
-            request_timeout_secs: *request_timeout_secs,
-            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
         },
-        // `LlmProvider` is `#[non_exhaustive]` and lives in another crate, so
-        // this match can never be exhaustive: a new style that forgets its arm
-        // above lands here instead of failing to compile. There is no generic
-        // way to reach a style this build has no client for, so say so rather
-        // than guess at one.
-        _ => {
-            return Err(LlmResolveError::UnsupportedProvider {
-                name: provider_name.to_string(),
-            }
-            .into());
-        }
+        _ => return Err(unsupported().into()),
     };
 
     Ok(ResolvedCandidate {
@@ -823,9 +841,17 @@ fn remote_http_client(
     // silently drops packets would hold an attempt open for the full request
     // timeout, and the retry loop's much shorter budget for an endpoint that
     // never answered could not stop it (see [`retry::CONNECT_TIMEOUT`]).
+    //
+    // No redirect is followed. reqwest drops `Authorization` from a request a
+    // redirect sends to another origin, but not `x-api-key`, the header
+    // Anthropic's wire carries the key in, and a `307` or `308` sends the
+    // conversation again besides. A redirect is taken as any other status that
+    // is not a success: the call fails, and the address it names is sent
+    // nothing.
     let builder = reqwest::Client::builder()
         .timeout(timeout)
-        .connect_timeout(retry::CONNECT_TIMEOUT);
+        .connect_timeout(retry::CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
 
     // Unit tests point providers at loopback fixtures. reqwest picks up
     // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of
