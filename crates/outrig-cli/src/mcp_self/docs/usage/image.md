@@ -26,8 +26,14 @@ If you run `outrig image add` in a directory without an `.agents/outrig/config.t
 
 ```
 [outrig] no .agents/outrig/config.toml found in /path/to/repo or any parent.
+[outrig] the config would go in /path/to/repo, which is then mounted read-write as the workspace.
 ? Configure outrig in this directory now? [Y/n]:
 ```
+
+The directory you are in becomes the workspace (`host-path = "."`), and the config applies to
+every `outrig run` below it. So the prompt defaults to yes only inside a git repository (a `.git`
+in the directory or one above it). Anywhere else, such as your home directory, it says so and
+defaults to no (`[y/N]`); type `y` to bootstrap there anyway.
 
 Answering `y` walks the same repo-config prompts that
 [`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (models, default agent,

@@ -63,7 +63,8 @@ pub async fn ensure(
 /// `global_override` is `--global-config`, which only the bootstrap reads: one
 /// that names nothing is refused before the bootstrap asks anything. With no
 /// flag and no default location, the bootstrap reads no global config, as it
-/// does when the default file is missing.
+/// does when the default file is missing. The bootstrap prompt names the
+/// directory it would make the workspace and defaults to no outside a git repo.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_override: Option<&Path>,
@@ -84,7 +85,23 @@ pub async fn resolve_or_bootstrap(
                 "[outrig] no .agents/outrig/config.toml found in {} or any parent.",
                 cwd.display()
             );
-            if !prompt.ask_bool(&CONFIGURE_NOW_FIELD, true).await? {
+            // The directory becomes the read-write workspace (`host-path = "."`),
+            // so say so, and decline by default where nothing marks it a project:
+            // Enter in `$HOME` must not hand the whole home directory to every
+            // later `outrig run` that walks up to this config.
+            let in_git = in_git_repo(cwd);
+            eprintln!(
+                "[outrig] the config would go in {}, which is then mounted read-write \
+                 as the workspace.",
+                cwd.display()
+            );
+            if !in_git {
+                eprintln!(
+                    "[outrig] {} is not inside a git repository, so this defaults to no.",
+                    cwd.display()
+                );
+            }
+            if !prompt.ask_bool(&CONFIGURE_NOW_FIELD, in_git).await? {
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
@@ -93,6 +110,13 @@ pub async fn resolve_or_bootstrap(
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Whether `dir`, or a directory above it, holds a `.git` (a directory, or
+/// the file a worktree or submodule has). Only a hint that `dir` is a project
+/// rather than, say, a home directory.
+fn in_git_repo(dir: &Path) -> bool {
+    dir.ancestors().any(|d| d.join(".git").exists())
 }
 
 /// Walks the three repo-config sections (image / model / agent),
@@ -478,7 +502,9 @@ const CONFIGURE_NOW_FIELD: Field = Field {
     name: "Configure outrig in this directory now?",
     description: "Yes walks the same prompts as `outrig init` (workspace, model, \
                   agent) and writes .agents/outrig/config.toml here, then \
-                  continues with `image add`. No exits without changes.",
+                  continues with `image add`. This directory becomes the \
+                  read-write workspace, so the default is no outside a git \
+                  repository. No exits without changes.",
     options: &[],
     doc_link: "doc/usage/init.md",
 };
